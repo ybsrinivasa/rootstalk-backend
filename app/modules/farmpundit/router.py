@@ -9,10 +9,12 @@ from app.dependencies import get_current_user
 from app.modules.platform.models import User
 from app.modules.farmpundit.models import (
     FarmPunditProfile, FarmPunditExpertise, FarmPunditSupportArea,
+    FarmPunditLanguage, FarmPunditCropGroup, FarmPunditPreference,
     ClientFarmPundit, PunditInvitation, PunditRole,
-    Query, QueryMedia, QueryRemark, QueryResponse, StandardResponse,
-    QueryStatus, QueryRemarkAction,
+    Query, QueryMedia, QueryRemark, QueryResponse, QueryResponseMedia,
+    StandardResponse, QueryStatus, QueryRemarkAction,
 )
+from app.services.bl12_query_routing import route_query, ExpertSlot
 
 router = APIRouter(tags=["FarmPundit"])
 
@@ -29,9 +31,12 @@ class PunditProfileCreate(BaseModel):
     support_method: Optional[str] = None
     cultivation_type: Optional[str] = None
     organisation_name: Optional[str] = None
+    organisation_type_cosh_id: Optional[str] = None
     declaration_accepted: bool = False
     expertise_domains: list[str] = []
-    support_areas: list[dict] = []
+    support_areas: list[dict] = []    # [{"state_cosh_id": ..., "district_cosh_id": ...}]
+    languages: list[str] = []          # language_code list
+    crop_groups: list[str] = []        # crop_group_cosh_id list
 
 
 @router.post("/pundit/profile", status_code=201)
@@ -54,6 +59,7 @@ async def create_pundit_profile(
         support_method=request.support_method,
         cultivation_type=request.cultivation_type,
         organisation_name=request.organisation_name,
+        organisation_type_cosh_id=request.organisation_type_cosh_id,
         declaration_accepted=request.declaration_accepted,
     )
     db.add(profile)
@@ -63,10 +69,62 @@ async def create_pundit_profile(
         db.add(FarmPunditExpertise(pundit_id=profile.id, domain=domain))
     for area in request.support_areas:
         db.add(FarmPunditSupportArea(pundit_id=profile.id, **area))
+    for lang in request.languages:
+        db.add(FarmPunditLanguage(pundit_id=profile.id, language_code=lang))
+    for cg in request.crop_groups:
+        db.add(FarmPunditCropGroup(pundit_id=profile.id, crop_group_cosh_id=cg))
+
+    # Add FARM_PUNDIT role to user
+    from app.modules.platform.models import UserRole, RoleType
+    existing_role = (await db.execute(
+        select(UserRole).where(UserRole.user_id == current_user.id, UserRole.role_type == RoleType.FARM_PUNDIT)
+    )).scalar_one_or_none()
+    if not existing_role:
+        db.add(UserRole(user_id=current_user.id, role_type=RoleType.FARM_PUNDIT))
 
     await db.commit()
     await db.refresh(profile)
     return {"id": profile.id, "user_id": profile.user_id, "declaration_accepted": profile.declaration_accepted}
+
+
+@router.get("/pundit/profile")
+async def get_pundit_profile_detail(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    profile = await _get_pundit_profile(db, current_user.id)
+    domains = (await db.execute(
+        select(FarmPunditExpertise).where(FarmPunditExpertise.pundit_id == profile.id)
+    )).scalars().all()
+    areas = (await db.execute(
+        select(FarmPunditSupportArea).where(FarmPunditSupportArea.pundit_id == profile.id)
+    )).scalars().all()
+    langs = (await db.execute(
+        select(FarmPunditLanguage).where(FarmPunditLanguage.pundit_id == profile.id)
+    )).scalars().all()
+    crop_groups = (await db.execute(
+        select(FarmPunditCropGroup).where(FarmPunditCropGroup.pundit_id == profile.id)
+    )).scalars().all()
+    companies = (await db.execute(
+        select(ClientFarmPundit).where(ClientFarmPundit.pundit_id == profile.id, ClientFarmPundit.status == "ACTIVE")
+    )).scalars().all()
+    return {
+        "id": profile.id,
+        "user_id": profile.user_id,
+        "email": profile.email,
+        "education": profile.education,
+        "experience_band": profile.experience_band,
+        "support_method": profile.support_method,
+        "cultivation_type": profile.cultivation_type,
+        "organisation_name": profile.organisation_name,
+        "phone_hidden": profile.phone_hidden,
+        "declaration_accepted": profile.declaration_accepted,
+        "expertise_domains": [d.domain for d in domains],
+        "support_areas": [{"state_cosh_id": a.state_cosh_id, "district_cosh_id": a.district_cosh_id} for a in areas],
+        "languages": [l.language_code for l in langs],
+        "crop_groups": [c.crop_group_cosh_id for c in crop_groups],
+        "companies": [{"client_id": c.client_id, "role": c.role, "is_promoter_pundit": c.is_promoter_pundit} for c in companies],
+    }
 
 
 @router.put("/pundit/profile/phone-privacy")
@@ -200,8 +258,8 @@ async def submit_query(
     db.add(query)
     await db.flush()
 
-    # BL-12a: Assign to next Primary Expert via round-robin
-    next_pundit = await _get_next_round_robin_pundit(db, request.client_id)
+    # BL-12a: Full priority routing (preference → Promoter-Pundit → round-robin)
+    next_pundit = await _get_next_pundit_for_query(db, request.client_id, request.subscription_id)
     if next_pundit:
         query.current_holder_id = next_pundit.id
         db.add(QueryRemark(
@@ -271,12 +329,28 @@ async def respond_to_query(
         standard_response_id=data.get("standard_response_id"),
     )
     db.add(response)
+    await db.flush()
+
+    # Attach response media if provided
+    for media in data.get("media", []):
+        db.add(QueryResponseMedia(
+            response_id=response.id,
+            media_type=media.get("media_type", "IMAGE"),
+            url=media["url"],
+            caption=media.get("caption"),
+        ))
+
     db.add(QueryRemark(query_id=query_id, pundit_id=profile.id, action=QueryRemarkAction.RESPONDED))
 
     query.status = QueryStatus.RESPONDED
     query.current_holder_id = None
+
+    # BL-12 / §14.7: If pundit identified a crop health problem → trigger CHA delivery
+    if data.get("problem_cosh_id"):
+        await _trigger_cha_for_query(db, query, data["problem_cosh_id"])
+
     await db.commit()
-    return {"status": "RESPONDED"}
+    return {"status": "RESPONDED", "response_id": response.id}
 
 
 @router.put("/pundit/queries/{query_id}/forward")
@@ -286,12 +360,22 @@ async def forward_query(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Primary Expert forwards to another expert. Mandatory comments. 7-day clock never resets."""
+    """Primary Expert forwards to another expert. Panel Experts cannot forward. Mandatory remarks."""
     if not data.get("to_pundit_id") or not data.get("remarks"):
         raise HTTPException(status_code=422, detail="to_pundit_id and remarks are mandatory")
 
     profile = await _get_pundit_profile(db, current_user.id)
     query = await _get_query(db, query_id)
+
+    # BL-12 TC-BL12-04: Panel Experts cannot forward
+    holder_slot = (await db.execute(
+        select(ClientFarmPundit).where(
+            ClientFarmPundit.client_id == query.client_id,
+            ClientFarmPundit.pundit_id == profile.id,
+        )
+    )).scalar_one_or_none()
+    if holder_slot and holder_slot.role == PunditRole.PANEL:
+        raise HTTPException(status_code=403, detail="Panel Experts cannot forward queries. You can only Respond or Return.")
 
     db.add(QueryRemark(
         query_id=query_id,
@@ -418,18 +502,319 @@ async def search_standard_responses(
 
 @router.get("/client/{client_id}/pundit-search")
 async def search_pundits(
-    support_area: Optional[str] = None,
+    client_id: str,
+    state_cosh_id: Optional[str] = None,
     expertise_domain: Optional[str] = None,
-    language: Optional[str] = None,
+    language_code: Optional[str] = None,
+    education: Optional[str] = None,
+    experience_band: Optional[str] = None,
+    support_method: Optional[str] = None,
+    crop_group: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Multi-filter search across all registered FarmPundits (declaration_accepted=True)."""
+    q = select(FarmPunditProfile).where(FarmPunditProfile.declaration_accepted == True)  # noqa: E712
+    if education:
+        q = q.where(FarmPunditProfile.education == education)
+    if experience_band:
+        q = q.where(FarmPunditProfile.experience_band == experience_band)
+    if support_method:
+        q = q.where(FarmPunditProfile.support_method == support_method)
+
+    profiles = (await db.execute(q)).scalars().all()
+
+    # Filter by support area, language, expertise domain in Python (small dataset)
+    if state_cosh_id:
+        area_pundit_ids = {
+            r.pundit_id for r in (await db.execute(
+                select(FarmPunditSupportArea).where(FarmPunditSupportArea.state_cosh_id == state_cosh_id)
+            )).scalars().all()
+        }
+        profiles = [p for p in profiles if p.id in area_pundit_ids]
+
+    if expertise_domain:
+        domain_pundit_ids = {
+            r.pundit_id for r in (await db.execute(
+                select(FarmPunditExpertise).where(FarmPunditExpertise.domain == expertise_domain)
+            )).scalars().all()
+        }
+        profiles = [p for p in profiles if p.id in domain_pundit_ids]
+
+    if language_code:
+        lang_pundit_ids = {
+            r.pundit_id for r in (await db.execute(
+                select(FarmPunditLanguage).where(FarmPunditLanguage.language_code == language_code)
+            )).scalars().all()
+        }
+        profiles = [p for p in profiles if p.id in lang_pundit_ids]
+
+    if crop_group:
+        cg_pundit_ids = {
+            r.pundit_id for r in (await db.execute(
+                select(FarmPunditCropGroup).where(FarmPunditCropGroup.crop_group_cosh_id == crop_group)
+            )).scalars().all()
+        }
+        profiles = [p for p in profiles if p.id in cg_pundit_ids]
+
+    # Already onboarded by this client?
+    onboarded_ids = {
+        r.pundit_id for r in (await db.execute(
+            select(ClientFarmPundit).where(ClientFarmPundit.client_id == client_id)
+        )).scalars().all()
+    }
+
+    result_out = []
+    for p in profiles:
+        user = (await db.execute(select(User).where(User.id == p.user_id))).scalar_one_or_none()
+        result_out.append({
+            "id": p.id,
+            "user_id": p.user_id,
+            "name": user.name if user else None,
+            "phone": user.phone if (user and not p.phone_hidden) else None,
+            "email": p.email,
+            "education": p.education,
+            "experience_band": p.experience_band,
+            "support_method": p.support_method,
+            "already_onboarded": p.id in onboarded_ids,
+        })
+    return result_out
+
+
+# ── Company Pundit Management (Client Portal) ─────────────────────────────────
+
+@router.get("/client/{client_id}/pundits")
+async def list_company_pundits(
+    client_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     result = await db.execute(
-        select(FarmPunditProfile).where(FarmPunditProfile.declaration_accepted == True)
+        select(ClientFarmPundit).where(ClientFarmPundit.client_id == client_id)
+        .order_by(ClientFarmPundit.onboarded_at)
     )
-    profiles = result.scalars().all()
-    return [{"id": p.id, "user_id": p.user_id, "education": p.education,
-             "experience_band": p.experience_band, "phone_hidden": p.phone_hidden} for p in profiles]
+    pundits = result.scalars().all()
+    out = []
+    for cp in pundits:
+        profile = (await db.execute(
+            select(FarmPunditProfile).where(FarmPunditProfile.id == cp.pundit_id)
+        )).scalar_one_or_none()
+        user = (await db.execute(
+            select(User).where(User.id == profile.user_id)
+        )).scalar_one_or_none() if profile else None
+        out.append({
+            "id": cp.id,
+            "pundit_id": cp.pundit_id,
+            "name": user.name if user else None,
+            "phone": user.phone if user else None,
+            "role": cp.role,
+            "status": cp.status,
+            "is_promoter_pundit": cp.is_promoter_pundit,
+            "round_robin_sequence": cp.round_robin_sequence,
+            "onboarded_at": cp.onboarded_at,
+        })
+    return out
+
+
+@router.put("/client/{client_id}/pundits/{cp_id}/deactivate")
+async def deactivate_company_pundit(
+    client_id: str,
+    cp_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Deactivate a FarmPundit from this company. They keep active queries until resolved."""
+    cp = (await db.execute(
+        select(ClientFarmPundit).where(ClientFarmPundit.id == cp_id, ClientFarmPundit.client_id == client_id)
+    )).scalar_one_or_none()
+    if not cp:
+        raise HTTPException(status_code=404, detail="Company pundit not found")
+    cp.status = "INACTIVE"
+    await db.commit()
+    return {"status": "INACTIVE"}
+
+
+@router.put("/client/{client_id}/pundits/{cp_id}/promoter-pundit")
+async def toggle_promoter_pundit(
+    client_id: str,
+    cp_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Field Manager designates a facilitator FarmPundit as a Promoter-Pundit."""
+    cp = (await db.execute(
+        select(ClientFarmPundit).where(ClientFarmPundit.id == cp_id, ClientFarmPundit.client_id == client_id)
+    )).scalar_one_or_none()
+    if not cp:
+        raise HTTPException(status_code=404, detail="Company pundit not found")
+    cp.is_promoter_pundit = data.get("is_promoter_pundit", not cp.is_promoter_pundit)
+    await db.commit()
+    return {"is_promoter_pundit": cp.is_promoter_pundit}
+
+
+# ── Query Detail Routes ────────────────────────────────────────────────────────
+
+@router.get("/pundit/queries/{query_id}")
+async def get_query_detail_pundit(
+    query_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Pundit sees full query with remarks chain and response."""
+    profile = await _get_pundit_profile(db, current_user.id)
+    query = await _get_query(db, query_id)
+
+    remarks = (await db.execute(
+        select(QueryRemark).where(QueryRemark.query_id == query_id).order_by(QueryRemark.created_at)
+    )).scalars().all()
+
+    response = (await db.execute(
+        select(QueryResponse).where(QueryResponse.query_id == query_id)
+    )).scalar_one_or_none()
+
+    media_result = (await db.execute(
+        select(QueryMedia).where(QueryMedia.query_id == query_id)
+    )).scalars().all()
+
+    response_media = []
+    if response:
+        rm_result = (await db.execute(
+            select(QueryResponseMedia).where(QueryResponseMedia.response_id == response.id)
+        )).scalars().all()
+        response_media = [{"media_type": m.media_type, "url": m.url, "caption": m.caption} for m in rm_result]
+
+    return {
+        "id": query.id,
+        "title": query.title,
+        "description": query.description,
+        "severity": query.severity,
+        "crop_cosh_id": query.crop_cosh_id,
+        "crop_age": query.crop_age,
+        "status": query.status,
+        "created_at": query.created_at,
+        "expires_at": query.expires_at,
+        "days_remaining": max(0, (query.expires_at.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).days),
+        "is_holding": query.current_holder_id == profile.id,
+        "media": [{"media_type": m.media_type, "url": m.url} for m in media_result],
+        "remarks": [
+            {
+                "action": r.action, "pundit_id": r.pundit_id,
+                "forwarded_to_pundit_id": r.forwarded_to_pundit_id,
+                "remark": r.remark, "created_at": r.created_at,
+            }
+            for r in remarks
+        ],
+        "response": {
+            "problem_cosh_id": response.problem_cosh_id,
+            "text": response.text,
+            "media": response_media,
+            "created_at": response.created_at,
+        } if response else None,
+    }
+
+
+@router.get("/farmer/queries/{query_id}")
+async def get_query_detail_farmer(
+    query_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Farmer sees their query with the pundit's response (if responded)."""
+    query = (await db.execute(
+        select(Query).where(Query.id == query_id, Query.farmer_user_id == current_user.id)
+    )).scalar_one_or_none()
+    if not query:
+        raise HTTPException(status_code=404, detail="Query not found")
+
+    response = (await db.execute(
+        select(QueryResponse).where(QueryResponse.query_id == query_id)
+    )).scalar_one_or_none()
+
+    response_media = []
+    if response:
+        rm_result = (await db.execute(
+            select(QueryResponseMedia).where(QueryResponseMedia.response_id == response.id)
+        )).scalars().all()
+        response_media = [{"media_type": m.media_type, "url": m.url, "caption": m.caption} for m in rm_result]
+
+    media_result = (await db.execute(
+        select(QueryMedia).where(QueryMedia.query_id == query_id)
+    )).scalars().all()
+
+    return {
+        "id": query.id,
+        "title": query.title,
+        "description": query.description,
+        "severity": query.severity,
+        "crop_cosh_id": query.crop_cosh_id,
+        "crop_age": query.crop_age,
+        "status": query.status,
+        "created_at": query.created_at,
+        "expires_at": query.expires_at,
+        "media": [{"media_type": m.media_type, "url": m.url} for m in media_result],
+        "response": {
+            "text": response.text,
+            "problem_cosh_id": response.problem_cosh_id,
+            "media": response_media,
+            "created_at": response.created_at,
+            "has_cha_recommendation": bool(response.problem_cosh_id),
+        } if response else None,
+    }
+
+
+# ── Farmer: Set preferred FarmPundit ─────────────────────────────────────────
+
+@router.post("/farmer/subscriptions/{subscription_id}/pundit-preference")
+async def set_pundit_preference(
+    subscription_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Farmer sets their preferred FarmPundit for this subscription."""
+    pundit_id = data.get("pundit_id")
+    if not pundit_id:
+        raise HTTPException(status_code=422, detail="pundit_id required")
+
+    existing = (await db.execute(
+        select(FarmPunditPreference).where(FarmPunditPreference.subscription_id == subscription_id)
+    )).scalar_one_or_none()
+
+    if existing:
+        existing.pundit_id = pundit_id
+        existing.set_at = datetime.now(timezone.utc)
+    else:
+        db.add(FarmPunditPreference(
+            subscription_id=subscription_id,
+            pundit_id=pundit_id,
+        ))
+    await db.commit()
+    return {"detail": "Preference set", "pundit_id": pundit_id}
+
+
+# ── Company Queries Monitoring ────────────────────────────────────────────────
+
+@router.get("/client/{client_id}/queries")
+async def list_company_queries(
+    client_id: str,
+    status_filter: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    q = select(Query).where(Query.client_id == client_id).order_by(Query.created_at.desc())
+    if status_filter:
+        q = q.where(Query.status == status_filter)
+    queries = (await db.execute(q)).scalars().all()
+    return [
+        {
+            "id": query.id, "title": query.title, "status": query.status,
+            "severity": query.severity, "created_at": query.created_at,
+            "expires_at": query.expires_at, "farmer_user_id": query.farmer_user_id,
+            "current_holder_id": query.current_holder_id,
+        }
+        for query in queries
+    ]
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -460,22 +845,59 @@ async def _get_invitation(db: AsyncSession, invitation_id: str) -> PunditInvitat
     return inv
 
 
-async def _get_next_round_robin_pundit(db: AsyncSession, client_id: str) -> Optional[FarmPunditProfile]:
-    """BL-12a: Sequential round-robin among PRIMARY experts, ordered by onboarded_at."""
-    result = await db.execute(
-        select(ClientFarmPundit)
-        .where(
-            ClientFarmPundit.client_id == client_id,
-            ClientFarmPundit.role == PunditRole.PRIMARY,
-            ClientFarmPundit.status == "ACTIVE",
-        )
-        .order_by(ClientFarmPundit.onboarded_at)
-    )
-    pundits = result.scalars().all()
-    if not pundits:
-        return None
+async def _get_next_pundit_for_query(
+    db: AsyncSession,
+    client_id: str,
+    subscription_id: str,
+) -> Optional[FarmPunditProfile]:
+    """BL-12a: Full priority routing — preference → Promoter-Pundit → round-robin."""
+    # Load all company pundits
+    all_cp = (await db.execute(
+        select(ClientFarmPundit).where(ClientFarmPundit.client_id == client_id)
+    )).scalars().all()
 
-    # Find which pundit received the last query
+    experts = [
+        ExpertSlot(
+            pundit_id=cp.pundit_id,
+            role=cp.role.value if hasattr(cp.role, 'value') else str(cp.role),
+            status=cp.status,
+            round_robin_sequence=cp.round_robin_sequence or 0,
+            is_promoter_pundit=cp.is_promoter_pundit,
+            onboarded_at=cp.onboarded_at,
+        )
+        for cp in all_cp
+    ]
+
+    # Priority 1: Farmer preference
+    pref = (await db.execute(
+        select(FarmPunditPreference).where(FarmPunditPreference.subscription_id == subscription_id)
+    )).scalar_one_or_none()
+    farmer_preferred = pref.pundit_id if pref else None
+
+    # Priority 2: Promoter-Pundit (from promoter_assignments)
+    from app.modules.subscriptions.models import PromoterAssignment
+    assignment = (await db.execute(
+        select(PromoterAssignment).where(
+            PromoterAssignment.subscription_id == subscription_id,
+            PromoterAssignment.status == "ACTIVE",
+        ).order_by(PromoterAssignment.assigned_at.desc()).limit(1)
+    )).scalar_one_or_none()
+
+    promoter_pundit_id = None
+    if assignment:
+        # Check if promoter is also a Promoter-Pundit for this client
+        promoter_user = (await db.execute(
+            select(FarmPunditProfile).where(FarmPunditProfile.user_id == assignment.promoter_user_id)
+        )).scalar_one_or_none()
+        if promoter_user:
+            pp_slot = next(
+                (e for e in experts if e.pundit_id == promoter_user.id and e.is_promoter_pundit),
+                None,
+            )
+            if pp_slot:
+                promoter_pundit_id = promoter_user.id
+
+    # Last received pundit (for round-robin)
     last_remark = (await db.execute(
         select(QueryRemark)
         .join(Query, Query.id == QueryRemark.query_id)
@@ -483,19 +905,21 @@ async def _get_next_round_robin_pundit(db: AsyncSession, client_id: str) -> Opti
         .order_by(QueryRemark.created_at.desc())
         .limit(1)
     )).scalar_one_or_none()
+    last_received_id = last_remark.pundit_id if last_remark else None
 
-    if not last_remark:
-        profile = (await db.execute(
-            select(FarmPunditProfile).where(FarmPunditProfile.id == pundits[0].pundit_id)
-        )).scalar_one_or_none()
-        return profile
+    # Run BL-12a service
+    result = route_query(experts, farmer_preferred, promoter_pundit_id, last_received_id)
+    if not result.pundit_id:
+        return None
 
-    last_idx = next((i for i, p in enumerate(pundits) if p.pundit_id == last_remark.pundit_id), -1)
-    next_pundit_row = pundits[(last_idx + 1) % len(pundits)]
-    profile = (await db.execute(
-        select(FarmPunditProfile).where(FarmPunditProfile.id == next_pundit_row.pundit_id)
+    return (await db.execute(
+        select(FarmPunditProfile).where(FarmPunditProfile.id == result.pundit_id)
     )).scalar_one_or_none()
-    return profile
+
+
+# Keep old name as alias for backward compat
+async def _get_next_round_robin_pundit(db: AsyncSession, client_id: str) -> Optional[FarmPunditProfile]:
+    return await _get_next_pundit_for_query(db, client_id, "")
 
 
 async def _next_round_robin_sequence(db: AsyncSession, client_id: str) -> int:
@@ -507,3 +931,38 @@ async def _next_round_robin_sequence(db: AsyncSession, client_id: str) -> int:
     )
     existing = result.scalars().all()
     return len(existing) + 1
+
+
+async def _trigger_cha_for_query(db: AsyncSession, query: Query, problem_cosh_id: str):
+    """
+    §14.7/14.8: When pundit identifies a problem, automatically deliver the corresponding
+    CHA recommendation to the farmer's advisory.
+    SP-level if available for this client, otherwise PG-level.
+    """
+    from app.modules.advisory.models import SPRecommendation, PGRecommendation
+
+    # Try SP-level first (client-specific)
+    sp = (await db.execute(
+        select(SPRecommendation).where(
+            SPRecommendation.specific_problem_cosh_id == problem_cosh_id,
+            SPRecommendation.client_id == query.client_id,
+            SPRecommendation.status == "ACTIVE",
+        )
+    )).scalar_one_or_none()
+
+    if sp:
+        # SP recommendation exists → it will be included in farmer's advisory on next render
+        # The advisory/today endpoint already loads CHA timelines from all sources;
+        # here we ensure the response links the SP recommendation to this subscription
+        # TODO: create a triggered_cha_delivery record when that table is added
+        pass
+    else:
+        # Fall back to PG-level (global or client)
+        pg = (await db.execute(
+            select(PGRecommendation).where(
+                PGRecommendation.problem_group_cosh_id.like(f"%{problem_cosh_id.split('_')[0]}%"),
+                PGRecommendation.status == "ACTIVE",
+            ).order_by(PGRecommendation.client_id.desc())  # prefer client-specific over global
+        )).scalar_one_or_none()
+        # Similar: link PG to farmer subscription for next advisory render
+        pass

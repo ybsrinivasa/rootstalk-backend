@@ -7,7 +7,7 @@ celery_app = Celery(
     "rootstalk",
     broker=settings.celery_broker_url,
     backend=settings.celery_result_backend,
-    include=["app.tasks.alerts"],
+    include=["app.tasks.alerts", "app.tasks.query_expiry"],
 )
 
 celery_app.conf.beat_schedule = {
@@ -15,6 +15,11 @@ celery_app.conf.beat_schedule = {
     "daily-advisory-alerts": {
         "task": "app.tasks.alerts.send_daily_alerts",
         "schedule": crontab(hour=6, minute=0),
+    },
+    # BL-12b: Hourly query expiry check
+    "query-expiry-check": {
+        "task": "app.tasks.query_expiry.expire_queries",
+        "schedule": crontab(minute=0),   # every hour on the hour
     },
 }
 

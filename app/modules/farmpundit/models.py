@@ -73,6 +73,44 @@ class FarmPunditSupportArea(Base):
     district_cosh_id: Mapped[str] = mapped_column(String(100), nullable=True)
 
 
+class FarmPunditLanguage(Base):
+    __tablename__ = "farm_pundit_languages"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    pundit_id: Mapped[str] = mapped_column(String(36), ForeignKey("farm_pundit_profiles.id"), nullable=False)
+    language_code: Mapped[str] = mapped_column(String(10), nullable=False)
+
+    __table_args__ = (UniqueConstraint("pundit_id", "language_code"),)
+
+
+class FarmPunditCropGroup(Base):
+    __tablename__ = "farm_pundit_crop_groups"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    pundit_id: Mapped[str] = mapped_column(String(36), ForeignKey("farm_pundit_profiles.id"), nullable=False)
+    crop_group_cosh_id: Mapped[str] = mapped_column(String(100), nullable=False)
+
+
+class FarmPunditPreference(Base):
+    """Farmer's preferred FarmPundit for a specific subscription (BL-12a priority 1)."""
+    __tablename__ = "farm_pundit_preferences"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    subscription_id: Mapped[str] = mapped_column(String(36), ForeignKey("subscriptions.id"), unique=True, nullable=False)
+    pundit_id: Mapped[str] = mapped_column(String(36), ForeignKey("farm_pundit_profiles.id"), nullable=False)
+    set_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class QueryResponseMedia(Base):
+    __tablename__ = "query_response_media"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    response_id: Mapped[str] = mapped_column(String(36), ForeignKey("query_responses.id"), nullable=False)
+    media_type: Mapped[str] = mapped_column(String(20), nullable=False)  # IMAGE|VIDEO|AUDIO|HYPERLINK
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    caption: Mapped[str] = mapped_column(String(500), nullable=True)
+
+
 class ClientFarmPundit(Base):
     """Company's onboarded FarmPundits."""
     __tablename__ = "client_farm_pundits"
@@ -83,6 +121,7 @@ class ClientFarmPundit(Base):
     role: Mapped[PunditRole] = mapped_column(String(20), nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
     round_robin_sequence: Mapped[int] = mapped_column(Integer, nullable=True)
+    is_promoter_pundit: Mapped[bool] = mapped_column(Boolean, default=False)
     onboarded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     pundit: Mapped["FarmPunditProfile"] = relationship("FarmPunditProfile", back_populates="company_pundits")
