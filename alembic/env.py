@@ -31,6 +31,11 @@ from app.modules.advisory.models import (
     PGRecommendation, PGTimeline, PGPractice, PGElement,
     SPRecommendation, SPTimeline, SPPractice, SPElement,
 )
+from app.modules.farmpundit.models import (
+    FarmPunditProfile, FarmPunditExpertise, FarmPunditSupportArea,
+    ClientFarmPundit, PunditInvitation, Query, QueryMedia,
+    QueryRemark, QueryResponse, StandardResponse,
+)
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.database_url_sync)
