@@ -15,6 +15,7 @@ from app.modules.clients.models import (
     Client, ClientOrganisationType, ClientUser, ClientLocation,
     ClientCrop, CropExpertAssignment, CMClientAssignment, CMPrivilegeModel
 )
+from app.modules.sync.models import CoshSyncLog, CoshReferenceCache, VolumeFormula, CropHealthCrop
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.database_url_sync)
