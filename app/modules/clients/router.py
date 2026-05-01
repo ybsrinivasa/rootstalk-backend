@@ -613,5 +613,107 @@ async def list_client_farmers(
                 "user_id": user.id, "name": user.name, "phone": user.phone,
                 "subscription_id": sub.id, "package_id": sub.package_id,
                 "subscription_status": sub.status,
+                "crop_start_date": sub.crop_start_date,
             })
     return out
+
+
+# ── Client Portal: Alerts dashboard ───────────────────────────────────────────
+
+@router.get("/client/{client_id}/alerts/pending-start-dates")
+async def get_pending_start_dates(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Farmers with ACTIVE subscriptions but no crop start date set."""
+    from app.modules.subscriptions.models import Subscription, SubscriptionStatus
+    result = await db.execute(
+        select(Subscription, User)
+        .join(User, User.id == Subscription.farmer_user_id)
+        .where(
+            Subscription.client_id == client_id,
+            Subscription.status == SubscriptionStatus.ACTIVE,
+            Subscription.crop_start_date == None,  # noqa: E711
+        )
+        .order_by(Subscription.created_at)
+    )
+    return [
+        {
+            "subscription_id": sub.id,
+            "farmer_name": user.name,
+            "farmer_phone": user.phone,
+            "package_id": sub.package_id,
+            "subscribed_at": sub.subscription_date,
+        }
+        for sub, user in result.all()
+    ]
+
+
+@router.get("/client/{client_id}/alerts/overdue-inputs")
+async def get_overdue_inputs(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Farmers whose input practices are due today but have no active order (simplified check)."""
+    from app.modules.subscriptions.models import Subscription, SubscriptionStatus
+    from app.modules.orders.models import Order, OrderStatus
+    from app.modules.advisory.models import Timeline, Practice, PracticeL0
+    from datetime import date
+    today = date.today()
+
+    result = await db.execute(
+        select(Subscription, User)
+        .join(User, User.id == Subscription.farmer_user_id)
+        .where(
+            Subscription.client_id == client_id,
+            Subscription.status == SubscriptionStatus.ACTIVE,
+            Subscription.crop_start_date != None,  # noqa: E711
+        )
+    )
+    rows = result.all()
+
+    overdue = []
+    for sub, user in rows:
+        crop_start = sub.crop_start_date.date() if hasattr(sub.crop_start_date, 'date') else sub.crop_start_date
+        day_offset = (today - crop_start).days
+
+        tl_result = await db.execute(
+            select(Timeline).where(Timeline.package_id == sub.package_id)
+        )
+        for tl in tl_result.scalars().all():
+            from_type = tl.from_type.value if hasattr(tl.from_type, 'value') else str(tl.from_type)
+            active = False
+            if from_type == "DAS" and tl.from_value <= day_offset <= tl.to_value:
+                active = True
+            elif from_type == "DBS" and -tl.to_value <= day_offset <= -tl.from_value:
+                active = True
+
+            if active:
+                p_result = await db.execute(
+                    select(Practice).where(
+                        Practice.timeline_id == tl.id,
+                        Practice.l0_type == PracticeL0.INPUT,
+                    )
+                )
+                if p_result.scalars().first():
+                    # Check if there's an active (non-cancelled) order
+                    order_result = await db.execute(
+                        select(Order).where(
+                            Order.subscription_id == sub.id,
+                            Order.status.notin_(["CANCELLED", "EXPIRED"]),
+                        )
+                    )
+                    if not order_result.scalar_one_or_none():
+                        overdue.append({
+                            "subscription_id": sub.id,
+                            "farmer_name": user.name,
+                            "farmer_phone": user.phone,
+                            "day_offset": day_offset,
+                            "timeline_name": tl.name,
+                            "package_id": sub.package_id,
+                        })
+                        break  # One entry per subscription
+
+    return overdue

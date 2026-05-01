@@ -31,9 +31,19 @@ class Settings(BaseSettings):
     google_translate_api_key: str = ""
     google_vision_api_key: str = ""
 
-    # RazorPay
+    # RazorPay (live + test)
     razorpay_key_id: str = ""
     razorpay_key_secret: str = ""
+    razorpay_key_id_test: str = ""
+    razorpay_key_secret_test: str = ""
+
+    @property
+    def razorpay_active_key_id(self) -> str:
+        return self.razorpay_key_id if self.environment == "production" else self.razorpay_key_id_test
+
+    @property
+    def razorpay_active_key_secret(self) -> str:
+        return self.razorpay_key_secret if self.environment == "production" else self.razorpay_key_secret_test
 
     # FCM
     fcm_server_key: str = ""

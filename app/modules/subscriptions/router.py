@@ -468,6 +468,180 @@ def _generate_reference() -> str:
     return "RT-" + "".join(secrets.choice(chars) for _ in range(10))
 
 
+# ── Farmer: Subscription Payment (RazorPay Rs. 199) ──────────────────────────
+
+@router.post("/farmer/subscriptions/{subscription_id}/payment/create-order")
+async def create_payment_order(
+    subscription_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Create a RazorPay order so the farmer can pay Rs. 199 to activate their subscription."""
+    from app.services.payment_service import create_subscription_order
+    sub = await _get_subscription(db, subscription_id, current_user.id)
+    if sub.status == SubscriptionStatus.ACTIVE:
+        raise HTTPException(status_code=400, detail="Subscription is already active")
+    order = create_subscription_order(receipt=subscription_id[:20])
+    return order
+
+
+@router.post("/farmer/subscriptions/{subscription_id}/payment/verify")
+async def verify_payment(
+    subscription_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Verify RazorPay signature and activate the subscription."""
+    from app.services.payment_service import verify_payment_signature
+    sub = await _get_subscription(db, subscription_id, current_user.id)
+    valid = verify_payment_signature(
+        data["razorpay_order_id"],
+        data["razorpay_payment_id"],
+        data["razorpay_signature"],
+    )
+    if not valid:
+        raise HTTPException(status_code=400, detail="Payment verification failed — invalid signature")
+
+    sub.status = SubscriptionStatus.ACTIVE
+    sub.subscription_date = datetime.now(timezone.utc)
+    if not sub.reference_number:
+        sub.reference_number = _generate_reference()
+    await db.commit()
+    return {"status": sub.status, "reference_number": sub.reference_number}
+
+
+# ── Farmer: Alert preferences ─────────────────────────────────────────────────
+
+@router.post("/farmer/subscriptions/{subscription_id}/alert-preferences")
+async def set_alert_preferences(
+    subscription_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Set who receives alerts for this subscription.
+    data: { send_to_self: bool, promoter_user_id: str | null }
+    """
+    sub = await _get_subscription(db, subscription_id, current_user.id)
+
+    # Clear existing recipients
+    existing = (await db.execute(
+        select(AlertRecipient).where(AlertRecipient.subscription_id == sub.id)
+    )).scalars().all()
+    for r in existing:
+        r.status = "INACTIVE"
+
+    if data.get("send_to_self", True):
+        db.add(AlertRecipient(
+            subscription_id=sub.id,
+            recipient_user_id=current_user.id,
+            recipient_type="FARMER",
+            status="ACTIVE",
+        ))
+
+    if data.get("promoter_user_id"):
+        db.add(AlertRecipient(
+            subscription_id=sub.id,
+            recipient_user_id=data["promoter_user_id"],
+            recipient_type="PROMOTER",
+            status="ACTIVE",
+        ))
+
+    await db.commit()
+    return {"detail": "Alert preferences updated"}
+
+
+@router.get("/farmer/subscriptions/{subscription_id}/alert-preferences")
+async def get_alert_preferences(
+    subscription_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    sub = await _get_subscription(db, subscription_id, current_user.id)
+    result = await db.execute(
+        select(AlertRecipient).where(
+            AlertRecipient.subscription_id == sub.id,
+            AlertRecipient.status == "ACTIVE",
+        )
+    )
+    recipients = result.scalars().all()
+    return [
+        {"recipient_user_id": r.recipient_user_id, "recipient_type": r.recipient_type}
+        for r in recipients
+    ]
+
+
+# ── Dealer/Facilitator: Payment on behalf of farmer ───────────────────────────
+
+@router.post("/dealer/payment-requests/{request_id}/create-order")
+async def dealer_create_payment_order(
+    request_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Dealer/Facilitator creates a RazorPay order to pay Rs. 199 for a farmer."""
+    from app.services.payment_service import create_subscription_order
+    pr = (await db.execute(
+        select(SubscriptionPaymentRequest).where(
+            SubscriptionPaymentRequest.id == request_id,
+            SubscriptionPaymentRequest.requested_from_user_id == current_user.id,
+            SubscriptionPaymentRequest.status == "PENDING",
+        )
+    )).scalar_one_or_none()
+    if not pr:
+        raise HTTPException(status_code=404, detail="Payment request not found or already handled")
+    order = create_subscription_order(receipt=request_id[:20])
+    return order
+
+
+@router.post("/dealer/payment-requests/{request_id}/verify")
+async def dealer_verify_payment(
+    request_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Dealer/Facilitator verifies payment and activates farmer's subscription."""
+    from app.services.payment_service import verify_payment_signature
+    pr = (await db.execute(
+        select(SubscriptionPaymentRequest).where(
+            SubscriptionPaymentRequest.id == request_id,
+            SubscriptionPaymentRequest.requested_from_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not pr:
+        raise HTTPException(status_code=404, detail="Payment request not found")
+
+    valid = verify_payment_signature(
+        data["razorpay_order_id"],
+        data["razorpay_payment_id"],
+        data["razorpay_signature"],
+    )
+    if not valid:
+        raise HTTPException(status_code=400, detail="Payment verification failed")
+
+    pr.status = "PAID"
+    pr.razorpay_payment_id = data["razorpay_payment_id"]
+
+    # Activate the farmer's subscription
+    sub = (await db.execute(
+        select(Subscription).where(Subscription.id == pr.subscription_id)
+    )).scalar_one_or_none()
+    if sub and sub.status == SubscriptionStatus.WAITLISTED:
+        sub.status = SubscriptionStatus.ACTIVE
+        sub.subscription_date = datetime.now(timezone.utc)
+        if not sub.reference_number:
+            sub.reference_number = _generate_reference()
+
+    await db.commit()
+    return {
+        "status": "PAID",
+        "subscription_status": sub.status if sub else None,
+        "reference_number": sub.reference_number if sub else None,
+    }
+
+
 # ── Farmer: My subscriptions alias (used by PWA home page) ────────────────────
 
 @router.get("/farmer/my-subscriptions")
