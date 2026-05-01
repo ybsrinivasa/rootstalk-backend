@@ -27,7 +27,10 @@ class Settings(BaseSettings):
     aws_s3_region: str = "ap-south-1"
     aws_cloudfront_url: str = ""
 
-    # Google APIs
+    # Anthropic (Claude) — image analysis + problem descriptions
+    anthropic_api_key: str = ""
+
+    # Google APIs (translate still used; Vision AI replaced by Claude)
     google_translate_api_key: str = ""
     google_vision_api_key: str = ""
 

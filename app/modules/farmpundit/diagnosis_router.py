@@ -1,6 +1,8 @@
 """
 Diagnosis API — BL-08 Crop Health Diagnosis Path.
 Routes farmers through a dynamic symptom Q&A to identify the crop health problem.
+Image analysis via Claude (claude-sonnet-4-6).
+Problem descriptions via Claude — plain language, farmer-accessible.
 """
 import uuid
 from datetime import datetime, timezone
@@ -13,6 +15,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy import String, Text, Boolean, JSON, DateTime, ForeignKey
 from app.database import Base, get_db
 from app.dependencies import get_current_user
+from app.services.claude_service import analyze_crop_image, enrich_problem_with_description
 from app.modules.platform.models import User
 from app.modules.sync.models import CoshReferenceCache
 from app.services.bl08_diagnosis_path import (
@@ -231,8 +234,10 @@ async def answer_question(
     if step.status == "DIAGNOSED":
         session.status = "DIAGNOSED"
         session.diagnosed_problem_cosh_id = step.diagnosed_problem_cosh_id
-        # Look up problem display info from Cosh cache
         problem_info = await _get_problem_info(db, step.diagnosed_problem_cosh_id)
+        # Enrich with Claude description (farmer-friendly 2 sentences)
+        crop_name = _get_display_name(session.crop_cosh_id)
+        problem_info = await enrich_problem_with_description(problem_info, crop_name)
     elif step.status == "INCONCLUSIVE":
         session.status = "ABORTED"
         problem_info = None
@@ -281,6 +286,8 @@ async def abort_diagnosis(
         session.diagnosed_problem_cosh_id = problem_cosh_id
         await db.commit()
         problem_info = await _get_problem_info(db, problem_cosh_id)
+        crop_name = _get_display_name(session.crop_cosh_id)
+        problem_info = await enrich_problem_with_description(problem_info, crop_name)
         return {"status": "DIAGNOSED", "diagnosed_problem_cosh_id": problem_cosh_id, "problem_info": problem_info}
     else:
         session.status = "ABORTED"
@@ -310,6 +317,67 @@ async def list_problems_for_crop(
         info = await _get_problem_info(db, pid)
         result.append(info)
     return result
+
+
+# ── Claude Image Analysis ─────────────────────────────────────────────────────
+
+class ImageAnalysisRequest(BaseModel):
+    image_base64: str          # base64-encoded image (JPEG/PNG/WebP)
+    media_type: str = "image/jpeg"
+    crop_cosh_id: str
+    crop_name: str
+    plant_part_cosh_id: str
+    plant_part_name: str
+    crop_stage_cosh_id: Optional[str] = None
+    language_code: str = "en"
+
+
+@router.post("/diagnosis/image-analysis")
+async def analyse_image_with_claude(
+    request: ImageAnalysisRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Farmer uploads a photo of the affected crop part.
+    Claude analyses the image and returns:
+    - The most likely problem name
+    - A matching Cosh problem_cosh_id (if available)
+    - Confidence level (HIGH / MEDIUM / LOW)
+    - 2-sentence farmer-friendly description of what it sees
+    - List of observed symptoms
+
+    The result can be used to pre-fill the diagnosis path or skip to direct diagnosis.
+    """
+    # Load known problems from Cosh cache for this crop+stage to help Claude match IDs
+    rows = await _load_problem_symptom_rows(db, request.crop_stage_cosh_id)
+    known_problem_ids = list(dict.fromkeys(r.problem_cosh_id for r in rows))
+
+    known_problem_names: list[str] = []
+    for pid in known_problem_ids[:20]:  # Limit to 20 to keep prompt manageable
+        info = await _get_problem_info(db, pid)
+        known_problem_names.append(info.get("name", pid))
+
+    # Call Claude
+    result = await analyze_crop_image(
+        image_base64=request.image_base64,
+        media_type=request.media_type,
+        crop_name=request.crop_name,
+        plant_part_name=request.plant_part_name,
+        known_problem_ids=known_problem_ids[:20],
+        known_problem_names=known_problem_names,
+        language_code=request.language_code,
+    )
+
+    return {
+        "analysis": result.to_dict(),
+        "note": (
+            "Claude identified a possible match — tap 'Confirm' to use this diagnosis, "
+            "or 'Check with Questions' to verify via the guided path."
+            if result.confidence in ("HIGH", "MEDIUM")
+            else "Claude is not confident. Please use the guided YES/NO questions for a more accurate diagnosis."
+        ),
+    }
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
