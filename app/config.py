@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     # FCM
     fcm_server_key: str = ""
 
+    # SMS (Draft4SMS — phone OTP for PWA)
+    draft_sms_key: str = ""
+    draft_sms_sender_id: str = "EYFARM"
+    draft_sms_base_url: str = "https://text.draft4sms.com/vb/apikey.php?"
+
     # Email (for portal user credentials)
     email_smtp_host: str = "smtp.gmail.com"
     email_smtp_port: int = 587

@@ -10,6 +10,7 @@ from app.modules.auth.service import (
     create_phone_otp, verify_phone_otp, get_or_create_farmer,
     get_user_by_email, verify_password, _build_token, get_user_by_id
 )
+from app.services.sms_service import send_otp_sms
 from app.dependencies import get_current_user
 from app.modules.platform.models import User
 
@@ -21,15 +22,22 @@ router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 @router.post("/request-otp")
 async def request_otp(request: PhoneOtpRequest, db: AsyncSession = Depends(get_db)):
-    """Step 1: generate and send OTP to farmer's phone."""
+    """Step 1: generate and send OTP to farmer's phone via Draft4SMS."""
     otp_code = await create_phone_otp(db, request.phone)
 
     if settings.environment == "development":
         logger.info(f"[DEV] OTP for {request.phone}: {otp_code}")
+        # In dev, also attempt SMS if key is configured — useful for testing with real phones
+        if settings.draft_sms_key:
+            await send_otp_sms(request.phone, otp_code)
         return {"detail": "OTP sent.", "dev_otp": otp_code}
 
-    # Production: send via SMS gateway (integrate later)
-    # await sms_service.send(request.phone, otp_code)
+    sent = await send_otp_sms(request.phone, otp_code)
+    if not sent:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Failed to send OTP. Please try again.",
+        )
     return {"detail": "OTP sent."}
 
 
