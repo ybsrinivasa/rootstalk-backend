@@ -290,6 +290,123 @@ async def mark_packing_list_shared(
     return {"detail": "Marked as shared", "first_shared_at": pl.first_shared_at}
 
 
+# ── Facilitator: Route and handle orders ──────────────────────────────────────
+
+@router.get("/facilitator/orders")
+async def list_facilitator_orders(
+    status_filter: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Orders routed to this facilitator for handling."""
+    q = select(Order).where(Order.facilitator_user_id == current_user.id).order_by(Order.created_at.desc())
+    if status_filter:
+        q = q.where(Order.status == status_filter)
+    result = await db.execute(q)
+    orders = result.scalars().all()
+    out = []
+    for o in orders:
+        items_result = await db.execute(select(OrderItem).where(OrderItem.order_id == o.id))
+        items = items_result.scalars().all()
+        out.append({
+            "id": o.id, "status": o.status,
+            "farmer_user_id": o.farmer_user_id, "client_id": o.client_id,
+            "dealer_user_id": o.dealer_user_id,
+            "date_from": o.date_from, "date_to": o.date_to,
+            "created_at": o.created_at,
+            "item_count": len(items),
+            "pending_count": sum(1 for i in items if i.status == OrderItemStatus.PENDING),
+        })
+    return out
+
+
+@router.put("/facilitator/orders/{order_id}/route-to-dealer")
+async def route_order_to_dealer(
+    order_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Facilitator assigns a dealer to handle a specific order."""
+    order = (await db.execute(
+        select(Order).where(Order.id == order_id, Order.facilitator_user_id == current_user.id)
+    )).scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found or not assigned to you")
+    if order.status not in [OrderStatus.SENT, OrderStatus.ACCEPTED]:
+        raise HTTPException(status_code=400, detail="Order cannot be routed in current status")
+    order.dealer_user_id = data["dealer_user_id"]
+    order.status = OrderStatus.PROCESSING
+    await db.commit()
+    return {"id": order.id, "status": order.status, "dealer_user_id": order.dealer_user_id}
+
+
+@router.get("/facilitator/orders/{order_id}")
+async def get_facilitator_order(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    order = (await db.execute(
+        select(Order).where(Order.id == order_id, Order.facilitator_user_id == current_user.id)
+    )).scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    items_result = await db.execute(select(OrderItem).where(OrderItem.order_id == order.id))
+    items = items_result.scalars().all()
+    return {
+        "id": order.id, "status": order.status,
+        "farmer_user_id": order.farmer_user_id, "client_id": order.client_id,
+        "dealer_user_id": order.dealer_user_id,
+        "date_from": order.date_from, "date_to": order.date_to,
+        "created_at": order.created_at,
+        "items": [
+            {
+                "id": i.id, "practice_id": i.practice_id,
+                "status": i.status, "brand_cosh_id": i.brand_cosh_id,
+                "brand_name": i.brand_name, "given_volume": float(i.given_volume) if i.given_volume else None,
+                "volume_unit": i.volume_unit, "price": float(i.price) if i.price else None,
+            }
+            for i in items
+        ],
+    }
+
+
+# ── Dealer: Get order detail with items ────────────────────────────────────────
+
+@router.get("/dealer/orders/{order_id}")
+async def get_dealer_order(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    order = (await db.execute(
+        select(Order).where(Order.id == order_id, Order.dealer_user_id == current_user.id)
+    )).scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    items_result = await db.execute(select(OrderItem).where(OrderItem.order_id == order.id))
+    items = items_result.scalars().all()
+    return {
+        "id": order.id, "status": order.status,
+        "farmer_user_id": order.farmer_user_id, "client_id": order.client_id,
+        "facilitator_user_id": order.facilitator_user_id,
+        "date_from": order.date_from, "date_to": order.date_to,
+        "created_at": order.created_at,
+        "items": [
+            {
+                "id": i.id, "practice_id": i.practice_id,
+                "status": i.status, "brand_cosh_id": i.brand_cosh_id,
+                "brand_name": i.brand_name,
+                "given_volume": float(i.given_volume) if i.given_volume else None,
+                "estimated_volume": float(i.estimated_volume) if i.estimated_volume else None,
+                "volume_unit": i.volume_unit, "price": float(i.price) if i.price else None,
+            }
+            for i in items
+        ],
+    }
+
+
 # ── Missing Brand Reports ─────────────────────────────────────────────────────
 
 @router.post("/dealer/missing-brand-reports", status_code=201)

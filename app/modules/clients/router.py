@@ -9,7 +9,7 @@ from app.dependencies import get_current_user
 from app.modules.platform.models import User, StatusEnum
 from app.modules.clients.models import (
     Client, ClientOrganisationType, ClientUser, ClientUserRole,
-    ClientLocation, ClientCrop, ClientStatus,
+    ClientLocation, ClientCrop, ClientStatus, ClientPromoter,
     CMClientAssignment, CMPrivilegeModel, CMRights, CMPrivilege
 )
 from app.modules.clients.schemas import (
@@ -464,3 +464,154 @@ async def add_portal_user(
         status=cu.status.value,
         created_at=cu.created_at,
     )
+
+
+# ── Field Manager: Dealers and Facilitators ────────────────────────────────────
+
+@router.get("/client/{client_id}/field-manager/promoters")
+async def list_promoters(
+    client_id: str,
+    promoter_type: str = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    q = select(ClientPromoter, User).join(User, User.id == ClientPromoter.user_id).where(
+        ClientPromoter.client_id == client_id
+    )
+    if promoter_type:
+        q = q.where(ClientPromoter.promoter_type == promoter_type.upper())
+    result = await db.execute(q.order_by(ClientPromoter.registered_at.desc()))
+    rows = result.all()
+    return [
+        {
+            "id": cp.id, "user_id": user.id,
+            "name": user.name, "phone": user.phone, "email": user.email,
+            "promoter_type": cp.promoter_type, "status": cp.status,
+            "territory_notes": cp.territory_notes, "registered_at": cp.registered_at,
+        }
+        for cp, user in rows
+    ]
+
+
+@router.post("/client/{client_id}/field-manager/promoters", status_code=201)
+async def register_promoter(
+    client_id: str,
+    request: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Register a dealer or facilitator with this client. Creates user account if needed."""
+    from app.modules.platform.models import RoleType, UserRole
+    from app.modules.auth.service import hash_password
+    import secrets
+
+    phone = request.get("phone")
+    name = request.get("name")
+    promoter_type = request.get("promoter_type", "DEALER").upper()
+    territory_notes = request.get("territory_notes")
+
+    if promoter_type not in ("DEALER", "FACILITATOR"):
+        raise HTTPException(status_code=422, detail="promoter_type must be DEALER or FACILITATOR")
+
+    # Find or create user by phone
+    existing_user = None
+    if phone:
+        existing_user = (await db.execute(
+            select(User).where(User.phone == phone)
+        )).scalar_one_or_none()
+
+    if existing_user:
+        user = existing_user
+    else:
+        user = User(
+            phone=phone,
+            name=name,
+            language_code="en",
+        )
+        db.add(user)
+        await db.flush()
+
+    # Assign system role (DEALER / FACILITATOR) if not already
+    role_type = RoleType.DEALER if promoter_type == "DEALER" else RoleType.FACILITATOR
+    existing_role = (await db.execute(
+        select(UserRole).where(UserRole.user_id == user.id, UserRole.role_type == role_type)
+    )).scalar_one_or_none()
+    if not existing_role:
+        db.add(UserRole(user_id=user.id, role_type=role_type))
+
+    # Link to this client
+    existing_cp = (await db.execute(
+        select(ClientPromoter).where(
+            ClientPromoter.client_id == client_id,
+            ClientPromoter.user_id == user.id,
+            ClientPromoter.promoter_type == promoter_type,
+        )
+    )).scalar_one_or_none()
+    if existing_cp:
+        raise HTTPException(status_code=409, detail="This person is already registered as a {promoter_type} for this client")
+
+    cp = ClientPromoter(
+        client_id=client_id,
+        user_id=user.id,
+        promoter_type=promoter_type,
+        territory_notes=territory_notes,
+        registered_by=current_user.id,
+    )
+    db.add(cp)
+    await db.commit()
+    await db.refresh(cp)
+
+    return {
+        "id": cp.id, "user_id": user.id,
+        "name": user.name, "phone": user.phone,
+        "promoter_type": cp.promoter_type, "status": cp.status,
+        "territory_notes": cp.territory_notes, "registered_at": cp.registered_at,
+    }
+
+
+@router.put("/client/{client_id}/field-manager/promoters/{promoter_id}/deactivate")
+async def deactivate_promoter(
+    client_id: str,
+    promoter_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    cp = (await db.execute(
+        select(ClientPromoter).where(ClientPromoter.id == promoter_id, ClientPromoter.client_id == client_id)
+    )).scalar_one_or_none()
+    if not cp:
+        raise HTTPException(status_code=404, detail="Promoter not found")
+    cp.status = "INACTIVE"
+    await db.commit()
+    return {"status": "INACTIVE"}
+
+
+# ── Field Manager: Get farmers for assignment ──────────────────────────────────
+
+@router.get("/client/{client_id}/field-manager/farmers")
+async def list_client_farmers(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List all farmers who have subscriptions with this client."""
+    from app.modules.subscriptions.models import Subscription
+    result = await db.execute(
+        select(Subscription, User)
+        .join(User, User.id == Subscription.farmer_user_id)
+        .where(Subscription.client_id == client_id)
+        .order_by(Subscription.created_at.desc())
+    )
+    rows = result.all()
+    # Deduplicate by farmer_user_id
+    seen = set()
+    out = []
+    for sub, user in rows:
+        if user.id not in seen:
+            seen.add(user.id)
+            out.append({
+                "user_id": user.id, "name": user.name, "phone": user.phone,
+                "subscription_id": sub.id, "package_id": sub.package_id,
+                "subscription_status": sub.status,
+            })
+    return out

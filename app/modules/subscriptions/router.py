@@ -1,6 +1,6 @@
 import secrets
 import string
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Optional
@@ -15,7 +15,7 @@ from app.modules.subscriptions.models import (
     SubscriptionStatus, SubscriptionType, PromoterType, AssignmentStatus,
     SubscriptionPaymentRequest, FarmerSubscriptionHistory,
 )
-from app.modules.advisory.models import Package, Parameter, Variable, PackageVariable
+from app.modules.advisory.models import Package, Parameter, Variable, PackageVariable, Timeline, Practice, Element
 
 router = APIRouter(tags=["Subscriptions"])
 
@@ -466,3 +466,155 @@ async def _package_has_variable(db: AsyncSession, package_id: str, parameter_id:
 def _generate_reference() -> str:
     chars = string.ascii_uppercase + string.digits
     return "RT-" + "".join(secrets.choice(chars) for _ in range(10))
+
+
+# ── Farmer: My subscriptions alias (used by PWA home page) ────────────────────
+
+@router.get("/farmer/my-subscriptions")
+async def my_subscriptions(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(Subscription)
+        .where(Subscription.farmer_user_id == current_user.id)
+        .order_by(Subscription.created_at.desc())
+    )
+    subs = result.scalars().all()
+    return [
+        {
+            "id": s.id, "client_id": s.client_id, "package_id": s.package_id,
+            "status": s.status, "crop_start_date": s.crop_start_date,
+            "reference_number": s.reference_number, "subscription_type": s.subscription_type,
+        }
+        for s in subs
+    ]
+
+
+# ── Farmer: Daily advisory (BL-04 timeline window filter) ─────────────────────
+
+@router.get("/farmer/advisory/today")
+async def get_today_advisory(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return today's active practices for all the farmer's ACTIVE subscriptions.
+    Applies BL-04 window logic (DAS/DBS). Deduplication (BL-03) is deferred to v2.
+    """
+    today = date.today()
+
+    # All ACTIVE subscriptions with a crop_start_date
+    subs_result = await db.execute(
+        select(Subscription).where(
+            Subscription.farmer_user_id == current_user.id,
+            Subscription.status == SubscriptionStatus.ACTIVE,
+            Subscription.crop_start_date != None,  # noqa: E711
+        )
+    )
+    subs = subs_result.scalars().all()
+    if not subs:
+        return []
+
+    out = []
+    for sub in subs:
+        # Get the active package
+        pkg_result = await db.execute(
+            select(Package).where(Package.id == sub.package_id, Package.status == "ACTIVE")
+        )
+        pkg = pkg_result.scalar_one_or_none()
+        if not pkg:
+            continue
+
+        crop_start = sub.crop_start_date.date() if hasattr(sub.crop_start_date, 'date') else sub.crop_start_date
+        day_offset = (today - crop_start).days  # positive = days after sowing
+
+        # Load all timelines for this package
+        tl_result = await db.execute(
+            select(Timeline).where(Timeline.package_id == pkg.id).order_by(Timeline.display_order)
+        )
+        timelines = tl_result.scalars().all()
+
+        active_timelines = []
+        for tl in timelines:
+            # BL-04 window logic
+            if tl.from_type.value == "DAS":
+                # Days After Sowing: active when from_value <= day_offset <= to_value
+                if tl.from_value <= day_offset <= tl.to_value:
+                    active_timelines.append((tl, day_offset))
+            elif tl.from_type.value == "DBS":
+                # Days Before Sowing: active when negative day_offset falls in window
+                # from_value and to_value are positive "days before sowing"
+                # window: -to_value <= day_offset <= -from_value
+                if -tl.to_value <= day_offset <= -tl.from_value:
+                    active_timelines.append((tl, day_offset))
+            # CALENDAR type: skip for now (requires absolute date mapping)
+
+        if not active_timelines:
+            # Still return the subscription but with empty timelines (so start-date gate shows)
+            out.append({
+                "subscription_id": sub.id,
+                "client_id": sub.client_id,
+                "package_id": sub.package_id,
+                "package_name": pkg.name,
+                "crop_cosh_id": pkg.crop_cosh_id,
+                "crop_start_date": sub.crop_start_date,
+                "day_offset": day_offset,
+                "reference_number": sub.reference_number,
+                "timelines": [],
+            })
+            continue
+
+        timeline_data = []
+        for tl, day_num in active_timelines:
+            p_result = await db.execute(
+                select(Practice).where(Practice.timeline_id == tl.id).order_by(Practice.display_order)
+            )
+            practices = p_result.scalars().all()
+
+            practice_data = []
+            for p in practices:
+                el_result = await db.execute(
+                    select(Element).where(Element.practice_id == p.id).order_by(Element.display_order)
+                )
+                elements = el_result.scalars().all()
+                practice_data.append({
+                    "id": p.id,
+                    "l0_type": p.l0_type,
+                    "l1_type": p.l1_type,
+                    "l2_type": p.l2_type,
+                    "display_order": p.display_order,
+                    "is_special_input": p.is_special_input,
+                    "elements": [
+                        {
+                            "element_type": el.element_type,
+                            "cosh_ref": el.cosh_ref,
+                            "value": el.value,
+                            "unit_cosh_id": el.unit_cosh_id,
+                        }
+                        for el in elements
+                    ],
+                })
+
+            timeline_data.append({
+                "id": tl.id,
+                "name": tl.name,
+                "from_type": tl.from_type,
+                "from_value": tl.from_value,
+                "to_value": tl.to_value,
+                "day_number": day_num,
+                "practices": practice_data,
+            })
+
+        out.append({
+            "subscription_id": sub.id,
+            "client_id": sub.client_id,
+            "package_id": sub.package_id,
+            "package_name": pkg.name,
+            "crop_cosh_id": pkg.crop_cosh_id,
+            "crop_start_date": sub.crop_start_date,
+            "day_offset": day_offset,
+            "reference_number": sub.reference_number,
+            "timelines": timeline_data,
+        })
+
+    return out
