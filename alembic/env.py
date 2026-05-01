@@ -31,6 +31,7 @@ from app.modules.advisory.models import (
     PGRecommendation, PGTimeline, PGPractice, PGElement,
     SPRecommendation, SPTimeline, SPPractice, SPElement,
 )
+from app.modules.qr.models import ManufacturerBrandPortfolio, ProductQRCode, QRScan
 from app.modules.farmpundit.models import (
     FarmPunditProfile, FarmPunditExpertise, FarmPunditSupportArea,
     ClientFarmPundit, PunditInvitation, Query, QueryMedia,
