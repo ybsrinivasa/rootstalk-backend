@@ -5,6 +5,7 @@ from app.modules.auth.router import router as auth_router
 from app.modules.platform.router import router as platform_router
 from app.modules.clients.router import router as clients_router
 from app.modules.sync.router import router as sync_router
+from app.modules.advisory.router import router as advisory_router
 
 app = FastAPI(
     title="RootsTalk API",
@@ -24,6 +25,7 @@ app.include_router(auth_router)
 app.include_router(platform_router)
 app.include_router(clients_router)
 app.include_router(sync_router)
+app.include_router(advisory_router)
 
 
 @app.get("/health")

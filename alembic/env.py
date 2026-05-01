@@ -16,6 +16,13 @@ from app.modules.clients.models import (
     ClientCrop, CropExpertAssignment, CMClientAssignment, CMPrivilegeModel
 )
 from app.modules.sync.models import CoshSyncLog, CoshReferenceCache, VolumeFormula, CropHealthCrop
+from app.modules.advisory.models import (
+    Package, PackageLocation, PackageAuthor, Parameter, ParameterTranslation,
+    Variable, VariableTranslation, PackageVariable, Timeline, Practice, Element,
+    Relation, ConditionalQuestion, ConditionalQuestionTranslation, PracticeConditional,
+    PGRecommendation, PGTimeline, PGPractice, PGElement,
+    SPRecommendation, SPTimeline, SPPractice, SPElement,
+)
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.database_url_sync)
