@@ -268,8 +268,9 @@ class Relation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     timeline: Mapped["Timeline"] = relationship("Timeline", back_populates="relations")
-    practices: Mapped[list["Practice"]] = relationship("Practice", back_populates="relation",
-                                                        foreign_keys="Practice.relation_id")
+    practices: Mapped[list["Practice"]] = relationship("Practice",
+                                                        foreign_keys="Practice.relation_id",
+                                                        primaryjoin="Relation.id == Practice.relation_id")
 
 
 class ConditionalQuestion(Base):
