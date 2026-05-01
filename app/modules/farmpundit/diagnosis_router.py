@@ -235,9 +235,10 @@ async def answer_question(
         session.status = "DIAGNOSED"
         session.diagnosed_problem_cosh_id = step.diagnosed_problem_cosh_id
         problem_info = await _get_problem_info(db, step.diagnosed_problem_cosh_id)
-        # Enrich with Claude description (farmer-friendly 2 sentences)
         crop_name = _get_display_name(session.crop_cosh_id)
         problem_info = await enrich_problem_with_description(problem_info, crop_name)
+        # Trigger CHA delivery to farmer's advisory
+        await _trigger_cha_from_diagnosis(db, session, step.diagnosed_problem_cosh_id)
     elif step.status == "INCONCLUSIVE":
         session.status = "ABORTED"
         problem_info = None
@@ -284,6 +285,7 @@ async def abort_diagnosis(
             raise HTTPException(status_code=422, detail="problem_cosh_id required for KNOW_PROBLEM")
         session.status = "DIAGNOSED"
         session.diagnosed_problem_cosh_id = problem_cosh_id
+        await _trigger_cha_from_diagnosis(db, session, problem_cosh_id)
         await db.commit()
         problem_info = await _get_problem_info(db, problem_cosh_id)
         crop_name = _get_display_name(session.crop_cosh_id)
@@ -412,6 +414,66 @@ def _build_question_text(question) -> str:
         return f"Is the {symptom} on the {sub_part} of the {part}?"
     else:
         return f"Do you see {symptom} on the {part}?"
+
+
+async def _trigger_cha_from_diagnosis(db: AsyncSession, session: DiagnosisSession, problem_cosh_id: str):
+    """
+    Create a TriggeredCHAEntry so the farmer's advisory/today includes CHA timelines.
+    SP-level preferred (client-specific); falls back to PG-level.
+    """
+    from app.modules.advisory.models import SPRecommendation, PGRecommendation
+    from app.modules.subscriptions.models import TriggeredCHAEntry
+
+    # Find the farmer's active subscription for this session
+    from app.modules.subscriptions.models import Subscription, SubscriptionStatus
+    sub = (await db.execute(
+        select(Subscription).where(Subscription.id == session.subscription_id)
+    )).scalar_one_or_none()
+    if not sub:
+        return
+
+    # Find client_id from session
+    client_id = sub.client_id
+
+    # Try SP first
+    sp = (await db.execute(
+        select(SPRecommendation).where(
+            SPRecommendation.specific_problem_cosh_id == problem_cosh_id,
+            SPRecommendation.client_id == client_id,
+            SPRecommendation.status == "ACTIVE",
+        )
+    )).scalar_one_or_none()
+
+    if sp:
+        db.add(TriggeredCHAEntry(
+            subscription_id=session.subscription_id,
+            farmer_user_id=session.farmer_user_id,
+            client_id=client_id,
+            problem_cosh_id=problem_cosh_id,
+            recommendation_type="SP",
+            recommendation_id=sp.id,
+            triggered_by="DIAGNOSIS",
+        ))
+        return
+
+    # Fall back to PG
+    pg = (await db.execute(
+        select(PGRecommendation).where(
+            PGRecommendation.problem_group_cosh_id == problem_cosh_id,
+            PGRecommendation.status == "ACTIVE",
+        ).order_by(PGRecommendation.client_id.desc())
+    )).scalar_one_or_none()
+
+    if pg:
+        db.add(TriggeredCHAEntry(
+            subscription_id=session.subscription_id,
+            farmer_user_id=session.farmer_user_id,
+            client_id=client_id,
+            problem_cosh_id=problem_cosh_id,
+            recommendation_type="PG",
+            recommendation_id=pg.id,
+            triggered_by="DIAGNOSIS",
+        ))
 
 
 async def _get_problem_info(db: AsyncSession, problem_cosh_id: str) -> dict:

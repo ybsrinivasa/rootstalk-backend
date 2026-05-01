@@ -1,7 +1,7 @@
 import uuid
 import enum
-from datetime import datetime, timezone
-from sqlalchemy import String, Text, Boolean, Integer, DateTime, ForeignKey, DECIMAL, UniqueConstraint
+from datetime import datetime, timezone, date as date_type
+from sqlalchemy import String, Text, Boolean, Integer, DateTime, ForeignKey, DECIMAL, UniqueConstraint, Date
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database import Base
 
@@ -152,3 +152,34 @@ class SubscriptionPaymentRequest(Base):
     razorpay_payment_id: Mapped[str] = mapped_column(String(200), nullable=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ConditionalAnswer(Base):
+    """BL-02: Farmer's YES/NO answer to a conditional question for today."""
+    __tablename__ = "conditional_answers"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    subscription_id: Mapped[str] = mapped_column(String(36), ForeignKey("subscriptions.id"), nullable=False)
+    question_id: Mapped[str] = mapped_column(String(36), ForeignKey("conditional_questions.id"), nullable=False)
+    answer_date: Mapped[date_type] = mapped_column(Date(), nullable=False)
+    answer: Mapped[str] = mapped_column(String(10), nullable=False)  # YES | NO | BLANK
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (UniqueConstraint("subscription_id", "question_id", "answer_date",
+                                       name="uq_conditional_answer_per_day"),)
+
+
+class TriggeredCHAEntry(Base):
+    """CHA recommendation triggered by diagnosis (BL-08) or FarmPundit query response."""
+    __tablename__ = "triggered_cha_entries"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    subscription_id: Mapped[str] = mapped_column(String(36), ForeignKey("subscriptions.id"), nullable=False)
+    farmer_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
+    client_id: Mapped[str] = mapped_column(String(36), ForeignKey("clients.id"), nullable=False)
+    problem_cosh_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    recommendation_type: Mapped[str] = mapped_column(String(5), nullable=False)  # SP | PG
+    recommendation_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    triggered_by: Mapped[str] = mapped_column(String(20), nullable=False)        # DIAGNOSIS | QUERY | DIRECT
+    triggered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    status: Mapped[str] = mapped_column(String(20), default="ACTIVE")

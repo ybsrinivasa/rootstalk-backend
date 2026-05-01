@@ -935,13 +935,28 @@ async def _next_round_robin_sequence(db: AsyncSession, client_id: str) -> int:
 
 async def _trigger_cha_for_query(db: AsyncSession, query: Query, problem_cosh_id: str):
     """
-    §14.7/14.8: When pundit identifies a problem, automatically deliver the corresponding
+    §14.7/14.8: When pundit identifies a problem, deliver the corresponding
     CHA recommendation to the farmer's advisory.
-    SP-level if available for this client, otherwise PG-level.
+    SP-level preferred (client-specific), falls back to PG-level (client then global).
+    Creates a TriggeredCHAEntry so advisory/today picks it up on next load.
     """
     from app.modules.advisory.models import SPRecommendation, PGRecommendation
+    from app.modules.subscriptions.models import TriggeredCHAEntry
+    from datetime import timezone
 
-    # Try SP-level first (client-specific)
+    # Get the farmer's subscription to find subscription_id
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.farmer_user_id == query.farmer_user_id,
+            Subscription.client_id == query.client_id,
+            Subscription.status == SubscriptionStatus.ACTIVE,
+        ).order_by(Subscription.created_at.desc()).limit(1)
+    )).scalar_one_or_none()
+
+    if not sub:
+        return  # No active subscription — can't trigger CHA
+
+    # Try SP-level first (client-specific for this exact problem)
     sp = (await db.execute(
         select(SPRecommendation).where(
             SPRecommendation.specific_problem_cosh_id == problem_cosh_id,
@@ -951,18 +966,34 @@ async def _trigger_cha_for_query(db: AsyncSession, query: Query, problem_cosh_id
     )).scalar_one_or_none()
 
     if sp:
-        # SP recommendation exists → it will be included in farmer's advisory on next render
-        # The advisory/today endpoint already loads CHA timelines from all sources;
-        # here we ensure the response links the SP recommendation to this subscription
-        # TODO: create a triggered_cha_delivery record when that table is added
-        pass
-    else:
-        # Fall back to PG-level (global or client)
-        pg = (await db.execute(
-            select(PGRecommendation).where(
-                PGRecommendation.problem_group_cosh_id.like(f"%{problem_cosh_id.split('_')[0]}%"),
-                PGRecommendation.status == "ACTIVE",
-            ).order_by(PGRecommendation.client_id.desc())  # prefer client-specific over global
-        )).scalar_one_or_none()
-        # Similar: link PG to farmer subscription for next advisory render
-        pass
+        db.add(TriggeredCHAEntry(
+            subscription_id=sub.id,
+            farmer_user_id=query.farmer_user_id,
+            client_id=query.client_id,
+            problem_cosh_id=problem_cosh_id,
+            recommendation_type="SP",
+            recommendation_id=sp.id,
+            triggered_by="QUERY",
+            triggered_at=datetime.now(timezone.utc),
+        ))
+        return
+
+    # Fall back to PG-level: client-specific first, then global
+    pg = (await db.execute(
+        select(PGRecommendation).where(
+            PGRecommendation.problem_group_cosh_id == problem_cosh_id,
+            PGRecommendation.status == "ACTIVE",
+        ).order_by(PGRecommendation.client_id.desc())  # client-specific before NULL (global)
+    )).scalar_one_or_none()
+
+    if pg:
+        db.add(TriggeredCHAEntry(
+            subscription_id=sub.id,
+            farmer_user_id=query.farmer_user_id,
+            client_id=query.client_id,
+            problem_cosh_id=problem_cosh_id,
+            recommendation_type="PG",
+            recommendation_id=pg.id,
+            triggered_by="QUERY",
+            triggered_at=datetime.now(timezone.utc),
+        ))

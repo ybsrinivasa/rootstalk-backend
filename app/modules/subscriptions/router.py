@@ -14,8 +14,14 @@ from app.modules.subscriptions.models import (
     AlertRecipient, PromoterAssignment,
     SubscriptionStatus, SubscriptionType, PromoterType, AssignmentStatus,
     SubscriptionPaymentRequest, FarmerSubscriptionHistory,
+    ConditionalAnswer, TriggeredCHAEntry,
 )
-from app.modules.advisory.models import Package, Parameter, Variable, PackageVariable, Timeline, Practice, Element
+from app.modules.advisory.models import (
+    Package, Parameter, Variable, PackageVariable, Timeline, Practice, Element,
+    ConditionalQuestion, PracticeConditional,
+)
+from app.modules.advisory.models import PGRecommendation, PGTimeline, PGPractice, PGElement
+from app.modules.advisory.models import SPRecommendation, SPTimeline, SPPractice, SPElement
 
 router = APIRouter(tags=["Subscriptions"])
 
@@ -740,7 +746,51 @@ async def my_subscriptions(
     ]
 
 
-# ── Farmer: Daily advisory (BL-04 timeline window filter) ─────────────────────
+# ── BL-02: Conditional question answer ────────────────────────────────────────
+
+class ConditionalAnswerRequest(BaseModel):
+    subscription_id: str
+    question_id: str
+    answer: str  # "YES" | "NO" | "BLANK"
+
+
+@router.post("/farmer/advisory/conditional-answer", status_code=201)
+async def submit_conditional_answer(
+    request: ConditionalAnswerRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """BL-02: Store farmer's YES/NO answer to a conditional question for today."""
+    from datetime import date
+    if request.answer not in ("YES", "NO", "BLANK"):
+        raise HTTPException(status_code=422, detail="answer must be YES, NO, or BLANK")
+
+    today = date.today()
+
+    # Upsert: replace today's answer if already exists
+    existing = (await db.execute(
+        select(ConditionalAnswer).where(
+            ConditionalAnswer.subscription_id == request.subscription_id,
+            ConditionalAnswer.question_id == request.question_id,
+            ConditionalAnswer.answer_date == today,
+        )
+    )).scalar_one_or_none()
+
+    if existing:
+        existing.answer = request.answer
+    else:
+        db.add(ConditionalAnswer(
+            subscription_id=request.subscription_id,
+            question_id=request.question_id,
+            answer_date=today,
+            answer=request.answer,
+        ))
+
+    await db.commit()
+    return {"detail": "Answer recorded", "answer": request.answer}
+
+
+# ── Farmer: Daily advisory (BL-02 + BL-03 + BL-04 + triggered CHA) ────────────
 
 @router.get("/farmer/advisory/today")
 async def get_today_advisory(
@@ -748,7 +798,8 @@ async def get_today_advisory(
     current_user: User = Depends(get_current_user),
 ):
     """Return today's active practices for all the farmer's ACTIVE subscriptions.
-    Applies BL-04 (DAS/DBS window) + BL-03 (deduplication) + BL-05 lock detection.
+    Applies BL-04 (DAS/DBS window) + BL-02 (conditional filtering) +
+    BL-03 (deduplication across CCA + triggered CHA timelines).
     """
     today = date.today()
 
@@ -798,8 +849,18 @@ async def get_today_advisory(
                     active_timelines.append((tl, day_offset))
             # CALENDAR type: skip for now (requires absolute date mapping)
 
+        from app.services.bl03_deduplication import (
+            deduplicate_advisory, TimelineWindow as TLWindow,
+            PracticeStub as PStub, PracticeElement as PEl,
+        )
+        from app.services.bl02_conditional import (
+            filter_practices_by_conditionals,
+            ConditionalQuestion as CQ, PracticeConditionalLink as PCL,
+        )
+        from app.modules.orders.models import Order, OrderItem
+        from datetime import timedelta
+
         if not active_timelines:
-            # Still return the subscription but with empty timelines (so start-date gate shows)
             out.append({
                 "subscription_id": sub.id,
                 "client_id": sub.client_id,
@@ -813,24 +874,62 @@ async def get_today_advisory(
             })
             continue
 
-        # Build BL-03 timeline stubs for deduplication
-        from app.services.bl03_deduplication import (
-            deduplicate_advisory, TimelineWindow as TLWindow,
-            PracticeStub as PStub, PracticeElement as PEl,
-        )
-        from app.modules.orders.models import Order, OrderItem
+        # ── Load today's conditional answers for this subscription ────────────
+        cond_rows = (await db.execute(
+            select(ConditionalAnswer).where(
+                ConditionalAnswer.subscription_id == sub.id,
+                ConditionalAnswer.answer_date == today,
+            )
+        )).scalars().all()
+        today_answers: dict[str, str] = {r.question_id: r.answer for r in cond_rows}
 
+        # ── Build CCA timeline stubs with BL-02 conditional filtering ─────────
         tl_windows: list[TLWindow] = []
-        tl_date_map: dict = {}  # tl.id → (from_date, to_date, day_num)
+        tl_date_map: dict = {}   # id → (from_date, to_date, day_num)
+        pending_questions_by_tl: dict = {}   # tl.id → {question info}
 
         for tl, day_num in active_timelines:
             p_result = await db.execute(
                 select(Practice).where(Practice.timeline_id == tl.id).order_by(Practice.display_order)
             )
-            practices = p_result.scalars().all()
+            all_practices = p_result.scalars().all()
+            all_practice_ids = [p.id for p in all_practices]
+
+            # BL-02: Load conditional questions for this timeline
+            cond_q_result = await db.execute(
+                select(ConditionalQuestion).where(ConditionalQuestion.timeline_id == tl.id)
+                .order_by(ConditionalQuestion.display_order)
+            )
+            cond_questions = cond_q_result.scalars().all()
+
+            # Load practice_conditionals links
+            pc_result = await db.execute(
+                select(PracticeConditional).where(PracticeConditional.practice_id.in_(all_practice_ids))
+            )
+            pc_rows = pc_result.scalars().all()
+
+            # Run BL-02 filter
+            bl02_result = filter_practices_by_conditionals(
+                all_practice_ids=all_practice_ids,
+                questions=[CQ(q.id, q.question_text, q.display_order) for q in cond_questions],
+                practice_links=[PCL(r.practice_id, r.question_id,
+                                    r.answer.value if hasattr(r.answer, 'value') else str(r.answer))
+                                for r in pc_rows],
+                today_answers=today_answers,
+            )
+
+            if not bl02_result.all_questions_answered and bl02_result.pending_question:
+                pending_questions_by_tl[tl.id] = {
+                    "question_id": bl02_result.pending_question.id,
+                    "question_text": bl02_result.pending_question.question_text,
+                    "display_order": bl02_result.pending_question.display_order,
+                }
+
+            visible_ids = set(bl02_result.visible_practices)
+            visible_practices = [p for p in all_practices if p.id in visible_ids]
 
             practice_stubs: list[PStub] = []
-            for p in practices:
+            for p in visible_practices:
                 el_result = await db.execute(
                     select(Element).where(Element.practice_id == p.id).order_by(Element.display_order)
                 )
@@ -838,21 +937,15 @@ async def get_today_advisory(
                 practice_stubs.append(PStub(
                     id=p.id,
                     l0_type=p.l0_type.value if hasattr(p.l0_type, 'value') else str(p.l0_type),
-                    l1_type=p.l1_type,
-                    l2_type=p.l2_type,
-                    display_order=p.display_order,
-                    is_special_input=p.is_special_input,
+                    l1_type=p.l1_type, l2_type=p.l2_type,
+                    display_order=p.display_order, is_special_input=p.is_special_input,
                     relation_id=p.relation_id,
-                    elements=[PEl(
-                        element_type=el.element_type,
-                        cosh_ref=el.cosh_ref,
-                        value=el.value,
-                        unit_cosh_id=el.unit_cosh_id,
-                    ) for el in elements],
+                    elements=[PEl(element_type=el.element_type, cosh_ref=el.cosh_ref,
+                                  value=el.value, unit_cosh_id=el.unit_cosh_id)
+                              for el in elements],
                 ))
 
-            # Compute actual calendar dates
-            from datetime import timedelta
+            # Calendar dates for this timeline
             if tl.from_type.value == "DAS":
                 from_d = crop_start + timedelta(days=tl.from_value)
                 to_d = crop_start + timedelta(days=tl.to_value)
@@ -865,15 +958,85 @@ async def get_today_advisory(
             tl_window = TLWindow(
                 id=tl.id, name=tl.name, from_date=from_d, to_date=to_d,
                 created_at=tl.created_at.date() if hasattr(tl.created_at, 'date') else today,
-                practices=practice_stubs,
+                practices=practice_stubs, source="CCA",
             )
             tl_windows.append(tl_window)
             tl_date_map[tl.id] = (from_d, to_d, day_num)
 
-        # Get approved practice IDs for BL-03 purchased rule
-        order_result = await db.execute(
-            select(Order).where(Order.subscription_id == sub.id)
-        )
+        # ── Load triggered CHA timelines (from diagnosis or FarmPundit queries) ─
+        cha_entries = (await db.execute(
+            select(TriggeredCHAEntry).where(
+                TriggeredCHAEntry.subscription_id == sub.id,
+                TriggeredCHAEntry.status == "ACTIVE",
+            )
+        )).scalars().all()
+
+        for cha in cha_entries:
+            if cha.recommendation_type == "SP":
+                sp_timelines = (await db.execute(
+                    select(SPTimeline).where(SPTimeline.sp_recommendation_id == cha.recommendation_id)
+                )).scalars().all()
+                for sp_tl in sp_timelines:
+                    from_d = cha.triggered_at.date() + timedelta(days=sp_tl.from_value)
+                    to_d = cha.triggered_at.date() + timedelta(days=sp_tl.to_value)
+                    if not (from_d <= today <= to_d):
+                        continue  # Not active today
+                    sp_practices = (await db.execute(
+                        select(SPPractice).where(SPPractice.timeline_id == sp_tl.id).order_by(SPPractice.display_order)
+                    )).scalars().all()
+                    stubs = [PStub(id=p.id,
+                                  l0_type=p.l0_type if isinstance(p.l0_type, str) else str(p.l0_type),
+                                  l1_type=p.l1_type, l2_type=p.l2_type,
+                                  display_order=p.display_order, is_special_input=p.is_special_input,
+                                  relation_id=None,
+                                  elements=[PEl(element_type=el.element_type, cosh_ref=el.cosh_ref,
+                                                value=el.value, unit_cosh_id=el.unit_cosh_id)
+                                            for el in (await db.execute(
+                                                select(SPElement).where(SPElement.practice_id == p.id)
+                                            )).scalars().all()])
+                             for p in sp_practices]
+                    cha_tl_id = f"cha-sp-{sp_tl.id}"
+                    tl_windows.append(TLWindow(
+                        id=cha_tl_id, name=f"CHA: {sp_tl.name}",
+                        from_date=from_d, to_date=to_d,
+                        created_at=cha.triggered_at.date() if hasattr(cha.triggered_at, 'date') else today,
+                        practices=stubs, source="CHA",
+                    ))
+                    tl_date_map[cha_tl_id] = (from_d, to_d, 0)
+            elif cha.recommendation_type == "PG":
+                pg_timelines = (await db.execute(
+                    select(PGTimeline).where(PGTimeline.pg_recommendation_id == cha.recommendation_id)
+                )).scalars().all()
+                for pg_tl in pg_timelines:
+                    from_d = cha.triggered_at.date() + timedelta(days=pg_tl.from_value)
+                    to_d = cha.triggered_at.date() + timedelta(days=pg_tl.to_value)
+                    if not (from_d <= today <= to_d):
+                        continue
+                    pg_practices = (await db.execute(
+                        select(PGPractice).where(PGPractice.timeline_id == pg_tl.id).order_by(PGPractice.display_order)
+                    )).scalars().all()
+                    stubs = [PStub(id=p.id,
+                                  l0_type=p.l0_type if isinstance(p.l0_type, str) else str(p.l0_type),
+                                  l1_type=p.l1_type, l2_type=p.l2_type,
+                                  display_order=p.display_order, is_special_input=p.is_special_input,
+                                  relation_id=None,
+                                  elements=[PEl(element_type=el.element_type, cosh_ref=el.cosh_ref,
+                                                value=el.value, unit_cosh_id=el.unit_cosh_id)
+                                            for el in (await db.execute(
+                                                select(PGElement).where(PGElement.practice_id == p.id)
+                                            )).scalars().all()])
+                             for p in pg_practices]
+                    cha_tl_id = f"cha-pg-{pg_tl.id}"
+                    tl_windows.append(TLWindow(
+                        id=cha_tl_id, name=f"CHA: {pg_tl.name}",
+                        from_date=from_d, to_date=to_d,
+                        created_at=cha.triggered_at.date() if hasattr(cha.triggered_at, 'date') else today,
+                        practices=stubs, source="CHA",
+                    ))
+                    tl_date_map[cha_tl_id] = (from_d, to_d, 0)
+
+        # ── BL-03 deduplication across CCA + CHA timelines ───────────────────
+        order_result = await db.execute(select(Order).where(Order.subscription_id == sub.id))
         approved_ids: set[str] = set()
         for order in order_result.scalars().all():
             items_result = await db.execute(
@@ -882,42 +1045,38 @@ async def get_today_advisory(
             for item in items_result.scalars().all():
                 approved_ids.add(item.practice_id)
 
-        # Run BL-03 deduplication
         deduped = deduplicate_advisory(tl_windows, approved_practice_ids=approved_ids)
 
-        # Build response
+        # ── Build response ────────────────────────────────────────────────────
         timeline_data = []
         for dedup_tl in deduped:
             tl = dedup_tl.timeline
             from_d, to_d, day_num = tl_date_map[tl.id]
-            timeline_data.append({
+            tl_entry: dict = {
                 "id": tl.id,
                 "name": tl.name,
+                "source": tl.source,  # CCA | CHA
                 "from_date": from_d.isoformat(),
                 "to_date": to_d.isoformat(),
                 "day_number": day_num,
                 "suppressed_count": len(dedup_tl.suppressed),
                 "practices": [
                     {
-                        "id": p.id,
-                        "l0_type": p.l0_type,
-                        "l1_type": p.l1_type,
-                        "l2_type": p.l2_type,
-                        "display_order": p.display_order,
-                        "is_special_input": p.is_special_input,
-                        "elements": [
-                            {
-                                "element_type": el.element_type,
-                                "cosh_ref": el.cosh_ref,
-                                "value": el.value,
-                                "unit_cosh_id": el.unit_cosh_id,
-                            }
-                            for el in p.elements
-                        ],
+                        "id": p.id, "l0_type": p.l0_type,
+                        "l1_type": p.l1_type, "l2_type": p.l2_type,
+                        "display_order": p.display_order, "is_special_input": p.is_special_input,
+                        "elements": [{"element_type": el.element_type, "cosh_ref": el.cosh_ref,
+                                      "value": el.value, "unit_cosh_id": el.unit_cosh_id}
+                                     for el in p.elements],
                     }
                     for p in dedup_tl.visible_practices
                 ],
-            })
+            }
+            # Include BL-02 pending question for this timeline (if any)
+            if tl.id in pending_questions_by_tl:
+                tl_entry["pending_conditional_question"] = pending_questions_by_tl[tl.id]
+                tl_entry["has_pending_question"] = True
+            timeline_data.append(tl_entry)
 
         out.append({
             "subscription_id": sub.id,
