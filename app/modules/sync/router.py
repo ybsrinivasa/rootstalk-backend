@@ -72,10 +72,8 @@ async def receive_cosh_sync(
 async def get_sync_log(
     limit: int = 20,
     db: AsyncSession = Depends(get_db),
-    x_cosh_api_key: str = Header(None, alias="X-Cosh-Api-Key"),
+    current_user: User = Depends(get_current_user),
 ):
-    if not x_cosh_api_key or x_cosh_api_key != settings.cosh_sync_api_key:
-        raise HTTPException(status_code=401, detail="Invalid or missing X-Cosh-Api-Key")
 
     result = await db.execute(
         select(CoshSyncLog).order_by(CoshSyncLog.started_at.desc()).limit(limit)
