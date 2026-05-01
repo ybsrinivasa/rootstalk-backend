@@ -11,6 +11,10 @@ from app.database import Base
 # Import all models so Alembic detects them
 from app.modules.platform.models import User, UserRole, Session, EnabledLanguage
 from app.modules.auth.models import PhoneOTP
+from app.modules.clients.models import (
+    Client, ClientOrganisationType, ClientUser, ClientLocation,
+    ClientCrop, CropExpertAssignment, CMClientAssignment, CMPrivilegeModel
+)
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.database_url_sync)
