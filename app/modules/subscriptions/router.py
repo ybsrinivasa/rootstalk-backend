@@ -243,11 +243,86 @@ async def set_start_date(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """BL-05b: Set or update crop start date."""
+    """BL-05b: Set or update crop start date — shifts all timeline dates, respects locks."""
+    from app.services.bl05_lock_detection import compute_date_shifts, TimelineDateRange, OrderItemStub
+    from app.modules.orders.models import Order, OrderItem
+    from datetime import date as dt_date
+
     sub = await _get_subscription(db, subscription_id, current_user.id)
-    sub.crop_start_date = data.get("crop_start_date")
+    new_start_raw = data.get("crop_start_date")
+
+    # First ever start date — just set it
+    if not sub.crop_start_date:
+        sub.crop_start_date = new_start_raw
+        await db.commit()
+        return {"detail": "Start date set", "crop_start_date": sub.crop_start_date}
+
+    # Parse old and new dates
+    old_start = sub.crop_start_date.date() if hasattr(sub.crop_start_date, 'date') else sub.crop_start_date
+    from datetime import datetime
+    if isinstance(new_start_raw, str):
+        new_start = datetime.fromisoformat(new_start_raw.replace("Z", "+00:00")).date()
+    else:
+        new_start = new_start_raw
+
+    today = dt_date.today()
+
+    # Get active order items for lock detection
+    order_result = await db.execute(
+        select(Order).where(Order.subscription_id == sub.id)
+    )
+    orders = order_result.scalars().all()
+    active_items: list[OrderItemStub] = []
+    for order in orders:
+        items_result = await db.execute(select(OrderItem).where(OrderItem.order_id == order.id))
+        for item in items_result.scalars().all():
+            active_items.append(OrderItemStub(
+                timeline_id=item.timeline_id,
+                order_from_date=order.date_from.date() if hasattr(order.date_from, 'date') else order.date_from,
+                order_to_date=order.date_to.date() if hasattr(order.date_to, 'date') else order.date_to,
+                status=item.status,
+            ))
+
+    # Load all timelines for this subscription's package
+    tl_result = await db.execute(
+        select(Timeline).where(Timeline.package_id == sub.package_id)
+    )
+    timelines = tl_result.scalars().all()
+
+    # Build timeline date ranges (compute dates relative to old start)
+    from datetime import timedelta
+    tl_ranges: list[TimelineDateRange] = []
+    for tl in timelines:
+        if tl.from_type.value == "DAS":
+            from_d = old_start + timedelta(days=tl.from_value)
+            to_d = old_start + timedelta(days=tl.to_value)
+        elif tl.from_type.value == "DBS":
+            from_d = old_start - timedelta(days=tl.from_value)
+            to_d = old_start - timedelta(days=tl.to_value)
+        else:
+            continue
+        tl_ranges.append(TimelineDateRange(id=tl.id, from_date=from_d, to_date=to_d))
+
+    # Compute shifts
+    shifts, delta_days = compute_date_shifts(tl_ranges, old_start, new_start, today, active_items)
+
+    # Update start date
+    sub.crop_start_date = new_start_raw
+
+    # Shift active orders by delta
+    for order in orders:
+        if hasattr(order.date_from, 'date'):
+            order.date_from = order.date_from + timedelta(days=delta_days)
+            order.date_to = order.date_to + timedelta(days=delta_days)
+
     await db.commit()
-    return {"detail": "Start date updated", "crop_start_date": sub.crop_start_date}
+    return {
+        "detail": "Start date updated",
+        "crop_start_date": sub.crop_start_date,
+        "delta_days": delta_days,
+        "timelines_shifted": len(shifts),
+        "locked_timelines": sum(1 for s in shifts if s.was_locked),
+    }
 
 
 # ── Promoter Assignment Flow ───────────────────────────────────────────────────
@@ -673,7 +748,7 @@ async def get_today_advisory(
     current_user: User = Depends(get_current_user),
 ):
     """Return today's active practices for all the farmer's ACTIVE subscriptions.
-    Applies BL-04 window logic (DAS/DBS). Deduplication (BL-03) is deferred to v2.
+    Applies BL-04 (DAS/DBS window) + BL-03 (deduplication) + BL-05 lock detection.
     """
     today = date.today()
 
@@ -738,45 +813,110 @@ async def get_today_advisory(
             })
             continue
 
-        timeline_data = []
+        # Build BL-03 timeline stubs for deduplication
+        from app.services.bl03_deduplication import (
+            deduplicate_advisory, TimelineWindow as TLWindow,
+            PracticeStub as PStub, PracticeElement as PEl,
+        )
+        from app.modules.orders.models import Order, OrderItem
+
+        tl_windows: list[TLWindow] = []
+        tl_date_map: dict = {}  # tl.id → (from_date, to_date, day_num)
+
         for tl, day_num in active_timelines:
             p_result = await db.execute(
                 select(Practice).where(Practice.timeline_id == tl.id).order_by(Practice.display_order)
             )
             practices = p_result.scalars().all()
 
-            practice_data = []
+            practice_stubs: list[PStub] = []
             for p in practices:
                 el_result = await db.execute(
                     select(Element).where(Element.practice_id == p.id).order_by(Element.display_order)
                 )
                 elements = el_result.scalars().all()
-                practice_data.append({
-                    "id": p.id,
-                    "l0_type": p.l0_type,
-                    "l1_type": p.l1_type,
-                    "l2_type": p.l2_type,
-                    "display_order": p.display_order,
-                    "is_special_input": p.is_special_input,
-                    "elements": [
-                        {
-                            "element_type": el.element_type,
-                            "cosh_ref": el.cosh_ref,
-                            "value": el.value,
-                            "unit_cosh_id": el.unit_cosh_id,
-                        }
-                        for el in elements
-                    ],
-                })
+                practice_stubs.append(PStub(
+                    id=p.id,
+                    l0_type=p.l0_type.value if hasattr(p.l0_type, 'value') else str(p.l0_type),
+                    l1_type=p.l1_type,
+                    l2_type=p.l2_type,
+                    display_order=p.display_order,
+                    is_special_input=p.is_special_input,
+                    relation_id=p.relation_id,
+                    elements=[PEl(
+                        element_type=el.element_type,
+                        cosh_ref=el.cosh_ref,
+                        value=el.value,
+                        unit_cosh_id=el.unit_cosh_id,
+                    ) for el in elements],
+                ))
 
+            # Compute actual calendar dates
+            from datetime import timedelta
+            if tl.from_type.value == "DAS":
+                from_d = crop_start + timedelta(days=tl.from_value)
+                to_d = crop_start + timedelta(days=tl.to_value)
+            elif tl.from_type.value == "DBS":
+                from_d = crop_start - timedelta(days=tl.from_value)
+                to_d = crop_start - timedelta(days=tl.to_value)
+            else:
+                from_d = to_d = today
+
+            tl_window = TLWindow(
+                id=tl.id, name=tl.name, from_date=from_d, to_date=to_d,
+                created_at=tl.created_at.date() if hasattr(tl.created_at, 'date') else today,
+                practices=practice_stubs,
+            )
+            tl_windows.append(tl_window)
+            tl_date_map[tl.id] = (from_d, to_d, day_num)
+
+        # Get approved practice IDs for BL-03 purchased rule
+        order_result = await db.execute(
+            select(Order).where(Order.subscription_id == sub.id)
+        )
+        approved_ids: set[str] = set()
+        for order in order_result.scalars().all():
+            items_result = await db.execute(
+                select(OrderItem).where(OrderItem.order_id == order.id, OrderItem.status == "APPROVED")
+            )
+            for item in items_result.scalars().all():
+                approved_ids.add(item.practice_id)
+
+        # Run BL-03 deduplication
+        deduped = deduplicate_advisory(tl_windows, approved_practice_ids=approved_ids)
+
+        # Build response
+        timeline_data = []
+        for dedup_tl in deduped:
+            tl = dedup_tl.timeline
+            from_d, to_d, day_num = tl_date_map[tl.id]
             timeline_data.append({
                 "id": tl.id,
                 "name": tl.name,
-                "from_type": tl.from_type,
-                "from_value": tl.from_value,
-                "to_value": tl.to_value,
+                "from_date": from_d.isoformat(),
+                "to_date": to_d.isoformat(),
                 "day_number": day_num,
-                "practices": practice_data,
+                "suppressed_count": len(dedup_tl.suppressed),
+                "practices": [
+                    {
+                        "id": p.id,
+                        "l0_type": p.l0_type,
+                        "l1_type": p.l1_type,
+                        "l2_type": p.l2_type,
+                        "display_order": p.display_order,
+                        "is_special_input": p.is_special_input,
+                        "elements": [
+                            {
+                                "element_type": el.element_type,
+                                "cosh_ref": el.cosh_ref,
+                                "value": el.value,
+                                "unit_cosh_id": el.unit_cosh_id,
+                            }
+                            for el in p.elements
+                        ],
+                    }
+                    for p in dedup_tl.visible_practices
+                ],
             })
 
         out.append({
