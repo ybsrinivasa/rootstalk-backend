@@ -62,3 +62,22 @@ async def admin_login(request: AdminLoginRequest, db: AsyncSession = Depends(get
 @router.get("/me", response_model=UserOut)
 async def get_me(current_user: User = Depends(get_current_user)):
     return current_user
+
+
+@router.put("/me/profile")
+async def update_my_profile(
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """PWA: update name and language preference after first login."""
+    from sqlalchemy import select
+    from app.database import get_db as _get_db
+    result = await db.execute(select(User).where(User.id == current_user.id))
+    user = result.scalar_one()
+    if data.get("name"):
+        user.name = data["name"]
+    if data.get("language_code"):
+        user.language_code = data["language_code"]
+    await db.commit()
+    return {"detail": "Profile updated"}
