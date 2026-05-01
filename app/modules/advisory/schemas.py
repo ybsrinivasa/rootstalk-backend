@@ -29,7 +29,8 @@ class PackageLocationIn(BaseModel):
 
 class PackageOut(BaseModel):
     id: str
-    client_id: str
+    client_id: Optional[str] = None
+    parent_global_id: Optional[str] = None
     crop_cosh_id: str
     name: str
     package_type: PackageType
@@ -146,3 +147,130 @@ class PracticeConditionalCreate(BaseModel):
     practice_id: str
     question_id: str
     answer: ConditionalAnswer
+
+
+# ── PG Recommendations ────────────────────────────────────────────────────────
+
+class PGRecommendationCreate(BaseModel):
+    problem_group_cosh_id: str
+    application_type: str  # e.g. SPRAY, DRENCH, SOIL
+
+
+class PGTimelineCreate(BaseModel):
+    name: str
+    from_type: str = "DAYS_AFTER_DETECTION"
+    from_value: int = 0
+    to_value: int
+
+
+class PGPracticeCreate(BaseModel):
+    l0_type: str
+    l1_type: Optional[str] = None
+    l2_type: Optional[str] = None
+    display_order: int = 0
+    is_special_input: bool = False
+    elements: List["ElementIn"] = []
+
+
+class PGPracticeOut(BaseModel):
+    id: str
+    timeline_id: str
+    l0_type: str
+    l1_type: Optional[str] = None
+    l2_type: Optional[str] = None
+    display_order: int
+    is_special_input: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PGTimelineOut(BaseModel):
+    id: str
+    pg_recommendation_id: str
+    name: str
+    from_type: str
+    from_value: int
+    to_value: int
+    practices: List[PGPracticeOut] = []
+
+    class Config:
+        from_attributes = True
+
+
+class PGRecommendationOut(BaseModel):
+    id: str
+    problem_group_cosh_id: str
+    client_id: Optional[str] = None
+    parent_id: Optional[str] = None
+    application_type: str
+    status: str
+    version: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# ── SP Recommendations ────────────────────────────────────────────────────────
+
+class SPRecommendationCreate(BaseModel):
+    specific_problem_cosh_id: str
+    application_type: str
+
+
+class SPTimelineCreate(BaseModel):
+    name: str
+    from_type: str = "DAYS_AFTER_DETECTION"
+    from_value: int = 0
+    to_value: int
+
+
+class SPPracticeCreate(BaseModel):
+    l0_type: str
+    l1_type: Optional[str] = None
+    l2_type: Optional[str] = None
+    display_order: int = 0
+    is_special_input: bool = False
+    elements: List["ElementIn"] = []
+
+
+class SPPracticeOut(BaseModel):
+    id: str
+    timeline_id: str
+    l0_type: str
+    l1_type: Optional[str] = None
+    l2_type: Optional[str] = None
+    display_order: int
+    is_special_input: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class SPTimelineOut(BaseModel):
+    id: str
+    sp_recommendation_id: str
+    name: str
+    from_type: str
+    from_value: int
+    to_value: int
+    practices: List[SPPracticeOut] = []
+
+    class Config:
+        from_attributes = True
+
+
+class SPRecommendationOut(BaseModel):
+    id: str
+    specific_problem_cosh_id: str
+    client_id: str
+    application_type: str
+    status: str
+    version: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True

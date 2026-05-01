@@ -71,7 +71,8 @@ class Package(Base):
     __tablename__ = "packages"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
-    client_id: Mapped[str] = mapped_column(String(36), ForeignKey("clients.id"), nullable=False)
+    client_id: Mapped[str] = mapped_column(String(36), ForeignKey("clients.id"), nullable=True)
+    parent_global_id: Mapped[str] = mapped_column(String(36), ForeignKey("packages.id"), nullable=True)
     crop_cosh_id: Mapped[str] = mapped_column(String(100), nullable=False)
     name: Mapped[str] = mapped_column(String(500), nullable=False)
     package_type: Mapped[PackageType] = mapped_column(SAEnum(PackageType), nullable=False)

@@ -19,6 +19,12 @@ from app.modules.advisory.schemas import (
     TimelineCreate, TimelineUpdate, TimelineOut,
     PracticeCreate, PracticeOut,
     RelationCreate, ConditionalQuestionCreate, PracticeConditionalCreate,
+    PGRecommendationCreate, PGRecommendationOut, PGTimelineCreate, PGTimelineOut, PGPracticeCreate,
+    SPRecommendationCreate, SPRecommendationOut, SPTimelineCreate, SPTimelineOut, SPPracticeCreate,
+)
+from app.modules.advisory.models import (
+    PGRecommendation, PGTimeline, PGPractice, PGElement,
+    SPRecommendation, SPTimeline, SPPractice, SPElement,
 )
 from app.modules.clients.models import ClientUser, ClientUserRole
 
@@ -427,3 +433,650 @@ def _validate_timeline(request: TimelineCreate):
     else:
         if request.to_value <= request.from_value:
             raise HTTPException(status_code=422, detail="DAS/CALENDAR timeline: to_value must be greater than from_value")
+
+
+# ── Global CCA Packages ────────────────────────────────────────────────────────
+
+@router.get("/advisory/global/packages", response_model=list[PackageOut])
+async def list_global_packages(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(Package).where(Package.client_id == None).order_by(Package.created_at.desc())  # noqa: E711
+    )
+    return result.scalars().all()
+
+
+@router.post("/advisory/global/packages", response_model=PackageOut, status_code=201)
+async def create_global_package(
+    request: PackageCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    pkg = Package(
+        client_id=None,
+        crop_cosh_id=request.crop_cosh_id,
+        name=request.name,
+        package_type=request.package_type,
+        duration_days=request.duration_days or 120,
+        start_date_label_cosh_id=request.start_date_label_cosh_id,
+        description=request.description,
+        created_by=current_user.id,
+    )
+    db.add(pkg)
+    await db.commit()
+    await db.refresh(pkg)
+    return pkg
+
+
+@router.get("/advisory/global/packages/{pkg_id}", response_model=PackageOut)
+async def get_global_package(
+    pkg_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(Package).where(Package.id == pkg_id, Package.client_id == None)  # noqa: E711
+    )
+    pkg = result.scalar_one_or_none()
+    if not pkg:
+        raise HTTPException(status_code=404, detail="Global package not found")
+    return pkg
+
+
+@router.post("/client/{client_id}/packages/{pkg_id}/fork", response_model=PackageOut, status_code=201)
+async def fork_global_package(
+    client_id: str,
+    pkg_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Deep-copy a global package (all timelines + practices + elements) to a client."""
+    src = (await db.execute(
+        select(Package).where(Package.id == pkg_id, Package.client_id == None)  # noqa: E711
+    )).scalar_one_or_none()
+    if not src:
+        raise HTTPException(status_code=404, detail="Global package not found")
+
+    # Create the local copy
+    copy = Package(
+        client_id=client_id,
+        parent_global_id=src.id,
+        crop_cosh_id=src.crop_cosh_id,
+        name=src.name,
+        package_type=src.package_type,
+        duration_days=src.duration_days,
+        start_date_label_cosh_id=src.start_date_label_cosh_id,
+        description=src.description,
+        created_by=current_user.id,
+    )
+    db.add(copy)
+    await db.flush()
+
+    # Load source timelines + practices + elements
+    tl_result = await db.execute(
+        select(Timeline).where(Timeline.package_id == src.id).order_by(Timeline.display_order)
+    )
+    for src_tl in tl_result.scalars().all():
+        new_tl = Timeline(
+            package_id=copy.id,
+            name=src_tl.name,
+            from_type=src_tl.from_type,
+            from_value=src_tl.from_value,
+            to_value=src_tl.to_value,
+            display_order=src_tl.display_order,
+        )
+        db.add(new_tl)
+        await db.flush()
+
+        p_result = await db.execute(
+            select(Practice).where(Practice.timeline_id == src_tl.id).order_by(Practice.display_order)
+        )
+        for src_p in p_result.scalars().all():
+            new_p = Practice(
+                timeline_id=new_tl.id,
+                l0_type=src_p.l0_type,
+                l1_type=src_p.l1_type,
+                l2_type=src_p.l2_type,
+                display_order=src_p.display_order,
+                is_special_input=src_p.is_special_input,
+            )
+            db.add(new_p)
+            await db.flush()
+
+            el_result = await db.execute(
+                select(Element).where(Element.practice_id == src_p.id).order_by(Element.display_order)
+            )
+            for src_el in el_result.scalars().all():
+                db.add(Element(
+                    practice_id=new_p.id,
+                    element_type=src_el.element_type,
+                    cosh_ref=src_el.cosh_ref,
+                    value=src_el.value,
+                    unit_cosh_id=src_el.unit_cosh_id,
+                    display_order=src_el.display_order,
+                ))
+
+    await db.commit()
+    await db.refresh(copy)
+    return copy
+
+
+# ── Global PG Recommendations ──────────────────────────────────────────────────
+
+@router.get("/advisory/global/pg-recommendations", response_model=list[PGRecommendationOut])
+async def list_global_pg(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(PGRecommendation).where(PGRecommendation.client_id == None)  # noqa: E711
+        .order_by(PGRecommendation.created_at.desc())
+    )
+    return result.scalars().all()
+
+
+@router.post("/advisory/global/pg-recommendations", response_model=PGRecommendationOut, status_code=201)
+async def create_global_pg(
+    request: PGRecommendationCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    pg = PGRecommendation(
+        problem_group_cosh_id=request.problem_group_cosh_id,
+        client_id=None,
+        application_type=request.application_type,
+    )
+    db.add(pg)
+    await db.commit()
+    await db.refresh(pg)
+    return pg
+
+
+@router.get("/advisory/global/pg-recommendations/{pg_id}", response_model=PGRecommendationOut)
+async def get_global_pg(
+    pg_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    pg = (await db.execute(
+        select(PGRecommendation).where(PGRecommendation.id == pg_id, PGRecommendation.client_id == None)  # noqa: E711
+    )).scalar_one_or_none()
+    if not pg:
+        raise HTTPException(status_code=404, detail="Global PG recommendation not found")
+    return pg
+
+
+@router.post("/advisory/global/pg-recommendations/{pg_id}/timelines", status_code=201)
+async def add_global_pg_timeline(
+    pg_id: str,
+    request: PGTimelineCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    pg = (await db.execute(
+        select(PGRecommendation).where(PGRecommendation.id == pg_id)
+    )).scalar_one_or_none()
+    if not pg:
+        raise HTTPException(status_code=404, detail="PG recommendation not found")
+    tl = PGTimeline(
+        pg_recommendation_id=pg_id,
+        name=request.name,
+        from_type=request.from_type,
+        from_value=request.from_value,
+        to_value=request.to_value,
+    )
+    db.add(tl)
+    await db.commit()
+    await db.refresh(tl)
+    return tl
+
+
+@router.post("/advisory/global/pg-recommendations/{pg_id}/timelines/{tl_id}/practices", status_code=201)
+async def add_global_pg_practice(
+    pg_id: str,
+    tl_id: str,
+    request: PGPracticeCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    practice = PGPractice(
+        timeline_id=tl_id,
+        l0_type=request.l0_type,
+        l1_type=request.l1_type,
+        l2_type=request.l2_type,
+        display_order=request.display_order,
+        is_special_input=request.is_special_input,
+    )
+    db.add(practice)
+    await db.flush()
+    for el in request.elements:
+        db.add(PGElement(
+            practice_id=practice.id,
+            element_type=el.element_type,
+            cosh_ref=el.cosh_ref,
+            value=el.value,
+            unit_cosh_id=el.unit_cosh_id,
+            display_order=el.display_order,
+        ))
+    await db.commit()
+    await db.refresh(practice)
+    return practice
+
+
+@router.delete("/advisory/global/pg-recommendations/{pg_id}/timelines/{tl_id}", status_code=204)
+async def delete_global_pg_timeline(
+    pg_id: str,
+    tl_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    tl = (await db.execute(
+        select(PGTimeline).where(PGTimeline.id == tl_id, PGTimeline.pg_recommendation_id == pg_id)
+    )).scalar_one_or_none()
+    if tl:
+        await db.delete(tl)
+        await db.commit()
+
+
+@router.post("/advisory/global/pg-recommendations/{pg_id}/publish")
+async def publish_global_pg(
+    pg_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    pg = (await db.execute(
+        select(PGRecommendation).where(PGRecommendation.id == pg_id)
+    )).scalar_one_or_none()
+    if not pg:
+        raise HTTPException(status_code=404, detail="PG recommendation not found")
+
+    # Deactivate previous active version for same problem_group + client
+    prev = (await db.execute(
+        select(PGRecommendation).where(
+            PGRecommendation.problem_group_cosh_id == pg.problem_group_cosh_id,
+            PGRecommendation.client_id == pg.client_id,
+            PGRecommendation.status == "ACTIVE",
+            PGRecommendation.id != pg.id,
+        )
+    )).scalars().all()
+    for p in prev:
+        p.status = "INACTIVE"
+
+    pg.status = "ACTIVE"
+    pg.version = pg.version + 1
+    await db.commit()
+    await db.refresh(pg)
+    return pg
+
+
+# ── Client PG Recommendations ──────────────────────────────────────────────────
+
+@router.get("/client/{client_id}/pg-recommendations", response_model=list[PGRecommendationOut])
+async def list_client_pg(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(PGRecommendation).where(PGRecommendation.client_id == client_id)
+        .order_by(PGRecommendation.created_at.desc())
+    )
+    return result.scalars().all()
+
+
+@router.get("/client/{client_id}/pg-recommendations/{pg_id}", response_model=PGRecommendationOut)
+async def get_client_pg(
+    client_id: str,
+    pg_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    pg = (await db.execute(
+        select(PGRecommendation).where(PGRecommendation.id == pg_id, PGRecommendation.client_id == client_id)
+    )).scalar_one_or_none()
+    if not pg:
+        raise HTTPException(status_code=404, detail="PG recommendation not found")
+    return pg
+
+
+@router.post("/client/{client_id}/pg-recommendations/import/{global_pg_id}", response_model=PGRecommendationOut, status_code=201)
+async def import_global_pg(
+    client_id: str,
+    global_pg_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Deep-copy a global PG recommendation to a client, creating an independent local copy."""
+    src = (await db.execute(
+        select(PGRecommendation).where(PGRecommendation.id == global_pg_id, PGRecommendation.client_id == None)  # noqa: E711
+    )).scalar_one_or_none()
+    if not src:
+        raise HTTPException(status_code=404, detail="Global PG recommendation not found")
+
+    # Check for existing import
+    existing = (await db.execute(
+        select(PGRecommendation).where(
+            PGRecommendation.client_id == client_id,
+            PGRecommendation.parent_id == global_pg_id,
+        )
+    )).scalar_one_or_none()
+    if existing:
+        raise HTTPException(status_code=409, detail="This PG recommendation is already imported. Edit the existing local copy.")
+
+    copy = PGRecommendation(
+        problem_group_cosh_id=src.problem_group_cosh_id,
+        client_id=client_id,
+        parent_id=global_pg_id,
+        application_type=src.application_type,
+    )
+    db.add(copy)
+    await db.flush()
+
+    tl_result = await db.execute(select(PGTimeline).where(PGTimeline.pg_recommendation_id == src.id))
+    for src_tl in tl_result.scalars().all():
+        new_tl = PGTimeline(
+            pg_recommendation_id=copy.id,
+            name=src_tl.name,
+            from_type=src_tl.from_type,
+            from_value=src_tl.from_value,
+            to_value=src_tl.to_value,
+        )
+        db.add(new_tl)
+        await db.flush()
+
+        p_result = await db.execute(select(PGPractice).where(PGPractice.timeline_id == src_tl.id))
+        for src_p in p_result.scalars().all():
+            new_p = PGPractice(
+                timeline_id=new_tl.id,
+                l0_type=src_p.l0_type,
+                l1_type=src_p.l1_type,
+                l2_type=src_p.l2_type,
+                display_order=src_p.display_order,
+                is_special_input=src_p.is_special_input,
+            )
+            db.add(new_p)
+            await db.flush()
+
+            el_result = await db.execute(select(PGElement).where(PGElement.practice_id == src_p.id))
+            for src_el in el_result.scalars().all():
+                db.add(PGElement(
+                    practice_id=new_p.id,
+                    element_type=src_el.element_type,
+                    cosh_ref=src_el.cosh_ref,
+                    value=src_el.value,
+                    unit_cosh_id=src_el.unit_cosh_id,
+                    display_order=src_el.display_order,
+                ))
+
+    await db.commit()
+    await db.refresh(copy)
+    return copy
+
+
+@router.post("/client/{client_id}/pg-recommendations/{pg_id}/publish")
+async def publish_client_pg(
+    client_id: str,
+    pg_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    pg = (await db.execute(
+        select(PGRecommendation).where(PGRecommendation.id == pg_id, PGRecommendation.client_id == client_id)
+    )).scalar_one_or_none()
+    if not pg:
+        raise HTTPException(status_code=404, detail="PG recommendation not found")
+
+    prev = (await db.execute(
+        select(PGRecommendation).where(
+            PGRecommendation.problem_group_cosh_id == pg.problem_group_cosh_id,
+            PGRecommendation.client_id == client_id,
+            PGRecommendation.status == "ACTIVE",
+            PGRecommendation.id != pg.id,
+        )
+    )).scalars().all()
+    for p in prev:
+        p.status = "INACTIVE"
+
+    pg.status = "ACTIVE"
+    pg.version = pg.version + 1
+    await db.commit()
+    await db.refresh(pg)
+    return pg
+
+
+# ── Client PG Timelines + Practices (for editing imported copies) ─────────────
+
+@router.get("/client/{client_id}/pg-recommendations/{pg_id}/timelines")
+async def list_client_pg_timelines(
+    client_id: str,
+    pg_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(PGTimeline).where(PGTimeline.pg_recommendation_id == pg_id)
+    )
+    timelines = result.scalars().all()
+    out = []
+    for tl in timelines:
+        p_res = await db.execute(select(PGPractice).where(PGPractice.timeline_id == tl.id).order_by(PGPractice.display_order))
+        out.append({
+            "id": tl.id, "pg_recommendation_id": tl.pg_recommendation_id,
+            "name": tl.name, "from_type": tl.from_type, "from_value": tl.from_value, "to_value": tl.to_value,
+            "practices": [
+                {"id": p.id, "l0_type": p.l0_type, "l1_type": p.l1_type, "l2_type": p.l2_type,
+                 "display_order": p.display_order, "is_special_input": p.is_special_input}
+                for p in p_res.scalars().all()
+            ],
+        })
+    return out
+
+
+@router.post("/client/{client_id}/pg-recommendations/{pg_id}/timelines", status_code=201)
+async def add_client_pg_timeline(
+    client_id: str,
+    pg_id: str,
+    request: PGTimelineCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    tl = PGTimeline(
+        pg_recommendation_id=pg_id,
+        name=request.name,
+        from_type=request.from_type,
+        from_value=request.from_value,
+        to_value=request.to_value,
+    )
+    db.add(tl)
+    await db.commit()
+    await db.refresh(tl)
+    return tl
+
+
+@router.post("/client/{client_id}/pg-recommendations/{pg_id}/timelines/{tl_id}/practices", status_code=201)
+async def add_client_pg_practice(
+    client_id: str,
+    pg_id: str,
+    tl_id: str,
+    request: PGPracticeCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    practice = PGPractice(
+        timeline_id=tl_id,
+        l0_type=request.l0_type,
+        l1_type=request.l1_type,
+        l2_type=request.l2_type,
+        display_order=request.display_order,
+        is_special_input=request.is_special_input,
+    )
+    db.add(practice)
+    await db.commit()
+    await db.refresh(practice)
+    return practice
+
+
+@router.delete("/client/{client_id}/pg-recommendations/{pg_id}/timelines/{tl_id}", status_code=204)
+async def delete_client_pg_timeline(
+    client_id: str,
+    pg_id: str,
+    tl_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    tl = (await db.execute(
+        select(PGTimeline).where(PGTimeline.id == tl_id, PGTimeline.pg_recommendation_id == pg_id)
+    )).scalar_one_or_none()
+    if tl:
+        await db.delete(tl)
+        await db.commit()
+
+
+# ── Client SP Recommendations ──────────────────────────────────────────────────
+
+@router.get("/client/{client_id}/sp-recommendations", response_model=list[SPRecommendationOut])
+async def list_client_sp(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(SPRecommendation).where(SPRecommendation.client_id == client_id)
+        .order_by(SPRecommendation.created_at.desc())
+    )
+    return result.scalars().all()
+
+
+@router.post("/client/{client_id}/sp-recommendations", response_model=SPRecommendationOut, status_code=201)
+async def create_client_sp(
+    client_id: str,
+    request: SPRecommendationCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    sp = SPRecommendation(
+        specific_problem_cosh_id=request.specific_problem_cosh_id,
+        client_id=client_id,
+        application_type=request.application_type,
+    )
+    db.add(sp)
+    await db.commit()
+    await db.refresh(sp)
+    return sp
+
+
+@router.get("/client/{client_id}/sp-recommendations/{sp_id}/timelines")
+async def list_sp_timelines(
+    client_id: str,
+    sp_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(select(SPTimeline).where(SPTimeline.sp_recommendation_id == sp_id))
+    timelines = result.scalars().all()
+    out = []
+    for tl in timelines:
+        p_res = await db.execute(select(SPPractice).where(SPPractice.timeline_id == tl.id).order_by(SPPractice.display_order))
+        out.append({
+            "id": tl.id, "sp_recommendation_id": tl.sp_recommendation_id,
+            "name": tl.name, "from_type": tl.from_type, "from_value": tl.from_value, "to_value": tl.to_value,
+            "practices": [
+                {"id": p.id, "l0_type": p.l0_type, "l1_type": p.l1_type, "l2_type": p.l2_type,
+                 "display_order": p.display_order, "is_special_input": p.is_special_input}
+                for p in p_res.scalars().all()
+            ],
+        })
+    return out
+
+
+@router.post("/client/{client_id}/sp-recommendations/{sp_id}/timelines", status_code=201)
+async def add_sp_timeline(
+    client_id: str,
+    sp_id: str,
+    request: SPTimelineCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    tl = SPTimeline(
+        sp_recommendation_id=sp_id,
+        name=request.name,
+        from_type=request.from_type,
+        from_value=request.from_value,
+        to_value=request.to_value,
+    )
+    db.add(tl)
+    await db.commit()
+    await db.refresh(tl)
+    return tl
+
+
+@router.post("/client/{client_id}/sp-recommendations/{sp_id}/timelines/{tl_id}/practices", status_code=201)
+async def add_sp_practice(
+    client_id: str,
+    sp_id: str,
+    tl_id: str,
+    request: SPPracticeCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    practice = SPPractice(
+        timeline_id=tl_id,
+        l0_type=request.l0_type,
+        l1_type=request.l1_type,
+        l2_type=request.l2_type,
+        display_order=request.display_order,
+        is_special_input=request.is_special_input,
+    )
+    db.add(practice)
+    await db.commit()
+    await db.refresh(practice)
+    return practice
+
+
+@router.delete("/client/{client_id}/sp-recommendations/{sp_id}/timelines/{tl_id}", status_code=204)
+async def delete_sp_timeline(
+    client_id: str,
+    sp_id: str,
+    tl_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    tl = (await db.execute(
+        select(SPTimeline).where(SPTimeline.id == tl_id, SPTimeline.sp_recommendation_id == sp_id)
+    )).scalar_one_or_none()
+    if tl:
+        await db.delete(tl)
+        await db.commit()
+
+
+@router.post("/client/{client_id}/sp-recommendations/{sp_id}/publish")
+async def publish_sp(
+    client_id: str,
+    sp_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    sp = (await db.execute(
+        select(SPRecommendation).where(SPRecommendation.id == sp_id, SPRecommendation.client_id == client_id)
+    )).scalar_one_or_none()
+    if not sp:
+        raise HTTPException(status_code=404, detail="SP recommendation not found")
+
+    prev = (await db.execute(
+        select(SPRecommendation).where(
+            SPRecommendation.specific_problem_cosh_id == sp.specific_problem_cosh_id,
+            SPRecommendation.client_id == client_id,
+            SPRecommendation.status == "ACTIVE",
+            SPRecommendation.id != sp.id,
+        )
+    )).scalars().all()
+    for p in prev:
+        p.status = "INACTIVE"
+
+    sp.status = "ACTIVE"
+    sp.version = sp.version + 1
+    await db.commit()
+    await db.refresh(sp)
+    return sp
