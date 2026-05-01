@@ -104,3 +104,58 @@ class OnboardingLinkOut(BaseModel):
     short_name: str
     onboarding_link: str
     expires_at: datetime
+
+
+# ── Portal: Locations ──────────────────────────────────────────────────────────
+
+class LocationCreate(BaseModel):
+    state_cosh_id: str
+    district_cosh_id: str
+
+
+class LocationOut(BaseModel):
+    id: str
+    state_cosh_id: str
+    district_cosh_id: str
+    status: str
+    added_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# ── Portal: Crops ──────────────────────────────────────────────────────────────
+
+class CropCreate(BaseModel):
+    crop_cosh_id: str
+
+
+class CropOut(BaseModel):
+    id: str
+    crop_cosh_id: str
+    status: str
+    added_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# ── Portal: Users ──────────────────────────────────────────────────────────────
+
+class PortalUserCreate(BaseModel):
+    email: EmailStr
+    name: Optional[str] = None
+    role: ClientUserRole
+    password: str
+
+
+class PortalUserOut(BaseModel):
+    id: str
+    email: str
+    name: Optional[str] = None
+    role: str
+    status: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True

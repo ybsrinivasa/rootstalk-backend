@@ -9,11 +9,14 @@ from app.dependencies import get_current_user
 from app.modules.platform.models import User, StatusEnum
 from app.modules.clients.models import (
     Client, ClientOrganisationType, ClientUser, ClientUserRole,
-    ClientStatus, CMClientAssignment, CMPrivilegeModel, CMRights, CMPrivilege
+    ClientLocation, ClientCrop, ClientStatus,
+    CMClientAssignment, CMPrivilegeModel, CMRights, CMPrivilege
 )
 from app.modules.clients.schemas import (
     ClientInitiate, ClientCASubmit, ClientReject, ClientEdit,
-    ClientStatusUpdate, ClientOut, OnboardingLinkOut, CMAssignment, CMPrivilegeGrant
+    ClientStatusUpdate, ClientOut, OnboardingLinkOut, CMAssignment, CMPrivilegeGrant,
+    LocationCreate, LocationOut, CropCreate, CropOut,
+    PortalUserCreate, PortalUserOut,
 )
 from app.modules.clients.service import (
     generate_token, send_onboarding_email, send_ca_credentials_email,
@@ -309,3 +312,155 @@ async def get_portal_branding(short_name: str, db: AsyncSession = Depends(get_db
         "logo_url": client.logo_url,
         "primary_colour": client.primary_colour,
     }
+
+
+# ── Portal: Locations ──────────────────────────────────────────────────────────
+
+@router.get("/client/{client_id}/locations", response_model=list[LocationOut])
+async def list_locations(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(ClientLocation).where(ClientLocation.client_id == client_id)
+        .order_by(ClientLocation.added_at)
+    )
+    return result.scalars().all()
+
+
+@router.post("/client/{client_id}/locations", response_model=LocationOut, status_code=201)
+async def add_location(
+    client_id: str,
+    request: LocationCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    loc = ClientLocation(
+        client_id=client_id,
+        state_cosh_id=request.state_cosh_id,
+        district_cosh_id=request.district_cosh_id,
+    )
+    db.add(loc)
+    await db.commit()
+    await db.refresh(loc)
+    return loc
+
+
+# ── Portal: Crops ──────────────────────────────────────────────────────────────
+
+@router.get("/client/{client_id}/crops", response_model=list[CropOut])
+async def list_crops(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(ClientCrop).where(ClientCrop.client_id == client_id)
+        .order_by(ClientCrop.added_at)
+    )
+    return result.scalars().all()
+
+
+@router.post("/client/{client_id}/crops", response_model=CropOut, status_code=201)
+async def add_crop(
+    client_id: str,
+    request: CropCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    existing = (await db.execute(
+        select(ClientCrop).where(
+            ClientCrop.client_id == client_id,
+            ClientCrop.crop_cosh_id == request.crop_cosh_id,
+        )
+    )).scalar_one_or_none()
+    if existing:
+        raise HTTPException(status_code=409, detail="This crop is already added")
+    crop = ClientCrop(client_id=client_id, crop_cosh_id=request.crop_cosh_id)
+    db.add(crop)
+    await db.commit()
+    await db.refresh(crop)
+    return crop
+
+
+# ── Portal: Users ──────────────────────────────────────────────────────────────
+
+@router.get("/client/{client_id}/users", response_model=list[PortalUserOut])
+async def list_portal_users(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(ClientUser, User)
+        .join(User, User.id == ClientUser.user_id)
+        .where(ClientUser.client_id == client_id)
+        .order_by(ClientUser.created_at)
+    )
+    rows = result.all()
+    out = []
+    for cu, user in rows:
+        out.append(PortalUserOut(
+            id=user.id,
+            email=user.email,
+            name=user.name,
+            role=cu.role.value,
+            status=cu.status.value,
+            created_at=cu.created_at,
+        ))
+    return out
+
+
+@router.post("/client/{client_id}/users", response_model=PortalUserOut, status_code=201)
+async def add_portal_user(
+    client_id: str,
+    request: PortalUserCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.modules.auth.service import hash_password
+    existing_user = (await db.execute(
+        select(User).where(User.email == request.email)
+    )).scalar_one_or_none()
+
+    if existing_user:
+        user = existing_user
+    else:
+        user = User(
+            email=request.email,
+            name=request.name,
+            password_hash=hash_password(request.password),
+            language_code="en",
+        )
+        db.add(user)
+        await db.flush()
+
+    conflict = (await db.execute(
+        select(ClientUser).where(
+            ClientUser.client_id == client_id,
+            ClientUser.user_id == user.id,
+            ClientUser.role == request.role,
+        )
+    )).scalar_one_or_none()
+    if conflict:
+        raise HTTPException(status_code=409, detail="This user already has this role for this client")
+
+    cu = ClientUser(
+        client_id=client_id,
+        user_id=user.id,
+        role=request.role,
+        status=StatusEnum.ACTIVE,
+    )
+    db.add(cu)
+    await db.commit()
+    await db.refresh(cu)
+
+    return PortalUserOut(
+        id=user.id,
+        email=user.email,
+        name=user.name,
+        role=cu.role.value,
+        status=cu.status.value,
+        created_at=cu.created_at,
+    )
