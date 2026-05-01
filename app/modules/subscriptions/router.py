@@ -746,6 +746,54 @@ async def my_subscriptions(
     ]
 
 
+# ── CHA: Dismiss and history ──────────────────────────────────────────────────
+
+@router.put("/farmer/cha/{entry_id}/dismiss")
+async def dismiss_cha(
+    entry_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Farmer dismisses a CHA entry (problem resolved or not relevant)."""
+    entry = (await db.execute(
+        select(TriggeredCHAEntry).where(
+            TriggeredCHAEntry.id == entry_id,
+            TriggeredCHAEntry.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not entry:
+        raise HTTPException(status_code=404, detail="CHA entry not found")
+    entry.status = "DISMISSED"
+    await db.commit()
+    return {"status": "DISMISSED"}
+
+
+@router.get("/farmer/cha-history")
+async def get_cha_history(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """All triggered CHA entries for this farmer — active and dismissed."""
+    result = await db.execute(
+        select(TriggeredCHAEntry).where(
+            TriggeredCHAEntry.farmer_user_id == current_user.id
+        ).order_by(TriggeredCHAEntry.triggered_at.desc())
+    )
+    entries = result.scalars().all()
+    return [
+        {
+            "id": e.id,
+            "problem_cosh_id": e.problem_cosh_id,
+            "problem_name": e.problem_name,
+            "recommendation_type": e.recommendation_type,
+            "triggered_by": e.triggered_by,
+            "triggered_at": e.triggered_at,
+            "status": e.status,
+        }
+        for e in entries
+    ]
+
+
 # ── BL-02: Conditional question answer ────────────────────────────────────────
 
 class ConditionalAnswerRequest(BaseModel):
@@ -996,8 +1044,9 @@ async def get_today_advisory(
                                             )).scalars().all()])
                              for p in sp_practices]
                     cha_tl_id = f"cha-sp-{sp_tl.id}"
+                    problem_label = cha.problem_name or problem_cosh_id
                     tl_windows.append(TLWindow(
-                        id=cha_tl_id, name=f"CHA: {sp_tl.name}",
+                        id=cha_tl_id, name=f"CHA — {problem_label}: {sp_tl.name}",
                         from_date=from_d, to_date=to_d,
                         created_at=cha.triggered_at.date() if hasattr(cha.triggered_at, 'date') else today,
                         practices=stubs, source="CHA",
@@ -1027,8 +1076,9 @@ async def get_today_advisory(
                                             )).scalars().all()])
                              for p in pg_practices]
                     cha_tl_id = f"cha-pg-{pg_tl.id}"
+                    problem_label = cha.problem_name or problem_cosh_id
                     tl_windows.append(TLWindow(
-                        id=cha_tl_id, name=f"CHA: {pg_tl.name}",
+                        id=cha_tl_id, name=f"CHA — {problem_label}: {pg_tl.name}",
                         from_date=from_d, to_date=to_d,
                         created_at=cha.triggered_at.date() if hasattr(cha.triggered_at, 'date') else today,
                         practices=stubs, source="CHA",

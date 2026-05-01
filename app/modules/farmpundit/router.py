@@ -936,15 +936,14 @@ async def _next_round_robin_sequence(db: AsyncSession, client_id: str) -> int:
 async def _trigger_cha_for_query(db: AsyncSession, query: Query, problem_cosh_id: str):
     """
     §14.7/14.8: When pundit identifies a problem, deliver the corresponding
-    CHA recommendation to the farmer's advisory.
-    SP-level preferred (client-specific), falls back to PG-level (client then global).
-    Creates a TriggeredCHAEntry so advisory/today picks it up on next load.
+    CHA recommendation using the full SP→PG hierarchy:
+    1. SP (client-specific for exact specific_problem_cosh_id)
+    2. PG (client-specific for parent problem_group)
+    3. PG (global for parent problem_group)
     """
-    from app.modules.advisory.models import SPRecommendation, PGRecommendation
     from app.modules.subscriptions.models import TriggeredCHAEntry
-    from datetime import timezone
+    from app.services.cha_hierarchy import resolve_cha_recommendation
 
-    # Get the farmer's subscription to find subscription_id
     sub = (await db.execute(
         select(Subscription).where(
             Subscription.farmer_user_id == query.farmer_user_id,
@@ -952,48 +951,21 @@ async def _trigger_cha_for_query(db: AsyncSession, query: Query, problem_cosh_id
             Subscription.status == SubscriptionStatus.ACTIVE,
         ).order_by(Subscription.created_at.desc()).limit(1)
     )).scalar_one_or_none()
-
     if not sub:
-        return  # No active subscription — can't trigger CHA
-
-    # Try SP-level first (client-specific for this exact problem)
-    sp = (await db.execute(
-        select(SPRecommendation).where(
-            SPRecommendation.specific_problem_cosh_id == problem_cosh_id,
-            SPRecommendation.client_id == query.client_id,
-            SPRecommendation.status == "ACTIVE",
-        )
-    )).scalar_one_or_none()
-
-    if sp:
-        db.add(TriggeredCHAEntry(
-            subscription_id=sub.id,
-            farmer_user_id=query.farmer_user_id,
-            client_id=query.client_id,
-            problem_cosh_id=problem_cosh_id,
-            recommendation_type="SP",
-            recommendation_id=sp.id,
-            triggered_by="QUERY",
-            triggered_at=datetime.now(timezone.utc),
-        ))
         return
 
-    # Fall back to PG-level: client-specific first, then global
-    pg = (await db.execute(
-        select(PGRecommendation).where(
-            PGRecommendation.problem_group_cosh_id == problem_cosh_id,
-            PGRecommendation.status == "ACTIVE",
-        ).order_by(PGRecommendation.client_id.desc())  # client-specific before NULL (global)
-    )).scalar_one_or_none()
+    resolved = await resolve_cha_recommendation(db, query.client_id, problem_cosh_id)
+    if not resolved:
+        return
 
-    if pg:
-        db.add(TriggeredCHAEntry(
-            subscription_id=sub.id,
-            farmer_user_id=query.farmer_user_id,
-            client_id=query.client_id,
-            problem_cosh_id=problem_cosh_id,
-            recommendation_type="PG",
-            recommendation_id=pg.id,
-            triggered_by="QUERY",
-            triggered_at=datetime.now(timezone.utc),
-        ))
+    db.add(TriggeredCHAEntry(
+        subscription_id=sub.id,
+        farmer_user_id=query.farmer_user_id,
+        client_id=query.client_id,
+        problem_cosh_id=problem_cosh_id,
+        recommendation_type=resolved.recommendation_type,
+        recommendation_id=resolved.recommendation_id,
+        triggered_by="QUERY",
+        problem_name=resolved.problem_name,
+        parent_pg_cosh_id=resolved.parent_pg_cosh_id,
+    ))

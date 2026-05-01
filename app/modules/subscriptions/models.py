@@ -183,3 +183,5 @@ class TriggeredCHAEntry(Base):
     triggered_by: Mapped[str] = mapped_column(String(20), nullable=False)        # DIAGNOSIS | QUERY | DIRECT
     triggered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
+    problem_name: Mapped[str] = mapped_column(String(500), nullable=True)    # display name e.g. "Leaf Blast"
+    parent_pg_cosh_id: Mapped[str] = mapped_column(String(200), nullable=True)  # resolved parent PG

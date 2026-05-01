@@ -419,61 +419,32 @@ def _build_question_text(question) -> str:
 async def _trigger_cha_from_diagnosis(db: AsyncSession, session: DiagnosisSession, problem_cosh_id: str):
     """
     Create a TriggeredCHAEntry so the farmer's advisory/today includes CHA timelines.
-    SP-level preferred (client-specific); falls back to PG-level.
+    Uses full SP→PG hierarchy: SP client → PG client → PG global.
     """
-    from app.modules.advisory.models import SPRecommendation, PGRecommendation
-    from app.modules.subscriptions.models import TriggeredCHAEntry
+    from app.modules.subscriptions.models import TriggeredCHAEntry, Subscription, SubscriptionStatus
+    from app.services.cha_hierarchy import resolve_cha_recommendation
 
-    # Find the farmer's active subscription for this session
-    from app.modules.subscriptions.models import Subscription, SubscriptionStatus
     sub = (await db.execute(
         select(Subscription).where(Subscription.id == session.subscription_id)
     )).scalar_one_or_none()
     if not sub:
         return
 
-    # Find client_id from session
-    client_id = sub.client_id
-
-    # Try SP first
-    sp = (await db.execute(
-        select(SPRecommendation).where(
-            SPRecommendation.specific_problem_cosh_id == problem_cosh_id,
-            SPRecommendation.client_id == client_id,
-            SPRecommendation.status == "ACTIVE",
-        )
-    )).scalar_one_or_none()
-
-    if sp:
-        db.add(TriggeredCHAEntry(
-            subscription_id=session.subscription_id,
-            farmer_user_id=session.farmer_user_id,
-            client_id=client_id,
-            problem_cosh_id=problem_cosh_id,
-            recommendation_type="SP",
-            recommendation_id=sp.id,
-            triggered_by="DIAGNOSIS",
-        ))
+    resolved = await resolve_cha_recommendation(db, sub.client_id, problem_cosh_id)
+    if not resolved:
         return
 
-    # Fall back to PG
-    pg = (await db.execute(
-        select(PGRecommendation).where(
-            PGRecommendation.problem_group_cosh_id == problem_cosh_id,
-            PGRecommendation.status == "ACTIVE",
-        ).order_by(PGRecommendation.client_id.desc())
-    )).scalar_one_or_none()
-
-    if pg:
-        db.add(TriggeredCHAEntry(
-            subscription_id=session.subscription_id,
-            farmer_user_id=session.farmer_user_id,
-            client_id=client_id,
-            problem_cosh_id=problem_cosh_id,
-            recommendation_type="PG",
-            recommendation_id=pg.id,
-            triggered_by="DIAGNOSIS",
-        ))
+    db.add(TriggeredCHAEntry(
+        subscription_id=session.subscription_id,
+        farmer_user_id=session.farmer_user_id,
+        client_id=sub.client_id,
+        problem_cosh_id=problem_cosh_id,
+        recommendation_type=resolved.recommendation_type,
+        recommendation_id=resolved.recommendation_id,
+        triggered_by="DIAGNOSIS",
+        problem_name=resolved.problem_name,
+        parent_pg_cosh_id=resolved.parent_pg_cosh_id,
+    ))
 
 
 async def _get_problem_info(db: AsyncSession, problem_cosh_id: str) -> dict:
