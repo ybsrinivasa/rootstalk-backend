@@ -16,6 +16,9 @@ from app.modules.clients.models import (
     ClientCrop, CropExpertAssignment, CMClientAssignment, CMPrivilegeModel
 )
 from app.modules.sync.models import CoshSyncLog, CoshReferenceCache, VolumeFormula, CropHealthCrop
+from app.modules.orders.models import (
+    Order, OrderItem, SeedOrder, PackingList, MissingBrandReport
+)
 from app.modules.subscriptions.models import (
     Subscription, SubscriptionWaitlist, SubscriptionPool,
     AlertRecipient, Alert, PromoterAssignment,
