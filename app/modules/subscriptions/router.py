@@ -1,6 +1,7 @@
 import secrets
 import string
 from datetime import datetime, timedelta, timezone, date
+from math import radians, cos, sin, asin, sqrt
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Optional
@@ -23,6 +24,8 @@ from app.modules.advisory.models import (
 from app.modules.clients.models import Client
 from app.modules.advisory.models import PGRecommendation, PGTimeline, PGPractice, PGElement
 from app.modules.advisory.models import SPRecommendation, SPTimeline, SPPractice, SPElement
+from app.modules.platform.models import UserRole, RoleType
+from app.modules.orders.models import DealerProfile
 
 router = APIRouter(tags=["Subscriptions"])
 
@@ -1156,3 +1159,248 @@ async def get_today_advisory(
         })
 
     return out
+
+
+# ── Farmer: Nearby dealers (for Ordering Screen) ─────────────────────────────
+
+@router.get("/farmer/subscriptions/{subscription_id}/nearby-dealers")
+async def nearby_dealers_for_farmer(
+    subscription_id: str,
+    order_type: Optional[str] = None,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Returns up to 5 nearest dealers + Promoter pinned first.
+    order_type: PESTICIDE | FERTILISER | SEED — filters by sell_categories."""
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    farmer_lat = lat or (float(current_user.gps_lat) if current_user.gps_lat else 0.0)
+    farmer_lng = lng or (float(current_user.gps_lng) if current_user.gps_lng else 0.0)
+
+    promoter_user_id = await _get_promoter(db, subscription_id, PromoterType.DEALER)
+
+    category_map = {"PESTICIDE": "PESTICIDES", "FERTILISER": "FERTILISERS", "SEED": "SEEDS"}
+    required_cat = category_map.get(order_type or "") if order_type else None
+
+    profiles = (await db.execute(select(DealerProfile))).scalars().all()
+    results = []
+    for profile in profiles:
+        if required_cat and required_cat not in (profile.sell_categories or []):
+            continue
+        if not profile.shop_gps_lat or not profile.shop_gps_lng:
+            continue
+        dist = _haversine_sub(farmer_lat, farmer_lng,
+                              float(profile.shop_gps_lat), float(profile.shop_gps_lng))
+        dealer = (await db.execute(select(User).where(User.id == profile.user_id))).scalar_one_or_none()
+        if dealer:
+            results.append({
+                "user_id": dealer.id,
+                "name": dealer.name,
+                "phone": dealer.phone,
+                "shop_name": profile.shop_name,
+                "shop_address": profile.shop_address,
+                "sell_categories": profile.sell_categories or [],
+                "distance_km": round(dist, 1),
+                "is_promoter": dealer.id == promoter_user_id,
+            })
+
+    results.sort(key=lambda x: (0 if x["is_promoter"] else 1, x["distance_km"]))
+    return results[:5]
+
+
+@router.get("/farmer/subscriptions/{subscription_id}/nearby-facilitators")
+async def nearby_facilitators_for_farmer(
+    subscription_id: str,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Returns up to 5 nearest facilitators + Promoter pinned first."""
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    farmer_lat = lat or (float(current_user.gps_lat) if current_user.gps_lat else 0.0)
+    farmer_lng = lng or (float(current_user.gps_lng) if current_user.gps_lng else 0.0)
+
+    promoter_user_id = await _get_promoter(db, subscription_id, PromoterType.FACILITATOR)
+
+    facilitator_role_rows = (await db.execute(
+        select(UserRole).where(UserRole.role_type == RoleType.FACILITATOR)
+    )).scalars().all()
+    facilitator_ids = {r.user_id for r in facilitator_role_rows}
+
+    results = []
+    for uid in facilitator_ids:
+        fac = (await db.execute(select(User).where(User.id == uid))).scalar_one_or_none()
+        if not fac or not fac.gps_lat or not fac.gps_lng:
+            continue
+        dist = _haversine_sub(farmer_lat, farmer_lng,
+                              float(fac.gps_lat), float(fac.gps_lng))
+        results.append({
+            "user_id": fac.id,
+            "name": fac.name,
+            "phone": fac.phone,
+            "distance_km": round(dist, 1),
+            "is_promoter": fac.id == promoter_user_id,
+        })
+
+    results.sort(key=lambda x: (0 if x["is_promoter"] else 1, x["distance_km"]))
+    return results[:5]
+
+
+# ── Farmer: Pre-start inputs (DBS practices + seed varieties) ─────────────────
+
+@router.get("/farmer/subscriptions/{subscription_id}/pre-start-inputs")
+async def get_pre_start_inputs(
+    subscription_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Returns DBS (days before sowing) INPUT practices for pre-start ordering."""
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    tl_result = await db.execute(
+        select(Timeline).where(
+            Timeline.package_id == sub.package_id,
+        )
+    )
+    timelines = tl_result.scalars().all()
+
+    dbs_timelines = [tl for tl in timelines if tl.from_type.value == "DBS"]
+
+    out = []
+    for tl in dbs_timelines:
+        practices = (await db.execute(
+            select(Practice).where(Practice.timeline_id == tl.id).order_by(Practice.display_order)
+        )).scalars().all()
+        input_practices = [p for p in practices if p.l0_type.value == "INPUT"]
+        if input_practices:
+            out.append({
+                "timeline_id": tl.id,
+                "timeline_name": tl.name,
+                "days_before_sowing_from": tl.from_value,
+                "days_before_sowing_to": tl.to_value,
+                "practices": [
+                    {
+                        "id": p.id,
+                        "l0_type": p.l0_type.value,
+                        "l1_type": p.l1_type,
+                        "l2_type": p.l2_type,
+                        "display_order": p.display_order,
+                    }
+                    for p in input_practices
+                ],
+            })
+    return out
+
+
+# ── Farmer: Missed items (expired practices) ──────────────────────────────────
+
+@router.get("/farmer/subscriptions/{subscription_id}/missed-items")
+async def get_missed_items(
+    subscription_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Returns practices whose application window has fully passed."""
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    if not sub.crop_start_date:
+        return []
+
+    today = datetime.now(timezone.utc).date()
+    crop_start = sub.crop_start_date.date() if hasattr(sub.crop_start_date, 'date') else sub.crop_start_date
+    day_offset = (today - crop_start).days
+
+    tl_result = await db.execute(
+        select(Timeline).where(Timeline.package_id == sub.package_id)
+    )
+    timelines = tl_result.scalars().all()
+
+    missed = []
+    for tl in timelines:
+        is_missed = False
+        window_end = None
+        if tl.from_type.value == "DAS":
+            if day_offset > tl.to_value:
+                is_missed = True
+                window_end = crop_start + timedelta(days=tl.to_value)
+        elif tl.from_type.value == "DBS":
+            if day_offset > -tl.to_value:
+                is_missed = True
+                window_end = crop_start - timedelta(days=tl.to_value)
+
+        if is_missed:
+            practices = (await db.execute(
+                select(Practice).where(Practice.timeline_id == tl.id).order_by(Practice.display_order)
+            )).scalars().all()
+            if practices:
+                missed.append({
+                    "timeline_id": tl.id,
+                    "timeline_name": tl.name,
+                    "from_type": tl.from_type.value,
+                    "from_value": tl.from_value,
+                    "to_value": tl.to_value,
+                    "window_end": window_end,
+                    "practices": [
+                        {
+                            "id": p.id,
+                            "l0_type": p.l0_type.value,
+                            "l1_type": p.l1_type,
+                            "l2_type": p.l2_type,
+                        }
+                        for p in practices
+                    ],
+                })
+    return missed
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+async def _get_promoter(db, subscription_id: str, promoter_type: PromoterType) -> Optional[str]:
+    result = (await db.execute(
+        select(PromoterAssignment).where(
+            PromoterAssignment.subscription_id == subscription_id,
+            PromoterAssignment.promoter_type == promoter_type,
+            PromoterAssignment.status == AssignmentStatus.ACTIVE,
+        ).order_by(PromoterAssignment.assigned_at.desc()).limit(1)
+    )).scalar_one_or_none()
+    return result.promoter_user_id if result else None
+
+
+def _haversine_sub(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    R = 6371.0
+    dlat = radians(lat2 - lat1)
+    dlng = radians(lng2 - lng1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlng / 2) ** 2
+    return R * 2 * asin(sqrt(a))
