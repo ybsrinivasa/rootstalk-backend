@@ -358,6 +358,9 @@ async def get_portal_branding(short_name: str, db: AsyncSession = Depends(get_db
     client = result.scalar_one_or_none()
     if not client:
         raise HTTPException(status_code=404, detail="Company not found")
+    org_types = (await db.execute(
+        select(ClientOrganisationType.org_type_cosh_id).where(ClientOrganisationType.client_id == client.id)
+    )).scalars().all()
     return {
         "id": client.id,
         "short_name": client.short_name,
@@ -365,6 +368,7 @@ async def get_portal_branding(short_name: str, db: AsyncSession = Depends(get_db
         "tagline": client.tagline,
         "logo_url": client.logo_url,
         "primary_colour": client.primary_colour,
+        "org_type_cosh_ids": list(org_types),
     }
 
 
@@ -568,6 +572,58 @@ async def toggle_portal_user_status(
     cu.status = StatusEnum.ACTIVE if new_status == "ACTIVE" else StatusEnum.INACTIVE
     await db.commit()
     return {"detail": f"User status set to {new_status}"}
+
+
+# ── CA: Self-serve company profile ─────────────────────────────────────────────
+
+@router.get("/client/{client_id}/profile")
+async def get_client_profile(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(select(Client).where(Client.id == client_id))
+    client = result.scalar_one_or_none()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    org_types = (await db.execute(
+        select(ClientOrganisationType.org_type_cosh_id).where(ClientOrganisationType.client_id == client_id)
+    )).scalars().all()
+    return {
+        "id": client.id, "short_name": client.short_name, "display_name": client.display_name,
+        "tagline": client.tagline, "logo_url": client.logo_url,
+        "primary_colour": client.primary_colour, "secondary_colour": client.secondary_colour,
+        "hq_address": client.hq_address, "gst_number": client.gst_number, "pan_number": client.pan_number,
+        "website": client.website, "support_phone": client.support_phone, "office_phone": client.office_phone,
+        "social_links": client.social_links or {},
+        "org_type_cosh_ids": list(org_types),
+        "ca_name": client.ca_name, "ca_email": client.ca_email,
+        "status": client.status.value, "approved_at": client.approved_at,
+    }
+
+
+@router.put("/client/{client_id}/profile")
+async def update_client_profile(
+    client_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CA self-serve: update company branding and contact info. GST and PAN are read-only."""
+    result = await db.execute(select(Client).where(Client.id == client_id))
+    client = result.scalar_one_or_none()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    editable = [
+        "display_name", "tagline", "logo_url", "primary_colour", "secondary_colour",
+        "hq_address", "website", "support_phone", "office_phone", "social_links",
+    ]
+    for field in editable:
+        if field in data and data[field] is not None:
+            setattr(client, field, data[field])
+    await db.commit()
+    await db.refresh(client)
+    return {"detail": "Profile updated"}
 
 
 # ── Field Manager: Dealers and Facilitators ────────────────────────────────────
