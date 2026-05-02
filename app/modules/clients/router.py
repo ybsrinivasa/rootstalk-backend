@@ -359,6 +359,8 @@ async def get_portal_branding(short_name: str, db: AsyncSession = Depends(get_db
     if not client:
         raise HTTPException(status_code=404, detail="Company not found")
     return {
+        "id": client.id,
+        "short_name": client.short_name,
         "display_name": client.display_name,
         "tagline": client.tagline,
         "logo_url": client.logo_url,

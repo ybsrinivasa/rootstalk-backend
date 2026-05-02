@@ -15,14 +15,33 @@ from app.modules.auth.service import (
 )
 from app.modules.auth.models import EmailOTP
 from app.modules.clients.service import _send_email
+from app.modules.clients.models import Client, ClientUser, ClientStatus
+from app.modules.platform.models import User, StatusEnum
 from app.services.sms_service import send_otp_sms
 from app.dependencies import get_current_user
-from app.modules.platform.models import User
 
 EMAIL_OTP_EXPIRY_MINUTES = 10
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["Authentication"])
+
+
+async def _check_client_user(db: AsyncSession, user: User, short_name: str) -> None:
+    """When logging in via client portal: verify client is ACTIVE and user belongs to it."""
+    client = (await db.execute(
+        select(Client).where(Client.short_name == short_name.lower(), Client.status == ClientStatus.ACTIVE)
+    )).scalar_one_or_none()
+    if not client:
+        raise HTTPException(status_code=403, detail="This company account is inactive or not found")
+    cu = (await db.execute(
+        select(ClientUser).where(
+            ClientUser.client_id == client.id,
+            ClientUser.user_id == user.id,
+            ClientUser.status == StatusEnum.ACTIVE,
+        )
+    )).scalar_one_or_none()
+    if not cu:
+        raise HTTPException(status_code=401, detail="This email is not registered with this company")
 
 
 # ── PWA: Phone OTP ─────────────────────────────────────────────────────────────
@@ -63,12 +82,14 @@ async def verify_otp(request: PhoneOtpVerify, db: AsyncSession = Depends(get_db)
 
 @router.post("/admin/login", response_model=TokenResponse)
 async def admin_login(request: AdminLoginRequest, db: AsyncSession = Depends(get_db)):
-    """SA and portal user login (email + password)."""
+    """SA and portal user login (email + password). Pass client_short_name for client portal logins."""
     user = await get_user_by_email(db, request.email)
     if not user or not user.password_hash:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     if not verify_password(request.password, user.password_hash):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    if request.client_short_name:
+        await _check_client_user(db, user, request.client_short_name)
     return TokenResponse(access_token=_build_token(user))
 
 
@@ -79,11 +100,14 @@ async def request_email_otp(data: dict, db: AsyncSession = Depends(get_db)):
     """Request a 6-digit OTP sent to the user's registered email. purpose: LOGIN or RESET."""
     email = (data.get("email") or "").strip().lower()
     purpose = data.get("purpose", "LOGIN")
+    client_short_name = data.get("client_short_name")
     if not email:
         raise HTTPException(status_code=422, detail="email required")
     user = await get_user_by_email(db, email)
     if not user:
         raise HTTPException(status_code=404, detail="No account found for this email")
+    if client_short_name and purpose == "LOGIN":
+        await _check_client_user(db, user, client_short_name)
 
     otp_code = "".join(secrets.choice("0123456789") for _ in range(6))
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=EMAIL_OTP_EXPIRY_MINUTES)
@@ -129,6 +153,9 @@ async def verify_email_otp(data: dict, db: AsyncSession = Depends(get_db)):
     user = await get_user_by_email(db, email)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    client_short_name = data.get("client_short_name")
+    if client_short_name and otp.purpose == "LOGIN":
+        await _check_client_user(db, user, client_short_name)
     await db.commit()
     return TokenResponse(access_token=_build_token(user))
 

@@ -19,6 +19,7 @@ class PhoneOtpVerify(BaseModel):
 class AdminLoginRequest(BaseModel):
     email: EmailStr
     password: str
+    client_short_name: str | None = None
 
 
 # ── Shared ─────────────────────────────────────────────────────────────────────
