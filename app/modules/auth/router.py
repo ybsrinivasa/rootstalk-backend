@@ -272,9 +272,16 @@ async def update_my_profile(
     from app.database import get_db as _get_db
     result = await db.execute(select(User).where(User.id == current_user.id))
     user = result.scalar_one()
-    if data.get("name"):
-        user.name = data["name"]
-    if data.get("language_code"):
-        user.language_code = data["language_code"]
+    for field in ["name", "language_code", "state_cosh_id", "district_cosh_id",
+                  "sub_district_cosh_id", "address_line", "locality", "town", "pin_code"]:
+        if data.get(field) is not None:
+            setattr(user, field, data[field])
+    # GPS fields are Decimal
+    if data.get("gps_lat") is not None:
+        from decimal import Decimal
+        user.gps_lat = Decimal(str(data["gps_lat"]))
+    if data.get("gps_lng") is not None:
+        from decimal import Decimal
+        user.gps_lng = Decimal(str(data["gps_lng"]))
     await db.commit()
     return {"detail": "Profile updated"}

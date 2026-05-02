@@ -372,6 +372,32 @@ async def get_portal_branding(short_name: str, db: AsyncSession = Depends(get_db
     }
 
 
+# ── PWA: Client info by UUID ──────────────────────────────────────────────────
+
+@router.get("/client/{client_id}/info")
+async def get_client_info_by_id(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """PWA: fetch client branding and contact info by UUID (used on home screen)."""
+    result = await db.execute(select(Client).where(Client.id == client_id))
+    client = result.scalar_one_or_none()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    org_types = (await db.execute(
+        select(ClientOrganisationType.org_type_cosh_id).where(ClientOrganisationType.client_id == client_id)
+    )).scalars().all()
+    return {
+        "id": client.id, "short_name": client.short_name,
+        "display_name": client.display_name, "tagline": client.tagline,
+        "logo_url": client.logo_url, "primary_colour": client.primary_colour,
+        "support_phone": client.support_phone, "office_phone": client.office_phone,
+        "website": client.website, "social_links": client.social_links or {},
+        "org_type_cosh_ids": list(org_types),
+    }
+
+
 # ── Portal: Locations ──────────────────────────────────────────────────────────
 
 @router.get("/client/{client_id}/locations", response_model=list[LocationOut])
