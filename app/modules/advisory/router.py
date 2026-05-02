@@ -270,6 +270,16 @@ async def update_timeline(
     tl = await _get_timeline(db, timeline_id, package_id)
     for field, value in request.model_dump(exclude_unset=True).items():
         setattr(tl, field, value)
+    # BL-17: validate boundaries after applying changes
+    from app.modules.advisory.models import TimelineFromType
+    check_from = request.from_value if request.from_value is not None else tl.from_value
+    check_to = request.to_value if request.to_value is not None else tl.to_value
+    if tl.from_type == TimelineFromType.DBS:
+        if check_to >= check_from:
+            raise HTTPException(status_code=422, detail="DBS timeline: from_value must be greater than to_value")
+    else:
+        if check_to <= check_from:
+            raise HTTPException(status_code=422, detail="DAS/CALENDAR timeline: to_value must be greater than from_value")
     await db.commit()
     await db.refresh(tl)
     return tl
@@ -284,6 +294,76 @@ async def delete_timeline(
     tl = await _get_timeline(db, timeline_id, package_id)
     await db.delete(tl)
     await db.commit()
+
+
+@router.post("/client/{client_id}/packages/{package_id}/timelines/import", response_model=TimelineOut, status_code=201)
+async def import_timeline(
+    client_id: str, package_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Copy a timeline (with all practices and elements) from any package into this one.
+    The copy is completely independent after save — changes to either do not affect the other.
+    """
+    source_id = data.get("source_timeline_id")
+    new_name = (data.get("new_name") or "").strip()
+    if not source_id:
+        raise HTTPException(status_code=422, detail="source_timeline_id required")
+    if not new_name:
+        raise HTTPException(status_code=422, detail="new_name required — imported timelines must be renamed")
+
+    # Load source timeline
+    src_tl = (await db.execute(select(Timeline).where(Timeline.id == source_id))).scalar_one_or_none()
+    if not src_tl:
+        raise HTTPException(status_code=404, detail="Source timeline not found")
+
+    # Create new timeline in target package
+    new_tl = Timeline(
+        package_id=package_id,
+        name=new_name,
+        from_type=src_tl.from_type,
+        from_value=src_tl.from_value,
+        to_value=src_tl.to_value,
+        display_order=data.get("display_order", 0),
+    )
+    db.add(new_tl)
+    await db.flush()
+
+    # Copy practices
+    src_practices = (await db.execute(
+        select(Practice).where(Practice.timeline_id == src_tl.id).order_by(Practice.display_order)
+    )).scalars().all()
+
+    for src_p in src_practices:
+        new_p = Practice(
+            timeline_id=new_tl.id,
+            l0_type=src_p.l0_type,
+            l1_type=src_p.l1_type,
+            l2_type=src_p.l2_type,
+            display_order=src_p.display_order,
+            is_special_input=src_p.is_special_input,
+        )
+        db.add(new_p)
+        await db.flush()
+
+        # Copy elements
+        src_elements = (await db.execute(
+            select(Element).where(Element.practice_id == src_p.id).order_by(Element.display_order)
+        )).scalars().all()
+        for src_el in src_elements:
+            db.add(Element(
+                practice_id=new_p.id,
+                element_type=src_el.element_type,
+                cosh_ref=src_el.cosh_ref,
+                value=src_el.value,
+                unit_cosh_id=src_el.unit_cosh_id,
+                display_order=src_el.display_order,
+            ))
+
+    await db.commit()
+    await db.refresh(new_tl)
+    return new_tl
 
 
 # ── Practices ──────────────────────────────────────────────────────────────────
