@@ -13,6 +13,19 @@ def new_uuid():
     return str(uuid.uuid4())
 
 
+class EmailOTP(Base):
+    """OTP sent to portal user's email for login or password reset."""
+    __tablename__ = "email_otps"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    otp_code: Mapped[str] = mapped_column(String(6), nullable=False)
+    purpose: Mapped[str] = mapped_column(String(20), default="LOGIN")
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class PhoneOTP(Base):
     """OTP sent to farmer's phone for PWA registration/login."""
     __tablename__ = "phone_otps"
