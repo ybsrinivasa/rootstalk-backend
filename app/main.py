@@ -14,6 +14,7 @@ from app.modules.qr.router import router as qr_router
 from app.modules.reports.router import router as reports_router
 from app.modules.seed_mgmt.router import router as seed_mgmt_router
 from app.modules.media.router import router as media_router
+from app.modules.rm.router import router as rm_router
 
 app = FastAPI(
     title="RootsTalk API",
@@ -42,6 +43,7 @@ app.include_router(qr_router)
 app.include_router(reports_router)
 app.include_router(seed_mgmt_router)
 app.include_router(media_router)
+app.include_router(rm_router)
 
 
 @app.get("/health")
