@@ -244,12 +244,36 @@ async def change_password(
 
 @router.get("/me", response_model=UserOut)
 async def get_me(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    from app.modules.clients.models import ClientPromoter
+    from app.modules.farmpundit.models import FarmPunditProfile
+
     cu = (await db.execute(
         select(ClientUser).where(
             ClientUser.user_id == current_user.id,
             ClientUser.status == StatusEnum.ACTIVE,
         )
     )).scalar_one_or_none()
+
+    # Determine PWA roles from ClientPromoter and FarmPunditProfile
+    pwa_roles: list[str] = []
+
+    promoters = (await db.execute(
+        select(ClientPromoter).where(
+            ClientPromoter.user_id == current_user.id,
+            ClientPromoter.status == "ACTIVE",
+        )
+    )).scalars().all()
+    for p in promoters:
+        role = p.promoter_type.upper()
+        if role not in pwa_roles:
+            pwa_roles.append(role)
+
+    pundit = (await db.execute(
+        select(FarmPunditProfile).where(FarmPunditProfile.user_id == current_user.id)
+    )).scalar_one_or_none()
+    if pundit:
+        pwa_roles.append("FARM_PUNDIT")
+
     return {
         "id": current_user.id,
         "email": current_user.email,
@@ -258,6 +282,7 @@ async def get_me(current_user: User = Depends(get_current_user), db: AsyncSessio
         "language_code": current_user.language_code,
         "roles": current_user.roles,
         "portal_role": cu.role.value if cu else None,
+        "pwa_roles": pwa_roles,
     }
 
 

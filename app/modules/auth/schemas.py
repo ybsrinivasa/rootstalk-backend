@@ -45,6 +45,7 @@ class UserOut(BaseModel):
     language_code: str
     roles: List[RoleOut] = []
     portal_role: Optional[str] = None
+    pwa_roles: List[str] = []
 
     class Config:
         from_attributes = True
