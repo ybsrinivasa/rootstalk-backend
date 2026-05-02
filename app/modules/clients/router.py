@@ -6,7 +6,7 @@ from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.config import settings
 from app.dependencies import get_current_user
-from app.modules.platform.models import User, StatusEnum
+from app.modules.platform.models import User, StatusEnum, RoleType, UserRole
 from app.modules.subscriptions.models import Subscription, SubscriptionStatus
 from app.modules.clients.models import (
     Client, ClientOrganisationType, ClientUser, ClientUserRole,
@@ -769,3 +769,135 @@ async def get_overdue_inputs(
                         break  # One entry per subscription
 
     return overdue
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SA: CM Client Assignments
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/admin/clients/{client_id}/cm-assignment")
+async def get_cm_assignment(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Get the current CM assignment for a client."""
+    _require_sa(current_user)
+    assignment = (await db.execute(
+        select(CMClientAssignment).where(
+            CMClientAssignment.client_id == client_id,
+            CMClientAssignment.status == StatusEnum.ACTIVE,
+        )
+    )).scalar_one_or_none()
+    if not assignment:
+        return {"cm_user_id": None, "cm_name": None, "cm_email": None, "rights": None}
+    cm = (await db.execute(select(User).where(User.id == assignment.cm_user_id))).scalar_one_or_none()
+    return {
+        "assignment_id": assignment.id,
+        "cm_user_id": assignment.cm_user_id,
+        "cm_name": cm.name if cm else None,
+        "cm_email": cm.email if cm else None,
+        "rights": assignment.rights.value,
+        "assigned_at": assignment.assigned_at,
+    }
+
+
+@router.put("/admin/clients/{client_id}/cm-assignment")
+async def assign_cm_to_client(
+    client_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SA: assign or update CM for a client. One CM per client at a time."""
+    _require_sa(current_user)
+    cm_user_id = data.get("cm_user_id")
+    rights = data.get("rights", "EDIT")
+    if not cm_user_id:
+        raise HTTPException(status_code=422, detail="cm_user_id required")
+
+    # Verify the user is a Content Manager
+    cm_role = (await db.execute(
+        select(UserRole).where(
+            UserRole.user_id == cm_user_id,
+            UserRole.role_type == RoleType.CONTENT_MANAGER,
+        )
+    )).scalar_one_or_none()
+    if not cm_role:
+        raise HTTPException(status_code=400, detail="User is not a Content Manager")
+
+    # Deactivate any existing assignment for this client
+    existing = (await db.execute(
+        select(CMClientAssignment).where(
+            CMClientAssignment.client_id == client_id,
+            CMClientAssignment.status == StatusEnum.ACTIVE,
+        )
+    )).scalar_one_or_none()
+    if existing:
+        if existing.cm_user_id == cm_user_id:
+            existing.rights = CMRights(rights)
+            await db.commit()
+            return {"detail": "Rights updated", "cm_user_id": cm_user_id, "rights": rights}
+        existing.status = StatusEnum.INACTIVE
+
+    assignment = CMClientAssignment(
+        cm_user_id=cm_user_id,
+        client_id=client_id,
+        rights=CMRights(rights),
+        status=StatusEnum.ACTIVE,
+    )
+    db.add(assignment)
+    await db.commit()
+    return {"detail": "CM assigned", "cm_user_id": cm_user_id, "rights": rights}
+
+
+@router.delete("/admin/clients/{client_id}/cm-assignment")
+async def remove_cm_assignment(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SA: remove CM from a client."""
+    _require_sa(current_user)
+    assignment = (await db.execute(
+        select(CMClientAssignment).where(
+            CMClientAssignment.client_id == client_id,
+            CMClientAssignment.status == StatusEnum.ACTIVE,
+        )
+    )).scalar_one_or_none()
+    if not assignment:
+        raise HTTPException(status_code=404, detail="No active CM assignment")
+    assignment.status = StatusEnum.INACTIVE
+    await db.commit()
+    return {"detail": "CM assignment removed"}
+
+
+@router.get("/admin/cm/my-clients")
+async def cm_my_clients(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CM: list all clients assigned to me with rights level."""
+    assignments = (await db.execute(
+        select(CMClientAssignment).where(
+            CMClientAssignment.cm_user_id == current_user.id,
+            CMClientAssignment.status == StatusEnum.ACTIVE,
+        )
+    )).scalars().all()
+    out = []
+    for a in assignments:
+        client = (await db.execute(select(Client).where(Client.id == a.client_id))).scalar_one_or_none()
+        if client:
+            out.append({
+                "client_id": client.id,
+                "full_name": client.full_name,
+                "display_name": client.display_name,
+                "short_name": client.short_name,
+                "logo_url": client.logo_url,
+                "primary_colour": client.primary_colour,
+                "status": client.status.value,
+                "rights": a.rights.value,
+                "assigned_at": a.assigned_at,
+                "portal_url": f"https://rootstalk.in/{client.short_name}",
+            })
+    return out

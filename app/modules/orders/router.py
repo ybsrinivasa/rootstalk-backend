@@ -515,6 +515,27 @@ async def list_missing_brand_reports(
     return result.scalars().all()
 
 
+@router.put("/admin/missing-brand-reports/{report_id}")
+async def update_brand_report(
+    report_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CM with BRAND_HANDLING privilege: review and approve/reject a missing brand report."""
+    report = (await db.execute(
+        select(MissingBrandReport).where(MissingBrandReport.id == report_id)
+    )).scalar_one_or_none()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+    if "status" in data:
+        report.status = data["status"]
+    if "cm_notes" in data:
+        report.cm_notes = data["cm_notes"]
+    await db.commit()
+    return {"id": report_id, "status": report.status}
+
+
 # ── BL-07: Brand options for an order item ───────────────────────────────────
 
 @router.get("/dealer/orders/{order_id}/items/{item_id}/brand-options")
