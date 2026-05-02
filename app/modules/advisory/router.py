@@ -731,6 +731,119 @@ async def get_global_package(
     return pkg
 
 
+@router.post("/advisory/global/packages/{pkg_id}/publish", response_model=PackageOut)
+async def publish_global_package(
+    pkg_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(Package).where(Package.id == pkg_id, Package.client_id == None)  # noqa: E711
+    )
+    pkg = result.scalar_one_or_none()
+    if not pkg:
+        raise HTTPException(status_code=404, detail="Global package not found")
+    pkg.status = PackageStatus.ACTIVE
+    pkg.version = pkg.version + 1
+    pkg.published_at = datetime.now(timezone.utc)
+    pkg.published_by = current_user.id
+    await db.commit()
+    await db.refresh(pkg)
+    return pkg
+
+
+@router.get("/advisory/global/packages/{pkg_id}/timelines", response_model=list[TimelineOut])
+async def list_global_timelines(
+    pkg_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(Timeline).where(Timeline.package_id == pkg_id).order_by(Timeline.display_order, Timeline.from_value)
+    )
+    return result.scalars().all()
+
+
+@router.post("/advisory/global/packages/{pkg_id}/timelines", response_model=TimelineOut, status_code=201)
+async def create_global_timeline(
+    pkg_id: str,
+    request: TimelineCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    pkg = (await db.execute(
+        select(Package).where(Package.id == pkg_id, Package.client_id == None)  # noqa: E711
+    )).scalar_one_or_none()
+    if not pkg:
+        raise HTTPException(status_code=404, detail="Global package not found")
+    _validate_timeline(request)
+    tl = Timeline(package_id=pkg_id, **request.model_dump())
+    db.add(tl)
+    await db.commit()
+    await db.refresh(tl)
+    return tl
+
+
+@router.delete("/advisory/global/packages/{pkg_id}/timelines/{tl_id}", status_code=204)
+async def delete_global_timeline(
+    pkg_id: str, tl_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    tl = await _get_timeline(db, tl_id, pkg_id)
+    await db.delete(tl)
+    await db.commit()
+
+
+@router.get("/advisory/global/packages/{pkg_id}/timelines/{tl_id}/practices", response_model=list[PracticeOut])
+async def list_global_practices(
+    pkg_id: str, tl_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(Practice).where(Practice.timeline_id == tl_id).order_by(Practice.display_order)
+    )
+    return result.scalars().all()
+
+
+@router.post("/advisory/global/packages/{pkg_id}/timelines/{tl_id}/practices", response_model=PracticeOut, status_code=201)
+async def create_global_practice(
+    pkg_id: str, tl_id: str,
+    request: PracticeCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    practice = Practice(
+        timeline_id=tl_id,
+        l0_type=request.l0_type,
+        l1_type=request.l1_type,
+        l2_type=request.l2_type,
+        display_order=request.display_order,
+        is_special_input=request.is_special_input,
+    )
+    db.add(practice)
+    for elem in request.elements:
+        db.add(Element(practice_id=practice.id, **elem.model_dump()))
+    await db.commit()
+    await db.refresh(practice)
+    return practice
+
+
+@router.delete("/advisory/global/packages/{pkg_id}/timelines/{tl_id}/practices/{practice_id}", status_code=204)
+async def delete_global_practice(
+    pkg_id: str, tl_id: str, practice_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(select(Practice).where(Practice.id == practice_id, Practice.timeline_id == tl_id))
+    practice = result.scalar_one_or_none()
+    if not practice:
+        raise HTTPException(status_code=404, detail="Practice not found")
+    await db.delete(practice)
+    await db.commit()
+
+
 @router.post("/client/{client_id}/packages/{pkg_id}/fork", response_model=PackageOut, status_code=201)
 async def fork_global_package(
     client_id: str,
