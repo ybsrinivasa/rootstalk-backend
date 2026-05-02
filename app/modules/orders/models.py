@@ -103,6 +103,35 @@ class PackingList(Base):
     first_shared_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class DealerProfile(Base):
+    __tablename__ = "dealer_profiles"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), unique=True, nullable=False)
+    shop_name: Mapped[str] = mapped_column(String(500), nullable=True)
+    shop_address: Mapped[str] = mapped_column(Text, nullable=True)
+    sell_categories: Mapped[list] = mapped_column(JSON, nullable=True)
+    pesticide_licence_url: Mapped[str] = mapped_column(Text, nullable=True)
+    fertiliser_licence_url: Mapped[str] = mapped_column(Text, nullable=True)
+    shop_registration_url: Mapped[str] = mapped_column(Text, nullable=True)
+    shop_photo_url: Mapped[str] = mapped_column(Text, nullable=True)
+    shop_gps_lat: Mapped[float] = mapped_column(DECIMAL(10, 7), nullable=True)
+    shop_gps_lng: Mapped[float] = mapped_column(DECIMAL(10, 7), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class DealerRelationship(Base):
+    __tablename__ = "dealer_relationships"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    dealer_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
+    manufacturer_name: Mapped[str] = mapped_column(String(500), nullable=False)
+    manufacturer_client_id: Mapped[str] = mapped_column(String(36), ForeignKey("clients.id"), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class MissingBrandReport(Base):
     __tablename__ = "missing_brand_reports"
 

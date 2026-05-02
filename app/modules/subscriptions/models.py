@@ -60,6 +60,8 @@ class Subscription(Base):
     promoter_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
     subscription_type: Mapped[SubscriptionType] = mapped_column(String(20), nullable=False)
     status: Mapped[SubscriptionStatus] = mapped_column(String(20), default=SubscriptionStatus.WAITLISTED)
+    farm_area_acres: Mapped[float] = mapped_column(DECIMAL(10, 2), nullable=True)
+    area_unit: Mapped[str] = mapped_column(String(20), nullable=True, default="acres")
     crop_start_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     subscription_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     lapsed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
