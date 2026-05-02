@@ -46,12 +46,25 @@ class ClientReject(BaseModel):
 # ── SA edits ───────────────────────────────────────────────────────────────────
 
 class ClientEdit(BaseModel):
+    # SA-side fields
     full_name: Optional[str] = None
-    display_name: Optional[str] = None
-    tagline: Optional[str] = None
     ca_name: Optional[str] = None
     ca_phone: Optional[str] = None
+    ca_email: Optional[EmailStr] = None
     is_manufacturer: Optional[bool] = None
+    # CA-side fields (SA can update post-approval)
+    display_name: Optional[str] = None
+    tagline: Optional[str] = None
+    logo_url: Optional[str] = None
+    primary_colour: Optional[str] = None
+    secondary_colour: Optional[str] = None
+    hq_address: Optional[str] = None
+    website: Optional[str] = None
+    support_phone: Optional[str] = None
+    office_phone: Optional[str] = None
+    social_links: Optional[dict] = None
+    # Org types — replaces the existing list when provided
+    org_type_cosh_ids: Optional[List[str]] = None
 
 
 class ClientStatusUpdate(BaseModel):

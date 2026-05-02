@@ -40,6 +40,20 @@ def _base_url() -> str:
 
 # ── SA: List all clients ───────────────────────────────────────────────────────
 
+@router.get("/admin/clients/check-short-name")
+async def check_short_name(
+    short_name: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Real-time short name uniqueness check (item #7)."""
+    _require_sa(current_user)
+    existing = (await db.execute(
+        select(Client).where(Client.short_name == short_name.lower().strip())
+    )).scalar_one_or_none()
+    return {"available": existing is None, "short_name": short_name.lower().strip()}
+
+
 @router.get("/admin/clients", response_model=list[ClientOut])
 async def list_clients(
     status_filter: str = None,
@@ -270,8 +284,22 @@ async def edit_client(
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
 
-    for field, value in request.model_dump(exclude_unset=True).items():
+    data = request.model_dump(exclude_unset=True)
+
+    # Handle org_type_cosh_ids separately — replace the existing list
+    new_org_types = data.pop("org_type_cosh_ids", None)
+    if new_org_types is not None:
+        existing_types = (await db.execute(
+            select(ClientOrganisationType).where(ClientOrganisationType.client_id == client_id)
+        )).scalars().all()
+        for ot in existing_types:
+            await db.delete(ot)
+        for cosh_id in new_org_types:
+            db.add(ClientOrganisationType(client_id=client_id, org_type_cosh_id=cosh_id))
+
+    for field, value in data.items():
         setattr(client, field, value)
+
     await db.commit()
     await db.refresh(client)
     return client
