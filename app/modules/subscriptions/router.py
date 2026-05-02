@@ -26,6 +26,7 @@ from app.modules.advisory.models import PGRecommendation, PGTimeline, PGPractice
 from app.modules.advisory.models import SPRecommendation, SPTimeline, SPPractice, SPElement
 from app.modules.platform.models import UserRole, RoleType
 from app.modules.orders.models import DealerProfile
+from app.modules.clients.models import Client, ClientLocation, ClientStatus
 
 router = APIRouter(tags=["Subscriptions"])
 
@@ -1158,6 +1159,93 @@ async def get_today_advisory(
             "timelines": timeline_data,
         })
 
+    return out
+
+
+# ── Farmer: Unsubscribe ───────────────────────────────────────────────────────
+
+@router.put("/farmer/subscriptions/{subscription_id}/unsubscribe")
+async def unsubscribe(
+    subscription_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Self-subscribed: cancel freely. Company-assigned: returns 400 (request required)."""
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.farmer_user_id == current_user.id,
+            Subscription.status == SubscriptionStatus.ACTIVE,
+        )
+    )).scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Active subscription not found")
+
+    if sub.subscription_type == SubscriptionType.SELF:
+        sub.status = SubscriptionStatus.CANCELLED
+        await db.commit()
+        return {"detail": "Unsubscribed successfully", "status": sub.status}
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Company-assigned subscriptions cannot be cancelled by the farmer. Please contact your company."
+        )
+
+
+# ── Farmer: Active advisories in district ─────────────────────────────────────
+
+@router.get("/farmer/active-advisories-in-district")
+async def active_advisories_in_district(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Returns active packages from clients serving the farmer's district."""
+    farmer_district = current_user.district_cosh_id
+    if not farmer_district:
+        return []
+
+    location_result = await db.execute(
+        select(ClientLocation).where(
+            ClientLocation.district_cosh_id == farmer_district,
+            ClientLocation.status == "ACTIVE",
+        )
+    )
+    client_ids = list({loc.client_id for loc in location_result.scalars().all()})
+    if not client_ids:
+        return []
+
+    # Get active packages for these clients
+    pkg_result = await db.execute(
+        select(Package).where(
+            Package.client_id.in_(client_ids),
+            Package.status == "ACTIVE",
+        ).order_by(Package.name)
+    )
+    packages = pkg_result.scalars().all()
+
+    # Get farmer's already subscribed client+package combos to exclude them
+    sub_result = await db.execute(
+        select(Subscription).where(
+            Subscription.farmer_user_id == current_user.id,
+            Subscription.status.in_([SubscriptionStatus.ACTIVE, SubscriptionStatus.WAITLISTED]),
+        )
+    )
+    existing_pkg_ids = {s.package_id for s in sub_result.scalars().all()}
+
+    out = []
+    for pkg in packages:
+        if pkg.id in existing_pkg_ids:
+            continue
+        client = (await db.execute(select(Client).where(Client.id == pkg.client_id))).scalar_one_or_none()
+        out.append({
+            "package_id": pkg.id,
+            "package_name": pkg.name,
+            "crop_cosh_id": pkg.crop_cosh_id,
+            "client_id": pkg.client_id,
+            "company_name": client.display_name or client.full_name if client else None,
+            "company_logo": client.logo_url if client else None,
+            "primary_colour": client.primary_colour if client else None,
+        })
     return out
 
 

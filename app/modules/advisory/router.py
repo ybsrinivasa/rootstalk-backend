@@ -10,6 +10,7 @@ from app.modules.platform.models import User
 from app.modules.advisory.models import (
     Package, PackageLocation, PackageAuthor, PackageVariable,
     Parameter, Variable, PackageVariable,
+    ParameterTranslation, VariableTranslation, TranslationStatus,
     Timeline, Practice, Element, Relation, ConditionalQuestion, PracticeConditional,
     PackageStatus, PackageType,
 )
@@ -189,6 +190,18 @@ async def create_parameter(
     return param
 
 
+@router.get("/client/{client_id}/parameters/{parameter_id}/variables")
+async def list_variables(
+    client_id: str, parameter_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(Variable).where(Variable.parameter_id == parameter_id).order_by(Variable.created_at)
+    )
+    return result.scalars().all()
+
+
 @router.post("/client/{client_id}/parameters/{parameter_id}/variables", status_code=201)
 async def create_variable(
     client_id: str, parameter_id: str,
@@ -202,6 +215,159 @@ async def create_variable(
     await db.commit()
     await db.refresh(var)
     return var
+
+
+# ── Custom Parameters: extended CRUD (status, edit, translation) ─────────────
+
+@router.put("/client/{client_id}/parameters/{parameter_id}/status")
+async def toggle_parameter_status(
+    client_id: str, parameter_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Activate or deactivate a custom parameter. Block delete — only inactivate."""
+    param = (await db.execute(
+        select(Parameter).where(Parameter.id == parameter_id, Parameter.client_id == client_id)
+    )).scalar_one_or_none()
+    if not param:
+        raise HTTPException(status_code=404, detail="Parameter not found")
+    param.status = data.get("status", "INACTIVE")
+    await db.commit()
+    return {"id": parameter_id, "status": param.status}
+
+
+@router.put("/client/{client_id}/parameters/{parameter_id}/variables/{variable_id}")
+async def update_variable(
+    client_id: str, parameter_id: str, variable_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Edit variable text. Resets all its translations to PENDING_REVIEW per spec A1.4."""
+    var = (await db.execute(
+        select(Variable).where(Variable.id == variable_id, Variable.parameter_id == parameter_id)
+    )).scalar_one_or_none()
+    if not var:
+        raise HTTPException(status_code=404, detail="Variable not found")
+    if "name" in data and data["name"] != var.name:
+        var.name = data["name"]
+        # Reset all translations to PENDING_REVIEW
+        translations = (await db.execute(
+            select(VariableTranslation).where(VariableTranslation.variable_id == variable_id)
+        )).scalars().all()
+        for t in translations:
+            t.translation_status = TranslationStatus.PENDING
+    await db.commit()
+    return {"id": variable_id, "name": var.name}
+
+
+@router.put("/client/{client_id}/parameters/{parameter_id}/variables/{variable_id}/status")
+async def toggle_variable_status(
+    client_id: str, parameter_id: str, variable_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Activate or deactivate a variable. Cannot delete once used in a published PoP."""
+    var = (await db.execute(
+        select(Variable).where(Variable.id == variable_id, Variable.parameter_id == parameter_id)
+    )).scalar_one_or_none()
+    if not var:
+        raise HTTPException(status_code=404, detail="Variable not found")
+    var.status = data.get("status", "INACTIVE")
+    await db.commit()
+    return {"id": variable_id, "status": var.status}
+
+
+@router.get("/client/{client_id}/parameters/{parameter_id}/translations")
+async def list_parameter_translations(
+    client_id: str, parameter_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List all language translations for a parameter."""
+    translations = (await db.execute(
+        select(ParameterTranslation).where(ParameterTranslation.parameter_id == parameter_id)
+    )).scalars().all()
+    return [{"language_code": t.language_code, "name": t.name,
+             "status": t.translation_status.value} for t in translations]
+
+
+@router.put("/client/{client_id}/parameters/{parameter_id}/translations/{lang_code}")
+async def approve_parameter_translation(
+    client_id: str, parameter_id: str, lang_code: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Approve or edit a parameter translation."""
+    existing = (await db.execute(
+        select(ParameterTranslation).where(
+            ParameterTranslation.parameter_id == parameter_id,
+            ParameterTranslation.language_code == lang_code,
+        )
+    )).scalar_one_or_none()
+    if existing:
+        if "name" in data:
+            existing.name = data["name"]
+        existing.translation_status = TranslationStatus.EXPERT_VALIDATED
+        existing.approved_by = current_user.id
+        existing.approved_at = datetime.now(timezone.utc)
+    else:
+        existing = ParameterTranslation(
+            parameter_id=parameter_id,
+            language_code=lang_code,
+            name=data.get("name", ""),
+            translation_status=TranslationStatus.EXPERT_VALIDATED,
+            approved_by=current_user.id,
+            approved_at=datetime.now(timezone.utc),
+        )
+        db.add(existing)
+    await db.commit()
+    return {"language_code": lang_code, "status": "EXPERT_VALIDATED"}
+
+
+@router.get("/client/{client_id}/parameters/{parameter_id}/variables/{variable_id}/translations")
+async def list_variable_translations(
+    client_id: str, parameter_id: str, variable_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    translations = (await db.execute(
+        select(VariableTranslation).where(VariableTranslation.variable_id == variable_id)
+    )).scalars().all()
+    return [{"language_code": t.language_code, "name": t.name,
+             "status": t.translation_status.value} for t in translations]
+
+
+@router.put("/client/{client_id}/parameters/{parameter_id}/variables/{variable_id}/translations/{lang_code}")
+async def approve_variable_translation(
+    client_id: str, parameter_id: str, variable_id: str, lang_code: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    existing = (await db.execute(
+        select(VariableTranslation).where(
+            VariableTranslation.variable_id == variable_id,
+            VariableTranslation.language_code == lang_code,
+        )
+    )).scalar_one_or_none()
+    if existing:
+        if "name" in data:
+            existing.name = data["name"]
+        existing.translation_status = TranslationStatus.EXPERT_VALIDATED
+    else:
+        existing = VariableTranslation(
+            variable_id=variable_id,
+            language_code=lang_code,
+            name=data.get("name", ""),
+            translation_status=TranslationStatus.EXPERT_VALIDATED,
+        )
+        db.add(existing)
+    await db.commit()
+    return {"language_code": lang_code, "status": "EXPERT_VALIDATED"}
 
 
 @router.put("/client/{client_id}/packages/{package_id}/variables")
