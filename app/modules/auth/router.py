@@ -240,6 +240,66 @@ async def change_password(
     return {"detail": "Password changed successfully"}
 
 
+@router.post("/me/request-delete-otp")
+async def request_delete_otp(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Send OTP to farmer's phone to confirm account deletion."""
+    if not current_user.phone:
+        raise HTTPException(status_code=422, detail="No phone number on this account")
+    otp_code = await create_phone_otp(db, current_user.phone)
+    response = {"detail": "OTP sent to your phone"}
+    if settings.environment == "development":
+        response["dev_otp"] = otp_code
+    return response
+
+
+@router.post("/me/confirm-delete")
+async def confirm_delete_account(
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Verify OTP and soft-delete the account. Active subscriptions cancelled. Data retained 30 days."""
+    otp_code = (data.get("otp_code") or "").strip()
+    if not otp_code:
+        raise HTTPException(status_code=422, detail="OTP required")
+    if not current_user.phone:
+        raise HTTPException(status_code=422, detail="No phone number on this account")
+
+    valid = await verify_phone_otp(db, current_user.phone, otp_code)
+    if not valid:
+        raise HTTPException(status_code=401, detail="Invalid or expired OTP")
+
+    # Soft delete: anonymise personal data, cancel subscriptions
+    from app.modules.subscriptions.models import Subscription, SubscriptionStatus
+
+    # Cancel all active subscriptions
+    subs = (await db.execute(
+        select(Subscription).where(
+            Subscription.farmer_user_id == current_user.id,
+            Subscription.status == SubscriptionStatus.ACTIVE,
+        )
+    )).scalars().all()
+    for sub in subs:
+        sub.status = SubscriptionStatus.CANCELLED
+
+    # Anonymise the user record
+    import secrets as _secrets
+    current_user.name = "Deleted User"
+    current_user.phone = f"deleted_{_secrets.token_hex(8)}"  # prevents phone reuse lookup
+    current_user.email = None
+    current_user.gps_lat = None
+    current_user.gps_lng = None
+    current_user.address_line = None
+    current_user.locality = None
+    current_user.town = None
+
+    await db.commit()
+    return {"detail": "Account deleted. Your data will be fully removed within 30 days."}
+
+
 # ── Shared ─────────────────────────────────────────────────────────────────────
 
 @router.get("/me", response_model=UserOut)
