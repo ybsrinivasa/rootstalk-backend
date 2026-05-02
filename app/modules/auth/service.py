@@ -1,12 +1,13 @@
 import random
 import string
 import hashlib
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, or_
 from sqlalchemy.orm import selectinload
 from app.config import settings
 from app.modules.platform.models import User, UserRole, RoleType, StatusEnum
@@ -45,14 +46,28 @@ def decode_token(token: str) -> Optional[dict]:
 
 def _build_token(user: User) -> str:
     active_roles = [r.role_type.value for r in user.roles if r.status == StatusEnum.ACTIVE]
-    return create_access_token({"sub": user.id, "roles": active_roles})
+    return create_access_token({"sub": user.id, "roles": active_roles, "jti": user.current_session_id})
+
+
+async def start_new_session(db: AsyncSession, user: User) -> str:
+    """Generate a new session_id, store on user, return it. Invalidates all previous tokens."""
+    new_session_id = secrets.token_hex(16)
+    user.current_session_id = new_session_id
+    await db.commit()
+    return new_session_id
 
 
 # ── User lookups ───────────────────────────────────────────────────────────────
 
 async def get_user_by_phone(db: AsyncSession, phone: str) -> Optional[User]:
+    """Find user by phone. Excludes accounts whose 30-day grace period has fully expired
+    (so a re-used phone after full deletion looks 'not found' and creates a fresh user)."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
     result = await db.execute(
-        select(User).options(selectinload(User.roles)).where(User.phone == phone)
+        select(User).options(selectinload(User.roles)).where(
+            User.phone == phone,
+            or_(User.deleted_at.is_(None), User.deleted_at > cutoff),
+        )
     )
     return result.scalar_one_or_none()
 

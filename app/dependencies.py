@@ -18,6 +18,15 @@ async def get_current_user(
     user = await get_user_by_id(db, payload["sub"])
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    # Single-device enforcement: if token has a jti and it doesn't match the user's
+    # current_session_id, this token was issued for a previous device. Older tokens
+    # without jti are still allowed (graceful migration — they expire naturally).
+    token_jti = payload.get("jti")
+    if token_jti and user.current_session_id and token_jti != user.current_session_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session ended — signed in on another device",
+        )
     return user
 
 

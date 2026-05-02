@@ -11,7 +11,8 @@ from app.modules.auth.schemas import (
 )
 from app.modules.auth.service import (
     create_phone_otp, verify_phone_otp, get_or_create_farmer,
-    get_user_by_email, verify_password, hash_password, _build_token, get_user_by_id
+    get_user_by_email, verify_password, hash_password, _build_token, get_user_by_id,
+    start_new_session,
 )
 from app.modules.auth.models import EmailOTP
 from app.modules.clients.service import _send_email
@@ -69,12 +70,21 @@ async def request_otp(request: PhoneOtpRequest, db: AsyncSession = Depends(get_d
 
 @router.post("/verify-otp", response_model=TokenResponse)
 async def verify_otp(request: PhoneOtpVerify, db: AsyncSession = Depends(get_db)):
-    """Step 2: verify OTP and return JWT. Creates user if first login."""
+    """Step 2: verify OTP and return JWT. Creates user if first login.
+
+    If the account is within the 30-day grace period (deleted_at set),
+    auto-restore it on login. Beyond that, get_user_by_phone hides the
+    record and a fresh account is created.
+    """
     valid = await verify_phone_otp(db, request.phone, request.otp_code)
     if not valid:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired OTP")
 
     user = await get_or_create_farmer(db, request.phone)
+    # Auto-restore if soft-deleted within grace window
+    if user.deleted_at:
+        user.deleted_at = None
+    await start_new_session(db, user)
     return TokenResponse(access_token=_build_token(user))
 
 
@@ -90,6 +100,7 @@ async def admin_login(request: AdminLoginRequest, db: AsyncSession = Depends(get
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     if request.client_short_name:
         await _check_client_user(db, user, request.client_short_name)
+    await start_new_session(db, user)
     return TokenResponse(access_token=_build_token(user))
 
 
@@ -157,6 +168,7 @@ async def verify_email_otp(data: dict, db: AsyncSession = Depends(get_db)):
     if client_short_name and otp.purpose == "LOGIN":
         await _check_client_user(db, user, client_short_name)
     await db.commit()
+    await start_new_session(db, user)
     return TokenResponse(access_token=_build_token(user))
 
 
@@ -272,10 +284,13 @@ async def confirm_delete_account(
     if not valid:
         raise HTTPException(status_code=401, detail="Invalid or expired OTP")
 
-    # Soft delete: anonymise personal data, cancel subscriptions
+    # Soft delete: mark deleted_at — actual anonymisation happens after 30 days
+    # via the daily Celery task. Within 30 days, signing in restores the account.
     from app.modules.subscriptions.models import Subscription, SubscriptionStatus
 
-    # Cancel all active subscriptions
+    current_user.deleted_at = datetime.now(timezone.utc)
+
+    # Cancel active subscriptions immediately
     subs = (await db.execute(
         select(Subscription).where(
             Subscription.farmer_user_id == current_user.id,
@@ -285,19 +300,11 @@ async def confirm_delete_account(
     for sub in subs:
         sub.status = SubscriptionStatus.CANCELLED
 
-    # Anonymise the user record
-    import secrets as _secrets
-    current_user.name = "Deleted User"
-    current_user.phone = f"deleted_{_secrets.token_hex(8)}"  # prevents phone reuse lookup
-    current_user.email = None
-    current_user.gps_lat = None
-    current_user.gps_lng = None
-    current_user.address_line = None
-    current_user.locality = None
-    current_user.town = None
+    # Invalidate current session — any open device gets logged out
+    current_user.current_session_id = None
 
     await db.commit()
-    return {"detail": "Account deleted. Your data will be fully removed within 30 days."}
+    return {"detail": "Account scheduled for deletion. You can restore it by signing in within 30 days."}
 
 
 # ── Shared ─────────────────────────────────────────────────────────────────────

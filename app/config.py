@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     # Security
     secret_key: str
     algorithm: str = "HS256"
-    access_token_expire_minutes: int = 60
+    access_token_expire_minutes: int = 43200  # 30 days — reduces re-login friction for farmers
     refresh_token_expire_days: int = 7
 
     # Cosh sync

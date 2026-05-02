@@ -7,7 +7,12 @@ celery_app = Celery(
     "rootstalk",
     broker=settings.celery_broker_url,
     backend=settings.celery_result_backend,
-    include=["app.tasks.alerts", "app.tasks.query_expiry", "app.tasks.order_expiry"],
+    include=[
+        "app.tasks.alerts",
+        "app.tasks.query_expiry",
+        "app.tasks.order_expiry",
+        "app.tasks.account_deletion",
+    ],
 )
 
 celery_app.conf.beat_schedule = {
@@ -25,6 +30,11 @@ celery_app.conf.beat_schedule = {
     "order-expiry-check": {
         "task": "app.tasks.order_expiry.expire_stale_orders",
         "schedule": crontab(hour=1, minute=0),  # 01:00 UTC daily
+    },
+    # 30-day grace deletion — permanently anonymise expired soft-deletes
+    "anonymise-deleted-users": {
+        "task": "app.tasks.account_deletion.anonymise_deleted_users",
+        "schedule": crontab(hour=3, minute=0),  # 03:00 UTC daily
     },
 }
 

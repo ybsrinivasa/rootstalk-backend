@@ -535,6 +535,62 @@ async def farmer_pending_assignments(
     ]
 
 
+@router.get("/farmer/assignments/{subscription_id}/details")
+async def get_assignment_details(
+    subscription_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Returns full details of a pending assignment for farmer review."""
+    sub = await _get_subscription(db, subscription_id, current_user.id)
+
+    assignment = (await db.execute(
+        select(PromoterAssignment).where(PromoterAssignment.subscription_id == subscription_id)
+    )).scalar_one_or_none()
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Not an assignment")
+
+    package = (await db.execute(
+        select(Package).where(Package.id == sub.package_id)
+    )).scalar_one_or_none()
+    client = (await db.execute(
+        select(Client).where(Client.id == sub.client_id)
+    )).scalar_one_or_none()
+
+    # Parameter-variable selections for this package (plain-language summary)
+    pvs = (await db.execute(
+        select(PackageVariable, Parameter, Variable)
+        .join(Parameter, Parameter.id == PackageVariable.parameter_id)
+        .join(Variable, Variable.id == PackageVariable.variable_id)
+        .where(PackageVariable.package_id == sub.package_id)
+    )).all()
+    pv_summary = [{"parameter": p.name, "variable": v.name} for _, p, v in pvs]
+
+    promoter = (await db.execute(
+        select(User).where(User.id == assignment.promoter_user_id)
+    )).scalar_one_or_none()
+
+    return {
+        "subscription_id": sub.id,
+        "company": {
+            "id": client.id,
+            "name": client.display_name,
+            "logo_url": client.logo_url,
+            "primary_colour": client.primary_colour,
+            "tagline": client.tagline,
+        } if client else None,
+        "crop_cosh_id": package.crop_cosh_id if package else None,
+        "package_description": package.description if package else None,
+        "duration_days": package.duration_days if package else None,
+        "package_type": package.package_type.value if package and package.package_type else None,
+        "parameter_variables": pv_summary,
+        "promoter": {"name": promoter.name, "phone": promoter.phone} if promoter else None,
+        "promoter_type": assignment.promoter_type.value if hasattr(assignment.promoter_type, "value") else assignment.promoter_type,
+        "subscription_price": 199,  # hardcoded for now
+        "paid_by_company": True,
+    }
+
+
 @router.put("/farmer/assignments/{subscription_id}/respond")
 async def respond_to_assignment(
     subscription_id: str,
@@ -609,6 +665,27 @@ async def delegate_payment(
     db.add(pr)
     await db.commit()
     return {"detail": "Payment request sent", "expires_at": expires_at}
+
+
+@router.delete("/farmer/subscriptions/{subscription_id}/delegate-payment")
+async def cancel_delegation(
+    subscription_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Farmer cancels a pending payment delegation. They can then choose someone else
+    or pay themselves."""
+    sub = await _get_subscription(db, subscription_id, current_user.id)
+    pending = (await db.execute(
+        select(SubscriptionPaymentRequest).where(
+            SubscriptionPaymentRequest.subscription_id == sub.id,
+            SubscriptionPaymentRequest.status == "PENDING",
+        )
+    )).scalars().all()
+    for pr in pending:
+        pr.status = "CANCELLED"
+    await db.commit()
+    return {"detail": f"{len(pending)} pending request(s) cancelled"}
 
 
 @router.get("/dealer/payment-requests")
