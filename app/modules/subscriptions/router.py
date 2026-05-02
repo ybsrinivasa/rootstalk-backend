@@ -442,6 +442,99 @@ async def initiate_assignment(
     return {"subscription_id": sub.id, "assignment_id": assignment.id, "status": "Awaiting farmer approval"}
 
 
+@router.get("/promoter/farmer-lookup")
+async def promoter_farmer_lookup(
+    phone: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Check if farmer is registered and return their basic info for promoter assignment."""
+    from app.modules.auth.service import get_user_by_phone
+    farmer = await get_user_by_phone(db, phone)
+    if not farmer:
+        raise HTTPException(status_code=404, detail="No farmer found with this phone number. They must register in the RootsTalk app first.")
+    return {
+        "id": farmer.id,
+        "name": farmer.name,
+        "phone": farmer.phone,
+        "state_cosh_id": farmer.state_cosh_id,
+        "district_cosh_id": farmer.district_cosh_id,
+    }
+
+
+@router.get("/dealer/district-advisories")
+async def dealer_district_advisories(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Returns active packages in the dealer's registered district — helps dealer understand what farmers are being advised to buy."""
+    from app.modules.advisory.models import PackageLocation, PackageStatus
+
+    if not current_user.district_cosh_id:
+        return []
+
+    result = await db.execute(
+        select(Package, Client)
+        .join(PackageLocation, PackageLocation.package_id == Package.id)
+        .join(Client, Client.id == Package.client_id)
+        .where(
+            Package.client_id != None,  # noqa
+            Package.status == PackageStatus.ACTIVE,
+            PackageLocation.district_cosh_id == current_user.district_cosh_id,
+            Client.status == ClientStatus.ACTIVE,
+        )
+        .order_by(Package.crop_cosh_id)
+    )
+    rows = result.all()
+    return [
+        {
+            "package_id": pkg.id,
+            "package_name": pkg.name,
+            "crop_cosh_id": pkg.crop_cosh_id,
+            "client_id": client.id,
+            "client_name": client.display_name,
+            "client_colour": client.primary_colour,
+        }
+        for pkg, client in rows
+    ]
+
+
+@router.get("/farmer/assignments/pending")
+async def farmer_pending_assignments(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Returns subscriptions assigned by a Promoter that are awaiting farmer approval."""
+    result = await db.execute(
+        select(Subscription, PromoterAssignment)
+        .join(PromoterAssignment, PromoterAssignment.subscription_id == Subscription.id)
+        .where(
+            Subscription.farmer_user_id == current_user.id,
+            Subscription.subscription_type == SubscriptionType.ASSIGNED,
+            PromoterAssignment.status == AssignmentStatus.PENDING_FARMER_APPROVAL,
+        )
+    )
+    rows = result.all()
+    promoter_ids = [assignment.promoter_user_id for _, assignment in rows]
+    promoters = {}
+    for pid in set(promoter_ids):
+        p = (await db.execute(select(User).where(User.id == pid))).scalar_one_or_none()
+        if p:
+            promoters[pid] = {"name": p.name, "phone": p.phone}
+
+    return [
+        {
+            "subscription_id": sub.id,
+            "client_id": sub.client_id,
+            "package_id": sub.package_id,
+            "promoter": promoters.get(assignment.promoter_user_id, {}),
+            "promoter_type": assignment.promoter_type,
+            "created_at": assignment.created_at,
+        }
+        for sub, assignment in rows
+    ]
+
+
 @router.put("/farmer/assignments/{subscription_id}/respond")
 async def respond_to_assignment(
     subscription_id: str,
