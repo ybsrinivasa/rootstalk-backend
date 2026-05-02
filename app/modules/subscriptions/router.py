@@ -20,6 +20,7 @@ from app.modules.advisory.models import (
     Package, Parameter, Variable, PackageVariable, Timeline, Practice, Element,
     ConditionalQuestion, PracticeConditional,
 )
+from app.modules.clients.models import Client
 from app.modules.advisory.models import PGRecommendation, PGTimeline, PGPractice, PGElement
 from app.modules.advisory.models import SPRecommendation, SPTimeline, SPPractice, SPElement
 
@@ -210,7 +211,7 @@ async def create_subscription(
     if balance > 0:
         sub.status = SubscriptionStatus.ACTIVE
         sub.subscription_date = datetime.now(timezone.utc)
-        sub.reference_number = _generate_reference()
+        sub.reference_number = await _generate_reference_for_sub(db, sub.client_id)
         await _consume_pool_unit(db, request.client_id)
     else:
         # Waitlisted — 3-day expiry
@@ -400,7 +401,7 @@ async def respond_to_assignment(
         if balance > 0:
             sub.status = SubscriptionStatus.ACTIVE
             sub.subscription_date = now
-            sub.reference_number = _generate_reference()
+            sub.reference_number = await _generate_reference_for_sub(db, sub.client_id)
             await _consume_pool_unit(db, sub.client_id)
         # else stays WAITLISTED — company has 3 days
     else:
@@ -472,7 +473,7 @@ async def pay_subscription(
     if balance > 0:
         sub.status = SubscriptionStatus.ACTIVE
         sub.subscription_date = datetime.now(timezone.utc)
-        sub.reference_number = _generate_reference()
+        sub.reference_number = await _generate_reference_for_sub(db, sub.client_id)
         await _consume_pool_unit(db, sub.client_id)
 
     await db.commit()
@@ -544,9 +545,23 @@ async def _package_has_variable(db: AsyncSession, package_id: str, parameter_id:
     return result.scalar_one_or_none() is not None
 
 
-def _generate_reference() -> str:
+def _generate_reference(short_name: str = "") -> str:
+    """BL-15: Generate coded reference number — [SHORT_NAME][YY]-[4DIGIT_SEQ]
+    e.g. SEEDS26-0047. Falls back to RT-XXXXXXXX if no short_name available."""
+    year = str(datetime.now(timezone.utc).year)[2:]
+    seq = "".join(secrets.choice(string.digits) for _ in range(4))
+    if short_name:
+        prefix = short_name.upper()[:8]
+        return f"{prefix}{year}-{seq}"
     chars = string.ascii_uppercase + string.digits
     return "RT-" + "".join(secrets.choice(chars) for _ in range(10))
+
+
+async def _generate_reference_for_sub(db: AsyncSession, client_id: str) -> str:
+    """Fetch client short_name and generate coded reference."""
+    client = (await db.execute(select(Client).where(Client.id == client_id))).scalar_one_or_none()
+    short_name = client.short_name if client else ""
+    return _generate_reference(short_name)
 
 
 # ── Farmer: Subscription Payment (RazorPay Rs. 199) ──────────────────────────
@@ -587,7 +602,7 @@ async def verify_payment(
     sub.status = SubscriptionStatus.ACTIVE
     sub.subscription_date = datetime.now(timezone.utc)
     if not sub.reference_number:
-        sub.reference_number = _generate_reference()
+        sub.reference_number = await _generate_reference_for_sub(db, sub.client_id)
     await db.commit()
     return {"status": sub.status, "reference_number": sub.reference_number}
 
@@ -713,7 +728,7 @@ async def dealer_verify_payment(
         sub.status = SubscriptionStatus.ACTIVE
         sub.subscription_date = datetime.now(timezone.utc)
         if not sub.reference_number:
-            sub.reference_number = _generate_reference()
+            sub.reference_number = await _generate_reference_for_sub(db, sub.client_id)
 
     await db.commit()
     return {

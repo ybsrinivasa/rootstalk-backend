@@ -33,6 +33,9 @@ class OrderItemStatus(str, enum.Enum):
     SENT_FOR_APPROVAL = "SENT_FOR_APPROVAL"
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
+    NOT_NEEDED = "NOT_NEEDED"
+    SKIPPED = "SKIPPED"
+    REMOVED = "REMOVED"
 
 
 class Order(Base):
@@ -48,6 +51,7 @@ class Order(Base):
     date_to: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     status: Mapped[OrderStatus] = mapped_column(String(30), default=OrderStatus.DRAFT)
     locked_timelines: Mapped[list] = mapped_column(JSON, nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -67,6 +71,8 @@ class OrderItem(Base):
     volume_unit: Mapped[str] = mapped_column(String(50), nullable=True)
     price: Mapped[float] = mapped_column(DECIMAL(10, 2), nullable=True)
     estimated_volume: Mapped[float] = mapped_column(DECIMAL(10, 4), nullable=True)
+    relation_id: Mapped[str] = mapped_column(String(36), nullable=True)
+    relation_type: Mapped[str] = mapped_column(String(20), nullable=True)
     status: Mapped[OrderItemStatus] = mapped_column(String(30), default=OrderItemStatus.PENDING)
     postponed_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

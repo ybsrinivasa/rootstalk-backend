@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -17,6 +17,8 @@ from app.modules.subscriptions.models import Subscription
 from app.modules.sync.models import VolumeFormula
 from app.modules.advisory.models import Practice, Element
 from app.services.bl06_volume_calc import calculate_volume
+from app.services.bl07_brand_options import get_brand_options
+from app.modules.advisory.models import RelationType
 
 router = APIRouter(tags=["Orders"])
 
@@ -49,15 +51,32 @@ async def create_order(
         date_from=request.date_from,
         date_to=request.date_to,
         status=OrderStatus.SENT,
+        expires_at=datetime.now(timezone.utc) + timedelta(days=14),
     )
     db.add(order)
     await db.flush()
 
     for practice_id in request.practice_ids:
+        practice = (await db.execute(select(Practice).where(Practice.id == practice_id))).scalar_one_or_none()
+        relation_type = None
+        if practice and practice.relation_id:
+            rel = (await db.execute(
+                select(Practice.relation_id)
+                .join(Practice, Practice.id == practice.id)
+            )).scalar_one_or_none()
+            if practice.relation_id:
+                from app.modules.advisory.models import Relation
+                relation_row = (await db.execute(
+                    select(Relation).where(Relation.id == practice.relation_id)
+                )).scalar_one_or_none()
+                if relation_row:
+                    relation_type = relation_row.relation_type.value
         db.add(OrderItem(
             order_id=order.id,
             practice_id=practice_id,
-            timeline_id="",  # resolved from practice in production
+            timeline_id=practice.timeline_id if practice else "",
+            relation_id=practice.relation_id if practice else None,
+            relation_type=relation_type,
             status=OrderItemStatus.PENDING,
         ))
 
@@ -79,6 +98,36 @@ async def list_farmer_orders(
     orders = result.scalars().all()
     return [{"id": o.id, "status": o.status, "date_from": o.date_from, "date_to": o.date_to,
              "dealer_user_id": o.dealer_user_id, "created_at": o.created_at} for o in orders]
+
+
+@router.get("/farmer/orders/{order_id}")
+async def get_farmer_order_detail(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    order = await _get_farmer_order(db, order_id, current_user.id)
+    items_result = await db.execute(select(OrderItem).where(OrderItem.order_id == order.id))
+    items = items_result.scalars().all()
+    return {
+        "id": order.id, "status": order.status,
+        "date_from": order.date_from, "date_to": order.date_to,
+        "created_at": order.created_at,
+        "dealer_user_id": order.dealer_user_id,
+        "facilitator_user_id": order.facilitator_user_id,
+        "items": [
+            {
+                "id": i.id, "practice_id": i.practice_id, "status": i.status,
+                "relation_id": i.relation_id, "relation_type": i.relation_type,
+                "brand_name": i.brand_name if i.status == OrderItemStatus.APPROVED else None,
+                "given_volume": float(i.given_volume) if i.given_volume and i.status != OrderItemStatus.PENDING else None,
+                "estimated_volume": float(i.estimated_volume) if i.estimated_volume else None,
+                "volume_unit": i.volume_unit,
+                "price": float(i.price) if i.price and i.status != OrderItemStatus.PENDING else None,
+            }
+            for i in items
+        ],
+    }
 
 
 @router.put("/farmer/orders/{order_id}/cancel")
@@ -167,7 +216,9 @@ async def mark_item_available(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """BL-07: Dealer selects brand and enters volume/price before marking available."""
+    """BL-07: Dealer selects brand and enters volume/price before marking available.
+    Automatically closes other OR-group items (NOT_NEEDED) if this item has a relation_id.
+    """
     item = await _get_order_item(db, item_id, order_id)
     item.brand_cosh_id = data.get("brand_cosh_id")
     item.brand_name = data.get("brand_name") or None
@@ -177,6 +228,20 @@ async def mark_item_available(
     if data.get("price") is not None:
         item.price = data["price"]
     item.status = OrderItemStatus.AVAILABLE
+
+    # BL-07 OR-group auto-close: mark sibling OR items as NOT_NEEDED
+    if item.relation_id and item.relation_type == "OR":
+        siblings_result = await db.execute(
+            select(OrderItem).where(
+                OrderItem.order_id == order_id,
+                OrderItem.relation_id == item.relation_id,
+                OrderItem.id != item.id,
+                OrderItem.status == OrderItemStatus.PENDING,
+            )
+        )
+        for sibling in siblings_result.scalars().all():
+            sibling.status = OrderItemStatus.NOT_NEEDED
+
     await db.commit()
     return {"item_id": item_id, "status": item.status}
 
@@ -446,6 +511,104 @@ async def list_missing_brand_reports(
 ):
     result = await db.execute(select(MissingBrandReport).order_by(MissingBrandReport.created_at.desc()))
     return result.scalars().all()
+
+
+# ── BL-07: Brand options for an order item ───────────────────────────────────
+
+@router.get("/dealer/orders/{order_id}/items/{item_id}/brand-options")
+async def get_item_brand_options(
+    order_id: str, item_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """BL-07: Returns locked or unlocked brand options for a specific order item."""
+    item = await _get_order_item(db, item_id, order_id)
+    result = await get_brand_options(db, item.practice_id, current_user.id)
+    return result.to_dict()
+
+
+# ── Farmer: Item-level actions (BL-10) ────────────────────────────────────────
+
+@router.delete("/farmer/orders/{order_id}/items/{item_id}")
+async def remove_order_item(
+    order_id: str, item_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """BL-10: Farmer removes an item from order before approval."""
+    order = await _get_farmer_order(db, order_id, current_user.id)
+    if order.status in [OrderStatus.SENT_FOR_APPROVAL, OrderStatus.COMPLETED, OrderStatus.PARTIALLY_APPROVED]:
+        raise HTTPException(status_code=400, detail="Cannot remove items after order sent for approval")
+    item = await _get_order_item(db, item_id, order_id)
+    item.status = OrderItemStatus.REMOVED
+    await db.commit()
+    return {"item_id": item_id, "status": item.status}
+
+
+@router.put("/farmer/orders/{order_id}/items/{item_id}/try-another-dealer")
+async def try_another_dealer(
+    order_id: str, item_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """BL-10: Farmer re-routes a NOT_AVAILABLE or REJECTED item to another dealer."""
+    order = await _get_farmer_order(db, order_id, current_user.id)
+    item = await _get_order_item(db, item_id, order_id)
+    if item.status not in [OrderItemStatus.NOT_AVAILABLE, OrderItemStatus.REJECTED]:
+        raise HTTPException(status_code=400, detail="Only NOT_AVAILABLE or REJECTED items can be re-routed")
+    new_dealer_id = data.get("dealer_user_id")
+    if not new_dealer_id:
+        raise HTTPException(status_code=422, detail="dealer_user_id required")
+    item.status = OrderItemStatus.PENDING
+    item.brand_cosh_id = None
+    item.brand_name = None
+    item.given_volume = None
+    item.price = None
+    order.dealer_user_id = new_dealer_id
+    order.status = OrderStatus.PROCESSING
+    await db.commit()
+    return {"item_id": item_id, "status": item.status, "new_dealer_user_id": new_dealer_id}
+
+
+@router.put("/farmer/orders/{order_id}/items/{item_id}/skip")
+async def skip_order_item(
+    order_id: str, item_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """BL-10: Farmer skips a NOT_AVAILABLE item for this ordering cycle."""
+    await _get_farmer_order(db, order_id, current_user.id)
+    item = await _get_order_item(db, item_id, order_id)
+    if item.status != OrderItemStatus.NOT_AVAILABLE:
+        raise HTTPException(status_code=400, detail="Only NOT_AVAILABLE items can be skipped")
+    item.status = OrderItemStatus.SKIPPED
+    await db.commit()
+    return {"item_id": item_id, "status": item.status}
+
+
+@router.put("/farmer/orders/{order_id}/items/approve-all")
+async def approve_all_items(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """BL-10: Farmer approves all items awaiting approval at once."""
+    await _get_farmer_order(db, order_id, current_user.id)
+    result = await db.execute(
+        select(OrderItem).where(
+            OrderItem.order_id == order_id,
+            OrderItem.status == OrderItemStatus.SENT_FOR_APPROVAL,
+        )
+    )
+    items = result.scalars().all()
+    if not items:
+        raise HTTPException(status_code=400, detail="No items awaiting approval")
+    for item in items:
+        item.status = OrderItemStatus.APPROVED
+    await _update_order_status(db, order_id)
+    await db.commit()
+    return {"approved_count": len(items)}
 
 
 # ── Dealer: Accept order ──────────────────────────────────────────────────────

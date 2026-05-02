@@ -7,6 +7,7 @@ from app.database import get_db
 from app.config import settings
 from app.dependencies import get_current_user
 from app.modules.platform.models import User, StatusEnum
+from app.modules.subscriptions.models import Subscription, SubscriptionStatus
 from app.modules.clients.models import (
     Client, ClientOrganisationType, ClientUser, ClientUserRole,
     ClientLocation, ClientCrop, ClientStatus, ClientPromoter,
@@ -289,7 +290,30 @@ async def toggle_client_status(
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
 
+    old_status = client.status
     client.status = request.status
+
+    # BL-11: Suspend or resume subscriptions when client goes inactive/active
+    if request.status == ClientStatus.INACTIVE and old_status == ClientStatus.ACTIVE:
+        subs_result = await db.execute(
+            select(Subscription).where(
+                Subscription.client_id == client_id,
+                Subscription.status == SubscriptionStatus.ACTIVE,
+            )
+        )
+        for sub in subs_result.scalars().all():
+            sub.status = SubscriptionStatus.SUSPENDED
+
+    elif request.status == ClientStatus.ACTIVE and old_status == ClientStatus.INACTIVE:
+        subs_result = await db.execute(
+            select(Subscription).where(
+                Subscription.client_id == client_id,
+                Subscription.status == SubscriptionStatus.SUSPENDED,
+            )
+        )
+        for sub in subs_result.scalars().all():
+            sub.status = SubscriptionStatus.ACTIVE
+
     await db.commit()
     await db.refresh(client)
     return client

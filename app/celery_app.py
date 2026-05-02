@@ -7,7 +7,7 @@ celery_app = Celery(
     "rootstalk",
     broker=settings.celery_broker_url,
     backend=settings.celery_result_backend,
-    include=["app.tasks.alerts", "app.tasks.query_expiry"],
+    include=["app.tasks.alerts", "app.tasks.query_expiry", "app.tasks.order_expiry"],
 )
 
 celery_app.conf.beat_schedule = {
@@ -20,6 +20,11 @@ celery_app.conf.beat_schedule = {
     "query-expiry-check": {
         "task": "app.tasks.query_expiry.expire_queries",
         "schedule": crontab(minute=0),   # every hour on the hour
+    },
+    # BL-10: Daily order expiry — mark stale orders EXPIRED
+    "order-expiry-check": {
+        "task": "app.tasks.order_expiry.expire_stale_orders",
+        "schedule": crontab(hour=1, minute=0),  # 01:00 UTC daily
     },
 }
 
