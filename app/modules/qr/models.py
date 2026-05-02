@@ -51,9 +51,11 @@ class QRScan(Base):
     __tablename__ = "qr_scans"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
-    qr_code_id: Mapped[str] = mapped_column(String(36), ForeignKey("product_qr_codes.id"), nullable=False)
+    qr_code_id: Mapped[str] = mapped_column(String(36), ForeignKey("product_qr_codes.id"), nullable=True)
     farmer_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
     order_item_id: Mapped[str] = mapped_column(String(36), ForeignKey("order_items.id"), nullable=False)
     match_status: Mapped[str] = mapped_column(String(20), nullable=False)
+    expected_brand_cosh_id: Mapped[str] = mapped_column(String(200), nullable=True)
+    scanned_brand_cosh_id: Mapped[str] = mapped_column(String(200), nullable=True)
     scan_attempt_number: Mapped[int] = mapped_column(Integer, default=1)
     scanned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
