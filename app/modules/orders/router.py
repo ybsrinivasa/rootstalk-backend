@@ -17,8 +17,10 @@ from app.modules.subscriptions.models import Subscription
 from app.modules.sync.models import VolumeFormula
 from app.modules.advisory.models import Practice, Element
 from app.services.bl06_volume_calc import calculate_volume
+from math import radians, cos, sin, asin, sqrt
 from app.services.bl07_brand_options import get_brand_options
 from app.modules.advisory.models import RelationType
+from app.modules.subscriptions.models import PromoterAssignment, SubscriptionPaymentRequest, AssignmentStatus
 
 router = APIRouter(tags=["Orders"])
 
@@ -846,6 +848,256 @@ async def remove_dealership(
     rel.status = "INACTIVE"
     await db.commit()
     return {"detail": "Removed"}
+
+
+# ── Dealer: Delete order after packing list shared ───────────────────────────
+
+@router.delete("/dealer/orders/{order_id}")
+async def delete_dealer_order(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Dealer can delete order only after packing list has been shared."""
+    order = (await db.execute(
+        select(Order).where(Order.id == order_id, Order.dealer_user_id == current_user.id)
+    )).scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    pl = (await db.execute(select(PackingList).where(PackingList.order_id == order_id))).scalar_one_or_none()
+    if not pl or not pl.first_shared_at:
+        raise HTTPException(status_code=400, detail="Packing list must be shared before deleting")
+    order.status = OrderStatus.COMPLETED
+    order.dealer_user_id = None
+    await db.commit()
+    return {"detail": "Order removed from your queue"}
+
+
+# ── Dealer / Facilitator: Promoted farmers ────────────────────────────────────
+
+@router.get("/dealer/promoted-farmers")
+async def dealer_promoted_farmers(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return await _promoted_farmers(db, current_user.id)
+
+
+@router.get("/facilitator/promoted-farmers")
+async def facilitator_promoted_farmers(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return await _promoted_farmers(db, current_user.id)
+
+
+async def _promoted_farmers(db, promoter_user_id: str):
+    result = await db.execute(
+        select(PromoterAssignment).where(
+            PromoterAssignment.promoter_user_id == promoter_user_id,
+            PromoterAssignment.status == AssignmentStatus.ACTIVE,
+        )
+    )
+    assignments = result.scalars().all()
+    out = []
+    for a in assignments:
+        sub = (await db.execute(select(Subscription).where(Subscription.id == a.subscription_id))).scalar_one_or_none()
+        if not sub:
+            continue
+        farmer = (await db.execute(select(User).where(User.id == sub.farmer_user_id))).scalar_one_or_none()
+        out.append({
+            "subscription_id": sub.id,
+            "farmer_user_id": sub.farmer_user_id,
+            "farmer_name": farmer.name if farmer else None,
+            "farmer_phone": farmer.phone if farmer else None,
+            "client_id": sub.client_id,
+            "package_id": sub.package_id,
+            "status": sub.status,
+            "reference_number": sub.reference_number,
+            "crop_start_date": sub.crop_start_date,
+        })
+    return out
+
+
+# ── Facilitator: Accept / Reject / Confirm delivery / Return to farmer ────────
+
+@router.put("/facilitator/orders/{order_id}/accept")
+async def facilitator_accept_order(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    order = (await db.execute(
+        select(Order).where(Order.id == order_id, Order.facilitator_user_id == current_user.id)
+    )).scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.status != OrderStatus.SENT:
+        raise HTTPException(status_code=400, detail="Order can only be accepted when in SENT status")
+    order.status = OrderStatus.ACCEPTED
+    await db.commit()
+    return {"order_id": order_id, "status": order.status}
+
+
+@router.put("/facilitator/orders/{order_id}/reject")
+async def facilitator_reject_order(
+    order_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    order = (await db.execute(
+        select(Order).where(Order.id == order_id, Order.facilitator_user_id == current_user.id)
+    )).scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.status != OrderStatus.SENT:
+        raise HTTPException(status_code=400, detail="Order can only be rejected when in SENT status")
+    order.status = OrderStatus.CANCELLED
+    order.facilitator_user_id = None
+    await db.commit()
+    return {"order_id": order_id, "status": order.status, "reason": data.get("reason")}
+
+
+@router.put("/facilitator/orders/{order_id}/confirm-delivery")
+async def confirm_delivery(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Facilitator marks delivery done. Only enabled after delivery list shared."""
+    order = (await db.execute(
+        select(Order).where(Order.id == order_id, Order.facilitator_user_id == current_user.id)
+    )).scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    pl = (await db.execute(select(PackingList).where(PackingList.order_id == order_id))).scalar_one_or_none()
+    if not pl or not pl.first_shared_at:
+        raise HTTPException(status_code=400, detail="Delivery list must be shared before confirming")
+    order.status = OrderStatus.COMPLETED
+    await db.commit()
+    return {"order_id": order_id, "status": order.status}
+
+
+@router.put("/facilitator/orders/{order_id}/return-to-farmer")
+async def return_to_farmer(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Facilitator returns NOT_AVAILABLE items to farmer when unable to source."""
+    order = (await db.execute(
+        select(Order).where(Order.id == order_id, Order.facilitator_user_id == current_user.id)
+    )).scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    items = (await db.execute(
+        select(OrderItem).where(
+            OrderItem.order_id == order_id,
+            OrderItem.status == OrderItemStatus.NOT_AVAILABLE,
+        )
+    )).scalars().all()
+    for item in items:
+        item.status = OrderItemStatus.PENDING
+        item.brand_cosh_id = None
+        item.brand_name = None
+    order.dealer_user_id = None
+    order.status = OrderStatus.SENT
+    await db.commit()
+    return {"order_id": order_id, "returned_items": len(items)}
+
+
+# ── Facilitator: Nearby dealers for forwarding ───────────────────────────────
+
+@router.get("/facilitator/nearby-dealers")
+async def nearby_dealers(
+    order_type: Optional[str] = None,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Returns up to 5 nearest dealers filtered by order type (PESTICIDE/FERTILISER/SEED)."""
+    if lat is None:
+        lat = float(current_user.gps_lat) if current_user.gps_lat else 0.0
+    if lng is None:
+        lng = float(current_user.gps_lng) if current_user.gps_lng else 0.0
+
+    profiles = (await db.execute(select(DealerProfile))).scalars().all()
+
+    category_map = {"PESTICIDE": "PESTICIDES", "FERTILISER": "FERTILISERS", "SEED": "SEEDS"}
+    required_cat = category_map.get(order_type or "", "") if order_type else None
+
+    results = []
+    for profile in profiles:
+        if required_cat:
+            cats = profile.sell_categories or []
+            if required_cat not in cats:
+                continue
+        if not profile.shop_gps_lat or not profile.shop_gps_lng:
+            continue
+        dist = _haversine(lat, lng, float(profile.shop_gps_lat), float(profile.shop_gps_lng))
+        dealer = (await db.execute(select(User).where(User.id == profile.user_id))).scalar_one_or_none()
+        if dealer:
+            results.append({
+                "user_id": dealer.id,
+                "name": dealer.name,
+                "phone": dealer.phone,
+                "shop_name": profile.shop_name,
+                "shop_address": profile.shop_address,
+                "sell_categories": profile.sell_categories or [],
+                "distance_km": round(dist, 1),
+                "shop_gps_lat": float(profile.shop_gps_lat),
+                "shop_gps_lng": float(profile.shop_gps_lng),
+            })
+
+    results.sort(key=lambda x: x["distance_km"])
+    return results[:5]
+
+
+def _haversine(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    R = 6371.0
+    dlat = radians(lat2 - lat1)
+    dlng = radians(lng2 - lng1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlng / 2) ** 2
+    return R * 2 * asin(sqrt(a))
+
+
+# ── Facilitator: Payment requests ─────────────────────────────────────────────
+
+@router.get("/facilitator/payment-requests")
+async def facilitator_payment_requests(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(SubscriptionPaymentRequest).where(
+            SubscriptionPaymentRequest.requested_from_user_id == current_user.id,
+        ).order_by(SubscriptionPaymentRequest.created_at.desc())
+    )
+    rows = result.scalars().all()
+    return [{"id": r.id, "subscription_id": r.subscription_id, "farmer_user_id": r.farmer_user_id,
+             "amount": float(r.amount), "status": r.status, "expires_at": r.expires_at,
+             "created_at": r.created_at} for r in rows]
+
+
+@router.put("/facilitator/payment-requests/{request_id}/decline")
+async def facilitator_decline_payment(
+    request_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    req = (await db.execute(
+        select(SubscriptionPaymentRequest).where(
+            SubscriptionPaymentRequest.id == request_id,
+            SubscriptionPaymentRequest.requested_from_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not req:
+        raise HTTPException(status_code=404)
+    req.status = "DECLINED"
+    await db.commit()
+    return {"id": request_id, "status": "DECLINED"}
 
 
 # ── Farmer: Set farm area on subscription ─────────────────────────────────────
