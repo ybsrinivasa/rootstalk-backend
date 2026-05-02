@@ -401,6 +401,21 @@ async def add_location(
     return loc
 
 
+@router.delete("/client/{client_id}/locations/{location_id}", status_code=204)
+async def remove_location(
+    client_id: str, location_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    loc = (await db.execute(
+        select(ClientLocation).where(ClientLocation.id == location_id, ClientLocation.client_id == client_id)
+    )).scalar_one_or_none()
+    if not loc:
+        raise HTTPException(status_code=404, detail="Location not found")
+    await db.delete(loc)
+    await db.commit()
+
+
 # ── Portal: Crops ──────────────────────────────────────────────────────────────
 
 @router.get("/client/{client_id}/crops", response_model=list[CropOut])
@@ -436,6 +451,21 @@ async def add_crop(
     await db.commit()
     await db.refresh(crop)
     return crop
+
+
+@router.delete("/client/{client_id}/crops/{crop_id}", status_code=204)
+async def remove_crop(
+    client_id: str, crop_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    crop = (await db.execute(
+        select(ClientCrop).where(ClientCrop.id == crop_id, ClientCrop.client_id == client_id)
+    )).scalar_one_or_none()
+    if not crop:
+        raise HTTPException(status_code=404, detail="Crop not found")
+    await db.delete(crop)
+    await db.commit()
 
 
 # ── Portal: Users ──────────────────────────────────────────────────────────────
@@ -518,6 +548,26 @@ async def add_portal_user(
         status=cu.status.value,
         created_at=cu.created_at,
     )
+
+
+@router.put("/client/{client_id}/users/{user_id}/status")
+async def toggle_portal_user_status(
+    client_id: str, user_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    new_status = data.get("status")  # "ACTIVE" or "INACTIVE"
+    if new_status not in ("ACTIVE", "INACTIVE"):
+        raise HTTPException(status_code=422, detail="status must be ACTIVE or INACTIVE")
+    cu = (await db.execute(
+        select(ClientUser).where(ClientUser.client_id == client_id, ClientUser.user_id == user_id)
+    )).scalar_one_or_none()
+    if not cu:
+        raise HTTPException(status_code=404, detail="User not found")
+    cu.status = StatusEnum.ACTIVE if new_status == "ACTIVE" else StatusEnum.INACTIVE
+    await db.commit()
+    return {"detail": f"User status set to {new_status}"}
 
 
 # ── Field Manager: Dealers and Facilitators ────────────────────────────────────

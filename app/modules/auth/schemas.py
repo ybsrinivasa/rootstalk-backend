@@ -44,6 +44,7 @@ class UserOut(BaseModel):
     name: Optional[str] = None
     language_code: str
     roles: List[RoleOut] = []
+    portal_role: Optional[str] = None
 
     class Config:
         from_attributes = True

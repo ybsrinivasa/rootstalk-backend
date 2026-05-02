@@ -510,6 +510,7 @@ async def search_pundits(
     experience_band: Optional[str] = None,
     support_method: Optional[str] = None,
     crop_group: Optional[str] = None,
+    phone: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -556,6 +557,14 @@ async def search_pundits(
             )).scalars().all()
         }
         profiles = [p for p in profiles if p.id in cg_pundit_ids]
+
+    if phone:
+        phone_user_ids = {
+            u.id for u in (await db.execute(
+                select(User).where(User.phone.like(f"%{phone}%"))
+            )).scalars().all()
+        }
+        profiles = [p for p in profiles if p.user_id in phone_user_ids]
 
     # Already onboarded by this client?
     onboarded_ids = {

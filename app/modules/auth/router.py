@@ -243,8 +243,22 @@ async def change_password(
 # ── Shared ─────────────────────────────────────────────────────────────────────
 
 @router.get("/me", response_model=UserOut)
-async def get_me(current_user: User = Depends(get_current_user)):
-    return current_user
+async def get_me(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    cu = (await db.execute(
+        select(ClientUser).where(
+            ClientUser.user_id == current_user.id,
+            ClientUser.status == StatusEnum.ACTIVE,
+        )
+    )).scalar_one_or_none()
+    return {
+        "id": current_user.id,
+        "email": current_user.email,
+        "name": current_user.name,
+        "phone": current_user.phone,
+        "language_code": current_user.language_code,
+        "roles": current_user.roles,
+        "portal_role": cu.role.value if cu else None,
+    }
 
 
 @router.put("/me/profile")
