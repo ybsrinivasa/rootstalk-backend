@@ -286,6 +286,18 @@ async def get_me(current_user: User = Depends(get_current_user), db: AsyncSessio
     }
 
 
+@router.get("/me/location")
+async def get_my_location(
+    current_user: User = Depends(get_current_user),
+):
+    """Return the authenticated user's registered location fields."""
+    return {
+        "state_cosh_id": current_user.state_cosh_id,
+        "district_cosh_id": current_user.district_cosh_id,
+        "sub_district_cosh_id": current_user.sub_district_cosh_id,
+    }
+
+
 @router.put("/me/profile")
 async def update_my_profile(
     data: dict,

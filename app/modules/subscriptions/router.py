@@ -183,6 +183,69 @@ async def guided_elimination_step(
     }
 
 
+# ── Discovery Endpoints ────────────────────────────────────────────────────────
+
+@router.get("/farmer/discover/crops")
+async def discover_crops(
+    district_cosh_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """All crops that have at least one ACTIVE package in the given district."""
+    from app.modules.advisory.models import PackageLocation, PackageStatus
+    result = await db.execute(
+        select(Package.crop_cosh_id)
+        .join(PackageLocation, PackageLocation.package_id == Package.id)
+        .where(
+            Package.client_id != None,  # noqa
+            Package.status == PackageStatus.ACTIVE,
+            PackageLocation.district_cosh_id == district_cosh_id,
+        )
+        .distinct()
+    )
+    crops = result.scalars().all()
+    return [{"crop_cosh_id": c} for c in crops]
+
+
+@router.get("/farmer/discover/companies")
+async def discover_companies(
+    crop_cosh_id: str,
+    district_cosh_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """All companies (clients) with at least one ACTIVE package for this crop+district."""
+    from app.modules.advisory.models import PackageLocation, PackageStatus
+    from app.modules.clients.models import Client, ClientStatus
+    result = await db.execute(
+        select(Package.client_id)
+        .join(PackageLocation, PackageLocation.package_id == Package.id)
+        .where(
+            Package.client_id != None,  # noqa
+            Package.crop_cosh_id == crop_cosh_id,
+            Package.status == PackageStatus.ACTIVE,
+            PackageLocation.district_cosh_id == district_cosh_id,
+        )
+        .distinct()
+    )
+    client_ids = result.scalars().all()
+
+    companies = []
+    for client_id in client_ids:
+        client = (await db.execute(
+            select(Client).where(Client.id == client_id, Client.status == ClientStatus.ACTIVE)
+        )).scalar_one_or_none()
+        if client:
+            companies.append({
+                "id": client.id,
+                "display_name": client.display_name,
+                "tagline": client.tagline,
+                "logo_url": client.logo_url,
+                "primary_colour": client.primary_colour,
+            })
+    return companies
+
+
 # ── Self-Subscription ─────────────────────────────────────────────────────────
 
 class SubscribeRequest(BaseModel):
@@ -418,7 +481,9 @@ async def respond_to_assignment(
 # ── Payment Delegation ────────────────────────────────────────────────────────
 
 class PaymentDelegateRequest(BaseModel):
-    requested_from_user_id: str
+    requested_from_user_id: Optional[str] = None
+    delegate_phone: Optional[str] = None  # phone-based lookup (e.g. "+919876543210")
+    role: Optional[str] = None  # DEALER or FACILITATOR (informational)
 
 
 @router.post("/farmer/subscriptions/{subscription_id}/delegate-payment")
@@ -429,11 +494,23 @@ async def delegate_payment(
     current_user: User = Depends(get_current_user),
 ):
     sub = await _get_subscription(db, subscription_id, current_user.id)
+
+    # Resolve delegate user — either by explicit ID or by phone number
+    resolved_user_id = request.requested_from_user_id
+    if not resolved_user_id and request.delegate_phone:
+        from app.modules.auth.service import get_user_by_phone
+        delegate_user = await get_user_by_phone(db, request.delegate_phone)
+        if not delegate_user:
+            raise HTTPException(status_code=404, detail="No registered user found with that phone number.")
+        resolved_user_id = delegate_user.id
+    if not resolved_user_id:
+        raise HTTPException(status_code=422, detail="Provide either requested_from_user_id or delegate_phone.")
+
     expires_at = datetime.now(timezone.utc) + timedelta(hours=PAYMENT_REQUEST_EXPIRY_HOURS)
     pr = SubscriptionPaymentRequest(
         subscription_id=subscription_id,
         farmer_user_id=current_user.id,
-        requested_from_user_id=request.requested_from_user_id,
+        requested_from_user_id=resolved_user_id,
         expires_at=expires_at,
     )
     db.add(pr)
