@@ -381,8 +381,16 @@ async def mark_item_available(
     current_user: User = Depends(get_current_user),
 ):
     """BL-07: Dealer selects brand and enters volume/price before marking available.
-    Automatically closes other OR-group items (NOT_NEEDED) if this item has a relation_id.
+
+    Part-aware sibling handling (Build C):
+      Same Part, different Option  -> mark sibling NOT_AVAILABLE (returned to farmer)
+      Same Part, same Option       -> leave alone (compound AND group; dealer fills these)
+      Different Part               -> leave alone (dealer processes that Part separately)
+
+    Falls back to flat OR-group closure if the relation_role is missing or malformed.
     """
+    from app.services.relations import decode_role
+
     item = await _get_order_item(db, item_id, order_id)
     item.brand_cosh_id = data.get("brand_cosh_id")
     item.brand_name = data.get("brand_name") or None
@@ -393,9 +401,49 @@ async def mark_item_available(
         item.price = data["price"]
     item.status = OrderItemStatus.AVAILABLE
 
-    # BL-07 OR-group auto-close: mark sibling OR items as NOT_NEEDED
-    if item.relation_id and item.relation_type == "OR":
-        siblings_result = await db.execute(
+    # Part-aware sibling handling
+    if item.relation_id and item.relation_role:
+        try:
+            my_coords = decode_role(item.relation_role)
+            siblings_result = await db.execute(
+                select(OrderItem).where(
+                    OrderItem.order_id == order_id,
+                    OrderItem.relation_id == item.relation_id,
+                    OrderItem.id != item.id,
+                )
+            )
+            for sibling in siblings_result.scalars().all():
+                if not sibling.relation_role:
+                    continue
+                try:
+                    s_coords = decode_role(sibling.relation_role)
+                except ValueError:
+                    continue
+                # Same Part, different Option -> mark NOT_AVAILABLE (returned to farmer)
+                if (
+                    s_coords.part == my_coords.part
+                    and s_coords.option != my_coords.option
+                    and sibling.status == OrderItemStatus.PENDING
+                ):
+                    sibling.status = OrderItemStatus.NOT_AVAILABLE
+                # Same Part, same Option (compound AND) -> leave alone, dealer fills these
+                # Different Part -> leave alone, dealer processes that Part separately
+        except ValueError:
+            # Malformed role: fall back to legacy flat OR closure
+            if item.relation_type == "OR":
+                fb_result = await db.execute(
+                    select(OrderItem).where(
+                        OrderItem.order_id == order_id,
+                        OrderItem.relation_id == item.relation_id,
+                        OrderItem.id != item.id,
+                        OrderItem.status == OrderItemStatus.PENDING,
+                    )
+                )
+                for sibling in fb_result.scalars().all():
+                    sibling.status = OrderItemStatus.NOT_AVAILABLE
+    elif item.relation_id and item.relation_type == "OR":
+        # No relation_role at all (legacy data) — preserve original flat OR closure
+        fb_result = await db.execute(
             select(OrderItem).where(
                 OrderItem.order_id == order_id,
                 OrderItem.relation_id == item.relation_id,
@@ -403,11 +451,201 @@ async def mark_item_available(
                 OrderItem.status == OrderItemStatus.PENDING,
             )
         )
-        for sibling in siblings_result.scalars().all():
-            sibling.status = OrderItemStatus.NOT_NEEDED
+        for sibling in fb_result.scalars().all():
+            sibling.status = OrderItemStatus.NOT_AVAILABLE
 
     await db.commit()
     return {"item_id": item_id, "status": item.status}
+
+
+@router.post("/dealer/orders/{order_id}/relations/{relation_id}/parts/{part_index}/select-option")
+async def select_option(
+    order_id: str, relation_id: str, part_index: int,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Dealer selects an Option for a Part atomically.
+    All items in that Option become AVAILABLE; items in other Options of this Part
+    become NOT_AVAILABLE. Brand selection then happens per item via the existing
+    /available endpoint.
+    Body: { option_index: int }
+    """
+    from app.services.relations import decode_role
+
+    option_index = data.get("option_index")
+    if option_index is None:
+        raise HTTPException(status_code=422, detail="option_index required")
+
+    order = (await db.execute(
+        select(Order).where(Order.id == order_id, Order.dealer_user_id == current_user.id)
+    )).scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    items = (await db.execute(
+        select(OrderItem).where(
+            OrderItem.order_id == order_id,
+            OrderItem.relation_id == relation_id,
+        )
+    )).scalars().all()
+    if not items:
+        raise HTTPException(status_code=404, detail="Relation not in this order")
+
+    affected = {"available": 0, "not_available": 0}
+    for item in items:
+        if not item.relation_role:
+            continue
+        try:
+            coords = decode_role(item.relation_role)
+        except ValueError:
+            continue
+        if coords.part != part_index:
+            continue
+        if coords.option == option_index:
+            item.status = OrderItemStatus.AVAILABLE
+            affected["available"] += 1
+        else:
+            item.status = OrderItemStatus.NOT_AVAILABLE
+            affected["not_available"] += 1
+
+    # TODO(FCM): when all options in a Part end up NOT_AVAILABLE, push notification
+    # to farmer that this Part of the relation could not be fulfilled.
+    await db.commit()
+    return {"part_index": part_index, "selected_option": option_index, **affected}
+
+
+@router.post("/dealer/orders/{order_id}/relations/{relation_id}/parts/{part_index}/check-duplicate")
+async def check_duplicate(
+    order_id: str, relation_id: str, part_index: int,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Runtime duplicate check for a candidate Option.
+    Compares its common_name_cosh_ids against AVAILABLE items in OTHER Parts of
+    the order (any relation, plus standalone). Special inputs are exempt.
+    Body: { option_index: int }
+    Returns: { would_duplicate, duplicate_input_name, suggested_alternatives }
+    """
+    from app.services.relations import decode_role
+
+    option_index = data.get("option_index")
+    if option_index is None:
+        raise HTTPException(status_code=422, detail="option_index required")
+
+    order = (await db.execute(
+        select(Order).where(Order.id == order_id, Order.dealer_user_id == current_user.id)
+    )).scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    items = (await db.execute(
+        select(OrderItem).where(OrderItem.order_id == order_id)
+    )).scalars().all()
+    practice_ids = list({i.practice_id for i in items if i.practice_id})
+    practices = (await db.execute(
+        select(Practice).where(Practice.id.in_(practice_ids))
+    )).scalars().all() if practice_ids else []
+    practice_map = {p.id: p for p in practices}
+
+    # committed_set: AVAILABLE items in OTHER Parts (excluding this Part of this relation)
+    committed_cn_ids: set[str] = set()
+    for item in items:
+        if item.status != OrderItemStatus.AVAILABLE:
+            continue
+        if item.relation_id == relation_id and item.relation_role:
+            try:
+                c = decode_role(item.relation_role)
+                if c.part == part_index:
+                    continue  # same Part is what we're evaluating
+            except ValueError:
+                pass
+        prac = practice_map.get(item.practice_id)
+        if prac and prac.common_name_cosh_id and not prac.is_special_input:
+            committed_cn_ids.add(prac.common_name_cosh_id)
+
+    # Build per-Option cn_id sets for this Part
+    options_in_part: dict[int, set[str]] = {}
+    for item in items:
+        if item.relation_id != relation_id or not item.relation_role:
+            continue
+        try:
+            c = decode_role(item.relation_role)
+        except ValueError:
+            continue
+        if c.part != part_index:
+            continue
+        prac = practice_map.get(item.practice_id)
+        if prac and prac.common_name_cosh_id and not prac.is_special_input:
+            options_in_part.setdefault(c.option, set()).add(prac.common_name_cosh_id)
+
+    candidate_cn_ids = options_in_part.get(option_index, set())
+    overlap = committed_cn_ids & candidate_cn_ids
+    if not overlap:
+        return {"would_duplicate": False, "duplicate_input_name": None, "suggested_alternatives": []}
+
+    suggested = sorted(
+        opt_idx for opt_idx, opt_cn_ids in options_in_part.items()
+        if opt_idx != option_index and not (opt_cn_ids & committed_cn_ids)
+    )
+
+    return {
+        "would_duplicate": True,
+        "duplicate_input_name": next(iter(overlap)),
+        "suggested_alternatives": suggested,
+    }
+
+
+@router.post("/dealer/orders/{order_id}/relations/{relation_id}/parts/{part_index}/mark-option-not-available")
+async def mark_option_not_available(
+    order_id: str, relation_id: str, part_index: int,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Dealer marks an entire Option as not available without affecting other Options.
+    All items in (Part, Option) are set to NOT_AVAILABLE. Other Options remain in
+    their current state, allowing the dealer to choose another Option.
+    Body: { option_index: int }
+    """
+    from app.services.relations import decode_role
+
+    option_index = data.get("option_index")
+    if option_index is None:
+        raise HTTPException(status_code=422, detail="option_index required")
+
+    order = (await db.execute(
+        select(Order).where(Order.id == order_id, Order.dealer_user_id == current_user.id)
+    )).scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    items = (await db.execute(
+        select(OrderItem).where(
+            OrderItem.order_id == order_id,
+            OrderItem.relation_id == relation_id,
+        )
+    )).scalars().all()
+    if not items:
+        raise HTTPException(status_code=404, detail="Relation not in this order")
+
+    affected = 0
+    for item in items:
+        if not item.relation_role:
+            continue
+        try:
+            coords = decode_role(item.relation_role)
+        except ValueError:
+            continue
+        if coords.part == part_index and coords.option == option_index:
+            item.status = OrderItemStatus.NOT_AVAILABLE
+            affected += 1
+
+    # TODO(FCM): if this closes the last open Option in the Part, push notification
+    # to farmer that this Part of the relation could not be fulfilled.
+    await db.commit()
+    return {"part_index": part_index, "option_index": option_index, "not_available": affected}
 
 
 @router.put("/dealer/orders/{order_id}/items/{item_id}/postpone")
@@ -620,6 +858,14 @@ async def get_dealer_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Dealer order detail with Part-aware relation structure (Build C).
+
+    Response includes both the legacy flat `items` array (unchanged for backward
+    compat) and a new `relations` array. Each relation lists Parts → Options →
+    items with progressive-reveal flags.
+    """
+    from app.services.relations import decode_role
+
     order = (await db.execute(
         select(Order).where(Order.id == order_id, Order.dealer_user_id == current_user.id)
     )).scalar_one_or_none()
@@ -627,23 +873,147 @@ async def get_dealer_order(
         raise HTTPException(status_code=404, detail="Order not found")
     items_result = await db.execute(select(OrderItem).where(OrderItem.order_id == order.id))
     items = items_result.scalars().all()
+
+    # Helper for the flat item shape
+    def item_brief(i: OrderItem) -> dict:
+        return {
+            "id": i.id, "practice_id": i.practice_id,
+            "status": i.status.value if hasattr(i.status, "value") else i.status,
+            "brand_cosh_id": i.brand_cosh_id,
+            "brand_name": i.brand_name,
+            "given_volume": float(i.given_volume) if i.given_volume else None,
+            "estimated_volume": float(i.estimated_volume) if i.estimated_volume else None,
+            "volume_unit": i.volume_unit,
+            "price": float(i.price) if i.price else None,
+            "relation_id": i.relation_id,
+            "relation_type": i.relation_type,
+            "relation_role": i.relation_role,
+        }
+
+    # Group items by relation
+    by_relation: dict[str, list[OrderItem]] = {}
+    standalone: list[OrderItem] = []
+    for i in items:
+        if i.relation_id and i.relation_role:
+            by_relation.setdefault(i.relation_id, []).append(i)
+        else:
+            standalone.append(i)
+
+    # Batch-load practices and elements for locked-brand detection
+    all_practice_ids = list({i.practice_id for i in items if i.practice_id})
+    practice_map: dict[str, Practice] = {}
+    elements_by_practice: dict[str, list[Element]] = {}
+    if all_practice_ids:
+        practices = (await db.execute(
+            select(Practice).where(Practice.id.in_(all_practice_ids))
+        )).scalars().all()
+        practice_map = {p.id: p for p in practices}
+        elements = (await db.execute(
+            select(Element).where(Element.practice_id.in_(all_practice_ids))
+        )).scalars().all()
+        for e in elements:
+            elements_by_practice.setdefault(e.practice_id, []).append(e)
+
+    def has_locked_brand(practice_id: str) -> bool:
+        return any(
+            e.element_type == "brand" and e.cosh_ref
+            for e in elements_by_practice.get(practice_id, [])
+        )
+
+    relations_payload: list[dict] = []
+    for rel_id, rel_items in by_relation.items():
+        # Group by Part -> Option, capturing positions for ordering
+        parts_data: dict[int, dict[int, list[tuple[int, OrderItem]]]] = {}
+        for it in rel_items:
+            try:
+                c = decode_role(it.relation_role)
+            except ValueError:
+                continue
+            parts_data.setdefault(c.part, {}).setdefault(c.option, []).append((c.position, it))
+
+        parts_out: list[dict] = []
+        for part_idx in sorted(parts_data.keys()):
+            option_data: list[dict] = []
+            for opt_idx in sorted(parts_data[part_idx].keys()):
+                sorted_items = [it for (_, it) in sorted(parts_data[part_idx][opt_idx], key=lambda x: x[0])]
+                has_locked = any(has_locked_brand(it.practice_id) for it in sorted_items)
+                statuses = [
+                    (it.status.value if hasattr(it.status, "value") else it.status)
+                    for it in sorted_items
+                ]
+                if all(s == OrderItemStatus.AVAILABLE.value for s in statuses):
+                    option_status = "AVAILABLE"
+                elif all(s == OrderItemStatus.NOT_AVAILABLE.value for s in statuses):
+                    option_status = "NOT_AVAILABLE"
+                else:
+                    option_status = "NEW"
+                option_data.append({
+                    "option_index": opt_idx,
+                    "items": sorted_items,
+                    "has_locked_brand": has_locked,
+                    "is_compound": len(sorted_items) > 1,
+                    "option_status": option_status,
+                })
+
+            # Progressive reveal: hide Unlocked-brand Options while any Locked-brand
+            # Option in the same Part is still open (NEW or AVAILABLE).
+            any_locked = any(o["has_locked_brand"] for o in option_data)
+            any_locked_still_open = any(
+                o["has_locked_brand"] and o["option_status"] in ("NEW", "AVAILABLE")
+                for o in option_data
+            )
+            for od in option_data:
+                if any_locked and not od["has_locked_brand"]:
+                    od["visible"] = not any_locked_still_open
+                else:
+                    od["visible"] = True
+
+            options_out = [
+                {
+                    "option_index": od["option_index"],
+                    "is_compound": od["is_compound"],
+                    "has_locked_brand": od["has_locked_brand"],
+                    "visible": od["visible"],
+                    "option_status": od["option_status"],
+                    "items": [item_brief(it) for it in od["items"]],
+                }
+                for od in option_data
+            ]
+
+            any_available = any(o["option_status"] == "AVAILABLE" for o in option_data)
+            all_not_available = bool(option_data) and all(
+                o["option_status"] == "NOT_AVAILABLE" for o in option_data
+            )
+            if any_available:
+                part_status = "RESOLVED"
+            elif all_not_available:
+                part_status = "FAILED"
+            else:
+                part_status = "PENDING"
+
+            parts_out.append({
+                "part_index": part_idx,
+                "options": options_out,
+                "part_status": part_status,
+            })
+
+        relations_payload.append({
+            "relation_id": rel_id,
+            "relation_type": rel_items[0].relation_type if rel_items else None,
+            "parts": parts_out,
+        })
+
     return {
         "id": order.id, "status": order.status,
         "farmer_user_id": order.farmer_user_id, "client_id": order.client_id,
         "facilitator_user_id": order.facilitator_user_id,
         "date_from": order.date_from, "date_to": order.date_to,
         "created_at": order.created_at,
-        "items": [
-            {
-                "id": i.id, "practice_id": i.practice_id,
-                "status": i.status, "brand_cosh_id": i.brand_cosh_id,
-                "brand_name": i.brand_name,
-                "given_volume": float(i.given_volume) if i.given_volume else None,
-                "estimated_volume": float(i.estimated_volume) if i.estimated_volume else None,
-                "volume_unit": i.volume_unit, "price": float(i.price) if i.price else None,
-            }
-            for i in items
-        ],
+        # Flat list (unchanged shape for backward compat)
+        "items": [item_brief(i) for i in items],
+        # New: Part-aware relation structure
+        "relations": relations_payload,
+        "standalone_items": [item_brief(i) for i in standalone],
     }
 
 
