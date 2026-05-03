@@ -1249,6 +1249,7 @@ async def get_today_advisory(
         tl_windows: list[TLWindow] = []
         tl_date_map: dict = {}   # id → (from_date, to_date, day_num)
         pending_questions_by_tl: dict = {}   # tl.id → {question info}
+        blank_paths_by_tl: dict = {}         # tl.id → list of {question_id, question_text, farmer_answer}
 
         for tl, day_num in active_timelines:
             p_result = await db.execute(
@@ -1286,6 +1287,21 @@ async def get_today_advisory(
                     "question_text": bl02_result.pending_question.question_text,
                     "display_order": bl02_result.pending_question.display_order,
                 }
+
+            # Per spec §6.4: when farmer's answer hits a Blank-linked option,
+            # show "we'll ask again tomorrow" — naming the specific question.
+            if bl02_result.blank_path_questions:
+                cq_text_map = {q.id: q.question_text for q in cond_questions}
+                bp_list = []
+                for qid in bl02_result.blank_path_questions:
+                    if qid in cq_text_map and qid in today_answers:
+                        bp_list.append({
+                            "question_id": qid,
+                            "question_text": cq_text_map[qid],
+                            "farmer_answer": today_answers[qid],
+                        })
+                if bp_list:
+                    blank_paths_by_tl[tl.id] = bp_list
 
             visible_ids = set(bl02_result.visible_practices)
             visible_practices = [p for p in all_practices if p.id in visible_ids]
@@ -1458,6 +1474,9 @@ async def get_today_advisory(
             if tl.id in pending_questions_by_tl:
                 tl_entry["pending_conditional_question"] = pending_questions_by_tl[tl.id]
                 tl_entry["has_pending_question"] = True
+            # Per spec §6.4: blank-path questions for this timeline (named, with farmer's answer)
+            if tl.id in blank_paths_by_tl:
+                tl_entry["blank_path_questions"] = blank_paths_by_tl[tl.id]
             timeline_data.append(tl_entry)
 
         out.append({
