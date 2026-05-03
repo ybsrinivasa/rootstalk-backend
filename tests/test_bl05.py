@@ -213,84 +213,89 @@ def test_bl05_extra_negative_delta():
         assert r.new_from_date == original.from_date - timedelta(days=5)
 
 
-# ── Gap 1 — date-range overlap PO lock (spec §6.5) ────────────────────────────
+# ── PO lock is per timeline (corrected 2026-05-03) ────────────────────────────
+# Lock is by which timeline the ordered practices belong to — NOT by order's date range.
+# A new timeline inserted later whose dates fall within a previous order's range is NOT locked.
 
-def test_bl05_06_po_lock_overlapping_timeline_without_direct_match():
-    """Order's date range covers timeline T2 even though items reference T1.
-    T2 should still be PO-locked per spec §6.5."""
+def test_bl05_po_lock_only_when_item_references_timeline():
+    """Order's items reference T1. T2's window may overlap the order's date range,
+    but T2 is NOT PO-locked because no item in T2 was ordered."""
     from datetime import date
     from app.services.bl05_lock_detection import detect_lock, LockType, TimelineDateRange, OrderItemStub
 
+    t1 = TimelineDateRange(id="T1", from_date=date(2026, 5, 18), to_date=date(2026, 5, 22))
     t2 = TimelineDateRange(id="T2", from_date=date(2026, 5, 10), to_date=date(2026, 5, 15))
     today = date(2026, 5, 1)
 
+    # Order references T1 only; date range happens to span T2's window
     items = [OrderItemStub(
         timeline_id="T1",
         order_from_date=date(2026, 5, 5),
-        order_to_date=date(2026, 5, 20),
+        order_to_date=date(2026, 5, 22),
         status="AVAILABLE",
     )]
 
-    result = detect_lock(t2, today, items)
-    assert result.po_locked
-    assert result.locked
-    assert result.lock_type == LockType.PURCHASE_ORDER
+    # T1 is locked (its practice was ordered)
+    r_t1 = detect_lock(t1, today, items)
+    assert r_t1.po_locked
+    assert r_t1.lock_type == LockType.PURCHASE_ORDER
+
+    # T2 is NOT locked (no item references T2, even though dates overlap)
+    r_t2 = detect_lock(t2, today, items)
+    assert not r_t2.po_locked
+    assert not r_t2.locked
 
 
-def test_bl05_07_po_lock_no_overlap_no_lock():
-    from datetime import date
-    from app.services.bl05_lock_detection import detect_lock, TimelineDateRange, OrderItemStub
-
-    timeline = TimelineDateRange(id="T1", from_date=date(2026, 5, 20), to_date=date(2026, 5, 25))
-    today = date(2026, 5, 1)
-
-    items = [OrderItemStub(
-        timeline_id="X",
-        order_from_date=date(2026, 5, 1),
-        order_to_date=date(2026, 5, 10),
-        status="AVAILABLE",
-    )]
-
-    assert not detect_lock(timeline, today, items).po_locked
-
-
-def test_bl05_08_po_lock_partial_overlap_locks():
-    from datetime import date
-    from app.services.bl05_lock_detection import detect_lock, TimelineDateRange, OrderItemStub
-
-    timeline = TimelineDateRange(id="T1", from_date=date(2026, 5, 10), to_date=date(2026, 5, 20))
-    today = date(2026, 5, 1)
-
-    items = [OrderItemStub(
-        timeline_id="X",
-        order_from_date=date(2026, 5, 18),
-        order_to_date=date(2026, 5, 25),
-        status="AVAILABLE",
-    )]
-
-    assert detect_lock(timeline, today, items).po_locked
-
-
-def test_bl05_09_inactive_order_does_not_lock():
+def test_bl05_po_lock_active_statuses_only():
+    """Only items in active statuses lock the timeline. CANCELLED/EXPIRED do not."""
     from datetime import date
     from app.services.bl05_lock_detection import detect_lock, TimelineDateRange, OrderItemStub
 
     timeline = TimelineDateRange(id="T1", from_date=date(2026, 5, 10), to_date=date(2026, 5, 15))
     today = date(2026, 5, 1)
 
-    items = [OrderItemStub(
+    cancelled = [OrderItemStub(
         timeline_id="T1",
         order_from_date=date(2026, 5, 8),
         order_to_date=date(2026, 5, 18),
         status="CANCELLED",
     )]
+    assert not detect_lock(timeline, today, cancelled).po_locked
 
-    assert not detect_lock(timeline, today, items).po_locked
+    active = [OrderItemStub(
+        timeline_id="T1",
+        order_from_date=date(2026, 5, 8),
+        order_to_date=date(2026, 5, 18),
+        status="AVAILABLE",
+    )]
+    assert detect_lock(timeline, today, active).po_locked
+
+
+def test_bl05_new_timeline_inserted_within_locked_range_is_not_locked():
+    """User scenario: farmer ordered for T1 (Day 20-25). SE inserts T2 (Day 10-15) later.
+    T1 stays locked. T2 is NOT locked even though Day 10-15 falls within the time
+    spanned by the original order. Each timeline is judged independently."""
+    from datetime import date
+    from app.services.bl05_lock_detection import detect_lock, TimelineDateRange, OrderItemStub
+
+    t1 = TimelineDateRange(id="T1", from_date=date(2026, 5, 20), to_date=date(2026, 5, 25))
+    t2_inserted = TimelineDateRange(id="T2_NEW", from_date=date(2026, 5, 10), to_date=date(2026, 5, 15))
+    today = date(2026, 5, 5)
+
+    items = [OrderItemStub(
+        timeline_id="T1",
+        order_from_date=date(2026, 5, 5),
+        order_to_date=date(2026, 5, 25),
+        status="AVAILABLE",
+    )]
+
+    assert detect_lock(t1, today, items).po_locked            # T1 locked
+    assert not detect_lock(t2_inserted, today, items).po_locked  # T2 still open
 
 
 # ── Gap 2 — CHA timelines don't shift but are locked normally ─────────────────
 
-def test_bl05_10_cha_timeline_does_not_shift():
+def test_bl05_cha_timeline_does_not_shift():
     from datetime import date
     from app.services.bl05_lock_detection import compute_date_shifts, TimelineDateRange
 
@@ -315,7 +320,7 @@ def test_bl05_10_cha_timeline_does_not_shift():
     assert not cha_result.content_updated
 
 
-def test_bl05_11_cha_timeline_locked_when_today_inside():
+def test_bl05_cha_timeline_locked_when_today_inside():
     from datetime import date
     from app.services.bl05_lock_detection import detect_lock, TimelineDateRange, LockType
 

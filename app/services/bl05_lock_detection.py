@@ -53,19 +53,19 @@ def detect_lock(
 
     Lock types (either triggers a lock):
     1. VIEWED LOCK: today falls within the timeline window.
-    2. PURCHASE ORDER LOCK: any active order's date range overlaps the timeline's window
-       (per spec §6.5 — purchase orders may span multiple timelines, so a timeline is
-       PO-locked when an order's farmer-selected date range touches it, not just when
-       an order item's `timeline_id` matches).
+    2. PURCHASE ORDER LOCK: any active order item directly references this timeline
+       (item.timeline_id == timeline.id). The lock is PER TIMELINE, NOT per order
+       date-range. A new timeline inserted later whose dates fall within a previous
+       order's date range is NOT locked — only timelines whose practices were
+       actually ordered are locked. (Confirmed by user 2026-05-03, supersedes the
+       date-range-overlap interpretation of spec §6.5 prose.)
 
     Returns LockResult with lock type details.
     """
     viewed_locked = timeline.from_date <= today <= timeline.to_date
 
     po_locked = any(
-        item.status in ACTIVE_ORDER_STATUSES
-        and item.order_from_date <= timeline.to_date
-        and item.order_to_date >= timeline.from_date
+        item.timeline_id == timeline.id and item.status in ACTIVE_ORDER_STATUSES
         for item in active_order_items
     )
 
