@@ -15,7 +15,7 @@ from app.modules.orders.models import (
 )
 from app.modules.subscriptions.models import Subscription
 from app.modules.sync.models import VolumeFormula
-from app.modules.advisory.models import Practice, Element
+from app.modules.advisory.models import Practice, Element, Timeline
 from app.services.bl06_volume_calc import calculate_volume
 from math import radians, cos, sin, asin, sqrt
 from app.services.bl07_brand_options import get_brand_options
@@ -59,6 +59,23 @@ async def create_order(
     )).scalar_one_or_none()
     if not sub:
         raise HTTPException(status_code=404, detail="Subscription not found")
+
+    # ── Timeline-type integrity: orders must NOT mix DBS / DAS / CALENDAR ─
+    if request.practice_ids:
+        practices_with_tl = (await db.execute(
+            select(Practice, Timeline)
+            .join(Timeline, Timeline.id == Practice.timeline_id)
+            .where(Practice.id.in_(request.practice_ids))
+        )).all()
+        if not practices_with_tl:
+            raise HTTPException(status_code=422, detail="No valid practices selected")
+        timing_types = {tl.from_type.value if hasattr(tl.from_type, 'value') else str(tl.from_type)
+                        for _, tl in practices_with_tl}
+        if len(timing_types) > 1:
+            raise HTTPException(
+                status_code=422,
+                detail="Cannot mix timing types in one order. Please order DBS, DAS, and Calendar items separately.",
+            )
 
     # ── Hard-lock acreage on first DAS order ──────────────────────────────
     if not sub.farm_area_confirmed_at:
@@ -126,8 +143,20 @@ async def list_farmer_orders(
         q = q.where(Order.status == status_filter)
     result = await db.execute(q)
     orders = result.scalars().all()
-    return [{"id": o.id, "status": o.status, "date_from": o.date_from, "date_to": o.date_to,
-             "dealer_user_id": o.dealer_user_id, "created_at": o.created_at} for o in orders]
+    out = []
+    for o in orders:
+        items_result = await db.execute(select(OrderItem).where(OrderItem.order_id == o.id))
+        items = items_result.scalars().all()
+        out.append({
+            "id": o.id,
+            "status": o.status,
+            "date_from": o.date_from,
+            "date_to": o.date_to,
+            "dealer_user_id": o.dealer_user_id,
+            "created_at": o.created_at,
+            "item_count": len(items),
+        })
+    return out
 
 
 @router.get("/farmer/orders/{order_id}")

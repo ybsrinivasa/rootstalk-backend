@@ -325,6 +325,13 @@ async def set_start_date(
     sub = await _get_subscription(db, subscription_id, current_user.id)
     new_start_raw = data.get("crop_start_date")
 
+    # Crop start date can be set or updated, but never cleared.
+    if not new_start_raw:
+        raise HTTPException(
+            status_code=422,
+            detail="Crop start date cannot be empty. You can update it but not remove it.",
+        )
+
     # First ever start date — just set it
     if not sub.crop_start_date:
         sub.crop_start_date = new_start_raw
@@ -396,6 +403,44 @@ async def set_start_date(
         "delta_days": delta_days,
         "timelines_shifted": len(shifts),
         "locked_timelines": sum(1 for s in shifts if s.was_locked),
+    }
+
+
+@router.get("/farmer/subscriptions/{subscription_id}/advisory/next-date")
+async def get_next_advisory_date(
+    subscription_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return the date of the next upcoming DAS practice for this subscription."""
+    from datetime import date as dt_date
+
+    sub = await _get_subscription(db, subscription_id, current_user.id)
+    if not sub.crop_start_date:
+        return {"next_date": None, "reason": "no_start_date"}
+
+    start = sub.crop_start_date.date() if hasattr(sub.crop_start_date, 'date') else sub.crop_start_date
+    today = dt_date.today()
+    day_offset = (today - start).days
+
+    timelines = (await db.execute(
+        select(Timeline).where(Timeline.package_id == sub.package_id)
+    )).scalars().all()
+
+    upcoming = [
+        tl for tl in timelines
+        if (tl.from_type.value if hasattr(tl.from_type, 'value') else str(tl.from_type)) == "DAS"
+        and int(tl.from_value) > day_offset
+    ]
+    if not upcoming:
+        return {"next_date": None, "reason": "no_more_practices"}
+
+    next_tl = min(upcoming, key=lambda t: int(t.from_value))
+    next_date = start + timedelta(days=int(next_tl.from_value))
+    return {
+        "next_date": next_date.isoformat(),
+        "timeline_name": next_tl.name,
+        "days_until": int(next_tl.from_value) - day_offset,
     }
 
 
@@ -1981,10 +2026,42 @@ async def buy_all_dbs(
     if not matching_practices:
         raise HTTPException(status_code=400, detail=f"No DBS {category.lower()} practices found")
 
-    # 14-day window from today for the dealer/facilitator to fulfil
+    # ── Timeline-type integrity sanity check (defensive) ──────────────────
+    # All matching practices were filtered from dbs_timelines, so all of
+    # their timelines are guaranteed to be DBS. We re-verify here so the
+    # type-isolation guarantee is explicit and any future regression is
+    # caught early.
+    dbs_tl_ids = {tl.id for tl in dbs_timelines}
+    bad = [p for p in matching_practices if p.timeline_id not in dbs_tl_ids]
+    if bad:
+        raise HTTPException(
+            status_code=500,
+            detail="Internal error: non-DBS practice slipped into DBS-only order",
+        )
+
+    # ── Date-range computation ────────────────────────────────────────────
+    # If crop_start_date is set, derive a focused buying window from the
+    # actual DBS values of the practices being ordered (DBS values are
+    # days BEFORE sowing; larger value = earlier date).
+    # If not set, fall back to a generic today + 14 days window.
     today = dt_date.today()
-    date_from = today
-    date_to = today + timedelta(days=14)
+    relevant_tl_ids = {p.timeline_id for p in matching_practices}
+    relevant_dbs_pairs = [
+        (int(tl.from_value), int(tl.to_value))
+        for tl in dbs_timelines if tl.id in relevant_tl_ids
+    ]
+
+    if sub.crop_start_date and relevant_dbs_pairs:
+        start = sub.crop_start_date.date() if hasattr(sub.crop_start_date, 'date') else sub.crop_start_date
+        # from_value is the larger # of days before sowing (earliest);
+        # to_value is the smaller # of days before sowing (latest).
+        earliest_buy = start - timedelta(days=max(v[0] for v in relevant_dbs_pairs))
+        latest_buy = start - timedelta(days=min(v[1] for v in relevant_dbs_pairs))
+        date_from = max(today, earliest_buy)
+        date_to = max(date_from, latest_buy)
+    else:
+        date_from = today
+        date_to = today + timedelta(days=14)
 
     order = Order(
         subscription_id=subscription_id,
