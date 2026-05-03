@@ -107,23 +107,19 @@ async def create_order(
         practice = (await db.execute(select(Practice).where(Practice.id == practice_id))).scalar_one_or_none()
         relation_type = None
         if practice and practice.relation_id:
-            rel = (await db.execute(
-                select(Practice.relation_id)
-                .join(Practice, Practice.id == practice.id)
+            from app.modules.advisory.models import Relation
+            relation_row = (await db.execute(
+                select(Relation).where(Relation.id == practice.relation_id)
             )).scalar_one_or_none()
-            if practice.relation_id:
-                from app.modules.advisory.models import Relation
-                relation_row = (await db.execute(
-                    select(Relation).where(Relation.id == practice.relation_id)
-                )).scalar_one_or_none()
-                if relation_row:
-                    relation_type = relation_row.relation_type.value
+            if relation_row:
+                relation_type = relation_row.relation_type.value
         db.add(OrderItem(
             order_id=order.id,
             practice_id=practice_id,
             timeline_id=practice.timeline_id if practice else "",
             relation_id=practice.relation_id if practice else None,
             relation_type=relation_type,
+            relation_role=practice.relation_role if practice else None,
             status=OrderItemStatus.PENDING,
         ))
 
@@ -138,6 +134,11 @@ async def list_farmer_orders(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    from app.modules.advisory.models import Relation
+    from app.services.relations import (
+        PracticeRef, build_structure, compute_count_display,
+    )
+
     q = select(Order).where(Order.farmer_user_id == current_user.id).order_by(Order.created_at.desc())
     if status_filter:
         q = q.where(Order.status == status_filter)
@@ -147,6 +148,53 @@ async def list_farmer_orders(
     for o in orders:
         items_result = await db.execute(select(OrderItem).where(OrderItem.order_id == o.id))
         items = items_result.scalars().all()
+
+        # Group items by relation_id; standalone = no relation or missing role
+        by_relation: dict[str, list[OrderItem]] = {}
+        standalone_items: list[OrderItem] = []
+        for item in items:
+            if item.relation_id and item.relation_role:
+                by_relation.setdefault(item.relation_id, []).append(item)
+            else:
+                standalone_items.append(item)
+
+        structures = []
+        if by_relation:
+            # Batch-fetch the practices and relations referenced
+            practice_ids = list({i.practice_id for rel_items in by_relation.values() for i in rel_items})
+            practices = (await db.execute(
+                select(Practice).where(Practice.id.in_(practice_ids))
+            )).scalars().all()
+            practice_map = {p.id: p for p in practices}
+
+            relations = (await db.execute(
+                select(Relation).where(Relation.id.in_(list(by_relation.keys())))
+            )).scalars().all()
+            rel_type_map = {r.id: (r.relation_type.value if hasattr(r.relation_type, 'value') else str(r.relation_type))
+                            for r in relations}
+
+            for rel_id, rel_items in by_relation.items():
+                practice_refs = []
+                for item in rel_items:
+                    prac = practice_map.get(item.practice_id)
+                    if prac and item.relation_role:
+                        practice_refs.append(PracticeRef(
+                            practice_id=item.practice_id,
+                            common_name_cosh_id=prac.common_name_cosh_id,
+                            is_special_input=prac.is_special_input,
+                            role=item.relation_role,
+                        ))
+                if not practice_refs:
+                    continue
+                rel_type = rel_type_map.get(rel_id, "OR")
+                try:
+                    structures.append(build_structure(practice_refs, rel_id, rel_type))
+                except ValueError:
+                    # Malformed roles — fall back to literal count for these items
+                    standalone_items.extend(rel_items)
+
+        cd = compute_count_display(structures, len(standalone_items))
+
         out.append({
             "id": o.id,
             "status": o.status,
@@ -154,7 +202,8 @@ async def list_farmer_orders(
             "date_to": o.date_to,
             "dealer_user_id": o.dealer_user_id,
             "created_at": o.created_at,
-            "item_count": len(items),
+            "item_count": cd.count,
+            "is_max_count": cd.is_max,
         })
     return out
 

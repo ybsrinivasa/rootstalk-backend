@@ -1290,6 +1290,19 @@ async def get_today_advisory(
             visible_ids = set(bl02_result.visible_practices)
             visible_practices = [p for p in all_practices if p.id in visible_ids]
 
+            # Resolve relation_type once per timeline (small batch lookup)
+            tl_rel_ids = {p.relation_id for p in visible_practices if p.relation_id}
+            tl_rel_type_map: dict[str, str] = {}
+            if tl_rel_ids:
+                from app.modules.advisory.models import Relation
+                rel_rows = (await db.execute(
+                    select(Relation).where(Relation.id.in_(tl_rel_ids))
+                )).scalars().all()
+                tl_rel_type_map = {
+                    r.id: (r.relation_type.value if hasattr(r.relation_type, 'value') else str(r.relation_type))
+                    for r in rel_rows
+                }
+
             practice_stubs: list[PStub] = []
             for p in visible_practices:
                 el_result = await db.execute(
@@ -1305,6 +1318,8 @@ async def get_today_advisory(
                     elements=[PEl(element_type=el.element_type, cosh_ref=el.cosh_ref,
                                   value=el.value, unit_cosh_id=el.unit_cosh_id)
                               for el in elements],
+                    relation_role=p.relation_role,
+                    relation_type=tl_rel_type_map.get(p.relation_id) if p.relation_id else None,
                 ))
 
             # Calendar dates for this timeline
@@ -1429,6 +1444,9 @@ async def get_today_advisory(
                         "id": p.id, "l0_type": p.l0_type,
                         "l1_type": p.l1_type, "l2_type": p.l2_type,
                         "display_order": p.display_order, "is_special_input": p.is_special_input,
+                        "relation_id": p.relation_id,
+                        "relation_role": p.relation_role,
+                        "relation_type": p.relation_type,
                         "elements": [{"element_type": el.element_type, "cosh_ref": el.cosh_ref,
                                       "value": el.value, "unit_cosh_id": el.unit_cosh_id}
                                      for el in p.elements],
@@ -2039,6 +2057,29 @@ async def buy_all_dbs(
             detail="Internal error: non-DBS practice slipped into DBS-only order",
         )
 
+    # ── Relation completeness expansion ──────────────────────────────────
+    # Per Practice Relations spec §8: when ordering a relation, ALL practices
+    # from ALL Options of ALL Parts go in — the dealer resolves which Option
+    # to fulfil per Part. So for any matched practice that participates in a
+    # relation, pull in its sibling INPUT practices (DBS-bound only) even if
+    # they don't match the category filter (e.g. a Pesticide OR-alternative
+    # to a Fertiliser). The order_type stays as requested by the farmer; the
+    # dealer side handles the mixed-category case (TODO Build C: dealer UI
+    # may need to recognise mixed-category siblings in a relation order).
+    relation_ids_in_set = {p.relation_id for p in matching_practices if p.relation_id}
+    if relation_ids_in_set:
+        matched_ids = {p.id for p in matching_practices}
+        sibling_practices = (await db.execute(
+            select(Practice).where(
+                Practice.relation_id.in_(relation_ids_in_set),
+                Practice.id.notin_(matched_ids),
+            )
+        )).scalars().all()
+        for sp in sibling_practices:
+            l0 = sp.l0_type.value if hasattr(sp.l0_type, 'value') else str(sp.l0_type)
+            if l0 == "INPUT" and sp.timeline_id in dbs_tl_ids:
+                matching_practices.append(sp)
+
     # ── Date-range computation ────────────────────────────────────────────
     # If crop_start_date is set, derive a focused buying window from the
     # actual DBS values of the practices being ordered (DBS values are
@@ -2077,12 +2118,27 @@ async def buy_all_dbs(
     db.add(order)
     await db.flush()
 
+    # Resolve relation_type per relation_id once (to avoid N queries)
+    rel_type_map: dict[str, str] = {}
+    rel_ids_for_items = {p.relation_id for p in matching_practices if p.relation_id}
+    if rel_ids_for_items:
+        from app.modules.advisory.models import Relation
+        rel_rows = (await db.execute(
+            select(Relation).where(Relation.id.in_(rel_ids_for_items))
+        )).scalars().all()
+        rel_type_map = {
+            r.id: (r.relation_type.value if hasattr(r.relation_type, 'value') else str(r.relation_type))
+            for r in rel_rows
+        }
+
     for p in matching_practices:
         db.add(OrderItem(
             order_id=order.id,
             practice_id=p.id,
             timeline_id=p.timeline_id,
             relation_id=p.relation_id,
+            relation_type=rel_type_map.get(p.relation_id) if p.relation_id else None,
+            relation_role=p.relation_role,
             status=OrderItemStatus.PENDING,
         ))
 

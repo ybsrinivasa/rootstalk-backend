@@ -26,6 +26,8 @@ class PracticeStub:
     is_special_input: bool
     relation_id: Optional[str]
     elements: list[PracticeElement] = field(default_factory=list)
+    relation_role: Optional[str] = None  # PART_n__OPT_m__POS_p (Practice Relations)
+    relation_type: Optional[str] = None  # AND | OR | IF — copied from Relation when known
 
     def primary_identity_ref(self) -> Optional[str]:
         """
