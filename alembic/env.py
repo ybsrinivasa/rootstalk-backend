@@ -24,6 +24,7 @@ from app.modules.subscriptions.models import (
     AlertRecipient, Alert, PromoterAssignment,
     FarmerSubscriptionHistory, SubscriptionPaymentRequest,
 )
+from app.modules.subscriptions.snapshot_models import LockedTimelineSnapshot
 from app.modules.advisory.models import (
     Package, PackageLocation, PackageAuthor, Parameter, ParameterTranslation,
     Variable, VariableTranslation, PackageVariable, Timeline, Practice, Element,
