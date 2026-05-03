@@ -802,6 +802,22 @@ async def set_pundit_preference(
     return {"detail": "Preference set", "pundit_id": pundit_id}
 
 
+@router.delete("/farmer/subscriptions/{subscription_id}/pundit-preference")
+async def clear_pundit_preference(
+    subscription_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Farmer reverts to default expert routing for this subscription."""
+    pref = (await db.execute(
+        select(FarmPunditPreference).where(FarmPunditPreference.subscription_id == subscription_id)
+    )).scalar_one_or_none()
+    if pref:
+        await db.delete(pref)
+        await db.commit()
+    return {"detail": "Reverted to default expert"}
+
+
 # ── Company Queries Monitoring ────────────────────────────────────────────────
 
 @router.get("/client/{client_id}/queries")

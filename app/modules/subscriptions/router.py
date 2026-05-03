@@ -1007,6 +1007,9 @@ async def my_subscriptions(
             "id": s.id, "client_id": s.client_id, "package_id": s.package_id,
             "status": s.status, "crop_start_date": s.crop_start_date,
             "reference_number": s.reference_number, "subscription_type": s.subscription_type,
+            "farm_area_acres": float(s.farm_area_acres) if s.farm_area_acres is not None else None,
+            "area_unit": s.area_unit,
+            "farm_area_confirmed_at": s.farm_area_confirmed_at,
         }
         for s in subs
     ]
@@ -1718,6 +1721,257 @@ async def get_missed_items(
                     ],
                 })
     return missed
+
+
+# ── Farmer: Expert setting (mode + available experts) ────────────────────────
+
+@router.get("/farmer/subscriptions/{subscription_id}/expert-setting")
+async def get_expert_setting(
+    subscription_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Returns current expert preference + Promoter-Pundit if any + company's available pundits."""
+    from app.modules.farmpundit.models import (
+        FarmPunditPreference, FarmPunditProfile, ClientFarmPundit,
+    )
+    from app.modules.clients.models import ClientPromoter
+
+    sub = await _get_subscription(db, subscription_id, current_user.id)
+
+    # 1) Current preference (farmer's specific choice for this subscription)
+    pref = (await db.execute(
+        select(FarmPunditPreference).where(FarmPunditPreference.subscription_id == subscription_id)
+    )).scalar_one_or_none()
+
+    preferred_pundit = None
+    if pref:
+        row = (await db.execute(
+            select(FarmPunditProfile, User)
+            .join(User, User.id == FarmPunditProfile.user_id)
+            .where(FarmPunditProfile.id == pref.pundit_id)
+        )).first()
+        if row:
+            profile, user_obj = row
+            preferred_pundit = {
+                "pundit_id": profile.id,
+                "name": user_obj.name,
+                "phone": user_obj.phone,
+            }
+
+    # 2) Promoter-Pundit (active promoter who is also marked as Promoter-Pundit on this client)
+    promoter_pundit = None
+    try:
+        assignment = (await db.execute(
+            select(PromoterAssignment).where(
+                PromoterAssignment.subscription_id == subscription_id,
+                PromoterAssignment.status == AssignmentStatus.ACTIVE,
+            )
+        )).scalar_one_or_none()
+        if assignment:
+            cp = (await db.execute(
+                select(ClientPromoter).where(
+                    ClientPromoter.user_id == assignment.promoter_user_id,
+                    ClientPromoter.client_id == sub.client_id,
+                )
+            )).scalar_one_or_none()
+            # Also find their FarmPundit profile and the ClientFarmPundit (is_promoter_pundit lives there)
+            promoter_user = (await db.execute(
+                select(User).where(User.id == assignment.promoter_user_id)
+            )).scalar_one_or_none()
+            pp_profile = None
+            if promoter_user:
+                pp_profile = (await db.execute(
+                    select(FarmPunditProfile).where(FarmPunditProfile.user_id == promoter_user.id)
+                )).scalar_one_or_none()
+            cfp = None
+            if pp_profile:
+                cfp = (await db.execute(
+                    select(ClientFarmPundit).where(
+                        ClientFarmPundit.client_id == sub.client_id,
+                        ClientFarmPundit.pundit_id == pp_profile.id,
+                        ClientFarmPundit.is_promoter_pundit == True,  # noqa: E712
+                        ClientFarmPundit.status == "ACTIVE",
+                    )
+                )).scalar_one_or_none()
+            if cp and cfp and pp_profile and promoter_user:
+                promoter_pundit = {
+                    "pundit_id": pp_profile.id,
+                    "name": promoter_user.name,
+                    "phone": promoter_user.phone,
+                }
+    except Exception:
+        promoter_pundit = None
+
+    # 3) Company's available experts (FarmPundits onboarded by this client)
+    company_experts = []
+    try:
+        rows = (await db.execute(
+            select(ClientFarmPundit, FarmPunditProfile, User)
+            .join(FarmPunditProfile, FarmPunditProfile.id == ClientFarmPundit.pundit_id)
+            .join(User, User.id == FarmPunditProfile.user_id)
+            .where(
+                ClientFarmPundit.client_id == sub.client_id,
+                ClientFarmPundit.status == "ACTIVE",
+            )
+        )).all()
+        company_experts = [
+            {
+                "pundit_id": p.id,
+                "name": u.name,
+                "phone": u.phone,
+                "role": link.role.value if hasattr(link.role, "value") else link.role,
+            }
+            for link, p, u in rows
+        ]
+    except Exception:
+        company_experts = []
+
+    if pref:
+        mode = "SPECIFIC"
+    elif promoter_pundit:
+        mode = "PROMOTER_PUNDIT"
+    else:
+        mode = "REGULAR_TEAM"
+
+    return {
+        "mode": mode,
+        "preferred_pundit": preferred_pundit,
+        "promoter_pundit": promoter_pundit,
+        "company_experts": company_experts,
+    }
+
+
+# ── Farmer: Seed availability check ──────────────────────────────────────────
+
+@router.get("/farmer/subscriptions/{subscription_id}/seed-availability")
+async def check_seed_availability(
+    subscription_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Returns true if any seed/seedling varieties are linked to this subscription's PoP."""
+    from app.modules.seed_mgmt.models import VarietyPoP
+    sub = await _get_subscription(db, subscription_id, current_user.id)
+    count = (await db.execute(
+        select(func.count(VarietyPoP.id)).where(
+            VarietyPoP.package_id == sub.package_id,
+            VarietyPoP.status == "ACTIVE",
+        )
+    )).scalar() or 0
+    return {"has_varieties": count > 0, "count": int(count)}
+
+
+# ── Farmer: Confirm farm area (locks it in) ──────────────────────────────────
+
+@router.post("/farmer/subscriptions/{subscription_id}/farm-area/confirm")
+async def confirm_farm_area(
+    subscription_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Locks in the farm area. Required at start date or first DAS order."""
+    sub = await _get_subscription(db, subscription_id, current_user.id)
+    new_area = data.get("farm_area_acres")
+    if new_area is not None:
+        sub.farm_area_acres = new_area
+    if data.get("area_unit"):
+        sub.area_unit = data["area_unit"]
+    if not sub.farm_area_acres:
+        raise HTTPException(status_code=422, detail="farm_area_acres required to confirm")
+    sub.farm_area_confirmed_at = datetime.now(timezone.utc)
+    await db.commit()
+    return {
+        "farm_area_acres": float(sub.farm_area_acres),
+        "area_unit": sub.area_unit,
+        "confirmed_at": sub.farm_area_confirmed_at,
+    }
+
+
+# ── Farmer: Buy-all DBS pesticides or fertilisers (single consolidated order) ──
+
+@router.post("/farmer/subscriptions/{subscription_id}/orders/buy-all-dbs")
+async def buy_all_dbs(
+    subscription_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Create a single consolidated order for all DBS pesticides OR fertilisers across all DBS timelines.
+    data: { category: 'PESTICIDE' | 'FERTILISER', dealer_user_id?, facilitator_user_id? }
+    """
+    from datetime import date as dt_date, timedelta
+    from app.modules.orders.models import Order, OrderItem, OrderStatus, OrderItemStatus
+
+    sub = await _get_subscription(db, subscription_id, current_user.id)
+    category = (data or {}).get("category")
+    if category not in ("PESTICIDE", "FERTILISER"):
+        raise HTTPException(status_code=422, detail="category must be PESTICIDE or FERTILISER")
+
+    # Find all DBS timelines for this PoP
+    timelines = (await db.execute(
+        select(Timeline).where(Timeline.package_id == sub.package_id)
+    )).scalars().all()
+    dbs_timelines = [tl for tl in timelines if tl.from_type.value == "DBS"]
+    if not dbs_timelines:
+        raise HTTPException(status_code=400, detail="No DBS practices for this advisory")
+
+    # Collect input practices matching the category
+    matching_practices: list[Practice] = []
+    for tl in dbs_timelines:
+        practices = (await db.execute(
+            select(Practice).where(Practice.timeline_id == tl.id).order_by(Practice.display_order)
+        )).scalars().all()
+        for p in practices:
+            if p.l0_type.value != "INPUT":
+                continue
+            l1 = (p.l1_type or "").upper()
+            if category == "PESTICIDE" and "PEST" in l1:
+                matching_practices.append(p)
+            elif category == "FERTILISER" and ("FERT" in l1 or "FERTI" in l1):
+                matching_practices.append(p)
+
+    if not matching_practices:
+        raise HTTPException(status_code=400, detail=f"No DBS {category.lower()} practices found")
+
+    # 14-day window from today for the dealer/facilitator to fulfil
+    today = dt_date.today()
+    date_from = today
+    date_to = today + timedelta(days=14)
+
+    order = Order(
+        subscription_id=subscription_id,
+        farmer_user_id=current_user.id,
+        client_id=sub.client_id,
+        dealer_user_id=(data or {}).get("dealer_user_id"),
+        facilitator_user_id=(data or {}).get("facilitator_user_id"),
+        date_from=date_from,
+        date_to=date_to,
+        status=OrderStatus.SENT,
+        expires_at=datetime.now(timezone.utc) + timedelta(days=14),
+    )
+    db.add(order)
+    await db.flush()
+
+    for p in matching_practices:
+        db.add(OrderItem(
+            order_id=order.id,
+            practice_id=p.id,
+            timeline_id=p.timeline_id,
+            relation_id=p.relation_id,
+            status=OrderItemStatus.PENDING,
+        ))
+
+    await db.commit()
+    await db.refresh(order)
+    return {
+        "order_id": order.id,
+        "item_count": len(matching_practices),
+        "date_from": date_from.isoformat(),
+        "date_to": date_to.isoformat(),
+        "category": category,
+    }
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

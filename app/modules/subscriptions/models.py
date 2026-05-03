@@ -62,6 +62,7 @@ class Subscription(Base):
     status: Mapped[SubscriptionStatus] = mapped_column(String(20), default=SubscriptionStatus.WAITLISTED)
     farm_area_acres: Mapped[float] = mapped_column(DECIMAL(10, 2), nullable=True)
     area_unit: Mapped[str] = mapped_column(String(20), nullable=True, default="acres")
+    farm_area_confirmed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     crop_start_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     subscription_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     lapsed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
