@@ -405,6 +405,41 @@ async def set_start_date(
             continue
         tl_ranges.append(TimelineDateRange(id=tl.id, from_date=from_d, to_date=to_d))
 
+    # ── Also include triggered CHA timelines (PG/SP) for lock detection ─────────
+    # Per spec §6.6: "Both conditions apply equally to CCA and CHA timelines."
+    # CHA timelines are anchored to triggered_at (the date the farmer confirmed
+    # the diagnosis), NOT to crop_start_date. They must be checked for VIEWED +
+    # PO locks but their dates do NOT shift when crop_start_date changes
+    # (is_cha=True signals this to compute_date_shifts).
+    cha_entries = (await db.execute(
+        select(TriggeredCHAEntry).where(
+            TriggeredCHAEntry.subscription_id == sub.id,
+            TriggeredCHAEntry.status == "ACTIVE",
+        )
+    )).scalars().all()
+    for cha in cha_entries:
+        triggered_d = cha.triggered_at.date() if hasattr(cha.triggered_at, 'date') else cha.triggered_at
+        if cha.recommendation_type == "SP":
+            sp_timelines = (await db.execute(
+                select(SPTimeline).where(SPTimeline.sp_recommendation_id == cha.recommendation_id)
+            )).scalars().all()
+            for sp_tl in sp_timelines:
+                from_d = triggered_d + timedelta(days=sp_tl.from_value)
+                to_d = triggered_d + timedelta(days=sp_tl.to_value)
+                tl_ranges.append(TimelineDateRange(
+                    id=f"sp_{sp_tl.id}", from_date=from_d, to_date=to_d, is_cha=True,
+                ))
+        elif cha.recommendation_type == "PG":
+            pg_timelines = (await db.execute(
+                select(PGTimeline).where(PGTimeline.pg_recommendation_id == cha.recommendation_id)
+            )).scalars().all()
+            for pg_tl in pg_timelines:
+                from_d = triggered_d + timedelta(days=pg_tl.from_value)
+                to_d = triggered_d + timedelta(days=pg_tl.to_value)
+                tl_ranges.append(TimelineDateRange(
+                    id=f"pg_{pg_tl.id}", from_date=from_d, to_date=to_d, is_cha=True,
+                ))
+
     # Compute shifts
     shifts, delta_days = compute_date_shifts(tl_ranges, old_start, new_start, today, active_items)
 

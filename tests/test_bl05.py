@@ -211,3 +211,118 @@ def test_bl05_extra_negative_delta():
     for r in results:
         original = next(t for t in timelines if t.id == r.timeline_id)
         assert r.new_from_date == original.from_date - timedelta(days=5)
+
+
+# ── Gap 1 — date-range overlap PO lock (spec §6.5) ────────────────────────────
+
+def test_bl05_06_po_lock_overlapping_timeline_without_direct_match():
+    """Order's date range covers timeline T2 even though items reference T1.
+    T2 should still be PO-locked per spec §6.5."""
+    from datetime import date
+    from app.services.bl05_lock_detection import detect_lock, LockType, TimelineDateRange, OrderItemStub
+
+    t2 = TimelineDateRange(id="T2", from_date=date(2026, 5, 10), to_date=date(2026, 5, 15))
+    today = date(2026, 5, 1)
+
+    items = [OrderItemStub(
+        timeline_id="T1",
+        order_from_date=date(2026, 5, 5),
+        order_to_date=date(2026, 5, 20),
+        status="AVAILABLE",
+    )]
+
+    result = detect_lock(t2, today, items)
+    assert result.po_locked
+    assert result.locked
+    assert result.lock_type == LockType.PURCHASE_ORDER
+
+
+def test_bl05_07_po_lock_no_overlap_no_lock():
+    from datetime import date
+    from app.services.bl05_lock_detection import detect_lock, TimelineDateRange, OrderItemStub
+
+    timeline = TimelineDateRange(id="T1", from_date=date(2026, 5, 20), to_date=date(2026, 5, 25))
+    today = date(2026, 5, 1)
+
+    items = [OrderItemStub(
+        timeline_id="X",
+        order_from_date=date(2026, 5, 1),
+        order_to_date=date(2026, 5, 10),
+        status="AVAILABLE",
+    )]
+
+    assert not detect_lock(timeline, today, items).po_locked
+
+
+def test_bl05_08_po_lock_partial_overlap_locks():
+    from datetime import date
+    from app.services.bl05_lock_detection import detect_lock, TimelineDateRange, OrderItemStub
+
+    timeline = TimelineDateRange(id="T1", from_date=date(2026, 5, 10), to_date=date(2026, 5, 20))
+    today = date(2026, 5, 1)
+
+    items = [OrderItemStub(
+        timeline_id="X",
+        order_from_date=date(2026, 5, 18),
+        order_to_date=date(2026, 5, 25),
+        status="AVAILABLE",
+    )]
+
+    assert detect_lock(timeline, today, items).po_locked
+
+
+def test_bl05_09_inactive_order_does_not_lock():
+    from datetime import date
+    from app.services.bl05_lock_detection import detect_lock, TimelineDateRange, OrderItemStub
+
+    timeline = TimelineDateRange(id="T1", from_date=date(2026, 5, 10), to_date=date(2026, 5, 15))
+    today = date(2026, 5, 1)
+
+    items = [OrderItemStub(
+        timeline_id="T1",
+        order_from_date=date(2026, 5, 8),
+        order_to_date=date(2026, 5, 18),
+        status="CANCELLED",
+    )]
+
+    assert not detect_lock(timeline, today, items).po_locked
+
+
+# ── Gap 2 — CHA timelines don't shift but are locked normally ─────────────────
+
+def test_bl05_10_cha_timeline_does_not_shift():
+    from datetime import date
+    from app.services.bl05_lock_detection import compute_date_shifts, TimelineDateRange
+
+    cca = TimelineDateRange(id="CCA1", from_date=date(2026, 5, 10), to_date=date(2026, 5, 15))
+    cha = TimelineDateRange(id="CHA1", from_date=date(2026, 5, 12), to_date=date(2026, 5, 18), is_cha=True)
+
+    old_start = date(2026, 5, 1)
+    new_start = date(2026, 5, 6)  # +5 days
+    today = date(2026, 5, 1)
+
+    results, delta = compute_date_shifts([cca, cha], old_start, new_start, today, [])
+    assert delta == 5
+
+    cca_result = next(r for r in results if r.timeline_id == "CCA1")
+    cha_result = next(r for r in results if r.timeline_id == "CHA1")
+
+    assert cca_result.new_from_date == date(2026, 5, 15)
+    assert cca_result.new_to_date == date(2026, 5, 20)
+
+    assert cha_result.new_from_date == date(2026, 5, 12)
+    assert cha_result.new_to_date == date(2026, 5, 18)
+    assert not cha_result.content_updated
+
+
+def test_bl05_11_cha_timeline_locked_when_today_inside():
+    from datetime import date
+    from app.services.bl05_lock_detection import detect_lock, TimelineDateRange, LockType
+
+    cha = TimelineDateRange(id="CHA1", from_date=date(2026, 5, 1), to_date=date(2026, 5, 10), is_cha=True)
+    today = date(2026, 5, 5)
+
+    result = detect_lock(cha, today, [])
+    assert result.viewed_locked
+    assert result.locked
+    assert result.lock_type == LockType.VIEWED
