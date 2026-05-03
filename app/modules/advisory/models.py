@@ -239,6 +239,7 @@ class Practice(Base):
     relation_role: Mapped[str] = mapped_column(String(50), nullable=True)
     is_special_input: Mapped[bool] = mapped_column(Boolean, default=False)
     common_name_cosh_id: Mapped[str] = mapped_column(String(100), nullable=True)
+    frequency_days: Mapped[int] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     timeline: Mapped["Timeline"] = relationship("Timeline", back_populates="practices")
@@ -360,6 +361,7 @@ class PGPractice(Base):
     l2_type: Mapped[str] = mapped_column(String(100), nullable=True)
     display_order: Mapped[int] = mapped_column(Integer, default=0)
     is_special_input: Mapped[bool] = mapped_column(Boolean, default=False)
+    frequency_days: Mapped[int] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     timeline: Mapped["PGTimeline"] = relationship("PGTimeline", back_populates="practices")
@@ -419,6 +421,7 @@ class SPPractice(Base):
     l2_type: Mapped[str] = mapped_column(String(100), nullable=True)
     display_order: Mapped[int] = mapped_column(Integer, default=0)
     is_special_input: Mapped[bool] = mapped_column(Boolean, default=False)
+    frequency_days: Mapped[int] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     timeline: Mapped["SPTimeline"] = relationship("SPTimeline", back_populates="practices")

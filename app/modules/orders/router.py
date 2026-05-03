@@ -1287,11 +1287,27 @@ async def get_volume_estimate(
     elements = {e.element_type: e.value for e in elements_result.scalars().all()}
     dosage = float(elements.get("dosage", 0)) if elements.get("dosage") else None
 
+    # Resolve timeline duration so frequency-based formulas get an Applications count.
+    # For DBS: from_value is days BEFORE sowing (larger), to_value is days BEFORE sowing (smaller).
+    #   Duration = from_value - to_value + 1
+    # For DAS / CALENDAR: Duration = to_value - from_value + 1
+    timeline_duration_days: Optional[int] = None
+    timeline = (await db.execute(
+        select(Timeline).where(Timeline.id == practice.timeline_id)
+    )).scalar_one_or_none()
+    if timeline is not None:
+        if timeline.from_type.value == "DBS":
+            timeline_duration_days = timeline.from_value - timeline.to_value + 1
+        else:
+            timeline_duration_days = timeline.to_value - timeline.from_value + 1
+
     result = calculate_volume(
         formula=formula_row.formula,
         brand_unit=formula_row.brand_unit,
         dosage=dosage,
         farm_area_acres=farm_area_acres,
+        frequency_days=practice.frequency_days,
+        timeline_duration_days=timeline_duration_days,
     )
     if result is None:
         return {"estimated_volume": None, "volume_unit": None, "message": "Could not calculate estimate"}

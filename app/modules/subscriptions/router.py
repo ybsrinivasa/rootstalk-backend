@@ -34,6 +34,27 @@ WAITLIST_EXPIRY_DAYS = 3
 PAYMENT_REQUEST_EXPIRY_HOURS = 72
 
 
+def _is_frequency_due_today(frequency_days, timeline_from_date, today_date) -> bool:
+    """Frequency-based practice display filter.
+
+    For a frequency-based practice, returns True only on prescribed application
+    days within the timeline window. Day numbering is 1-based from timeline start.
+    With frequency_days = 2, the practice appears on Days 1, 3, 5, ... (offset 0).
+    Formula: (day_in_timeline - 1) % frequency_days == 0.
+
+    Returns True for non-frequency practices (treat as always-due if in window),
+    so this can be used as a uniform post-BL-04 filter.
+    """
+    if not frequency_days or frequency_days < 1:
+        return True
+    if timeline_from_date is None:
+        return True
+    day_in_timeline = (today_date - timeline_from_date).days + 1  # 1-based
+    if day_in_timeline < 1:
+        return False
+    return (day_in_timeline - 1) % frequency_days == 0
+
+
 # ── Subscription Pool (CA) ─────────────────────────────────────────────────────
 
 class PoolPurchase(BaseModel):
@@ -1336,6 +1357,7 @@ async def get_today_advisory(
                               for el in elements],
                     relation_role=p.relation_role,
                     relation_type=tl_rel_type_map.get(p.relation_id) if p.relation_id else None,
+                    frequency_days=p.frequency_days,
                 ))
 
             # Calendar dates for this timeline
@@ -1386,7 +1408,8 @@ async def get_today_advisory(
                                                 value=el.value, unit_cosh_id=el.unit_cosh_id)
                                             for el in (await db.execute(
                                                 select(SPElement).where(SPElement.practice_id == p.id)
-                                            )).scalars().all()])
+                                            )).scalars().all()],
+                                  frequency_days=p.frequency_days)
                              for p in sp_practices]
                     cha_tl_id = f"cha-sp-{sp_tl.id}"
                     problem_label = cha.problem_name or problem_cosh_id
@@ -1418,7 +1441,8 @@ async def get_today_advisory(
                                                 value=el.value, unit_cosh_id=el.unit_cosh_id)
                                             for el in (await db.execute(
                                                 select(PGElement).where(PGElement.practice_id == p.id)
-                                            )).scalars().all()])
+                                            )).scalars().all()],
+                                  frequency_days=p.frequency_days)
                              for p in pg_practices]
                     cha_tl_id = f"cha-pg-{pg_tl.id}"
                     problem_label = cha.problem_name or problem_cosh_id
@@ -1447,6 +1471,12 @@ async def get_today_advisory(
         for dedup_tl in deduped:
             tl = dedup_tl.timeline
             from_d, to_d, day_num = tl_date_map[tl.id]
+            # Frequency filter: hide frequency-based practices that aren't due today.
+            # Non-frequency practices (frequency_days NULL) are always shown if in window.
+            freq_filtered_practices = [
+                p for p in dedup_tl.visible_practices
+                if _is_frequency_due_today(p.frequency_days, from_d, today)
+            ]
             tl_entry: dict = {
                 "id": tl.id,
                 "name": tl.name,
@@ -1463,11 +1493,13 @@ async def get_today_advisory(
                         "relation_id": p.relation_id,
                         "relation_role": p.relation_role,
                         "relation_type": p.relation_type,
+                        "frequency_days": p.frequency_days,
+                        "is_frequency_due_today": True,  # always True — list is already filtered
                         "elements": [{"element_type": el.element_type, "cosh_ref": el.cosh_ref,
                                       "value": el.value, "unit_cosh_id": el.unit_cosh_id}
                                      for el in p.elements],
                     }
-                    for p in dedup_tl.visible_practices
+                    for p in freq_filtered_practices
                 ],
             }
             # Include BL-02 pending question for this timeline (if any)

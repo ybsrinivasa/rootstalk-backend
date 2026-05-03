@@ -28,6 +28,7 @@ class PracticeStub:
     elements: list[PracticeElement] = field(default_factory=list)
     relation_role: Optional[str] = None  # PART_n__OPT_m__POS_p (Practice Relations)
     relation_type: Optional[str] = None  # AND | OR | IF — copied from Relation when known
+    frequency_days: Optional[int] = None  # NULL = one-time; >=1 = recurring every N days
 
     def primary_identity_ref(self) -> Optional[str]:
         """
