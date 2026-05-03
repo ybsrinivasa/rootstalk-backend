@@ -238,6 +238,7 @@ class Practice(Base):
     relation_id: Mapped[str] = mapped_column(String(36), ForeignKey("relations.id"), nullable=True)
     relation_role: Mapped[str] = mapped_column(String(50), nullable=True)
     is_special_input: Mapped[bool] = mapped_column(Boolean, default=False)
+    common_name_cosh_id: Mapped[str] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     timeline: Mapped["Timeline"] = relationship("Timeline", back_populates="practices")

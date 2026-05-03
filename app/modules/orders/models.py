@@ -73,6 +73,7 @@ class OrderItem(Base):
     estimated_volume: Mapped[float] = mapped_column(DECIMAL(10, 4), nullable=True)
     relation_id: Mapped[str] = mapped_column(String(36), nullable=True)
     relation_type: Mapped[str] = mapped_column(String(20), nullable=True)
+    relation_role: Mapped[str] = mapped_column(String(50), nullable=True)
     scan_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[OrderItemStatus] = mapped_column(String(30), default=OrderItemStatus.PENDING)
     postponed_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
