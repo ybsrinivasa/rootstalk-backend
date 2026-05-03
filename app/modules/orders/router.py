@@ -351,6 +351,7 @@ async def list_purchased_items(
             "timeline_to_value": int(tl.to_value),
             "application_date_from": date_from_iso,
             "application_date_to": date_to_iso,
+            "frequency_days": int(practice.frequency_days) if practice.frequency_days else None,
         })
     return out
 
