@@ -33,6 +33,8 @@ class OrderCreate(BaseModel):
     practice_ids: list[str] = []
     dealer_user_id: Optional[str] = None
     facilitator_user_id: Optional[str] = None
+    farm_area_acres: Optional[float] = None
+    area_unit: Optional[str] = None
 
 
 # ── Farmer: Create and manage orders ─────────────────────────────────────────
@@ -43,7 +45,33 @@ async def create_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Farmer places an order for inputs in a date range (BL-10)."""
+    """Farmer places an order for inputs in a date range (BL-10).
+
+    Acreage hard-lock: This endpoint is the DAS path (buy-all-dbs is the only DBS path).
+    On the first DAS order, farm_area_confirmed_at is set, locking the area for all
+    subsequent volume calculations. The acreage cannot be changed afterwards.
+    """
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == request.subscription_id,
+            Subscription.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    # ── Hard-lock acreage on first DAS order ──────────────────────────────
+    if not sub.farm_area_confirmed_at:
+        if not request.farm_area_acres and not sub.farm_area_acres:
+            raise HTTPException(
+                status_code=422,
+                detail="farm_area_acres required to confirm before this order",
+            )
+        if request.farm_area_acres:
+            sub.farm_area_acres = request.farm_area_acres
+            sub.area_unit = request.area_unit or sub.area_unit or "acres"
+        sub.farm_area_confirmed_at = datetime.now(timezone.utc)
+
     order = Order(
         subscription_id=request.subscription_id,
         farmer_user_id=current_user.id,
@@ -179,18 +207,74 @@ async def list_purchased_items(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    result = await db.execute(
-        select(OrderItem)
+    """Approved purchased items with computed application date window.
+
+    For each item, derive practice_date_from/to using the item's timeline anchor:
+      - DAS:      crop_start_date + from/to_value (days after sowing)
+      - DBS:      crop_start_date - from/to_value (days before sowing — pre-sowing)
+      - CALENDAR: not date-anchored; returns null/null
+    If crop_start_date is not set on the subscription yet, both dates are null
+    and the frontend should prompt the farmer to set it.
+    """
+    from app.modules.advisory.models import Timeline, Practice as AdvPractice, TimelineFromType
+    from datetime import timedelta
+
+    rows = (await db.execute(
+        select(OrderItem, Order, Timeline, AdvPractice, Subscription)
         .join(Order, Order.id == OrderItem.order_id)
+        .join(Timeline, Timeline.id == OrderItem.timeline_id)
+        .join(AdvPractice, AdvPractice.id == OrderItem.practice_id)
+        .join(Subscription, Subscription.id == Order.subscription_id)
         .where(
             Order.farmer_user_id == current_user.id,
             OrderItem.status == OrderItemStatus.APPROVED,
         )
         .order_by(Order.date_from.desc())
-    )
-    items = result.scalars().all()
-    return [{"id": i.id, "practice_id": i.practice_id, "brand_name": i.brand_name,
-             "given_volume": i.given_volume, "volume_unit": i.volume_unit, "price": i.price} for i in items]
+    )).all()
+
+    out: list[dict] = []
+    for item, order, tl, practice, sub in rows:
+        date_from_iso = None
+        date_to_iso = None
+        crop_start = sub.crop_start_date
+        if crop_start is not None:
+            from_type_value = tl.from_type.value if hasattr(tl.from_type, 'value') else str(tl.from_type)
+            crop_date = crop_start.date() if hasattr(crop_start, 'date') else crop_start
+            if from_type_value == "DAS":
+                df = crop_date + timedelta(days=int(tl.from_value))
+                dt_ = crop_date + timedelta(days=int(tl.to_value))
+                date_from_iso = df.isoformat()
+                date_to_iso = dt_.isoformat()
+            elif from_type_value == "DBS":
+                # Before sowing: subtract. from_value is the larger # of days before;
+                # to_value is the smaller (closer to sowing). Order ascending.
+                d1 = crop_date - timedelta(days=int(tl.from_value))
+                d2 = crop_date - timedelta(days=int(tl.to_value))
+                df, dt_ = (d1, d2) if d1 <= d2 else (d2, d1)
+                date_from_iso = df.isoformat()
+                date_to_iso = dt_.isoformat()
+            # CALENDAR: leave null for now (would need absolute reference dates)
+
+        out.append({
+            "id": item.id,
+            "practice_id": item.practice_id,
+            "brand_name": item.brand_name,
+            "l1_type": practice.l1_type,
+            "l2_type": practice.l2_type,
+            "given_volume": float(item.given_volume) if item.given_volume is not None else None,
+            "volume_unit": item.volume_unit,
+            "price": float(item.price) if item.price is not None else None,
+            "scan_verified": bool(item.scan_verified),
+            "order_id": item.order_id,
+            "created_at": item.created_at,
+            "timeline_name": tl.name,
+            "timeline_from_type": tl.from_type.value if hasattr(tl.from_type, 'value') else str(tl.from_type),
+            "timeline_from_value": int(tl.from_value),
+            "timeline_to_value": int(tl.to_value),
+            "application_date_from": date_from_iso,
+            "application_date_to": date_to_iso,
+        })
+    return out
 
 
 # ── Dealer: Process orders ─────────────────────────────────────────────────────

@@ -1862,6 +1862,33 @@ async def check_seed_availability(
     return {"has_varieties": count > 0, "count": int(count)}
 
 
+# ── Farmer: Update tentative/soft-confirmed farm area (does not lock) ────────
+
+@router.put("/farmer/subscriptions/{subscription_id}/farm-area")
+async def update_farm_area(
+    subscription_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Update tentative or soft-confirmed farm area. Rejected if hard-locked."""
+    sub = await _get_subscription(db, subscription_id, current_user.id)
+    if sub.farm_area_confirmed_at:
+        raise HTTPException(status_code=400, detail="Farm area is locked and cannot be changed")
+    new_area = data.get("farm_area_acres")
+    if new_area is None:
+        raise HTTPException(status_code=422, detail="farm_area_acres required")
+    sub.farm_area_acres = new_area
+    if data.get("area_unit"):
+        sub.area_unit = data["area_unit"]
+    await db.commit()
+    return {
+        "farm_area_acres": float(sub.farm_area_acres),
+        "area_unit": sub.area_unit,
+        "farm_area_confirmed_at": sub.farm_area_confirmed_at,
+    }
+
+
 # ── Farmer: Confirm farm area (locks it in) ──────────────────────────────────
 
 @router.post("/farmer/subscriptions/{subscription_id}/farm-area/confirm")
@@ -1908,6 +1935,25 @@ async def buy_all_dbs(
     category = (data or {}).get("category")
     if category not in ("PESTICIDE", "FERTILISER"):
         raise HTTPException(status_code=422, detail="category must be PESTICIDE or FERTILISER")
+
+    # ── Acreage soft-confirm on first DBS order ───────────────────────────
+    # Tentative → Soft confirmed. Allow update unless already hard-locked.
+    new_acreage = (data or {}).get("farm_area_acres")
+    new_unit = (data or {}).get("area_unit") or "acres"
+
+    if not sub.farm_area_acres:
+        # First time — must provide acreage
+        if not new_acreage:
+            raise HTTPException(status_code=422, detail="farm_area_acres required for first order")
+        sub.farm_area_acres = new_acreage
+        sub.area_unit = new_unit
+    elif new_acreage:
+        # Soft update allowed (not yet hard-locked)
+        if sub.farm_area_confirmed_at:
+            raise HTTPException(status_code=400, detail="Farm area is locked and cannot be changed")
+        sub.farm_area_acres = new_acreage
+        sub.area_unit = new_unit
+    # Note: do NOT set farm_area_confirmed_at — DBS is soft confirm only
 
     # Find all DBS timelines for this PoP
     timelines = (await db.execute(
