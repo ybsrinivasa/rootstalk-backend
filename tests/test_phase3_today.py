@@ -321,6 +321,46 @@ async def test_today_renders_cha_when_no_cca_active(db):
 
 @requires_docker
 @pytest.mark.asyncio
+async def test_today_dbs_timeline_renders_pre_sowing(db):
+    """Regression: production convention for DBS rows is from_value > to_value
+    (e.g. from=15, to=8 means "active 15 to 8 days before sowing"). The
+    cca_window_active check used to evaluate the inverse range and silently
+    return False for every DBS row — DBS practices were never appearing on
+    Today. This test seeds a real DBS timeline with crop_start in the
+    future and asserts the timeline + its practice render today.
+    """
+    user = await make_user(db)
+    client = await make_client(db)
+    package = await make_package(db, client)
+    sub = await make_subscription(
+        db, farmer=user, client=client, package=package,
+    )
+    # Crop starts in 10 days → today is 10 days before sowing → day_offset = -10.
+    sub.crop_start_date = datetime.now(timezone.utc) + timedelta(days=10)
+    await db.commit()
+
+    # DBS 15..8 (production convention) — active from 15 to 8 days before sowing.
+    # day_offset = -10 must fall inside. -15 <= -10 <= -8 → True.
+    tl = await make_timeline(
+        db, package, name="DBS_PRESOW",
+        from_type=TimelineFromType.DBS, from_value=15, to_value=8,
+    )
+    p = await make_practice(db, tl, l0=PracticeL0.INPUT, l1="FERTILIZER", l2="DAP")
+    await make_element(db, p, value="50", unit_cosh_id="kg_per_acre")
+    await db.commit()
+
+    out = await get_today_advisory(db=db, current_user=user)
+    rendered_ids = [rt["id"] for rt in out[0]["timelines"]]
+    assert tl.id in rendered_ids, (
+        "DBS timeline must render today — production convention is "
+        "from_value > to_value, window is -from <= day_offset <= -to"
+    )
+    rt = next(r for r in out[0]["timelines"] if r["id"] == tl.id)
+    assert any(pr["l2_type"] == "DAP" for pr in rt["practices"])
+
+
+@requires_docker
+@pytest.mark.asyncio
 async def test_today_outside_window_takes_no_snapshot(db):
     """Window 0..5; subscription day_offset = 50 → no snapshot."""
     user, sub, tl, _p = await _seed_today_active(db, day_offset=50, das_to=5)

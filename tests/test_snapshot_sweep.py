@@ -29,30 +29,32 @@ def test_cca_das_outside():
 
 
 # ── cca_window_active (DBS) ─────────────────────────────────────────────────
-# Convention (per today-route BL-04): for DBS rows, from_value is the smaller
-# "days before sowing" (latest day) and to_value is the larger (earliest day).
-# Window is -to_value <= day_offset <= -from_value.
+# Production convention (verified against actual seed data 2026-05-04): for
+# DBS rows, `from_value` is the LARGER "days before sowing" (earliest day)
+# and `to_value` is the smaller (latest day, closer to sowing). Example:
+# from=15, to=8 means "active 15 to 8 days before sowing". Window is
+# -from_value <= day_offset <= -to_value.
 
 def test_cca_dbs_pre_sowing():
-    # DBS 7..30: active 7 to 30 days before sowing.
+    # DBS 30..7: active 30 to 7 days before sowing.
     # day_offset = -10 (10 days before sowing) → inside.
-    assert cca_window_active("DBS", 7, 30, -10) is True
+    assert cca_window_active("DBS", 30, 7, -10) is True
 
 
 def test_cca_dbs_inclusive_edges():
     # day_offset = -7 (latest day, 7 days before sowing) — inside.
-    assert cca_window_active("DBS", 7, 30, -7) is True
+    assert cca_window_active("DBS", 30, 7, -7) is True
     # day_offset = -30 (earliest day) — inside.
-    assert cca_window_active("DBS", 7, 30, -30) is True
+    assert cca_window_active("DBS", 30, 7, -30) is True
 
 
 def test_cca_dbs_outside():
     # 6 before sowing — too late.
-    assert cca_window_active("DBS", 7, 30, -6) is False
+    assert cca_window_active("DBS", 30, 7, -6) is False
     # 31 before sowing — too early.
-    assert cca_window_active("DBS", 7, 30, -31) is False
+    assert cca_window_active("DBS", 30, 7, -31) is False
     # 0 = sowing day — well past the DBS window.
-    assert cca_window_active("DBS", 7, 30, 0) is False
+    assert cca_window_active("DBS", 30, 7, 0) is False
 
 
 # ── cca_window_active (CALENDAR / unknown) ──────────────────────────────────

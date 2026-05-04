@@ -146,15 +146,17 @@ def cca_window_active(
 ) -> bool:
     """True when today falls inside this CCA timeline's window.
 
-    DAS: from_value <= day_offset <= to_value (positive offsets).
-    DBS: -to_value <= day_offset <= -from_value (offsets are negative;
-         from_value is the larger # days before sowing).
+    DAS: from_value <= day_offset <= to_value (positive offsets, from < to).
+    DBS: -from_value <= day_offset <= -to_value. Production convention has
+         `from_value > to_value` for DBS rows (from_value is the larger
+         # days before sowing, e.g. from=15 to=8 means active 15 to 8
+         days before sowing). day_offset is negative pre-sowing.
     CALENDAR: not handled here (the today route also defers it).
     """
     if from_type == "DAS":
         return from_value <= day_offset <= to_value
     if from_type == "DBS":
-        return -to_value <= day_offset <= -from_value
+        return -from_value <= day_offset <= -to_value
     return False
 
 

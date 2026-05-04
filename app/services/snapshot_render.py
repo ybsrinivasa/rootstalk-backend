@@ -73,14 +73,17 @@ def metadata_from_master_cca(tl) -> TimelineMetadata:
 def cca_window_active(meta: TimelineMetadata, day_offset: int) -> bool:
     """Mirrors the BL-04 check in `/farmer/advisory/today` for CCA timelines.
 
-    DAS: from_value <= day_offset <= to_value.
-    DBS: -to_value <= day_offset <= -from_value (today route convention).
+    DAS: from_value <= day_offset <= to_value (positive offsets, from < to).
+    DBS: -from_value <= day_offset <= -to_value. Production convention has
+         `from_value > to_value` for DBS rows (e.g. from=15, to=8 means
+         "active 15 to 8 days before sowing"). day_offset is negative
+         pre-sowing; today is in window when -from <= day_offset <= -to.
     CALENDAR / unknown: False (today route also defers it).
     """
     if meta.from_type == "DAS":
         return meta.from_value <= day_offset <= meta.to_value
     if meta.from_type == "DBS":
-        return -meta.to_value <= day_offset <= -meta.from_value
+        return -meta.from_value <= day_offset <= -meta.to_value
     return False
 
 
