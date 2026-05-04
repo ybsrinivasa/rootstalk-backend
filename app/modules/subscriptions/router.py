@@ -122,85 +122,123 @@ async def guided_elimination_step(
 ):
     """
     BL-01: PoP Guided Elimination.
-    Returns next parameter question with only valid variables,
-    or the final package if one remains.
+
+    Loads the candidate pool + parameter/variable metadata, then delegates
+    to the pure-function service `run_elimination` (single source of truth
+    for the algorithm). Returns the next parameter question with only valid
+    variables, the final package if one remains, or a config-error marker.
+
+    Reset semantics: pass `answers=''` (or omit) to start over from
+    Parameter 1 — the algorithm naturally returns the first parameter
+    question on an empty answer set. The PWA "decline confirmation"
+    flow uses this.
     """
     from app.modules.advisory.models import PackageLocation, PackageStatus
+    from app.services.bl01_guided_elimination import (
+        run_elimination,
+        PackageStub as ServicePackageStub,
+        ParameterOption as ServiceParameterOption,
+    )
 
-    # Load remaining pool
-    q = (select(Package)
-         .join(PackageLocation, PackageLocation.package_id == Package.id)
-         .where(
-             Package.client_id == client_id,
-             Package.crop_cosh_id == crop_cosh_id,
-             Package.status == PackageStatus.ACTIVE,
-             PackageLocation.district_cosh_id == district_cosh_id,
-         ))
-
-    # Apply previous answers to narrow pool
-    parsed_answers = {}
+    # ── Parse caller-supplied previous answers ───────────────────────────
+    parsed_answers: dict[str, str] = {}
     if answers:
         for pair in answers.split(","):
             if ":" in pair:
                 param_id, var_id = pair.split(":", 1)
                 parsed_answers[param_id] = var_id
 
-    remaining_packages = (await db.execute(q)).scalars().all()
+    # ── Load the candidate pool ───────────────────────────────────────────
+    pkg_rows = (await db.execute(
+        select(Package)
+        .join(PackageLocation, PackageLocation.package_id == Package.id)
+        .where(
+            Package.client_id == client_id,
+            Package.crop_cosh_id == crop_cosh_id,
+            Package.status == PackageStatus.ACTIVE,
+            PackageLocation.district_cosh_id == district_cosh_id,
+        )
+    )).scalars().all()
 
-    for param_id, var_id in parsed_answers.items():
-        remaining_packages = [
-            p for p in remaining_packages
-            if await _package_has_variable(db, p.id, param_id, var_id)
-        ]
+    if not pkg_rows:
+        return {"done": False, "error": "DATA_CONFIG_ERROR"}
 
-    if len(remaining_packages) == 1:
-        pkg = remaining_packages[0]
-        return {"done": True, "package": {"id": pkg.id, "name": pkg.name, "description": pkg.description}}
+    pkg_ids = [p.id for p in pkg_rows]
 
-    if len(remaining_packages) == 0:
-        return {"done": False, "error": "No packages match — data configuration issue"}
-
-    # Find next Parameter (most variables across remaining pool, not yet answered)
-    pkg_ids = [p.id for p in remaining_packages]
-    answered_params = set(parsed_answers.keys())
-
-    all_pvs = (await db.execute(
+    # ── Load the variable map for every candidate package ────────────────
+    pvs = (await db.execute(
         select(PackageVariable).where(PackageVariable.package_id.in_(pkg_ids))
     )).scalars().all()
+    variable_map_by_pkg: dict[str, dict[str, str]] = {pid: {} for pid in pkg_ids}
+    for pv in pvs:
+        variable_map_by_pkg[pv.package_id][pv.parameter_id] = pv.variable_id
 
-    param_var_counts: dict = {}
-    for pv in all_pvs:
-        if pv.parameter_id in answered_params:
-            continue
-        if pv.parameter_id not in param_var_counts:
-            param_var_counts[pv.parameter_id] = set()
-        param_var_counts[pv.parameter_id].add(pv.variable_id)
-
-    if not param_var_counts:
-        pkg = remaining_packages[0]
-        return {"done": True, "package": {"id": pkg.id, "name": pkg.name, "description": pkg.description}}
-
-    next_param_id = max(param_var_counts, key=lambda p: len(param_var_counts[p]))
-    valid_var_ids = param_var_counts[next_param_id]
-
-    param = (await db.execute(select(Parameter).where(Parameter.id == next_param_id))).scalar_one_or_none()
-    variables = (await db.execute(
-        select(Variable).where(Variable.id.in_(valid_var_ids))
-    )).scalars().all()
-
-    if len(variables) == 1:
-        # Auto-select single-option parameter
-        return await guided_elimination_step(
-            crop_cosh_id, district_cosh_id, client_id,
-            answers=f"{answers},{next_param_id}:{variables[0].id}" if answers else f"{next_param_id}:{variables[0].id}",
-            db=db, current_user=current_user
+    pool: list[ServicePackageStub] = [
+        ServicePackageStub(
+            id=p.id, name=p.name, description=p.description,
+            variable_map=variable_map_by_pkg.get(p.id, {}),
         )
+        for p in pkg_rows
+    ]
 
+    # ── Load the parameters in display_order ─────────────────────────────
+    param_ids_in_pool = {pid for vm in variable_map_by_pkg.values() for pid in vm}
+    param_rows = (await db.execute(
+        select(Parameter)
+        .where(Parameter.id.in_(param_ids_in_pool))
+        .order_by(Parameter.display_order.asc())
+    )).scalars().all() if param_ids_in_pool else []
+
+    parameters: list[ServiceParameterOption] = [
+        ServiceParameterOption(
+            id=pr.id, name=pr.name,
+            display_order=int(pr.display_order or 0),
+        )
+        for pr in param_rows
+    ]
+
+    # ── Load variable display names for the variables actually used ──────
+    var_ids_in_pool = {
+        vid for vm in variable_map_by_pkg.values() for vid in vm.values()
+    }
+    var_rows = (await db.execute(
+        select(Variable).where(Variable.id.in_(var_ids_in_pool))
+    )).scalars().all() if var_ids_in_pool else []
+    variable_names: dict[str, str] = {v.id: v.name for v in var_rows}
+
+    # ── Run the algorithm ────────────────────────────────────────────────
+    step = run_elimination(pool, parameters, parsed_answers, variable_names)
+
+    # ── Translate EliminationStep → JSON response ────────────────────────
+    if step.error:
+        # Spec: pool=0 is a Content-Manager-alertable configuration error.
+        # Phase 5.3 will wire the actual alert; for now we log and return.
+        import logging as _logging
+        _logging.getLogger(__name__).error(
+            "BL-01 DATA_CONFIG_ERROR client=%s crop=%s district=%s answers=%s",
+            client_id, crop_cosh_id, district_cosh_id, answers,
+        )
+        return {"done": False, "error": step.error}
+
+    if step.done and step.package is not None:
+        return {
+            "done": True,
+            "package": {
+                "id": step.package.id,
+                "name": step.package.name,
+                "description": step.package.description,
+            },
+            "summary": step.summary,        # plain-language variable names
+            "auto_selected": step.auto_selected,
+        }
+
+    # Question step
     return {
         "done": False,
-        "parameter": {"id": next_param_id, "name": param.name if param else next_param_id},
-        "variables": [{"id": v.id, "name": v.name} for v in variables],
-        "remaining_count": len(remaining_packages),
+        "parameter": {"id": step.parameter.id, "name": step.parameter.name},
+        "variables": [{"id": v.id, "name": v.name} for v in step.variables],
+        "remaining_count": step.remaining_count,
+        "auto_selected": step.auto_selected,
     }
 
 
@@ -884,17 +922,6 @@ async def _get_subscription(db: AsyncSession, subscription_id: str, farmer_user_
     if not sub:
         raise HTTPException(status_code=404, detail="Subscription not found")
     return sub
-
-
-async def _package_has_variable(db: AsyncSession, package_id: str, parameter_id: str, variable_id: str) -> bool:
-    result = await db.execute(
-        select(PackageVariable).where(
-            PackageVariable.package_id == package_id,
-            PackageVariable.parameter_id == parameter_id,
-            PackageVariable.variable_id == variable_id,
-        )
-    )
-    return result.scalar_one_or_none() is not None
 
 
 def _generate_reference(short_name: str = "") -> str:
