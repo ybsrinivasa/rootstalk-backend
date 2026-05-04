@@ -260,6 +260,90 @@ async def test_reset_with_empty_answers_starts_over(db):
 
 @requires_docker
 @pytest.mark.asyncio
+async def test_data_config_error_persisted_for_sa_review(db):
+    """When BL-01 returns DATA_CONFIG_ERROR, a row is written to
+    data_config_errors so SA / Content Manager can investigate."""
+    from app.modules.subscriptions.config_error_models import DataConfigError
+
+    user = await make_user(db)
+    client = await make_client(db)
+    await db.commit()
+
+    # Empty pool — no PackageLocation rows for this district.
+    out = await guided_elimination_step(
+        crop_cosh_id="crop:nonexistent",
+        district_cosh_id="district:nonexistent",
+        client_id=client.id, answers="",
+        db=db, current_user=user,
+    )
+    assert out["error"] == "DATA_CONFIG_ERROR"
+
+    rows = (await db.execute(
+        select(DataConfigError).where(DataConfigError.algorithm == "BL-01")
+    )).scalars().all()
+    assert len(rows) == 1
+    r = rows[0]
+    assert r.client_id == client.id
+    assert r.crop_cosh_id == "crop:nonexistent"
+    assert r.district_cosh_id == "district:nonexistent"
+    assert r.observed_by_user_id == user.id
+    assert r.details == "DATA_CONFIG_ERROR"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_admin_endpoint_lists_recent_config_errors(db):
+    """SA endpoint returns DATA_CONFIG_ERROR rows newest first, gated
+    by SA email."""
+    from app.config import settings
+    from app.modules.subscriptions.router import admin_list_bl01_config_errors
+
+    sa = await make_user(db)
+    sa.email = settings.sa_email
+    farmer = await make_user(db)
+    client = await make_client(db)
+    await db.commit()
+
+    # Trigger two errors as the farmer.
+    await guided_elimination_step(
+        crop_cosh_id="crop:x", district_cosh_id="district:1",
+        client_id=client.id, answers="",
+        db=db, current_user=farmer,
+    )
+    await guided_elimination_step(
+        crop_cosh_id="crop:y", district_cosh_id="district:2",
+        client_id=client.id, answers="",
+        db=db, current_user=farmer,
+    )
+
+    out = await admin_list_bl01_config_errors(
+        limit=50, db=db, current_user=sa,
+    )
+    assert len(out) == 2
+    # Newest first.
+    assert out[0]["crop_cosh_id"] == "crop:y"
+    assert out[1]["crop_cosh_id"] == "crop:x"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_admin_endpoint_rejects_non_sa(db):
+    from fastapi import HTTPException
+    from app.modules.subscriptions.router import admin_list_bl01_config_errors
+
+    other = await make_user(db)
+    other.email = "not-sa@example.com"
+    await db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await admin_list_bl01_config_errors(
+            limit=50, db=db, current_user=other,
+        )
+    assert exc.value.status_code == 403
+
+
+@requires_docker
+@pytest.mark.asyncio
 async def test_only_dead_end_safe_variables_are_offered(db):
     """Spec: 'Only show Variables that lead to at least one valid PoP at
     each step (dead ends structurally impossible)'.

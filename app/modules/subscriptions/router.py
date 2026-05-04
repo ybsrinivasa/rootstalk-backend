@@ -160,8 +160,10 @@ async def guided_elimination_step(
         )
     )).scalars().all()
 
-    if not pkg_rows:
-        return {"done": False, "error": "DATA_CONFIG_ERROR"}
+    # Note: do NOT early-return on empty pkg_rows — let the algorithm
+    # produce the DATA_CONFIG_ERROR so the audit-row write at the bottom
+    # runs uniformly for every error path (no candidates, or candidates
+    # but ambiguous fingerprints).
 
     pkg_ids = [p.id for p in pkg_rows]
 
@@ -211,13 +213,32 @@ async def guided_elimination_step(
 
     # ── Translate EliminationStep → JSON response ────────────────────────
     if step.error:
-        # Spec: pool=0 is a Content-Manager-alertable configuration error.
-        # Phase 5.3 will wire the actual alert; for now we log and return.
+        # Spec: pool=0 (or pool>1 with no remaining parameters) is a
+        # Content-Manager-alertable configuration error. We log AND
+        # persist to data_config_errors so SA can review via
+        # GET /admin/bl01/config-errors.
         import logging as _logging
+        from app.modules.subscriptions.config_error_models import DataConfigError
         _logging.getLogger(__name__).error(
             "BL-01 DATA_CONFIG_ERROR client=%s crop=%s district=%s answers=%s",
             client_id, crop_cosh_id, district_cosh_id, answers,
         )
+        try:
+            db.add(DataConfigError(
+                algorithm="BL-01",
+                client_id=client_id,
+                crop_cosh_id=crop_cosh_id,
+                district_cosh_id=district_cosh_id,
+                answers_state=answers or None,
+                observed_by_user_id=current_user.id,
+                details=step.error,
+            ))
+            await db.commit()
+        except Exception as _audit_exc:  # noqa: BLE001 — never let logging fail the request
+            _logging.getLogger(__name__).warning(
+                "BL-01 audit row insert failed: %r", _audit_exc,
+            )
+            await db.rollback()
         return {"done": False, "error": step.error}
 
     if step.done and step.package is not None:
@@ -2285,6 +2306,46 @@ async def admin_list_subscription_snapshots(
             "practice_count": len((s.content or {}).get("practices") or []),
         }
         for s in rows
+    ]
+
+
+@router.get("/admin/bl01/config-errors")
+async def admin_list_bl01_config_errors(
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SA debug — most recent BL-01 (PoP guided elimination) config errors.
+
+    Each row is one farmer hit on a configuration that doesn't resolve to
+    any package OR resolves to multiple packages with no remaining
+    parameter to ask. Investigate by checking the (client_id,
+    crop_cosh_id, district_cosh_id) combination — usually means the SE
+    is missing a PackageLocation, a PackageVariable, or has duplicate
+    package fingerprints.
+    """
+    _require_sa_for_snapshots(current_user)
+
+    from app.modules.subscriptions.config_error_models import DataConfigError
+    rows = (await db.execute(
+        select(DataConfigError)
+        .where(DataConfigError.algorithm == "BL-01")
+        .order_by(DataConfigError.occurred_at.desc())
+        .limit(max(1, min(limit, 500)))
+    )).scalars().all()
+
+    return [
+        {
+            "id": r.id,
+            "client_id": r.client_id,
+            "crop_cosh_id": r.crop_cosh_id,
+            "district_cosh_id": r.district_cosh_id,
+            "answers_state": r.answers_state,
+            "details": r.details,
+            "observed_by_user_id": r.observed_by_user_id,
+            "occurred_at": r.occurred_at,
+        }
+        for r in rows
     ]
 
 
