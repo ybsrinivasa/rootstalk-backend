@@ -1,0 +1,8 @@
+# Development / test-only dependencies. Not deployed to production.
+# Install with: venv/bin/pip install -r requirements-dev.txt
+-r requirements.txt
+
+pytest==9.0.3
+pytest-asyncio==1.3.0
+testcontainers[postgres]==4.14.2
+docker==7.1.0
