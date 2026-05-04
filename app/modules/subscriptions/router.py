@@ -1307,6 +1307,13 @@ async def get_today_advisory(
         pending_questions_by_tl: dict = {}   # tl.id → {question info}
         blank_paths_by_tl: dict = {}         # tl.id → list of {question_id, question_text, farmer_answer}
 
+        # VIEWED-lock: collect (timeline_id, source) of every today-active
+        # timeline rendered for this subscription. Snapshots taken at the
+        # end of the iteration. See per_subscription_versioning.md.
+        viewed_keys: list[tuple[str, str]] = [
+            (tl.id, "CCA") for tl, _ in active_timelines
+        ]
+
         for tl, day_num in active_timelines:
             p_result = await db.execute(
                 select(Practice).where(Practice.timeline_id == tl.id).order_by(Practice.display_order)
@@ -1431,6 +1438,7 @@ async def get_today_advisory(
                     to_d = cha.triggered_at.date() + timedelta(days=sp_tl.to_value)
                     if not (from_d <= today <= to_d):
                         continue  # Not active today
+                    viewed_keys.append((sp_tl.id, "SP"))
                     sp_practices = (await db.execute(
                         select(SPPractice).where(SPPractice.timeline_id == sp_tl.id).order_by(SPPractice.display_order)
                     )).scalars().all()
@@ -1464,6 +1472,7 @@ async def get_today_advisory(
                     to_d = cha.triggered_at.date() + timedelta(days=pg_tl.to_value)
                     if not (from_d <= today <= to_d):
                         continue
+                    viewed_keys.append((pg_tl.id, "PG"))
                     pg_practices = (await db.execute(
                         select(PGPractice).where(PGPractice.timeline_id == pg_tl.id).order_by(PGPractice.display_order)
                     )).scalars().all()
@@ -1557,6 +1566,14 @@ async def get_today_advisory(
             "reference_number": sub.reference_number,
             "timelines": timeline_data,
         })
+
+        # VIEWED-lock — best-effort. Per-key has_snapshot fast path inside
+        # take_snapshot makes repeat calls cheap.
+        if viewed_keys:
+            from app.services.snapshot_triggers import take_snapshots_for_keys
+            await take_snapshots_for_keys(
+                db, sub.id, viewed_keys, lock_trigger="VIEWED",
+            )
 
     return out
 
