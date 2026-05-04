@@ -16,10 +16,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.advisory.models import (
     ConditionalAnswer, ConditionalQuestion, Element, PGElement, PGPractice,
-    PGRecommendation, PGTimeline, Package, PackageStatus, PackageType,
+    PGRecommendation, PGTimeline, Package, PackageLocation, PackageStatus,
+    PackageType, PackageVariable, Parameter, ParameterSource,
     Practice, PracticeConditional, PracticeL0, Relation, RelationType,
     SPElement, SPPractice, SPRecommendation, SPTimeline, Timeline,
-    TimelineFromType,
+    TimelineFromType, Variable,
 )
 from app.modules.clients.models import Client
 from app.modules.platform.models import User
@@ -79,6 +80,57 @@ async def make_subscription(
     db.add(s)
     await db.flush()
     return s
+
+
+async def make_package_location(
+    db: AsyncSession, package: Package, *,
+    state_cosh_id: str = "state:test",
+    district_cosh_id: str = "district:test",
+) -> PackageLocation:
+    pl = PackageLocation(
+        package_id=package.id,
+        state_cosh_id=state_cosh_id,
+        district_cosh_id=district_cosh_id,
+    )
+    db.add(pl)
+    await db.flush()
+    return pl
+
+
+async def make_parameter(
+    db: AsyncSession, *,
+    crop_cosh_id: str = "crop:test", name: str = "Param",
+    display_order: int = 0,
+) -> Parameter:
+    p = Parameter(
+        crop_cosh_id=crop_cosh_id,
+        name=name,
+        source=ParameterSource.COSH,
+        display_order=display_order,
+    )
+    db.add(p)
+    await db.flush()
+    return p
+
+
+async def make_variable(
+    db: AsyncSession, parameter: Parameter, *, name: str = "Var",
+) -> Variable:
+    v = Variable(parameter_id=parameter.id, name=name)
+    db.add(v)
+    await db.flush()
+    return v
+
+
+async def make_package_variable(
+    db: AsyncSession, package: Package, parameter: Parameter, variable: Variable,
+) -> PackageVariable:
+    pv = PackageVariable(
+        package_id=package.id, parameter_id=parameter.id, variable_id=variable.id,
+    )
+    db.add(pv)
+    await db.flush()
+    return pv
 
 
 async def make_timeline(
