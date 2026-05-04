@@ -77,6 +77,14 @@ class OrderItem(Base):
     scan_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[OrderItemStatus] = mapped_column(String(30), default=OrderItemStatus.PENDING)
     postponed_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Per-subscription versioning Phase 3.2: pointer to the locked snapshot in
+    # force at order-create time. Nullable for backwards compatibility — orders
+    # placed before Phase 3.2 have NULL and fall back to master at read time.
+    snapshot_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("locked_timeline_snapshots.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 

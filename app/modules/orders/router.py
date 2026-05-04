@@ -103,6 +103,8 @@ async def create_order(
     db.add(order)
     await db.flush()
 
+    # ── Pass 1: resolve practice rows + build relation_type map ──────────
+    item_specs: list[dict] = []
     timeline_ids_in_order: set[str] = set()
     for practice_id in request.practice_ids:
         practice = (await db.execute(select(Practice).where(Practice.id == practice_id))).scalar_one_or_none()
@@ -116,30 +118,51 @@ async def create_order(
                 relation_type = relation_row.relation_type.value
         if practice and practice.timeline_id:
             timeline_ids_in_order.add(practice.timeline_id)
+        item_specs.append({
+            "practice_id": practice_id,
+            "timeline_id": practice.timeline_id if practice else "",
+            "relation_id": practice.relation_id if practice else None,
+            "relation_type": relation_type,
+            "relation_role": practice.relation_role if practice else None,
+        })
+
+    # ── Pass 2: take snapshots BEFORE creating items (Phase 3.2) ─────────
+    # Each item carries a permanent pointer to the snapshot in force at
+    # order-create time. The dealer's read path follows this pointer.
+    from app.services.snapshot_triggers import take_snapshots_for_keys  # noqa: F401 (legacy import kept warm)
+    from app.services.snapshot import take_snapshot
+    import logging as _logging
+    _logger = _logging.getLogger(__name__)
+
+    snap_id_by_tl: dict[str, Optional[str]] = {}
+    for tl_id in timeline_ids_in_order:
+        try:
+            snap = await take_snapshot(
+                db, request.subscription_id, tl_id, "PURCHASE_ORDER", source="CCA",
+            )
+            snap_id_by_tl[tl_id] = snap.id
+        except Exception as exc:  # noqa: BLE001 — best-effort; nightly sweep retries
+            _logger.warning(
+                "PO snapshot capture failed sub=%s tl=%s: %s",
+                request.subscription_id, tl_id, exc,
+            )
+            snap_id_by_tl[tl_id] = None
+
+    # ── Pass 3: create OrderItems with snapshot_id pointer ───────────────
+    for spec in item_specs:
         db.add(OrderItem(
             order_id=order.id,
-            practice_id=practice_id,
-            timeline_id=practice.timeline_id if practice else "",
-            relation_id=practice.relation_id if practice else None,
-            relation_type=relation_type,
-            relation_role=practice.relation_role if practice else None,
+            practice_id=spec["practice_id"],
+            timeline_id=spec["timeline_id"],
+            relation_id=spec["relation_id"],
+            relation_type=spec["relation_type"],
+            relation_role=spec["relation_role"],
+            snapshot_id=snap_id_by_tl.get(spec["timeline_id"]),
             status=OrderItemStatus.PENDING,
         ))
 
     await db.commit()
     await db.refresh(order)
-
-    # PO Lock — freeze the timeline content for this subscription per
-    # per_subscription_versioning.md. Best-effort; nightly sweep is the
-    # safety net.
-    from app.services.snapshot_triggers import take_snapshots_for_keys
-    await take_snapshots_for_keys(
-        db,
-        subscription_id=request.subscription_id,
-        keys=[(tid, "CCA") for tid in timeline_ids_in_order],
-        lock_trigger="PURCHASE_ORDER",
-    )
-
     return {"id": order.id, "status": order.status}
 
 

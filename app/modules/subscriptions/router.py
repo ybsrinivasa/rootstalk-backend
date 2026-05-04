@@ -2155,6 +2155,27 @@ async def buy_all_dbs(
             for r in rel_rows
         }
 
+    # ── Take snapshots BEFORE creating items (Phase 3.2) ─────────────────
+    # Items carry a permanent pointer to the locked snapshot.
+    from app.services.snapshot import take_snapshot
+    import logging as _logging
+    _po_logger = _logging.getLogger(__name__)
+
+    timeline_ids_in_order = {p.timeline_id for p in matching_practices if p.timeline_id}
+    snap_id_by_tl: dict[str, Optional[str]] = {}
+    for tl_id in timeline_ids_in_order:
+        try:
+            snap = await take_snapshot(
+                db, subscription_id, tl_id, "PURCHASE_ORDER", source="CCA",
+            )
+            snap_id_by_tl[tl_id] = snap.id
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            _po_logger.warning(
+                "PO snapshot capture failed sub=%s tl=%s: %s",
+                subscription_id, tl_id, exc,
+            )
+            snap_id_by_tl[tl_id] = None
+
     for p in matching_practices:
         db.add(OrderItem(
             order_id=order.id,
@@ -2163,22 +2184,12 @@ async def buy_all_dbs(
             relation_id=p.relation_id,
             relation_type=rel_type_map.get(p.relation_id) if p.relation_id else None,
             relation_role=p.relation_role,
+            snapshot_id=snap_id_by_tl.get(p.timeline_id),
             status=OrderItemStatus.PENDING,
         ))
 
     await db.commit()
     await db.refresh(order)
-
-    # PO Lock — freeze every DBS timeline this consolidated order touches.
-    from app.services.snapshot_triggers import take_snapshots_for_keys
-    timeline_ids_in_order = {p.timeline_id for p in matching_practices if p.timeline_id}
-    await take_snapshots_for_keys(
-        db,
-        subscription_id=subscription_id,
-        keys=[(tid, "CCA") for tid in timeline_ids_in_order],
-        lock_trigger="PURCHASE_ORDER",
-    )
-
     return {
         "order_id": order.id,
         "item_count": len(matching_practices),
