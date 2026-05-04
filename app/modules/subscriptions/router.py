@@ -2218,3 +2218,80 @@ def _haversine_sub(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     dlng = radians(lng2 - lng1)
     a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlng / 2) ** 2
     return R * 2 * asin(sqrt(a))
+
+
+# ── Phase 4.1: Admin debug endpoints for snapshots ──────────────────────────
+#
+# Two read-only endpoints for the SA support team. When a farmer reports
+# "I'm seeing old advice" or a dealer says "the brand-lock is wrong",
+# the SA can call these to verify exactly what was frozen at lock time
+# (and when, and why) for the affected subscription.
+
+def _require_sa_for_snapshots(current_user: User):
+    from app.config import settings as _settings
+    if current_user.email != _settings.sa_email:
+        raise HTTPException(
+            status_code=403, detail="Super Admin access required"
+        )
+
+
+@router.get("/admin/subscriptions/{subscription_id}/snapshots")
+async def admin_list_subscription_snapshots(
+    subscription_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SA debug — list every locked-timeline snapshot recorded for one
+    subscription, with timestamps and triggers. Content body is *not*
+    returned here (use the per-snapshot endpoint for that)."""
+    _require_sa_for_snapshots(current_user)
+
+    from app.modules.subscriptions.snapshot_models import LockedTimelineSnapshot
+    rows = (await db.execute(
+        select(LockedTimelineSnapshot)
+        .where(LockedTimelineSnapshot.subscription_id == subscription_id)
+        .order_by(LockedTimelineSnapshot.locked_at.asc())
+    )).scalars().all()
+
+    return [
+        {
+            "id": s.id,
+            "subscription_id": s.subscription_id,
+            "timeline_id": s.timeline_id,
+            "source": s.source,                  # CCA | PG | SP
+            "lock_trigger": s.lock_trigger,      # PURCHASE_ORDER | VIEWED | BACKFILL
+            "locked_at": s.locked_at,
+            "schema_version": (s.content or {}).get("schema_version"),
+            "practice_count": len((s.content or {}).get("practices") or []),
+        }
+        for s in rows
+    ]
+
+
+@router.get("/admin/snapshots/{snapshot_id}")
+async def admin_get_snapshot(
+    snapshot_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SA debug — full content of a single snapshot. Returns the entire
+    JSONB payload so the SA can compare against current master tables."""
+    _require_sa_for_snapshots(current_user)
+
+    from app.modules.subscriptions.snapshot_models import LockedTimelineSnapshot
+    row = (await db.execute(
+        select(LockedTimelineSnapshot)
+        .where(LockedTimelineSnapshot.id == snapshot_id)
+    )).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+
+    return {
+        "id": row.id,
+        "subscription_id": row.subscription_id,
+        "timeline_id": row.timeline_id,
+        "source": row.source,
+        "lock_trigger": row.lock_trigger,
+        "locked_at": row.locked_at,
+        "content": row.content,
+    }
