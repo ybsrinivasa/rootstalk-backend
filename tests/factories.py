@@ -131,10 +131,12 @@ async def make_element(
     db: AsyncSession, practice: Practice, *,
     element_type: str = "DOSAGE", value: str = "50",
     unit_cosh_id: str = "kg_per_acre", display_order: int = 0,
+    cosh_ref: str | None = None,
 ) -> Element:
     e = Element(
         practice_id=practice.id, element_type=element_type, value=value,
         unit_cosh_id=unit_cosh_id, display_order=display_order,
+        cosh_ref=cosh_ref,
     )
     db.add(e)
     await db.flush()

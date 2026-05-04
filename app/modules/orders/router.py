@@ -953,11 +953,43 @@ async def get_dealer_order(
         for e in elements:
             elements_by_practice.setdefault(e.practice_id, []).append(e)
 
-    def has_locked_brand(practice_id: str) -> bool:
-        return any(
-            e.element_type == "brand" and e.cosh_ref
-            for e in elements_by_practice.get(practice_id, [])
-        )
+    # ── Phase 3.3: per-item snapshot resolution ──────────────────────────
+    # Each item that was created post-Phase-3.2 carries a permanent pointer
+    # to the locked_timeline_snapshot in force at order-create time. When
+    # present, this snapshot is the source of truth for brand-lock state —
+    # SE edits to master practice elements made AFTER order placement
+    # cannot bleed into the dealer's view of THIS order (Rule 5).
+    from app.modules.subscriptions.snapshot_models import LockedTimelineSnapshot
+    from app.services.bl07_brand_options import _practice_elements_from_snapshot
+
+    snap_ids_in_order = list({i.snapshot_id for i in items if i.snapshot_id})
+    snapshots_by_id: dict[str, LockedTimelineSnapshot] = {}
+    if snap_ids_in_order:
+        snap_rows = (await db.execute(
+            select(LockedTimelineSnapshot).where(
+                LockedTimelineSnapshot.id.in_(snap_ids_in_order)
+            )
+        )).scalars().all()
+        snapshots_by_id = {s.id: s for s in snap_rows}
+
+    def _elements_for_item(it: OrderItem):
+        """Return element list for this item — from snapshot if linked,
+        else from master."""
+        if it.snapshot_id and it.snapshot_id in snapshots_by_id:
+            snap_els = _practice_elements_from_snapshot(
+                snapshots_by_id[it.snapshot_id], it.practice_id,
+            )
+            if snap_els is not None:
+                return snap_els
+        return elements_by_practice.get(it.practice_id, [])
+
+    def has_locked_brand_item(it: OrderItem) -> bool:
+        for e in _elements_for_item(it):
+            et = e.get("element_type") if isinstance(e, dict) else getattr(e, "element_type", None)
+            cr = e.get("cosh_ref") if isinstance(e, dict) else getattr(e, "cosh_ref", None)
+            if et == "brand" and cr:
+                return True
+        return False
 
     relations_payload: list[dict] = []
     for rel_id, rel_items in by_relation.items():
@@ -975,7 +1007,7 @@ async def get_dealer_order(
             option_data: list[dict] = []
             for opt_idx in sorted(parts_data[part_idx].keys()):
                 sorted_items = [it for (_, it) in sorted(parts_data[part_idx][opt_idx], key=lambda x: x[0])]
-                has_locked = any(has_locked_brand(it.practice_id) for it in sorted_items)
+                has_locked = any(has_locked_brand_item(it) for it in sorted_items)
                 statuses = [
                     (it.status.value if hasattr(it.status, "value") else it.status)
                     for it in sorted_items
@@ -1115,9 +1147,24 @@ async def get_item_brand_options(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """BL-07: Returns locked or unlocked brand options for a specific order item."""
+    """BL-07: Returns locked or unlocked brand options for a specific order item.
+
+    Phase 3.3: when item.snapshot_id is set, brand-lock state is sourced from
+    the frozen snapshot — SE edits to master practice elements after order
+    placement do not change what the dealer sees for THIS order.
+    """
     item = await _get_order_item(db, item_id, order_id)
-    result = await get_brand_options(db, item.practice_id, current_user.id)
+    snapshot = None
+    if item.snapshot_id:
+        from app.modules.subscriptions.snapshot_models import LockedTimelineSnapshot
+        snapshot = (await db.execute(
+            select(LockedTimelineSnapshot).where(
+                LockedTimelineSnapshot.id == item.snapshot_id
+            )
+        )).scalar_one_or_none()
+    result = await get_brand_options(
+        db, item.practice_id, current_user.id, snapshot=snapshot,
+    )
     return result.to_dict()
 
 

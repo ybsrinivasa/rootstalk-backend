@@ -22,6 +22,33 @@ from dataclasses import dataclass
 from typing import Optional
 
 
+# ── Phase 3.3 helpers: source elements from snapshot when available ─────────
+
+def _el_field(el, name):
+    """Read an element attribute uniformly whether it's a SQLAlchemy row
+    (master) or a dict (snapshot content)."""
+    if el is None:
+        return None
+    if isinstance(el, dict):
+        return el.get(name)
+    return getattr(el, name, None)
+
+
+def _practice_elements_from_snapshot(snapshot, practice_id: str):
+    """If a snapshot is provided, return the frozen element list for this
+    practice (list of dicts). Returns None when no snapshot is given OR
+    the practice id is not present inside the snapshot's content (caller
+    falls back to master).
+    """
+    if snapshot is None:
+        return None
+    content = getattr(snapshot, "content", None) or {}
+    for p in (content.get("practices") or []):
+        if p.get("id") == practice_id:
+            return p.get("elements") or []
+    return None
+
+
 @dataclass
 class BrandOption:
     cosh_id: str
@@ -75,48 +102,68 @@ async def get_brand_options(
     db,
     practice_id: str,
     dealer_user_id: str,
+    snapshot=None,
 ) -> BrandOptionsResult:
     """
     Returns brand options for a given practice and dealer.
     Queries cosh_reference_cache for available brands and filters by
     dealer's active dealership relationships.
+
+    Phase 3.3: when `snapshot` is provided (a LockedTimelineSnapshot row from
+    the per-subscription versioning system), the practice's elements are
+    sourced from the frozen snapshot content rather than the master Element
+    table. This protects the dealer's view of brand-lock state from SE
+    edits made AFTER order placement (Rule 5). Cosh-cache lookups (brand
+    name translations, alternative-brand list) stay master-sourced because
+    cosh_reference_cache is a global reference, not per-subscription.
     """
     from sqlalchemy import select
     from app.modules.advisory.models import Practice, Element
     from app.modules.orders.models import DealerRelationship
     from app.modules.sync.models import CoshReferenceCache
 
-    practice = (await db.execute(
-        select(Practice).where(Practice.id == practice_id)
-    )).scalar_one_or_none()
-    if not practice:
-        return BrandOptionsResult(is_locked=False)
-
-    elements = (await db.execute(
-        select(Element).where(Element.practice_id == practice_id)
-    )).scalars().all()
+    elements = _practice_elements_from_snapshot(snapshot, practice_id)
+    if elements is None:
+        # No snapshot or practice not found inside snapshot — fall back to master.
+        practice = (await db.execute(
+            select(Practice).where(Practice.id == practice_id)
+        )).scalar_one_or_none()
+        if not practice:
+            return BrandOptionsResult(is_locked=False)
+        elements = (await db.execute(
+            select(Element).where(Element.practice_id == practice_id)
+        )).scalars().all()
 
     # Check for locked brand: element_type == 'brand' with a specific cosh_ref
-    locked_el = next((e for e in elements if e.element_type == "brand" and e.cosh_ref), None)
+    locked_el = next(
+        (e for e in elements
+         if _el_field(e, "element_type") == "brand" and _el_field(e, "cosh_ref")),
+        None,
+    )
     if locked_el:
+        locked_cosh_ref = _el_field(locked_el, "cosh_ref")
         brand_entry = (await db.execute(
             select(CoshReferenceCache).where(
-                CoshReferenceCache.cosh_id == locked_el.cosh_ref,
+                CoshReferenceCache.cosh_id == locked_cosh_ref,
                 CoshReferenceCache.entity_type == "brand",
             )
         )).scalar_one_or_none()
         brand_name = None
         if brand_entry and brand_entry.translations:
-            brand_name = brand_entry.translations.get("en") or locked_el.cosh_ref
+            brand_name = brand_entry.translations.get("en") or locked_cosh_ref
         return BrandOptionsResult(
             is_locked=True,
-            locked_brand_cosh_id=locked_el.cosh_ref,
-            locked_brand_name=brand_name or locked_el.cosh_ref,
+            locked_brand_cosh_id=locked_cosh_ref,
+            locked_brand_name=brand_name or locked_cosh_ref,
         )
 
     # Unlocked brand — find available brands from cosh_reference_cache
-    common_name_el = next((e for e in elements if e.element_type == "common_name" and e.cosh_ref), None)
-    common_name_cosh_id = common_name_el.cosh_ref if common_name_el else None
+    common_name_el = next(
+        (e for e in elements
+         if _el_field(e, "element_type") == "common_name" and _el_field(e, "cosh_ref")),
+        None,
+    )
+    common_name_cosh_id = _el_field(common_name_el, "cosh_ref") if common_name_el else None
 
     if common_name_cosh_id:
         brands_result = await db.execute(
