@@ -176,6 +176,97 @@ async def test_today_renders_snapshot_after_master_element_edit(db):
 
 @requires_docker
 @pytest.mark.asyncio
+async def test_today_cha_window_does_not_shift_with_crop_start(db):
+    """Rule 3 (second clause) — CHA timelines anchor to triggered_at, NOT
+    crop_start_date. Shifting crop_start_date must leave CHA window dates
+    untouched. Belt-and-braces test: the code path is correct by
+    construction (cha_calendar_dates takes triggered_at), but this
+    test guarantees it stays that way under future refactors.
+    """
+    from datetime import date as _date
+    from app.modules.subscriptions.models import TriggeredCHAEntry
+    from tests.factories import (
+        make_sp_element, make_sp_practice, make_sp_recommendation,
+        make_sp_timeline,
+    )
+
+    user = await make_user(db)
+    client = await make_client(db)
+    package = await make_package(db, client)
+    sub = await make_subscription(
+        db, farmer=user, client=client, package=package,
+    )
+    sub.crop_start_date = datetime.now(timezone.utc) - timedelta(days=60)
+    await db.commit()
+
+    # An active CCA timeline so the route doesn't short-circuit on
+    # `not active_timelines` (pre-existing today-route quirk; CHA
+    # processing lives inside the same per-subscription loop).
+    cca_tl = await make_timeline(
+        db, package, name="CCA_FOR_CHA_TEST",
+        from_type=TimelineFromType.DAS, from_value=0, to_value=120,
+    )
+    await make_practice(db, cca_tl)
+
+    sp_rec = await make_sp_recommendation(db, client)
+    sp_tl = await make_sp_timeline(
+        db, sp_rec, name="CHA_TL", from_value=0, to_value=14,
+    )
+    sp_p = await make_sp_practice(db, sp_tl, l1_type="PESTICIDE")
+    await make_sp_element(db, sp_p, value="2.5")
+
+    triggered_at_dt = datetime.now(timezone.utc) - timedelta(days=5)
+    cha_entry = TriggeredCHAEntry(
+        subscription_id=sub.id,
+        farmer_user_id=user.id,
+        client_id=client.id,
+        problem_cosh_id="problem:test",
+        recommendation_type="SP",
+        recommendation_id=sp_rec.id,
+        triggered_by="DIAGNOSIS",
+        triggered_at=triggered_at_dt,
+        status="ACTIVE",
+        problem_name="Test Problem",
+    )
+    db.add(cha_entry)
+    await db.commit()
+
+    cha_tl_id = f"cha-sp-{sp_tl.id}"
+
+    out1 = await get_today_advisory(db=db, current_user=user)
+    cha_rt1 = next(
+        (rt for rt in out1[0]["timelines"] if rt["id"] == cha_tl_id), None,
+    )
+    assert cha_rt1 is not None, "CHA timeline must render — today is in window"
+    cha_from_1, cha_to_1 = cha_rt1["from_date"], cha_rt1["to_date"]
+
+    # Sanity: dates anchor to triggered_at.
+    expected_from = (triggered_at_dt.date()).isoformat()
+    expected_to = (triggered_at_dt.date() + timedelta(days=14)).isoformat()
+    assert cha_from_1 == expected_from
+    assert cha_to_1 == expected_to
+
+    # Now shift crop_start_date significantly. CCA timelines (if any) would
+    # move; CHA must not.
+    sub.crop_start_date = datetime.now(timezone.utc) - timedelta(days=90)
+    await db.commit()
+
+    out2 = await get_today_advisory(db=db, current_user=user)
+    cha_rt2 = next(
+        (rt for rt in out2[0]["timelines"] if rt["id"] == cha_tl_id), None,
+    )
+    assert cha_rt2 is not None, "CHA timeline still in window after crop_start shift"
+    assert cha_rt2["from_date"] == cha_from_1, (
+        "CHA from_date must be unchanged after crop_start_date shift "
+        "(Rule 3, second clause)"
+    )
+    assert cha_rt2["to_date"] == cha_to_1, (
+        "CHA to_date must be unchanged after crop_start_date shift"
+    )
+
+
+@requires_docker
+@pytest.mark.asyncio
 async def test_today_outside_window_takes_no_snapshot(db):
     """Window 0..5; subscription day_offset = 50 → no snapshot."""
     user, sub, tl, _p = await _seed_today_active(db, day_offset=50, das_to=5)
