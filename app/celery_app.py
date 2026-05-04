@@ -12,6 +12,7 @@ celery_app = Celery(
         "app.tasks.query_expiry",
         "app.tasks.order_expiry",
         "app.tasks.account_deletion",
+        "app.tasks.snapshot_sweep",
     ],
 )
 
@@ -35,6 +36,12 @@ celery_app.conf.beat_schedule = {
     "anonymise-deleted-users": {
         "task": "app.tasks.account_deletion.anonymise_deleted_users",
         "schedule": crontab(hour=3, minute=0),  # 03:00 UTC daily
+    },
+    # Per-subscription versioning — defensive snapshot sweep at 02:00 UTC.
+    # Catches any synchronous PO/VIEWED trigger misses.
+    "snapshot-sweep": {
+        "task": "app.tasks.snapshot_sweep.take_missing_snapshots",
+        "schedule": crontab(hour=2, minute=0),
     },
 }
 
