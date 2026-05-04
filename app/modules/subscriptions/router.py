@@ -85,17 +85,19 @@ async def get_pool_can_assign(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Phase B.1 — proactive guard for the promoter PWA flow.
+    """Phase C — proactive guard for the promoter PWA flow.
 
-    Returns whether a promoter is allowed to start a new assignment for
-    this client. Falsy when the pool balance is zero. The PWA uses this
-    on company-select so promoters don't waste a full BL-01 walk only to
-    be rejected at the final step.
+    Returns whether the *current_user as promoter* is allowed to start
+    a new assignment for this client. Gates on the promoter's personal
+    allocation balance (Phase C model), not the company-wide pool. The
+    PWA uses this on company-select so promoters don't waste a full
+    BL-01 walk only to be rejected at the final step.
     """
-    balance = await _get_pool_balance(db, client_id)
+    from app.services.promoter_pool import get_promoter_balance
+    balance = await get_promoter_balance(db, client_id, current_user.id)
     return {
         "client_id": client_id,
-        "available_units": balance,
+        "available_units": balance,   # promoter's own balance, not company's
         "can_assign": balance > 0,
     }
 
@@ -139,6 +141,147 @@ async def get_pool_quote(
         "discount_rupees": f"{q.discount_paise / 100:.2f}",
         "total_rupees": f"{q.total_paise / 100:.2f}",
     }
+
+
+# ── Phase C: Per-promoter allocations ──────────────────────────────────────────
+
+class PromoterAllocateRequest(BaseModel):
+    units: int
+
+
+@router.get("/client/{client_id}/promoter-allocations")
+async def list_promoter_allocations(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CA-side — list every promoter who has an allocation row for
+    this company along with their current balance and audit totals."""
+    from app.modules.subscriptions.promoter_allocation_models import PromoterAllocation
+    from app.services.promoter_pool import get_company_unallocated_balance
+
+    rows = (await db.execute(
+        select(PromoterAllocation, User)
+        .join(User, User.id == PromoterAllocation.promoter_user_id)
+        .where(PromoterAllocation.client_id == client_id)
+        .order_by(User.name)
+    )).all()
+
+    company_unallocated = await get_company_unallocated_balance(db, client_id)
+
+    return {
+        "client_id": client_id,
+        "company_unallocated_balance": company_unallocated,
+        "promoters": [
+            {
+                "promoter_user_id": user.id,
+                "promoter_name": user.name,
+                "promoter_phone": user.phone,
+                "units_balance": int(alloc.units_balance),
+                "allocated_total": int(alloc.allocated_total),
+                "reclaimed_total": int(alloc.reclaimed_total),
+                "consumed_total": int(alloc.consumed_total),
+            }
+            for alloc, user in rows
+        ],
+    }
+
+
+@router.post(
+    "/client/{client_id}/promoter-allocations/{promoter_user_id}/allocate",
+    status_code=201,
+)
+async def allocate_to_promoter_endpoint(
+    client_id: str,
+    promoter_user_id: str,
+    request: PromoterAllocateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CA action — give `units` to a specific promoter, drawn from the
+    company's unallocated balance. Lazy-creates the allocation row on
+    first call. Returns 422 if the company doesn't have enough
+    unallocated units."""
+    from app.services.promoter_pool import (
+        allocate_to_promoter, get_promoter_balance,
+    )
+    try:
+        row = await allocate_to_promoter(
+            db, client_id=client_id,
+            promoter_user_id=promoter_user_id,
+            units=request.units,
+        )
+        await db.commit()
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return {
+        "promoter_user_id": promoter_user_id,
+        "units_balance": int(row.units_balance),
+        "allocated_total": int(row.allocated_total),
+    }
+
+
+@router.post(
+    "/client/{client_id}/promoter-allocations/{promoter_user_id}/reclaim",
+    status_code=200,
+)
+async def reclaim_from_promoter_endpoint(
+    client_id: str,
+    promoter_user_id: str,
+    request: PromoterAllocateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CA action — pull `units` back from a promoter into the company
+    unallocated balance. Cannot exceed the promoter's current balance
+    (already-consumed units are not reclaimable)."""
+    from app.services.promoter_pool import reclaim_from_promoter
+    try:
+        row = await reclaim_from_promoter(
+            db, client_id=client_id,
+            promoter_user_id=promoter_user_id,
+            units=request.units,
+        )
+        await db.commit()
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return {
+        "promoter_user_id": promoter_user_id,
+        "units_balance": int(row.units_balance),
+        "reclaimed_total": int(row.reclaimed_total),
+    }
+
+
+@router.get("/promoter/me/allocations")
+async def my_promoter_allocations(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Promoter-side — current_user sees their own allocation rows
+    across all companies that have allocated to them."""
+    from app.modules.subscriptions.promoter_allocation_models import PromoterAllocation
+    from app.modules.clients.models import Client
+
+    rows = (await db.execute(
+        select(PromoterAllocation, Client)
+        .join(Client, Client.id == PromoterAllocation.client_id)
+        .where(PromoterAllocation.promoter_user_id == current_user.id)
+        .order_by(Client.display_name)
+    )).all()
+
+    return [
+        {
+            "client_id": client.id,
+            "client_name": client.display_name or client.full_name,
+            "units_balance": int(alloc.units_balance),
+            "allocated_total": int(alloc.allocated_total),
+            "reclaimed_total": int(alloc.reclaimed_total),
+            "consumed_total": int(alloc.consumed_total),
+        }
+        for alloc, client in rows
+    ]
 
 
 # ── Phase B: Razorpay-backed pool top-up ───────────────────────────────────────
@@ -526,9 +669,16 @@ async def create_subscription(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Confirm subscription. Checks pool — activates or waitlists."""
-    balance = await _get_pool_balance(db, request.client_id)
+    """Create a self-subscribed Subscription in WAITLISTED state.
 
+    Phase C clarification (2026-05-04): self-subscribe is entirely
+    independent of the company subscription pool. The farmer pays
+    ₹199 directly to RootsTalk; nothing on any company's pool is
+    touched here. Status moves to ACTIVE only after Razorpay
+    `/payment/verify` confirms payment. The 3-day SubscriptionWaitlist
+    expiry row that used to gate "company tops up" is no longer
+    written — there's nothing to wait for.
+    """
     sub = Subscription(
         farmer_user_id=current_user.id,
         client_id=request.client_id,
@@ -540,23 +690,13 @@ async def create_subscription(
     db.add(sub)
     await db.flush()
 
-    if balance > 0:
-        sub.status = SubscriptionStatus.ACTIVE
-        sub.subscription_date = datetime.now(timezone.utc)
-        sub.reference_number = await _generate_reference_for_sub(db, sub.client_id)
-        await _consume_pool_unit(db, request.client_id)
-    else:
-        # Waitlisted — 3-day expiry
-        expires_at = datetime.now(timezone.utc) + timedelta(days=WAITLIST_EXPIRY_DAYS)
-        db.add(SubscriptionWaitlist(subscription_id=sub.id, expires_at=expires_at))
-
     await db.commit()
     await db.refresh(sub)
     return {
         "id": sub.id,
         "status": sub.status,
         "reference_number": sub.reference_number,
-        "message": "Subscription active." if sub.status == SubscriptionStatus.ACTIVE else "Subscription waitlisted — company has 3 days to top up pool.",
+        "message": "Subscription created — please complete payment to activate.",
     }
 
 
@@ -761,28 +901,46 @@ async def initiate_assignment(
 ):
     """Promoter assigns advisory to farmer. Farmer must approve.
 
-    Policy (2026-05-04): a promoter cannot assign a subscription if the
-    company's pool balance is zero. Allowing it would create a phantom
-    WAITLISTED subscription with no path to activation, eroding trust
-    between the farmer, the promoter, and the company. The pool balance
-    is the company's responsibility — block early and force the company
-    to top up. (Farmer self-subscribe still allows waitlisting; that's a
-    voluntary act on the farmer's part.)
+    Policy (Phase C, 2026-05-04): the gate is now the **promoter's
+    personal allocation balance** for this company, not the company-
+    wide pool. Each company allocates units to specific promoters; a
+    promoter who has exhausted their share is blocked from assigning
+    further until the CA reallocates. This is consumed atomically at
+    initiate time — if the farmer rejects later, the unit is *not*
+    refunded (CA can manually reallocate to compensate). Farmer self-
+    subscribe is unchanged and remains independent of the company pool.
     """
     from app.modules.auth.service import get_user_by_phone
+    from app.services.promoter_pool import (
+        consume_for_assignment, get_promoter_balance,
+    )
+
     farmer = await get_user_by_phone(db, request.farmer_phone)
     if not farmer:
         raise HTTPException(status_code=404, detail="Farmer not found. They must be registered in the PWA first.")
 
-    pool_balance = await _get_pool_balance(db, request.client_id)
-    if pool_balance <= 0:
+    promoter_balance = await get_promoter_balance(
+        db, request.client_id, current_user.id,
+    )
+    if promoter_balance <= 0:
         raise HTTPException(
             status_code=422,
             detail=(
-                "This company has no available subscriptions in their pool. "
-                "Ask the company to top up before assigning advisories to farmers."
+                "You have no subscriptions allocated for this company. "
+                "Ask the company admin to allocate units to you before assigning advisories to farmers."
             ),
         )
+
+    # Atomically consume one unit from the promoter's allocation. The
+    # SELECT FOR UPDATE inside `consume_for_assignment` serialises
+    # concurrent initiate calls against the same promoter so we never
+    # over-spend their balance.
+    try:
+        await consume_for_assignment(
+            db, client_id=request.client_id, promoter_user_id=current_user.id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
     sub = Subscription(
         farmer_user_id=farmer.id,
@@ -977,15 +1135,16 @@ async def respond_to_assignment(
         assignment.farmer_responded_at = now
 
     if approved:
-        balance = await _get_pool_balance(db, sub.client_id)
-        if balance > 0:
-            sub.status = SubscriptionStatus.ACTIVE
-            sub.subscription_date = now
-            sub.reference_number = await _generate_reference_for_sub(db, sub.client_id)
-            await _consume_pool_unit(db, sub.client_id)
-        # else stays WAITLISTED — company has 3 days
+        # Phase C: the unit was already consumed from the promoter's
+        # allocation at initiate time, so we just flip status here.
+        # No pool check, no consumption.
+        sub.status = SubscriptionStatus.ACTIVE
+        sub.subscription_date = now
+        sub.reference_number = await _generate_reference_for_sub(db, sub.client_id)
     else:
         sub.status = SubscriptionStatus.CANCELLED
+        # Note: rejected unit is NOT refunded to the promoter's
+        # allocation. The CA can manually reallocate if appropriate.
 
     await db.commit()
     return {"status": sub.status, "reference_number": sub.reference_number}
@@ -1080,16 +1239,39 @@ async def pay_subscription(
     if not pr:
         raise HTTPException(status_code=404, detail="Payment request not found")
 
-    pr.status = "PAID"
     sub = (await db.execute(select(Subscription).where(Subscription.id == pr.subscription_id))).scalar_one()
-    sub.promoter_user_id = current_user.id
 
-    balance = await _get_pool_balance(db, sub.client_id)
-    if balance > 0:
-        sub.status = SubscriptionStatus.ACTIVE
-        sub.subscription_date = datetime.now(timezone.utc)
-        sub.reference_number = await _generate_reference_for_sub(db, sub.client_id)
-        await _consume_pool_unit(db, sub.client_id)
+    # Phase C: the dealer/facilitator paying on the farmer's behalf
+    # becomes the promoter for this subscription. They must have
+    # allocation in this company's pool; if not, the payment cannot
+    # complete (company hasn't given them units).
+    from app.services.promoter_pool import (
+        consume_for_assignment, get_promoter_balance,
+    )
+    promoter_balance = await get_promoter_balance(
+        db, sub.client_id, current_user.id,
+    )
+    if promoter_balance <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "You have no subscriptions allocated for this company. "
+                "Ask the company admin to allocate units to you before paying for farmer subscriptions."
+            ),
+        )
+
+    pr.status = "PAID"
+    sub.promoter_user_id = current_user.id
+    try:
+        await consume_for_assignment(
+            db, client_id=sub.client_id, promoter_user_id=current_user.id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    sub.status = SubscriptionStatus.ACTIVE
+    sub.subscription_date = datetime.now(timezone.utc)
+    sub.reference_number = await _generate_reference_for_sub(db, sub.client_id)
 
     await db.commit()
     return {"status": sub.status, "reference_number": sub.reference_number}

@@ -44,11 +44,15 @@ async def test_can_assign_false_when_pool_empty(db):
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_can_assign_true_when_pool_has_units(db):
+async def test_can_assign_true_when_promoter_has_allocation(db):
+    """Phase C semantics — can_assign now reflects the promoter's own
+    allocation balance for this client, not the company-wide pool."""
+    from app.services.promoter_pool import allocate_to_promoter
     user = await make_user(db)
     client = await make_client(db)
-    pool = SubscriptionPool(client_id=client.id, units_purchased=5, units_consumed=2)
-    db.add(pool)
+    db.add(SubscriptionPool(client_id=client.id, units_purchased=10, units_consumed=0))
+    await db.commit()
+    await allocate_to_promoter(db, client_id=client.id, promoter_user_id=user.id, units=3)
     await db.commit()
 
     out = await get_pool_can_assign(
@@ -60,12 +64,18 @@ async def test_can_assign_true_when_pool_has_units(db):
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_can_assign_false_when_pool_fully_consumed(db):
-    """Pool exists but all units already consumed → still no."""
+async def test_can_assign_false_when_promoter_balance_exhausted(db):
+    """Phase C — even if the company has unallocated units, a promoter
+    with 0 in their own row can't assign. Their gate is their own
+    allocation, not the company-wide pool."""
+    from app.services.promoter_pool import allocate_to_promoter, consume_for_assignment
     user = await make_user(db)
     client = await make_client(db)
-    pool = SubscriptionPool(client_id=client.id, units_purchased=10, units_consumed=10)
-    db.add(pool)
+    db.add(SubscriptionPool(client_id=client.id, units_purchased=100, units_consumed=0))
+    await db.commit()
+    # Allocate 1, then drain it.
+    await allocate_to_promoter(db, client_id=client.id, promoter_user_id=user.id, units=1)
+    await consume_for_assignment(db, client_id=client.id, promoter_user_id=user.id)
     await db.commit()
 
     out = await get_pool_can_assign(
@@ -79,14 +89,17 @@ async def test_can_assign_false_when_pool_fully_consumed(db):
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_initiate_blocked_when_pool_empty(db):
-    """Pool=0 — initiate returns 422 with the company-top-up message
-    and does NOT create any Subscription row."""
+async def test_initiate_blocked_when_promoter_has_no_allocation(db):
+    """Phase C — even if the company has units, a promoter with no
+    allocation row (or a zero balance) is blocked. Returns 422 with
+    a "you have no subscriptions allocated" message and creates no
+    Subscription row."""
     promoter = await make_user(db)
     farmer = await make_user(db)
-    farmer.phone = "+918888888881"  # routable through farmer-lookup
+    farmer.phone = "+918888888881"
     client = await make_client(db)
     package = await make_package(db, client)
+    db.add(SubscriptionPool(client_id=client.id, units_purchased=100, units_consumed=0))
     await db.commit()
 
     payload = PromoterAssignRequest(
@@ -100,9 +113,8 @@ async def test_initiate_blocked_when_pool_empty(db):
             request=payload, db=db, current_user=promoter,
         )
     assert exc.value.status_code == 422
-    assert "no available subscriptions" in exc.value.detail.lower()
+    assert "no subscriptions allocated" in exc.value.detail.lower()
 
-    # No Subscription row was created.
     rows = (await db.execute(
         select(Subscription).where(Subscription.farmer_user_id == farmer.id)
     )).scalars().all()
@@ -111,17 +123,21 @@ async def test_initiate_blocked_when_pool_empty(db):
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_initiate_succeeds_when_pool_has_units(db):
-    """Pool>0 — initiate works as before. We don't assert the full
-    end-state shape (that's covered by upstream tests); just that no
-    422 is raised and the Subscription row exists."""
+async def test_initiate_succeeds_when_promoter_has_allocation(db):
+    """Phase C — initiate works when the promoter has a non-zero
+    allocation row. The Subscription is created and the promoter's
+    balance is debited by 1."""
+    from app.modules.subscriptions.promoter_allocation_models import PromoterAllocation
+    from app.services.promoter_pool import allocate_to_promoter
+
     promoter = await make_user(db)
     farmer = await make_user(db)
     farmer.phone = "+918888888882"
     client = await make_client(db)
     package = await make_package(db, client)
-    pool = SubscriptionPool(client_id=client.id, units_purchased=5, units_consumed=0)
-    db.add(pool)
+    db.add(SubscriptionPool(client_id=client.id, units_purchased=10, units_consumed=0))
+    await db.commit()
+    await allocate_to_promoter(db, client_id=client.id, promoter_user_id=promoter.id, units=5)
     await db.commit()
 
     payload = PromoterAssignRequest(
@@ -138,6 +154,15 @@ async def test_initiate_succeeds_when_pool_has_units(db):
         select(Subscription).where(Subscription.farmer_user_id == farmer.id)
     )).scalars().all()
     assert len(rows) == 1
+
+    alloc = (await db.execute(
+        select(PromoterAllocation).where(
+            PromoterAllocation.client_id == client.id,
+            PromoterAllocation.promoter_user_id == promoter.id,
+        )
+    )).scalar_one()
+    assert alloc.units_balance == 4  # was 5, consumed 1
+    assert alloc.consumed_total == 1
 
 
 @requires_docker
