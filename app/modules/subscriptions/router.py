@@ -1290,19 +1290,12 @@ async def get_today_advisory(
         from app.modules.orders.models import Order, OrderItem
         from datetime import timedelta
 
-        if not active_timelines:
-            out.append({
-                "subscription_id": sub.id,
-                "client_id": sub.client_id,
-                "package_id": sub.package_id,
-                "package_name": pkg.name,
-                "crop_cosh_id": pkg.crop_cosh_id,
-                "crop_start_date": sub.crop_start_date,
-                "day_offset": day_offset,
-                "reference_number": sub.reference_number,
-                "timelines": [],
-            })
-            continue
+        # NOTE: do NOT early-return when active_timelines is empty — a farmer
+        # may still have an ACTIVE TriggeredCHAEntry (diagnosis-driven
+        # advisory) whose window includes today even when no CCA timeline is
+        # in window right now. The downstream loops below all handle empty
+        # CCA correctly (no-op iteration), and the CHA branches will still
+        # populate tl_windows.
 
         # ── Load today's conditional answers for this subscription ────────────
         cond_rows = (await db.execute(

@@ -267,6 +267,60 @@ async def test_today_cha_window_does_not_shift_with_crop_start(db):
 
 @requires_docker
 @pytest.mark.asyncio
+async def test_today_renders_cha_when_no_cca_active(db):
+    """Regression — a farmer with ZERO active CCA timelines but an ACTIVE
+    diagnosis-triggered CHA entry whose window contains today must still
+    see the CHA advisory on Today. Earlier the route short-circuited
+    when active_timelines was empty, hiding the CHA entirely."""
+    from app.modules.subscriptions.models import TriggeredCHAEntry
+    from tests.factories import (
+        make_sp_element, make_sp_practice, make_sp_recommendation,
+        make_sp_timeline,
+    )
+
+    user = await make_user(db)
+    client = await make_client(db)
+    package = await make_package(db, client)
+    sub = await make_subscription(
+        db, farmer=user, client=client, package=package,
+    )
+    sub.crop_start_date = datetime.now(timezone.utc) - timedelta(days=10)
+    await db.commit()
+
+    # Deliberately NO CCA timelines on the package — only the CHA entry.
+    sp_rec = await make_sp_recommendation(db, client)
+    sp_tl = await make_sp_timeline(
+        db, sp_rec, name="LONELY_CHA", from_value=0, to_value=14,
+    )
+    sp_p = await make_sp_practice(db, sp_tl, l1_type="PESTICIDE")
+    await make_sp_element(db, sp_p, value="2.5")
+
+    triggered_at_dt = datetime.now(timezone.utc) - timedelta(days=2)
+    db.add(TriggeredCHAEntry(
+        subscription_id=sub.id,
+        farmer_user_id=user.id,
+        client_id=client.id,
+        problem_cosh_id="problem:test",
+        recommendation_type="SP",
+        recommendation_id=sp_rec.id,
+        triggered_by="DIAGNOSIS",
+        triggered_at=triggered_at_dt,
+        status="ACTIVE",
+        problem_name="Test Problem",
+    ))
+    await db.commit()
+
+    out = await get_today_advisory(db=db, current_user=user)
+    assert len(out) == 1
+    rendered_ids = [rt["id"] for rt in out[0]["timelines"]]
+    cha_tl_id = f"cha-sp-{sp_tl.id}"
+    assert cha_tl_id in rendered_ids, (
+        "CHA advisory must render even when no CCA timeline is in window"
+    )
+
+
+@requires_docker
+@pytest.mark.asyncio
 async def test_today_outside_window_takes_no_snapshot(db):
     """Window 0..5; subscription day_offset = 50 → no snapshot."""
     user, sub, tl, _p = await _seed_today_active(db, day_offset=50, das_to=5)
