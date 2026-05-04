@@ -32,6 +32,45 @@ def create_subscription_order(receipt: str) -> dict:
     }
 
 
+def create_pool_topup_order(
+    receipt: str, amount_paise: int, units: int, client_id: str,
+) -> dict:
+    """Create a RazorPay order for a CA's subscription-pool top-up.
+
+    `amount_paise` MUST come from the server-side pricing service
+    (`app.services.subscription_pricing.quote_for`), never from the
+    client. `units` and `client_id` are passed as Razorpay notes for
+    audit; the verify path also re-computes the quote and cross-checks
+    it against the order amount as defence in depth.
+    """
+    client = _client()
+    order = client.order.create({
+        "amount": amount_paise,
+        "currency": "INR",
+        "receipt": receipt,
+        "notes": {
+            "purpose": "RootsTalk Pool Top-Up",
+            "units": str(units),
+            "client_id": client_id,
+        },
+    })
+    return {
+        "razorpay_order_id": order["id"],
+        "amount": amount_paise,
+        "currency": "INR",
+        "key_id": settings.razorpay_active_key_id,
+    }
+
+
+def fetch_order_amount_paise(razorpay_order_id: str) -> int:
+    """Fetch the amount of an existing Razorpay order in paise. Used by
+    the pool-verify path to cross-check that no client-side tampering
+    altered the unit count between create-order and verify."""
+    client = _client()
+    order = client.order.fetch(razorpay_order_id)
+    return int(order["amount"])
+
+
 def create_query_order(receipt: str) -> dict:
     """Create a RazorPay order for Rs. 25 expert query fee."""
     client = _client()

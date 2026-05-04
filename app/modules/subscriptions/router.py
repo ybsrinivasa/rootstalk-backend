@@ -141,6 +141,135 @@ async def get_pool_quote(
     }
 
 
+# ── Phase B: Razorpay-backed pool top-up ───────────────────────────────────────
+
+class PoolPaymentCreateOrder(BaseModel):
+    units: int
+
+
+class PoolPaymentVerify(BaseModel):
+    units: int
+    razorpay_order_id: str
+    razorpay_payment_id: str
+    razorpay_signature: str
+
+
+@router.post("/client/{client_id}/subscription-pool/payment/create-order")
+async def create_pool_payment_order(
+    client_id: str,
+    request: PoolPaymentCreateOrder,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Phase B.2 — start a Razorpay checkout for a pool top-up.
+
+    Server computes the quote (never trust client-side amount), creates
+    a Razorpay order at that amount, returns the bits the Razorpay JS
+    SDK needs. NO SubscriptionPool row is written here — that happens
+    only after `/payment/verify` confirms the signature.
+    """
+    from app.services.payment_service import create_pool_topup_order
+    from app.services.subscription_pricing import quote_for
+    try:
+        q = quote_for(request.units)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    # Receipt: short, unique-ish, traceable. Razorpay caps at 40 chars.
+    receipt = f"pool-{client_id[:8]}-{request.units}"[:40]
+    return create_pool_topup_order(
+        receipt=receipt,
+        amount_paise=q.total_paise,
+        units=q.units,
+        client_id=client_id,
+    )
+
+
+@router.post("/client/{client_id}/subscription-pool/payment/verify")
+async def verify_pool_payment(
+    client_id: str,
+    request: PoolPaymentVerify,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Phase B.2 — verify Razorpay signature and add units to the pool.
+
+    Defence-in-depth checks:
+      1. Razorpay signature matches the secret-keyed HMAC.
+      2. Server re-computes the quote for `units` and asserts it equals
+         the original Razorpay order amount (rejects tampering between
+         create-order and verify).
+      3. Idempotency: refuse to write a second pool row for the same
+         razorpay_order_id (partial unique index also enforces this at
+         the DB level).
+    """
+    from app.services.payment_service import (
+        fetch_order_amount_paise, verify_payment_signature,
+    )
+    from app.services.subscription_pricing import quote_for
+
+    if not verify_payment_signature(
+        request.razorpay_order_id,
+        request.razorpay_payment_id,
+        request.razorpay_signature,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Payment verification failed — invalid signature",
+        )
+
+    try:
+        q = quote_for(request.units)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    # Cross-check against the actual Razorpay order amount.
+    razorpay_amount = fetch_order_amount_paise(request.razorpay_order_id)
+    if razorpay_amount != q.total_paise:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Amount mismatch — Razorpay order amount does not match "
+                "the recomputed quote. Refusing to credit pool."
+            ),
+        )
+
+    # Idempotency — a second verify call for the same Razorpay order
+    # (e.g. a duplicate webhook) must not double-credit the pool.
+    existing = (await db.execute(
+        select(SubscriptionPool).where(
+            SubscriptionPool.razorpay_order_id == request.razorpay_order_id,
+        )
+    )).scalar_one_or_none()
+    if existing is not None:
+        balance = await _get_pool_balance(db, client_id)
+        return {
+            "detail": "Order already credited.",
+            "balance": balance,
+            "units_added": existing.units_purchased,
+        }
+
+    pool = SubscriptionPool(
+        client_id=client_id,
+        units_purchased=q.units,
+        units_consumed=0,
+        razorpay_order_id=request.razorpay_order_id,
+        razorpay_payment_id=request.razorpay_payment_id,
+        amount_paid_paise=q.total_paise,
+        purchased_by_user_id=current_user.id,
+    )
+    db.add(pool)
+    await db.commit()
+
+    balance = await _get_pool_balance(db, client_id)
+    return {
+        "detail": f"{q.units} units added to pool.",
+        "balance": balance,
+        "units_added": q.units,
+        "amount_paid_paise": q.total_paise,
+    }
+
+
 # ── PoP Guided Elimination (BL-01) ─────────────────────────────────────────────
 
 @router.get("/farmer/packages")
