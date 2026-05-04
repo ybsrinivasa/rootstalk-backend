@@ -83,7 +83,13 @@ class SubscriptionWaitlist(Base):
 
 
 class SubscriptionPool(Base):
-    """Company subscription units purchased by CA."""
+    """Company subscription units purchased by CA.
+
+    Phase B (Razorpay, 2026-05-04): each row now carries a payment audit
+    trail. New rows are written only after Razorpay verification.
+    Pre-Phase-B rows have NULL payment columns (the free-purchase endpoint
+    was removed in commit d5e7b1a93f28).
+    """
     __tablename__ = "subscription_pools"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
@@ -91,6 +97,12 @@ class SubscriptionPool(Base):
     units_purchased: Mapped[int] = mapped_column(Integer, nullable=False)
     units_consumed: Mapped[int] = mapped_column(Integer, default=0)
     purchased_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    razorpay_order_id: Mapped[str] = mapped_column(String(64), nullable=True)
+    razorpay_payment_id: Mapped[str] = mapped_column(String(64), nullable=True)
+    amount_paid_paise: Mapped[int] = mapped_column(Integer, nullable=True)
+    purchased_by_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True,
+    )
 
 
 class AlertRecipient(Base):

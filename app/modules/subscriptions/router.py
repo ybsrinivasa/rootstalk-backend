@@ -61,18 +61,12 @@ class PoolPurchase(BaseModel):
     units: int
 
 
-@router.post("/client/{client_id}/subscription-pool/purchase", status_code=201)
-async def purchase_pool_units(
-    client_id: str,
-    request: PoolPurchase,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    pool = SubscriptionPool(client_id=client_id, units_purchased=request.units)
-    db.add(pool)
-    await db.commit()
-    balance = await _get_pool_balance(db, client_id)
-    return {"detail": f"{request.units} units added", "balance": balance}
+# NOTE: the free POST /client/{id}/subscription-pool/purchase endpoint
+# was removed in Phase B (2026-05-04 commit d5e7b1a93f28). Pool top-ups
+# now flow exclusively through Razorpay — see /payment/create-order and
+# /payment/verify below. The PoolPurchase model is retained because
+# legacy pytest fixtures may still import it; it is no longer used by
+# any route handler.
 
 
 @router.get("/client/{client_id}/subscription-pool/balance")
