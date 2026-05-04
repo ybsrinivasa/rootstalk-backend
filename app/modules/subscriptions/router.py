@@ -85,6 +85,47 @@ async def get_pool_balance(
     return {"client_id": client_id, "available_units": balance}
 
 
+@router.get("/client/{client_id}/subscription-pool/quote")
+async def get_pool_quote(
+    client_id: str,
+    units: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Phase A.1 — preview pricing for a pool top-up.
+
+    Returns gross / discount / total in paise (integers, never float).
+    Formula: Total = [N × 199] − [0.5 × N^1.4887593].
+
+    The Client Portal calls this on every change of the unit count to
+    show a live "you save ₹X / total ₹Y" preview before the CA confirms
+    the purchase. No DB writes; safe to call repeatedly.
+    """
+    from app.services.subscription_pricing import (
+        MAX_UNITS, MIN_UNITS, PER_UNIT_GROSS_PAISE, quote_for,
+    )
+    try:
+        q = quote_for(units)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return {
+        "client_id": client_id,
+        "units": q.units,
+        "per_unit_gross_paise": PER_UNIT_GROSS_PAISE,
+        "gross_paise": q.gross_paise,
+        "discount_paise": q.discount_paise,
+        "total_paise": q.total_paise,
+        "per_unit_effective_paise": q.per_unit_effective_paise,
+        "min_units": MIN_UNITS,
+        "max_units": MAX_UNITS,
+        # Convenience strings for direct display (rupees with 2 decimals).
+        "gross_rupees": f"{q.gross_paise / 100:.2f}",
+        "discount_rupees": f"{q.discount_paise / 100:.2f}",
+        "total_rupees": f"{q.total_paise / 100:.2f}",
+    }
+
+
 # ── PoP Guided Elimination (BL-01) ─────────────────────────────────────────────
 
 @router.get("/farmer/packages")
