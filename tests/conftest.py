@@ -99,6 +99,7 @@ async def _engine(_async_db_url):
     import app.modules.subscriptions.models  # noqa: F401
     import app.modules.subscriptions.snapshot_models  # noqa: F401
     import app.modules.subscriptions.config_error_models  # noqa: F401
+    import app.modules.subscriptions.promoter_allocation_models  # noqa: F401
     import app.modules.advisory.models  # noqa: F401
     import app.modules.qr.models  # noqa: F401
     import app.modules.farmpundit.models  # noqa: F401
