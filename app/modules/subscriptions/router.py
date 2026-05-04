@@ -2230,6 +2230,17 @@ async def buy_all_dbs(
 
     await db.commit()
     await db.refresh(order)
+
+    # PO Lock — freeze every DBS timeline this consolidated order touches.
+    from app.services.snapshot_triggers import take_snapshots_for_keys
+    timeline_ids_in_order = {p.timeline_id for p in matching_practices if p.timeline_id}
+    await take_snapshots_for_keys(
+        db,
+        subscription_id=subscription_id,
+        keys=[(tid, "CCA") for tid in timeline_ids_in_order],
+        lock_trigger="PURCHASE_ORDER",
+    )
+
     return {
         "order_id": order.id,
         "item_count": len(matching_practices),

@@ -103,6 +103,7 @@ async def create_order(
     db.add(order)
     await db.flush()
 
+    timeline_ids_in_order: set[str] = set()
     for practice_id in request.practice_ids:
         practice = (await db.execute(select(Practice).where(Practice.id == practice_id))).scalar_one_or_none()
         relation_type = None
@@ -113,6 +114,8 @@ async def create_order(
             )).scalar_one_or_none()
             if relation_row:
                 relation_type = relation_row.relation_type.value
+        if practice and practice.timeline_id:
+            timeline_ids_in_order.add(practice.timeline_id)
         db.add(OrderItem(
             order_id=order.id,
             practice_id=practice_id,
@@ -125,6 +128,18 @@ async def create_order(
 
     await db.commit()
     await db.refresh(order)
+
+    # PO Lock — freeze the timeline content for this subscription per
+    # per_subscription_versioning.md. Best-effort; nightly sweep is the
+    # safety net.
+    from app.services.snapshot_triggers import take_snapshots_for_keys
+    await take_snapshots_for_keys(
+        db,
+        subscription_id=request.subscription_id,
+        keys=[(tid, "CCA") for tid in timeline_ids_in_order],
+        lock_trigger="PURCHASE_ORDER",
+    )
+
     return {"id": order.id, "status": order.status}
 
 
