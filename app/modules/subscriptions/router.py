@@ -85,6 +85,27 @@ async def get_pool_balance(
     return {"client_id": client_id, "available_units": balance}
 
 
+@router.get("/client/{client_id}/subscription-pool/can-assign")
+async def get_pool_can_assign(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Phase B.1 — proactive guard for the promoter PWA flow.
+
+    Returns whether a promoter is allowed to start a new assignment for
+    this client. Falsy when the pool balance is zero. The PWA uses this
+    on company-select so promoters don't waste a full BL-01 walk only to
+    be rejected at the final step.
+    """
+    balance = await _get_pool_balance(db, client_id)
+    return {
+        "client_id": client_id,
+        "available_units": balance,
+        "can_assign": balance > 0,
+    }
+
+
 @router.get("/client/{client_id}/subscription-pool/quote")
 async def get_pool_quote(
     client_id: str,
@@ -615,11 +636,30 @@ async def initiate_assignment(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Promoter assigns advisory to farmer. Farmer must approve."""
+    """Promoter assigns advisory to farmer. Farmer must approve.
+
+    Policy (2026-05-04): a promoter cannot assign a subscription if the
+    company's pool balance is zero. Allowing it would create a phantom
+    WAITLISTED subscription with no path to activation, eroding trust
+    between the farmer, the promoter, and the company. The pool balance
+    is the company's responsibility — block early and force the company
+    to top up. (Farmer self-subscribe still allows waitlisting; that's a
+    voluntary act on the farmer's part.)
+    """
     from app.modules.auth.service import get_user_by_phone
     farmer = await get_user_by_phone(db, request.farmer_phone)
     if not farmer:
         raise HTTPException(status_code=404, detail="Farmer not found. They must be registered in the PWA first.")
+
+    pool_balance = await _get_pool_balance(db, request.client_id)
+    if pool_balance <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This company has no available subscriptions in their pool. "
+                "Ask the company to top up before assigning advisories to farmers."
+            ),
+        )
 
     sub = Subscription(
         farmer_user_id=farmer.id,
