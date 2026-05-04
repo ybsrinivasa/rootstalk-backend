@@ -1252,28 +1252,40 @@ async def get_today_advisory(
         )
         timelines = tl_result.scalars().all()
 
+        # ── Phase 3: load existing snapshots for this subscription ────────────
+        # If a snapshot exists for a timeline, its frozen window drives BL-04
+        # (Rule 3) and its frozen content drives rendering (Rules 1 & 2).
+        from app.modules.subscriptions.snapshot_models import LockedTimelineSnapshot
+        from app.services.snapshot_render import (
+            cca_calendar_dates, cca_window_active,
+            cha_calendar_dates,
+            metadata_from_content, metadata_from_master_cca,
+            render_cca_from_content, render_cha_from_content,
+            resolve_cca_content, resolve_cha_content,
+        )
+
+        existing_cca_snaps = (await db.execute(
+            select(LockedTimelineSnapshot).where(
+                LockedTimelineSnapshot.subscription_id == sub.id,
+                LockedTimelineSnapshot.source == "CCA",
+            )
+        )).scalars().all()
+        cca_snap_by_tl: dict = {s.timeline_id: s for s in existing_cca_snaps}
+
         active_timelines = []
         for tl in timelines:
-            # BL-04 window logic
-            if tl.from_type.value == "DAS":
-                # Days After Sowing: active when from_value <= day_offset <= to_value
-                if tl.from_value <= day_offset <= tl.to_value:
-                    active_timelines.append((tl, day_offset))
-            elif tl.from_type.value == "DBS":
-                # Days Before Sowing: active when negative day_offset falls in window
-                # from_value and to_value are positive "days before sowing"
-                # window: -to_value <= day_offset <= -from_value
-                if -tl.to_value <= day_offset <= -tl.from_value:
-                    active_timelines.append((tl, day_offset))
-            # CALENDAR type: skip for now (requires absolute date mapping)
+            existing_snap = cca_snap_by_tl.get(tl.id)
+            meta = (
+                metadata_from_content(existing_snap.content)
+                if existing_snap is not None
+                else metadata_from_master_cca(tl)
+            )
+            if cca_window_active(meta, day_offset):
+                active_timelines.append((tl, day_offset, meta))
 
         from app.services.bl03_deduplication import (
             deduplicate_advisory, TimelineWindow as TLWindow,
             PracticeStub as PStub, PracticeElement as PEl,
-        )
-        from app.services.bl02_conditional import (
-            filter_practices_by_conditionals,
-            ConditionalQuestion as CQ, PracticeConditionalLink as PCL,
         )
         from app.modules.orders.models import Order, OrderItem
         from datetime import timedelta
@@ -1301,121 +1313,32 @@ async def get_today_advisory(
         )).scalars().all()
         today_answers: dict[str, str] = {r.question_id: r.answer for r in cond_rows}
 
-        # ── Build CCA timeline stubs with BL-02 conditional filtering ─────────
+        # ── Build CCA timeline stubs from snapshot content (Rules 1-3) ──────
         tl_windows: list[TLWindow] = []
         tl_date_map: dict = {}   # id → (from_date, to_date, day_num)
         pending_questions_by_tl: dict = {}   # tl.id → {question info}
         blank_paths_by_tl: dict = {}         # tl.id → list of {question_id, question_text, farmer_answer}
 
-        # VIEWED-lock: collect (timeline_id, source) of every today-active
-        # timeline rendered for this subscription. Snapshots taken at the
-        # end of the iteration. See per_subscription_versioning.md.
-        viewed_keys: list[tuple[str, str]] = [
-            (tl.id, "CCA") for tl, _ in active_timelines
-        ]
+        for tl, day_num, meta in active_timelines:
+            # Snapshot is the source of truth for content. If missing,
+            # resolve_cca_content takes one synchronously (lock-on-view) so
+            # downstream rendering always reads frozen data.
+            content, _locked = await resolve_cca_content(db, sub.id, tl.id)
+            rendered = render_cca_from_content(content, today_answers)
 
-        for tl, day_num in active_timelines:
-            p_result = await db.execute(
-                select(Practice).where(Practice.timeline_id == tl.id).order_by(Practice.display_order)
-            )
-            all_practices = p_result.scalars().all()
-            all_practice_ids = [p.id for p in all_practices]
+            if rendered.pending_question:
+                pending_questions_by_tl[tl.id] = rendered.pending_question
+            if rendered.blank_paths:
+                blank_paths_by_tl[tl.id] = rendered.blank_paths
 
-            # BL-02: Load conditional questions for this timeline
-            cond_q_result = await db.execute(
-                select(ConditionalQuestion).where(ConditionalQuestion.timeline_id == tl.id)
-                .order_by(ConditionalQuestion.display_order)
-            )
-            cond_questions = cond_q_result.scalars().all()
-
-            # Load practice_conditionals links
-            pc_result = await db.execute(
-                select(PracticeConditional).where(PracticeConditional.practice_id.in_(all_practice_ids))
-            )
-            pc_rows = pc_result.scalars().all()
-
-            # Run BL-02 filter
-            bl02_result = filter_practices_by_conditionals(
-                all_practice_ids=all_practice_ids,
-                questions=[CQ(q.id, q.question_text, q.display_order) for q in cond_questions],
-                practice_links=[PCL(r.practice_id, r.question_id,
-                                    r.answer.value if hasattr(r.answer, 'value') else str(r.answer))
-                                for r in pc_rows],
-                today_answers=today_answers,
-            )
-
-            if not bl02_result.all_questions_answered and bl02_result.pending_question:
-                pending_questions_by_tl[tl.id] = {
-                    "question_id": bl02_result.pending_question.id,
-                    "question_text": bl02_result.pending_question.question_text,
-                    "display_order": bl02_result.pending_question.display_order,
-                }
-
-            # Per spec §6.4: when farmer's answer hits a Blank-linked option,
-            # show "we'll ask again tomorrow" — naming the specific question.
-            if bl02_result.blank_path_questions:
-                cq_text_map = {q.id: q.question_text for q in cond_questions}
-                bp_list = []
-                for qid in bl02_result.blank_path_questions:
-                    if qid in cq_text_map and qid in today_answers:
-                        bp_list.append({
-                            "question_id": qid,
-                            "question_text": cq_text_map[qid],
-                            "farmer_answer": today_answers[qid],
-                        })
-                if bp_list:
-                    blank_paths_by_tl[tl.id] = bp_list
-
-            visible_ids = set(bl02_result.visible_practices)
-            visible_practices = [p for p in all_practices if p.id in visible_ids]
-
-            # Resolve relation_type once per timeline (small batch lookup)
-            tl_rel_ids = {p.relation_id for p in visible_practices if p.relation_id}
-            tl_rel_type_map: dict[str, str] = {}
-            if tl_rel_ids:
-                from app.modules.advisory.models import Relation
-                rel_rows = (await db.execute(
-                    select(Relation).where(Relation.id.in_(tl_rel_ids))
-                )).scalars().all()
-                tl_rel_type_map = {
-                    r.id: (r.relation_type.value if hasattr(r.relation_type, 'value') else str(r.relation_type))
-                    for r in rel_rows
-                }
-
-            practice_stubs: list[PStub] = []
-            for p in visible_practices:
-                el_result = await db.execute(
-                    select(Element).where(Element.practice_id == p.id).order_by(Element.display_order)
-                )
-                elements = el_result.scalars().all()
-                practice_stubs.append(PStub(
-                    id=p.id,
-                    l0_type=p.l0_type.value if hasattr(p.l0_type, 'value') else str(p.l0_type),
-                    l1_type=p.l1_type, l2_type=p.l2_type,
-                    display_order=p.display_order, is_special_input=p.is_special_input,
-                    relation_id=p.relation_id,
-                    elements=[PEl(element_type=el.element_type, cosh_ref=el.cosh_ref,
-                                  value=el.value, unit_cosh_id=el.unit_cosh_id)
-                              for el in elements],
-                    relation_role=p.relation_role,
-                    relation_type=tl_rel_type_map.get(p.relation_id) if p.relation_id else None,
-                    frequency_days=p.frequency_days,
-                ))
-
-            # Calendar dates for this timeline
-            if tl.from_type.value == "DAS":
-                from_d = crop_start + timedelta(days=tl.from_value)
-                to_d = crop_start + timedelta(days=tl.to_value)
-            elif tl.from_type.value == "DBS":
-                from_d = crop_start - timedelta(days=tl.from_value)
-                to_d = crop_start - timedelta(days=tl.to_value)
-            else:
-                from_d = to_d = today
+            from_d, to_d = cca_calendar_dates(meta, crop_start)
 
             tl_window = TLWindow(
-                id=tl.id, name=tl.name, from_date=from_d, to_date=to_d,
+                id=tl.id,
+                name=(content.get("timeline") or {}).get("name") or tl.name,
+                from_date=from_d, to_date=to_d,
                 created_at=tl.created_at.date() if hasattr(tl.created_at, 'date') else today,
-                practices=practice_stubs, source="CCA",
+                practices=rendered.practice_stubs, source="CCA",
             )
             tl_windows.append(tl_window)
             tl_date_map[tl.id] = (from_d, to_d, day_num)
@@ -1434,26 +1357,28 @@ async def get_today_advisory(
                     select(SPTimeline).where(SPTimeline.sp_recommendation_id == cha.recommendation_id)
                 )).scalars().all()
                 for sp_tl in sp_timelines:
-                    from_d = cha.triggered_at.date() + timedelta(days=sp_tl.from_value)
-                    to_d = cha.triggered_at.date() + timedelta(days=sp_tl.to_value)
+                    # CHA window check uses snapshot's frozen offsets if a
+                    # snapshot exists, else master.
+                    sp_snap = (await db.execute(
+                        select(LockedTimelineSnapshot).where(
+                            LockedTimelineSnapshot.subscription_id == sub.id,
+                            LockedTimelineSnapshot.timeline_id == sp_tl.id,
+                            LockedTimelineSnapshot.source == "SP",
+                        )
+                    )).scalar_one_or_none()
+                    if sp_snap is not None:
+                        meta = metadata_from_content(sp_snap.content)
+                    else:
+                        meta = metadata_from_content({"timeline": {
+                            "from_type": "DAS",
+                            "from_value": int(sp_tl.from_value),
+                            "to_value": int(sp_tl.to_value),
+                        }})
+                    from_d, to_d = cha_calendar_dates(meta, cha.triggered_at.date())
                     if not (from_d <= today <= to_d):
                         continue  # Not active today
-                    viewed_keys.append((sp_tl.id, "SP"))
-                    sp_practices = (await db.execute(
-                        select(SPPractice).where(SPPractice.timeline_id == sp_tl.id).order_by(SPPractice.display_order)
-                    )).scalars().all()
-                    stubs = [PStub(id=p.id,
-                                  l0_type=p.l0_type if isinstance(p.l0_type, str) else str(p.l0_type),
-                                  l1_type=p.l1_type, l2_type=p.l2_type,
-                                  display_order=p.display_order, is_special_input=p.is_special_input,
-                                  relation_id=None,
-                                  elements=[PEl(element_type=el.element_type, cosh_ref=el.cosh_ref,
-                                                value=el.value, unit_cosh_id=el.unit_cosh_id)
-                                            for el in (await db.execute(
-                                                select(SPElement).where(SPElement.practice_id == p.id)
-                                            )).scalars().all()],
-                                  frequency_days=p.frequency_days)
-                             for p in sp_practices]
+                    content, _locked = await resolve_cha_content(db, sub.id, sp_tl.id, "SP")
+                    stubs = render_cha_from_content(content)
                     cha_tl_id = f"cha-sp-{sp_tl.id}"
                     problem_label = cha.problem_name or problem_cosh_id
                     tl_windows.append(TLWindow(
@@ -1468,26 +1393,26 @@ async def get_today_advisory(
                     select(PGTimeline).where(PGTimeline.pg_recommendation_id == cha.recommendation_id)
                 )).scalars().all()
                 for pg_tl in pg_timelines:
-                    from_d = cha.triggered_at.date() + timedelta(days=pg_tl.from_value)
-                    to_d = cha.triggered_at.date() + timedelta(days=pg_tl.to_value)
+                    pg_snap = (await db.execute(
+                        select(LockedTimelineSnapshot).where(
+                            LockedTimelineSnapshot.subscription_id == sub.id,
+                            LockedTimelineSnapshot.timeline_id == pg_tl.id,
+                            LockedTimelineSnapshot.source == "PG",
+                        )
+                    )).scalar_one_or_none()
+                    if pg_snap is not None:
+                        meta = metadata_from_content(pg_snap.content)
+                    else:
+                        meta = metadata_from_content({"timeline": {
+                            "from_type": "DAS",
+                            "from_value": int(pg_tl.from_value),
+                            "to_value": int(pg_tl.to_value),
+                        }})
+                    from_d, to_d = cha_calendar_dates(meta, cha.triggered_at.date())
                     if not (from_d <= today <= to_d):
                         continue
-                    viewed_keys.append((pg_tl.id, "PG"))
-                    pg_practices = (await db.execute(
-                        select(PGPractice).where(PGPractice.timeline_id == pg_tl.id).order_by(PGPractice.display_order)
-                    )).scalars().all()
-                    stubs = [PStub(id=p.id,
-                                  l0_type=p.l0_type if isinstance(p.l0_type, str) else str(p.l0_type),
-                                  l1_type=p.l1_type, l2_type=p.l2_type,
-                                  display_order=p.display_order, is_special_input=p.is_special_input,
-                                  relation_id=None,
-                                  elements=[PEl(element_type=el.element_type, cosh_ref=el.cosh_ref,
-                                                value=el.value, unit_cosh_id=el.unit_cosh_id)
-                                            for el in (await db.execute(
-                                                select(PGElement).where(PGElement.practice_id == p.id)
-                                            )).scalars().all()],
-                                  frequency_days=p.frequency_days)
-                             for p in pg_practices]
+                    content, _locked = await resolve_cha_content(db, sub.id, pg_tl.id, "PG")
+                    stubs = render_cha_from_content(content)
                     cha_tl_id = f"cha-pg-{pg_tl.id}"
                     problem_label = cha.problem_name or problem_cosh_id
                     tl_windows.append(TLWindow(
@@ -1567,13 +1492,9 @@ async def get_today_advisory(
             "timelines": timeline_data,
         })
 
-        # VIEWED-lock — best-effort. Per-key has_snapshot fast path inside
-        # take_snapshot makes repeat calls cheap.
-        if viewed_keys:
-            from app.services.snapshot_triggers import take_snapshots_for_keys
-            await take_snapshots_for_keys(
-                db, sub.id, viewed_keys, lock_trigger="VIEWED",
-            )
+        # VIEWED-locks are now taken inline by resolve_cca_content /
+        # resolve_cha_content before each timeline is rendered (Phase 3).
+        # The Phase 2 trailing call has been removed.
 
     return out
 
