@@ -260,6 +260,7 @@ async def make_pg_element(db: AsyncSession, prac: PGPractice, **kw) -> PGElement
     e = PGElement(
         practice_id=prac.id, element_type=kw.get("element_type", "DOSAGE"),
         value=kw.get("value", "1"),
+        cosh_ref=kw.get("cosh_ref"),
     )
     db.add(e)
     await db.flush()
@@ -306,6 +307,7 @@ async def make_sp_element(db: AsyncSession, prac: SPPractice, **kw) -> SPElement
     e = SPElement(
         practice_id=prac.id, element_type=kw.get("element_type", "DOSAGE"),
         value=kw.get("value", "1"),
+        cosh_ref=kw.get("cosh_ref"),
     )
     db.add(e)
     await db.flush()

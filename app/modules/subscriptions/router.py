@@ -1546,14 +1546,50 @@ async def get_today_advisory(
                     tl_date_map[cha_tl_id] = (from_d, to_d, 0)
 
         # ── BL-03 deduplication across CCA + CHA timelines ───────────────────
-        order_result = await db.execute(select(Order).where(Order.subscription_id == sub.id))
-        approved_ids: set[str] = set()
-        for order in order_result.scalars().all():
-            items_result = await db.execute(
-                select(OrderItem).where(OrderItem.order_id == order.id, OrderItem.status == "APPROVED")
+        # Includes a "context-only" pass: timelines referenced by APPROVED
+        # order items that are NOT currently in window. The purchased rule
+        # (BL-03) requires the closed governing timeline to be present in
+        # dedup input — otherwise a farmer who bought Mancozeb in week 1
+        # gets told to buy it again in week 4 when a later timeline also
+        # recommends it.
+        approved_items_q = await db.execute(
+            select(OrderItem)
+            .join(Order, Order.id == OrderItem.order_id)
+            .where(
+                Order.subscription_id == sub.id,
+                OrderItem.status == "APPROVED",
             )
-            for item in items_result.scalars().all():
-                approved_ids.add(item.practice_id)
+        )
+        approved_items = approved_items_q.scalars().all()
+        approved_ids: set[str] = {it.practice_id for it in approved_items}
+
+        active_tl_ids = {tl.id for tl, _, _ in active_timelines}
+        context_tl_ids: set[str] = {
+            it.timeline_id for it in approved_items
+            if it.timeline_id and it.timeline_id not in active_tl_ids
+        }
+        context_render_ids: set[str] = set()  # mark for response-build skip
+
+        if context_tl_ids:
+            context_tl_rows = (await db.execute(
+                select(Timeline).where(Timeline.id.in_(context_tl_ids))
+            )).scalars().all()
+            for ctx_tl in context_tl_rows:
+                ctx_meta = metadata_from_master_cca(ctx_tl)
+                ctx_content, _ = await resolve_cca_content(db, sub.id, ctx_tl.id)
+                ctx_rendered = render_cca_from_content(ctx_content, today_answers)
+                ctx_from_d, ctx_to_d = cca_calendar_dates(ctx_meta, crop_start)
+                tl_windows.append(TLWindow(
+                    id=ctx_tl.id,
+                    name=(ctx_content.get("timeline") or {}).get("name") or ctx_tl.name,
+                    from_date=ctx_from_d, to_date=ctx_to_d,
+                    created_at=(
+                        ctx_tl.created_at.date()
+                        if hasattr(ctx_tl.created_at, "date") else today
+                    ),
+                    practices=ctx_rendered.practice_stubs, source="CCA",
+                ))
+                context_render_ids.add(ctx_tl.id)
 
         deduped = deduplicate_advisory(tl_windows, approved_practice_ids=approved_ids)
 
@@ -1561,6 +1597,11 @@ async def get_today_advisory(
         timeline_data = []
         for dedup_tl in deduped:
             tl = dedup_tl.timeline
+            # Context-only timelines exist purely to inform BL-03's
+            # purchased rule — they are NOT in tl_date_map and must not
+            # render to the farmer.
+            if tl.id in context_render_ids:
+                continue
             from_d, to_d, day_num = tl_date_map[tl.id]
             # Frequency filter: hide frequency-based practices that aren't due today.
             # Non-frequency practices (frequency_days NULL) are always shown if in window.
