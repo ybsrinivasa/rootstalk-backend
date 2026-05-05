@@ -1330,12 +1330,31 @@ async def get_volume_estimate(
     order_id: str,
     item_id: str,
     farm_area_acres: Optional[float] = None,
+    brand_unit: Optional[str] = None,    # caller override (dealer's brand pick)
+    dosage_unit: Optional[str] = None,   # caller override
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """BL-06: Returns estimated volume for a practice item based on farm area."""
+    """BL-06: estimated volume for a practice item.
+
+    Phase D.2: lookup is now keyed on all 5 spec fields —
+    measure + l2_practice + application_method + brand_unit + dosage_unit.
+    The previous l2-only filter could pick the wrong row when several
+    formulas existed for the same L2 (different application methods,
+    units, etc.) — fixed.
+
+    `measure` comes from `crop_measures` for the package's crop.
+    `application_method` comes from a Practice element of that name.
+    `brand_unit`/`dosage_unit` are derived from the order item or practice
+    elements; callers can override via query params (e.g. when the dealer
+    is mid-pick and wants a preview).
+    """
+    from app.modules.advisory.models import Package
+    from app.services.crop_measure import get_measure
+
     item = await _get_order_item(db, item_id, order_id)
 
+    # ── Farm area ──────────────────────────────────────────────────
     if farm_area_acres is None:
         sub = (await db.execute(
             select(Subscription).where(Subscription.id == (
@@ -1344,48 +1363,119 @@ async def get_volume_estimate(
         )).scalar_one_or_none()
         if sub:
             farm_area_acres = float(sub.farm_area_acres) if sub.farm_area_acres else None
-
     if not farm_area_acres:
         return {"estimated_volume": None, "volume_unit": None, "message": "Farm area not set on subscription"}
 
+    # ── Practice + Timeline + Package + Measure ────────────────────
     practice = (await db.execute(
         select(Practice).where(Practice.id == item.practice_id)
     )).scalar_one_or_none()
-
     if not practice or not practice.l2_type:
         return {"estimated_volume": None, "volume_unit": None, "message": "Practice data not available"}
 
+    timeline = (await db.execute(
+        select(Timeline).where(Timeline.id == practice.timeline_id)
+    )).scalar_one_or_none()
+    if timeline is None:
+        return {"estimated_volume": None, "volume_unit": None, "message": "Timeline not found for practice"}
+
+    package = (await db.execute(
+        select(Package).where(Package.id == timeline.package_id)
+    )).scalar_one_or_none()
+    if package is None or not package.crop_cosh_id:
+        return {"estimated_volume": None, "volume_unit": None, "message": "Package or crop not found"}
+
+    measure = await get_measure(db, package.crop_cosh_id)
+    if not measure:
+        return {
+            "estimated_volume": None, "volume_unit": None,
+            "message": (
+                f"Crop measure not configured for crop {package.crop_cosh_id}. "
+                "Ask SA to set Area-wise or Plant-wise via /admin/crop-measures."
+            ),
+            "error_code": "CROP_MEASURE_MISSING",
+        }
+
+    # ── Practice elements: dosage + application_method (+ derived units) ─
+    elements_rows = (await db.execute(
+        select(Element).where(Element.practice_id == item.practice_id)
+    )).scalars().all()
+    elements_by_type = {e.element_type: e for e in elements_rows}
+
+    dosage_el = elements_by_type.get("dosage")
+    dosage = float(dosage_el.value) if dosage_el and dosage_el.value else None
+
+    method_el = elements_by_type.get("application_method")
+    application_method = method_el.value if method_el and method_el.value else None
+    if not application_method:
+        return {
+            "estimated_volume": None, "volume_unit": None,
+            "message": "Application method not set on practice (DATA_CONFIG_ERROR).",
+            "error_code": "APPLICATION_METHOD_MISSING",
+        }
+
+    # Derive units. Callers can override; otherwise fall back to the
+    # order item (set by the dealer at fulfillment) and finally to the
+    # dosage element's unit_cosh_id for dosage_unit.
+    if not brand_unit:
+        brand_unit = item.volume_unit or None
+    if not dosage_unit and dosage_el and dosage_el.unit_cosh_id:
+        dosage_unit = dosage_el.unit_cosh_id
+
+    if not brand_unit:
+        return {
+            "estimated_volume": None, "volume_unit": None,
+            "message": "Brand unit not yet determined — pick a brand or pass ?brand_unit=…",
+            "error_code": "BRAND_UNIT_MISSING",
+        }
+    if not dosage_unit:
+        return {
+            "estimated_volume": None, "volume_unit": None,
+            "message": "Dosage unit not set on dosage element (DATA_CONFIG_ERROR).",
+            "error_code": "DOSAGE_UNIT_MISSING",
+        }
+
+    # ── 5-key lookup ───────────────────────────────────────────────
     formulas = (await db.execute(
         select(VolumeFormula).where(
+            VolumeFormula.measure == measure,
             VolumeFormula.l2_practice == practice.l2_type,
+            VolumeFormula.application_method == application_method,
+            VolumeFormula.brand_unit == brand_unit,
+            VolumeFormula.dosage_unit == dosage_unit,
             VolumeFormula.status == "ACTIVE",
         )
     )).scalars().all()
 
     if not formulas:
-        return {"estimated_volume": None, "volume_unit": None, "message": "No formula found for this practice type"}
-
+        return {
+            "estimated_volume": None, "volume_unit": None,
+            "message": (
+                f"No formula found for measure={measure}, l2={practice.l2_type}, "
+                f"method={application_method}, brand_unit={brand_unit}, "
+                f"dosage_unit={dosage_unit}. (DATA_CONFIG_ERROR)"
+            ),
+            "error_code": "FORMULA_NOT_FOUND",
+        }
+    if len(formulas) > 1:
+        return {
+            "estimated_volume": None, "volume_unit": None,
+            "message": (
+                f"{len(formulas)} matching formulas for the same key — "
+                "data integrity error in volume_formulas. (DATA_CONFIG_ERROR)"
+            ),
+            "error_code": "FORMULA_DUPLICATE",
+        }
     formula_row = formulas[0]
 
-    elements_result = await db.execute(
-        select(Element).where(Element.practice_id == item.practice_id)
-    )
-    elements = {e.element_type: e.value for e in elements_result.scalars().all()}
-    dosage = float(elements.get("dosage", 0)) if elements.get("dosage") else None
-
-    # Resolve timeline duration so frequency-based formulas get an Applications count.
-    # For DBS: from_value is days BEFORE sowing (larger), to_value is days BEFORE sowing (smaller).
-    #   Duration = from_value - to_value + 1
-    # For DAS / CALENDAR: Duration = to_value - from_value + 1
+    # ── Timeline duration for legacy frequency-based fallback ──────
+    # (Phase D.3 will switch this to read Applications from a Practice
+    # element; until then, keep the existing compute path.)
     timeline_duration_days: Optional[int] = None
-    timeline = (await db.execute(
-        select(Timeline).where(Timeline.id == practice.timeline_id)
-    )).scalar_one_or_none()
-    if timeline is not None:
-        if timeline.from_type.value == "DBS":
-            timeline_duration_days = timeline.from_value - timeline.to_value + 1
-        else:
-            timeline_duration_days = timeline.to_value - timeline.from_value + 1
+    if timeline.from_type.value == "DBS":
+        timeline_duration_days = timeline.from_value - timeline.to_value + 1
+    else:
+        timeline_duration_days = timeline.to_value - timeline.from_value + 1
 
     result = calculate_volume(
         formula=formula_row.formula,
@@ -1398,7 +1488,17 @@ async def get_volume_estimate(
     if result is None:
         return {"estimated_volume": None, "volume_unit": None, "message": "Could not calculate estimate"}
     volume, unit = result
-    return {"estimated_volume": volume, "volume_unit": unit, "formula_used": formula_row.formula}
+    return {
+        "estimated_volume": volume, "volume_unit": unit,
+        "formula_used": formula_row.formula,
+        "lookup_key": {
+            "measure": measure,
+            "l2_practice": practice.l2_type,
+            "application_method": application_method,
+            "brand_unit": brand_unit,
+            "dosage_unit": dosage_unit,
+        },
+    }
 
 
 # ── Dealer: Profile (what do you sell, shop details) ─────────────────────────
