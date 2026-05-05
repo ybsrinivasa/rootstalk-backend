@@ -737,19 +737,28 @@ async def set_start_date(
             detail="Crop start date cannot be empty. You can update it but not remove it.",
         )
 
+    # Parse new_start_raw → datetime ONCE so we can write a real datetime
+    # to the DB (asyncpg rejects bare strings on TIMESTAMP columns).
+    from datetime import datetime
+    if isinstance(new_start_raw, str):
+        new_start_dt = datetime.fromisoformat(new_start_raw.replace("Z", "+00:00"))
+    elif isinstance(new_start_raw, datetime):
+        new_start_dt = new_start_raw
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail="crop_start_date must be an ISO datetime string",
+        )
+
     # First ever start date — just set it
     if not sub.crop_start_date:
-        sub.crop_start_date = new_start_raw
+        sub.crop_start_date = new_start_dt
         await db.commit()
         return {"detail": "Start date set", "crop_start_date": sub.crop_start_date}
 
-    # Parse old and new dates
+    # Parse old and new dates for date-shift math
     old_start = sub.crop_start_date.date() if hasattr(sub.crop_start_date, 'date') else sub.crop_start_date
-    from datetime import datetime
-    if isinstance(new_start_raw, str):
-        new_start = datetime.fromisoformat(new_start_raw.replace("Z", "+00:00")).date()
-    else:
-        new_start = new_start_raw
+    new_start = new_start_dt.date()
 
     today = dt_date.today()
 
@@ -827,8 +836,8 @@ async def set_start_date(
     # Compute shifts
     shifts, delta_days = compute_date_shifts(tl_ranges, old_start, new_start, today, active_items)
 
-    # Update start date
-    sub.crop_start_date = new_start_raw
+    # Update start date (use the parsed datetime, not the raw string)
+    sub.crop_start_date = new_start_dt
 
     # Shift active orders by delta
     for order in orders:
