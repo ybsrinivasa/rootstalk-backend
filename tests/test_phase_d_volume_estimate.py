@@ -233,6 +233,39 @@ async def test_estimate_blocks_on_duplicate_formulas(db):
 
 @requires_docker
 @pytest.mark.asyncio
+async def test_estimate_uses_applications_element_when_present(db):
+    """When the practice has an `applications` element (Phase D.3), its
+    value drives the formula's Applications variable — not a runtime
+    re-compute from frequency_days. Element wins."""
+    user, order, item = await _seed_volume_estimate_scenario(
+        db, measure=AREA_WISE,
+        formula_text="Dosage × Total_area × Applications",
+    )
+    # The seeded practice has dosage + application_method elements only.
+    # Add an applications element with value=3 and tag the practice as
+    # frequency-based (would have computed to a different number).
+    from app.modules.advisory.models import Element, Practice
+    from sqlalchemy import select as _sel
+    practice = (await db.execute(
+        _sel(Practice).where(Practice.id == item.practice_id)
+    )).scalar_one()
+    practice.frequency_days = 2  # would compute to ceil(31/2) = 16
+    db.add(Element(
+        practice_id=practice.id, element_type="applications", value="3",
+    ))
+    await db.commit()
+
+    out = await get_volume_estimate(
+        order_id=order.id, item_id=item.id,
+        db=db, current_user=user,
+    )
+    # 2 (dosage) × 5 (acres) × 3 (applications from element) = 30
+    assert out["estimated_volume"] == 30.0
+    assert out["volume_unit"] == "kg"
+
+
+@requires_docker
+@pytest.mark.asyncio
 async def test_estimate_blocks_when_application_method_missing(db):
     """Practice has no application_method element → APPLICATION_METHOD_MISSING."""
     user = await make_user(db)

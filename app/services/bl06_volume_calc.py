@@ -60,36 +60,42 @@ def calculate_volume(
     volume_water_per_acre: Optional[float] = None,
     frequency_days: Optional[int] = None,
     timeline_duration_days: Optional[int] = None,
+    applications: Optional[int] = None,
 ) -> Optional[tuple[float, str]]:
     """
     Returns (estimated_volume, brand_unit) or None if inputs are insufficient.
 
-    Frequency-based practices:
-    - If frequency_days is None: Applications = 1 (one-time)
-    - If frequency_days >= 1 and timeline_duration_days >= 1:
-      Applications = ceil(timeline_duration_days / frequency_days)
+    Applications resolution (Phase D.3):
+    1. If `applications` is provided directly (now the SE-preferred path —
+       value comes from a Practice element with element_type='applications'
+       which the SE confirms at practice creation time), use it.
+    2. Otherwise fall back to the legacy compute:
+       - frequency_days + timeline_duration_days both >= 1 →
+         Applications = ceil(timeline_duration_days / frequency_days)
+       - Either missing or zero → Applications = 1 (one-time).
 
-    Convention for SE:
-    - One-time formula:        `Dosage * Total_area`
-    - Frequency-based formula: `Dosage * Total_area * Applications`
-
-    If the SE forgets to use `Applications` in a frequency-based formula, the
-    volume will be one-application's worth. That's an SE error, not a system error.
+    The element-first path means the SE sees and confirms the count once,
+    and that fixed value flows downstream — no risk of re-computation drift
+    when frequency or timeline shifts later. The legacy compute remains for
+    practices created before Applications-as-element rolled out.
     """
     if farm_area_acres is None:
         return None
 
-    if frequency_days and frequency_days >= 1 and timeline_duration_days and timeline_duration_days >= 1:
-        applications = math.ceil(timeline_duration_days / frequency_days)
+    # Element-first; legacy compute is the fallback.
+    if applications is not None and applications >= 1:
+        resolved_applications = int(applications)
+    elif frequency_days and frequency_days >= 1 and timeline_duration_days and timeline_duration_days >= 1:
+        resolved_applications = math.ceil(timeline_duration_days / frequency_days)
     else:
-        applications = 1
+        resolved_applications = 1
 
     variables: dict[str, float] = {
         "Total_area": float(farm_area_acres),
         "Dosage": float(dosage) if dosage else 0.0,
         "Concentration": float(concentration) if concentration else 1.0,
         "Volume_water": float(volume_water_per_acre) if volume_water_per_acre else 200.0,
-        "Applications": float(applications),
+        "Applications": float(resolved_applications),
     }
     try:
         volume = evaluate_formula(formula, variables)

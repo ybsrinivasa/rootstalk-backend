@@ -1414,6 +1414,20 @@ async def get_volume_estimate(
             "error_code": "APPLICATION_METHOD_MISSING",
         }
 
+    # Phase D.3: Applications can now live as a Practice element. The SE
+    # confirms the count at practice-creation time and the system stores
+    # it as element_type='applications'. We prefer this over re-computing
+    # at render time so frequency/timeline drift can't change the count.
+    applications: Optional[int] = None
+    apps_el = elements_by_type.get("applications")
+    if apps_el and apps_el.value:
+        try:
+            n = int(apps_el.value)
+            if n >= 1:
+                applications = n
+        except (TypeError, ValueError):
+            pass  # element value malformed → fall through to legacy compute
+
     # Derive units. Callers can override; otherwise fall back to the
     # order item (set by the dealer at fulfillment) and finally to the
     # dosage element's unit_cosh_id for dosage_unit.
@@ -1484,6 +1498,7 @@ async def get_volume_estimate(
         farm_area_acres=farm_area_acres,
         frequency_days=practice.frequency_days,
         timeline_duration_days=timeline_duration_days,
+        applications=applications,
     )
     if result is None:
         return {"estimated_volume": None, "volume_unit": None, "message": "Could not calculate estimate"}

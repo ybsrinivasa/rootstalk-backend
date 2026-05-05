@@ -163,3 +163,72 @@ def test_empty_formula_does_not_crash_substitution():
     import pytest
     with pytest.raises(ValueError):
         evaluate_formula("", {})
+
+
+# ── Applications as Practice element (Phase D.3) ────────────────────────────
+# `applications` is now the preferred input. Legacy frequency_days +
+# timeline_duration_days remain as a fallback for practices created before
+# Applications-as-element rolled out.
+
+def test_applications_explicit_overrides_legacy_compute():
+    """Pass applications=4 alongside conflicting frequency inputs that
+    would compute to 8. The explicit value wins."""
+    result = calculate_volume(
+        formula="Dosage * Total_area * Applications",
+        brand_unit="kg",
+        dosage=2.0,
+        farm_area_acres=5.0,
+        frequency_days=2,
+        timeline_duration_days=15,   # legacy compute → ceil(15/2) = 8
+        applications=4,              # element-supplied — wins
+    )
+    assert result == (40.0, "kg")    # 2 × 5 × 4 = 40
+
+
+def test_applications_missing_falls_back_to_legacy_compute():
+    """No `applications` argument — legacy compute kicks in."""
+    result = calculate_volume(
+        formula="Dosage * Total_area * Applications",
+        brand_unit="kg",
+        dosage=2.0,
+        farm_area_acres=5.0,
+        frequency_days=2,
+        timeline_duration_days=15,   # → ceil(15/2) = 8
+    )
+    assert result == (80.0, "kg")    # 2 × 5 × 8 = 80
+
+
+def test_applications_zero_or_negative_falls_back():
+    """Defensive: a malformed element value (0, -1) must not silently zero
+    out the volume. Treated as 'not provided' → falls back to legacy."""
+    out_zero = calculate_volume(
+        formula="Dosage * Total_area * Applications",
+        brand_unit="kg",
+        dosage=2.0,
+        farm_area_acres=5.0,
+        frequency_days=2,
+        timeline_duration_days=15,
+        applications=0,
+    )
+    assert out_zero == (80.0, "kg")  # legacy compute → 8 applications
+
+    out_neg = calculate_volume(
+        formula="Dosage * Total_area * Applications",
+        brand_unit="kg",
+        dosage=2.0,
+        farm_area_acres=5.0,
+        applications=-3,
+    )
+    assert out_neg == (10.0, "kg")  # falls back to 1
+
+
+def test_applications_one_when_no_frequency_inputs():
+    """With nothing to indicate frequency, Applications = 1 (one-time)."""
+    result = calculate_volume(
+        formula="Dosage * Total_area * Applications",
+        brand_unit="kg",
+        dosage=2.0,
+        farm_area_acres=5.0,
+        # no frequency_days, no timeline_duration_days, no applications
+    )
+    assert result == (10.0, "kg")
