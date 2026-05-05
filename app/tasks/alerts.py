@@ -199,22 +199,27 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
         await _send_to_recipient(db, sub.id, AlertType.INPUT, recipient, user, msg)
 
 
+async def _run_daily_alerts_with_session(db, today: date | None = None) -> int:
+    """Inner loop: takes a session, processes every ACTIVE subscription,
+    commits. Split out so integration tests can inject the testcontainer
+    session and assert on Alert rows it commits."""
+    today = today or datetime.now(timezone.utc).date()
+    subs = (await db.execute(
+        select(Subscription).where(Subscription.status == SubscriptionStatus.ACTIVE)
+    )).scalars().all()
+    for sub in subs:
+        await _process_subscription(db, sub, today)
+    await db.commit()
+    logger.info(f"Daily alerts processed for {len(subs)} subscriptions")
+    return len(subs)
+
+
 async def _run_daily_alerts() -> int:
-    """Runs all ACTIVE subscriptions through the BL-09 alert decisions.
-    Returns the count of subscriptions processed (for logging / tests).
-    Every-day idempotency is enforced via `_alert_sent_today` lookups."""
+    """Production entry point: opens its own session and runs the inner
+    loop. Every-day idempotency is enforced inside `_process_subscription`
+    via the `_alert_sent_today` lookups."""
     async with AsyncSessionLocal() as db:
-        today = datetime.now(timezone.utc).date()
-        subs = (await db.execute(
-            select(Subscription).where(Subscription.status == SubscriptionStatus.ACTIVE)
-        )).scalars().all()
-
-        for sub in subs:
-            await _process_subscription(db, sub, today)
-
-        await db.commit()
-        logger.info(f"Daily alerts processed for {len(subs)} subscriptions")
-        return len(subs)
+        return await _run_daily_alerts_with_session(db)
 
 
 @celery_app.task(name="app.tasks.alerts.send_daily_alerts")
