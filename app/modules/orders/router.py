@@ -19,6 +19,11 @@ from app.modules.advisory.models import Practice, Element, Timeline
 from app.services.bl06_volume_calc import calculate_volume
 from math import radians, cos, sin, asin, sqrt
 from app.services.bl07_brand_options import get_brand_options
+from app.services.bl10_order_state import (
+    DEALER, FARMER,
+    is_item_abortable, is_order_abortable,
+    validate_item_transition, validate_order_transition,
+)
 from app.modules.advisory.models import RelationType
 from app.modules.subscriptions.models import PromoterAssignment, SubscriptionPaymentRequest, AssignmentStatus
 
@@ -297,9 +302,11 @@ async def approve_order_item(
     current_user: User = Depends(get_current_user),
 ):
     """BL-14: Farmer approves dealer's volume and price."""
+    await _get_farmer_order(db, order_id, current_user.id)
     item = await _get_order_item(db, item_id, order_id)
-    if item.status != OrderItemStatus.SENT_FOR_APPROVAL:
-        raise HTTPException(status_code=400, detail="Item is not awaiting approval")
+    res = validate_item_transition(item.status, OrderItemStatus.APPROVED.value, FARMER)
+    if not res.allowed:
+        _raise_transition(res)
     item.status = OrderItemStatus.APPROVED
     await _update_order_status(db, order_id)
     await db.commit()
@@ -312,7 +319,11 @@ async def reject_order_item(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _get_farmer_order(db, order_id, current_user.id)
     item = await _get_order_item(db, item_id, order_id)
+    res = validate_item_transition(item.status, OrderItemStatus.REJECTED.value, FARMER)
+    if not res.allowed:
+        _raise_transition(res)
     item.status = OrderItemStatus.REJECTED
     await db.commit()
     return {"item_id": item_id, "status": item.status}
@@ -443,7 +454,11 @@ async def mark_item_available(
     from app.services.relations import decode_role
     from app.modules.sync.models import CoshReferenceCache
 
+    await _get_dealer_order(db, order_id, current_user.id)
     item = await _get_order_item(db, item_id, order_id)
+    res = validate_item_transition(item.status, OrderItemStatus.AVAILABLE.value, DEALER)
+    if not res.allowed:
+        _raise_transition(res)
 
     # ── BL-07 strict brand validation ─────────────────────────────────────
     brand_cosh_id = (data.get("brand_cosh_id") or "").strip()
@@ -747,7 +762,11 @@ async def postpone_item(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _get_dealer_order(db, order_id, current_user.id)
     item = await _get_order_item(db, item_id, order_id)
+    res = validate_item_transition(item.status, OrderItemStatus.POSTPONED.value, DEALER)
+    if not res.allowed:
+        _raise_transition(res)
     item.status = OrderItemStatus.POSTPONED
     item.postponed_until = data.get("postponed_until")
     await db.commit()
@@ -760,7 +779,11 @@ async def mark_item_unavailable(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _get_dealer_order(db, order_id, current_user.id)
     item = await _get_order_item(db, item_id, order_id)
+    res = validate_item_transition(item.status, OrderItemStatus.NOT_AVAILABLE.value, DEALER)
+    if not res.allowed:
+        _raise_transition(res)
     item.status = OrderItemStatus.NOT_AVAILABLE
     await db.commit()
     return {"item_id": item_id, "status": item.status}
@@ -774,6 +797,10 @@ async def submit_for_approval(
     current_user: User = Depends(get_current_user),
 ):
     """BL-14: Sends all AVAILABLE items to farmer for approval."""
+    order = await _get_dealer_order(db, order_id, current_user.id)
+    res = validate_order_transition(order.status, OrderStatus.SENT_FOR_APPROVAL.value, DEALER)
+    if not res.allowed:
+        _raise_transition(res)
     result = await db.execute(
         select(OrderItem).where(
             OrderItem.order_id == order_id,
@@ -796,7 +823,6 @@ async def submit_for_approval(
             raise HTTPException(status_code=422, detail=f"given_volume missing for item {item.id}")
         item.status = OrderItemStatus.SENT_FOR_APPROVAL
 
-    order = (await db.execute(select(Order).where(Order.id == order_id))).scalar_one()
     order.status = OrderStatus.SENT_FOR_APPROVAL
     await db.commit()
     return {"order_id": order_id, "status": order.status}
@@ -808,17 +834,51 @@ async def abort_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """BL-10: Dealer aborts — all items revert to PENDING, order reverts to SENT."""
-    result = await db.execute(
+    """BL-10: Dealer aborts an in-flight order — items in dealer-owned
+    states revert to PENDING with their fulfilment fields cleared, and
+    the order goes back to SENT so a different dealer can pick it up.
+
+    Audit fixes (2026-05-05):
+    - dealer ownership check (was missing — any dealer could abort
+      anyone's order)
+    - is_order_abortable guard so CANCELLED / COMPLETED / EXPIRED
+      orders cannot be resurrected
+    - per-item is_item_abortable guard so APPROVED / REJECTED /
+      REMOVED / SKIPPED items survive the abort (was wiping prior
+      farmer approvals)
+    - clears all fulfilment fields, not just brand (given_volume,
+      volume_unit, price, postponed_until, scan_verified — were
+      stale on the resulting PENDING item).
+    """
+    order = await _get_dealer_order(db, order_id, current_user.id)
+    if not is_order_abortable(order.status):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_code": "ORDER_NOT_ABORTABLE",
+                "message": (
+                    f"Order in status '{order.status}' cannot be aborted. "
+                    "Abort is only valid for PROCESSING / SENT_FOR_APPROVAL / "
+                    "PARTIALLY_APPROVED orders."
+                ),
+            },
+        )
+
+    items = (await db.execute(
         select(OrderItem).where(OrderItem.order_id == order_id)
-    )
-    items = result.scalars().all()
+    )).scalars().all()
     for item in items:
+        if not is_item_abortable(item.status):
+            continue
         item.status = OrderItemStatus.PENDING
         item.brand_cosh_id = None
         item.brand_name = None
+        item.given_volume = None
+        item.volume_unit = None
+        item.price = None
+        item.postponed_until = None
+        item.scan_verified = False
 
-    order = (await db.execute(select(Order).where(Order.id == order_id))).scalar_one()
     order.status = OrderStatus.SENT
     await db.commit()
     return {"order_id": order_id, "status": order.status}
@@ -1956,6 +2016,29 @@ async def _get_farmer_order(db: AsyncSession, order_id: str, farmer_user_id: str
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
     return order
+
+
+async def _get_dealer_order(db: AsyncSession, order_id: str, dealer_user_id: str) -> Order:
+    """Mirrors _get_farmer_order for the dealer side. Returns 404 (no
+    existence leak) when the order doesn't exist OR is assigned to a
+    different dealer — closes the BL-10 audit privilege gap where the
+    dealer endpoints accepted any authenticated user."""
+    result = await db.execute(
+        select(Order).where(Order.id == order_id, Order.dealer_user_id == dealer_user_id)
+    )
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return order
+
+
+def _raise_transition(res, status_code: int = 400) -> None:
+    """Convert a TransitionResult.allowed=False into an HTTPException
+    with the stable error_code in the detail."""
+    raise HTTPException(
+        status_code=status_code,
+        detail={"error_code": res.error_code, "message": res.message},
+    )
 
 
 async def _get_order_item(db: AsyncSession, item_id: str, order_id: str) -> OrderItem:
