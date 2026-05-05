@@ -27,11 +27,24 @@ from app.modules.advisory.models import SPRecommendation, SPTimeline, SPPractice
 from app.modules.platform.models import UserRole, RoleType
 from app.modules.orders.models import DealerProfile
 from app.modules.clients.models import Client, ClientLocation, ClientStatus
+from app.services.bl11_subscription_state import (
+    DEALER as BL11_DEALER, FARMER as BL11_FARMER,
+    is_self_unsubscribable, validate_transition as validate_sub_transition,
+)
 
 router = APIRouter(tags=["Subscriptions"])
 
 WAITLIST_EXPIRY_DAYS = 3
 PAYMENT_REQUEST_EXPIRY_HOURS = 72
+
+
+def _raise_sub_transition(res, status_code: int = 400) -> None:
+    """Convert a TransitionResult.allowed=False into an HTTPException
+    carrying the stable error_code in the detail payload."""
+    raise HTTPException(
+        status_code=status_code,
+        detail={"error_code": res.error_code, "message": res.message},
+    )
 
 
 def _is_frequency_due_today(frequency_days, timeline_from_date, today_date) -> bool:
@@ -1129,9 +1142,21 @@ async def respond_to_assignment(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Farmer approves or rejects Promoter assignment."""
+    """Farmer approves or rejects Promoter assignment.
+
+    BL-11 audit (2026-05-06): added transition guard so a stale or
+    duplicated request can't re-write status on a sub that's already
+    moved past WAITLISTED. Pre-fix, hitting respond again on an ACTIVE
+    sub would silently reset subscription_date and re-issue the
+    reference_number, and hitting it on a CANCELLED sub could
+    un-cancel a rejection.
+    """
     sub = await _get_subscription(db, subscription_id, current_user.id)
     approved = data.get("approved", False)
+    target = SubscriptionStatus.ACTIVE if approved else SubscriptionStatus.CANCELLED
+    res = validate_sub_transition(sub.status, target.value, BL11_FARMER)
+    if not res.allowed:
+        _raise_sub_transition(res)
 
     assignment_result = await db.execute(
         select(PromoterAssignment).where(PromoterAssignment.subscription_id == subscription_id)
@@ -1240,7 +1265,16 @@ async def pay_subscription(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Dealer/facilitator pays — becomes Promoter for this subscription."""
+    """Dealer/facilitator pays — becomes Promoter for this subscription.
+
+    BL-11 audit (2026-05-06): added a transition guard up front so a
+    duplicate hit (network retry, double-tap, replay) on an already-
+    ACTIVE sub doesn't silently consume a second unit from the
+    promoter's allocation and reset subscription_date. The state-
+    machine table only allows WAITLISTED → ACTIVE; anything else
+    raises NO_OP_TRANSITION or ILLEGAL_TRANSITION before we touch
+    the allocation.
+    """
     result = await db.execute(
         select(SubscriptionPaymentRequest).where(SubscriptionPaymentRequest.id == request_id)
     )
@@ -1249,6 +1283,12 @@ async def pay_subscription(
         raise HTTPException(status_code=404, detail="Payment request not found")
 
     sub = (await db.execute(select(Subscription).where(Subscription.id == pr.subscription_id))).scalar_one()
+
+    res = validate_sub_transition(
+        sub.status, SubscriptionStatus.ACTIVE.value, BL11_DEALER,
+    )
+    if not res.allowed:
+        _raise_sub_transition(res)
 
     # Phase C: the dealer/facilitator paying on the farmer's behalf
     # becomes the promoter for this subscription. They must have
@@ -1383,9 +1423,22 @@ async def verify_payment(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Verify RazorPay signature and activate the subscription."""
+    """Verify RazorPay signature and activate the subscription.
+
+    BL-11 audit (2026-05-06): added a transition guard so a replayed
+    verify payload (signatures stay valid until Razorpay invalidates
+    the order) can't bounce a sub back to ACTIVE and reset
+    subscription_date. Mirrors the existing dealer_verify_payment
+    pattern. Returns NO_OP_TRANSITION on duplicate hits, which the
+    PWA can treat as success-ish.
+    """
     from app.services.payment_service import verify_payment_signature
     sub = await _get_subscription(db, subscription_id, current_user.id)
+    res = validate_sub_transition(
+        sub.status, SubscriptionStatus.ACTIVE.value, BL11_FARMER,
+    )
+    if not res.allowed:
+        _raise_sub_transition(res)
     valid = verify_payment_signature(
         data["razorpay_order_id"],
         data["razorpay_payment_id"],
@@ -1515,11 +1568,20 @@ async def dealer_verify_payment(
     pr.status = "PAID"
     pr.razorpay_payment_id = data["razorpay_payment_id"]
 
-    # Activate the farmer's subscription
+    # Activate the farmer's subscription. BL-11 audit (2026-05-06):
+    # swapped the inline `if WAITLISTED` for validate_transition so a
+    # replayed verify on an already-ACTIVE sub returns the standard
+    # NO_OP_TRANSITION error_code — matches the farmer-side
+    # verify_payment behaviour and the dealer-side pay_subscription.
     sub = (await db.execute(
         select(Subscription).where(Subscription.id == pr.subscription_id)
     )).scalar_one_or_none()
-    if sub and sub.status == SubscriptionStatus.WAITLISTED:
+    if sub:
+        res = validate_sub_transition(
+            sub.status, SubscriptionStatus.ACTIVE.value, BL11_DEALER,
+        )
+        if not res.allowed:
+            _raise_sub_transition(res)
         sub.status = SubscriptionStatus.ACTIVE
         sub.subscription_date = datetime.now(timezone.utc)
         if not sub.reference_number:
@@ -1993,7 +2055,12 @@ async def unsubscribe(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Self-subscribed: cancel freely. Company-assigned: returns 400 (request required)."""
+    """Self-subscribed: cancel freely. Company-assigned: returns 400 (request required).
+
+    BL-11 audit (2026-05-06): the SELF-vs-ASSIGNED rule lives in the
+    `is_self_unsubscribable` predicate of bl11_subscription_state so
+    the policy is testable in isolation. Behaviour is unchanged.
+    """
     sub = (await db.execute(
         select(Subscription).where(
             Subscription.id == subscription_id,
@@ -2004,15 +2071,15 @@ async def unsubscribe(
     if not sub:
         raise HTTPException(status_code=404, detail="Active subscription not found")
 
-    if sub.subscription_type == SubscriptionType.SELF:
-        sub.status = SubscriptionStatus.CANCELLED
-        await db.commit()
-        return {"detail": "Unsubscribed successfully", "status": sub.status}
-    else:
+    sub_type = sub.subscription_type.value if hasattr(sub.subscription_type, "value") else str(sub.subscription_type)
+    if not is_self_unsubscribable(sub_type, sub.status):
         raise HTTPException(
             status_code=400,
-            detail="Company-assigned subscriptions cannot be cancelled by the farmer. Please contact your company."
+            detail="Company-assigned subscriptions cannot be cancelled by the farmer. Please contact your company.",
         )
+    sub.status = SubscriptionStatus.CANCELLED
+    await db.commit()
+    return {"detail": "Unsubscribed successfully", "status": sub.status}
 
 
 # ── Farmer: Active advisories in district ─────────────────────────────────────
