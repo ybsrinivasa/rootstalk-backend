@@ -1,6 +1,21 @@
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+if settings.environment != "development" and (
+    not settings.email_smtp_user or not settings.email_smtp_pass
+):
+    logger.warning(
+        "EMAIL_SMTP_USER / EMAIL_SMTP_PASS not configured in '%s' environment — "
+        "email OTP login and password resets will fail with 503. Set both env "
+        "vars (and EMAIL_FROM if the sender differs from EMAIL_SMTP_USER) to "
+        "restore email delivery.",
+        settings.environment,
+    )
 from app.modules.auth.router import router as auth_router
 from app.modules.platform.router import router as platform_router
 from app.modules.clients.router import router as clients_router

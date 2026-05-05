@@ -20,7 +20,22 @@ def generate_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-def _send_email(to: str, subject: str, html: str, plain: str):
+def _send_email(to: str, subject: str, html: str, plain: str) -> bool:
+    """Send an email via SMTP. Returns True on success, False on any
+    failure (missing creds, connection, auth, rejected sender, etc.).
+
+    Callers that surface user-visible flows (OTP login, password reset)
+    should turn a False return into a 5xx so the user knows something
+    went wrong — pre-fix this helper swallowed the exception silently
+    and the API returned 200 even when the email never went out.
+    """
+    if not settings.email_smtp_user or not settings.email_smtp_pass:
+        logger.error(
+            "Email send to %s skipped: EMAIL_SMTP_USER / EMAIL_SMTP_PASS "
+            "not configured. Subject was: %s",
+            to, subject,
+        )
+        return False
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
@@ -32,8 +47,10 @@ def _send_email(to: str, subject: str, html: str, plain: str):
             s.ehlo(); s.starttls()
             s.login(settings.email_smtp_user, settings.email_smtp_pass)
             s.sendmail(msg["From"], to, msg.as_string())
+        return True
     except Exception as e:
         logger.error(f"Email send failed to {to}: {e}")
+        return False
 
 
 async def send_onboarding_email(client: Client, link: str):

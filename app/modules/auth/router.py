@@ -134,9 +134,20 @@ async def request_email_otp(data: dict, db: AsyncSession = Depends(get_db)):
     <div style="font-size:36px;font-weight:bold;letter-spacing:8px;color:#1A5C2A;margin:16px 0">{otp_code}</div>
     <p style="color:#666;font-size:12px">Valid for {EMAIL_OTP_EXPIRY_MINUTES} minutes. Do not share this code.</p>
     </body>"""
-    _send_email(email, subject, body_html, body_plain)
+    sent = _send_email(email, subject, body_html, body_plain)
 
-    return {"detail": "OTP sent", "dev_otp": otp_code if settings.environment == "development" else None}
+    # In dev we return the OTP in the response so the developer can use
+    # it directly even when SMTP isn't wired. In other envs we surface
+    # the SMTP failure as a 503 so the user knows to retry — pre-fix
+    # the helper swallowed the error and the API silently returned 200.
+    if settings.environment == "development":
+        return {"detail": "OTP sent", "dev_otp": otp_code}
+    if not sent:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Failed to send email OTP. Please try again or contact support.",
+        )
+    return {"detail": "OTP sent", "dev_otp": None}
 
 
 @router.post("/admin/verify-email-otp", response_model=TokenResponse)
@@ -187,7 +198,7 @@ async def forgot_password(data: dict, db: AsyncSession = Depends(get_db)):
         expires_at = datetime.now(timezone.utc) + timedelta(minutes=EMAIL_OTP_EXPIRY_MINUTES)
         db.add(EmailOTP(email=email, otp_code=otp_code, purpose="RESET", expires_at=expires_at))
         await db.commit()
-        _send_email(
+        sent = _send_email(
             email,
             "Reset your RootsTalk password",
             f"<body style='font-family:sans-serif;padding:32px'><h2>Password Reset</h2><p>Your reset code: <strong style='font-size:28px;color:#1A5C2A;letter-spacing:6px'>{otp_code}</strong></p><p style='color:#666;font-size:12px'>Valid for {EMAIL_OTP_EXPIRY_MINUTES} minutes.</p></body>",
@@ -195,6 +206,15 @@ async def forgot_password(data: dict, db: AsyncSession = Depends(get_db)):
         )
         if settings.environment == "development":
             return {"detail": "OTP sent", "dev_otp": otp_code}
+        # Production: surface the SMTP failure to the user instead of
+        # the silent "OTP sent" lie, but only if the email actually
+        # exists — for unknown emails we still return the generic
+        # message to prevent enumeration.
+        if not sent:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Failed to send reset email. Please try again or contact support.",
+            )
     return {"detail": "If this email is registered, you will receive a reset code shortly"}
 
 
