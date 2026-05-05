@@ -1,12 +1,13 @@
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Header, status, Request
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.database import get_db
 from app.config import settings
 from app.dependencies import get_current_user
 from app.modules.platform.models import User
-from app.modules.sync.models import CoshSyncLog, VolumeFormula, CropHealthCrop
+from app.modules.sync.models import CoshSyncLog, VolumeFormula, CropHealthCrop, CropMeasure
 from app.modules.sync.service import process_payload, get_cosh_translation
 
 router = APIRouter(tags=["Cosh Sync"])
@@ -191,6 +192,59 @@ async def disable_crop_health(
     await db.commit()
     await db.refresh(crop)
     return crop
+
+
+# ── Crop Measure (Phase D.1) ──────────────────────────────────────────────────
+# AREA_WISE / PLANT_WISE classification per crop. Drives BL-06 volume-formula
+# lookup and the SE practice-creation form. Today seeded manually by SA;
+# Cosh sync will populate `synced_from_cosh_at` when integration ships.
+
+class CropMeasureSetRequest(BaseModel):
+    measure: str   # 'AREA_WISE' | 'PLANT_WISE'
+
+
+@router.get("/admin/crop-measures")
+async def list_crop_measures(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.crop_measure import list_measures
+    rows = await list_measures(db)
+    return [
+        {
+            "crop_cosh_id": r.crop_cosh_id,
+            "measure": r.measure,
+            "updated_by_user_id": r.updated_by_user_id,
+            "synced_from_cosh_at": r.synced_from_cosh_at,
+            "updated_at": r.updated_at,
+        }
+        for r in rows
+    ]
+
+
+@router.put("/admin/crop-measures/{crop_cosh_id}")
+async def set_crop_measure(
+    crop_cosh_id: str,
+    request: CropMeasureSetRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.crop_measure import set_measure
+    try:
+        row = await set_measure(
+            db, crop_cosh_id=crop_cosh_id, measure=request.measure,
+            user_id=current_user.id,
+        )
+        await db.commit()
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return {
+        "crop_cosh_id": row.crop_cosh_id,
+        "measure": row.measure,
+        "updated_by_user_id": row.updated_by_user_id,
+        "updated_at": row.updated_at,
+    }
 
 
 # ── Cosh Reference Lookup (used internally by all other modules) ───────────────

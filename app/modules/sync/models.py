@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import String, Text, Integer, DateTime, JSON, UniqueConstraint, Index
+from sqlalchemy import String, Text, Integer, DateTime, JSON, UniqueConstraint, Index, ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column
 from app.database import Base
 
@@ -83,3 +83,34 @@ class CropHealthCrop(Base):
     enabled_by: Mapped[str] = mapped_column(String(36), nullable=True)
     enabled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="ACTIVE")
+
+
+class CropMeasure(Base):
+    """Crop → Measure mapping (Area-wise vs Plant-wise).
+
+    Drives BL-06 volume-formula lookup and the SE practice-creation form
+    (which fields to show — e.g. Volume_per_plant only for Plant-wise).
+    Today populated by SA admin endpoints; future plan is to source from
+    Cosh — `synced_from_cosh_at` is the placeholder for that integration.
+
+    Valid `measure` values: 'AREA_WISE' | 'PLANT_WISE'. Validation lives in
+    the service layer (`app/services/crop_measure.py`) so the schema can
+    grow without an enum migration if other measures are added later.
+    """
+    __tablename__ = "crop_measures"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    crop_cosh_id: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
+    measure: Mapped[str] = mapped_column(String(20), nullable=False)
+    updated_by_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True,
+    )
+    synced_from_cosh_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow,
+    )
