@@ -142,7 +142,25 @@ async def start_diagnosis(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Begin a new diagnosis session. Returns the first question."""
+    """Begin a new diagnosis session. Returns the first question.
+
+    Ownership gate: the request's subscription_id must belong to the
+    caller. Without this, a malicious farmer could start a session
+    bound to another farmer's subscription_id and ultimately trigger
+    a CHA recommendation onto that farmer's advisory via
+    `_trigger_cha_from_diagnosis`. Returns 404 (doesn't leak existence)
+    on mismatch.
+    """
+    from app.modules.subscriptions.models import Subscription
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == request.subscription_id,
+            Subscription.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
     rows = await _load_problem_symptom_rows(db, request.crop_stage_cosh_id)
 
     if not rows:
