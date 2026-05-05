@@ -1,146 +1,225 @@
-"""BL-09 — Daily advisory alerts: start-date and input-due notifications via SMS."""
+"""BL-09 — Daily advisory alerts: START_DATE and INPUT-due notifications via SMS.
+
+Wires the live Celery task to the pure-function service in
+`app/services/bl09_alerts.py`. The task only does I/O — load
+subscriptions / recipients / timelines / orders / today's already-sent
+alerts, and fan out SMS to recipients who have a phone number.
+"""
+from __future__ import annotations
+
 import asyncio
 import logging
 from datetime import date, datetime, timezone
+
 from celery import shared_task
 from sqlalchemy import select
+
 from app.celery_app import celery_app
 from app.database import AsyncSessionLocal
-from app.modules.subscriptions.models import Subscription, SubscriptionStatus, AlertRecipient, Alert, AlertType
-from app.modules.advisory.models import Package, Timeline, Practice, PracticeL0
+from app.modules.advisory.models import Package, Practice, PracticeL0, Timeline
+from app.modules.orders.models import Order, OrderItem, OrderStatus
 from app.modules.platform.models import User
-from app.services.sms_service import send_otp_sms
+from app.modules.subscriptions.models import (
+    Alert, AlertRecipient, AlertType, Subscription, SubscriptionStatus,
+)
+from app.services.bl09_alerts import (
+    AlertRecipientSpec, ConfiguredRecipient, SubscriptionView, TimelineWindow,
+    find_input_practices_due_today, resolve_alert_recipients,
+    should_send_input_alert, should_send_start_date_alert,
+)
+from app.services.sms_service import send_sms
 
 logger = logging.getLogger(__name__)
 
-SUBSCRIPTION_ALERT_SMS = "RootsTalk: {name}, your crop advisory for {package} is active but no start date is set. Please set your sowing date in the app."
-INPUT_ALERT_SMS = "RootsTalk: {name}, an input is due today for your {package} crop advisory. Open RootsTalk to place your order."
+START_DATE_ALERT_SMS = (
+    "RootsTalk: {name}, your crop advisory for {package} is active "
+    "but no start date is set. Please set your sowing date in the app."
+)
+INPUT_ALERT_SMS = (
+    "RootsTalk: {name}, an input is due today for your {package} "
+    "crop advisory. Open RootsTalk to place your order."
+)
+
+# Order statuses that suppress an INPUT alert. Mirrors the set in
+# bl09_alerts._SUPPRESSING_ORDER_STATUSES; held here as enum values for
+# the ORM comparison.
+_SUPPRESSING_ORDER_STATUSES = (
+    OrderStatus.DRAFT, OrderStatus.SENT, OrderStatus.ACCEPTED,
+    OrderStatus.PROCESSING, OrderStatus.SENT_FOR_APPROVAL,
+    OrderStatus.PARTIALLY_APPROVED, OrderStatus.COMPLETED,
+)
 
 
-async def _run_daily_alerts():
-    async with AsyncSessionLocal() as db:
-        today = date.today()
+def _start_of_today_utc(today: date) -> datetime:
+    return datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc)
 
-        subs_result = await db.execute(
-            select(Subscription).where(Subscription.status == SubscriptionStatus.ACTIVE)
+
+async def _alert_sent_today(db, subscription_id: str, alert_type: AlertType, today: date) -> bool:
+    row = (await db.execute(
+        select(Alert).where(
+            Alert.subscription_id == subscription_id,
+            Alert.alert_type == alert_type,
+            Alert.sent_at >= _start_of_today_utc(today),
         )
-        subs = subs_result.scalars().all()
+    )).first()
+    return row is not None
+
+
+async def _load_configured_recipients(db, subscription_id: str) -> list[ConfiguredRecipient]:
+    rows = (await db.execute(
+        select(AlertRecipient).where(
+            AlertRecipient.subscription_id == subscription_id,
+            AlertRecipient.status == "ACTIVE",
+        )
+    )).scalars().all()
+    return [
+        ConfiguredRecipient(user_id=r.recipient_user_id, role=r.recipient_type)
+        for r in rows
+    ]
+
+
+async def _load_timeline_windows(db, package_id: str) -> list[TimelineWindow]:
+    timelines = (await db.execute(
+        select(Timeline).where(Timeline.package_id == package_id)
+    )).scalars().all()
+    out: list[TimelineWindow] = []
+    for tl in timelines:
+        practice_ids = (await db.execute(
+            select(Practice.id).where(
+                Practice.timeline_id == tl.id,
+                Practice.l0_type == PracticeL0.INPUT,
+            )
+        )).scalars().all()
+        if not practice_ids:
+            continue
+        from_type = tl.from_type.value if hasattr(tl.from_type, "value") else str(tl.from_type)
+        out.append(TimelineWindow(
+            timeline_id=tl.id, from_type=from_type,
+            from_value=int(tl.from_value), to_value=int(tl.to_value),
+            input_practice_ids=tuple(practice_ids),
+        ))
+    return out
+
+
+async def _load_active_order_practice_ids(db, subscription_id: str) -> set[str]:
+    """Practice IDs that already have a live order on this subscription —
+    these suppress today's INPUT alert."""
+    rows = (await db.execute(
+        select(OrderItem.practice_id)
+        .join(Order, Order.id == OrderItem.order_id)
+        .where(
+            Order.subscription_id == subscription_id,
+            Order.status.in_(_SUPPRESSING_ORDER_STATUSES),
+        )
+    )).scalars().all()
+    return set(rows)
+
+
+async def _send_to_recipient(
+    db, sub_id: str, alert_type: AlertType, recipient: AlertRecipientSpec,
+    user: User, message: str,
+) -> None:
+    if user.phone:
+        try:
+            await send_sms(user.phone, message)
+        except Exception as e:
+            logger.error(f"SMS send failed to {user.phone}: {e}")
+    db.add(Alert(
+        subscription_id=sub_id,
+        alert_type=alert_type,
+        recipient_user_id=recipient.user_id,
+    ))
+
+
+async def _process_subscription(db, sub: Subscription, today: date) -> None:
+    pkg = (await db.execute(
+        select(Package).where(Package.id == sub.package_id)
+    )).scalar_one_or_none()
+    if not pkg:
+        return
+
+    crop_start = sub.crop_start_date.date() if sub.crop_start_date else None
+    sub_view = SubscriptionView(
+        subscription_id=sub.id,
+        subscription_type=sub.subscription_type.value if hasattr(sub.subscription_type, "value") else str(sub.subscription_type),
+        farmer_user_id=sub.farmer_user_id,
+        promoter_user_id=sub.promoter_user_id,
+        crop_start_date=crop_start,
+    )
+
+    configured = await _load_configured_recipients(db, sub.id)
+    recipients = resolve_alert_recipients(sub_view, configured)
+    if not recipients:
+        return
+
+    # Resolve User rows once for the recipients in this subscription.
+    user_ids = [r.user_id for r in recipients]
+    users = (await db.execute(
+        select(User).where(User.id.in_(user_ids))
+    )).scalars().all()
+    user_by_id = {u.id: u for u in users}
+
+    # ── START_DATE alert ──────────────────────────────────────────────
+    sd_sent_today = await _alert_sent_today(db, sub.id, AlertType.START_DATE, today)
+    if should_send_start_date_alert(sub_view, sent_today=sd_sent_today):
+        for recipient in recipients:
+            user = user_by_id.get(recipient.user_id)
+            if not user:
+                continue
+            msg = START_DATE_ALERT_SMS.format(
+                name=user.name or "Farmer", package=pkg.name,
+            )
+            await _send_to_recipient(db, sub.id, AlertType.START_DATE, recipient, user, msg)
+        return  # no INPUT alerts before the farmer has set their start date
+
+    # ── INPUT alert ───────────────────────────────────────────────────
+    if crop_start is None:
+        return
+    day_offset = (today - crop_start).days
+
+    timelines = await _load_timeline_windows(db, sub.package_id)
+    due_practice_ids = find_input_practices_due_today(timelines, day_offset)
+    if not due_practice_ids:
+        return
+
+    ordered_pids = await _load_active_order_practice_ids(db, sub.id)
+    in_sent_today = await _alert_sent_today(db, sub.id, AlertType.INPUT, today)
+    if not should_send_input_alert(
+        sub_view, due_practice_ids, ordered_pids, sent_today=in_sent_today,
+    ):
+        return
+
+    for recipient in recipients:
+        user = user_by_id.get(recipient.user_id)
+        if not user:
+            continue
+        msg = INPUT_ALERT_SMS.format(
+            name=user.name or "Farmer", package=pkg.name,
+        )
+        await _send_to_recipient(db, sub.id, AlertType.INPUT, recipient, user, msg)
+
+
+async def _run_daily_alerts() -> int:
+    """Runs all ACTIVE subscriptions through the BL-09 alert decisions.
+    Returns the count of subscriptions processed (for logging / tests).
+    Every-day idempotency is enforced via `_alert_sent_today` lookups."""
+    async with AsyncSessionLocal() as db:
+        today = datetime.now(timezone.utc).date()
+        subs = (await db.execute(
+            select(Subscription).where(Subscription.status == SubscriptionStatus.ACTIVE)
+        )).scalars().all()
 
         for sub in subs:
-            # Load alert recipients for this subscription
-            recip_result = await db.execute(
-                select(AlertRecipient, User)
-                .join(User, User.id == AlertRecipient.recipient_user_id)
-                .where(AlertRecipient.subscription_id == sub.id, AlertRecipient.status == "ACTIVE")
-            )
-            recipients = recip_result.all()
-
-            if not recipients:
-                # Default: alert the farmer themselves
-                farmer = (await db.execute(select(User).where(User.id == sub.farmer_user_id))).scalar_one_or_none()
-                if farmer:
-                    recipients = [(type("AR", (), {"recipient_type": "FARMER"}), farmer)]
-
-            pkg = (await db.execute(select(Package).where(Package.id == sub.package_id))).scalar_one_or_none()
-            if not pkg:
-                continue
-
-            # ── START_DATE alert ──────────────────────────────────────────────
-            if not sub.crop_start_date:
-                already_sent_today = (await db.execute(
-                    select(Alert).where(
-                        Alert.subscription_id == sub.id,
-                        Alert.alert_type == AlertType.START_DATE,
-                        Alert.sent_at >= datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc),
-                    )
-                )).scalar_one_or_none()
-
-                if not already_sent_today:
-                    for _, user in recipients:
-                        if user.phone:
-                            msg = SUBSCRIPTION_ALERT_SMS.format(
-                                name=user.name or "Farmer",
-                                package=pkg.name,
-                            )
-                            try:
-                                await send_otp_sms(user.phone, msg)
-                            except Exception as e:
-                                logger.error(f"SMS failed to {user.phone}: {e}")
-
-                        db.add(Alert(
-                            subscription_id=sub.id,
-                            alert_type=AlertType.START_DATE,
-                            recipient_user_id=user.id,
-                        ))
-                continue  # Skip input alerts if no start date
-
-            # ── INPUT_DUE alert ───────────────────────────────────────────────
-            crop_start = sub.crop_start_date.date() if hasattr(sub.crop_start_date, 'date') else sub.crop_start_date
-            day_offset = (today - crop_start).days
-
-            tl_result = await db.execute(
-                select(Timeline).where(Timeline.package_id == sub.package_id)
-            )
-            timelines = tl_result.scalars().all()
-
-            input_due = False
-            for tl in timelines:
-                from_type = tl.from_type.value if hasattr(tl.from_type, 'value') else str(tl.from_type)
-                if from_type == "DAS":
-                    if tl.from_value <= day_offset <= tl.to_value:
-                        p_result = await db.execute(
-                            select(Practice).where(
-                                Practice.timeline_id == tl.id,
-                                Practice.l0_type == PracticeL0.INPUT,
-                            )
-                        )
-                        if p_result.scalars().first():
-                            input_due = True
-                            break
-                elif from_type == "DBS":
-                    if -tl.to_value <= day_offset <= -tl.from_value:
-                        p_result = await db.execute(
-                            select(Practice).where(
-                                Practice.timeline_id == tl.id,
-                                Practice.l0_type == PracticeL0.INPUT,
-                            )
-                        )
-                        if p_result.scalars().first():
-                            input_due = True
-                            break
-
-            if input_due:
-                already_sent_today = (await db.execute(
-                    select(Alert).where(
-                        Alert.subscription_id == sub.id,
-                        Alert.alert_type == AlertType.INPUT,
-                        Alert.sent_at >= datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc),
-                    )
-                )).scalar_one_or_none()
-
-                if not already_sent_today:
-                    for _, user in recipients:
-                        if user.phone:
-                            msg = INPUT_ALERT_SMS.format(
-                                name=user.name or "Farmer",
-                                package=pkg.name,
-                            )
-                            try:
-                                await send_otp_sms(user.phone, msg)
-                            except Exception as e:
-                                logger.error(f"SMS failed to {user.phone}: {e}")
-
-                        db.add(Alert(
-                            subscription_id=sub.id,
-                            alert_type=AlertType.INPUT,
-                            recipient_user_id=user.id,
-                        ))
+            await _process_subscription(db, sub, today)
 
         await db.commit()
         logger.info(f"Daily alerts processed for {len(subs)} subscriptions")
+        return len(subs)
 
 
 @celery_app.task(name="app.tasks.alerts.send_daily_alerts")
-def send_daily_alerts():
-    """BL-09: Triggered daily at 06:00 UTC. Sends start-date and input-due SMS alerts."""
-    asyncio.get_event_loop().run_until_complete(_run_daily_alerts())
+def send_daily_alerts() -> None:
+    """BL-09: Triggered daily at 06:00 UTC. Sends START_DATE and INPUT
+    SMS alerts to the configured recipients, defaulting to farmer plus
+    assigning promoter when no preferences are set."""
+    asyncio.run(_run_daily_alerts())
