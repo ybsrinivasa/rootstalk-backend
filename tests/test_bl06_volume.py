@@ -4,7 +4,7 @@ BL-06 Volume Calculation tests.
 Covers one-time formulas (backwards compatible) and frequency-based formulas
 that use the new `Applications` variable.
 """
-from app.services.bl06_volume_calc import calculate_volume
+from app.services.bl06_volume_calc import calculate_volume, evaluate_formula
 
 
 def test_one_time_volume():
@@ -102,3 +102,64 @@ def test_frequency_zero_duration_falls_back_to_one_time():
         timeline_duration_days=0,
     )
     assert result == (10.0, "kg")
+
+
+# ── × (U+00D7) substitution — production formulas use × not * ──────────────
+# Per the Volume Calculation Formulas Reference (April 2026), every seeded
+# formula uses × instead of *. Without the substitution in evaluate_formula,
+# Python's eval would parse-error on every one of them and the dealer would
+# see "Could not calculate estimate" for every item.
+
+def test_unicode_times_substituted_simple():
+    """Real seeded formula: `Dosage × Total_area` for a kg/acre direct dose."""
+    result = calculate_volume(
+        formula="Dosage × Total_area",
+        brand_unit="kg",
+        dosage=3.0,
+        farm_area_acres=4.0,
+    )
+    assert result == (12.0, "kg")
+
+
+def test_unicode_times_substituted_foliar_spray():
+    """Real seeded formula: `(Dosage × 150 × Total_area)/1000` — foliar spray
+    with 150 L/acre water rate baked in. Dosage 2 g/L, 5 acres → 1.5 kg."""
+    result = calculate_volume(
+        formula="(Dosage × 150 × Total_area)/1000",
+        brand_unit="kg",
+        dosage=2.0,
+        farm_area_acres=5.0,
+    )
+    assert result == (1.5, "kg")
+
+
+def test_unicode_times_substituted_soil_drench():
+    """Real seeded formula: `Dosage × 200 × Total_area` — soil drenching
+    with 200 L/acre water rate. Dosage 1 ml/L, 3 acres → 600 ml."""
+    result = calculate_volume(
+        formula="Dosage × 200 × Total_area",
+        brand_unit="ml",
+        dosage=1.0,
+        farm_area_acres=3.0,
+    )
+    assert result == (600.0, "ml")
+
+
+def test_unicode_times_evaluator_directly():
+    """evaluate_formula handles × independently of calculate_volume."""
+    out = evaluate_formula("a × b × c", {"a": 2.0, "b": 3.0, "c": 4.0})
+    assert out == 24.0
+
+
+def test_mixed_times_and_star_both_work():
+    """Defensive: a formula could mix × and * (e.g. a hand-edited row).
+    Both should evaluate."""
+    out = evaluate_formula("a × b * c", {"a": 2.0, "b": 3.0, "c": 4.0})
+    assert out == 24.0
+
+
+def test_empty_formula_does_not_crash_substitution():
+    """No formula is invalid input — must raise ValueError, not surprise."""
+    import pytest
+    with pytest.raises(ValueError):
+        evaluate_formula("", {})

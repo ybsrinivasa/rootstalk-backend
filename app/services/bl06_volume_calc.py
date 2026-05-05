@@ -31,7 +31,18 @@ _ALLOWED_NAMES = {
 
 
 def evaluate_formula(formula: str, variables: dict[str, float]) -> float:
-    """Safely evaluate a formula string with the given numeric variables."""
+    """Safely evaluate a formula string with the given numeric variables.
+
+    Per the Volume Calculation Formulas Reference (April 2026): seeded
+    formulas use the × character (U+00D7, the Unicode multiplication
+    sign) for multiplication. Python's eval cannot parse ×, so we
+    substitute it with * before compiling. Without this substitution,
+    every seeded formula returns a parse error and the dealer sees
+    "Could not calculate estimate" for every item — a silent failure
+    that bypasses every test that uses the * character.
+    """
+    if formula:
+        formula = formula.replace("×", "*")
     env = {**_ALLOWED_NAMES, **variables}
     try:
         result = eval(compile(formula, "<formula>", "eval"), {"__builtins__": {}}, env)
