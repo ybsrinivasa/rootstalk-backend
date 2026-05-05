@@ -1612,10 +1612,19 @@ async def submit_conditional_answer(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """BL-02: Store farmer's YES/NO answer to a conditional question for today."""
+    """BL-02: Store farmer's YES/NO/BLANK answer to a conditional question
+    for today. Idempotent: replaces today's answer if one already exists.
+
+    Subscription ownership is verified — a farmer can only submit answers
+    against their own subscriptions. Returns 404 (subscription not found
+    OR not owned by caller) instead of leaking the distinction.
+    """
     from datetime import date
     if request.answer not in ("YES", "NO", "BLANK"):
         raise HTTPException(status_code=422, detail="answer must be YES, NO, or BLANK")
+
+    # Ownership gate — `_get_subscription` already does the join + 404 path.
+    await _get_subscription(db, request.subscription_id, current_user.id)
 
     today = date.today()
 
