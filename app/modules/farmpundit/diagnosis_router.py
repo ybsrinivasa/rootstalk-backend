@@ -15,7 +15,9 @@ from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy import String, Text, Boolean, JSON, DateTime, ForeignKey
 from app.database import Base, get_db
 from app.dependencies import get_current_user
-from app.services.claude_service import analyze_crop_image, enrich_problem_with_description
+from app.services.claude_service import (
+    analyze_crop_image, enrich_problem_with_description, explain_symptom,
+)
 from app.modules.platform.models import User
 from app.modules.sync.models import CoshReferenceCache
 from app.services.bl08_diagnosis_path import (
@@ -400,6 +402,40 @@ async def analyse_image_with_claude(
             else "Claude is not confident. Please use the guided YES/NO questions for a more accurate diagnosis."
         ),
     }
+
+
+# ── Symptom explanation (ⓘ tooltip on the diagnosis question card) ────────────
+
+class ExplainSymptomRequest(BaseModel):
+    crop_cosh_id: str
+    plant_part_cosh_id: str
+    symptom_cosh_id: str
+    sub_part_cosh_id: Optional[str] = None
+    sub_symptom_cosh_id: Optional[str] = None
+    language_code: str = "en"
+    language_name: str = "English"
+
+
+@router.post("/diagnosis/explain-symptom")
+async def explain_symptom_route(
+    request: ExplainSymptomRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Returns 2 plain-language sentences telling the farmer how to verify
+    the current question's symptom — what 'yes' looks like, what could be
+    confused with it. Auth-only (no DB access, no per-subscription state):
+    the explanation is just educational text and is the same for every
+    farmer asking about the same (crop, part, symptom)."""
+    text = await explain_symptom(
+        crop_name=_get_display_name(request.crop_cosh_id),
+        plant_part_name=_get_display_name(request.plant_part_cosh_id),
+        symptom_name=_get_display_name(request.symptom_cosh_id),
+        sub_part_name=_get_display_name(request.sub_part_cosh_id) if request.sub_part_cosh_id else None,
+        sub_symptom_name=_get_display_name(request.sub_symptom_cosh_id) if request.sub_symptom_cosh_id else None,
+        language_code=request.language_code,
+        language_name=request.language_name,
+    )
+    return {"explanation": text, "language_code": request.language_code}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

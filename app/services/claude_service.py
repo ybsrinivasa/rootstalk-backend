@@ -255,6 +255,76 @@ Output ONLY the 2 sentences, nothing else."""
         )
 
 
+# ── Symptom explanation (used by the ⓘ tooltip on diagnosis questions) ────────
+
+async def explain_symptom(
+    crop_name: str,
+    plant_part_name: str,
+    symptom_name: str,
+    sub_part_name: Optional[str] = None,
+    sub_symptom_name: Optional[str] = None,
+    language_code: str = "en",
+    language_name: str = "English",
+) -> str:
+    """Plain-language guidance for the farmer on how to verify a single
+    symptom on a single plant part — what they should look for, what
+    "yes" looks like, what "no" looks like. Used by the ⓘ button next to
+    the YES/NO question on the diagnosis screen.
+
+    Falls back to a static line when ANTHROPIC_API_KEY is unset (so the
+    test environment and any deployment without the key still works).
+    """
+    if not settings.anthropic_api_key:
+        return (
+            f"Look at the {plant_part_name} of your {crop_name} plants. "
+            f"If you see {symptom_name}, tap Yes. If not, tap No."
+        )
+
+    try:
+        import anthropic
+
+        sub_clause = ""
+        if sub_part_name or sub_symptom_name:
+            extras = " ".join(filter(None, [sub_part_name, sub_symptom_name]))
+            sub_clause = f" Be specific to: {extras}."
+
+        language_instruction = (
+            f"Write in {language_name}." if language_code != "en"
+            else "Write in simple English."
+        )
+
+        prompt = f"""You are helping a farmer in India confirm a single symptom on their crop.
+
+Crop: {crop_name}
+Plant part: {plant_part_name}
+Symptom to verify: {symptom_name}{sub_clause}
+
+Write 2 short sentences:
+- Sentence 1: tell the farmer exactly what to look at on the {plant_part_name} and what "yes" looks like.
+- Sentence 2: a contrasting hint — what looks similar but is NOT this symptom, so they don't confuse it.
+
+Rules:
+- Plain language, Class 5 reading level. No Latin, no jargon.
+- Each sentence under 25 words.
+- {language_instruction}
+
+Output ONLY the 2 sentences, nothing else."""
+
+        client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        logger.error(f"Claude symptom explanation failed: {e}")
+        return (
+            f"Look at the {plant_part_name} of your {crop_name}. "
+            f"If you can clearly see {symptom_name}, tap Yes. If you are unsure, tap No."
+        )
+
+
 # ── Batch: enrich problem info with Claude description ─────────────────────────
 
 async def enrich_problem_with_description(

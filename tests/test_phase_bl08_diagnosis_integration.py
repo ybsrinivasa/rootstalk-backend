@@ -13,8 +13,9 @@ from fastapi import HTTPException
 from sqlalchemy import select
 
 from app.modules.farmpundit.diagnosis_router import (
-    AnswerRequest, DiagnosisSession, StartDiagnosisRequest,
-    answer_question, start_diagnosis,
+    AnswerRequest, DiagnosisSession, ExplainSymptomRequest,
+    StartDiagnosisRequest, answer_question, explain_symptom_route,
+    start_diagnosis,
 )
 from app.modules.sync.models import CoshReferenceCache
 from tests.conftest import requires_docker
@@ -277,6 +278,28 @@ async def test_priority_rank_demotes_problem_through_live_router(db):
     )
     assert out["status"] == "DIAGNOSED"
     assert out["diagnosed_problem_cosh_id"] == "problem:unranked"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_explain_symptom_returns_text_in_fallback_mode(db, monkeypatch):
+    """The ⓘ tooltip endpoint returns 2 sentences in test mode. We force the
+    Claude fallback by clearing the API key, so the test is hermetic — no
+    network, no key required."""
+    from app.config import settings
+    monkeypatch.setattr(settings, "anthropic_api_key", "")
+    farmer = await make_user(db)
+    out = await explain_symptom_route(
+        request=ExplainSymptomRequest(
+            crop_cosh_id="crop:tomato",
+            plant_part_cosh_id="part:leaf",
+            symptom_cosh_id="symptom:yellow",
+        ),
+        current_user=farmer,
+    )
+    assert out["language_code"] == "en"
+    assert "yellow" in out["explanation"].lower()
+    assert "leaf" in out["explanation"].lower() or "leaves" in out["explanation"].lower()
 
 
 @requires_docker
