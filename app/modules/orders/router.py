@@ -421,6 +421,18 @@ async def mark_item_available(
 ):
     """BL-07: Dealer selects brand and enters volume/price before marking available.
 
+    Brand discipline (BL-07 audit, 2026-05-05):
+      `brand_cosh_id` is REQUIRED and MUST refer to an active row in
+      `cosh_reference_cache` with entity_type='brand'. Free-text or
+      unknown identifiers are rejected with stable error codes
+      (BRAND_REQUIRED / BRAND_NOT_IN_SYSTEM) so downstream analytics —
+      brand comparisons, sale tracking, manufacturer reports, spelling
+      consistency — stay reliable. The dealer's typed `brand_name` is
+      ignored; the canonical English name from cosh translations is
+      stored on the row instead. If a real brand truly isn't in the
+      system, the dealer should use POST /dealer/missing-brand-reports
+      to flag it for the CM.
+
     Part-aware sibling handling (Build C):
       Same Part, different Option  -> mark sibling NOT_AVAILABLE (returned to farmer)
       Same Part, same Option       -> leave alone (compound AND group; dealer fills these)
@@ -429,10 +441,51 @@ async def mark_item_available(
     Falls back to flat OR-group closure if the relation_role is missing or malformed.
     """
     from app.services.relations import decode_role
+    from app.modules.sync.models import CoshReferenceCache
 
     item = await _get_order_item(db, item_id, order_id)
-    item.brand_cosh_id = data.get("brand_cosh_id")
-    item.brand_name = data.get("brand_name") or None
+
+    # ── BL-07 strict brand validation ─────────────────────────────────────
+    brand_cosh_id = (data.get("brand_cosh_id") or "").strip()
+    if not brand_cosh_id:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error_code": "BRAND_REQUIRED",
+                "message": (
+                    "brand_cosh_id is required. Pick a brand from the "
+                    "system list, or POST /dealer/missing-brand-reports "
+                    "if the brand isn't available."
+                ),
+            },
+        )
+
+    brand_row = (await db.execute(
+        select(CoshReferenceCache).where(
+            CoshReferenceCache.cosh_id == brand_cosh_id,
+            CoshReferenceCache.entity_type == "brand",
+            CoshReferenceCache.status == "active",
+        )
+    )).scalar_one_or_none()
+    if brand_row is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error_code": "BRAND_NOT_IN_SYSTEM",
+                "message": (
+                    f"Brand '{brand_cosh_id}' is not in the active system "
+                    "list. Pick a different brand, or POST /dealer/"
+                    "missing-brand-reports to flag it for the CM."
+                ),
+            },
+        )
+
+    # Canonicalise brand_name from cosh — dealer's typed value ignored so
+    # spellings are 100% consistent across the system.
+    canonical_name = (brand_row.translations or {}).get("en") or brand_cosh_id
+
+    item.brand_cosh_id = brand_cosh_id
+    item.brand_name = canonical_name
     if data.get("given_volume") is not None:
         item.given_volume = data["given_volume"]
         item.volume_unit = data.get("volume_unit", "")
