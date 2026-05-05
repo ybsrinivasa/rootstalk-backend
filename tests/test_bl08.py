@@ -234,3 +234,102 @@ def test_bl08_10_available_plant_parts():
     assert "LEAF" in parts
     assert "STEM" in parts
     assert len(set(parts)) == len(parts)  # No duplicates
+
+
+# ── TC-BL08-11: Priority Ranking — rank-1 YES keeps a 1-2-2 problem ───────────
+
+def test_bl08_11_priority_rank1_yes_keeps_problem():
+    """A YES on the rank-1 symptom of a 1-2-2 problem leaves it in the pool —
+    no demotion fires (top priority confirmed). An unranked sibling problem
+    that also has the symptom is unaffected."""
+    rows = [
+        # P1: ranks 1-2-2 (Spots top, others lower)
+        PSR("P1", "LEAF", "Spots", priority_rank=1),
+        PSR("P1", "LEAF", "Colour_Change", priority_rank=2),
+        PSR("P1", "STEM", "Lesions", priority_rank=2),
+        # P2: unranked (priority rule does not apply)
+        PSR("P2", "LEAF", "Spots"),
+    ]
+    answers = [DA("LEAF", "Spots", None, None, "YES")]
+    step = run_diagnosis_step(rows, initial_plant_part="LEAF", answers=answers, random_seed=42)
+    assert set(step.remaining_problem_ids) == {"P1", "P2"}
+
+
+# ── TC-BL08-12: Priority Ranking — rank-2 YES demotes a 1-2-2 problem ─────────
+
+def test_bl08_12_priority_rank2_yes_demotes_problem():
+    """YES on the rank-2 symptom of P1 (a 1-2-2 problem) permanently drops P1.
+    An unranked sibling problem with the same symptom is kept."""
+    rows = [
+        PSR("P1", "LEAF", "Spots", priority_rank=1),
+        PSR("P1", "LEAF", "Colour_Change", priority_rank=2),
+        PSR("P1", "STEM", "Lesions", priority_rank=2),
+        PSR("P_unranked", "LEAF", "Colour_Change"),
+    ]
+    answers = [DA("LEAF", "Colour_Change", None, None, "YES")]
+    step = run_diagnosis_step(rows, initial_plant_part="LEAF", answers=answers, random_seed=42)
+    assert step.status == "DIAGNOSED"
+    assert step.diagnosed_problem_cosh_id == "P_unranked"
+
+
+# ── TC-BL08-13: Priority demotion is permanent — later rank-1 YES doesn't undo ─
+
+def test_bl08_13_demotion_is_permanent():
+    """Once P1 is demoted by a rank-2 YES, a subsequent YES on its rank-1
+    symptom does NOT bring P1 back. The pool only narrows further."""
+    rows = [
+        PSR("P1", "LEAF", "Spots", priority_rank=1),
+        PSR("P1", "LEAF", "Colour_Change", priority_rank=2),
+        # P2 unranked, has both symptoms — survives both YESes.
+        PSR("P2", "LEAF", "Spots"),
+        PSR("P2", "LEAF", "Colour_Change"),
+    ]
+    answers = [
+        DA("LEAF", "Colour_Change", None, None, "YES"),  # demotes P1
+        DA("LEAF", "Spots", None, None, "YES"),          # P1 must stay out
+    ]
+    step = run_diagnosis_step(rows, initial_plant_part="LEAF", answers=answers, random_seed=42)
+    assert step.status == "DIAGNOSED"
+    assert step.diagnosed_problem_cosh_id == "P2"
+
+
+# ── TC-BL08-14: 1-2-2 ties — YES on either rank-1 keeps; YES on rank-2 demotes ─
+
+def test_bl08_14_priority_1_1_2_ties():
+    """A 1-1-2 problem: YES on either rank-1 row keeps it; YES on the rank-2
+    row demotes."""
+    rank_1_1_2 = [
+        PSR("P1", "LEAF", "Spots", priority_rank=1),
+        PSR("P1", "LEAF", "Colour_Change", priority_rank=1),
+        PSR("P1", "STEM", "Lesions", priority_rank=2),
+    ]
+    # YES on either rank-1 symptom → P1 still in pool
+    keep_step = run_diagnosis_step(
+        rank_1_1_2, initial_plant_part="LEAF",
+        answers=[DA("LEAF", "Colour_Change", None, None, "YES")],
+        random_seed=42,
+    )
+    assert "P1" in keep_step.remaining_problem_ids
+
+    # YES on the rank-2 symptom → P1 demoted; pool empty.
+    demote_step = run_diagnosis_step(
+        rank_1_1_2, initial_plant_part="LEAF",
+        answers=[DA("STEM", "Lesions", None, None, "YES")],
+        random_seed=42,
+    )
+    assert "P1" not in demote_step.remaining_problem_ids
+
+
+# ── TC-BL08-15: Single-symptom ranked problem — rank meaningless, no demotion ─
+
+def test_bl08_15_single_symptom_rank_does_not_demote():
+    """A problem with exactly one symptom row (whatever its rank) has no
+    'higher priority' alternative — a YES on that row never demotes."""
+    rows = [PSR("P1", "LEAF", "Spots", priority_rank=2)]
+    step = run_diagnosis_step(
+        rows, initial_plant_part="LEAF",
+        answers=[DA("LEAF", "Spots", None, None, "YES")],
+        random_seed=42,
+    )
+    assert step.status == "DIAGNOSED"
+    assert step.diagnosed_problem_cosh_id == "P1"

@@ -100,12 +100,14 @@ async def _load_problem_symptom_rows(
         m = r.metadata_ or {}
         if not m.get("problem_cosh_id") or not m.get("plant_part_cosh_id") or not m.get("symptom_cosh_id"):
             continue
+        raw_rank = m.get("priority_rank")
         rows.append(ProblemSymptomRow(
             problem_cosh_id=m["problem_cosh_id"],
             plant_part_cosh_id=m["plant_part_cosh_id"],
             symptom_cosh_id=m["symptom_cosh_id"],
             sub_part_cosh_id=m.get("sub_part_cosh_id"),
             sub_symptom_cosh_id=m.get("sub_symptom_cosh_id"),
+            priority_rank=raw_rank if isinstance(raw_rank, int) else None,
         ))
     return rows
 

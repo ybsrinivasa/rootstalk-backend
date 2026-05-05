@@ -209,6 +209,78 @@ async def test_answer_session_404_for_other_farmer(db):
 
 @requires_docker
 @pytest.mark.asyncio
+async def test_priority_rank_demotes_problem_through_live_router(db):
+    """End-to-end check that `priority_rank` in `cosh_reference_cache.metadata_`
+    is honoured by the live router. Two problems share LEAF+Colour_Change, but
+    one has it at rank 2 (with a rank-1 symptom elsewhere). YES on Colour_Change
+    must demote the ranked problem and diagnose the unranked one."""
+    farmer = await make_user(db)
+    sub = await _seed_subscription(db, farmer)
+
+    # Ranked problem: LEAF+Spots is rank 1, LEAF+Colour_Change is rank 2.
+    db.add(CoshReferenceCache(
+        cosh_id="pts:ranked-spots",
+        entity_type="problem_to_symptom",
+        status="active",
+        translations={},
+        metadata_={
+            "problem_cosh_id": "problem:ranked",
+            "plant_part_cosh_id": "part:leaf",
+            "symptom_cosh_id": "symptom:spots",
+            "crop_stage_cosh_id": STAGE,
+            "priority_rank": 1,
+        },
+    ))
+    db.add(CoshReferenceCache(
+        cosh_id="pts:ranked-colour",
+        entity_type="problem_to_symptom",
+        status="active",
+        translations={},
+        metadata_={
+            "problem_cosh_id": "problem:ranked",
+            "plant_part_cosh_id": "part:leaf",
+            "symptom_cosh_id": "symptom:colour",
+            "crop_stage_cosh_id": STAGE,
+            "priority_rank": 2,
+        },
+    ))
+    # Unranked sibling — only has Colour_Change.
+    db.add(CoshReferenceCache(
+        cosh_id="pts:unranked-colour",
+        entity_type="problem_to_symptom",
+        status="active",
+        translations={},
+        metadata_={
+            "problem_cosh_id": "problem:unranked",
+            "plant_part_cosh_id": "part:leaf",
+            "symptom_cosh_id": "symptom:colour",
+            "crop_stage_cosh_id": STAGE,
+        },
+    ))
+    await db.commit()
+
+    started = await start_diagnosis(
+        request=StartDiagnosisRequest(
+            subscription_id=sub.id, crop_cosh_id=CROP,
+            crop_stage_cosh_id=STAGE, plant_part_cosh_id="part:leaf",
+        ),
+        db=db, current_user=farmer,
+    )
+    out = await answer_question(
+        session_id=started["session_id"],
+        request=AnswerRequest(
+            plant_part_cosh_id="part:leaf",
+            symptom_cosh_id="symptom:colour",
+            answer="YES",
+        ),
+        db=db, current_user=farmer,
+    )
+    assert out["status"] == "DIAGNOSED"
+    assert out["diagnosed_problem_cosh_id"] == "problem:unranked"
+
+
+@requires_docker
+@pytest.mark.asyncio
 async def test_answer_rejects_invalid_value(db):
     farmer = await make_user(db)
     sub = await _seed_subscription(db, farmer)

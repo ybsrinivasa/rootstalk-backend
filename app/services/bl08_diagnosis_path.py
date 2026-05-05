@@ -20,6 +20,11 @@ class ProblemSymptomRow:
     symptom_cosh_id: str
     sub_part_cosh_id: Optional[str] = None
     sub_symptom_cosh_id: Optional[str] = None
+    # Optional rank of this symptom *within this problem* (1 = top priority).
+    # When ANY of a problem's rows have a rank set, a YES on a row whose rank
+    # is greater than the problem's minimum rank permanently demotes that
+    # problem (BL-08 Priority Ranking, Option A — audit 2026-05-05).
+    priority_rank: Optional[int] = None
 
 
 @dataclass
@@ -154,23 +159,58 @@ def _apply_answers(rows: list[ProblemSymptomRow], answers: list[DiagnosisAnswer]
          After filtering, the remaining active rows for that problem are ALL its rows (not just the matching one).
     NO: remove all rows matching (part, symptom, [sub_part], [sub_symptom]) from the active set.
         Problems with zero remaining rows are effectively eliminated.
+
+    Priority Ranking (Option A): on a YES, any problem whose matched row is
+    not at the problem's top rank is permanently demoted out of the pool —
+    even a later YES on its rank-1 row will not bring it back. Problems with
+    no ranked rows are unaffected by this rule.
     """
+    # Pre-compute each problem's top (minimum) rank from the unchanging
+    # master set. Absence from this dict ⇒ ranks not in play for that problem.
+    problem_min_rank: dict[str, int] = {}
+    for r in rows:
+        if r.priority_rank is None:
+            continue
+        existing = problem_min_rank.get(r.problem_cosh_id)
+        if existing is None or r.priority_rank < existing:
+            problem_min_rank[r.problem_cosh_id] = r.priority_rank
+
     active = list(rows)
+    demoted: set[str] = set()
 
     for answer in answers:
         if answer.answer == "YES":
-            # Find which problems HAVE this combination
             matching_problems = {
                 r.problem_cosh_id for r in active
                 if _row_matches(r, answer)
             }
-            # Keep only rows for problems that have the matching combination
             active = [r for r in active if r.problem_cosh_id in matching_problems]
 
+            for p in matching_problems:
+                if p in demoted or p not in problem_min_rank:
+                    continue
+                top = problem_min_rank[p]
+                # Best (lowest) rank among rows of p that match this answer,
+                # taken from the master set so demotion is independent of
+                # how many of p's rows are still in `active`.
+                matching_ranks = [
+                    r.priority_rank for r in rows
+                    if r.problem_cosh_id == p
+                    and r.priority_rank is not None
+                    and _row_matches(r, answer)
+                ]
+                # No ranked match (only unranked rows of a ranked problem
+                # matched this answer) ⇒ treat as below top priority.
+                if not matching_ranks or min(matching_ranks) > top:
+                    demoted.add(p)
+
+            if demoted:
+                active = [r for r in active if r.problem_cosh_id not in demoted]
+
         elif answer.answer == "NO":
-            # Remove all rows that match this combination
-            # Problems with no remaining rows are implicitly eliminated
             active = [r for r in active if not _row_matches(r, answer)]
+            if demoted:
+                active = [r for r in active if r.problem_cosh_id not in demoted]
 
     return active
 
