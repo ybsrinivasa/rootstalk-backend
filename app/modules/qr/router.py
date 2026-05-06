@@ -27,6 +27,30 @@ from app.modules.clients.models import Client
 from app.services.bl16_crop_record import (
     crop_record_public_url, public_record_payload,
 )
+from app.services.bl18_qr_dedup import (
+    DedupKey, DedupKeyError, dedup_key, is_spec_faithful,
+)
+from sqlalchemy.exc import IntegrityError
+import logging
+
+_logger = logging.getLogger(__name__)
+
+
+async def _find_qr_dupe(
+    db: AsyncSession, client_id: str, key: DedupKey,
+) -> Optional[ProductQRCode]:
+    """Run the dedup query implied by `key`. Single source of truth
+    used by both create_qr_code (single) and bulk_create_qr_codes
+    (CSV) — pre-audit the two paths had different inline queries
+    and silently disagreed on what counted as a duplicate."""
+    column = getattr(ProductQRCode, key.column_name)
+    return (await db.execute(
+        select(ProductQRCode).where(
+            ProductQRCode.client_id == client_id,
+            column == key.column_value,
+            ProductQRCode.batch_lot_number == key.batch_lot_number,
+        )
+    )).scalar_one_or_none()
 
 router = APIRouter(tags=["QR Codes"])
 
@@ -218,17 +242,25 @@ async def create_qr_code(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """BL-18: Duplicate check. Generate and store QR code record."""
+    """BL-18: Duplicate check. Generate and store QR code record.
+
+    BL-18 audit (2026-05-06): dedup-key derivation moved to the
+    bl18_qr_dedup service — same helper drives the bulk path so the
+    two writers can never disagree on what counts as a duplicate.
+    """
     _validate_dates(request.manufacture_date, request.expiry_date)
 
-    existing = (await db.execute(
-        select(ProductQRCode).where(
-            ProductQRCode.client_id == client_id,
-            ProductQRCode.brand_cosh_id == request.brand_cosh_id,
-            ProductQRCode.variety_id == request.variety_id,
-            ProductQRCode.batch_lot_number == request.batch_lot_number,
+    try:
+        key = dedup_key(
+            brand_cosh_id=request.brand_cosh_id,
+            variety_id=request.variety_id,
+            product_display_name=request.product_display_name,
+            batch_lot_number=request.batch_lot_number,
         )
-    )).scalar_one_or_none()
+    except DedupKeyError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    existing = await _find_qr_dupe(db, client_id, key)
     if existing:
         if existing.status == "ACTIVE":
             raise HTTPException(status_code=409,
@@ -318,13 +350,34 @@ async def bulk_create_qr_codes(
             failed += 1
             continue
 
-        existing = (await db.execute(
-            select(ProductQRCode).where(
-                ProductQRCode.client_id == client_id,
-                ProductQRCode.product_display_name == display_name,
-                ProductQRCode.batch_lot_number == batch_lot,
+        # BL-18 audit (2026-05-06): use the shared dedup-key helper.
+        # The CSV today has no brand_cosh_id / variety_id columns
+        # (V2 follow-up — see project_rootstalk_v2_ideas.md), so the
+        # helper falls back to (client, display_name, batch). Single
+        # path uses the same helper, so a bulk row with the same
+        # display_name + batch as a single-created row is now caught
+        # by this in-app check (cross-path dedup).
+        try:
+            key = dedup_key(
+                brand_cosh_id=None,
+                variety_id=None,
+                product_display_name=display_name,
+                batch_lot_number=batch_lot,
             )
-        )).scalar_one_or_none()
+        except DedupKeyError as exc:
+            results.append({"row": i, "status": "FAILED", "reason": str(exc), "display_name": display_name})
+            failed += 1
+            continue
+
+        if key.is_fallback:
+            _logger.warning(
+                "Bulk QR import row %d using display_name fallback "
+                "(no brand_cosh_id / variety_id from CSV) — V2 should "
+                "add those columns. row display_name=%r batch=%r",
+                i, display_name, batch_lot,
+            )
+
+        existing = await _find_qr_dupe(db, client_id, key)
         if existing:
             results.append({"row": i, "status": "DUPLICATE", "reason": "Batch already generated", "display_name": display_name})
             skipped_dup += 1
@@ -342,14 +395,27 @@ async def bulk_create_qr_codes(
             "mfr_date": mfr_date,
             "exp_date": exp_date,
         })
-        qr = ProductQRCode(
-            client_id=client_id, product_type=product_type,
-            product_display_name=display_name,
-            manufacture_date=mfr_date_iso, expiry_date=exp_date_iso,
-            batch_lot_number=batch_lot, qr_payload=payload,
-            created_by=current_user.id,
-        )
-        db.add(qr)
+        # BL-18 audit (2026-05-06): wrap each insert in a SAVEPOINT
+        # so an IntegrityError on one row (e.g. a race against a
+        # concurrent insert that the in-app check missed) marks just
+        # that row as DUPLICATE — pre-fix the whole bulk transaction
+        # rolled back and every valid sibling row was lost despite
+        # being reported as OK in the summary.
+        try:
+            async with db.begin_nested():
+                qr = ProductQRCode(
+                    client_id=client_id, product_type=product_type,
+                    product_display_name=display_name,
+                    manufacture_date=mfr_date_iso, expiry_date=exp_date_iso,
+                    batch_lot_number=batch_lot, qr_payload=payload,
+                    created_by=current_user.id,
+                )
+                db.add(qr)
+                await db.flush()
+        except IntegrityError:
+            results.append({"row": i, "status": "DUPLICATE", "reason": "Caught by unique constraint at insert", "display_name": display_name})
+            skipped_dup += 1
+            continue
         results.append({"row": i, "status": "OK", "display_name": display_name, "batch_lot": batch_lot})
         generated += 1
 
