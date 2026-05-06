@@ -14,13 +14,17 @@ from types import SimpleNamespace
 from app.modules.advisory.models import PackageStatus
 from app.services.crop_lifecycle import (
     cascade_inactivate_packages_for_crop,
+    derive_active_crop_set,
     restore_cascade_inactivated_packages,
 )
 
 
-def _pkg(status: PackageStatus, cascade_at=None) -> SimpleNamespace:
+def _pkg(status: PackageStatus, cascade_at=None, crop_cosh_id="crop:test") -> SimpleNamespace:
     """Stand-in for an ORM Package — only the fields the service touches."""
-    return SimpleNamespace(status=status, cascade_inactivated_at=cascade_at)
+    return SimpleNamespace(
+        status=status, cascade_inactivated_at=cascade_at,
+        crop_cosh_id=crop_cosh_id,
+    )
 
 
 # ── cascade_inactivate_packages_for_crop ─────────────────────────────────────
@@ -115,3 +119,36 @@ def test_restore_leaves_drafts_alone():
 
 def test_restore_empty_input_no_op():
     assert restore_cascade_inactivated_packages([]) == []
+
+
+# ── derive_active_crop_set (Batch 1D) ────────────────────────────────────────
+
+def test_derive_active_set_picks_only_active_packages():
+    """Spec: a crop is active iff at least one PoP under it is
+    ACTIVE. DRAFT and INACTIVE PoPs do not contribute."""
+    pkgs = [
+        _pkg(PackageStatus.ACTIVE, crop_cosh_id="crop:paddy"),
+        _pkg(PackageStatus.DRAFT, crop_cosh_id="crop:tomato"),
+        _pkg(PackageStatus.INACTIVE, crop_cosh_id="crop:coconut"),
+    ]
+    assert derive_active_crop_set(pkgs) == {"crop:paddy"}
+
+
+def test_derive_active_set_dedupes_when_multiple_pops_same_crop():
+    """Two ACTIVE PoPs for the same crop — set semantics handle it."""
+    pkgs = [
+        _pkg(PackageStatus.ACTIVE, crop_cosh_id="crop:paddy"),
+        _pkg(PackageStatus.ACTIVE, crop_cosh_id="crop:paddy"),
+    ]
+    assert derive_active_crop_set(pkgs) == {"crop:paddy"}
+
+
+def test_derive_active_set_empty_when_only_drafts():
+    """Crop with only a DRAFT PoP is not yet 'active' — there's no
+    live advisory delivery happening for any farmer."""
+    pkgs = [_pkg(PackageStatus.DRAFT, crop_cosh_id="crop:paddy")]
+    assert derive_active_crop_set(pkgs) == set()
+
+
+def test_derive_active_set_empty_input():
+    assert derive_active_crop_set([]) == set()

@@ -634,3 +634,116 @@ async def test_publish_package_succeeds_after_re_add(db):
         db=db, current_user=user,
     )
     assert out.status == PackageStatus.ACTIVE
+
+
+# ── Batch 1D: derived is_active on the list endpoint ────────────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_list_emits_is_active_true_when_active_pop_exists(db):
+    """Crop with an ACTIVE PoP surfaces as is_active=True; the
+    derived `status` string mirrors it for portal compat."""
+    client = await make_client(db)
+    user = await make_user(db, name="CA")
+    await _seed_paddy(db)
+    await add_crop(
+        client_id=client.id, request=CropCreate(crop_cosh_id="crop:paddy"),
+        db=db, current_user=user,
+    )
+    await _make_package(
+        db, client=client, crop_cosh_id="crop:paddy",
+        name="Live PoP", status=PackageStatus.ACTIVE,
+    )
+    await db.commit()
+
+    listed = await list_crops(client_id=client.id, db=db, current_user=user)
+    assert len(listed) == 1
+    assert listed[0].crop_cosh_id == "crop:paddy"
+    assert listed[0].is_active is True
+    assert listed[0].status == "ACTIVE"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_list_emits_is_active_false_when_only_draft(db):
+    """Crop with only DRAFT PoPs is on the belt but has no live
+    advisory — surfaces as inactive in the list."""
+    client = await make_client(db)
+    user = await make_user(db, name="CA")
+    await _seed_paddy(db)
+    await add_crop(
+        client_id=client.id, request=CropCreate(crop_cosh_id="crop:paddy"),
+        db=db, current_user=user,
+    )
+    await _make_package(
+        db, client=client, crop_cosh_id="crop:paddy",
+        name="WIP PoP", status=PackageStatus.DRAFT,
+    )
+    await db.commit()
+
+    listed = await list_crops(client_id=client.id, db=db, current_user=user)
+    assert listed[0].is_active is False
+    assert listed[0].status == "INACTIVE"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_list_emits_is_active_false_when_zero_pops(db):
+    """Crop just added by CA, no PoPs yet — inactive."""
+    client = await make_client(db)
+    user = await make_user(db, name="CA")
+    await _seed_paddy(db)
+    await add_crop(
+        client_id=client.id, request=CropCreate(crop_cosh_id="crop:paddy"),
+        db=db, current_user=user,
+    )
+    await db.commit()
+
+    listed = await list_crops(client_id=client.id, db=db, current_user=user)
+    assert listed[0].is_active is False
+    assert listed[0].status == "INACTIVE"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_add_returns_is_active_true_when_re_add_revives_active_pop(db):
+    """Re-add path: cascade-inactivated PoP gets revived to ACTIVE
+    by `restore_cascade_inactivated_packages`. The CropOut response
+    must reflect that, otherwise the portal shows the wrong chip."""
+    client = await make_client(db)
+    user = await make_user(db, name="CA")
+    await _seed_paddy(db)
+    crop = await add_crop(
+        client_id=client.id, request=CropCreate(crop_cosh_id="crop:paddy"),
+        db=db, current_user=user,
+    )
+    await _make_package(
+        db, client=client, crop_cosh_id="crop:paddy",
+        name="Revivable PoP", status=PackageStatus.ACTIVE,
+    )
+    await db.commit()
+    await remove_crop(client_id=client.id, crop_id=crop.id, db=db, current_user=user)
+
+    out = await add_crop(
+        client_id=client.id, request=CropCreate(crop_cosh_id="crop:paddy"),
+        db=db, current_user=user,
+    )
+    assert out.is_active is True
+    assert out.status == "ACTIVE"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_fresh_add_returns_is_active_false(db):
+    """Brand-new add — no PoPs exist yet, so is_active must be False."""
+    client = await make_client(db)
+    user = await make_user(db, name="CA")
+    await _seed_paddy(db)
+    await db.commit()
+
+    out = await add_crop(
+        client_id=client.id, request=CropCreate(crop_cosh_id="crop:paddy"),
+        db=db, current_user=user,
+    )
+    assert out.is_active is False
+    assert out.status == "INACTIVE"

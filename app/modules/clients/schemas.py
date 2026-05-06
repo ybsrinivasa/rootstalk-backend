@@ -146,7 +146,8 @@ class CropCreate(BaseModel):
 class CropOut(BaseModel):
     id: str
     crop_cosh_id: str
-    status: str
+    status: str  # derived: "ACTIVE" if any ACTIVE PoP exists, else "INACTIVE"
+    is_active: bool  # same signal as status, typed for the portal
     added_at: datetime
     removed_at: Optional[datetime] = None
     crop_name_en: Optional[str] = None

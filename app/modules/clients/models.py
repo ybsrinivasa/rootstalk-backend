@@ -138,10 +138,6 @@ class ClientCrop(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     client_id: Mapped[str] = mapped_column(String(36), ForeignKey("clients.id"), nullable=False)
     crop_cosh_id: Mapped[str] = mapped_column(String(100), nullable=False)
-    status: Mapped[StatusEnum] = mapped_column(
-        SAEnum(StatusEnum, native_enum=False, length=20),
-        default=StatusEnum.ACTIVE,
-    )
     added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     removed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
 

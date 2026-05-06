@@ -23,9 +23,10 @@ from app.modules.clients.service import (
     generate_token, send_onboarding_email, send_ca_credentials_email,
     get_client_by_token, create_ca_user
 )
-from app.modules.advisory.models import Package
+from app.modules.advisory.models import Package, PackageStatus
 from app.services.crop_lifecycle import (
     cascade_inactivate_packages_for_crop,
+    derive_active_crop_set,
     restore_cascade_inactivated_packages,
 )
 from app.services.crop_snapshot import (
@@ -460,19 +461,64 @@ async def remove_location(
 
 # ── Portal: Crops ──────────────────────────────────────────────────────────────
 
+def _crop_to_out(crop: ClientCrop, *, is_active: bool) -> CropOut:
+    """Build a CropOut from a ClientCrop row with the derived
+    active/inactive flag attached. `is_active` and `status` carry
+    the same signal — the latter is kept as a string for portals
+    that render a chip."""
+    return CropOut(
+        id=crop.id, crop_cosh_id=crop.crop_cosh_id,
+        status="ACTIVE" if is_active else "INACTIVE",
+        is_active=is_active,
+        added_at=crop.added_at, removed_at=crop.removed_at,
+        crop_name_en=crop.crop_name_en,
+        crop_scientific_name=crop.crop_scientific_name,
+        crop_area_or_plant=crop.crop_area_or_plant,
+    )
+
+
+async def _is_crop_active(
+    db: AsyncSession, *, client_id: str, crop_cosh_id: str,
+) -> bool:
+    """EXISTS check used after add/restore to compute is_active for
+    the response. Cheap; uses the (client_id, crop_cosh_id, status)
+    columns that already serve the publish-package query."""
+    row = (await db.execute(
+        select(Package.id).where(
+            Package.client_id == client_id,
+            Package.crop_cosh_id == crop_cosh_id,
+            Package.status == PackageStatus.ACTIVE,
+        ).limit(1)
+    )).first()
+    return row is not None
+
+
 @router.get("/client/{client_id}/crops", response_model=list[CropOut])
 async def list_crops(
     client_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    result = await db.execute(
+    """CCA Step 1 — SE/CM-facing list of crops on the company's
+    conveyor belt. `is_active` is derived from PoP existence: a
+    crop is ACTIVE iff at least one Package under it is ACTIVE
+    (Batch 1D)."""
+    crops = (await db.execute(
         select(ClientCrop).where(
             ClientCrop.client_id == client_id,
             ClientCrop.removed_at.is_(None),
         ).order_by(ClientCrop.added_at)
-    )
-    return result.scalars().all()
+    )).scalars().all()
+
+    packages = (await db.execute(
+        select(Package).where(Package.client_id == client_id)
+    )).scalars().all()
+    active_set = derive_active_crop_set(packages)
+
+    return [
+        _crop_to_out(cc, is_active=cc.crop_cosh_id in active_set)
+        for cc in crops
+    ]
 
 
 @router.post("/client/{client_id}/crops", response_model=CropOut, status_code=201)
@@ -527,7 +573,10 @@ async def add_crop(
         restore_cascade_inactivated_packages(packages)
         await db.commit()
         await db.refresh(existing)
-        return existing
+        is_active = await _is_crop_active(
+            db, client_id=client_id, crop_cosh_id=existing.crop_cosh_id,
+        )
+        return _crop_to_out(existing, is_active=is_active)
 
     crop = ClientCrop(
         client_id=client_id, crop_cosh_id=request.crop_cosh_id,
@@ -538,7 +587,10 @@ async def add_crop(
     db.add(crop)
     await db.commit()
     await db.refresh(crop)
-    return crop
+    is_active = await _is_crop_active(
+        db, client_id=client_id, crop_cosh_id=crop.crop_cosh_id,
+    )
+    return _crop_to_out(crop, is_active=is_active)
 
 
 @router.delete("/client/{client_id}/crops/{crop_id}", status_code=204)

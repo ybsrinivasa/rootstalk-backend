@@ -52,6 +52,20 @@ class CropNotOnBeltError(Exception):
         )
 
 
+def derive_active_crop_set(packages: Iterable[Package]) -> set[str]:
+    """Return the set of `crop_cosh_id`s that have at least one
+    ACTIVE Package in the input collection.
+
+    Spec rule (CCA Step 1, 2026-05-06): a crop's active/inactive
+    state is *derived* from its Packages. A crop is ACTIVE iff at
+    least one PoP under it is ACTIVE. DRAFT and INACTIVE PoPs do
+    not contribute. A crop with zero PoPs surfaces as inactive —
+    it's on the conveyor belt but no live advisory has been built
+    for it yet.
+    """
+    return {p.crop_cosh_id for p in packages if p.status == PackageStatus.ACTIVE}
+
+
 async def assert_crop_on_belt(
     db: AsyncSession, *, client_id: str, crop_cosh_id: str,
 ) -> None:
