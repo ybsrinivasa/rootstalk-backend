@@ -63,6 +63,10 @@ class User(Base):
     current_session_id: Mapped[str] = mapped_column(String(36), nullable=True)
     # 30-day grace deletion — set on confirm-delete, anonymised by daily Celery task
     deleted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    # FCM push-notification token. Updated by the PWA via
+    # POST /platform/fcm-token when the device registers.
+    # Single-device for V1; multi-device support deferred to V2.
+    fcm_token: Mapped[str] = mapped_column(Text, nullable=True)
 
     roles: Mapped[list["UserRole"]] = relationship("UserRole", back_populates="user")
 

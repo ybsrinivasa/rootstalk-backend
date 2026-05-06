@@ -23,6 +23,30 @@ async def list_languages(db: AsyncSession = Depends(get_db)):
     return result.scalars().all()
 
 
+@router.post("/platform/fcm-token")
+async def register_fcm_token(
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """PWA registers (or updates) the device's FCM push-notification
+    token for the authenticated user.
+
+    Single-device for V1 — the token replaces any previously
+    registered one. Multi-device support deferred to V2.
+
+    Body: `{"token": "<fcm-registration-token-from-firebase-messaging>"}`
+    Pass `{"token": null}` to clear (e.g. on logout).
+    """
+    raw = data.get("token")
+    if raw is not None and not isinstance(raw, str):
+        raise HTTPException(status_code=422, detail="token must be a string or null")
+    token = (raw or "").strip() or None
+    current_user.fcm_token = token
+    await db.commit()
+    return {"detail": "FCM token registered" if token else "FCM token cleared"}
+
+
 @router.put("/platform/languages/{code}/status", response_model=LanguageOut)
 async def toggle_language(
     code: str,
