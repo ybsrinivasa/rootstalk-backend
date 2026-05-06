@@ -1,0 +1,66 @@
+# RootsTalk testing-server Caddyfile.
+#
+# Install:
+#   sudo cp ~/apps/rootstalk-backend/scripts/ops/Caddyfile.testing /etc/caddy/Caddyfile
+#   sudo systemctl reload caddy
+#
+# Caddy auto-fetches Let's Encrypt certs (the existing *.eywa.farm
+# wildcard, if Caddy has DNS-API credentials; otherwise per-host
+# certs via HTTP-01 — works as long as ports 80/443 are open).
+#
+# Hostnames assume the four testing-server A records are in place:
+#   rstalk.eywa.farm        → SA admin
+#   rstalk-ca.eywa.farm     → CA portal
+#   rstalk-pwa.eywa.farm    → PWA
+#   rstalkapi.eywa.farm     → FastAPI
+#
+# Each block also writes an access log under /var/log/caddy/ with
+# 7-day retention (10 MiB roll, keep 7 files, max 168h).
+
+rstalkapi.eywa.farm {
+    encode gzip
+    reverse_proxy localhost:8001
+    log {
+        output file /var/log/caddy/rstalkapi-access.log {
+            roll_size 10MiB
+            roll_keep 7
+            roll_keep_for 168h
+        }
+    }
+}
+
+rstalk.eywa.farm {
+    encode gzip
+    reverse_proxy localhost:3002
+    log {
+        output file /var/log/caddy/rstalk-access.log {
+            roll_size 10MiB
+            roll_keep 7
+            roll_keep_for 168h
+        }
+    }
+}
+
+rstalk-ca.eywa.farm {
+    encode gzip
+    reverse_proxy localhost:3004
+    log {
+        output file /var/log/caddy/rstalk-ca-access.log {
+            roll_size 10MiB
+            roll_keep 7
+            roll_keep_for 168h
+        }
+    }
+}
+
+rstalk-pwa.eywa.farm {
+    encode gzip
+    reverse_proxy localhost:3003
+    log {
+        output file /var/log/caddy/rstalk-pwa-access.log {
+            roll_size 10MiB
+            roll_keep 7
+            roll_keep_for 168h
+        }
+    }
+}

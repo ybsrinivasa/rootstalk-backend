@@ -1,0 +1,14 @@
+[Unit]
+Description=RootsTalk Client Portal (Next.js)
+After=network.target
+
+[Service]
+Type=simple
+User=rootstalk
+WorkingDirectory=/home/rootstalk/apps/rootstalk-client-portal
+ExecStart=/usr/bin/npm run start -- -p 3004
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,14 @@
+[Unit]
+Description=RootsTalk SA Admin (Next.js)
+After=network.target
+
+[Service]
+Type=simple
+User=rootstalk
+WorkingDirectory=/home/rootstalk/apps/rootstalk-frontend
+ExecStart=/usr/bin/npm run start -- -p 3002
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

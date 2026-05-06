@@ -1,0 +1,16 @@
+[Unit]
+Description=RootsTalk FastAPI backend
+After=network.target postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=rootstalk
+WorkingDirectory=/home/rootstalk/apps/rootstalk-backend
+EnvironmentFile=/home/rootstalk/apps/rootstalk-backend/.env
+ExecStart=/home/rootstalk/apps/rootstalk-backend/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8001
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

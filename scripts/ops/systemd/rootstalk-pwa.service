@@ -1,0 +1,14 @@
+[Unit]
+Description=RootsTalk PWA (Next.js)
+After=network.target
+
+[Service]
+Type=simple
+User=rootstalk
+WorkingDirectory=/home/rootstalk/apps/rootstalk-pwa
+ExecStart=/usr/bin/npm run start -- -p 3003
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
