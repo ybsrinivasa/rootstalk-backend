@@ -1,5 +1,8 @@
 """BL-12b — Query Expiry Background Job (runs hourly).
 Closes all queries that have exceeded their 7-day window.
+Pushes an FCM notification to the farmer (if they have a token
+registered via the PWA) so they aren't left wondering whether
+the FarmPundit ever got back to them.
 """
 import asyncio
 import logging
@@ -11,8 +14,15 @@ from app.database import AsyncSessionLocal
 from app.modules.farmpundit.models import Query, QueryRemark, QueryStatus, QueryRemarkAction
 from app.modules.platform.models import User
 from app.modules.clients.models import Client, ClientUser, ClientUserRole
+from app.services.fcm_service import send_fcm
 
 logger = logging.getLogger(__name__)
+
+EXPIRY_FCM_TITLE = "Your query couldn't be answered in time"
+EXPIRY_FCM_BODY = (
+    "The 7-day window for your FarmPundit query has elapsed. The company "
+    "has been notified — please raise it again or ask another expert."
+)
 
 
 async def _expire_queries_with_session(db, now=None) -> int:
@@ -49,13 +59,29 @@ async def _expire_queries_with_session(db, now=None) -> int:
             remark="Auto-expired: 7-day resolution window elapsed.",
         ))
 
-        # Get farmer for FCM notification
+        # FCM Batch 3 (2026-05-06): notify farmer that their query
+        # auto-expired. Skipped silently if the farmer hasn't
+        # registered a token yet (most farmers in V1 until the PWA
+        # wires the registration call).
         farmer = (await db.execute(
             select(User).where(User.id == query.farmer_user_id)
         )).scalar_one_or_none()
-
-        # TODO: Send FCM to farmer when Firebase key is available
-        # FCM payload: "Your query could not be answered within 7 days. The company has been notified."
+        if farmer and farmer.fcm_token:
+            try:
+                await send_fcm(
+                    token=farmer.fcm_token,
+                    title=EXPIRY_FCM_TITLE,
+                    body=EXPIRY_FCM_BODY,
+                    data={
+                        "type": "QUERY_EXPIRED",
+                        "query_id": query.id,
+                        "subscription_id": query.subscription_id,
+                    },
+                )
+            except Exception as e:
+                # send_fcm catches its own errors and returns False;
+                # this guard is belt-and-braces.
+                logger.error(f"FCM send raised unexpectedly for farmer {farmer.id}: {e}")
         logger.info(f"Query {query.id} expired. Farmer: {farmer.phone if farmer else 'unknown'}")
 
         # Get CA email for notification

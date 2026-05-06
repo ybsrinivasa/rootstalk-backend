@@ -290,3 +290,96 @@ async def test_expiry_sweep_flips_past_due_query_to_expired(db):
     assert refreshed_past.current_holder_id is None
     assert refreshed_fresh.status == QueryStatus.NEW
     assert refreshed_fresh.current_holder_id == profile.id
+
+
+# ── FCM channel on expiry (Batch 3 wiring) ────────────────────────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_expiry_pushes_fcm_when_farmer_has_token(db, monkeypatch):
+    """When the hourly sweep auto-expires a farmer's query, a push
+    notification fires to the registered device with the spec'd
+    'couldn't be answered in time' copy. Data payload carries
+    type=QUERY_EXPIRED, query_id, subscription_id so the PWA can
+    deep-link the farmer back to the query screen."""
+    from app.tasks import query_expiry as expiry_task
+    sent: list[tuple[str, str, str, dict]] = []
+
+    async def fake_send_fcm(token, title, body, data=None):
+        sent.append((token, title, body, data or {}))
+        return True
+
+    monkeypatch.setattr(expiry_task, "send_fcm", fake_send_fcm)
+
+    farmer = await make_user(db, name="Farmer FCM Exp")
+    farmer.fcm_token = "farmer-token-abc"
+    client = await make_client(db)
+    package = await make_package(db, client)
+    sub = await make_subscription(db, farmer=farmer, client=client, package=package)
+    _, profile = await _make_pundit(db)
+    await _enrol(db, client_id=client.id, profile=profile, role=PunditRole.PRIMARY)
+    await db.commit()
+
+    past_due = Query(
+        farmer_user_id=farmer.id, subscription_id=sub.id, client_id=client.id,
+        title="My crop is yellowing", severity="MEDIUM", status=QueryStatus.NEW,
+        current_holder_id=profile.id,
+        expires_at=datetime.now(timezone.utc) - timedelta(hours=1),
+    )
+    db.add(past_due)
+    await db.commit()
+
+    await _expire_queries_with_session(db)
+
+    assert len(sent) == 1
+    token, title, body, data = sent[0]
+    assert token == "farmer-token-abc"
+    assert title == expiry_task.EXPIRY_FCM_TITLE
+    assert "7-day window" in body
+    assert data["type"] == "QUERY_EXPIRED"
+    assert data["query_id"] == past_due.id
+    assert data["subscription_id"] == sub.id
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_expiry_skips_fcm_when_farmer_has_no_token(db, monkeypatch):
+    """A farmer without an fcm_token registered (most V1 users
+    until the PWA wires registration) doesn't trigger a send_fcm
+    call — sweep proceeds, the Alert / QueryRemark is written,
+    but no push attempted."""
+    from app.tasks import query_expiry as expiry_task
+    sent: list = []
+
+    async def fake_send_fcm(*args, **kwargs):
+        sent.append((args, kwargs))
+        return True
+
+    monkeypatch.setattr(expiry_task, "send_fcm", fake_send_fcm)
+
+    farmer = await make_user(db, name="Farmer No Token")
+    # fcm_token defaults to None — leave unset.
+    client = await make_client(db)
+    package = await make_package(db, client)
+    sub = await make_subscription(db, farmer=farmer, client=client, package=package)
+    _, profile = await _make_pundit(db)
+    await _enrol(db, client_id=client.id, profile=profile, role=PunditRole.PRIMARY)
+    await db.commit()
+
+    past_due = Query(
+        farmer_user_id=farmer.id, subscription_id=sub.id, client_id=client.id,
+        title="Q", severity="LOW", status=QueryStatus.NEW,
+        current_holder_id=profile.id,
+        expires_at=datetime.now(timezone.utc) - timedelta(hours=1),
+    )
+    db.add(past_due)
+    await db.commit()
+
+    expired_count = await _expire_queries_with_session(db)
+    assert expired_count == 1
+    assert sent == []  # FCM never invoked
+    # Sweep still completed: query is EXPIRED.
+    refreshed = (await db.execute(
+        select(Query).where(Query.id == past_due.id)
+    )).scalar_one()
+    assert refreshed.status == QueryStatus.EXPIRED
