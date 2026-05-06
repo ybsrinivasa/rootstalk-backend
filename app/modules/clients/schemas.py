@@ -143,6 +143,23 @@ class CropCreate(BaseModel):
     crop_cosh_id: str
 
 
+class ClientBrandingOut(BaseModel):
+    """Public branding payload for the per-client login page.
+
+    Surfaced at GET /public/clients/{short_name}/branding so the CA
+    portal can render the right logo + tagline + colours BEFORE the
+    user has authenticated. Only ACTIVE clients are surfaced; non-
+    existent or non-ACTIVE short_names return 404 (avoids leaking
+    that pre-launch clients exist).
+    """
+    short_name: str
+    full_name: str
+    tagline: Optional[str] = None
+    logo_url: Optional[str] = None
+    primary_colour: Optional[str] = None
+    secondary_colour: Optional[str] = None
+
+
 class CropOut(BaseModel):
     id: str
     crop_cosh_id: str

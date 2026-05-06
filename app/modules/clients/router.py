@@ -16,7 +16,7 @@ from app.modules.clients.models import (
 from app.modules.clients.schemas import (
     ClientInitiate, ClientCASubmit, ClientReject, ClientEdit,
     ClientStatusUpdate, ClientOut, OnboardingLinkOut, CMAssignment, CMPrivilegeGrant,
-    LocationCreate, LocationOut, CropCreate, CropOut,
+    LocationCreate, LocationOut, CropCreate, CropOut, ClientBrandingOut,
     PortalUserCreate, PortalUserOut,
 )
 from app.modules.clients.service import (
@@ -67,6 +67,49 @@ def _base_url() -> str:
         "FRONTEND_BASE_URL is required in non-dev environments. "
         "The startup gate in app/main.py should have caught this — "
         "see that file for the env-var contract."
+    )
+
+
+# ── Public: per-client branding for the login page ───────────────────────────
+
+@router.get(
+    "/public/clients/{short_name}/branding",
+    response_model=ClientBrandingOut,
+)
+async def get_public_client_branding(
+    short_name: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Public — no auth required.
+
+    Returns the branding fields the CA portal needs to render its
+    per-client login page (`/login/<short_name>`) before the user
+    has authenticated. Only ACTIVE clients are exposed; any other
+    state (PENDING_REVIEW, INACTIVE, REJECTED) returns 404 to avoid
+    leaking the existence of pre-launch or wound-down clients.
+
+    Wired 2026-05-06 alongside the fix to `send_ca_credentials_email`
+    that now points the CA at `{frontend_base_url}/login/{short_name}`.
+    The frontend `app/login/[shortName]/page.tsx` (in
+    `rootstalk-client-portal`) consumes this endpoint to populate the
+    logo, tagline, and brand colours.
+    """
+    client = (await db.execute(
+        select(Client).where(
+            Client.short_name == short_name,
+            Client.status == ClientStatus.ACTIVE,
+        )
+    )).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    return ClientBrandingOut(
+        short_name=client.short_name,
+        full_name=client.full_name,
+        tagline=client.tagline,
+        logo_url=client.logo_url,
+        primary_colour=client.primary_colour,
+        secondary_colour=client.secondary_colour,
     )
 
 
@@ -274,8 +317,9 @@ async def approve_client(
     await db.refresh(client)
 
     if settings.email_smtp_user:
+        login_url = f"{_base_url()}/login/{client.short_name}"
         await send_ca_credentials_email(
-            client.ca_email, client.ca_name, client.short_name, plain_password
+            client.ca_email, client.ca_name, login_url, plain_password,
         )
 
     return client

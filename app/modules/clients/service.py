@@ -75,8 +75,17 @@ RootsTalk — Neytiri Eywafarm Agritech"""
     _send_email(client.ca_email, subject, html, plain)
 
 
-async def send_ca_credentials_email(ca_email: str, ca_name: str, short_name: str, password: str):
-    login_url = f"https://rootstalk.in/{short_name}"
+async def send_ca_credentials_email(
+    ca_email: str, ca_name: str, login_url: str, password: str,
+):
+    """Email the CA their post-approval credentials.
+
+    `login_url` is built by the caller (e.g. `f"{_base_url()}/login/{short_name}"`)
+    so the env-driven host always matches the deployment. Pre-fix this
+    function hardcoded `https://rootstalk.in/{short_name}` — that was
+    incorrect once `rootstalk.in` got earmarked for the PWA, and broke
+    on testing/dev environments anyway.
+    """
     subject = "Your RootsTalk Client Portal access"
     plain = f"""Hi {ca_name},
 
