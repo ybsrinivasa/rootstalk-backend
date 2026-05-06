@@ -31,6 +31,9 @@ from app.modules.clients.models import ClientUser, ClientUserRole
 from app.services.bl13_versioning import (
     compute_publish_version, validate_publish_transition,
 )
+from app.services.crop_lifecycle import (
+    CropNotOnBeltError, assert_crop_on_belt,
+)
 from app.services.bl17_timeline_boundary import (
     TimelineSpec, find_timeline_conflicts,
 )
@@ -73,6 +76,18 @@ async def create_package(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    # CCA Step 1 membership gate (Batch 1C): the crop must be on the
+    # company's conveyor belt before an expert can build a PoP for it.
+    try:
+        await assert_crop_on_belt(
+            db, client_id=client_id, crop_cosh_id=request.crop_cosh_id,
+        )
+    except CropNotOnBeltError as e:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": e.code, "message": str(e)},
+        )
+
     # Package type lock: duration fixed for PERENNIAL
     duration = 365 if request.package_type == PackageType.PERENNIAL else (request.duration_days or 180)
 
@@ -133,6 +148,22 @@ async def publish_package(
     publish for a default-version-1 row.
     """
     pkg = await _get_package(db, package_id, client_id)
+
+    # CCA Step 1 membership gate (Batch 1C): publish requires the
+    # crop to be currently on the conveyor belt. Cascade-inactivated
+    # PoPs (CA soft-removed the crop) are auto-revived to ACTIVE on
+    # re-add, so this guard is the only path that prevents a publish
+    # of a draft whose crop has since been removed.
+    try:
+        await assert_crop_on_belt(
+            db, client_id=client_id, crop_cosh_id=pkg.crop_cosh_id,
+        )
+    except CropNotOnBeltError as e:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": e.code, "message": str(e)},
+        )
+
     current_status = pkg.status.value if hasattr(pkg.status, "value") else str(pkg.status)
     res = validate_publish_transition(current_status)
     if not res.allowed:

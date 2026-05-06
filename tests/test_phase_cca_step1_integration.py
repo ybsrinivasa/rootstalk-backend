@@ -481,3 +481,156 @@ async def test_re_add_refreshes_snapshot_from_current_cosh(db):
     )
     assert out.id == crop.id
     assert out.crop_scientific_name == "Foeniculum vulgare"
+
+
+# ── Batch 1C: PoP create/publish membership gate ─────────────────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_create_package_succeeds_when_crop_on_belt(db):
+    """Happy path — CA has added the crop, expert can build a PoP."""
+    from app.modules.advisory.router import create_package
+    from app.modules.advisory.schemas import PackageCreate as PkgCreate
+
+    client = await make_client(db)
+    user = await make_user(db, name="Expert")
+    await _seed_paddy(db)
+    await add_crop(
+        client_id=client.id, request=CropCreate(crop_cosh_id="crop:paddy"),
+        db=db, current_user=user,
+    )
+
+    out = await create_package(
+        client_id=client.id,
+        request=PkgCreate(
+            crop_cosh_id="crop:paddy", name="Paddy Kharif PoP",
+            package_type=PackageType.ANNUAL, duration_days=120,
+        ),
+        db=db, current_user=user,
+    )
+    assert out.crop_cosh_id == "crop:paddy"
+    assert out.status == PackageStatus.DRAFT
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_create_package_422_when_crop_never_added(db):
+    """Spec rule: experts can only build PoPs for crops the CA has
+    placed on the belt. With no ClientCrop row at all, create must
+    fail with the stable code so the portal can surface the
+    'ask the CA to add this crop' message."""
+    from app.modules.advisory.router import create_package
+    from app.modules.advisory.schemas import PackageCreate as PkgCreate
+
+    client = await make_client(db)
+    user = await make_user(db, name="Expert")
+    await db.commit()
+
+    with pytest.raises(HTTPException) as ei:
+        await create_package(
+            client_id=client.id,
+            request=PkgCreate(
+                crop_cosh_id="crop:never_added", name="Phantom PoP",
+                package_type=PackageType.ANNUAL, duration_days=120,
+            ),
+            db=db, current_user=user,
+        )
+    assert ei.value.status_code == 422
+    assert ei.value.detail["code"] == "crop_not_on_belt"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_create_package_422_when_crop_soft_removed(db):
+    """The crop was on the belt, then the CA removed it. Until they
+    re-add, no expert can build a new PoP — the gate fires identically
+    to the never-added case."""
+    from app.modules.advisory.router import create_package
+    from app.modules.advisory.schemas import PackageCreate as PkgCreate
+
+    client = await make_client(db)
+    user = await make_user(db, name="Expert")
+    await _seed_paddy(db)
+    crop = await add_crop(
+        client_id=client.id, request=CropCreate(crop_cosh_id="crop:paddy"),
+        db=db, current_user=user,
+    )
+    await remove_crop(client_id=client.id, crop_id=crop.id, db=db, current_user=user)
+
+    with pytest.raises(HTTPException) as ei:
+        await create_package(
+            client_id=client.id,
+            request=PkgCreate(
+                crop_cosh_id="crop:paddy", name="Late PoP",
+                package_type=PackageType.ANNUAL, duration_days=120,
+            ),
+            db=db, current_user=user,
+        )
+    assert ei.value.status_code == 422
+    assert ei.value.detail["code"] == "crop_not_on_belt"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_publish_package_422_when_crop_soft_removed_after_draft(db):
+    """Critical case: a DRAFT PoP exists, the CA soft-removes the
+    crop (DRAFTs are NOT cascade-flagged per Batch 1A), then the
+    expert tries to publish. Without the gate, the publish would
+    silently succeed despite the crop being off the belt. The gate
+    blocks it; the CA must re-add the crop first."""
+    from app.modules.advisory.router import publish_package
+
+    client = await make_client(db)
+    user = await make_user(db, name="Expert")
+    await _seed_paddy(db)
+    crop = await add_crop(
+        client_id=client.id, request=CropCreate(crop_cosh_id="crop:paddy"),
+        db=db, current_user=user,
+    )
+    pkg = await _make_package(
+        db, client=client, crop_cosh_id="crop:paddy",
+        name="Draft PoP", status=PackageStatus.DRAFT,
+    )
+    await db.commit()
+    await remove_crop(client_id=client.id, crop_id=crop.id, db=db, current_user=user)
+
+    with pytest.raises(HTTPException) as ei:
+        await publish_package(
+            client_id=client.id, package_id=pkg.id,
+            db=db, current_user=user,
+        )
+    assert ei.value.status_code == 422
+    assert ei.value.detail["code"] == "crop_not_on_belt"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_publish_package_succeeds_after_re_add(db):
+    """The recovery path — re-adding the crop unblocks the publish
+    that the gate had blocked. Confirms the gate is reversible by
+    the legitimate CA action and not a one-way trap door."""
+    from app.modules.advisory.router import publish_package
+
+    client = await make_client(db)
+    user = await make_user(db, name="Expert")
+    await _seed_paddy(db)
+    crop = await add_crop(
+        client_id=client.id, request=CropCreate(crop_cosh_id="crop:paddy"),
+        db=db, current_user=user,
+    )
+    pkg = await _make_package(
+        db, client=client, crop_cosh_id="crop:paddy",
+        name="Reviving PoP", status=PackageStatus.DRAFT,
+    )
+    await db.commit()
+    await remove_crop(client_id=client.id, crop_id=crop.id, db=db, current_user=user)
+    await add_crop(
+        client_id=client.id, request=CropCreate(crop_cosh_id="crop:paddy"),
+        db=db, current_user=user,
+    )
+
+    out = await publish_package(
+        client_id=client.id, package_id=pkg.id,
+        db=db, current_user=user,
+    )
+    assert out.status == PackageStatus.ACTIVE

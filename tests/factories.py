@@ -23,7 +23,7 @@ from app.modules.advisory.models import (
     SPElement, SPPractice, SPRecommendation, SPTimeline, Timeline,
     TimelineFromType, Variable,
 )
-from app.modules.clients.models import Client
+from app.modules.clients.models import Client, ClientCrop
 from app.modules.platform.models import User
 from app.modules.subscriptions.models import (
     Subscription, SubscriptionStatus, SubscriptionType,
@@ -93,9 +93,29 @@ async def make_client(db: AsyncSession, **kw) -> Client:
 
 
 async def make_package(db: AsyncSession, client: Client, **kw) -> Package:
+    """Create a Package row.
+
+    Batch 1C invariant: every Package in production has a matching
+    ACTIVE ClientCrop row (the crop must be on the company's
+    conveyor belt). The factory mirrors that invariant by
+    idempotently inserting the ClientCrop row before the Package.
+    Tests that exercise the soft-removed-crop edge case bypass this
+    factory and seed Package rows directly.
+    """
+    crop_cosh_id = kw.get("crop_cosh_id", "crop:test")
+    existing_cc = (await db.execute(
+        select(ClientCrop).where(
+            ClientCrop.client_id == client.id,
+            ClientCrop.crop_cosh_id == crop_cosh_id,
+        )
+    )).scalar_one_or_none()
+    if existing_cc is None:
+        db.add(ClientCrop(client_id=client.id, crop_cosh_id=crop_cosh_id))
+        await db.flush()
+
     p = Package(
         client_id=client.id,
-        crop_cosh_id=kw.get("crop_cosh_id", "crop:test"),
+        crop_cosh_id=crop_cosh_id,
         name=kw.get("name", "Test PoP"),
         package_type=PackageType.ANNUAL,
         duration_days=120,
