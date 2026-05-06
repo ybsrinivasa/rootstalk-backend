@@ -105,7 +105,10 @@ class ClientUser(Base):
     client_id: Mapped[str] = mapped_column(String(36), ForeignKey("clients.id"), nullable=False)
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
     role: Mapped[ClientUserRole] = mapped_column(SAEnum(ClientUserRole), nullable=False)
-    status: Mapped[StatusEnum] = mapped_column(SAEnum(StatusEnum), default=StatusEnum.ACTIVE)
+    status: Mapped[StatusEnum] = mapped_column(
+        SAEnum(StatusEnum, native_enum=False, length=20),
+        default=StatusEnum.ACTIVE,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     client: Mapped["Client"] = relationship("Client", back_populates="client_users")
@@ -120,7 +123,10 @@ class ClientLocation(Base):
     client_id: Mapped[str] = mapped_column(String(36), ForeignKey("clients.id"), nullable=False)
     state_cosh_id: Mapped[str] = mapped_column(String(100), nullable=False)
     district_cosh_id: Mapped[str] = mapped_column(String(100), nullable=False)
-    status: Mapped[StatusEnum] = mapped_column(SAEnum(StatusEnum), default=StatusEnum.ACTIVE)
+    status: Mapped[StatusEnum] = mapped_column(
+        SAEnum(StatusEnum, native_enum=False, length=20),
+        default=StatusEnum.ACTIVE,
+    )
     added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     client: Mapped["Client"] = relationship("Client", back_populates="locations")
@@ -132,7 +138,10 @@ class ClientCrop(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     client_id: Mapped[str] = mapped_column(String(36), ForeignKey("clients.id"), nullable=False)
     crop_cosh_id: Mapped[str] = mapped_column(String(100), nullable=False)
-    status: Mapped[StatusEnum] = mapped_column(SAEnum(StatusEnum), default=StatusEnum.ACTIVE)
+    status: Mapped[StatusEnum] = mapped_column(
+        SAEnum(StatusEnum, native_enum=False, length=20),
+        default=StatusEnum.ACTIVE,
+    )
     added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     client: Mapped["Client"] = relationship("Client", back_populates="crops")
@@ -157,7 +166,10 @@ class CMClientAssignment(Base):
     cm_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
     client_id: Mapped[str] = mapped_column(String(36), ForeignKey("clients.id"), nullable=False)
     rights: Mapped[CMRights] = mapped_column(SAEnum(CMRights), default=CMRights.EDIT)
-    status: Mapped[StatusEnum] = mapped_column(SAEnum(StatusEnum), default=StatusEnum.ACTIVE)
+    status: Mapped[StatusEnum] = mapped_column(
+        SAEnum(StatusEnum, native_enum=False, length=20),
+        default=StatusEnum.ACTIVE,
+    )
     assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     __table_args__ = (UniqueConstraint("cm_user_id", "client_id"),)
