@@ -33,8 +33,12 @@ def _require_sa(current_user: User):
 
 
 def _base_url() -> str:
+    """Public base URL for CA-facing links (onboarding magic link, post-
+    approval portal URL). The `rootstalk-client-portal` Next.js app
+    serves these routes — defaults to port 3004 locally, the actual
+    rootstalk.in domain in production."""
     if settings.environment == "development":
-        return "http://localhost:3000"
+        return "http://localhost:3004"
     return "https://rootstalk.in"
 
 
