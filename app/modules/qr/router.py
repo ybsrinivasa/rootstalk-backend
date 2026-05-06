@@ -13,18 +13,33 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
 from reportlab.pdfgen import canvas as pdf_canvas
 
+from app.config import settings
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.modules.platform.models import User
 from app.modules.qr.models import ManufacturerBrandPortfolio, ProductQRCode, QRScan
 from app.modules.orders.models import OrderItem, OrderItemStatus
 from app.modules.sync.models import CoshReferenceCache
-from app.modules.subscriptions.models import Subscription
+from app.modules.subscriptions.models import (
+    FarmerSubscriptionHistory, Subscription,
+)
 from app.modules.clients.models import Client
+from app.services.bl16_crop_record import (
+    crop_record_public_url, public_record_payload,
+)
 
 router = APIRouter(tags=["QR Codes"])
 
-PUBLIC_DOMAIN = "https://coshdev.eywa.farm"   # replaced with env var in production
+
+def _public_base_url() -> str:
+    """Env-aware public base URL. Mirrors the `_base_url()` pattern
+    in `clients/router.py`. Spec calls for `rootstalk.in` in prod;
+    dev returns the local PWA host so QR codes printed in dev
+    decode to a working URL on the developer's machine."""
+    if settings.environment == "development":
+        return "http://localhost:3000"
+    return "https://rootstalk.in"
+
 
 PRODUCT_TYPE_SIZES = {"SMALL": 2.0, "MEDIUM": 3.5, "LARGE": 5.0}
 
@@ -579,7 +594,10 @@ async def get_crop_history_qr(
     if not sub.reference_number:
         raise HTTPException(status_code=400, detail="Subscription has no reference number yet")
 
-    public_url = f"{PUBLIC_DOMAIN}/crop/{sub.reference_number}"
+    # BL-16 audit (2026-05-06): URL composition lifted into the
+    # bl16_crop_record service. Pre-fix the path was `/crop/...` and
+    # the domain was hardcoded to a non-prod, non-spec value.
+    public_url = crop_record_public_url(_public_base_url(), sub.reference_number)
 
     qr = qrcode.QRCode(version=1, box_size=8, border=4)
     qr.add_data(public_url)
@@ -592,12 +610,24 @@ async def get_crop_history_qr(
                     headers={"Content-Disposition": f'inline; filename="crop-{sub.reference_number}.png"'})
 
 
-@router.get("/public/crop/{reference_number}")
+@router.get("/public/crop-record/{reference_number}")
 async def get_crop_public_page(
     reference_number: str,
     db: AsyncSession = Depends(get_db),
 ):
-    """PUBLIC — no auth. Returns crop record data for the traceability web page."""
+    """PUBLIC — no auth. Returns crop record data for the
+    traceability web page reached by scanning the QR.
+
+    BL-16 audit (2026-05-06): route path moved from `/public/crop/`
+    to `/public/crop-record/` to match the spec URL the QR encodes;
+    response trimmed to the spec-permitted fields via
+    `public_record_payload` (privacy: pre-fix the route leaked
+    farmer_district + farmer_state + package_name + subscription_date
+    + status on this unauthenticated URL); reads
+    `parameter_variable_summary` from FarmerSubscriptionHistory
+    (column exists but is currently never written by the backend —
+    deferred follow-up; field will be null until that writer lands).
+    """
     sub = (await db.execute(
         select(Subscription).where(Subscription.reference_number == reference_number)
     )).scalar_one_or_none()
@@ -610,19 +640,21 @@ async def get_crop_public_page(
     from app.modules.advisory.models import Package
     package = (await db.execute(select(Package).where(Package.id == sub.package_id))).scalar_one_or_none()
 
-    return {
-        "reference_number": sub.reference_number,
-        "farmer_name": farmer.name if farmer else None,
-        "farmer_district": farmer.district_cosh_id if farmer else None,
-        "farmer_state": farmer.state_cosh_id if farmer else None,
-        "company_name": client.full_name if client else None,
-        "company_display_name": client.display_name if client else None,
-        "crop_cosh_id": package.crop_cosh_id if package else None,
-        "package_name": package.name if package else None,
-        "subscription_date": sub.subscription_date,
-        "crop_start_date": sub.crop_start_date,
-        "status": sub.status,
-    }
+    history = (await db.execute(
+        select(FarmerSubscriptionHistory).where(
+            FarmerSubscriptionHistory.subscription_id == sub.id,
+        )
+    )).scalar_one_or_none()
+
+    return public_record_payload(
+        reference_number=sub.reference_number,
+        farmer_name=farmer.name if farmer else None,
+        crop_cosh_id=package.crop_cosh_id if package else None,
+        company_display_name=client.display_name if client else None,
+        company_full_name=client.full_name if client else None,
+        crop_start_date=sub.crop_start_date,
+        parameter_variable_summary=history.parameter_variable_summary if history else None,
+    )
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
