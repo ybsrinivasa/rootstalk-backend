@@ -75,6 +75,67 @@ RootsTalk — Neytiri Eywafarm Agritech"""
     _send_email(client.ca_email, subject, html, plain)
 
 
+CLIENT_USER_ROLE_DISPLAY = {
+    "SUBJECT_EXPERT": "Subject Expert",
+    "FIELD_MANAGER": "Field Manager",
+    "SEED_DATA_MANAGER": "Seed Data Manager",
+    "REPORT_USER": "Report User",
+    "CLIENT_RM": "Client RM",
+    "PRODUCT_MANAGER": "Product Manager",
+    "CA": "CA",
+}
+
+
+def humanize_client_user_role(role_value: str) -> str:
+    """Friendly label for emails. Falls back to the raw enum value if a
+    new role is added to the enum without updating this map — ugly but
+    not broken."""
+    return CLIENT_USER_ROLE_DISPLAY.get(role_value, role_value)
+
+
+async def send_portal_user_welcome_email(
+    *, email: str, name: str | None, company_name: str,
+    login_url: str, password: str, role_value: str,
+):
+    """Email a newly-created portal user their initial credentials.
+
+    Sent automatically by `add_portal_user` when the CA creates a
+    Subject Expert / Field Manager / SDM / Report User / Client RM /
+    Product Manager. The login URL is the per-client branded route
+    (`{frontend_base_url}/login/{short_name}`) so the user lands on
+    their company's branded sign-in page (commit 556113b wires the
+    backend; frontend `[shortName]` route is a follow-up).
+    """
+    role_display = humanize_client_user_role(role_value)
+    subject = f"Your RootsTalk access — {company_name}"
+    plain = f"""Hi {name or ''},
+
+You have been added to {company_name} on RootsTalk as a {role_display}.
+
+Login URL: {login_url}
+Email: {email}
+Password: {password}
+Role: {role_display}
+
+Please change your password after first login.
+
+RootsTalk — Neytiri Eywafarm Agritech"""
+    html = f"""
+<body style="font-family:sans-serif;padding:32px">
+  <h2>Welcome to RootsTalk</h2>
+  <p>Hi {name or ''},</p>
+  <p>You have been added to <strong>{company_name}</strong> on RootsTalk as a <strong>{role_display}</strong>.</p>
+  <table style="background:#f8fafc;border-radius:8px;padding:16px;margin:16px 0">
+    <tr><td><strong>Login URL:</strong></td><td><a href="{login_url}">{login_url}</a></td></tr>
+    <tr><td><strong>Email:</strong></td><td>{email}</td></tr>
+    <tr><td><strong>Password:</strong></td><td>{password}</td></tr>
+    <tr><td><strong>Role:</strong></td><td>{role_display}</td></tr>
+  </table>
+  <p style="color:#666;font-size:12px">Please change your password after first login.</p>
+</body>"""
+    _send_email(email, subject, html, plain)
+
+
 async def send_ca_credentials_email(
     ca_email: str, ca_name: str, login_url: str, password: str,
 ):

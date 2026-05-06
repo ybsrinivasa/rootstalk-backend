@@ -21,6 +21,7 @@ from app.modules.clients.schemas import (
 )
 from app.modules.clients.service import (
     generate_token, send_onboarding_email, send_ca_credentials_email,
+    send_portal_user_welcome_email,
     get_client_by_token, create_ca_user
 )
 from app.modules.advisory.models import Package, PackageStatus
@@ -731,10 +732,33 @@ async def add_portal_user(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """CA creates a portal user (Subject Expert / Field Manager / SDM
+    / Report User / Client RM / Product Manager) for their org.
+
+    Welcome email (Batch CA-Welcome, 2026-05-06): when a fresh User
+    row is created, the new user automatically receives an email
+    with their login URL, email, password, and role. The login URL
+    is the per-client branded `{frontend_base_url}/login/{short_name}`.
+
+    Existing-user case (the email already belongs to a User created
+    via another client/role): the password the CA typed is silently
+    ignored by the model layer (we don't overwrite an existing
+    password_hash here), so emailing the new password would mislead
+    the recipient. That cross-client invite flow is a separate
+    concern — no welcome email is sent on this path.
+    """
     from app.modules.auth.service import hash_password
+
+    client = (await db.execute(
+        select(Client).where(Client.id == client_id)
+    )).scalar_one_or_none()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+
     existing_user = (await db.execute(
         select(User).where(User.email == request.email)
     )).scalar_one_or_none()
+    is_new_user = existing_user is None
 
     if existing_user:
         user = existing_user
@@ -767,6 +791,17 @@ async def add_portal_user(
     db.add(cu)
     await db.commit()
     await db.refresh(cu)
+
+    if is_new_user and settings.email_smtp_user:
+        login_url = f"{_base_url()}/login/{client.short_name}"
+        await send_portal_user_welcome_email(
+            email=user.email,
+            name=user.name,
+            company_name=client.full_name,
+            login_url=login_url,
+            password=request.password,
+            role_value=cu.role.value,
+        )
 
     return PortalUserOut(
         id=user.id,
