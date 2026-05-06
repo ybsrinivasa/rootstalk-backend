@@ -46,6 +46,7 @@ class UserOut(BaseModel):
     roles: List[RoleOut] = []
     portal_role: Optional[str] = None
     pwa_roles: List[str] = []
+    is_sa: bool = False  # True iff email matches settings.sa_email
 
     class Config:
         from_attributes = True

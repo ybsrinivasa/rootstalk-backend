@@ -370,6 +370,7 @@ async def get_me(current_user: User = Depends(get_current_user), db: AsyncSessio
         "roles": current_user.roles,
         "portal_role": cu.role.value if cu else None,
         "pwa_roles": pwa_roles,
+        "is_sa": bool(current_user.email and current_user.email == settings.sa_email),
     }
 
 
