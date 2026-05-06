@@ -145,6 +145,10 @@ class ClientCrop(Base):
     added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     removed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    crop_name_en: Mapped[str] = mapped_column(Text, nullable=True)
+    crop_scientific_name: Mapped[str] = mapped_column(Text, nullable=True)
+    crop_area_or_plant: Mapped[str] = mapped_column(String(20), nullable=True)
+
     client: Mapped["Client"] = relationship("Client", back_populates="crops")
 
     __table_args__ = (UniqueConstraint("client_id", "crop_cosh_id"),)

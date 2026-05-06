@@ -28,6 +28,9 @@ from app.services.crop_lifecycle import (
     cascade_inactivate_packages_for_crop,
     restore_cascade_inactivated_packages,
 )
+from app.services.crop_snapshot import (
+    CropSnapshotError, fetch_snapshot,
+)
 
 router = APIRouter(tags=["Clients"])
 
@@ -486,6 +489,12 @@ async def add_crop(
     timestamp and restores every Package that was cascade-inactivated
     by the prior removal. Packages inactivated for other reasons stay
     inactive.
+
+    Snapshot (Batch 1B): on every add — fresh and re-add — the
+    crop's English name, scientific name, and area/plant typing are
+    captured from `CoshReferenceCache` + `CropMeasure`. Either
+    source missing or inactive → 422 with a stable error code so
+    the CA portal can surface the right escalation path.
     """
     existing = (await db.execute(
         select(ClientCrop).where(
@@ -496,8 +505,19 @@ async def add_crop(
     if existing is not None and existing.removed_at is None:
         raise HTTPException(status_code=409, detail="This crop is already added")
 
+    try:
+        snapshot = await fetch_snapshot(db, request.crop_cosh_id)
+    except CropSnapshotError as e:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": e.code, "message": e.message},
+        )
+
     if existing is not None:
         existing.removed_at = None
+        existing.crop_name_en = snapshot.name_en
+        existing.crop_scientific_name = snapshot.scientific_name
+        existing.crop_area_or_plant = snapshot.area_or_plant
         packages = (await db.execute(
             select(Package).where(
                 Package.client_id == client_id,
@@ -509,7 +529,12 @@ async def add_crop(
         await db.refresh(existing)
         return existing
 
-    crop = ClientCrop(client_id=client_id, crop_cosh_id=request.crop_cosh_id)
+    crop = ClientCrop(
+        client_id=client_id, crop_cosh_id=request.crop_cosh_id,
+        crop_name_en=snapshot.name_en,
+        crop_scientific_name=snapshot.scientific_name,
+        crop_area_or_plant=snapshot.area_or_plant,
+    )
     db.add(crop)
     await db.commit()
     await db.refresh(crop)

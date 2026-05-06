@@ -27,8 +27,20 @@ from app.modules.clients.schemas import CropCreate
 from app.modules.subscriptions.models import (
     Subscription, SubscriptionStatus, SubscriptionType,
 )
+from app.modules.sync.models import CoshReferenceCache, CropMeasure
 from tests.conftest import requires_docker
-from tests.factories import make_client, make_user
+from tests.factories import make_client, make_crop_reference, make_user
+
+
+async def _seed_paddy(db):
+    await make_crop_reference(db, "crop:paddy", name="Paddy",
+                              scientific_name="Oryza sativa", measure="AREA_WISE")
+
+
+async def _seed_tomato(db):
+    await make_crop_reference(db, "crop:tomato", name="Tomato",
+                              scientific_name="Solanum lycopersicum",
+                              measure="AREA_WISE")
 
 
 async def _make_package(
@@ -51,6 +63,7 @@ async def _make_package(
 async def test_add_crop_creates_row(db):
     client = await make_client(db)
     user = await make_user(db, name="CA")
+    await _seed_paddy(db)
     await db.commit()
 
     out = await add_crop(
@@ -68,6 +81,7 @@ async def test_add_duplicate_active_crop_409s(db):
     first is rejected. Prevents accidental double-rows on the belt."""
     client = await make_client(db)
     user = await make_user(db, name="CA")
+    await _seed_paddy(db)
     await db.commit()
 
     await add_crop(
@@ -88,6 +102,8 @@ async def test_list_crops_filters_removed(db):
     """Only on-the-belt crops appear in the SE/CM CCA list."""
     client = await make_client(db)
     user = await make_user(db, name="CA")
+    await _seed_paddy(db)
+    await _seed_tomato(db)
     await db.commit()
 
     crop_a = await add_crop(
@@ -117,6 +133,7 @@ async def test_remove_crop_soft_deletes_row(db):
     a future re-add can find and revive it."""
     client = await make_client(db)
     user = await make_user(db, name="CA")
+    await _seed_paddy(db)
     await db.commit()
 
     crop = await add_crop(
@@ -138,6 +155,7 @@ async def test_remove_crop_cascade_inactivates_active_pop(db):
     INACTIVE with the cascade timestamp set."""
     client = await make_client(db)
     user = await make_user(db, name="CA")
+    await _seed_paddy(db)
     crop_row = await add_crop(
         client_id=client.id, request=CropCreate(crop_cosh_id="crop:paddy"),
         db=db, current_user=user,
@@ -165,6 +183,7 @@ async def test_remove_crop_leaves_draft_alone(db):
     Spec says DRAFTs stay DRAFT in both directions."""
     client = await make_client(db)
     user = await make_user(db, name="CA")
+    await _seed_paddy(db)
     crop_row = await add_crop(
         client_id=client.id, request=CropCreate(crop_cosh_id="crop:paddy"),
         db=db, current_user=user,
@@ -192,6 +211,7 @@ async def test_remove_crop_does_not_claim_independent_inactive(db):
     Important — otherwise re-add would silently republish it."""
     client = await make_client(db)
     user = await make_user(db, name="CA")
+    await _seed_paddy(db)
     crop_row = await add_crop(
         client_id=client.id, request=CropCreate(crop_cosh_id="crop:paddy"),
         db=db, current_user=user,
@@ -220,6 +240,7 @@ async def test_remove_crop_preserves_existing_subscription(db):
     client = await make_client(db)
     user = await make_user(db, name="CA")
     farmer = await make_user(db, name="Farmer Sub")
+    await _seed_paddy(db)
     crop_row = await add_crop(
         client_id=client.id, request=CropCreate(crop_cosh_id="crop:paddy"),
         db=db, current_user=user,
@@ -251,6 +272,7 @@ async def test_remove_already_removed_404s(db):
     re-removable — the next legitimate operation on it is re-add."""
     client = await make_client(db)
     user = await make_user(db, name="CA")
+    await _seed_paddy(db)
     crop_row = await add_crop(
         client_id=client.id, request=CropCreate(crop_cosh_id="crop:paddy"),
         db=db, current_user=user,
@@ -274,6 +296,7 @@ async def test_re_add_revives_cascade_inactivated_pop(db):
     without the experts having to rebuild anything."""
     client = await make_client(db)
     user = await make_user(db, name="CA")
+    await _seed_paddy(db)
     crop_row = await add_crop(
         client_id=client.id, request=CropCreate(crop_cosh_id="crop:paddy"),
         db=db, current_user=user,
@@ -306,6 +329,7 @@ async def test_re_add_does_not_revive_independent_inactive(db):
     a PoP. Only PoPs we ourselves cascade-inactivated come back."""
     client = await make_client(db)
     user = await make_user(db, name="CA")
+    await _seed_paddy(db)
     crop_row = await add_crop(
         client_id=client.id, request=CropCreate(crop_cosh_id="crop:paddy"),
         db=db, current_user=user,
@@ -327,3 +351,133 @@ async def test_re_add_does_not_revive_independent_inactive(db):
     )).scalar_one()
     assert refreshed.status == PackageStatus.INACTIVE
     assert refreshed.cascade_inactivated_at is None
+
+
+# ── Batch 1B: snapshot fields ────────────────────────────────────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_add_crop_populates_snapshot_fields(db):
+    """Snapshot rule: at CA-add time, crop_name_en /
+    crop_scientific_name / crop_area_or_plant are captured from
+    Cosh + CropMeasure so the company's CCA configuration is frozen
+    against future Cosh-side drift."""
+    client = await make_client(db)
+    user = await make_user(db, name="CA")
+    await make_crop_reference(
+        db, "crop:coconut",
+        name="Coconut", scientific_name="Cocos nucifera",
+        measure="PLANT_WISE",
+    )
+    await db.commit()
+
+    out = await add_crop(
+        client_id=client.id, request=CropCreate(crop_cosh_id="crop:coconut"),
+        db=db, current_user=user,
+    )
+    assert out.crop_name_en == "Coconut"
+    assert out.crop_scientific_name == "Cocos nucifera"
+    assert out.crop_area_or_plant == "PLANT_WISE"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_add_crop_422_when_cosh_entity_missing(db):
+    """If SA hasn't synced the crop into the reference cache, the
+    CA add fails with a stable error code that the portal can map
+    to an SA-escalation message."""
+    client = await make_client(db)
+    user = await make_user(db, name="CA")
+    await db.commit()
+
+    with pytest.raises(HTTPException) as ei:
+        await add_crop(
+            client_id=client.id,
+            request=CropCreate(crop_cosh_id="crop:never_synced"),
+            db=db, current_user=user,
+        )
+    assert ei.value.status_code == 422
+    assert ei.value.detail["code"] == "crop_not_in_cosh"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_add_crop_422_when_measure_missing(db):
+    """Cosh entity exists but no CropMeasure row — SA must seed the
+    area/plant typing first. Fail closed; never default."""
+    client = await make_client(db)
+    user = await make_user(db, name="CA")
+    db.add(CoshReferenceCache(
+        cosh_id="crop:no_measure", entity_type="crop", status="active",
+        translations={"en": "MysteryCrop"},
+    ))
+    await db.commit()
+
+    with pytest.raises(HTTPException) as ei:
+        await add_crop(
+            client_id=client.id,
+            request=CropCreate(crop_cosh_id="crop:no_measure"),
+            db=db, current_user=user,
+        )
+    assert ei.value.status_code == 422
+    assert ei.value.detail["code"] == "crop_missing_measure"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_add_crop_422_when_cosh_inactive(db):
+    """Inactive Cosh entity must not be addable — same rule the
+    spec has for inactive global PG imports (§ 8.8)."""
+    client = await make_client(db)
+    user = await make_user(db, name="CA")
+    await make_crop_reference(
+        db, "crop:retired", name="Retired", measure="AREA_WISE",
+        status="inactive",
+    )
+    await db.commit()
+
+    with pytest.raises(HTTPException) as ei:
+        await add_crop(
+            client_id=client.id,
+            request=CropCreate(crop_cosh_id="crop:retired"),
+            db=db, current_user=user,
+        )
+    assert ei.value.status_code == 422
+    assert ei.value.detail["code"] == "crop_inactive_in_cosh"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_re_add_refreshes_snapshot_from_current_cosh(db):
+    """User's explicit decision (2026-05-06): on re-add after a
+    soft-removal, the snapshot is re-taken fresh from current Cosh
+    state — not preserved from the original add. So if SA fixes a
+    scientific name in Cosh while the crop was off the belt, the
+    re-add picks up the corrected value."""
+    client = await make_client(db)
+    user = await make_user(db, name="CA")
+    cosh_row, _ = await make_crop_reference(
+        db, "crop:fennel",
+        name="Fennel", scientific_name="OldName",
+        measure="AREA_WISE",
+    )
+    await db.commit()
+
+    await add_crop(
+        client_id=client.id, request=CropCreate(crop_cosh_id="crop:fennel"),
+        db=db, current_user=user,
+    )
+    crop = (await db.execute(
+        select(ClientCrop).where(ClientCrop.client_id == client.id)
+    )).scalar_one()
+    await remove_crop(client_id=client.id, crop_id=crop.id, db=db, current_user=user)
+
+    cosh_row.metadata_ = {"scientific_name": "Foeniculum vulgare"}
+    await db.commit()
+
+    out = await add_crop(
+        client_id=client.id, request=CropCreate(crop_cosh_id="crop:fennel"),
+        db=db, current_user=user,
+    )
+    assert out.id == crop.id
+    assert out.crop_scientific_name == "Foeniculum vulgare"

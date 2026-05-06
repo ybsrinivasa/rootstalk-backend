@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import uuid
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.advisory.models import (
@@ -27,6 +28,7 @@ from app.modules.platform.models import User
 from app.modules.subscriptions.models import (
     Subscription, SubscriptionStatus, SubscriptionType,
 )
+from app.modules.sync.models import CoshReferenceCache, CropMeasure
 
 
 def _short(prefix: str) -> str:
@@ -38,6 +40,43 @@ async def make_user(db: AsyncSession, **kw) -> User:
     db.add(u)
     await db.flush()
     return u
+
+
+async def make_crop_reference(
+    db: AsyncSession, cosh_id: str, *,
+    name: str = "Paddy", scientific_name: str | None = "Oryza sativa",
+    measure: str = "AREA_WISE", status: str = "active",
+) -> tuple[CoshReferenceCache, CropMeasure]:
+    """Seed a Cosh crop entity + its system-level area/plant mapping.
+
+    Required when a test exercises CCA Step 1 add_crop, since add_crop
+    refuses to create a ClientCrop unless these reference rows exist
+    (CropSnapshot 422 path). Idempotent: re-seeding the same cosh_id
+    is a no-op.
+    """
+    existing_ref = (await db.execute(
+        select(CoshReferenceCache).where(
+            CoshReferenceCache.cosh_id == cosh_id,
+            CoshReferenceCache.entity_type == "crop",
+        )
+    )).scalar_one_or_none()
+    if existing_ref is None:
+        existing_ref = CoshReferenceCache(
+            cosh_id=cosh_id, entity_type="crop", status=status,
+            translations={"en": name},
+            metadata_={"scientific_name": scientific_name} if scientific_name else None,
+        )
+        db.add(existing_ref)
+
+    existing_measure = (await db.execute(
+        select(CropMeasure).where(CropMeasure.crop_cosh_id == cosh_id)
+    )).scalar_one_or_none()
+    if existing_measure is None:
+        existing_measure = CropMeasure(crop_cosh_id=cosh_id, measure=measure)
+        db.add(existing_measure)
+
+    await db.flush()
+    return existing_ref, existing_measure
 
 
 async def make_client(db: AsyncSession, **kw) -> Client:

@@ -149,6 +149,9 @@ class CropOut(BaseModel):
     status: str
     added_at: datetime
     removed_at: Optional[datetime] = None
+    crop_name_en: Optional[str] = None
+    crop_scientific_name: Optional[str] = None
+    crop_area_or_plant: Optional[str] = None
 
     class Config:
         from_attributes = True
