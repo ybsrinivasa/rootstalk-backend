@@ -160,3 +160,20 @@ async def test_public_page_returns_404_for_unknown_reference(db):
             reference_number="PA-26-999999", db=db,
         )
     assert exc.value.status_code == 404
+
+
+# ── Legacy alias /public/crop/{ref} → 301 → /public/crop-record/{ref} ────────
+
+@pytest.mark.asyncio
+async def test_legacy_alias_redirects_with_301():
+    """Anything still calling the old `/public/crop/{ref}` path (PWA
+    frontend code that hasn't shipped the BL-16 fix yet, a printed
+    QR generated against a pre-audit build) gets a 301 redirect to
+    the new spec path. Forwards the reference_number unchanged."""
+    from app.modules.qr.router import get_crop_public_page_legacy_alias
+
+    response = await get_crop_public_page_legacy_alias(
+        reference_number="PA-26-000147",
+    )
+    assert response.status_code == 301
+    assert response.headers["location"] == "/public/crop-record/PA-26-000147"

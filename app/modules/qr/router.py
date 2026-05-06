@@ -5,7 +5,7 @@ import qrcode
 from datetime import datetime, timezone, date
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile, File
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -654,6 +654,22 @@ async def get_crop_public_page(
         company_full_name=client.full_name if client else None,
         crop_start_date=sub.crop_start_date,
         parameter_variable_summary=history.parameter_variable_summary if history else None,
+    )
+
+
+@router.get("/public/crop/{reference_number}", include_in_schema=False)
+async def get_crop_public_page_legacy_alias(reference_number: str):
+    """Legacy alias for the BL-16 audit (2026-05-06). The public route
+    moved from `/public/crop/{ref}` to `/public/crop-record/{ref}` to
+    match the spec URL the QR now encodes. Anything still calling the
+    old path (PWA frontend code that hasn't been updated, a printed
+    QR generated against a previous build) gets a 301 redirect to the
+    new path. Hidden from OpenAPI schema since it's a deprecation
+    bridge, not a documented surface.
+    """
+    return RedirectResponse(
+        url=f"/public/crop-record/{reference_number}",
+        status_code=301,
     )
 
 
