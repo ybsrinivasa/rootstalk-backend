@@ -15,8 +15,49 @@ from app.modules.farmpundit.models import (
     StandardResponse, QueryStatus, QueryRemarkAction,
 )
 from app.services.bl12_query_routing import route_query, ExpertSlot
+from app.services.bl12_query_state import (
+    PANEL as BL12_PANEL, PRIMARY as BL12_PRIMARY,
+    can_reject as bl12_can_reject,
+    validate_transition as validate_query_transition,
+)
+from app.modules.subscriptions.models import Subscription
 
 router = APIRouter(tags=["FarmPundit"])
+
+
+def _raise_query_transition(res, status_code: int = 400) -> None:
+    """Convert a TransitionResult.allowed=False into an HTTPException
+    carrying the stable error_code in the detail payload."""
+    raise HTTPException(
+        status_code=status_code,
+        detail={"error_code": res.error_code, "message": res.message},
+    )
+
+
+async def _holder_role(
+    db: AsyncSession, profile: FarmPunditProfile, query: Query,
+) -> str:
+    """Return the holder's role on this query's client, as the BL-12
+    state-machine vocabulary expects ('PRIMARY' | 'PANEL'). Raises 403
+    if the pundit isn't holding the query at all."""
+    if query.current_holder_id != profile.id:
+        raise HTTPException(
+            status_code=403,
+            detail="You are not the current holder of this query.",
+        )
+    holder_slot = (await db.execute(
+        select(ClientFarmPundit).where(
+            ClientFarmPundit.client_id == query.client_id,
+            ClientFarmPundit.pundit_id == profile.id,
+        )
+    )).scalar_one_or_none()
+    if not holder_slot:
+        raise HTTPException(
+            status_code=403,
+            detail="You are not enrolled with this company.",
+        )
+    role = holder_slot.role.value if hasattr(holder_slot.role, "value") else str(holder_slot.role)
+    return BL12_PRIMARY if role == "PRIMARY" else BL12_PANEL
 
 QUERY_EXPIRE_DAYS = 7
 FREE_QUERIES_PER_COMPANY = 6
@@ -314,9 +355,19 @@ async def respond_to_query(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Any expert holding query can respond. Closes query everywhere simultaneously."""
+    """Any expert holding query can respond. Closes query everywhere simultaneously.
+
+    BL-12 audit (2026-05-06): added holder check (pre-fix any pundit
+    could respond to any query by guessing the URL) and a transition
+    guard so a stale request can't re-respond to an already-closed
+    query.
+    """
     profile = await _get_pundit_profile(db, current_user.id)
     query = await _get_query(db, query_id)
+    role = await _holder_role(db, profile, query)
+    res = validate_query_transition(query.status, QueryStatus.RESPONDED.value, role)
+    if not res.allowed:
+        _raise_query_transition(res)
 
     if not any([data.get("text"), data.get("problem_cosh_id"), data.get("standard_response_id")]):
         raise HTTPException(status_code=422, detail="At least one response element required")
@@ -360,22 +411,37 @@ async def forward_query(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Primary Expert forwards to another expert. Panel Experts cannot forward. Mandatory remarks."""
+    """Primary Expert forwards to another expert. Panel Experts cannot forward. Mandatory remarks.
+
+    BL-12 audit (2026-05-06): holder check + transition guard via
+    validate_transition (PRIMARY-only edges into FORWARDED). The
+    PANEL-cannot-forward rule is now enforced via the table's
+    role-set rather than an inline `if`. Chained forwards (already
+    in FORWARDED, just rotating holder) short-circuit the transition
+    check since the status doesn't change.
+    """
     if not data.get("to_pundit_id") or not data.get("remarks"):
         raise HTTPException(status_code=422, detail="to_pundit_id and remarks are mandatory")
 
     profile = await _get_pundit_profile(db, current_user.id)
     query = await _get_query(db, query_id)
+    role = await _holder_role(db, profile, query)
 
-    # BL-12 TC-BL12-04: Panel Experts cannot forward
-    holder_slot = (await db.execute(
-        select(ClientFarmPundit).where(
-            ClientFarmPundit.client_id == query.client_id,
-            ClientFarmPundit.pundit_id == profile.id,
+    # Chained forwards (status already FORWARDED) just rotate the
+    # holder; only the table-validated transitions need the guard.
+    if query.status != QueryStatus.FORWARDED:
+        res = validate_query_transition(query.status, QueryStatus.FORWARDED.value, role)
+        if not res.allowed:
+            _raise_query_transition(res)
+    elif role != BL12_PRIMARY:
+        # PANEL chained forward — also blocked. Use the same error_code.
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_code": "ROLE_NOT_ALLOWED",
+                "message": "Panel Experts cannot forward queries. You can only Respond or Return.",
+            },
         )
-    )).scalar_one_or_none()
-    if holder_slot and holder_slot.role == PunditRole.PANEL:
-        raise HTTPException(status_code=403, detail="Panel Experts cannot forward queries. You can only Respond or Return.")
 
     db.add(QueryRemark(
         query_id=query_id,
@@ -398,12 +464,19 @@ async def return_query(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Recipient returns query to sender. Mandatory remarks."""
+    """Recipient returns query to sender. Mandatory remarks.
+
+    BL-12 audit (2026-05-06): added holder check + transition guard.
+    """
     if not data.get("remarks"):
         raise HTTPException(status_code=422, detail="Remarks are mandatory when returning")
 
     profile = await _get_pundit_profile(db, current_user.id)
     query = await _get_query(db, query_id)
+    role = await _holder_role(db, profile, query)
+    res = validate_query_transition(query.status, QueryStatus.RETURNED.value, role)
+    if not res.allowed:
+        _raise_query_transition(res)
 
     # Find original sender
     remarks = (await db.execute(
@@ -434,12 +507,23 @@ async def reject_query(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Primary Expert only. Mandatory comments."""
+    """Primary Expert only. Mandatory comments.
+
+    BL-12 audit (2026-05-06): the docstring already said 'Primary
+    Expert only' but the rule wasn't enforced — a PANEL pundit could
+    reject. Now caught by validate_transition (PRIMARY-only role on
+    every edge into REJECTED). Holder check also added — pre-fix any
+    pundit could reject any query by guessing the URL.
+    """
     if not data.get("remarks"):
         raise HTTPException(status_code=422, detail="Remarks are mandatory when rejecting")
 
     profile = await _get_pundit_profile(db, current_user.id)
     query = await _get_query(db, query_id)
+    role = await _holder_role(db, profile, query)
+    res = validate_query_transition(query.status, QueryStatus.REJECTED.value, role)
+    if not res.allowed:
+        _raise_query_transition(res)
 
     db.add(QueryRemark(query_id=query_id, pundit_id=profile.id,
                        action=QueryRemarkAction.REJECTED, remark=data["remarks"]))
@@ -781,10 +865,24 @@ async def set_pundit_preference(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Farmer sets their preferred FarmPundit for this subscription."""
+    """Farmer sets their preferred FarmPundit for this subscription.
+
+    BL-12 audit (2026-05-06): added subscription ownership check.
+    Pre-fix any farmer could set preferences on any subscription by
+    guessing the ID — same family of bug as BL-08 / BL-10.
+    """
     pundit_id = data.get("pundit_id")
     if not pundit_id:
         raise HTTPException(status_code=422, detail="pundit_id required")
+
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
 
     existing = (await db.execute(
         select(FarmPunditPreference).where(FarmPunditPreference.subscription_id == subscription_id)
@@ -808,7 +906,20 @@ async def clear_pundit_preference(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Farmer reverts to default expert routing for this subscription."""
+    """Farmer reverts to default expert routing for this subscription.
+
+    BL-12 audit (2026-05-06): subscription ownership check added,
+    matching set_pundit_preference.
+    """
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
     pref = (await db.execute(
         select(FarmPunditPreference).where(FarmPunditPreference.subscription_id == subscription_id)
     )).scalar_one_or_none()
