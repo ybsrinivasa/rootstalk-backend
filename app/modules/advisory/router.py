@@ -28,8 +28,20 @@ from app.modules.advisory.models import (
     SPRecommendation, SPTimeline, SPPractice, SPElement,
 )
 from app.modules.clients.models import ClientUser, ClientUserRole
+from app.services.bl13_versioning import (
+    compute_publish_version, validate_publish_transition,
+)
 
 router = APIRouter(tags=["Advisory"])
+
+
+def _raise_publish_transition(res, status_code: int = 400) -> None:
+    """Convert a TransitionResult.allowed=False into an HTTPException
+    carrying the stable error_code in the detail payload."""
+    raise HTTPException(
+        status_code=status_code,
+        detail={"error_code": res.error_code, "message": res.message},
+    )
 
 
 def _require_client_role(current_user: User, client_id: str, *roles: ClientUserRole):
@@ -109,8 +121,19 @@ async def publish_package(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """BL-13: Versioning lifecycle — publish creates new version, previous ACTIVE → INACTIVE."""
+    """BL-13: Versioning lifecycle — publish creates new version, previous ACTIVE → INACTIVE.
+
+    BL-13 audit (2026-05-06): version arithmetic moved to
+    compute_publish_version. First publish (published_at IS NULL)
+    lands at v=1; subsequent publishes increment from current.
+    Pre-fix the unconditional `version + 1` produced v=2 on first
+    publish for a default-version-1 row.
+    """
     pkg = await _get_package(db, package_id, client_id)
+    current_status = pkg.status.value if hasattr(pkg.status, "value") else str(pkg.status)
+    res = validate_publish_transition(current_status)
+    if not res.allowed:
+        _raise_publish_transition(res)
 
     # Inactivate current ACTIVE version for same crop in same client
     existing_active = (await db.execute(
@@ -124,8 +147,10 @@ async def publish_package(
     for active in existing_active:
         active.status = PackageStatus.INACTIVE
 
+    pkg.version = compute_publish_version(
+        current_version=pkg.version, was_published=pkg.published_at is not None,
+    )
     pkg.status = PackageStatus.ACTIVE
-    pkg.version = pkg.version + 1
     pkg.published_at = datetime.now(timezone.utc)
     pkg.published_by = current_user.id
     await db.commit()
@@ -743,8 +768,14 @@ async def publish_global_package(
     pkg = result.scalar_one_or_none()
     if not pkg:
         raise HTTPException(status_code=404, detail="Global package not found")
+    current_status = pkg.status.value if hasattr(pkg.status, "value") else str(pkg.status)
+    res = validate_publish_transition(current_status)
+    if not res.allowed:
+        _raise_publish_transition(res)
+    pkg.version = compute_publish_version(
+        current_version=pkg.version, was_published=pkg.published_at is not None,
+    )
     pkg.status = PackageStatus.ACTIVE
-    pkg.version = pkg.version + 1
     pkg.published_at = datetime.now(timezone.utc)
     pkg.published_by = current_user.id
     await db.commit()
@@ -1050,6 +1081,9 @@ async def publish_global_pg(
     )).scalar_one_or_none()
     if not pg:
         raise HTTPException(status_code=404, detail="PG recommendation not found")
+    res = validate_publish_transition(pg.status)
+    if not res.allowed:
+        _raise_publish_transition(res)
 
     # Deactivate previous active version for same problem_group + client
     prev = (await db.execute(
@@ -1063,8 +1097,14 @@ async def publish_global_pg(
     for p in prev:
         p.status = "INACTIVE"
 
+    # PGRecommendation has no published_at; "first publish" is signalled
+    # by status=DRAFT. Once status moves to ACTIVE / INACTIVE, the row
+    # has been published at least once, so subsequent publishes
+    # increment normally.
+    pg.version = compute_publish_version(
+        current_version=pg.version, was_published=pg.status != "DRAFT",
+    )
     pg.status = "ACTIVE"
-    pg.version = pg.version + 1
     await db.commit()
     await db.refresh(pg)
     return pg
@@ -1186,6 +1226,9 @@ async def publish_client_pg(
     )).scalar_one_or_none()
     if not pg:
         raise HTTPException(status_code=404, detail="PG recommendation not found")
+    res = validate_publish_transition(pg.status)
+    if not res.allowed:
+        _raise_publish_transition(res)
 
     prev = (await db.execute(
         select(PGRecommendation).where(
@@ -1198,8 +1241,10 @@ async def publish_client_pg(
     for p in prev:
         p.status = "INACTIVE"
 
+    pg.version = compute_publish_version(
+        current_version=pg.version, was_published=pg.status != "DRAFT",
+    )
     pg.status = "ACTIVE"
-    pg.version = pg.version + 1
     await db.commit()
     await db.refresh(pg)
     return pg
@@ -1422,6 +1467,9 @@ async def publish_sp(
     )).scalar_one_or_none()
     if not sp:
         raise HTTPException(status_code=404, detail="SP recommendation not found")
+    res = validate_publish_transition(sp.status)
+    if not res.allowed:
+        _raise_publish_transition(res)
 
     prev = (await db.execute(
         select(SPRecommendation).where(
@@ -1434,8 +1482,10 @@ async def publish_sp(
     for p in prev:
         p.status = "INACTIVE"
 
+    sp.version = compute_publish_version(
+        current_version=sp.version, was_published=sp.status != "DRAFT",
+    )
     sp.status = "ACTIVE"
-    sp.version = sp.version + 1
     await db.commit()
     await db.refresh(sp)
     return sp
