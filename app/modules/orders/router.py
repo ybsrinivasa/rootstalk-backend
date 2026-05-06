@@ -344,8 +344,10 @@ async def list_purchased_items(
     If crop_start_date is not set on the subscription yet, both dates are null
     and the frontend should prompt the farmer to set it.
     """
-    from app.modules.advisory.models import Timeline, Practice as AdvPractice, TimelineFromType
-    from datetime import timedelta
+    from app.modules.advisory.models import Timeline, Practice as AdvPractice
+    from app.services.snapshot_render import (
+        TimelineMetadata, cca_calendar_dates,
+    )
 
     rows = (await db.execute(
         select(OrderItem, Order, Timeline, AdvPractice, Subscription)
@@ -362,26 +364,28 @@ async def list_purchased_items(
 
     out: list[dict] = []
     for item, order, tl, practice, sub in rows:
+        # BL-17 audit (2026-05-06): replaced inline DAS/DBS date
+        # arithmetic with the canonical helper. Pre-audit this branch
+        # duplicated cca_calendar_dates' logic — drift risk if BL-17
+        # boundary semantics change.
         date_from_iso = None
         date_to_iso = None
         crop_start = sub.crop_start_date
         if crop_start is not None:
             from_type_value = tl.from_type.value if hasattr(tl.from_type, 'value') else str(tl.from_type)
             crop_date = crop_start.date() if hasattr(crop_start, 'date') else crop_start
-            if from_type_value == "DAS":
-                df = crop_date + timedelta(days=int(tl.from_value))
-                dt_ = crop_date + timedelta(days=int(tl.to_value))
+            if from_type_value in ("DAS", "DBS"):
+                meta = TimelineMetadata(
+                    from_type=from_type_value,
+                    from_value=int(tl.from_value),
+                    to_value=int(tl.to_value),
+                )
+                df, dt_ = cca_calendar_dates(meta, crop_date)
+                # DBS production convention is from > to, so cca_calendar_dates
+                # already returns (earlier, later). DAS is naturally ordered.
                 date_from_iso = df.isoformat()
                 date_to_iso = dt_.isoformat()
-            elif from_type_value == "DBS":
-                # Before sowing: subtract. from_value is the larger # of days before;
-                # to_value is the smaller (closer to sowing). Order ascending.
-                d1 = crop_date - timedelta(days=int(tl.from_value))
-                d2 = crop_date - timedelta(days=int(tl.to_value))
-                df, dt_ = (d1, d2) if d1 <= d2 else (d2, d1)
-                date_from_iso = df.isoformat()
-                date_to_iso = dt_.isoformat()
-            # CALENDAR: leave null for now (would need absolute reference dates)
+            # CALENDAR: leave null for now (no absolute reference dates).
 
         out.append({
             "id": item.id,

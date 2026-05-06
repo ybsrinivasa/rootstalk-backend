@@ -31,6 +31,9 @@ from app.modules.clients.models import ClientUser, ClientUserRole
 from app.services.bl13_versioning import (
     compute_publish_version, validate_publish_transition,
 )
+from app.services.bl17_timeline_boundary import (
+    TimelineSpec, find_timeline_conflicts,
+)
 
 router = APIRouter(tags=["Advisory"])
 
@@ -432,6 +435,54 @@ async def list_timelines(
         select(Timeline).where(Timeline.package_id == package_id).order_by(Timeline.display_order, Timeline.from_value)
     )
     return result.scalars().all()
+
+
+@router.get("/client/{client_id}/packages/{package_id}/timelines/conflicts")
+async def list_timeline_conflicts(
+    client_id: str, package_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """BL-17 audit (2026-05-06): soft-warning surface for the CA
+    portal. Spec says consecutive timelines must have no gaps and
+    no overlaps, validated at save but not hard-blocked. Pre-audit
+    the live router didn't validate this at all — a Package could
+    ship with silent coverage gaps or duplicated coverage.
+
+    The CA portal calls this endpoint after a timeline save to
+    surface warnings (or after loading the package detail page).
+    Returns an empty `conflicts` list when the package's timelines
+    are clean. CALENDAR-typed timelines are skipped — they have no
+    day-offset anchor relative to crop_start, so they can't gap or
+    overlap with DAS/DBS timelines on the same number line.
+    """
+    await _get_package(db, package_id, client_id)
+    rows = (await db.execute(
+        select(Timeline).where(Timeline.package_id == package_id)
+    )).scalars().all()
+    specs = [
+        TimelineSpec(
+            timeline_id=row.id,
+            from_type=row.from_type.value if hasattr(row.from_type, "value") else str(row.from_type),
+            from_value=int(row.from_value),
+            to_value=int(row.to_value),
+        )
+        for row in rows
+    ]
+    conflicts = find_timeline_conflicts(specs)
+    return {
+        "package_id": package_id,
+        "conflict_count": len(conflicts),
+        "conflicts": [
+            {
+                "timeline_a_id": c.timeline_a_id,
+                "timeline_b_id": c.timeline_b_id,
+                "kind": c.kind,
+                "detail": c.detail,
+            }
+            for c in conflicts
+        ],
+    }
 
 
 @router.post("/client/{client_id}/packages/{package_id}/timelines", response_model=TimelineOut, status_code=201)
