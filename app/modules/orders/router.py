@@ -1348,7 +1348,15 @@ async def approve_all_items(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """BL-10: Farmer approves all items awaiting approval at once."""
+    """BL-10: Farmer approves all items awaiting approval at once.
+
+    BL-14 audit (2026-05-06): swapped the inline status flip for a
+    validate_item_transition pass per item, matching the pattern
+    used in approve_order_item / reject_order_item from the BL-10
+    rewire. The SQL filter on SENT_FOR_APPROVAL was already
+    sufficient defence-in-depth; this adds parity so a future
+    refactor doesn't drift between the two approval paths.
+    """
     await _get_farmer_order(db, order_id, current_user.id)
     result = await db.execute(
         select(OrderItem).where(
@@ -1360,6 +1368,9 @@ async def approve_all_items(
     if not items:
         raise HTTPException(status_code=400, detail="No items awaiting approval")
     for item in items:
+        res = validate_item_transition(item.status, OrderItemStatus.APPROVED.value, FARMER)
+        if not res.allowed:
+            _raise_transition(res)
         item.status = OrderItemStatus.APPROVED
     await _update_order_status(db, order_id)
     await db.commit()

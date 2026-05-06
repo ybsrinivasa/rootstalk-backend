@@ -106,3 +106,28 @@ async def test_brand_hidden_at_available_before_dealer_submits(db):
         order_id=order.id, db=db, current_user=farmer,
     )
     assert out["items"][0]["brand_name"] is None
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_approve_all_items_runs_through_transition_validator(db):
+    """Bulk approval still works end-to-end after the BL-14 batch 2
+    consistency cleanup that wired validate_item_transition through
+    approve_all_items. Pre-fix the route flipped status inline; now
+    each item runs through the same per-item validator that
+    approve_order_item uses, so the two approval paths can't drift."""
+    from sqlalchemy import select
+    from app.modules.orders.router import approve_all_items
+
+    farmer, order, item = await _seed_farmer_order_with_item(
+        db, OrderItemStatus.SENT_FOR_APPROVAL,
+    )
+    out = await approve_all_items(
+        order_id=order.id, db=db, current_user=farmer,
+    )
+    assert out["approved_count"] == 1
+
+    refreshed = (await db.execute(
+        select(OrderItem).where(OrderItem.id == item.id)
+    )).scalar_one()
+    assert refreshed.status == OrderItemStatus.APPROVED
