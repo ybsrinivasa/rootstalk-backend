@@ -24,6 +24,7 @@ from app.services.bl10_order_state import (
     is_item_abortable, is_order_abortable,
     validate_item_transition, validate_order_transition,
 )
+from app.services.bl14_approval import is_brand_visible_to_farmer
 from app.modules.advisory.models import RelationType
 from app.modules.subscriptions.models import PromoterAssignment, SubscriptionPaymentRequest, AssignmentStatus
 
@@ -270,7 +271,7 @@ async def get_farmer_order_detail(
             {
                 "id": i.id, "practice_id": i.practice_id, "status": i.status,
                 "relation_id": i.relation_id, "relation_type": i.relation_type,
-                "brand_name": i.brand_name if i.status == OrderItemStatus.APPROVED else None,
+                "brand_name": i.brand_name if is_brand_visible_to_farmer(i.status) else None,
                 "given_volume": float(i.given_volume) if i.given_volume and i.status != OrderItemStatus.PENDING else None,
                 "estimated_volume": float(i.estimated_volume) if i.estimated_volume else None,
                 "volume_unit": i.volume_unit,
