@@ -46,6 +46,20 @@ def sms_recorder(monkeypatch):
     return sent
 
 
+@pytest.fixture
+def fcm_recorder(monkeypatch):
+    """Replace send_fcm with a recorder. Returns the list of
+    (token, title, body, data) tuples sent during the test."""
+    sent: list[tuple[str, str, str, dict]] = []
+
+    async def fake_send_fcm(token, title, body, data=None):
+        sent.append((token, title, body, data or {}))
+        return True
+
+    monkeypatch.setattr(alerts_task, "send_fcm", fake_send_fcm)
+    return sent
+
+
 async def _seed_assigned_active_sub(db, *, with_promoter=True, with_start_date=False):
     farmer = await make_user(db, name="Farmer A")
     promoter = await make_user(db, name="Promoter P") if with_promoter else None
@@ -220,6 +234,105 @@ async def test_input_alert_suppressed_by_active_order(db, sms_recorder):
         )
     )).scalars().all()
     assert rows == []
+
+
+# ── FCM channel ──────────────────────────────────────────────────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_start_date_alert_pushes_fcm_when_recipient_has_token(
+    db, sms_recorder, fcm_recorder,
+):
+    """FCM Batch 2 wiring. Recipients with an fcm_token set get a push
+    notification in addition to the SMS. The push payload's `data` field
+    carries `alert_type` and `subscription_id` so the PWA can deep-link
+    into the right screen on tap."""
+    sub, farmer, promoter, _ = await _seed_assigned_active_sub(db)
+    farmer.fcm_token = "fcm-token-farmer"
+    promoter.fcm_token = "fcm-token-promoter"
+    await db.commit()
+
+    await _run_daily_alerts_with_session(db)
+
+    assert len(fcm_recorder) == 2
+    tokens = {entry[0] for entry in fcm_recorder}
+    assert tokens == {"fcm-token-farmer", "fcm-token-promoter"}
+
+    # Title / body shape matches BL-09 design — short title for the
+    # banner, fuller body for the lock-screen preview.
+    titles = {entry[1] for entry in fcm_recorder}
+    assert titles == {"Set your sowing date"}
+
+    # Data payload carries the routing info the PWA needs.
+    for _token, _title, _body, data in fcm_recorder:
+        assert data["alert_type"] == "START_DATE"
+        assert data["subscription_id"] == sub.id
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_alert_skips_fcm_when_recipient_has_no_token(
+    db, sms_recorder, fcm_recorder,
+):
+    """A recipient with no fcm_token registered (most farmers in V1
+    until the PWA wires the registration call) gets SMS only — no
+    FCM call attempted."""
+    sub, _, _, _ = await _seed_assigned_active_sub(db)
+    # Don't set any fcm_token — defaults to None in the factory.
+    await _run_daily_alerts_with_session(db)
+    assert len(fcm_recorder) == 0
+    # SMS still fires for both recipients (farmer + default promoter).
+    assert len(sms_recorder) == 2
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_alert_writes_db_row_even_when_both_channels_unavailable(
+    db, sms_recorder, fcm_recorder,
+):
+    """A recipient with neither phone nor fcm_token still gets an
+    Alert row written for the audit trail. The dashboard / RM portal
+    can use the row to escalate ('this farmer was never reached')."""
+    farmer = await make_user(db, name="Phoneless Farmer")
+    farmer.phone = None
+    farmer.fcm_token = None
+    client = await make_client(db)
+    package = await make_package(db, client, name="Pack")
+    sub = await make_subscription(db, farmer=farmer, client=client, package=package)
+    sub.subscription_type = SubscriptionType.SELF
+    await db.commit()
+
+    await _run_daily_alerts_with_session(db)
+
+    rows = (await db.execute(
+        select(Alert).where(Alert.subscription_id == sub.id)
+    )).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].recipient_user_id == farmer.id
+    assert len(sms_recorder) == 0
+    assert len(fcm_recorder) == 0
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_input_alert_pushes_fcm_with_input_payload(
+    db, sms_recorder, fcm_recorder,
+):
+    """INPUT alerts get their own FCM title / body distinct from
+    START_DATE. Verifies the per-alert-type FCM constants flow through
+    correctly."""
+    sub, farmer, _, package = await _seed_assigned_active_sub(db)
+    farmer.fcm_token = "fcm-token-input"
+    await _seed_input_due_today(db, sub, package, das_offset_days=10)
+
+    await _run_daily_alerts_with_session(db)
+
+    farmer_pushes = [e for e in fcm_recorder if e[0] == "fcm-token-input"]
+    assert len(farmer_pushes) == 1
+    _, title, _body, data = farmer_pushes[0]
+    assert title == "Input due today"
+    assert data["alert_type"] == "INPUT"
+    assert data["subscription_id"] == sub.id
 
 
 @requires_docker

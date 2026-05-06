@@ -1,9 +1,13 @@
-"""BL-09 — Daily advisory alerts: START_DATE and INPUT-due notifications via SMS.
+"""BL-09 — Daily advisory alerts: START_DATE and INPUT-due notifications.
 
 Wires the live Celery task to the pure-function service in
 `app/services/bl09_alerts.py`. The task only does I/O — load
 subscriptions / recipients / timelines / orders / today's already-sent
-alerts, and fan out SMS to recipients who have a phone number.
+alerts, and fan out notifications to recipients via SMS (if they
+have a phone) and FCM push (if they have an fcm_token registered
+via the PWA). Both channels are independent: a recipient with both
+contact methods receives both; with one, only that one fires; with
+neither, only the Alert row is written for the audit trail.
 """
 from __future__ import annotations
 
@@ -27,6 +31,7 @@ from app.services.bl09_alerts import (
     find_input_practices_due_today, resolve_alert_recipients,
     should_send_input_alert, should_send_start_date_alert,
 )
+from app.services.fcm_service import send_fcm
 from app.services.sms_service import send_sms
 
 logger = logging.getLogger(__name__)
@@ -38,6 +43,21 @@ START_DATE_ALERT_SMS = (
 INPUT_ALERT_SMS = (
     "RootsTalk: {name}, an input is due today for your {package} "
     "crop advisory. Open RootsTalk to place your order."
+)
+
+# FCM payloads — short title for the lock-screen banner, body
+# tightened from the SMS version (no "RootsTalk:" prefix, no
+# salutation; the user knows it's from us because they installed
+# the app).
+START_DATE_ALERT_FCM_TITLE = "Set your sowing date"
+START_DATE_ALERT_FCM_BODY = (
+    "Your {package} advisory is active. Set your sowing date to start receiving "
+    "daily guidance."
+)
+INPUT_ALERT_FCM_TITLE = "Input due today"
+INPUT_ALERT_FCM_BODY = (
+    "An input is due today for your {package} advisory. Open RootsTalk to place "
+    "your order."
 )
 
 # Order statuses that suppress an INPUT alert. Mirrors the set in
@@ -117,13 +137,34 @@ async def _load_active_order_practice_ids(db, subscription_id: str) -> set[str]:
 
 async def _send_to_recipient(
     db, sub_id: str, alert_type: AlertType, recipient: AlertRecipientSpec,
-    user: User, message: str,
+    user: User, sms_body: str, fcm_title: str, fcm_body: str,
 ) -> None:
+    """Fan out one alert to one recipient via every channel they
+    accept. SMS fires if user.phone is set; FCM push fires if
+    user.fcm_token is set; both run independently of each other.
+    The Alert row is written unconditionally so the audit trail
+    captures every intended notification regardless of delivery
+    channel availability.
+    """
     if user.phone:
         try:
-            await send_sms(user.phone, message)
+            await send_sms(user.phone, sms_body)
         except Exception as e:
             logger.error(f"SMS send failed to {user.phone}: {e}")
+    if user.fcm_token:
+        try:
+            await send_fcm(
+                token=user.fcm_token, title=fcm_title, body=fcm_body,
+                data={
+                    "alert_type": alert_type.value if hasattr(alert_type, "value") else str(alert_type),
+                    "subscription_id": sub_id,
+                },
+            )
+        except Exception as e:
+            # send_fcm itself catches and returns False, but the
+            # try/except is belt-and-braces in case a future change
+            # removes that guard.
+            logger.error(f"FCM send raised unexpectedly for user {user.id}: {e}")
     db.add(Alert(
         subscription_id=sub_id,
         alert_type=alert_type,
@@ -166,10 +207,16 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
             user = user_by_id.get(recipient.user_id)
             if not user:
                 continue
-            msg = START_DATE_ALERT_SMS.format(
+            sms = START_DATE_ALERT_SMS.format(
                 name=user.name or "Farmer", package=pkg.name,
             )
-            await _send_to_recipient(db, sub.id, AlertType.START_DATE, recipient, user, msg)
+            fcm_body = START_DATE_ALERT_FCM_BODY.format(package=pkg.name)
+            await _send_to_recipient(
+                db, sub.id, AlertType.START_DATE, recipient, user,
+                sms_body=sms,
+                fcm_title=START_DATE_ALERT_FCM_TITLE,
+                fcm_body=fcm_body,
+            )
         return  # no INPUT alerts before the farmer has set their start date
 
     # ── INPUT alert ───────────────────────────────────────────────────
@@ -193,10 +240,16 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
         user = user_by_id.get(recipient.user_id)
         if not user:
             continue
-        msg = INPUT_ALERT_SMS.format(
+        sms = INPUT_ALERT_SMS.format(
             name=user.name or "Farmer", package=pkg.name,
         )
-        await _send_to_recipient(db, sub.id, AlertType.INPUT, recipient, user, msg)
+        fcm_body = INPUT_ALERT_FCM_BODY.format(package=pkg.name)
+        await _send_to_recipient(
+            db, sub.id, AlertType.INPUT, recipient, user,
+            sms_body=sms,
+            fcm_title=INPUT_ALERT_FCM_TITLE,
+            fcm_body=fcm_body,
+        )
 
 
 async def _run_daily_alerts_with_session(db, today: date | None = None) -> int:
