@@ -43,9 +43,20 @@ def _require_sa(current_user: User):
 
 def _base_url() -> str:
     """Public base URL for CA-facing links (onboarding magic link, post-
-    approval portal URL). The `rootstalk-client-portal` Next.js app
-    serves these routes — defaults to port 3004 locally, the actual
-    rootstalk.in domain in production."""
+    approval portal URL). Single Next.js app at this host serves the
+    SA portal at `/` and per-client portals at `/{short_name}` —
+    path-based multi-tenant routing.
+
+    Resolution order:
+    1. `FRONTEND_BASE_URL` env var (preferred — explicit per environment).
+    2. Dev fallback `http://localhost:3004` if `environment=development`.
+    3. Final fallback `https://rootstalk.in` for backwards compat with the
+       pre-config-driven prod deploy. Startup logs a warning if step 3
+       fires in a non-dev environment (the test server should set the
+       env var to e.g. https://rstalk.eywa.farm).
+    """
+    if settings.frontend_base_url:
+        return settings.frontend_base_url.rstrip("/")
     if settings.environment == "development":
         return "http://localhost:3004"
     return "https://rootstalk.in"

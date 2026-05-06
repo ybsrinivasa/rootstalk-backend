@@ -70,6 +70,15 @@ class Settings(BaseSettings):
     # CORS
     allowed_origins: str = "http://localhost:3000"
 
+    # Frontend base URL — used to build CA-facing email links (onboarding
+    # magic link, portal login). Same Next.js app serves the SA portal at
+    # `/` and per-client portals at `/{short_name}` (path-based routing).
+    # In development this defaults to localhost:3004; in non-dev envs it
+    # MUST be set explicitly (e.g. https://rstalk.eywa.farm for testing,
+    # https://rootstalk.in for production) — startup logs a warning if
+    # unset, and `_base_url()` falls back to the production value.
+    frontend_base_url: str = ""
+
     # Environment
     environment: str = "development"
 

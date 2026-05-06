@@ -16,6 +16,15 @@ if settings.environment != "development" and (
         "restore email delivery.",
         settings.environment,
     )
+
+if settings.environment != "development" and not settings.frontend_base_url:
+    logger.warning(
+        "FRONTEND_BASE_URL not configured in '%s' environment — onboarding "
+        "links and portal URLs will fall back to https://rootstalk.in. "
+        "Set FRONTEND_BASE_URL to the correct host for this environment "
+        "(e.g. https://rstalk.eywa.farm for the testing server).",
+        settings.environment,
+    )
 from app.modules.auth.router import router as auth_router
 from app.modules.platform.router import router as platform_router
 from app.modules.clients.router import router as clients_router
