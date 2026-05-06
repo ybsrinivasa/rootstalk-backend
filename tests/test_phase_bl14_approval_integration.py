@@ -131,3 +131,138 @@ async def test_approve_all_items_runs_through_transition_validator(db):
         select(OrderItem).where(OrderItem.id == item.id)
     )).scalar_one()
     assert refreshed.status == OrderItemStatus.APPROVED
+
+
+# ── FCM Batch 4: facilitator alert on submit_for_approval ────────────────────
+
+async def _seed_pending_order_for_submit(db, *, with_facilitator: bool = True):
+    """Seed an order in PROCESSING with one AVAILABLE item ready for
+    submit_for_approval. Returns (farmer, dealer, facilitator, order)
+    — facilitator may be None when with_facilitator=False."""
+    farmer = await make_user(db, name="Farmer S")
+    dealer = await make_user(db, name="Dealer S")
+    facilitator = await make_user(db, name="Facilitator S") if with_facilitator else None
+    client = await make_client(db)
+    package = await make_package(db, client)
+    sub = await make_subscription(db, farmer=farmer, client=client, package=package)
+    sub.crop_start_date = datetime.now(timezone.utc) - timedelta(days=10)
+    await db.commit()
+
+    tl = await make_timeline(db, package, name="TL_S")
+    practice = await make_practice(db, tl, l1="PESTICIDE", l2="MANCOZEB")
+    await make_element(db, practice, value="2", unit_cosh_id="kg_per_acre")
+
+    order = Order(
+        subscription_id=sub.id, farmer_user_id=farmer.id,
+        client_id=client.id, dealer_user_id=dealer.id,
+        facilitator_user_id=facilitator.id if facilitator else None,
+        date_from=datetime.now(timezone.utc),
+        date_to=datetime.now(timezone.utc) + timedelta(days=14),
+        status=OrderStatus.PROCESSING,
+    )
+    db.add(order); await db.flush()
+    item = OrderItem(
+        order_id=order.id, practice_id=practice.id, timeline_id=tl.id,
+        brand_cosh_id="brand:dithane-m45", brand_name="Dithane M-45",
+        given_volume=5, volume_unit="kg", price=800,
+        status=OrderItemStatus.AVAILABLE,
+    )
+    db.add(item)
+    await db.commit()
+    return farmer, dealer, facilitator, order
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_submit_for_approval_pushes_fcm_to_facilitator(db, monkeypatch):
+    """BL-14 spec: when the dealer submits volumes/prices for farmer
+    approval, the facilitator gets an FCM push with 'Your farmer needs
+    to approve' so they can nudge the farmer if needed. The farmer
+    drives the actual approve/reject through the PWA — FCM goes to
+    the facilitator only."""
+    from app.modules.orders import router as orders_router
+    from app.modules.orders.router import submit_for_approval
+
+    sent: list[tuple[str, str, str, dict]] = []
+
+    async def fake_send_fcm(token, title, body, data=None):
+        sent.append((token, title, body, data or {}))
+        return True
+
+    monkeypatch.setattr(orders_router, "send_fcm", fake_send_fcm)
+
+    _, dealer, facilitator, order = await _seed_pending_order_for_submit(db)
+    facilitator.fcm_token = "facilitator-token-xyz"
+    await db.commit()
+
+    await submit_for_approval(
+        order_id=order.id, data={"items": {}},
+        db=db, current_user=dealer,
+    )
+
+    assert len(sent) == 1
+    token, title, body, data = sent[0]
+    assert token == "facilitator-token-xyz"
+    assert title == orders_router.SUBMIT_FOR_APPROVAL_FCM_TITLE
+    assert "approve" in title.lower()  # spec phrasing
+    assert "nudge" in body.lower()      # facilitator's role per the body
+    assert data["type"] == "ORDER_AWAITING_FARMER_APPROVAL"
+    assert data["order_id"] == order.id
+    assert data["farmer_user_id"] == order.farmer_user_id
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_submit_for_approval_skips_fcm_when_no_facilitator(db, monkeypatch):
+    """Direct dealer ↔ farmer flow with no facilitator routing the
+    order: no FCM is fired (nothing to send to). The farmer-side
+    approval path still works through the PWA."""
+    from app.modules.orders import router as orders_router
+    from app.modules.orders.router import submit_for_approval
+
+    sent: list = []
+
+    async def fake_send_fcm(*args, **kwargs):
+        sent.append((args, kwargs))
+        return True
+
+    monkeypatch.setattr(orders_router, "send_fcm", fake_send_fcm)
+
+    _, dealer, _, order = await _seed_pending_order_for_submit(db, with_facilitator=False)
+
+    await submit_for_approval(
+        order_id=order.id, data={"items": {}},
+        db=db, current_user=dealer,
+    )
+    assert sent == []
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_submit_for_approval_skips_fcm_when_facilitator_has_no_token(
+    db, monkeypatch,
+):
+    """Facilitator is assigned but hasn't registered an FCM token
+    (most facilitators in V1 until the PWA wires registration).
+    Submit still succeeds; no FCM call attempted."""
+    from app.modules.orders import router as orders_router
+    from app.modules.orders.router import submit_for_approval
+
+    sent: list = []
+
+    async def fake_send_fcm(*args, **kwargs):
+        sent.append((args, kwargs))
+        return True
+
+    monkeypatch.setattr(orders_router, "send_fcm", fake_send_fcm)
+
+    _, dealer, facilitator, order = await _seed_pending_order_for_submit(db)
+    # facilitator.fcm_token defaults to None — leave unset.
+    assert facilitator.fcm_token is None
+
+    out = await submit_for_approval(
+        order_id=order.id, data={"items": {}},
+        db=db, current_user=dealer,
+    )
+    assert out["status"] == OrderStatus.SENT_FOR_APPROVAL
+    assert sent == []

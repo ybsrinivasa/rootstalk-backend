@@ -25,8 +25,22 @@ from app.services.bl10_order_state import (
     validate_item_transition, validate_order_transition,
 )
 from app.services.bl14_approval import is_brand_visible_to_farmer
+from app.services.fcm_service import send_fcm
+import logging
 from app.modules.advisory.models import RelationType
 from app.modules.subscriptions.models import PromoterAssignment, SubscriptionPaymentRequest, AssignmentStatus
+
+_orders_logger = logging.getLogger(__name__)
+
+# BL-14 spec: facilitator gets the FCM "your farmer needs to approve"
+# alert when the dealer submits volumes/prices for farmer approval.
+# The farmer drives the actual approve/reject decision; the
+# facilitator's role is to nudge the farmer if they delay.
+SUBMIT_FOR_APPROVAL_FCM_TITLE = "Your farmer needs to approve"
+SUBMIT_FOR_APPROVAL_FCM_BODY = (
+    "The dealer has sent volume and pricing for an order. Open RootsTalk "
+    "to nudge the farmer if needed."
+)
 
 router = APIRouter(tags=["Orders"])
 
@@ -830,6 +844,36 @@ async def submit_for_approval(
 
     order.status = OrderStatus.SENT_FOR_APPROVAL
     await db.commit()
+
+    # BL-14 / FCM Batch 4 (2026-05-06): notify the facilitator that
+    # the farmer needs to approve. Skipped silently if no facilitator
+    # is assigned to the order (direct dealer ↔ farmer flow with no
+    # intermediary), or if the facilitator hasn't registered an
+    # fcm_token. Spec is explicit that the FCM goes to the
+    # facilitator only — the farmer drives the actual approve /
+    # reject through the PWA.
+    if order.facilitator_user_id:
+        facilitator = (await db.execute(
+            select(User).where(User.id == order.facilitator_user_id)
+        )).scalar_one_or_none()
+        if facilitator and facilitator.fcm_token:
+            try:
+                await send_fcm(
+                    token=facilitator.fcm_token,
+                    title=SUBMIT_FOR_APPROVAL_FCM_TITLE,
+                    body=SUBMIT_FOR_APPROVAL_FCM_BODY,
+                    data={
+                        "type": "ORDER_AWAITING_FARMER_APPROVAL",
+                        "order_id": order.id,
+                        "farmer_user_id": order.farmer_user_id,
+                    },
+                )
+            except Exception as e:
+                _orders_logger.error(
+                    f"FCM send raised unexpectedly for facilitator "
+                    f"{facilitator.id}: {e}"
+                )
+
     return {"order_id": order_id, "status": order.status}
 
 
