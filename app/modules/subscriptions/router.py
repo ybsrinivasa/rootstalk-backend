@@ -1,5 +1,3 @@
-import secrets
-import string
 from datetime import datetime, timedelta, timezone, date
 from math import radians, cos, sin, asin, sqrt
 from fastapi import APIRouter, Depends, HTTPException
@@ -30,6 +28,10 @@ from app.modules.clients.models import Client, ClientLocation, ClientStatus
 from app.services.bl11_subscription_state import (
     DEALER as BL11_DEALER, FARMER as BL11_FARMER,
     is_self_unsubscribable, validate_transition as validate_sub_transition,
+)
+from app.services.bl15_reference import (
+    client_code_from_short_name, format_reference, parse_sequence,
+    reference_prefix, two_digit_year,
 )
 
 router = APIRouter(tags=["Subscriptions"])
@@ -1380,23 +1382,55 @@ async def _get_subscription(db: AsyncSession, subscription_id: str, farmer_user_
     return sub
 
 
-def _generate_reference(short_name: str = "") -> str:
-    """BL-15: Generate coded reference number — [SHORT_NAME][YY]-[4DIGIT_SEQ]
-    e.g. SEEDS26-0047. Falls back to RT-XXXXXXXX if no short_name available."""
-    year = str(datetime.now(timezone.utc).year)[2:]
-    seq = "".join(secrets.choice(string.digits) for _ in range(4))
-    if short_name:
-        prefix = short_name.upper()[:8]
-        return f"{prefix}{year}-{seq}"
-    chars = string.ascii_uppercase + string.digits
-    return "RT-" + "".join(secrets.choice(chars) for _ in range(10))
-
-
 async def _generate_reference_for_sub(db: AsyncSession, client_id: str) -> str:
-    """Fetch client short_name and generate coded reference."""
-    client = (await db.execute(select(Client).where(Client.id == client_id))).scalar_one_or_none()
+    """BL-15 V1 (Option B, audit 2026-05-06): generate a sequential
+    reference number scoped to (client_code, year_two_digit).
+
+    Format: `{client_code}-{YY}-{NNNNNN}` like `PA-26-000147`.
+    `client_code` is the first 2 chars of `client.short_name` upper-
+    cased, with `RT` as the fallback for too-short short_names.
+
+    Sequential allocation: SELECT the lexicographically-highest
+    existing reference matching the (client_code, year) prefix, parse
+    its 6-digit suffix, return prefix + (suffix + 1). Lexicographic
+    order matches numeric order at fixed 6-digit zero-padding, so this
+    walks correctly without a separate counter table.
+
+    Concurrency note: under concurrent activations on the same
+    (client, year) bucket, two transactions may compute the same next
+    number and one will fail with the unique constraint at commit
+    time. The route returns 500 and the frontend retries — a rare
+    failure mode given the per-(client, year) activation rate. V2
+    will tighten this with a SELECT FOR UPDATE counter row (see
+    project_rootstalk_v2_ideas.md). Pre-V1 the format used a 4-digit
+    random suffix with ~50% birthday-collision rate at 118 references
+    per (client, year), so V1 sequential is a strict improvement.
+
+    Legacy references (V0 format `PADMASHALI26-3847` etc.) are
+    invisible to the LIKE pattern `PA-26-%` and don't poison the
+    max+1 query. They stay on the row as-is per the BL-15 spec
+    rule "Never updated".
+    """
+    client = (await db.execute(
+        select(Client).where(Client.id == client_id)
+    )).scalar_one_or_none()
     short_name = client.short_name if client else ""
-    return _generate_reference(short_name)
+    code = client_code_from_short_name(short_name)
+    year = two_digit_year()
+    prefix = reference_prefix(code, year)
+
+    last = (await db.execute(
+        select(Subscription.reference_number)
+        .where(Subscription.reference_number.like(f"{prefix}%"))
+        .order_by(Subscription.reference_number.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+    if last:
+        prev_seq = parse_sequence(last)
+        next_seq = prev_seq + 1 if prev_seq >= 0 else 1
+    else:
+        next_seq = 1
+    return format_reference(code, year, next_seq)
 
 
 # ── Farmer: Subscription Payment (RazorPay Rs. 199) ──────────────────────────
