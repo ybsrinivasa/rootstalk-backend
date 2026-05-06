@@ -48,18 +48,26 @@ def _base_url() -> str:
     path-based multi-tenant routing.
 
     Resolution order:
-    1. `FRONTEND_BASE_URL` env var (preferred — explicit per environment).
+    1. `FRONTEND_BASE_URL` env var (the only path for non-dev envs).
     2. Dev fallback `http://localhost:3004` if `environment=development`.
-    3. Final fallback `https://rootstalk.in` for backwards compat with the
-       pre-config-driven prod deploy. Startup logs a warning if step 3
-       fires in a non-dev environment (the test server should set the
-       env var to e.g. https://rstalk.eywa.farm).
+
+    No production fallback. The startup gate in `app/main.py` refuses
+    to boot a non-dev process if `FRONTEND_BASE_URL` is unset, but if
+    something mutates settings at runtime to bypass that gate, this
+    function raises rather than silently building wrong URLs.
+    Production prior to 2026-05-06 had a `https://rootstalk.in`
+    fallback here — that was incorrect once `rootstalk.in` was
+    earmarked for the PWA, so the fallback was dropped.
     """
     if settings.frontend_base_url:
         return settings.frontend_base_url.rstrip("/")
     if settings.environment == "development":
         return "http://localhost:3004"
-    return "https://rootstalk.in"
+    raise RuntimeError(
+        "FRONTEND_BASE_URL is required in non-dev environments. "
+        "The startup gate in app/main.py should have caught this — "
+        "see that file for the env-var contract."
+    )
 
 
 # ── SA: List all clients ───────────────────────────────────────────────────────

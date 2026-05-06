@@ -1,14 +1,16 @@
 """Tests for `_base_url()` resolution order.
 
 Pre-fix: hardcoded `localhost:3004` in dev / `https://rootstalk.in`
-elsewhere. Post-fix: env-driven via `FRONTEND_BASE_URL`, with the
-hardcoded values as fallbacks for backwards compatibility.
-
-Critical for the testing-server rollout — the testing server lives
-at https://rstalk.eywa.farm and onboarding emails must point there,
-not at the production rootstalk.in domain.
+elsewhere. Post-fix: env-driven via `FRONTEND_BASE_URL`. The
+production fallback was dropped on 2026-05-06 once `rootstalk.in`
+got earmarked for the PWA — the old fallback was actively wrong
+for the SA/CA portal. Non-dev now raises if the env var is unset
+(both at startup in app/main.py and inline here as belt-and-
+suspenders).
 """
 from __future__ import annotations
+
+import pytest
 
 from app.modules.clients import router as clients_router
 from app.config import settings
@@ -40,10 +42,13 @@ def test_dev_fallback_when_unset(monkeypatch):
     assert clients_router._base_url() == "http://localhost:3004"
 
 
-def test_prod_fallback_when_unset_in_non_dev(monkeypatch):
-    """Backwards compat for the pre-config-driven prod deploy. A
-    startup warning fires (in main.py) — see that path tested via
-    log capture in tests/test_startup_warnings.py if needed."""
+def test_raises_when_unset_in_non_dev(monkeypatch):
+    """Non-dev requires the env var. If something bypasses the
+    startup gate in main.py and we reach `_base_url()` with an
+    unset value, fail loudly rather than silently emitting the
+    wrong host (the previous behaviour silently used the PWA
+    domain `rootstalk.in` for the SA/CA portal — actively wrong)."""
     monkeypatch.setattr(settings, "frontend_base_url", "")
     monkeypatch.setattr(settings, "environment", "production")
-    assert clients_router._base_url() == "https://rootstalk.in"
+    with pytest.raises(RuntimeError, match="FRONTEND_BASE_URL"):
+        clients_router._base_url()

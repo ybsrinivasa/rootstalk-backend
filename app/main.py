@@ -18,12 +18,12 @@ if settings.environment != "development" and (
     )
 
 if settings.environment != "development" and not settings.frontend_base_url:
-    logger.warning(
-        "FRONTEND_BASE_URL not configured in '%s' environment — onboarding "
-        "links and portal URLs will fall back to https://rootstalk.in. "
-        "Set FRONTEND_BASE_URL to the correct host for this environment "
-        "(e.g. https://rstalk.eywa.farm for the testing server).",
-        settings.environment,
+    raise RuntimeError(
+        f"FRONTEND_BASE_URL must be set when ENVIRONMENT is {settings.environment!r}. "
+        "Onboarding links and portal URLs depend on it; refusing to start "
+        "with a silent misconfiguration. Set the env var to the correct "
+        "host (e.g. https://rootstalk.eywa.farm for production, "
+        "https://rstalk.eywa.farm for testing)."
     )
 from app.modules.auth.router import router as auth_router
 from app.modules.platform.router import router as platform_router
