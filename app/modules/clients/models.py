@@ -143,6 +143,7 @@ class ClientCrop(Base):
         default=StatusEnum.ACTIVE,
     )
     added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    removed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
 
     client: Mapped["Client"] = relationship("Client", back_populates="crops")
 

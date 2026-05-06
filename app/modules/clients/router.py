@@ -23,6 +23,11 @@ from app.modules.clients.service import (
     generate_token, send_onboarding_email, send_ca_credentials_email,
     get_client_by_token, create_ca_user
 )
+from app.modules.advisory.models import Package
+from app.services.crop_lifecycle import (
+    cascade_inactivate_packages_for_crop,
+    restore_cascade_inactivated_packages,
+)
 
 router = APIRouter(tags=["Clients"])
 
@@ -459,8 +464,10 @@ async def list_crops(
     current_user: User = Depends(get_current_user),
 ):
     result = await db.execute(
-        select(ClientCrop).where(ClientCrop.client_id == client_id)
-        .order_by(ClientCrop.added_at)
+        select(ClientCrop).where(
+            ClientCrop.client_id == client_id,
+            ClientCrop.removed_at.is_(None),
+        ).order_by(ClientCrop.added_at)
     )
     return result.scalars().all()
 
@@ -472,14 +479,36 @@ async def add_crop(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """CCA Step 1 — CA puts a crop on the conveyor belt.
+
+    A row that exists with `removed_at IS NOT NULL` was previously
+    soft-removed by the CA. Re-adding revives it: clears the
+    timestamp and restores every Package that was cascade-inactivated
+    by the prior removal. Packages inactivated for other reasons stay
+    inactive.
+    """
     existing = (await db.execute(
         select(ClientCrop).where(
             ClientCrop.client_id == client_id,
             ClientCrop.crop_cosh_id == request.crop_cosh_id,
         )
     )).scalar_one_or_none()
-    if existing:
+    if existing is not None and existing.removed_at is None:
         raise HTTPException(status_code=409, detail="This crop is already added")
+
+    if existing is not None:
+        existing.removed_at = None
+        packages = (await db.execute(
+            select(Package).where(
+                Package.client_id == client_id,
+                Package.crop_cosh_id == request.crop_cosh_id,
+            )
+        )).scalars().all()
+        restore_cascade_inactivated_packages(packages)
+        await db.commit()
+        await db.refresh(existing)
+        return existing
+
     crop = ClientCrop(client_id=client_id, crop_cosh_id=request.crop_cosh_id)
     db.add(crop)
     await db.commit()
@@ -493,12 +522,37 @@ async def remove_crop(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """CCA Step 1 — CA removes a crop from the conveyor belt.
+
+    Soft-removal: stamps `removed_at` on the ClientCrop row and
+    cascade-inactivates every ACTIVE Package under that (client,
+    crop). Existing farmer subscriptions on those Packages continue
+    unabated; new subscriptions are blocked because the Package is
+    INACTIVE. DRAFT and already-INACTIVE Packages are left alone so
+    the eventual re-add can revive only what we ourselves
+    cascade-inactivated.
+    """
     crop = (await db.execute(
-        select(ClientCrop).where(ClientCrop.id == crop_id, ClientCrop.client_id == client_id)
+        select(ClientCrop).where(
+            ClientCrop.id == crop_id,
+            ClientCrop.client_id == client_id,
+            ClientCrop.removed_at.is_(None),
+        )
     )).scalar_one_or_none()
     if not crop:
         raise HTTPException(status_code=404, detail="Crop not found")
-    await db.delete(crop)
+
+    now = datetime.now(timezone.utc)
+    crop.removed_at = now
+
+    packages = (await db.execute(
+        select(Package).where(
+            Package.client_id == client_id,
+            Package.crop_cosh_id == crop.crop_cosh_id,
+        )
+    )).scalars().all()
+    cascade_inactivate_packages_for_crop(packages, now)
+
     await db.commit()
 
 

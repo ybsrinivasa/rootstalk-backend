@@ -86,6 +86,7 @@ class Package(Base):
     created_by: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    cascade_inactivated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
 
     locations: Mapped[list["PackageLocation"]] = relationship("PackageLocation", back_populates="package")
     authors: Mapped[list["PackageAuthor"]] = relationship("PackageAuthor", back_populates="package")

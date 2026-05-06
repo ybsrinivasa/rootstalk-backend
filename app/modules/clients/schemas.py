@@ -148,6 +148,7 @@ class CropOut(BaseModel):
     crop_cosh_id: str
     status: str
     added_at: datetime
+    removed_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
