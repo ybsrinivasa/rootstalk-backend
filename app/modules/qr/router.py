@@ -281,14 +281,19 @@ async def create_qr_code(
         "mfr_date": request.manufacture_date,
         "exp_date": request.expiry_date,
     })
+    # BL-18 audit (2026-05-06): parse date strings before assigning to
+    # the Date columns. asyncpg rejects raw strings on Date params with
+    # 'str object has no attribute toordinal' — bug pre-existed; first
+    # surfaced when the audit added end-to-end integration tests
+    # (the route had no tests before).
     qr = ProductQRCode(
         client_id=client_id,
         product_type=request.product_type,
         brand_cosh_id=request.brand_cosh_id,
         variety_id=request.variety_id,
         product_display_name=request.product_display_name,
-        manufacture_date=request.manufacture_date,
-        expiry_date=request.expiry_date,
+        manufacture_date=date.fromisoformat(request.manufacture_date),
+        expiry_date=date.fromisoformat(request.expiry_date),
         batch_lot_number=request.batch_lot_number,
         qr_payload=payload,
         created_by=current_user.id,
@@ -383,8 +388,12 @@ async def bulk_create_qr_codes(
             skipped_dup += 1
             continue
 
-        mfr_date_iso = datetime.strptime(mfr_date, "%d-%m-%Y").strftime("%Y-%m-%d")
-        exp_date_iso = datetime.strptime(exp_date, "%d-%m-%Y").strftime("%Y-%m-%d")
+        # BL-18 audit (2026-05-06): keep dates as date objects rather
+        # than re-stringifying — asyncpg rejects raw strings on Date
+        # columns. Was a latent bug; not exercised because the bulk
+        # path had no tests before this audit.
+        mfr_date_obj = datetime.strptime(mfr_date, "%d-%m-%Y").date()
+        exp_date_obj = datetime.strptime(exp_date, "%d-%m-%Y").date()
         payload = json.dumps({
             "rt_qr": True, "v": "1",
             "client_id": client_id,
@@ -406,7 +415,7 @@ async def bulk_create_qr_codes(
                 qr = ProductQRCode(
                     client_id=client_id, product_type=product_type,
                     product_display_name=display_name,
-                    manufacture_date=mfr_date_iso, expiry_date=exp_date_iso,
+                    manufacture_date=mfr_date_obj, expiry_date=exp_date_obj,
                     batch_lot_number=batch_lot, qr_payload=payload,
                     created_by=current_user.id,
                 )
