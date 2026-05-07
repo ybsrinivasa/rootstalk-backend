@@ -2,8 +2,8 @@
 
 Walks every `client_crops` row whose snapshot fields are NULL and
 populates `crop_name_en`, `crop_scientific_name`, `crop_area_or_plant`
-from the canonical sources: `cosh_reference_cache(entity_type='crop')`
-for the names and `crop_measures` for the area/plant typing.
+from the canonical sources: `cosh_core_items(core_type='crop')` for
+the names and `crop_measures` for the area/plant typing.
 
 Idempotent — re-running visits only still-NULL rows. Rows whose
 source data is missing or incomplete are reported and left NULL;

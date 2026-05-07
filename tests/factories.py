@@ -30,7 +30,7 @@ from app.modules.platform.models import StatusEnum, User
 from app.modules.subscriptions.models import (
     Subscription, SubscriptionStatus, SubscriptionType,
 )
-from app.modules.sync.models import CoshReferenceCache, CropMeasure
+from app.modules.sync.models import CoshCoreItem, CropMeasure
 
 
 def _short(prefix: str) -> str:
@@ -48,7 +48,7 @@ async def make_crop_reference(
     db: AsyncSession, cosh_id: str, *,
     name: str = "Paddy", scientific_name: str | None = "Oryza sativa",
     measure: str = "AREA_WISE", status: str = "active",
-) -> tuple[CoshReferenceCache, CropMeasure]:
+) -> tuple[CoshCoreItem, CropMeasure]:
     """Seed a Cosh crop entity + its system-level area/plant mapping.
 
     Required when a test exercises CCA Step 1 add_crop, since add_crop
@@ -57,14 +57,14 @@ async def make_crop_reference(
     is a no-op.
     """
     existing_ref = (await db.execute(
-        select(CoshReferenceCache).where(
-            CoshReferenceCache.cosh_id == cosh_id,
-            CoshReferenceCache.entity_type == "crop",
+        select(CoshCoreItem).where(
+            CoshCoreItem.cosh_id == cosh_id,
+            CoshCoreItem.core_type == "crop",
         )
     )).scalar_one_or_none()
     if existing_ref is None:
-        existing_ref = CoshReferenceCache(
-            cosh_id=cosh_id, entity_type="crop", status=status,
+        existing_ref = CoshCoreItem(
+            cosh_id=cosh_id, core_type="crop", status=status,
             translations={"en": name},
             metadata_={"scientific_name": scientific_name} if scientific_name else None,
         )

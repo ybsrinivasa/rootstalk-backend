@@ -602,9 +602,9 @@ async def add_crop(
 
     Snapshot (Batch 1B): on every add — fresh and re-add — the
     crop's English name, scientific name, and area/plant typing are
-    captured from `CoshReferenceCache` + `CropMeasure`. Either
-    source missing or inactive → 422 with a stable error code so
-    the CA portal can surface the right escalation path.
+    captured from `CoshCoreItem` + `CropMeasure`. Either source
+    missing or inactive → 422 with a stable error code so the CA
+    portal can surface the right escalation path.
     """
     existing = (await db.execute(
         select(ClientCrop).where(

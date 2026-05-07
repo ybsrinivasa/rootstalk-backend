@@ -27,7 +27,7 @@ from app.modules.clients.schemas import CropCreate
 from app.modules.subscriptions.models import (
     Subscription, SubscriptionStatus, SubscriptionType,
 )
-from app.modules.sync.models import CoshReferenceCache, CropMeasure
+from app.modules.sync.models import CoshCoreItem, CropMeasure
 from tests.conftest import requires_docker
 from tests.factories import make_client, make_crop_reference, make_user
 
@@ -407,8 +407,8 @@ async def test_add_crop_422_when_measure_missing(db):
     area/plant typing first. Fail closed; never default."""
     client = await make_client(db)
     user = await make_user(db, name="CA")
-    db.add(CoshReferenceCache(
-        cosh_id="crop:no_measure", entity_type="crop", status="active",
+    db.add(CoshCoreItem(
+        cosh_id="crop:no_measure", core_type="crop", status="active",
         translations={"en": "MysteryCrop"},
     ))
     await db.commit()

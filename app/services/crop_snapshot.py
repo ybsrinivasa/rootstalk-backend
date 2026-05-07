@@ -2,7 +2,7 @@
 
 When the CA puts a crop on the conveyor belt, ClientCrop captures a
 per-client snapshot of attributes that are otherwise live-fetched
-from the Cosh reference cache. The snapshot freezes the company's
+from the Cosh reference tables. The snapshot freezes the company's
 CCA configuration against any future Cosh-side drift, and gives a
 clear audit trail of what the CA agreed to at add time.
 
@@ -11,11 +11,11 @@ canonical in `CropMeasure`. The per-client snapshot duplicates it
 deliberately as defense-in-depth — if the system row ever drifts,
 the per-client copy preserves the original.
 
-Lookups: `CoshReferenceCache(entity_type='crop', cosh_id=...)` for
-name + scientific name, `CropMeasure(crop_cosh_id=...)` for
-area/plant. Either missing is a configuration error the CA can't
-fix from the portal — `CropSnapshotError` carries a stable
-`code` so the route can map to a 422 with a clear reason.
+Lookups: `CoshCoreItem(core_type='crop', cosh_id=...)` for name +
+scientific name, `CropMeasure(crop_cosh_id=...)` for area/plant.
+Either missing is a configuration error the CA can't fix from the
+portal — `CropSnapshotError` carries a stable `code` so the route
+can map to a 422 with a clear reason.
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.sync.models import CoshReferenceCache, CropMeasure
+from app.modules.sync.models import CoshCoreItem, CropMeasure
 
 
 @dataclass(frozen=True)
@@ -46,7 +46,7 @@ class CropSnapshotError(Exception):
 
 
 def build_snapshot_from_rows(
-    cosh_row: Optional[CoshReferenceCache],
+    cosh_row: Optional[CoshCoreItem],
     measure_row: Optional[CropMeasure],
 ) -> CropSnapshot:
     """Pure: assemble a snapshot from already-loaded ORM rows.
@@ -97,9 +97,9 @@ async def fetch_snapshot(db: AsyncSession, crop_cosh_id: str) -> CropSnapshot:
     pure builder. Used on CA add and CA re-add (fresh snapshot in
     both cases — the user explicitly chose this on 2026-05-06)."""
     cosh_row = (await db.execute(
-        select(CoshReferenceCache).where(
-            CoshReferenceCache.cosh_id == crop_cosh_id,
-            CoshReferenceCache.entity_type == "crop",
+        select(CoshCoreItem).where(
+            CoshCoreItem.cosh_id == crop_cosh_id,
+            CoshCoreItem.core_type == "crop",
         )
     )).scalar_one_or_none()
     measure_row = (await db.execute(

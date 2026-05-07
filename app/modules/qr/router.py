@@ -19,7 +19,7 @@ from app.dependencies import get_current_user
 from app.modules.platform.models import User
 from app.modules.qr.models import ManufacturerBrandPortfolio, ProductQRCode, QRScan
 from app.modules.orders.models import OrderItem, OrderItemStatus
-from app.modules.sync.models import CoshReferenceCache
+from app.modules.sync.models import CoshCoreItem
 from app.modules.subscriptions.models import (
     FarmerSubscriptionHistory, Subscription,
 )
@@ -92,7 +92,7 @@ async def list_brand_portfolio(
         name = None
         if r.brand_cosh_id:
             entry = (await db.execute(
-                select(CoshReferenceCache).where(CoshReferenceCache.cosh_id == r.brand_cosh_id)
+                select(CoshCoreItem).where(CoshCoreItem.cosh_id == r.brand_cosh_id)
             )).scalar_one_or_none()
             if entry:
                 name = (entry.translations or {}).get("en") or r.brand_cosh_id
@@ -113,14 +113,14 @@ async def search_portfolio_brands(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Search cosh_reference_cache for brands matching a manufacturer name."""
+    """Search cosh_core_items for brands matching a manufacturer name."""
     manufacturer_name = data.get("manufacturer_name", "").strip().lower()
     if not manufacturer_name:
         raise HTTPException(status_code=422, detail="manufacturer_name required")
     result = await db.execute(
-        select(CoshReferenceCache).where(
-            CoshReferenceCache.entity_type == "brand",
-            CoshReferenceCache.status == "active",
+        select(CoshCoreItem).where(
+            CoshCoreItem.core_type == "brand",
+            CoshCoreItem.status == "active",
         )
     )
     all_brands = result.scalars().all()
