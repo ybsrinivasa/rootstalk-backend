@@ -1,6 +1,6 @@
-"""CCA Step 2 / Batch 2C — Publish-time mandatory-fields gate.
+"""CCA Step 2 / Batch 2C + Step 4 / Batch 4E — Publish-time gates.
 
-Spec §4.1 + §4.2 together require, before a Package can publish:
+Spec §4.1 + §4.2 + §6.4 together require, before a Package can publish:
 
 - All mandatory fields populated: name, package_type, duration_days,
   start_date_label_cosh_id. (These are enforced at create time as
@@ -10,6 +10,10 @@ Spec §4.1 + §4.2 together require, before a Package can publish:
 - §4.2 second-PoP rule: if any other DRAFT/ACTIVE PoP for the same
   (client, crop) shares at least one district with this PoP, BOTH
   must have non-empty P/V before either can publish.
+- §6.4 conditional-question rule (Batch 4E): every ConditionalQuestion
+  under any of this package's timelines must have at least one link
+  (PracticeConditional or RelationConditional) — a question with no
+  links would surface to the farmer but gate nothing.
 
 The validator returns the **complete** list of missing items so the
 CA portal can render a single consolidated checklist instead of
@@ -34,7 +38,9 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.advisory.models import (
-    Package, PackageAuthor, PackageLocation, PackageStatus, PackageVariable,
+    ConditionalQuestion, Package, PackageAuthor, PackageLocation,
+    PackageStatus, PackageVariable, PracticeConditional, RelationConditional,
+    Timeline,
 )
 
 
@@ -139,6 +145,61 @@ def validate_publish_readiness(
     return missing
 
 
+async def find_dangling_conditional_questions(
+    db: AsyncSession, *, package_id: str,
+) -> list[MissingPublishField]:
+    """CCA Step 4 / Batch 4E — dangling-question publish gate.
+
+    Every ConditionalQuestion under this package's timelines must have
+    at least one link (PracticeConditional or RelationConditional) by
+    publish time. A question with no links would surface to the farmer
+    in the field but gate nothing — meaningless and confusing — so the
+    publish gate refuses until the SE either deletes the question or
+    links a YES/NO answer to a practice or relation.
+
+    Returns one MissingPublishField per dangling question, each
+    carrying the question_id + question_text in `extra` so the CA
+    portal can deep-link the SE to the offending question.
+    """
+    timeline_ids_q = select(Timeline.id).where(
+        Timeline.package_id == package_id,
+    )
+
+    practice_link_exists = (
+        select(PracticeConditional.id)
+        .where(PracticeConditional.question_id == ConditionalQuestion.id)
+        .exists()
+    )
+    relation_link_exists = (
+        select(RelationConditional.id)
+        .where(RelationConditional.question_id == ConditionalQuestion.id)
+        .exists()
+    )
+
+    dangling = (await db.execute(
+        select(ConditionalQuestion).where(
+            ConditionalQuestion.timeline_id.in_(timeline_ids_q),
+            ~practice_link_exists,
+            ~relation_link_exists,
+        )
+    )).scalars().all()
+
+    return [
+        MissingPublishField(
+            "conditional_question_no_links",
+            (f"Conditional question '{q.question_text}' has no YES or NO "
+             "link to any practice or relation. Either link an answer or "
+             "delete the question before publishing."),
+            extra={
+                "question_id": q.id,
+                "question_text": q.question_text,
+                "timeline_id": q.timeline_id,
+            },
+        )
+        for q in dangling
+    ]
+
+
 async def assert_package_publish_ready(
     db: AsyncSession, *, package: Package,
 ) -> None:
@@ -222,5 +283,11 @@ async def assert_package_publish_ready(
         has_pv=has_pv,
         siblings_with_shared_districts=siblings_with_shared,
     )
+
+    # Batch 4E: dangling conditional-question gate.
+    missing.extend(
+        await find_dangling_conditional_questions(db, package_id=package.id)
+    )
+
     if missing:
         raise PublishBlockedError(missing)
