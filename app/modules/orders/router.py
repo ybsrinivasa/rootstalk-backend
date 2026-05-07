@@ -453,8 +453,8 @@ async def mark_item_available(
 
     Brand discipline (BL-07 audit, 2026-05-05):
       `brand_cosh_id` is REQUIRED and MUST refer to an active row in
-      `cosh_reference_cache` with entity_type='brand'. Free-text or
-      unknown identifiers are rejected with stable error codes
+      `cosh_core_items` with core_type='brand'. Free-text or unknown
+      identifiers are rejected with stable error codes
       (BRAND_REQUIRED / BRAND_NOT_IN_SYSTEM) so downstream analytics —
       brand comparisons, sale tracking, manufacturer reports, spelling
       consistency — stay reliable. The dealer's typed `brand_name` is
@@ -471,7 +471,7 @@ async def mark_item_available(
     Falls back to flat OR-group closure if the relation_role is missing or malformed.
     """
     from app.services.relations import decode_role
-    from app.modules.sync.models import CoshReferenceCache
+    from app.modules.sync.models import CoshCoreItem
 
     await _get_dealer_order(db, order_id, current_user.id)
     item = await _get_order_item(db, item_id, order_id)
@@ -495,10 +495,10 @@ async def mark_item_available(
         )
 
     brand_row = (await db.execute(
-        select(CoshReferenceCache).where(
-            CoshReferenceCache.cosh_id == brand_cosh_id,
-            CoshReferenceCache.entity_type == "brand",
-            CoshReferenceCache.status == "active",
+        select(CoshCoreItem).where(
+            CoshCoreItem.cosh_id == brand_cosh_id,
+            CoshCoreItem.core_type == "brand",
+            CoshCoreItem.status == "active",
         )
     )).scalar_one_or_none()
     if brand_row is None:

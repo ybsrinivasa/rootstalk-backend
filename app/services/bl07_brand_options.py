@@ -113,14 +113,14 @@ async def get_brand_options(
     the per-subscription versioning system), the practice's elements are
     sourced from the frozen snapshot content rather than the master Element
     table. This protects the dealer's view of brand-lock state from SE
-    edits made AFTER order placement (Rule 5). Cosh-cache lookups (brand
-    name translations, alternative-brand list) stay master-sourced because
-    cosh_reference_cache is a global reference, not per-subscription.
+    edits made AFTER order placement (Rule 5). Cosh lookups (brand name
+    translations, alternative-brand list) stay master-sourced because
+    cosh_core_items is a global reference, not per-subscription.
     """
     from sqlalchemy import select
     from app.modules.advisory.models import Practice, Element
     from app.modules.orders.models import DealerRelationship
-    from app.modules.sync.models import CoshReferenceCache
+    from app.modules.sync.models import CoshCoreItem
 
     elements = _practice_elements_from_snapshot(snapshot, practice_id)
     if elements is None:
@@ -143,9 +143,9 @@ async def get_brand_options(
     if locked_el:
         locked_cosh_ref = _el_field(locked_el, "cosh_ref")
         brand_entry = (await db.execute(
-            select(CoshReferenceCache).where(
-                CoshReferenceCache.cosh_id == locked_cosh_ref,
-                CoshReferenceCache.entity_type == "brand",
+            select(CoshCoreItem).where(
+                CoshCoreItem.cosh_id == locked_cosh_ref,
+                CoshCoreItem.core_type == "brand",
             )
         )).scalar_one_or_none()
         brand_name = None
@@ -157,7 +157,7 @@ async def get_brand_options(
             locked_brand_name=brand_name or locked_cosh_ref,
         )
 
-    # Unlocked brand — find available brands from cosh_reference_cache
+    # Unlocked brand — find available brands from cosh_core_items
     common_name_el = next(
         (e for e in elements
          if _el_field(e, "element_type") == "common_name" and _el_field(e, "cosh_ref")),
@@ -167,11 +167,11 @@ async def get_brand_options(
 
     if common_name_cosh_id:
         brands_result = await db.execute(
-            select(CoshReferenceCache).where(
-                CoshReferenceCache.entity_type == "brand",
-                CoshReferenceCache.parent_cosh_id == common_name_cosh_id,
-                CoshReferenceCache.status == "active",
-            ).order_by(CoshReferenceCache.cosh_id)
+            select(CoshCoreItem).where(
+                CoshCoreItem.core_type == "brand",
+                CoshCoreItem.parent_cosh_id == common_name_cosh_id,
+                CoshCoreItem.status == "active",
+            ).order_by(CoshCoreItem.cosh_id)
         )
         all_brands = brands_result.scalars().all()
     else:

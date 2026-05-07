@@ -19,7 +19,7 @@ from app.modules.orders.models import (
     Order, OrderItem, OrderItemStatus, OrderStatus,
 )
 from app.modules.orders.router import mark_item_available
-from app.modules.sync.models import CoshReferenceCache
+from app.modules.sync.models import CoshCoreItem
 from tests.conftest import requires_docker
 from tests.factories import (
     make_client, make_element, make_package, make_practice, make_subscription,
@@ -123,8 +123,8 @@ async def test_mark_available_rejects_unknown_brand(db):
 async def test_mark_available_rejects_inactive_brand(db):
     """A brand that exists but is status='retired' must also be rejected."""
     order, item, dealer = await _seed_dealer_orderitem(db)
-    db.add(CoshReferenceCache(
-        cosh_id="brand:retired", entity_type="brand",
+    db.add(CoshCoreItem(
+        cosh_id="brand:retired", core_type="brand",
         translations={"en": "Old Brand"},
         status="retired",
     ))
@@ -146,8 +146,8 @@ async def test_mark_available_rejects_inactive_brand(db):
 @pytest.mark.asyncio
 async def test_mark_available_succeeds_for_valid_brand(db):
     order, item, dealer = await _seed_dealer_orderitem(db)
-    db.add(CoshReferenceCache(
-        cosh_id="brand:dithane-m45", entity_type="brand",
+    db.add(CoshCoreItem(
+        cosh_id="brand:dithane-m45", core_type="brand",
         translations={"en": "Dithane M-45"},
         status="active",
     ))
@@ -181,8 +181,8 @@ async def test_canonical_name_falls_back_to_cosh_id_when_no_translation(db):
     """If the brand has no English translation, the cosh_id is used as
     the canonical name (defensive)."""
     order, item, dealer = await _seed_dealer_orderitem(db)
-    db.add(CoshReferenceCache(
-        cosh_id="brand:no-translation", entity_type="brand",
+    db.add(CoshCoreItem(
+        cosh_id="brand:no-translation", core_type="brand",
         translations={},   # empty
         status="active",
     ))
