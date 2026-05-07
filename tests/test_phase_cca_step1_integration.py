@@ -625,6 +625,26 @@ async def test_publish_package_succeeds_after_re_add(db):
         db, client=client, crop_cosh_id="crop:paddy",
         name="Reviving PoP", status=PackageStatus.DRAFT,
     )
+    # CCA Step 2 / Batch 2C gate: publish requires start_date_label,
+    # at least one location, and at least one author. The local
+    # `_make_package` helper is intentionally minimalist for the
+    # cascade-behaviour tests; satisfy the gate here so we exercise
+    # the Step 1 crop-on-belt path, not the Step 2 publish-readiness
+    # path.
+    from app.modules.advisory.models import PackageAuthor, PackageLocation
+    from app.modules.clients.models import ClientUser, ClientUserRole
+    from app.modules.platform.models import StatusEnum
+    pkg.start_date_label_cosh_id = "label:sowing_date"
+    db.add(PackageLocation(
+        package_id=pkg.id, state_cosh_id="S1", district_cosh_id="D-revive",
+    ))
+    se = await make_user(db, name="Reviving Author")
+    db.add(ClientUser(
+        client_id=client.id, user_id=se.id,
+        role=ClientUserRole.SUBJECT_EXPERT,
+        status=StatusEnum.ACTIVE,
+    ))
+    db.add(PackageAuthor(package_id=pkg.id, user_id=se.id))
     await db.commit()
     await remove_crop(client_id=client.id, crop_id=crop.id, db=db, current_user=user)
     await add_crop(

@@ -46,6 +46,26 @@ from app.services.pv_uniqueness import (
 from app.services.pv_consistency import (
     PVConsistencyError, assert_pv_consistency_for_package,
 )
+from app.services.publish_validation import (
+    PublishBlockedError, assert_package_publish_ready,
+)
+
+
+def _raise_publish_blocked(e: PublishBlockedError):
+    """Map a PublishBlockedError to a 422 with a complete checklist
+    body. The CA portal renders one item per missing requirement so
+    the expert can fix them all in a single pass."""
+    raise HTTPException(
+        status_code=422,
+        detail={
+            "code": e.code,
+            "message": str(e),
+            "missing": [
+                {"code": m.code, "message": m.message, **(m.extra or {})}
+                for m in e.missing
+            ],
+        },
+    )
 
 
 def _raise_pv_consistency(e: PVConsistencyError):
@@ -256,6 +276,18 @@ async def publish_package(
             status_code=422,
             detail={"code": e.code, "message": str(e)},
         )
+
+    # CCA Step 2 / Batch 2C: complete-checklist publish-readiness
+    # gate. Surfaces every missing mandatory field + the §4.2
+    # second-PoP rule as a single consolidated 422 response so the
+    # CA portal can render a checklist instead of forcing the
+    # expert through fix-one-at-a-time roundtrips. Runs BEFORE the
+    # 2D/2E defensive checks because a missing-fields failure is
+    # the more fundamental issue — fix it first, then re-publish.
+    try:
+        await assert_package_publish_ready(db, package=pkg)
+    except PublishBlockedError as e:
+        _raise_publish_blocked(e)
 
     # CCA Step 2 / Batch 2D: defensive uniqueness check at publish.
     # The save-time guards on set_package_variables / locations

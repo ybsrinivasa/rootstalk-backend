@@ -17,14 +17,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.advisory.models import (
     ConditionalAnswer, ConditionalQuestion, Element, PGElement, PGPractice,
-    PGRecommendation, PGTimeline, Package, PackageLocation, PackageStatus,
-    PackageType, PackageVariable, Parameter, ParameterSource,
+    PGRecommendation, PGTimeline, Package, PackageAuthor, PackageLocation,
+    PackageStatus, PackageType, PackageVariable, Parameter, ParameterSource,
     Practice, PracticeConditional, PracticeL0, Relation, RelationType,
     SPElement, SPPractice, SPRecommendation, SPTimeline, Timeline,
     TimelineFromType, Variable,
 )
-from app.modules.clients.models import Client, ClientCrop
-from app.modules.platform.models import User
+from app.modules.clients.models import (
+    Client, ClientCrop, ClientUser, ClientUserRole,
+)
+from app.modules.platform.models import StatusEnum, User
 from app.modules.subscriptions.models import (
     Subscription, SubscriptionStatus, SubscriptionType,
 )
@@ -95,12 +97,19 @@ async def make_client(db: AsyncSession, **kw) -> Client:
 async def make_package(db: AsyncSession, client: Client, **kw) -> Package:
     """Create a Package row.
 
-    Batch 1C invariant: every Package in production has a matching
-    ACTIVE ClientCrop row (the crop must be on the company's
-    conveyor belt). The factory mirrors that invariant by
-    idempotently inserting the ClientCrop row before the Package.
-    Tests that exercise the soft-removed-crop edge case bypass this
-    factory and seed Package rows directly.
+    Mirrors the production invariants enforced by the live router so
+    tests don't have to opt in to each one:
+
+    - Batch 1C: every Package has a matching ACTIVE ClientCrop row
+      (idempotent insert).
+    - Batch 2C: Package can publish — has at least one
+      PackageLocation and at least one PackageAuthor. The factory
+      auto-creates a default Subject Expert + ClientUser row + author
+      link so the publish gate is satisfied out of the box.
+
+    Tests that exercise the unset-fields edge cases (e.g. CCA Step 2
+    Batch 2C tests for `no_locations` / `no_authors`) bypass this
+    factory and create Packages via the API endpoints directly.
     """
     crop_cosh_id = kw.get("crop_cosh_id", "crop:test")
     existing_cc = (await db.execute(
@@ -119,9 +128,33 @@ async def make_package(db: AsyncSession, client: Client, **kw) -> Package:
         name=kw.get("name", "Test PoP"),
         package_type=PackageType.ANNUAL,
         duration_days=120,
+        start_date_label_cosh_id=kw.get(
+            "start_date_label_cosh_id", "label:sowing_date",
+        ),
         status=PackageStatus.ACTIVE,
     )
     db.add(p)
+    await db.flush()
+
+    # Unique district per Package so two factory-created Packages
+    # under the same client don't trip the §4.2 shared-district rule
+    # (Batch 2D / 2E / 2C). Tests that specifically need shared
+    # districts set them explicitly via the API.
+    db.add(PackageLocation(
+        package_id=p.id,
+        state_cosh_id="state:test",
+        district_cosh_id=_short("district:test:"),
+    ))
+
+    se = User(phone=_short("+91"), name="Test SE")
+    db.add(se)
+    await db.flush()
+    db.add(ClientUser(
+        client_id=client.id, user_id=se.id,
+        role=ClientUserRole.SUBJECT_EXPERT,
+        status=StatusEnum.ACTIVE,
+    ))
+    db.add(PackageAuthor(package_id=p.id, user_id=se.id))
     await db.flush()
     return p
 
