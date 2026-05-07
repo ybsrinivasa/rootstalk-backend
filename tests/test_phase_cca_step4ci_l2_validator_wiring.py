@@ -4,7 +4,7 @@ Pure-function validator coverage lives in
 `tests/test_l2_element_validator.py` (mocked cascade lookups).
 
 This file drives `create_practice` and `create_global_practice` end to
-end against the testcontainer DB, seeding real CoshReferenceCache rows
+end against the testcontainer DB, seeding real cosh_core_items rows
 so the cascade service walks live data, to verify:
   • a valid element list creates the Practice + Elements (201)
   • each rule violation surfaces as a 422 with stable error codes
@@ -20,7 +20,7 @@ from sqlalchemy import select
 from app.modules.advisory.models import Element, Practice, PracticeL0, TimelineFromType
 from app.modules.advisory.router import create_practice
 from app.modules.advisory.schemas import ElementIn, PracticeCreate
-from app.modules.sync.models import CoshReferenceCache
+from app.modules.sync.models import CoshCoreItem
 from tests.conftest import requires_docker
 from tests.factories import (
     make_client, make_crop_reference, make_package, make_timeline, make_user,
@@ -30,19 +30,19 @@ from tests.factories import (
 # ── Cosh seeding helpers ────────────────────────────────────────────────────
 
 async def _seed_pesticide_cosh(db) -> None:
-    """Seed the CoshReferenceCache rows the cascade service walks for a
+    """Seed cosh_core_items rows the cascade service walks for a
     Chemical Pesticide happy-path validation."""
     rows = [
         # Cores referenced by cosh_core: sources
-        CoshReferenceCache(cosh_id="cn:imida", entity_type="common_name",
-                           translations={"en": "Imidacloprid"}, status="active"),
-        CoshReferenceCache(cosh_id="am:foliar_spray", entity_type="application_method",
-                           translations={"en": "Foliar spray"}, status="active"),
-        CoshReferenceCache(cosh_id="du:ml_per_l", entity_type="dosage_unit",
-                           translations={"en": "ml/L"}, status="active"),
+        CoshCoreItem(cosh_id="cn:imida", core_type="common_name",
+                     translations={"en": "Imidacloprid"}, status="active"),
+        CoshCoreItem(cosh_id="am:foliar_spray", core_type="application_method",
+                     translations={"en": "Foliar spray"}, status="active"),
+        CoshCoreItem(cosh_id="du:ml_per_l", core_type="dosage_unit",
+                     translations={"en": "ml/L"}, status="active"),
         # Brand row: parent=common_name, manufacturer in metadata
-        CoshReferenceCache(
-            cosh_id="brand:confidor", entity_type="brand",
+        CoshCoreItem(
+            cosh_id="brand:confidor", core_type="brand",
             parent_cosh_id="cn:imida",
             translations={"en": "Confidor"},
             metadata_={
@@ -52,8 +52,8 @@ async def _seed_pesticide_cosh(db) -> None:
             },
             status="active",
         ),
-        CoshReferenceCache(cosh_id="form:SC", entity_type="formulation",
-                           translations={"en": "SC"}, status="active"),
+        CoshCoreItem(cosh_id="form:SC", core_type="formulation",
+                     translations={"en": "SC"}, status="active"),
     ]
     for r in rows:
         db.add(r)
@@ -220,11 +220,11 @@ async def test_special_input_required_for_adjuvants(db):
     """ADJUVANTS L2 with is_special_input=False is rejected."""
     client, user, pkg, tl = await _setup_timeline(db)
     db.add_all([
-        CoshReferenceCache(cosh_id="cn:silwet", entity_type="common_name",
+        CoshCoreItem(cosh_id="cn:silwet", core_type="common_name",
                            translations={"en": "Silwet"}, status="active"),
-        CoshReferenceCache(cosh_id="am:foliar", entity_type="application_method",
+        CoshCoreItem(cosh_id="am:foliar", core_type="application_method",
                            translations={"en": "Foliar"}, status="active"),
-        CoshReferenceCache(cosh_id="du:ml", entity_type="dosage_unit",
+        CoshCoreItem(cosh_id="du:ml", core_type="dosage_unit",
                            translations={"en": "ml/L"}, status="active"),
     ])
     await db.commit()
@@ -258,11 +258,11 @@ async def test_frequency_days_persists_and_validates(db):
     saves successfully and persists the frequency_days column."""
     client, user, pkg, tl = await _setup_timeline(db)
     db.add_all([
-        CoshReferenceCache(cosh_id="du:kg_acre", entity_type="dosage_unit",
+        CoshCoreItem(cosh_id="du:kg_acre", core_type="dosage_unit",
                            translations={"en": "kg/acre"}, status="active"),
-        CoshReferenceCache(cosh_id="form:water_soluble", entity_type="formulation",
+        CoshCoreItem(cosh_id="form:water_soluble", core_type="formulation",
                            translations={"en": "Water soluble"}, status="active"),
-        CoshReferenceCache(cosh_id="am:fertigation", entity_type="application_method",
+        CoshCoreItem(cosh_id="am:fertigation", core_type="application_method",
                            translations={"en": "Fertigation"}, status="active"),
     ])
     await db.commit()
@@ -298,11 +298,11 @@ async def test_frequency_mismatch_returns_422(db):
     """Practice.frequency_days ≠ FERTIGATION_INTERVAL → 422."""
     client, user, pkg, tl = await _setup_timeline(db)
     db.add_all([
-        CoshReferenceCache(cosh_id="du:kg_acre", entity_type="dosage_unit",
+        CoshCoreItem(cosh_id="du:kg_acre", core_type="dosage_unit",
                            translations={"en": "kg/acre"}, status="active"),
-        CoshReferenceCache(cosh_id="form:water_soluble", entity_type="formulation",
+        CoshCoreItem(cosh_id="form:water_soluble", core_type="formulation",
                            translations={"en": "Water soluble"}, status="active"),
-        CoshReferenceCache(cosh_id="am:fertigation", entity_type="application_method",
+        CoshCoreItem(cosh_id="am:fertigation", core_type="application_method",
                            translations={"en": "Fertigation"}, status="active"),
     ])
     await db.commit()

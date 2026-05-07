@@ -1,34 +1,36 @@
 """
 Cosh Cascade Service
 
-Named lookup functions that walk the Cosh reference cache to produce the
-filtered option lists referenced by `cosh_cascade:<name>` sources in the
-L2 element rule book (see `l2_element_rules.py`).
+Named lookup functions that walk the typed Cosh tables to produce the
+filtered option lists referenced by `cosh_cascade:<name>` sources in
+the L2 element rule book (see `l2_element_rules.py`).
 
-This module is the single boundary between the L2 element validator and
-the underlying `cosh_reference_cache` schema. When the dedicated-tables
-schema migration lands later, only this file is rewritten — the rule
-book and validator stay untouched.
+This module is the single boundary between the L2 element validator
+and the underlying Cosh storage. The schema migration (commits
+5b4967e, 0952ffb, …) moved truth-source from the legacy
+`cosh_reference_cache` to `cosh_core_items` + `cosh_connect_rows`;
+this module reads from the new tables exclusively.
 
-Current data shape (from sync handler + BL-07 conventions)
-----------------------------------------------------------
-  entity_type='common_name'  : top-level CNI item.
-  entity_type='brand'        : parent_cosh_id = CNI;
-                               metadata_ may carry:
-                                 manufacturer_name        (str, free text)
-                                 manufacturer_client_id   (str, optional)
-                                 formulation_cosh_id      (str, optional)
-                                 ai_concentration         (str, optional —
-                                   may be a label like "75% WP" or a cosh_id)
+Data shape this module assumes
+------------------------------
+  cosh_core_items (core_type='common_name')   : top-level CNI item.
+  cosh_core_items (core_type='brand')         : parent_cosh_id = CNI;
+                                                metadata_ may carry:
+                                                  manufacturer_name        (str)
+                                                  manufacturer_client_id   (str, optional)
+                                                  formulation_cosh_id      (str, optional)
+                                                  ai_concentration         (str, optional)
+  cosh_core_items (core_type='formulation')   : referenced by brand.metadata_
 
 Manufacturers do not currently have their own Cosh rows; they exist as
-name strings on brand metadata. The cascade returns option `value`s that
-the SE picks and the validator stores back into Element.cosh_ref. For
-manufacturers this is the name string itself; for brands and
+name strings on brand metadata. The cascade returns option `value`s
+that the SE picks and the validator stores back into Element.cosh_ref.
+For manufacturers this is the name string itself; for brands and
 formulations it's the cosh_id.
 
 Cascade names recognised here must match `COSH_CASCADE_LOOKUPS` in
-`l2_element_rules.py`. Adding a new cascade requires updating both files.
+`l2_element_rules.py`. Adding a new cascade requires updating both
+files.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -37,7 +39,7 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.sync.models import CoshReferenceCache
+from app.modules.sync.models import CoshCoreItem
 
 
 # ── Public types ────────────────────────────────────────────────────────────
@@ -61,15 +63,15 @@ class CascadeOption:
 async def manufacturers_for_common_name(
     db: AsyncSession, common_name_cosh_id: Optional[str],
 ) -> list[CascadeOption]:
-    """Distinct manufacturer name strings across active brand rows whose
-    parent is this CNI. Sorted case-insensitive by label."""
+    """Distinct manufacturer name strings across active brand rows
+    whose parent is this CNI. Sorted case-insensitive by label."""
     if not common_name_cosh_id:
         return []
     result = await db.execute(
-        select(CoshReferenceCache).where(
-            CoshReferenceCache.entity_type == "brand",
-            CoshReferenceCache.parent_cosh_id == common_name_cosh_id,
-            CoshReferenceCache.status == "active",
+        select(CoshCoreItem).where(
+            CoshCoreItem.core_type == "brand",
+            CoshCoreItem.parent_cosh_id == common_name_cosh_id,
+            CoshCoreItem.status == "active",
         )
     )
     seen: dict[str, CascadeOption] = {}
@@ -95,10 +97,10 @@ async def brands_for_common_name_and_manufacturer(
         return []
     target = manufacturer_name.lower()
     result = await db.execute(
-        select(CoshReferenceCache).where(
-            CoshReferenceCache.entity_type == "brand",
-            CoshReferenceCache.parent_cosh_id == common_name_cosh_id,
-            CoshReferenceCache.status == "active",
+        select(CoshCoreItem).where(
+            CoshCoreItem.core_type == "brand",
+            CoshCoreItem.parent_cosh_id == common_name_cosh_id,
+            CoshCoreItem.status == "active",
         )
     )
     options: list[CascadeOption] = []
@@ -114,15 +116,15 @@ async def brands_for_common_name_and_manufacturer(
 async def formulation_for_brand(
     db: AsyncSession, brand_cosh_id: Optional[str],
 ) -> list[CascadeOption]:
-    """Auto-selected: the brand's own formulation_cosh_id from metadata.
-    Returns 0 or 1 option (auto-selected fields are deterministic when
-    the brand carries the linkage)."""
+    """Auto-selected: the brand's own formulation_cosh_id from
+    metadata. Returns 0 or 1 option (auto-selected fields are
+    deterministic when the brand carries the linkage)."""
     if not brand_cosh_id:
         return []
     brand = (await db.execute(
-        select(CoshReferenceCache).where(
-            CoshReferenceCache.cosh_id == brand_cosh_id,
-            CoshReferenceCache.entity_type == "brand",
+        select(CoshCoreItem).where(
+            CoshCoreItem.cosh_id == brand_cosh_id,
+            CoshCoreItem.core_type == "brand",
         )
     )).scalar_one_or_none()
     if not brand:
@@ -131,9 +133,9 @@ async def formulation_for_brand(
     if not fid:
         return []
     fmt = (await db.execute(
-        select(CoshReferenceCache).where(
-            CoshReferenceCache.cosh_id == fid,
-            CoshReferenceCache.entity_type == "formulation",
+        select(CoshCoreItem).where(
+            CoshCoreItem.cosh_id == fid,
+            CoshCoreItem.core_type == "formulation",
         )
     )).scalar_one_or_none()
     label = (fmt.translations or {}).get("en") if fmt and fmt.translations else None
@@ -143,15 +145,15 @@ async def formulation_for_brand(
 async def ai_concentration_for_brand(
     db: AsyncSession, brand_cosh_id: Optional[str],
 ) -> list[CascadeOption]:
-    """Auto-selected: the brand's a.i. concentration value from metadata.
-    Stored as a string (may be a label like "75% WP" or a cosh_id pointing
-    to a structured concentration entity)."""
+    """Auto-selected: the brand's a.i. concentration value from
+    metadata. Stored as a string (may be a label like "75% WP" or a
+    cosh_id pointing to a structured concentration entity)."""
     if not brand_cosh_id:
         return []
     brand = (await db.execute(
-        select(CoshReferenceCache).where(
-            CoshReferenceCache.cosh_id == brand_cosh_id,
-            CoshReferenceCache.entity_type == "brand",
+        select(CoshCoreItem).where(
+            CoshCoreItem.cosh_id == brand_cosh_id,
+            CoshCoreItem.core_type == "brand",
         )
     )).scalar_one_or_none()
     if not brand:
@@ -169,13 +171,17 @@ async def ai_concentration_for_brand(
 async def list_core_options(
     db: AsyncSession, entity_type: str,
 ) -> list[CascadeOption]:
-    """All active items of a Cosh Core entity_type. Used by the validator
-    to enforce that values for `cosh_core:<slug>` fields are real Cosh
-    entities. Sorted by English label."""
+    """All active items of a Cosh Core type. Used by the validator to
+    enforce that values for `cosh_core:<slug>` fields are real Cosh
+    entities. Sorted by English label.
+
+    The parameter is kept named `entity_type` for back-compat with the
+    L2 element validator's COSH_CORE_SLUG_MAP — its values are core_type
+    strings now, but the slug-to-core-type mapping is 1:1 today."""
     result = await db.execute(
-        select(CoshReferenceCache).where(
-            CoshReferenceCache.entity_type == entity_type,
-            CoshReferenceCache.status == "active",
+        select(CoshCoreItem).where(
+            CoshCoreItem.core_type == entity_type,
+            CoshCoreItem.status == "active",
         )
     )
     options: list[CascadeOption] = []
@@ -198,10 +204,11 @@ CASCADE_INPUTS: dict[str, tuple[str, ...]] = {
 async def list_cascade_options(
     db: AsyncSession, cascade_name: str, inputs: dict[str, Optional[str]],
 ) -> list[CascadeOption]:
-    """Validator-facing dispatch. Accepts the full upstream-field map and
-    extracts the inputs each cascade needs. Returns [] when any required
-    upstream field is missing — the caller decides whether that's an error
-    (mandatory_if_set) or expected (cascade not yet activated)."""
+    """Validator-facing dispatch. Accepts the full upstream-field map
+    and extracts the inputs each cascade needs. Returns [] when any
+    required upstream field is missing — the caller decides whether
+    that's an error (mandatory_if_set) or expected (cascade not yet
+    activated)."""
     if cascade_name == "manufacturers_for_common_name":
         return await manufacturers_for_common_name(db, inputs.get("COMMON_NAME"))
     if cascade_name == "brands_for_common_name_and_manufacturer":
