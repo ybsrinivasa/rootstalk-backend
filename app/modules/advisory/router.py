@@ -49,6 +49,41 @@ from app.services.pv_consistency import (
 from app.services.publish_validation import (
     PublishBlockedError, assert_package_publish_ready,
 )
+from app.services.timeline_validation import (
+    TimelineValidationError, validate_timeline,
+)
+
+
+def _raise_timeline_validation(e: TimelineValidationError):
+    raise HTTPException(
+        status_code=422,
+        detail={"code": e.code, "message": e.message},
+    )
+
+
+async def _assert_timeline_name_unique(
+    db: AsyncSession, *, package_id: str, name: str,
+    exclude_timeline_id: str | None = None,
+) -> None:
+    """Pre-check name uniqueness so we surface a friendly 422 instead
+    of letting the DB unique constraint fire as a 500. `exclude_timeline_id`
+    lets `update_timeline` re-check without false-positiving on its own
+    row when the name isn't actually changing."""
+    q = select(Timeline).where(
+        Timeline.package_id == package_id,
+        Timeline.name == name,
+    )
+    if exclude_timeline_id is not None:
+        q = q.where(Timeline.id != exclude_timeline_id)
+    existing = (await db.execute(q)).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "timeline_name_duplicate",
+                "message": f"A timeline named '{name}' already exists in this Package.",
+            },
+        )
 
 
 def _raise_publish_blocked(e: PublishBlockedError):
@@ -800,8 +835,25 @@ async def create_timeline(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    await _get_package(db, package_id, client_id)
-    _validate_timeline(request)
+    """CCA Step 3 / Batch 3-Hardening: validates type/direction/sign
+    against the parent Package's type, plus pre-checks name
+    uniqueness within the Package so duplicate names surface as a
+    friendly 422 instead of a 500 from the DB unique constraint."""
+    pkg = await _get_package(db, package_id, client_id)
+
+    try:
+        validate_timeline(
+            package_type=pkg.package_type.value,
+            from_type=request.from_type.value,
+            from_value=request.from_value,
+            to_value=request.to_value,
+        )
+    except TimelineValidationError as e:
+        _raise_timeline_validation(e)
+
+    await _assert_timeline_name_unique(
+        db, package_id=package_id, name=request.name,
+    )
 
     tl = Timeline(package_id=package_id, **request.model_dump())
     db.add(tl)
@@ -817,19 +869,36 @@ async def update_timeline(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """CCA Step 3 / Batch 3-Hardening: name-uniqueness pre-check on
+    rename + direction + sign re-validation post-update.
+
+    `from_type` is intentionally not exposed in `TimelineUpdate`, so
+    type ↔ package consistency is fixed at create time and the
+    update path doesn't need to re-check it.
+    """
+    pkg = await _get_package(db, package_id, client_id)
     tl = await _get_timeline(db, timeline_id, package_id)
-    for field, value in request.model_dump(exclude_unset=True).items():
+
+    update_data = request.model_dump(exclude_unset=True)
+    if "name" in update_data and update_data["name"] != tl.name:
+        await _assert_timeline_name_unique(
+            db, package_id=package_id, name=update_data["name"],
+            exclude_timeline_id=timeline_id,
+        )
+
+    new_from = update_data.get("from_value", tl.from_value)
+    new_to = update_data.get("to_value", tl.to_value)
+    try:
+        validate_timeline(
+            package_type=pkg.package_type.value,
+            from_type=tl.from_type.value,
+            from_value=new_from, to_value=new_to,
+        )
+    except TimelineValidationError as e:
+        _raise_timeline_validation(e)
+
+    for field, value in update_data.items():
         setattr(tl, field, value)
-    # BL-17: validate boundaries after applying changes
-    from app.modules.advisory.models import TimelineFromType
-    check_from = request.from_value if request.from_value is not None else tl.from_value
-    check_to = request.to_value if request.to_value is not None else tl.to_value
-    if tl.from_type == TimelineFromType.DBS:
-        if check_to >= check_from:
-            raise HTTPException(status_code=422, detail="DBS timeline: from_value must be greater than to_value")
-    else:
-        if check_to <= check_from:
-            raise HTTPException(status_code=422, detail="DAS/CALENDAR timeline: to_value must be greater than from_value")
     await db.commit()
     await db.refresh(tl)
     return tl
@@ -867,6 +936,27 @@ async def import_timeline(
     src_tl = (await db.execute(select(Timeline).where(Timeline.id == source_id))).scalar_one_or_none()
     if not src_tl:
         raise HTTPException(status_code=404, detail="Source timeline not found")
+
+    # CCA Step 3 / Batch 3-Hardening: validate the imported timeline
+    # against the TARGET package's type — source might be Annual+DAS
+    # and target might be Perennial; that combo is a type mismatch.
+    # Plus the standard direction + sign checks. Plus name uniqueness
+    # in the target package (the unique constraint would otherwise
+    # surface as a 500).
+    target_pkg = await _get_package(db, package_id, client_id)
+    try:
+        validate_timeline(
+            package_type=target_pkg.package_type.value,
+            from_type=src_tl.from_type.value,
+            from_value=src_tl.from_value,
+            to_value=src_tl.to_value,
+        )
+    except TimelineValidationError as e:
+        _raise_timeline_validation(e)
+
+    await _assert_timeline_name_unique(
+        db, package_id=package_id, name=new_name,
+    )
 
     # Create new timeline in target package
     new_tl = Timeline(
@@ -1052,17 +1142,6 @@ async def _get_timeline(db: AsyncSession, timeline_id: str, package_id: str) -> 
     if not tl:
         raise HTTPException(status_code=404, detail="Timeline not found")
     return tl
-
-
-def _validate_timeline(request: TimelineCreate):
-    """DBS: from > to. DAS/CALENDAR: to > from. No cross-start timelines."""
-    from app.modules.advisory.models import TimelineFromType
-    if request.from_type == TimelineFromType.DBS:
-        if request.to_value >= request.from_value:
-            raise HTTPException(status_code=422, detail="DBS timeline: from_value must be greater than to_value")
-    else:
-        if request.to_value <= request.from_value:
-            raise HTTPException(status_code=422, detail="DAS/CALENDAR timeline: to_value must be greater than from_value")
 
 
 # ── Global CCA Packages ────────────────────────────────────────────────────────
