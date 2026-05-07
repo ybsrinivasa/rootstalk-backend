@@ -1,0 +1,215 @@
+"""
+Cosh Cascade Service
+
+Named lookup functions that walk the Cosh reference cache to produce the
+filtered option lists referenced by `cosh_cascade:<name>` sources in the
+L2 element rule book (see `l2_element_rules.py`).
+
+This module is the single boundary between the L2 element validator and
+the underlying `cosh_reference_cache` schema. When the dedicated-tables
+schema migration lands later, only this file is rewritten — the rule
+book and validator stay untouched.
+
+Current data shape (from sync handler + BL-07 conventions)
+----------------------------------------------------------
+  entity_type='common_name'  : top-level CNI item.
+  entity_type='brand'        : parent_cosh_id = CNI;
+                               metadata_ may carry:
+                                 manufacturer_name        (str, free text)
+                                 manufacturer_client_id   (str, optional)
+                                 formulation_cosh_id      (str, optional)
+                                 ai_concentration         (str, optional —
+                                   may be a label like "75% WP" or a cosh_id)
+
+Manufacturers do not currently have their own Cosh rows; they exist as
+name strings on brand metadata. The cascade returns option `value`s that
+the SE picks and the validator stores back into Element.cosh_ref. For
+manufacturers this is the name string itself; for brands and
+formulations it's the cosh_id.
+
+Cascade names recognised here must match `COSH_CASCADE_LOOKUPS` in
+`l2_element_rules.py`. Adding a new cascade requires updating both files.
+"""
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Optional
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.modules.sync.models import CoshReferenceCache
+
+
+# ── Public types ────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class CascadeOption:
+    """One row in a cascade dropdown's option list.
+
+    `value` is what the SE's choice is stored as in Element.cosh_ref —
+    a cosh_id for entity-backed options (brand, formulation), a name
+    string for free-text options (manufacturer).
+
+    `label` is the display string shown in the dropdown.
+    """
+    value: str
+    label: str
+
+
+# ── Per-cascade walks ───────────────────────────────────────────────────────
+
+async def manufacturers_for_common_name(
+    db: AsyncSession, common_name_cosh_id: Optional[str],
+) -> list[CascadeOption]:
+    """Distinct manufacturer name strings across active brand rows whose
+    parent is this CNI. Sorted case-insensitive by label."""
+    if not common_name_cosh_id:
+        return []
+    result = await db.execute(
+        select(CoshReferenceCache).where(
+            CoshReferenceCache.entity_type == "brand",
+            CoshReferenceCache.parent_cosh_id == common_name_cosh_id,
+            CoshReferenceCache.status == "active",
+        )
+    )
+    seen: dict[str, CascadeOption] = {}
+    for row in result.scalars().all():
+        meta = row.metadata_ or {}
+        mn = meta.get("manufacturer_name")
+        if not mn:
+            continue
+        key = mn.lower()
+        if key not in seen:
+            seen[key] = CascadeOption(value=mn, label=mn)
+    return sorted(seen.values(), key=lambda o: o.label.lower())
+
+
+async def brands_for_common_name_and_manufacturer(
+    db: AsyncSession,
+    common_name_cosh_id: Optional[str],
+    manufacturer_name: Optional[str],
+) -> list[CascadeOption]:
+    """Brand options for a (CNI, manufacturer name) pair. Match on
+    manufacturer_name is case-insensitive. Sorted by display label."""
+    if not common_name_cosh_id or not manufacturer_name:
+        return []
+    target = manufacturer_name.lower()
+    result = await db.execute(
+        select(CoshReferenceCache).where(
+            CoshReferenceCache.entity_type == "brand",
+            CoshReferenceCache.parent_cosh_id == common_name_cosh_id,
+            CoshReferenceCache.status == "active",
+        )
+    )
+    options: list[CascadeOption] = []
+    for row in result.scalars().all():
+        meta = row.metadata_ or {}
+        if (meta.get("manufacturer_name") or "").lower() != target:
+            continue
+        label = (row.translations or {}).get("en") or row.cosh_id
+        options.append(CascadeOption(value=row.cosh_id, label=label))
+    return sorted(options, key=lambda o: o.label.lower())
+
+
+async def formulation_for_brand(
+    db: AsyncSession, brand_cosh_id: Optional[str],
+) -> list[CascadeOption]:
+    """Auto-selected: the brand's own formulation_cosh_id from metadata.
+    Returns 0 or 1 option (auto-selected fields are deterministic when
+    the brand carries the linkage)."""
+    if not brand_cosh_id:
+        return []
+    brand = (await db.execute(
+        select(CoshReferenceCache).where(
+            CoshReferenceCache.cosh_id == brand_cosh_id,
+            CoshReferenceCache.entity_type == "brand",
+        )
+    )).scalar_one_or_none()
+    if not brand:
+        return []
+    fid = (brand.metadata_ or {}).get("formulation_cosh_id")
+    if not fid:
+        return []
+    fmt = (await db.execute(
+        select(CoshReferenceCache).where(
+            CoshReferenceCache.cosh_id == fid,
+            CoshReferenceCache.entity_type == "formulation",
+        )
+    )).scalar_one_or_none()
+    label = (fmt.translations or {}).get("en") if fmt and fmt.translations else None
+    return [CascadeOption(value=fid, label=label or fid)]
+
+
+async def ai_concentration_for_brand(
+    db: AsyncSession, brand_cosh_id: Optional[str],
+) -> list[CascadeOption]:
+    """Auto-selected: the brand's a.i. concentration value from metadata.
+    Stored as a string (may be a label like "75% WP" or a cosh_id pointing
+    to a structured concentration entity)."""
+    if not brand_cosh_id:
+        return []
+    brand = (await db.execute(
+        select(CoshReferenceCache).where(
+            CoshReferenceCache.cosh_id == brand_cosh_id,
+            CoshReferenceCache.entity_type == "brand",
+        )
+    )).scalar_one_or_none()
+    if not brand:
+        return []
+    ai = (brand.metadata_ or {}).get("ai_concentration") \
+        or (brand.metadata_ or {}).get("ai_concentration_cosh_id")
+    if not ai:
+        return []
+    ai = str(ai)
+    return [CascadeOption(value=ai, label=ai)]
+
+
+# ── Generic Core dropdowns (for `cosh_core:<slug>` sources) ────────────────
+
+async def list_core_options(
+    db: AsyncSession, entity_type: str,
+) -> list[CascadeOption]:
+    """All active items of a Cosh Core entity_type. Used by the validator
+    to enforce that values for `cosh_core:<slug>` fields are real Cosh
+    entities. Sorted by English label."""
+    result = await db.execute(
+        select(CoshReferenceCache).where(
+            CoshReferenceCache.entity_type == entity_type,
+            CoshReferenceCache.status == "active",
+        )
+    )
+    options: list[CascadeOption] = []
+    for row in result.scalars().all():
+        label = (row.translations or {}).get("en") or row.cosh_id
+        options.append(CascadeOption(value=row.cosh_id, label=label))
+    return sorted(options, key=lambda o: o.label.lower())
+
+
+# ── Unified entry point ─────────────────────────────────────────────────────
+
+CASCADE_INPUTS: dict[str, tuple[str, ...]] = {
+    "manufacturers_for_common_name":           ("COMMON_NAME",),
+    "brands_for_common_name_and_manufacturer": ("COMMON_NAME", "MANUFACTURER"),
+    "formulation_for_brand":                   ("BRAND_NAME",),
+    "ai_concentration_for_brand":              ("BRAND_NAME",),
+}
+
+
+async def list_cascade_options(
+    db: AsyncSession, cascade_name: str, inputs: dict[str, Optional[str]],
+) -> list[CascadeOption]:
+    """Validator-facing dispatch. Accepts the full upstream-field map and
+    extracts the inputs each cascade needs. Returns [] when any required
+    upstream field is missing — the caller decides whether that's an error
+    (mandatory_if_set) or expected (cascade not yet activated)."""
+    if cascade_name == "manufacturers_for_common_name":
+        return await manufacturers_for_common_name(db, inputs.get("COMMON_NAME"))
+    if cascade_name == "brands_for_common_name_and_manufacturer":
+        return await brands_for_common_name_and_manufacturer(
+            db, inputs.get("COMMON_NAME"), inputs.get("MANUFACTURER"),
+        )
+    if cascade_name == "formulation_for_brand":
+        return await formulation_for_brand(db, inputs.get("BRAND_NAME"))
+    if cascade_name == "ai_concentration_for_brand":
+        return await ai_concentration_for_brand(db, inputs.get("BRAND_NAME"))
+    raise ValueError(f"Unknown cascade: {cascade_name}")
