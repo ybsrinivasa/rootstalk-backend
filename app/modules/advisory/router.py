@@ -42,6 +42,35 @@ from app.services.package_validation import (
 from app.services.pv_uniqueness import (
     PVConflictError, assert_pv_unique_for_package,
 )
+from app.services.pv_consistency import (
+    PVConsistencyError, assert_pv_consistency_for_package,
+)
+
+
+def _raise_pv_consistency(e: PVConsistencyError):
+    """Map a PVConsistencyError to a 422 with both parameter sets
+    surfaced so the CA portal can name precisely which parameters
+    are missing/extra on this PoP vs the sibling."""
+    raise HTTPException(
+        status_code=422,
+        detail={
+            "code": e.code,
+            "message": str(e),
+            "violations": [
+                {
+                    "sibling_package_id": v.sibling_package_id,
+                    "sibling_package_name": v.sibling_package_name,
+                    "shared_districts": [
+                        {"state_cosh_id": s, "district_cosh_id": d}
+                        for s, d in v.shared_districts
+                    ],
+                    "this_parameter_ids": list(v.this_parameter_ids),
+                    "sibling_parameter_ids": list(v.sibling_parameter_ids),
+                }
+                for v in e.violations
+            ],
+        },
+    )
 
 
 def _raise_pv_conflict(e: PVConflictError):
@@ -236,6 +265,10 @@ async def publish_package(
         await assert_pv_unique_for_package(db, package=pkg)
     except PVConflictError as e:
         _raise_pv_conflict(e)
+    try:
+        await assert_pv_consistency_for_package(db, package=pkg)
+    except PVConsistencyError as e:
+        _raise_pv_consistency(e)
 
     current_status = pkg.status.value if hasattr(pkg.status, "value") else str(pkg.status)
     res = validate_publish_transition(current_status)
@@ -291,6 +324,10 @@ async def set_package_locations(
         await assert_pv_unique_for_package(db, package=pkg)
     except PVConflictError as e:
         _raise_pv_conflict(e)
+    try:
+        await assert_pv_consistency_for_package(db, package=pkg)
+    except PVConsistencyError as e:
+        _raise_pv_consistency(e)
 
     await db.commit()
     return {"detail": f"{len(locations)} locations saved"}
@@ -548,6 +585,10 @@ async def set_package_variables(
         await assert_pv_unique_for_package(db, package=pkg)
     except PVConflictError as e:
         _raise_pv_conflict(e)
+    try:
+        await assert_pv_consistency_for_package(db, package=pkg)
+    except PVConsistencyError as e:
+        _raise_pv_consistency(e)
 
     await db.commit()
     return {"detail": f"{len(request.assignments)} parameter-variable assignments saved"}
