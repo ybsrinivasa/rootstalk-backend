@@ -35,8 +35,8 @@ Checks performed
   • UNKNOWN_L2                 — l2_type not in the rule book.
 
 The validator is db-async because cosh_core: and cosh_cascade: checks
-query `cosh_reference_cache` via the cascade service. Lookups are
-memoised per `validate_l2_elements` call so an L2 with multiple fields
+query the Cosh tables via the cascade service. Lookups are memoised
+per `validate_l2_elements` call so an L2 with multiple fields
 referencing the same Cosh entity_type only hits the DB once.
 """
 from __future__ import annotations

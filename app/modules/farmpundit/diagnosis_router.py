@@ -119,7 +119,7 @@ async def _load_problem_symptom_rows(
 
 
 def _get_display_name(entity_cosh_id: str, lang: str = "en") -> str:
-    """Placeholder — in production, looked up from cosh_reference_cache translations."""
+    """Placeholder — in production, looked up from cosh_core_items translations."""
     return entity_cosh_id.replace("_", " ").title()
 
 

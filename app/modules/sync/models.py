@@ -28,33 +28,6 @@ class CoshSyncLog(Base):
     completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-class CoshReferenceCache(Base):
-    """
-    Legacy single-table cache for all Cosh entities (Cores and Connects).
-    Kept alive in parallel with `cosh_core_items` / `cosh_connect_rows`
-    for the duration of the schema migration (CCA Step 4 / Batch 4C-i+).
-    To be dropped once every readsite is migrated.
-    """
-    __tablename__ = "cosh_reference_cache"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
-    cosh_id: Mapped[str] = mapped_column(String(200), nullable=False)
-    entity_type: Mapped[str] = mapped_column(String(100), nullable=False)
-    parent_cosh_id: Mapped[str] = mapped_column(String(200), nullable=True)
-    secondary_parent_cosh_id: Mapped[str] = mapped_column(String(200), nullable=True)
-    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
-    translations: Mapped[dict] = mapped_column(JSON, nullable=False)
-    metadata_: Mapped[dict] = mapped_column("metadata", JSON, nullable=True)
-    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-
-    __table_args__ = (
-        UniqueConstraint("cosh_id", "entity_type", name="uq_cosh_ref_id_type"),
-        Index("idx_crc_entity", "entity_type"),
-        Index("idx_crc_parent", "parent_cosh_id"),
-        Index("idx_crc_status", "entity_type", "status"),
-    )
-
-
 class CoshCoreItem(Base):
     """One Cosh Core item — a flat reference entity (crop, common_name,
     application_method, dosage_unit, formulation, problem_group,

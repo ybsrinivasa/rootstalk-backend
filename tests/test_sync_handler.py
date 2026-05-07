@@ -1,22 +1,20 @@
-"""Sync handler — dual-write + Connect adapter tests.
+"""Sync handler — Cores + Connect adapter tests.
 
-Covers the schema-migration transition:
-  • Cores land in BOTH cosh_reference_cache (legacy) AND cosh_core_items.
-  • Connects land in BOTH cosh_reference_cache AND cosh_connect_rows
-    with endpoints extracted from the legacy flat-payload metadata.
+Covers the post-migration single-write sync behaviour:
+  • Cores land in cosh_core_items.
+  • Connects (problem_to_symptom) land in cosh_connect_rows with
+    endpoints extracted from the legacy flat-payload metadata.
   • Native typed payload (`endpoints` array directly on the item)
     bypasses the metadata extraction.
-  • Full-sync inactivation flips both tables' rows.
-  • Translations validation still gates writes.
+  • Full-sync inactivation flips rows that aren't in the new payload.
+  • Translations validation gates Core writes.
 """
 from __future__ import annotations
 
 import pytest
 from sqlalchemy import select
 
-from app.modules.sync.models import (
-    CoshConnectRow, CoshCoreItem, CoshReferenceCache, CoshSyncLog,
-)
+from app.modules.sync.models import CoshConnectRow, CoshCoreItem, CoshSyncLog
 from app.modules.sync.service import process_payload
 from tests.conftest import requires_docker
 
@@ -44,8 +42,7 @@ async def _new_log(db) -> CoshSyncLog:
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_core_dual_write(db):
-    """Crop entity lands in both legacy and new tables with matching data."""
+async def test_core_lands_in_cosh_core_items(db):
     log = await _new_log(db)
     result = await process_payload(db, _payload(_batch(
         "crop",
@@ -54,24 +51,19 @@ async def test_core_dual_write(db):
     )), log)
     await db.commit()
 
-    legacy = (await db.execute(
-        select(CoshReferenceCache).where(CoshReferenceCache.cosh_id == "crop:paddy")
-    )).scalar_one()
-    new = (await db.execute(
+    row = (await db.execute(
         select(CoshCoreItem).where(CoshCoreItem.cosh_id == "crop:paddy")
     )).scalar_one()
-
-    assert legacy.entity_type == "crop"
-    assert new.core_type == "crop"
-    assert legacy.translations == new.translations
-    assert legacy.metadata_ == new.metadata_
+    assert row.core_type == "crop"
+    assert row.translations == {"en": "Paddy", "kn": "ಭತ್ತ"}
+    assert row.metadata_ == {"scientific_name": "Oryza sativa"}
     assert result["summary"]["inserted"] == 1
 
 
 @requires_docker
 @pytest.mark.asyncio
 async def test_core_with_parent_chain(db):
-    """specific_problem with parent=problem_group propagates to new table."""
+    """specific_problem with parent=problem_group propagates."""
     log = await _new_log(db)
     await process_payload(db, _payload(
         _batch("problem_group",
@@ -82,17 +74,16 @@ async def test_core_with_parent_chain(db):
     ), log)
     await db.commit()
 
-    new_sp = (await db.execute(
+    row = (await db.execute(
         select(CoshCoreItem).where(CoshCoreItem.cosh_id == "sp:powdery")
     )).scalar_one()
-    assert new_sp.core_type == "specific_problem"
-    assert new_sp.parent_cosh_id == "pg:fungal"
+    assert row.core_type == "specific_problem"
+    assert row.parent_cosh_id == "pg:fungal"
 
 
 @requires_docker
 @pytest.mark.asyncio
 async def test_core_upsert_updates_existing(db):
-    """Re-syncing the same cosh_id updates both tables."""
     log = await _new_log(db)
     await process_payload(db, _payload(_batch(
         "common_name",
@@ -108,10 +99,10 @@ async def test_core_upsert_updates_existing(db):
     )), log2)
     await db.commit()
 
-    new = (await db.execute(
+    row = (await db.execute(
         select(CoshCoreItem).where(CoshCoreItem.cosh_id == "cn:imida")
     )).scalar_one()
-    assert "hi" in new.translations
+    assert "hi" in row.translations
 
 
 # ── Connects: legacy adapter (endpoints in metadata) ───────────────────────
@@ -140,19 +131,11 @@ async def test_connect_extracts_endpoints_from_metadata(db):
     )), log)
     await db.commit()
 
-    legacy = (await db.execute(
-        select(CoshReferenceCache).where(CoshReferenceCache.cosh_id == "pts:0001")
-    )).scalar_one()
-    # Legacy still carries everything in metadata for back-compat with BL-08
-    assert legacy.metadata_["problem_cosh_id"] == "sp:powdery"
-    assert legacy.metadata_["priority_rank"] == 1
-
     row = (await db.execute(
         select(CoshConnectRow).where(CoshConnectRow.connect_id == "pts:0001")
     )).scalar_one()
     assert row.connect_type == "problem_to_symptom"
 
-    # endpoints array has only the 4 set roles (sub_symptom was None)
     by_role = {ep["role"]: ep["cosh_id"] for ep in row.endpoints}
     assert by_role == {
         "problem":    "sp:powdery",
@@ -160,7 +143,7 @@ async def test_connect_extracts_endpoints_from_metadata(db):
         "symptom":    "sym:white_spots",
         "sub_part":   "subpart:upper",
     }
-    # metadata on the new row strips the role-keyed cosh_ids; keeps the rest
+    # metadata strips the role-keyed cosh_ids; keeps the rest
     assert row.metadata_ == {
         "priority_rank": 1, "crop_stage_cosh_id": "stage:vegetative",
     }
@@ -169,8 +152,8 @@ async def test_connect_extracts_endpoints_from_metadata(db):
 @requires_docker
 @pytest.mark.asyncio
 async def test_connect_native_endpoints_bypass_adapter(db):
-    """When Cosh emits typed payload with `endpoints` directly, the
-    adapter respects it and skips metadata extraction."""
+    """Native typed payload with `endpoints` directly bypasses metadata
+    extraction."""
     log = await _new_log(db)
     await process_payload(db, _payload(_batch(
         "problem_to_symptom",
@@ -215,10 +198,7 @@ async def test_missing_translation_fails_item(db):
 @requires_docker
 @pytest.mark.asyncio
 async def test_connect_with_no_extractable_endpoints_fails(db):
-    """problem_to_symptom row without any of the 5 endpoint keys in
-    metadata → the new-table upsert raises and the item is recorded
-    failed. The legacy table is rolled-back-by-exception too because
-    the dual-write happens inside the same per-item try block."""
+    """problem_to_symptom row without any endpoint keys → upsert fails."""
     log = await _new_log(db)
     result = await process_payload(db, _payload(_batch(
         "problem_to_symptom",
@@ -238,9 +218,7 @@ async def test_connect_with_no_extractable_endpoints_fails(db):
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_full_sync_inactivates_absent_rows_in_both_tables(db):
-    """First sync seeds two crops; second `full` sync includes only
-    one — the absent crop flips to inactive in both tables."""
+async def test_full_sync_inactivates_absent_cores(db):
     log1 = await _new_log(db)
     await process_payload(db, _payload(_batch(
         "crop",
@@ -256,29 +234,19 @@ async def test_full_sync_inactivates_absent_rows_in_both_tables(db):
     ), sync_mode="full"), log2)
     await db.commit()
 
-    legacy_dropped = (await db.execute(
-        select(CoshReferenceCache).where(CoshReferenceCache.cosh_id == "crop:drop")
-    )).scalar_one()
-    new_dropped = (await db.execute(
+    dropped = (await db.execute(
         select(CoshCoreItem).where(CoshCoreItem.cosh_id == "crop:drop")
     )).scalar_one()
-    assert legacy_dropped.status == "inactive"
-    assert new_dropped.status == "inactive"
-
-    legacy_kept = (await db.execute(
-        select(CoshReferenceCache).where(CoshReferenceCache.cosh_id == "crop:keep")
-    )).scalar_one()
-    new_kept = (await db.execute(
+    kept = (await db.execute(
         select(CoshCoreItem).where(CoshCoreItem.cosh_id == "crop:keep")
     )).scalar_one()
-    assert legacy_kept.status == "active"
-    assert new_kept.status == "active"
+    assert dropped.status == "inactive"
+    assert kept.status == "active"
 
 
 @requires_docker
 @pytest.mark.asyncio
 async def test_full_sync_inactivates_absent_connect_rows(db):
-    """Same inactivation rule for Connects — flips cosh_connect_rows."""
     log1 = await _new_log(db)
     await process_payload(db, _payload(_batch(
         "problem_to_symptom",

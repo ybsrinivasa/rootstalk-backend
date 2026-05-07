@@ -3,7 +3,7 @@ BL-08 — Diagnosis Path Construction Algorithm
 Pure function service. No database access.
 Spec: RootsTalk_Dev_BusinessLogic.pdf §BL-08, AGR §8
 
-Data source: problem_to_symptom rows from cosh_reference_cache.
+Data source: problem_to_symptom rows from cosh_connect_rows.
 Each row: one problem's known manifestation on a specific plant part + symptom combination.
 """
 import random
@@ -14,7 +14,7 @@ from collections import Counter
 
 @dataclass
 class ProblemSymptomRow:
-    """One row from cosh_reference_cache WHERE entity_type='problem_to_symptom'."""
+    """One row from cosh_connect_rows WHERE connect_type='problem_to_symptom'."""
     problem_cosh_id: str
     plant_part_cosh_id: str
     symptom_cosh_id: str

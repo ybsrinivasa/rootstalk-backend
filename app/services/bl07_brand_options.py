@@ -4,13 +4,13 @@ Determines whether an order item's practice has a locked brand or an unlocked
 brand requiring dealer selection, and returns a grouped brand options list.
 
 Locked brand: Practice has an element of element_type 'brand' with a cosh_ref
-  that points to a specific brand in cosh_reference_cache. Dealer confirms and
+  that points to a specific brand in cosh_core_items. Dealer confirms and
   proceeds — no selection needed.
 
 Unlocked brand: No locked brand element. Return three groups:
   Group 1 — brands whose manufacturer_cosh_id matches any of the dealer's active
              dealership manufacturer_client_id or manufacturer_name (preferred)
-  Group 2 — all other active brands from cosh_reference_cache for this practice
+  Group 2 — all other active brands from cosh_core_items for this practice
   Group 3 — sentinel "Not in system / Report missing brand"
 
 OR-relation auto-close: When a dealer marks one item in an OR group as
@@ -106,7 +106,7 @@ async def get_brand_options(
 ) -> BrandOptionsResult:
     """
     Returns brand options for a given practice and dealer.
-    Queries cosh_reference_cache for available brands and filters by
+    Queries cosh_core_items for available brands and filters by
     dealer's active dealership relationships.
 
     Phase 3.3: when `snapshot` is provided (a LockedTimelineSnapshot row from

@@ -92,7 +92,7 @@ async def test_sp_client_takes_priority():
         call_count[0] += 1
         result = MagicMock()
         if call_count[0] == 1:
-            # First call: cosh_reference_cache lookup → return SP entry
+            # First call: cosh_core_items lookup → return SP entry
             result.scalar_one_or_none = MagicMock(return_value=sp_entry)
         elif call_count[0] == 2:
             # Second call: SP recommendation lookup → return match
@@ -238,7 +238,7 @@ async def test_problem_group_input_skips_sp_lookup():
 
 @pytest.mark.asyncio
 async def test_problem_name_set_correctly_from_cosh():
-    """problem_name in result comes from cosh_reference_cache translations."""
+    """problem_name in result comes from cosh_core_items translations."""
     from app.services.cha_hierarchy import resolve_cha_recommendation
 
     sp_entry = make_sp_entry("sp_blast_paddy", "pg_foliar_fungal", "Paddy Leaf Blast")

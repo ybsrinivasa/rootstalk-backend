@@ -2,16 +2,8 @@
 Cosh → RootsTalk sync service.
 
 Processes incoming sync payloads from Cosh and persists them into:
-  • cosh_reference_cache       — legacy single-table cache (kept alive
-                                  during the schema-migration transition;
-                                  to be dropped once every readsite is
-                                  refactored).
   • cosh_core_items            — flat Cosh entities (Cores).
   • cosh_connect_rows          — N-ary Connects with typed endpoints.
-
-Both new tables receive the same data as the legacy table — dual-write —
-so existing readsites keep working until they're individually migrated
-to read the new tables.
 
 Classification & adapter
 ------------------------
@@ -49,9 +41,7 @@ from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.sync.models import (
-    CoshConnectRow, CoshCoreItem, CoshReferenceCache, CoshSyncLog,
-)
+from app.modules.sync.models import CoshConnectRow, CoshCoreItem, CoshSyncLog
 
 
 # ── Classification & endpoint-role adapter ──────────────────────────────────
@@ -114,45 +104,6 @@ def _connect_metadata_clean(entity_type: str, item: dict) -> Optional[dict]:
 
 # ── Upserts ─────────────────────────────────────────────────────────────────
 
-async def upsert_entity(
-    db: AsyncSession,
-    cosh_id: str,
-    entity_type: str,
-    status: str,
-    translations: dict,
-    parent_cosh_id: Optional[str],
-    secondary_parent_cosh_id: Optional[str],
-    metadata: Optional[dict],
-) -> str:
-    """Legacy upsert into cosh_reference_cache. Returns 'inserted' or
-    'updated'. Translations must include `en`."""
-    if not translations.get("en"):
-        raise ValueError("Missing required translation: en")
-    now = datetime.now(timezone.utc)
-    stmt = pg_insert(CoshReferenceCache).values(
-        cosh_id=cosh_id,
-        entity_type=entity_type,
-        parent_cosh_id=parent_cosh_id,
-        secondary_parent_cosh_id=secondary_parent_cosh_id,
-        status=status,
-        translations=translations,
-        metadata_=metadata,
-        synced_at=now,
-    ).on_conflict_do_update(
-        constraint="uq_cosh_ref_id_type",
-        set_={
-            "parent_cosh_id": parent_cosh_id,
-            "secondary_parent_cosh_id": secondary_parent_cosh_id,
-            "status": status,
-            "translations": translations,
-            "metadata": metadata,
-            "synced_at": now,
-        },
-    )
-    result = await db.execute(stmt)
-    return "inserted" if result.rowcount == 1 else "updated"
-
-
 async def upsert_core_item(
     db: AsyncSession,
     *,
@@ -162,8 +113,9 @@ async def upsert_core_item(
     status: str,
     translations: dict,
     metadata: Optional[dict],
-) -> None:
-    """Upsert into cosh_core_items. Translations must include `en`."""
+) -> str:
+    """Upsert into cosh_core_items. Translations must include `en`.
+    Returns 'inserted' or 'updated'."""
     if not translations.get("en"):
         raise ValueError("Missing required translation: en")
     now = datetime.now(timezone.utc)
@@ -185,7 +137,8 @@ async def upsert_core_item(
             "synced_at": now,
         },
     )
-    await db.execute(stmt)
+    result = await db.execute(stmt)
+    return "inserted" if result.rowcount == 1 else "updated"
 
 
 async def upsert_connect_row(
@@ -196,9 +149,9 @@ async def upsert_connect_row(
     endpoints: list[dict],
     status: str,
     metadata: Optional[dict],
-) -> None:
+) -> str:
     """Upsert into cosh_connect_rows. `endpoints` must be a non-empty
-    list of {role, cosh_id} dicts."""
+    list of {role, cosh_id} dicts. Returns 'inserted' or 'updated'."""
     if not endpoints:
         raise ValueError(
             f"Connect {connect_type} for {connect_id!r} has no endpoints"
@@ -220,7 +173,8 @@ async def upsert_connect_row(
             "synced_at": now,
         },
     )
-    await db.execute(stmt)
+    result = await db.execute(stmt)
+    return "inserted" if result.rowcount == 1 else "updated"
 
 
 # ── Full-sync inactivation ──────────────────────────────────────────────────
@@ -228,37 +182,25 @@ async def upsert_connect_row(
 async def inactivate_absent_entities(
     db: AsyncSession, entity_type: str, seen_ids: set[str],
 ) -> None:
-    """Full sync: mark any active rows of this entity_type whose id
-    is not in `seen_ids` as inactive. Mirrors the inactivation across
-    legacy `cosh_reference_cache` and the new typed table for the same
-    entity_type."""
-
-    # Legacy cache
-    legacy_q = update(CoshReferenceCache).where(
-        CoshReferenceCache.entity_type == entity_type,
-        CoshReferenceCache.status == "active",
-    )
-    if seen_ids:
-        legacy_q = legacy_q.where(CoshReferenceCache.cosh_id.not_in(seen_ids))
-    await db.execute(legacy_q.values(status="inactive"))
-
-    # New typed table — Core or Connect
+    """Full sync: mark any active rows of this entity_type whose id is
+    not in `seen_ids` as inactive. Routes to cosh_core_items or
+    cosh_connect_rows by classification."""
     if _is_connect(entity_type):
-        new_q = update(CoshConnectRow).where(
+        q = update(CoshConnectRow).where(
             CoshConnectRow.connect_type == entity_type,
             CoshConnectRow.status == "active",
         )
         if seen_ids:
-            new_q = new_q.where(CoshConnectRow.connect_id.not_in(seen_ids))
-        await db.execute(new_q.values(status="inactive"))
+            q = q.where(CoshConnectRow.connect_id.not_in(seen_ids))
+        await db.execute(q.values(status="inactive"))
     else:
-        new_q = update(CoshCoreItem).where(
+        q = update(CoshCoreItem).where(
             CoshCoreItem.core_type == entity_type,
             CoshCoreItem.status == "active",
         )
         if seen_ids:
-            new_q = new_q.where(CoshCoreItem.cosh_id.not_in(seen_ids))
-        await db.execute(new_q.values(status="inactive"))
+            q = q.where(CoshCoreItem.cosh_id.not_in(seen_ids))
+        await db.execute(q.values(status="inactive"))
 
 
 # ── Main payload processor ──────────────────────────────────────────────────
@@ -266,9 +208,10 @@ async def inactivate_absent_entities(
 async def process_payload(
     db: AsyncSession, payload: dict, sync_log: CoshSyncLog,
 ) -> dict:
-    """Process the full sync payload: dual-writes every item to the
-    legacy table and the appropriate typed table. Returns the summary
-    body the sync endpoint hands back to Cosh."""
+    """Process the full sync payload: write each item to the
+    appropriate typed table (cosh_core_items or cosh_connect_rows)
+    based on its entity_type. Returns the summary body the sync
+    endpoint hands back to Cosh."""
     sync_mode = payload.get("sync_mode", "incremental")
     entity_batches = payload.get("entity_batches", [])
 
@@ -296,22 +239,9 @@ async def process_payload(
                 item_status = item.get("status", "active")
                 metadata = item.get("metadata")
 
-                # 1. Legacy cache (kept alive during transition)
-                action = await upsert_entity(
-                    db=db,
-                    cosh_id=cosh_id,
-                    entity_type=entity_type,
-                    status=item_status,
-                    translations=translations,
-                    parent_cosh_id=item.get("parent_cosh_id"),
-                    secondary_parent_cosh_id=item.get("secondary_parent_cosh_id"),
-                    metadata=metadata,
-                )
-
-                # 2. New typed tables — Core or Connect
                 if _is_connect(entity_type):
                     endpoints = _extract_endpoints(entity_type, item)
-                    await upsert_connect_row(
+                    action = await upsert_connect_row(
                         db=db,
                         connect_id=cosh_id,
                         connect_type=entity_type,
@@ -320,7 +250,7 @@ async def process_payload(
                         metadata=_connect_metadata_clean(entity_type, item),
                     )
                 else:
-                    await upsert_core_item(
+                    action = await upsert_core_item(
                         db=db,
                         cosh_id=cosh_id,
                         core_type=entity_type,
@@ -395,13 +325,11 @@ async def get_cosh_translation(
 ) -> Optional[str]:
     """Returns the display name for a Cosh entity in the requested
     language. Falls back to English if the language is not available.
-
-    Reads from the legacy cache today; will switch to cosh_core_items
-    in Batch #100 when readsites are migrated."""
+    Reads from cosh_core_items (Connect rows have no translations)."""
     result = await db.execute(
-        select(CoshReferenceCache.translations).where(
-            CoshReferenceCache.cosh_id == cosh_id,
-            CoshReferenceCache.entity_type == entity_type,
+        select(CoshCoreItem.translations).where(
+            CoshCoreItem.cosh_id == cosh_id,
+            CoshCoreItem.core_type == entity_type,
         )
     )
     row = result.scalar_one_or_none()

@@ -6,10 +6,9 @@ filtered option lists referenced by `cosh_cascade:<name>` sources in
 the L2 element rule book (see `l2_element_rules.py`).
 
 This module is the single boundary between the L2 element validator
-and the underlying Cosh storage. The schema migration (commits
-5b4967e, 0952ffb, …) moved truth-source from the legacy
-`cosh_reference_cache` to `cosh_core_items` + `cosh_connect_rows`;
-this module reads from the new tables exclusively.
+and the underlying Cosh storage. Reads from `cosh_core_items`
+exclusively (Connects live in `cosh_connect_rows` but no cascade
+declared in `l2_element_rules.py` walks Connects today).
 
 Data shape this module assumes
 ------------------------------
