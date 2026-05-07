@@ -19,7 +19,7 @@ from app.services.claude_service import (
     analyze_crop_image, enrich_problem_with_description, explain_symptom,
 )
 from app.modules.platform.models import User
-from app.modules.sync.models import CoshReferenceCache
+from app.modules.sync.models import CoshConnectRow, CoshCoreItem
 from app.services.bl08_diagnosis_path import (
     run_diagnosis_step, get_available_plant_parts, get_problem_list,
     ProblemSymptomRow, DiagnosisAnswer,
@@ -81,17 +81,17 @@ async def _load_problem_symptom_rows(
     db: AsyncSession,
     crop_stage_cosh_id: Optional[str],
 ) -> list[ProblemSymptomRow]:
-    """Query cosh_reference_cache for problem_to_symptom entries."""
-    q = select(CoshReferenceCache).where(
-        CoshReferenceCache.entity_type == "problem_to_symptom",
-        CoshReferenceCache.status == "active",
+    """Load problem_to_symptom rows from cosh_connect_rows. Endpoints
+    are stored as a typed array of {role, cosh_id}; we pivot them back
+    into the BL-08 dataclass shape. crop_stage_cosh_id (when given)
+    filters via metadata JSONB."""
+    q = select(CoshConnectRow).where(
+        CoshConnectRow.connect_type == "problem_to_symptom",
+        CoshConnectRow.status == "active",
     )
     if crop_stage_cosh_id:
-        # Filter by crop stage via metadata JSON field
-        from sqlalchemy import cast, String as SAStr
-        # PostgreSQL JSON path filter
         q = q.where(
-            CoshReferenceCache.metadata_.op("->>")(  "crop_stage_cosh_id") == crop_stage_cosh_id
+            CoshConnectRow.metadata_.op("->>")("crop_stage_cosh_id") == crop_stage_cosh_id
         )
 
     result = await db.execute(q)
@@ -99,16 +99,20 @@ async def _load_problem_symptom_rows(
 
     rows: list[ProblemSymptomRow] = []
     for r in rows_raw:
-        m = r.metadata_ or {}
-        if not m.get("problem_cosh_id") or not m.get("plant_part_cosh_id") or not m.get("symptom_cosh_id"):
+        # Pivot endpoints array → role-keyed dict
+        endpoints = {ep["role"]: ep["cosh_id"] for ep in (r.endpoints or [])
+                     if ep.get("role") and ep.get("cosh_id")}
+        if not endpoints.get("problem") or not endpoints.get("plant_part") \
+                or not endpoints.get("symptom"):
             continue
-        raw_rank = m.get("priority_rank")
+        meta = r.metadata_ or {}
+        raw_rank = meta.get("priority_rank")
         rows.append(ProblemSymptomRow(
-            problem_cosh_id=m["problem_cosh_id"],
-            plant_part_cosh_id=m["plant_part_cosh_id"],
-            symptom_cosh_id=m["symptom_cosh_id"],
-            sub_part_cosh_id=m.get("sub_part_cosh_id"),
-            sub_symptom_cosh_id=m.get("sub_symptom_cosh_id"),
+            problem_cosh_id=endpoints["problem"],
+            plant_part_cosh_id=endpoints["plant_part"],
+            symptom_cosh_id=endpoints["symptom"],
+            sub_part_cosh_id=endpoints.get("sub_part"),
+            sub_symptom_cosh_id=endpoints.get("sub_symptom"),
             priority_rank=raw_rank if isinstance(raw_rank, int) else None,
         ))
     return rows
@@ -504,19 +508,19 @@ async def _trigger_cha_from_diagnosis(db: AsyncSession, session: DiagnosisSessio
 
 
 async def _get_problem_info(db: AsyncSession, problem_cosh_id: str) -> dict:
-    """Get problem display info from Cosh cache."""
+    """Get problem display info from cosh_core_items."""
     sp = (await db.execute(
-        select(CoshReferenceCache).where(
-            CoshReferenceCache.cosh_id == problem_cosh_id,
-            CoshReferenceCache.entity_type == "specific_problem",
+        select(CoshCoreItem).where(
+            CoshCoreItem.cosh_id == problem_cosh_id,
+            CoshCoreItem.core_type == "specific_problem",
         )
     )).scalar_one_or_none()
 
     if not sp:
         pg = (await db.execute(
-            select(CoshReferenceCache).where(
-                CoshReferenceCache.cosh_id == problem_cosh_id,
-                CoshReferenceCache.entity_type == "problem_group",
+            select(CoshCoreItem).where(
+                CoshCoreItem.cosh_id == problem_cosh_id,
+                CoshCoreItem.core_type == "problem_group",
             )
         )).scalar_one_or_none()
         if pg:

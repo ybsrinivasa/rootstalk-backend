@@ -17,7 +17,7 @@ from app.modules.farmpundit.diagnosis_router import (
     StartDiagnosisRequest, answer_question, explain_symptom_route,
     start_diagnosis,
 )
-from app.modules.sync.models import CoshReferenceCache
+from app.modules.sync.models import CoshConnectRow, CoshCoreItem
 from tests.conftest import requires_docker
 from tests.factories import (
     make_client, make_package, make_subscription, make_user,
@@ -32,29 +32,27 @@ async def _seed_diagnosis_data(db):
     """Seed two `problem_to_symptom` rows for two distinct problems on
     the same plant_part. Algorithm asks one question; YES diagnoses one,
     NO narrows to the other."""
-    db.add(CoshReferenceCache(
-        cosh_id="pts:p1-leaf-spot",
-        entity_type="problem_to_symptom",
+    db.add(CoshConnectRow(
+        connect_id="pts:p1-leaf-spot",
+        connect_type="problem_to_symptom",
         status="active",
-        translations={},
-        metadata_={
-            "problem_cosh_id": "problem:leaf-blight",
-            "plant_part_cosh_id": "part:leaf",
-            "symptom_cosh_id": "symptom:spot",
-            "crop_stage_cosh_id": STAGE,
-        },
+        endpoints=[
+            {"role": "problem", "cosh_id": "problem:leaf-blight"},
+            {"role": "plant_part", "cosh_id": "part:leaf"},
+            {"role": "symptom", "cosh_id": "symptom:spot"},
+        ],
+        metadata_={"crop_stage_cosh_id": STAGE},
     ))
-    db.add(CoshReferenceCache(
-        cosh_id="pts:p2-leaf-yellow",
-        entity_type="problem_to_symptom",
+    db.add(CoshConnectRow(
+        connect_id="pts:p2-leaf-yellow",
+        connect_type="problem_to_symptom",
         status="active",
-        translations={},
-        metadata_={
-            "problem_cosh_id": "problem:nutrient-deficiency",
-            "plant_part_cosh_id": "part:leaf",
-            "symptom_cosh_id": "symptom:yellow",
-            "crop_stage_cosh_id": STAGE,
-        },
+        endpoints=[
+            {"role": "problem", "cosh_id": "problem:nutrient-deficiency"},
+            {"role": "plant_part", "cosh_id": "part:leaf"},
+            {"role": "symptom", "cosh_id": "symptom:yellow"},
+        ],
+        metadata_={"crop_stage_cosh_id": STAGE},
     ))
     await db.commit()
 
@@ -211,52 +209,48 @@ async def test_answer_session_404_for_other_farmer(db):
 @requires_docker
 @pytest.mark.asyncio
 async def test_priority_rank_demotes_problem_through_live_router(db):
-    """End-to-end check that `priority_rank` in `cosh_reference_cache.metadata_`
-    is honoured by the live router. Two problems share LEAF+Colour_Change, but
-    one has it at rank 2 (with a rank-1 symptom elsewhere). YES on Colour_Change
-    must demote the ranked problem and diagnose the unranked one."""
+    """End-to-end check that `priority_rank` in cosh_connect_rows.metadata_
+    is honoured by the live router. Two problems share LEAF+Colour_Change,
+    but one has it at rank 2 (with a rank-1 symptom elsewhere). YES on
+    Colour_Change must demote the ranked problem and diagnose the
+    unranked one."""
     farmer = await make_user(db)
     sub = await _seed_subscription(db, farmer)
 
     # Ranked problem: LEAF+Spots is rank 1, LEAF+Colour_Change is rank 2.
-    db.add(CoshReferenceCache(
-        cosh_id="pts:ranked-spots",
-        entity_type="problem_to_symptom",
+    db.add(CoshConnectRow(
+        connect_id="pts:ranked-spots",
+        connect_type="problem_to_symptom",
         status="active",
-        translations={},
-        metadata_={
-            "problem_cosh_id": "problem:ranked",
-            "plant_part_cosh_id": "part:leaf",
-            "symptom_cosh_id": "symptom:spots",
-            "crop_stage_cosh_id": STAGE,
-            "priority_rank": 1,
-        },
+        endpoints=[
+            {"role": "problem", "cosh_id": "problem:ranked"},
+            {"role": "plant_part", "cosh_id": "part:leaf"},
+            {"role": "symptom", "cosh_id": "symptom:spots"},
+        ],
+        metadata_={"crop_stage_cosh_id": STAGE, "priority_rank": 1},
     ))
-    db.add(CoshReferenceCache(
-        cosh_id="pts:ranked-colour",
-        entity_type="problem_to_symptom",
+    db.add(CoshConnectRow(
+        connect_id="pts:ranked-colour",
+        connect_type="problem_to_symptom",
         status="active",
-        translations={},
-        metadata_={
-            "problem_cosh_id": "problem:ranked",
-            "plant_part_cosh_id": "part:leaf",
-            "symptom_cosh_id": "symptom:colour",
-            "crop_stage_cosh_id": STAGE,
-            "priority_rank": 2,
-        },
+        endpoints=[
+            {"role": "problem", "cosh_id": "problem:ranked"},
+            {"role": "plant_part", "cosh_id": "part:leaf"},
+            {"role": "symptom", "cosh_id": "symptom:colour"},
+        ],
+        metadata_={"crop_stage_cosh_id": STAGE, "priority_rank": 2},
     ))
     # Unranked sibling — only has Colour_Change.
-    db.add(CoshReferenceCache(
-        cosh_id="pts:unranked-colour",
-        entity_type="problem_to_symptom",
+    db.add(CoshConnectRow(
+        connect_id="pts:unranked-colour",
+        connect_type="problem_to_symptom",
         status="active",
-        translations={},
-        metadata_={
-            "problem_cosh_id": "problem:unranked",
-            "plant_part_cosh_id": "part:leaf",
-            "symptom_cosh_id": "symptom:colour",
-            "crop_stage_cosh_id": STAGE,
-        },
+        endpoints=[
+            {"role": "problem", "cosh_id": "problem:unranked"},
+            {"role": "plant_part", "cosh_id": "part:leaf"},
+            {"role": "symptom", "cosh_id": "symptom:colour"},
+        ],
+        metadata_={"crop_stage_cosh_id": STAGE},
     ))
     await db.commit()
 
