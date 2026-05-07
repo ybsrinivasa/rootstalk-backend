@@ -136,6 +136,7 @@ class PracticeCreate(BaseModel):
     l2_type: Optional[str] = None
     display_order: int = 0
     is_special_input: bool = False
+    frequency_days: Optional[int] = None
     elements: List[ElementIn] = []
 
 
@@ -214,6 +215,7 @@ class PGPracticeCreate(BaseModel):
     l2_type: Optional[str] = None
     display_order: int = 0
     is_special_input: bool = False
+    frequency_days: Optional[int] = None
     elements: List["ElementIn"] = []
 
 

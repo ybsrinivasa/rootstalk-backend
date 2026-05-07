@@ -63,6 +63,9 @@ from app.services.conditional_validation import (
     assert_practices_have_no_independent_conditional,
     assert_relation_can_be_linked_to_conditional,
 )
+from app.services.l2_element_validator import (
+    L2ElementValidationError, assert_l2_elements_valid,
+)
 
 
 def _raise_conditional_validation(e: ConditionalValidationError):
@@ -92,6 +95,28 @@ def _raise_timeline_validation(e: TimelineValidationError):
     raise HTTPException(
         status_code=422,
         detail={"code": e.code, "message": e.message},
+    )
+
+
+def _raise_l2_element_validation(e: L2ElementValidationError):
+    """Map L2ElementValidationError to a 422 carrying the full error list
+    so the CA portal can render every failed rule at once instead of
+    forcing the SE through one-fix-per-roundtrip."""
+    raise HTTPException(
+        status_code=422,
+        detail={
+            "code": e.code,
+            "message": str(e),
+            "errors": [
+                {
+                    "code": err.code,
+                    "field_name": err.field_name,
+                    "message": err.message,
+                    "details": err.details,
+                }
+                for err in e.errors
+            ],
+        },
     )
 
 
@@ -1061,6 +1086,21 @@ async def create_practice(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """CCA Step 4 / Batch 4C-i.D: validates the proposed element list
+    against the L2 rule book before persisting. Returns 422 with the
+    full error list on rule violations (mandatory fields, cascade
+    integrity, special-input / frequency-based / plant-wise invariants)."""
+    try:
+        await assert_l2_elements_valid(
+            db,
+            l2_type=request.l2_type,
+            elements=request.elements,
+            is_special_input=request.is_special_input,
+            frequency_days=request.frequency_days,
+        )
+    except L2ElementValidationError as e:
+        _raise_l2_element_validation(e)
+
     practice = Practice(
         timeline_id=timeline_id,
         l0_type=request.l0_type,
@@ -1068,6 +1108,7 @@ async def create_practice(
         l2_type=request.l2_type,
         display_order=request.display_order,
         is_special_input=request.is_special_input,
+        frequency_days=request.frequency_days,
     )
     db.add(practice)
     await db.flush()
@@ -1532,6 +1573,19 @@ async def create_global_practice(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """CCA Step 4 / Batch 4C-i.D: same L2 element rule book validation
+    as the client-side create_practice route."""
+    try:
+        await assert_l2_elements_valid(
+            db,
+            l2_type=request.l2_type,
+            elements=request.elements,
+            is_special_input=request.is_special_input,
+            frequency_days=request.frequency_days,
+        )
+    except L2ElementValidationError as e:
+        _raise_l2_element_validation(e)
+
     practice = Practice(
         timeline_id=tl_id,
         l0_type=request.l0_type,
@@ -1539,6 +1593,7 @@ async def create_global_practice(
         l2_type=request.l2_type,
         display_order=request.display_order,
         is_special_input=request.is_special_input,
+        frequency_days=request.frequency_days,
     )
     db.add(practice)
     for elem in request.elements:
@@ -1718,6 +1773,19 @@ async def add_global_pg_practice(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """CCA Step 4 / Batch 4C-i.D: L2 element rule book validation also
+    applies to PG-recommendation practices — same shape as PoP."""
+    try:
+        await assert_l2_elements_valid(
+            db,
+            l2_type=request.l2_type,
+            elements=request.elements,
+            is_special_input=request.is_special_input,
+            frequency_days=request.frequency_days,
+        )
+    except L2ElementValidationError as e:
+        _raise_l2_element_validation(e)
+
     practice = PGPractice(
         timeline_id=tl_id,
         l0_type=request.l0_type,
@@ -1725,6 +1793,7 @@ async def add_global_pg_practice(
         l2_type=request.l2_type,
         display_order=request.display_order,
         is_special_input=request.is_special_input,
+        frequency_days=request.frequency_days,
     )
     db.add(practice)
     await db.flush()

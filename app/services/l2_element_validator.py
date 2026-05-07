@@ -333,3 +333,58 @@ async def _validate_value(
     # no validator-side constraint here. Form layer enforces upload
     # mime-types, URL well-formedness, and length limits.
     return
+
+
+# ── Router-facing assertion + exception ─────────────────────────────────────
+
+class L2ElementValidationError(Exception):
+    """Raised by `assert_l2_elements_valid` when the validator returns
+    one or more errors. The advisory router maps this to a 422 with the
+    full error list so the CA portal can render a single checklist."""
+
+    code = "l2_elements_validation_failed"
+
+    def __init__(self, errors: list[ValidationError]):
+        self.errors = errors
+        codes = ", ".join(e.code for e in errors)
+        super().__init__(
+            f"L2 element validation failed: {len(errors)} error(s) ({codes})"
+        )
+
+
+async def assert_l2_elements_valid(
+    db: AsyncSession,
+    *,
+    l2_type: Optional[str],
+    elements: list[Any],
+    is_special_input: bool = False,
+    frequency_days: Optional[int] = None,
+) -> None:
+    """Convenience wrapper: skips when l2_type is unset, otherwise runs
+    the validator and raises L2ElementValidationError on failure.
+
+    Accepts elements as a list of pydantic ElementIn objects, dicts, or
+    SQLAlchemy Element rows — duck-typed via `_el_get`."""
+    if not l2_type:
+        return
+
+    el_dicts: list[dict[str, Any]] = []
+    for e in elements:
+        if isinstance(e, dict):
+            el_dicts.append(e)
+        else:
+            el_dicts.append({
+                "element_type": getattr(e, "element_type", None),
+                "cosh_ref": getattr(e, "cosh_ref", None),
+                "value": getattr(e, "value", None),
+            })
+
+    result = await validate_l2_elements(
+        db=db,
+        l2_type=l2_type,
+        elements=el_dicts,
+        practice_is_special_input=is_special_input,
+        practice_frequency_days=frequency_days,
+    )
+    if not result.is_valid:
+        raise L2ElementValidationError(result.errors)
