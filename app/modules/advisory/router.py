@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.dependencies import get_current_user
-from app.modules.platform.models import User
+from app.modules.platform.models import StatusEnum, User
 from app.modules.advisory.models import (
     Package, PackageLocation, PackageAuthor, PackageVariable,
     Parameter, Variable, PackageVariable,
@@ -15,7 +15,8 @@ from app.modules.advisory.models import (
     PackageStatus, PackageType,
 )
 from app.modules.advisory.schemas import (
-    PackageCreate, PackageUpdate, PackageOut, PackageLocationIn,
+    PackageCreate, PackageUpdate, PackageOut,
+    PackageLocationIn, PackageAuthorIn, PackageAuthorOut,
     ParameterCreate, VariableCreate, PackageVariableSet,
     TimelineCreate, TimelineUpdate, TimelineOut,
     PracticeCreate, PracticeOut,
@@ -331,6 +332,109 @@ async def set_package_locations(
 
     await db.commit()
     return {"detail": f"{len(locations)} locations saved"}
+
+
+# ── Package Authors (CCA Step 2 / Batch 2B) ──────────────────────────────────
+
+@router.get(
+    "/client/{client_id}/packages/{package_id}/authors",
+    response_model=list[PackageAuthorOut],
+)
+async def list_package_authors(
+    client_id: str, package_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List the Subject Experts credited as authors on this Package,
+    ordered by `display_order`. Each row carries the User's name
+    joined in for portal rendering convenience."""
+    await _get_package(db, package_id, client_id)
+    rows = (await db.execute(
+        select(PackageAuthor, User)
+        .join(User, User.id == PackageAuthor.user_id)
+        .where(PackageAuthor.package_id == package_id)
+        .order_by(PackageAuthor.display_order, PackageAuthor.id)
+    )).all()
+    return [
+        PackageAuthorOut(
+            id=pa.id, user_id=pa.user_id, user_name=u.name,
+            designation=pa.designation,
+            professional_profile=pa.professional_profile,
+            display_order=pa.display_order,
+        )
+        for pa, u in rows
+    ]
+
+
+@router.put("/client/{client_id}/packages/{package_id}/authors")
+async def set_package_authors(
+    client_id: str, package_id: str,
+    authors: list[PackageAuthorIn],
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Replace-all save of the Package's authors. Spec §4.1: each
+    entry must be an ACTIVE ClientUser of this client with role
+    SUBJECT_EXPERT. Empty list is allowed at save time (CA may be
+    mid-edit); publish-time non-empty enforcement is Batch 2C.
+
+    Stable error codes:
+    - duplicate_author — same user_id appears twice in the request.
+    - invalid_author — at least one user_id is not an ACTIVE SE
+      of this client. Detail includes `invalid_user_ids` so the
+      portal can highlight precisely which rows to fix.
+    """
+    await _get_package(db, package_id, client_id)
+
+    user_ids = [a.user_id for a in authors]
+    if len(set(user_ids)) != len(user_ids):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "duplicate_author",
+                "message": "An expert cannot be listed twice as an author of the same Package.",
+            },
+        )
+
+    if user_ids:
+        valid_se_ids = set((await db.execute(
+            select(ClientUser.user_id).where(
+                ClientUser.client_id == client_id,
+                ClientUser.user_id.in_(user_ids),
+                ClientUser.role == ClientUserRole.SUBJECT_EXPERT,
+                ClientUser.status == StatusEnum.ACTIVE,
+            )
+        )).scalars().all())
+        invalid = sorted(set(user_ids) - valid_se_ids)
+        if invalid:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "invalid_author",
+                    "message": (
+                        "The following user_id(s) are not ACTIVE Subject "
+                        "Experts of this company and cannot be assigned "
+                        "as Package authors."
+                    ),
+                    "invalid_user_ids": invalid,
+                },
+            )
+
+    existing = (await db.execute(
+        select(PackageAuthor).where(PackageAuthor.package_id == package_id)
+    )).scalars().all()
+    for pa in existing:
+        await db.delete(pa)
+    for a in authors:
+        db.add(PackageAuthor(
+            package_id=package_id,
+            user_id=a.user_id,
+            designation=a.designation,
+            professional_profile=a.professional_profile,
+            display_order=a.display_order,
+        ))
+    await db.commit()
+    return {"detail": f"{len(authors)} authors saved"}
 
 
 # ── Parameters and Variables ───────────────────────────────────────────────────

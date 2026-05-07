@@ -15,18 +15,23 @@ from pydantic import ValidationError
 
 from app.modules.advisory.models import (
     Package, PackageStatus, PackageType,
-    PackageVariable, PackageLocation, Parameter, Variable,
+    PackageAuthor, PackageVariable, PackageLocation, Parameter, Variable,
 )
 from app.modules.advisory.router import (
     create_package, update_package, set_package_locations,
     set_package_variables, publish_package,
+    list_package_authors, set_package_authors,
 )
 from app.modules.advisory.schemas import (
-    PackageCreate, PackageUpdate, PackageLocationIn, PackageVariableSet,
+    PackageCreate, PackageUpdate,
+    PackageLocationIn, PackageAuthorIn, PackageVariableSet,
 )
-from app.modules.clients.models import ClientCrop
+from app.modules.clients.models import (
+    Client, ClientCrop, ClientUser, ClientUserRole,
+)
 from app.modules.clients.router import add_crop
 from app.modules.clients.schemas import CropCreate
+from app.modules.platform.models import StatusEnum, User as UserModel
 from tests.conftest import requires_docker
 from tests.factories import make_client, make_crop_reference, make_user
 
@@ -923,3 +928,224 @@ async def test_consistency_inactive_sibling_does_not_block(db):
         db=db, current_user=user,
     )
     assert "saved" in out["detail"]
+
+
+# ── Batch 2B: package authors management ─────────────────────────────────────
+
+async def _make_subject_expert(db, *, client, name="SE One") -> UserModel:
+    """Create a User + an ACTIVE SUBJECT_EXPERT ClientUser row for
+    the given client. Returns the User."""
+    se = await make_user(db, name=name)
+    db.add(ClientUser(
+        client_id=client.id, user_id=se.id,
+        role=ClientUserRole.SUBJECT_EXPERT,
+        status=StatusEnum.ACTIVE,
+    ))
+    await db.flush()
+    return se
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_set_authors_with_two_active_ses(db):
+    """Happy path. Two SEs of this client are listed as authors;
+    save succeeds, GET returns them in display_order with the
+    joined user_name surfaced."""
+    client = await make_client(db)
+    user = await make_user(db, name="CA")
+    await _seed_paddy_on_belt(db, client, user)
+    pkg = await _create_test_package(db, client=client, user=user)
+    se1 = await _make_subject_expert(db, client=client, name="Dr A")
+    se2 = await _make_subject_expert(db, client=client, name="Dr B")
+    await db.commit()
+
+    out = await set_package_authors(
+        client_id=client.id, package_id=pkg.id,
+        authors=[
+            PackageAuthorIn(user_id=se1.id, designation="Lead", display_order=0),
+            PackageAuthorIn(user_id=se2.id, designation="Reviewer", display_order=1),
+        ],
+        db=db, current_user=user,
+    )
+    assert "2 authors saved" in out["detail"]
+
+    listed = await list_package_authors(
+        client_id=client.id, package_id=pkg.id, db=db, current_user=user,
+    )
+    assert [a.user_id for a in listed] == [se1.id, se2.id]
+    assert [a.user_name for a in listed] == ["Dr A", "Dr B"]
+    assert [a.designation for a in listed] == ["Lead", "Reviewer"]
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_set_authors_replace_all_semantics(db):
+    """Match the locations/variables endpoints: PUT replaces the
+    entire set. Setting [B] after [A] leaves only B."""
+    client = await make_client(db)
+    user = await make_user(db, name="CA")
+    await _seed_paddy_on_belt(db, client, user)
+    pkg = await _create_test_package(db, client=client, user=user)
+    se_a = await _make_subject_expert(db, client=client, name="Dr A")
+    se_b = await _make_subject_expert(db, client=client, name="Dr B")
+    await db.commit()
+
+    await set_package_authors(
+        client_id=client.id, package_id=pkg.id,
+        authors=[PackageAuthorIn(user_id=se_a.id)],
+        db=db, current_user=user,
+    )
+    await set_package_authors(
+        client_id=client.id, package_id=pkg.id,
+        authors=[PackageAuthorIn(user_id=se_b.id)],
+        db=db, current_user=user,
+    )
+    listed = await list_package_authors(
+        client_id=client.id, package_id=pkg.id, db=db, current_user=user,
+    )
+    assert [a.user_id for a in listed] == [se_b.id]
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_set_authors_empty_list_allowed_at_save(db):
+    """Spec rules: authors mandatory at PUBLISH, but mid-edit save
+    with empty list is allowed (CA may be re-arranging).
+    Publish-time enforcement lives in Batch 2C."""
+    client = await make_client(db)
+    user = await make_user(db, name="CA")
+    await _seed_paddy_on_belt(db, client, user)
+    pkg = await _create_test_package(db, client=client, user=user)
+    await db.commit()
+
+    out = await set_package_authors(
+        client_id=client.id, package_id=pkg.id,
+        authors=[], db=db, current_user=user,
+    )
+    assert "0 authors saved" in out["detail"]
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_set_authors_422_when_user_not_in_client(db):
+    """user_id is a real User but has no ClientUser row for THIS
+    client. Reject — spec §4.1: authors must be SEs of the company."""
+    client = await make_client(db)
+    user = await make_user(db, name="CA")
+    await _seed_paddy_on_belt(db, client, user)
+    pkg = await _create_test_package(db, client=client, user=user)
+    stranger = await make_user(db, name="Stranger")  # exists, no ClientUser row
+    await db.commit()
+
+    with pytest.raises(HTTPException) as ei:
+        await set_package_authors(
+            client_id=client.id, package_id=pkg.id,
+            authors=[PackageAuthorIn(user_id=stranger.id)],
+            db=db, current_user=user,
+        )
+    assert ei.value.status_code == 422
+    assert ei.value.detail["code"] == "invalid_author"
+    assert stranger.id in ei.value.detail["invalid_user_ids"]
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_set_authors_422_when_user_is_wrong_role(db):
+    """user is a ClientUser of this client but as CA, not
+    SUBJECT_EXPERT. Authors must specifically be SEs."""
+    client = await make_client(db)
+    user = await make_user(db, name="CA")
+    await _seed_paddy_on_belt(db, client, user)
+    pkg = await _create_test_package(db, client=client, user=user)
+    other_ca = await make_user(db, name="Other CA")
+    db.add(ClientUser(
+        client_id=client.id, user_id=other_ca.id,
+        role=ClientUserRole.CA,
+        status=StatusEnum.ACTIVE,
+    ))
+    await db.commit()
+
+    with pytest.raises(HTTPException) as ei:
+        await set_package_authors(
+            client_id=client.id, package_id=pkg.id,
+            authors=[PackageAuthorIn(user_id=other_ca.id)],
+            db=db, current_user=user,
+        )
+    assert ei.value.status_code == 422
+    assert ei.value.detail["code"] == "invalid_author"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_set_authors_422_when_user_is_se_of_different_client(db):
+    """SE of Client X cannot be listed as author on Client Y's
+    Package — defensive cross-tenant guard."""
+    client_y = await make_client(db, full_name="Client Y")
+    client_x = await make_client(db, full_name="Client X")
+    user = await make_user(db, name="CA Y")
+    await _seed_paddy_on_belt(db, client_y, user)
+    pkg = await _create_test_package(db, client=client_y, user=user)
+
+    se_x = await _make_subject_expert(db, client=client_x, name="Dr X")
+    await db.commit()
+
+    with pytest.raises(HTTPException) as ei:
+        await set_package_authors(
+            client_id=client_y.id, package_id=pkg.id,
+            authors=[PackageAuthorIn(user_id=se_x.id)],
+            db=db, current_user=user,
+        )
+    assert ei.value.status_code == 422
+    assert ei.value.detail["code"] == "invalid_author"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_set_authors_422_when_se_is_inactive(db):
+    """An SE whose ClientUser row is INACTIVE (e.g. self-removed
+    role) must not appear as a Package author."""
+    client = await make_client(db)
+    user = await make_user(db, name="CA")
+    await _seed_paddy_on_belt(db, client, user)
+    pkg = await _create_test_package(db, client=client, user=user)
+    from sqlalchemy import select as sql_select
+    se = await _make_subject_expert(db, client=client, name="Dr Inactive")
+    cu_row = (await db.execute(
+        sql_select(ClientUser).where(ClientUser.user_id == se.id)
+    )).scalar_one()
+    cu_row.status = StatusEnum.INACTIVE
+    await db.commit()
+
+    with pytest.raises(HTTPException) as ei:
+        await set_package_authors(
+            client_id=client.id, package_id=pkg.id,
+            authors=[PackageAuthorIn(user_id=se.id)],
+            db=db, current_user=user,
+        )
+    assert ei.value.status_code == 422
+    assert ei.value.detail["code"] == "invalid_author"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_set_authors_422_when_duplicate_user_ids(db):
+    """Same SE listed twice → reject. Stops sloppy CA portal forms
+    from creating a meaningless duplicate row."""
+    client = await make_client(db)
+    user = await make_user(db, name="CA")
+    await _seed_paddy_on_belt(db, client, user)
+    pkg = await _create_test_package(db, client=client, user=user)
+    se = await _make_subject_expert(db, client=client, name="Dr Dup")
+    await db.commit()
+
+    with pytest.raises(HTTPException) as ei:
+        await set_package_authors(
+            client_id=client.id, package_id=pkg.id,
+            authors=[
+                PackageAuthorIn(user_id=se.id, designation="A"),
+                PackageAuthorIn(user_id=se.id, designation="B"),
+            ],
+            db=db, current_user=user,
+        )
+    assert ei.value.status_code == 422
+    assert ei.value.detail["code"] == "duplicate_author"

@@ -30,6 +30,29 @@ class PackageLocationIn(BaseModel):
     district_cosh_id: str
 
 
+class PackageAuthorIn(BaseModel):
+    """Input row for PUT /packages/{id}/authors — one per Subject
+    Expert credited on the Package. `user_id` must reference an
+    ACTIVE ClientUser of the same client with role SUBJECT_EXPERT
+    (validated server-side; spec §4.1)."""
+    user_id: str
+    designation: Optional[str] = None
+    professional_profile: Optional[str] = None
+    display_order: int = 0
+
+
+class PackageAuthorOut(BaseModel):
+    id: str
+    user_id: str
+    user_name: Optional[str] = None  # joined from User.name for portal rendering
+    designation: Optional[str] = None
+    professional_profile: Optional[str] = None
+    display_order: int
+
+    class Config:
+        from_attributes = True
+
+
 class PackageOut(BaseModel):
     id: str
     client_id: Optional[str] = None
