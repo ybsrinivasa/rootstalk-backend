@@ -14,11 +14,16 @@ from fastapi import HTTPException
 from sqlalchemy import select
 
 from app.modules.advisory.models import (
-    Element, Package, PackageStatus, PackageType, Practice, PracticeL0,
-    Relation, RelationType, Timeline, TimelineFromType,
+    ConditionalAnswer, ConditionalQuestion, Element, Package,
+    PackageStatus, PackageType, Practice, PracticeConditional, PracticeL0,
+    Relation, RelationConditional, RelationType, Timeline, TimelineFromType,
 )
-from app.modules.advisory.router import create_relation
-from app.modules.advisory.schemas import RelationCreate
+from app.modules.advisory.router import (
+    create_relation, link_practice_conditional, link_relation_conditional,
+)
+from app.modules.advisory.schemas import (
+    PracticeConditionalCreate, RelationCreate,
+)
 from app.modules.clients.router import add_crop
 from app.modules.clients.schemas import CropCreate
 from tests.conftest import requires_docker
@@ -368,3 +373,273 @@ async def test_role_strings_correctly_persisted_for_complex_structure(db):
     assert refreshed[b.id].relation_role == "PART_1__OPT_1__POS_2"
     assert refreshed[c.id].relation_role == "PART_1__OPT_2__POS_1"
     assert refreshed[d.id].relation_role == "PART_2__OPT_1__POS_1"
+
+
+# ── Batch 4B: conditional link validation + RelationConditional ──────────────
+
+async def _conditional_question(db, *, timeline, text="Has it rained today?"):
+    q = ConditionalQuestion(
+        timeline_id=timeline.id, question_text=text, display_order=0,
+    )
+    db.add(q)
+    await db.flush()
+    return q
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_link_practice_conditional_independent_practice_passes(db):
+    """Happy path: an independent practice (no relation_id) gets a
+    conditional link via PracticeConditional."""
+    client, user, pkg, tl = await _setup_timeline(db)
+    p = await _practice(db, timeline=tl, common_name_cosh_id="cn:1")
+    q = await _conditional_question(db, timeline=tl)
+    await db.commit()
+
+    out = await link_practice_conditional(
+        client_id=client.id, practice_id=p.id,
+        request=PracticeConditionalCreate(
+            practice_id=p.id, question_id=q.id, answer=ConditionalAnswer.YES,
+        ),
+        db=db, current_user=user,
+    )
+    assert out.practice_id == p.id
+    assert out.question_id == q.id
+    assert out.answer == ConditionalAnswer.YES
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_link_practice_conditional_blocked_when_in_relation(db):
+    """Spec §6.4 + user clarification: a practice in a saved Relation
+    cannot have a PracticeConditional. Use link_relation_conditional
+    on the Relation instead."""
+    client, user, pkg, tl = await _setup_timeline(db)
+    p1 = await _practice(db, timeline=tl, common_name_cosh_id="cn:1")
+    p2 = await _practice(db, timeline=tl, l1="FERTILIZER", common_name_cosh_id="cn:2")
+    q = await _conditional_question(db, timeline=tl)
+    await db.commit()
+
+    # Put p1 into a saved Relation.
+    await create_relation(
+        client_id=client.id, timeline_id=tl.id,
+        request=RelationCreate(
+            relation_type=RelationType.AND,
+            parts=[[[p1.id, p2.id]]],
+        ),
+        db=db, current_user=user,
+    )
+    # p1 now has relation_id set. Linking it to a conditional via
+    # PracticeConditional must be refused.
+    with pytest.raises(HTTPException) as ei:
+        await link_practice_conditional(
+            client_id=client.id, practice_id=p1.id,
+            request=PracticeConditionalCreate(
+                practice_id=p1.id, question_id=q.id, answer=ConditionalAnswer.YES,
+            ),
+            db=db, current_user=user,
+        )
+    assert ei.value.status_code == 422
+    assert ei.value.detail["code"] == "practice_in_relation_use_relation_link"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_link_practice_conditional_blocks_second_question(db):
+    """A practice can be linked to at most ONE conditional question."""
+    client, user, pkg, tl = await _setup_timeline(db)
+    p = await _practice(db, timeline=tl, common_name_cosh_id="cn:1")
+    q1 = await _conditional_question(db, timeline=tl, text="Q1")
+    q2 = await _conditional_question(db, timeline=tl, text="Q2")
+    await db.commit()
+
+    await link_practice_conditional(
+        client_id=client.id, practice_id=p.id,
+        request=PracticeConditionalCreate(
+            practice_id=p.id, question_id=q1.id, answer=ConditionalAnswer.YES,
+        ),
+        db=db, current_user=user,
+    )
+    with pytest.raises(HTTPException) as ei:
+        await link_practice_conditional(
+            client_id=client.id, practice_id=p.id,
+            request=PracticeConditionalCreate(
+                practice_id=p.id, question_id=q2.id, answer=ConditionalAnswer.YES,
+            ),
+            db=db, current_user=user,
+        )
+    assert ei.value.detail["code"] == "practice_already_in_conditional"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_link_practice_conditional_same_question_idempotent(db):
+    """Re-linking the same `(practice, question)` updates the answer
+    in place rather than creating a duplicate row."""
+    client, user, pkg, tl = await _setup_timeline(db)
+    p = await _practice(db, timeline=tl, common_name_cosh_id="cn:1")
+    q = await _conditional_question(db, timeline=tl)
+    await db.commit()
+
+    first = await link_practice_conditional(
+        client_id=client.id, practice_id=p.id,
+        request=PracticeConditionalCreate(
+            practice_id=p.id, question_id=q.id, answer=ConditionalAnswer.YES,
+        ),
+        db=db, current_user=user,
+    )
+    second = await link_practice_conditional(
+        client_id=client.id, practice_id=p.id,
+        request=PracticeConditionalCreate(
+            practice_id=p.id, question_id=q.id, answer=ConditionalAnswer.NO,
+        ),
+        db=db, current_user=user,
+    )
+    assert second.id == first.id
+    assert second.answer == ConditionalAnswer.NO
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_link_relation_conditional_happy_path(db):
+    """Path A: a Relation gets a conditional link via the new
+    RelationConditional table."""
+    client, user, pkg, tl = await _setup_timeline(db)
+    p1 = await _practice(db, timeline=tl, common_name_cosh_id="cn:1")
+    p2 = await _practice(db, timeline=tl, l1="FERTILIZER", common_name_cosh_id="cn:2")
+    q = await _conditional_question(db, timeline=tl)
+    await db.commit()
+
+    rel = await create_relation(
+        client_id=client.id, timeline_id=tl.id,
+        request=RelationCreate(
+            relation_type=RelationType.AND,
+            parts=[[[p1.id, p2.id]]],
+        ),
+        db=db, current_user=user,
+    )
+    out = await link_relation_conditional(
+        client_id=client.id, relation_id=rel["id"],
+        request=PracticeConditionalCreate(
+            practice_id=p1.id,  # ignored on this endpoint
+            question_id=q.id, answer=ConditionalAnswer.YES,
+        ),
+        db=db, current_user=user,
+    )
+    assert out.relation_id == rel["id"]
+    assert out.question_id == q.id
+    assert out.answer == ConditionalAnswer.YES
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_link_relation_conditional_blocks_second_question(db):
+    """A Relation can be linked to at most ONE Conditional Question."""
+    client, user, pkg, tl = await _setup_timeline(db)
+    p1 = await _practice(db, timeline=tl, common_name_cosh_id="cn:1")
+    p2 = await _practice(db, timeline=tl, l1="FERTILIZER", common_name_cosh_id="cn:2")
+    q1 = await _conditional_question(db, timeline=tl, text="Q1")
+    q2 = await _conditional_question(db, timeline=tl, text="Q2")
+    await db.commit()
+
+    rel = await create_relation(
+        client_id=client.id, timeline_id=tl.id,
+        request=RelationCreate(
+            relation_type=RelationType.AND,
+            parts=[[[p1.id, p2.id]]],
+        ),
+        db=db, current_user=user,
+    )
+    await link_relation_conditional(
+        client_id=client.id, relation_id=rel["id"],
+        request=PracticeConditionalCreate(
+            practice_id=p1.id, question_id=q1.id, answer=ConditionalAnswer.YES,
+        ),
+        db=db, current_user=user,
+    )
+    with pytest.raises(HTTPException) as ei:
+        await link_relation_conditional(
+            client_id=client.id, relation_id=rel["id"],
+            request=PracticeConditionalCreate(
+                practice_id=p1.id, question_id=q2.id, answer=ConditionalAnswer.YES,
+            ),
+            db=db, current_user=user,
+        )
+    assert ei.value.detail["code"] == "relation_already_in_conditional"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_create_relation_blocked_when_practice_has_independent_conditional(db):
+    """Cross-check: an SE has linked Practice X to a Conditional
+    Question independently. Now they try to add X to a new Relation.
+    Refuse — the conditional link is bound to the practice, but the
+    practice is being moved into a relation. SE must clear the
+    conditional first."""
+    client, user, pkg, tl = await _setup_timeline(db)
+    p1 = await _practice(db, timeline=tl, common_name_cosh_id="cn:1")
+    p2 = await _practice(db, timeline=tl, l1="FERTILIZER", common_name_cosh_id="cn:2")
+    q = await _conditional_question(db, timeline=tl)
+    await db.commit()
+
+    # Link p1 independently to the conditional.
+    await link_practice_conditional(
+        client_id=client.id, practice_id=p1.id,
+        request=PracticeConditionalCreate(
+            practice_id=p1.id, question_id=q.id, answer=ConditionalAnswer.YES,
+        ),
+        db=db, current_user=user,
+    )
+
+    # Now try to put p1 into a Relation. Must 422.
+    with pytest.raises(HTTPException) as ei:
+        await create_relation(
+            client_id=client.id, timeline_id=tl.id,
+            request=RelationCreate(
+                relation_type=RelationType.AND,
+                parts=[[[p1.id, p2.id]]],
+            ),
+            db=db, current_user=user,
+        )
+    assert ei.value.status_code == 422
+    assert ei.value.detail["code"] == "practice_has_independent_conditional"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_link_practice_conditional_404_when_practice_missing(db):
+    client, user, pkg, tl = await _setup_timeline(db)
+    q = await _conditional_question(db, timeline=tl)
+    await db.commit()
+
+    with pytest.raises(HTTPException) as ei:
+        await link_practice_conditional(
+            client_id=client.id,
+            practice_id="00000000-0000-0000-0000-000000000000",
+            request=PracticeConditionalCreate(
+                practice_id="00000000-0000-0000-0000-000000000000",
+                question_id=q.id, answer=ConditionalAnswer.YES,
+            ),
+            db=db, current_user=user,
+        )
+    assert ei.value.status_code == 404
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_link_relation_conditional_404_when_relation_missing(db):
+    client, user, pkg, tl = await _setup_timeline(db)
+    q = await _conditional_question(db, timeline=tl)
+    await db.commit()
+
+    with pytest.raises(HTTPException) as ei:
+        await link_relation_conditional(
+            client_id=client.id,
+            relation_id="00000000-0000-0000-0000-000000000000",
+            request=PracticeConditionalCreate(
+                practice_id="00000000-0000-0000-0000-000000000000",
+                question_id=q.id, answer=ConditionalAnswer.YES,
+            ),
+            db=db, current_user=user,
+        )
+    assert ei.value.status_code == 404

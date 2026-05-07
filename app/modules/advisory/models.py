@@ -319,6 +319,25 @@ class PracticeConditional(Base):
     question: Mapped["ConditionalQuestion"] = relationship("ConditionalQuestion", back_populates="practice_conditionals")
 
 
+class RelationConditional(Base):
+    """CCA Step 4 / Batch 4B — Path A.
+
+    When a Practice is part of a saved Relation, the conditional link
+    binds to the Relation rather than the individual Practice (spec
+    §6.4 + user clarification 2026-05-07: 'the whole relation needs
+    to be associated with a conditional'). PracticeConditional remains
+    in use for independent practices.
+    """
+    __tablename__ = "relation_conditionals"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    relation_id: Mapped[str] = mapped_column(String(36), ForeignKey("relations.id"), nullable=False)
+    question_id: Mapped[str] = mapped_column(String(36), ForeignKey("conditional_questions.id"), nullable=False)
+    answer: Mapped[ConditionalAnswer] = mapped_column(SAEnum(ConditionalAnswer), nullable=False)
+
+    __table_args__ = (UniqueConstraint("relation_id", "question_id"),)
+
+
 # ── Domain 4: CHA — Problem Groups and Specific Problems ──────────────────────
 
 class PGRecommendation(Base):

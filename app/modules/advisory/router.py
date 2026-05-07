@@ -11,7 +11,8 @@ from app.modules.advisory.models import (
     Package, PackageLocation, PackageAuthor, PackageVariable,
     Parameter, Variable, PackageVariable,
     ParameterTranslation, VariableTranslation, TranslationStatus,
-    Timeline, Practice, Element, Relation, ConditionalQuestion, PracticeConditional,
+    Timeline, Practice, Element, Relation,
+    ConditionalQuestion, PracticeConditional, RelationConditional,
     PackageStatus, PackageType,
 )
 from app.modules.advisory.schemas import (
@@ -56,6 +57,19 @@ from app.services.relations import PracticeRef
 from app.services.relation_validation import (
     RelationValidationFailed, validate_relation_save,
 )
+from app.services.conditional_validation import (
+    ConditionalValidationError,
+    assert_practice_can_be_linked_to_conditional,
+    assert_practices_have_no_independent_conditional,
+    assert_relation_can_be_linked_to_conditional,
+)
+
+
+def _raise_conditional_validation(e: ConditionalValidationError):
+    raise HTTPException(
+        status_code=422,
+        detail={"code": e.code, "message": e.message, **(e.extra or {})},
+    )
 
 
 def _raise_relation_validation(e: RelationValidationFailed):
@@ -1164,6 +1178,27 @@ async def create_relation(
         for pid, p in by_id.items()
     }
 
+    # CCA Step 4 / Batch 4B cross-check: refuse if any incoming
+    # practice has an existing PracticeConditional. The link is
+    # bound to the practice as an independent unit; once it joins
+    # a Relation, the conditional must move (or be cleared) before
+    # the relation save proceeds.
+    existing_pcs = (await db.execute(
+        select(PracticeConditional).where(
+            PracticeConditional.practice_id.in_(distinct_practice_ids)
+        )
+    )).scalars().all()
+    if existing_pcs:
+        try:
+            assert_practices_have_no_independent_conditional(
+                practices_with_conditional=[
+                    {"practice_id": pc.practice_id, "question_id": pc.question_id}
+                    for pc in existing_pcs
+                ],
+            )
+        except ConditionalValidationError as e:
+            _raise_conditional_validation(e)
+
     try:
         structure = validate_relation_save(
             relation_type=request.relation_type.value,
@@ -1224,6 +1259,45 @@ async def link_practice_conditional(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """CCA Step 4 / Batch 4B: validates that
+    1) the Practice exists,
+    2) the Practice is NOT in a saved Relation (refuse — use the
+       link_relation_conditional endpoint instead),
+    3) the Practice is not already linked to a different
+       Conditional Question.
+    Same `(practice_id, question_id)` repeats are idempotent — the
+    existing row is returned without modification.
+    """
+    practice = (await db.execute(
+        select(Practice).where(Practice.id == practice_id)
+    )).scalar_one_or_none()
+    if practice is None:
+        raise HTTPException(status_code=404, detail="Practice not found")
+
+    existing_pc = (await db.execute(
+        select(PracticeConditional).where(
+            PracticeConditional.practice_id == practice_id
+        )
+    )).scalar_one_or_none()
+    existing_q_id = existing_pc.question_id if existing_pc else None
+
+    try:
+        assert_practice_can_be_linked_to_conditional(
+            practice_id=practice_id,
+            practice_relation_id=practice.relation_id,
+            target_question_id=request.question_id,
+            existing_question_id_for_practice=existing_q_id,
+        )
+    except ConditionalValidationError as e:
+        _raise_conditional_validation(e)
+
+    if existing_pc is not None and existing_pc.question_id == request.question_id:
+        # Idempotent: same link already exists. Update answer if different.
+        existing_pc.answer = request.answer
+        await db.commit()
+        await db.refresh(existing_pc)
+        return existing_pc
+
     pc = PracticeConditional(
         practice_id=practice_id,
         question_id=request.question_id,
@@ -1233,6 +1307,68 @@ async def link_practice_conditional(
     await db.commit()
     await db.refresh(pc)
     return pc
+
+
+@router.post("/client/{client_id}/relations/{relation_id}/conditionals", status_code=201)
+async def link_relation_conditional(
+    client_id: str, relation_id: str,
+    request: PracticeConditionalCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CCA Step 4 / Batch 4B Path A: when the practices in a Relation
+    need to be conditionally applied, the link binds to the Relation
+    rather than each individual Practice (spec §6.4 + user
+    clarification 2026-05-07). The PracticeConditional table is
+    reserved for INDEPENDENT practices.
+
+    Refuses if:
+    - The Relation doesn't exist (404).
+    - The Relation is already linked to a different Conditional
+      Question (422 `relation_already_in_conditional`).
+    Same `(relation_id, question_id)` repeats are idempotent.
+
+    Note: `request.practice_id` (inherited from PracticeConditionalCreate)
+    is ignored on this endpoint — the resource is the Relation
+    identified in the URL.
+    """
+    relation = (await db.execute(
+        select(Relation).where(Relation.id == relation_id)
+    )).scalar_one_or_none()
+    if relation is None:
+        raise HTTPException(status_code=404, detail="Relation not found")
+
+    existing_rc = (await db.execute(
+        select(RelationConditional).where(
+            RelationConditional.relation_id == relation_id
+        )
+    )).scalar_one_or_none()
+    existing_q_id = existing_rc.question_id if existing_rc else None
+
+    try:
+        assert_relation_can_be_linked_to_conditional(
+            relation_id=relation_id,
+            target_question_id=request.question_id,
+            existing_question_id_for_relation=existing_q_id,
+        )
+    except ConditionalValidationError as e:
+        _raise_conditional_validation(e)
+
+    if existing_rc is not None and existing_rc.question_id == request.question_id:
+        existing_rc.answer = request.answer
+        await db.commit()
+        await db.refresh(existing_rc)
+        return existing_rc
+
+    rc = RelationConditional(
+        relation_id=relation_id,
+        question_id=request.question_id,
+        answer=request.answer,
+    )
+    db.add(rc)
+    await db.commit()
+    await db.refresh(rc)
+    return rc
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
