@@ -34,6 +34,11 @@ from app.services.bl13_versioning import (
 from app.services.crop_lifecycle import (
     CropNotOnBeltError, assert_crop_on_belt,
 )
+from app.services.package_validation import (
+    PackageValidationError,
+    validate_package_duration_for_create,
+    validate_package_duration_for_update,
+)
 from app.services.bl17_timeline_boundary import (
     TimelineSpec, find_timeline_conflicts,
 )
@@ -88,8 +93,20 @@ async def create_package(
             detail={"code": e.code, "message": str(e)},
         )
 
-    # Package type lock: duration fixed for PERENNIAL
-    duration = 365 if request.package_type == PackageType.PERENNIAL else (request.duration_days or 180)
+    # CCA Step 2 / Batch 2A: range-check Annual duration (1-365);
+    # Perennial is forced to 365 regardless of input. Pre-fix the live
+    # route silently defaulted Annual to 180 when omitted and never
+    # checked the upper bound — a CA could ship 9999-day timelines.
+    try:
+        duration = validate_package_duration_for_create(
+            package_type=request.package_type.value,
+            duration_days=request.duration_days,
+        )
+    except PackageValidationError as e:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": e.code, "message": e.message},
+        )
 
     pkg = Package(
         client_id=client_id,
@@ -125,8 +142,27 @@ async def update_package(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """CCA Step 2 / Batch 2A: duration_days is range-checked on update
+    and locked at 365 for Perennial packages. Pre-fix the route blindly
+    setattr'd whatever was sent — a Perennial's duration could be
+    flipped to 100 and break advisory alignment downstream."""
     pkg = await _get_package(db, package_id, client_id)
-    for field, value in request.model_dump(exclude_unset=True).items():
+    update_data = request.model_dump(exclude_unset=True)
+
+    if "duration_days" in update_data:
+        try:
+            update_data["duration_days"] = validate_package_duration_for_update(
+                package_type=pkg.package_type.value,
+                current_duration=pkg.duration_days,
+                new_duration=update_data["duration_days"],
+            )
+        except PackageValidationError as e:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": e.code, "message": e.message},
+            )
+
+    for field, value in update_data.items():
         setattr(pkg, field, value)
     await db.commit()
     await db.refresh(pkg)

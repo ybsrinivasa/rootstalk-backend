@@ -505,6 +505,7 @@ async def test_create_package_succeeds_when_crop_on_belt(db):
         request=PkgCreate(
             crop_cosh_id="crop:paddy", name="Paddy Kharif PoP",
             package_type=PackageType.ANNUAL, duration_days=120,
+            start_date_label_cosh_id="label:sowing_date",
         ),
         db=db, current_user=user,
     )
@@ -532,6 +533,7 @@ async def test_create_package_422_when_crop_never_added(db):
             request=PkgCreate(
                 crop_cosh_id="crop:never_added", name="Phantom PoP",
                 package_type=PackageType.ANNUAL, duration_days=120,
+                start_date_label_cosh_id="label:sowing_date",
             ),
             db=db, current_user=user,
         )
@@ -563,6 +565,7 @@ async def test_create_package_422_when_crop_soft_removed(db):
             request=PkgCreate(
                 crop_cosh_id="crop:paddy", name="Late PoP",
                 package_type=PackageType.ANNUAL, duration_days=120,
+                start_date_label_cosh_id="label:sowing_date",
             ),
             db=db, current_user=user,
         )

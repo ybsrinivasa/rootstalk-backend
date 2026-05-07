@@ -10,8 +10,11 @@ class PackageCreate(BaseModel):
     crop_cosh_id: str
     name: str
     package_type: PackageType
+    # Annual: required, 1-365. Perennial: input is ignored (forced to 365).
     duration_days: Optional[int] = None
-    start_date_label_cosh_id: Optional[str] = None
+    # Mandatory per spec §4.1 — fixed Cosh list (Sowing/Planting/Pruning Date).
+    # Editable post-create via PackageUpdate.
+    start_date_label_cosh_id: str
     description: Optional[str] = None
 
 
