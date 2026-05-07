@@ -157,9 +157,28 @@ class PracticeOut(BaseModel):
 # ── Relations ──────────────────────────────────────────────────────────────────
 
 class RelationCreate(BaseModel):
+    """Save-time payload for `POST /timelines/{id}/relations`.
+
+    `parts` is a 3-D list mirroring the spec's mental model:
+        parts[i][j][k] = practice_id at Part i+1, Option j+1, Position k+1
+
+    Pure AND of N practices: `[[[p1, p2, ..., pN]]]` (single Part,
+    single Option, N positions).
+    Pure OR of N practices: `[[[p1], [p2], ..., [pN]]]` (single
+    Part, N Options of 1 position each).
+    Mixed AND-OR per spec §10.1 example "(A+B) or (C) or (D) +
+    (P or Q) + (M) or (N)":
+        [[[A, B], [C], [D]],
+         [[P], [Q]],
+         [[M], [N]]]
+
+    `expression` is a human-readable display string the CA portal
+    builds for confirmation; the backend stores it for read-back
+    but doesn't parse or validate it.
+    """
     relation_type: RelationType
     expression: Optional[str] = None
-    practice_ids: List[str] = []
+    parts: List[List[List[str]]]
 
 
 # ── Conditional Questions ──────────────────────────────────────────────────────

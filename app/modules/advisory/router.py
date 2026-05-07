@@ -52,6 +52,26 @@ from app.services.publish_validation import (
 from app.services.timeline_validation import (
     TimelineValidationError, validate_timeline,
 )
+from app.services.relations import PracticeRef
+from app.services.relation_validation import (
+    RelationValidationFailed, validate_relation_save,
+)
+
+
+def _raise_relation_validation(e: RelationValidationFailed):
+    """Map RelationValidationFailed to a 422 with the complete list
+    of violated rules so the CA portal can render a checklist."""
+    raise HTTPException(
+        status_code=422,
+        detail={
+            "code": e.code,
+            "message": str(e),
+            "errors": [
+                {"code": err.code, "message": err.message, **(err.extra or {})}
+                for err in e.errors
+            ],
+        },
+    )
 
 
 def _raise_timeline_validation(e: TimelineValidationError):
@@ -1069,6 +1089,92 @@ async def create_relation(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """CCA Step 4 / Batch 4A: validates AND/OR structure against
+    spec §6.4 + §10.2 + user clarification 2026-05-07. Builds the
+    Part/Option/Position structure, runs every save-time rule, and
+    persists Practice.relation_id + Practice.relation_role on success.
+
+    Returns 422 with `code = relation_validation_failed` and
+    `errors: [...]` containing the complete list of rule violations
+    so the CA portal can render a single checklist.
+
+    `request.parts` is a 3-D list (parts × options × positions) of
+    practice_ids — see RelationCreate docstring for the shape.
+    """
+    # Flatten + dedupe practice_ids while preserving the structure.
+    distinct_practice_ids: set[str] = set()
+    for opts in request.parts:
+        for positions in opts:
+            for pid in positions:
+                distinct_practice_ids.add(pid)
+
+    if not distinct_practice_ids:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "relation_empty",
+                "message": "A Relation must reference at least one Practice.",
+            },
+        )
+
+    practices = (await db.execute(
+        select(Practice).where(Practice.id.in_(distinct_practice_ids))
+    )).scalars().all()
+    by_id = {p.id: p for p in practices}
+
+    missing = sorted(distinct_practice_ids - set(by_id.keys()))
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "relation_practice_not_found",
+                "message": f"Practice(s) not found: {missing}.",
+                "missing_practice_ids": missing,
+            },
+        )
+
+    # Load the COMMON_NAME element value per practice so the
+    # combinatorial-duplicate checks have a stable input identity.
+    common_name_rows = (await db.execute(
+        select(Element.practice_id, Element.cosh_ref).where(
+            Element.practice_id.in_(distinct_practice_ids),
+            Element.element_type == "COMMON_NAME",
+        )
+    )).all()
+    cn_by_practice = {row[0]: row[1] for row in common_name_rows}
+
+    practice_refs_by_id = {
+        pid: PracticeRef(
+            practice_id=pid,
+            common_name_cosh_id=cn_by_practice.get(pid) or p.common_name_cosh_id,
+            is_special_input=p.is_special_input,
+            role="",  # to be filled by build_structure_from_parts
+            l2_type=p.l2_type,
+        )
+        for pid, p in by_id.items()
+    }
+
+    practice_meta = {
+        pid: {
+            "l0_type": p.l0_type.value if p.l0_type else None,
+            "l1_type": p.l1_type,
+            "timeline_id": p.timeline_id,
+            "relation_id": p.relation_id,
+        }
+        for pid, p in by_id.items()
+    }
+
+    try:
+        structure = validate_relation_save(
+            relation_type=request.relation_type.value,
+            target_timeline_id=timeline_id,
+            parts=request.parts,
+            practice_refs_by_id=practice_refs_by_id,
+            practice_meta=practice_meta,
+        )
+    except RelationValidationFailed as e:
+        _raise_relation_validation(e)
+
     relation = Relation(
         timeline_id=timeline_id,
         relation_type=request.relation_type,
@@ -1077,15 +1183,22 @@ async def create_relation(
     db.add(relation)
     await db.flush()
 
-    for practice_id in request.practice_ids:
-        result = await db.execute(select(Practice).where(Practice.id == practice_id))
-        practice = result.scalar_one_or_none()
-        if practice:
-            practice.relation_id = relation.id
+    # Persist relation_id + relation_role on each PracticeRef in the
+    # structure. The role is the encoded PART/OPT/POS string.
+    for part in structure.parts:
+        for opt in part.options:
+            for pref in opt.practices:
+                pkg_practice = by_id[pref.practice_id]
+                pkg_practice.relation_id = relation.id
+                pkg_practice.relation_role = pref.role
 
     await db.commit()
     await db.refresh(relation)
-    return {"id": relation.id, "relation_type": relation.relation_type, "expression": relation.expression}
+    return {
+        "id": relation.id,
+        "relation_type": relation.relation_type.value,
+        "expression": relation.expression,
+    }
 
 
 # ── Conditional Questions ──────────────────────────────────────────────────────
