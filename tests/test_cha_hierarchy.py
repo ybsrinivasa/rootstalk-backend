@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 def make_sp_entry(cosh_id: str, parent_pg_id: str, name_en: str):
     e = MagicMock()
     e.cosh_id = cosh_id
-    e.entity_type = "specific_problem"
+    e.core_type = "specific_problem"
     e.parent_cosh_id = parent_pg_id
     e.translations = {"en": name_en}
     return e
@@ -24,7 +24,7 @@ def make_sp_entry(cosh_id: str, parent_pg_id: str, name_en: str):
 def make_pg_entry(cosh_id: str, name_en: str):
     e = MagicMock()
     e.cosh_id = cosh_id
-    e.entity_type = "problem_group"
+    e.core_type = "problem_group"
     e.parent_cosh_id = None
     e.translations = {"en": name_en}
     return e
@@ -64,7 +64,7 @@ def mock_db_returning(
         q_str = str(query)
 
         # Route by what seems to be queried (fragile but sufficient for unit tests)
-        if 'cosh_reference_cache' in q_str.lower() or hasattr(query, 'froms'):
+        if 'cosh_core_items' in q_str.lower() or hasattr(query, 'froms'):
             result.scalar_one_or_none = MagicMock(return_value=cosh_entry)
         else:
             result.scalar_one_or_none = MagicMock(return_value=None)

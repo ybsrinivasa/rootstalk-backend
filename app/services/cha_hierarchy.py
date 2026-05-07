@@ -9,10 +9,10 @@ Priority:
 4. None — no CHA recommendation available
 
 The diagnosed problem_cosh_id may be:
-- A specific_problem ID (has a parent problem_group in cosh_reference_cache)
+- A specific_problem ID (has a parent problem_group in cosh_core_items)
 - A problem_group ID (no parent — it IS the group)
 
-We must traverse cosh_reference_cache to find the parent before PG lookup.
+We must traverse cosh_core_items to find the parent before PG lookup.
 """
 from dataclasses import dataclass
 from typing import Optional
@@ -39,24 +39,24 @@ async def resolve_cha_recommendation(
     Full SP→PG hierarchy lookup.
 
     Steps:
-    1. Check cosh_reference_cache: is problem_cosh_id a specific_problem or a problem_group?
+    1. Check cosh_core_items: is problem_cosh_id a specific_problem or a problem_group?
     2. If specific_problem: try SP recommendation (client). Get parent PG ID.
     3. Try PG recommendation (client-specific).
     4. Try PG recommendation (global).
     5. Return first match, or None.
     """
-    from app.modules.sync.models import CoshReferenceCache
+    from app.modules.sync.models import CoshCoreItem
     from app.modules.advisory.models import SPRecommendation, PGRecommendation
 
-    # Step 1: Identify the entity type from Cosh cache
+    # Step 1: Identify the entity type from cosh_core_items
     cosh_entry = (await db.execute(
-        select(CoshReferenceCache).where(
-            CoshReferenceCache.cosh_id == problem_cosh_id,
-            CoshReferenceCache.entity_type.in_(["specific_problem", "problem_group"]),
+        select(CoshCoreItem).where(
+            CoshCoreItem.cosh_id == problem_cosh_id,
+            CoshCoreItem.core_type.in_(["specific_problem", "problem_group"]),
         )
     )).scalar_one_or_none()
 
-    is_specific_problem = cosh_entry and cosh_entry.entity_type == "specific_problem"
+    is_specific_problem = cosh_entry and cosh_entry.core_type == "specific_problem"
 
     # Determine the parent problem_group_cosh_id
     if is_specific_problem:
