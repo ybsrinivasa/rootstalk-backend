@@ -39,6 +39,33 @@ from app.services.package_validation import (
     validate_package_duration_for_create,
     validate_package_duration_for_update,
 )
+from app.services.pv_uniqueness import (
+    PVConflictError, assert_pv_unique_for_package,
+)
+
+
+def _raise_pv_conflict(e: PVConflictError):
+    """Map a PVConflictError to a 422 with a body the CA portal can
+    surface. Each conflict carries the sibling's id+name and the
+    shared districts so the portal can name them precisely."""
+    raise HTTPException(
+        status_code=422,
+        detail={
+            "code": e.code,
+            "message": str(e),
+            "conflicts": [
+                {
+                    "sibling_package_id": c.sibling_package_id,
+                    "sibling_package_name": c.sibling_package_name,
+                    "shared_districts": [
+                        {"state_cosh_id": s, "district_cosh_id": d}
+                        for s, d in c.shared_districts
+                    ],
+                }
+                for c in e.conflicts
+            ],
+        },
+    )
 from app.services.bl17_timeline_boundary import (
     TimelineSpec, find_timeline_conflicts,
 )
@@ -200,6 +227,16 @@ async def publish_package(
             detail={"code": e.code, "message": str(e)},
         )
 
+    # CCA Step 2 / Batch 2D: defensive uniqueness check at publish.
+    # The save-time guards on set_package_variables / locations
+    # should have caught any conflict already, but if a sibling was
+    # edited concurrently, or rows were inserted via SQL outside the
+    # API, last-line block here.
+    try:
+        await assert_pv_unique_for_package(db, package=pkg)
+    except PVConflictError as e:
+        _raise_pv_conflict(e)
+
     current_status = pkg.status.value if hasattr(pkg.status, "value") else str(pkg.status)
     res = validate_publish_transition(current_status)
     if not res.allowed:
@@ -235,6 +272,11 @@ async def set_package_locations(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """CCA Step 2 / Batch 2D: changing locations can newly create a
+    shared district with a sibling that has the same P/V fingerprint.
+    After the new location set is in place, run the uniqueness check
+    against DRAFT/ACTIVE siblings and refuse the save if any conflict
+    surfaces. Spec §4.2."""
     pkg = await _get_package(db, package_id, client_id)
     existing = (await db.execute(
         select(PackageLocation).where(PackageLocation.package_id == package_id)
@@ -243,6 +285,13 @@ async def set_package_locations(
         await db.delete(loc)
     for loc in locations:
         db.add(PackageLocation(package_id=package_id, **loc.model_dump()))
+    await db.flush()
+
+    try:
+        await assert_pv_unique_for_package(db, package=pkg)
+    except PVConflictError as e:
+        _raise_pv_conflict(e)
+
     await db.commit()
     return {"detail": f"{len(locations)} locations saved"}
 
@@ -472,7 +521,15 @@ async def set_package_variables(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Set the parameter→variable fingerprint for a Package."""
+    """Set the parameter→variable fingerprint for a Package.
+
+    CCA Step 2 / Batch 2D (spec §4.2): after the new fingerprint is
+    in place, refuse the save if any DRAFT/ACTIVE sibling under the
+    same `(client, crop)` shares at least one district AND has an
+    identical fingerprint. Guided elimination is non-deterministic
+    otherwise — the farmer answers all the questions and ends up
+    with two PoPs the system can't distinguish.
+    """
     pkg = await _get_package(db, package_id, client_id)
     existing = (await db.execute(
         select(PackageVariable).where(PackageVariable.package_id == package_id)
@@ -485,6 +542,13 @@ async def set_package_variables(
             parameter_id=assignment["parameter_id"],
             variable_id=assignment["variable_id"],
         ))
+    await db.flush()
+
+    try:
+        await assert_pv_unique_for_package(db, package=pkg)
+    except PVConflictError as e:
+        _raise_pv_conflict(e)
+
     await db.commit()
     return {"detail": f"{len(request.assignments)} parameter-variable assignments saved"}
 
