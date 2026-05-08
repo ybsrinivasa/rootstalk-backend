@@ -192,6 +192,7 @@ async def test_import_global_pg_preserves_frequency_days(db):
         problem_group_cosh_id="pg:fungal",
         client_id=None,
         application_type="SPRAY",
+        status="ACTIVE",  # publish gate
     )
     db.add(global_pg)
     await db.flush()
@@ -251,6 +252,7 @@ async def test_import_global_pg_idempotent_returns_409_on_duplicate(db):
         problem_group_cosh_id="pg:fungal",
         client_id=None,
         application_type="SPRAY",
+        status="ACTIVE",  # publish gate
     )
     db.add(global_pg)
     await db.flush()

@@ -1440,12 +1440,19 @@ async def _get_timeline(db: AsyncSession, timeline_id: str, package_id: str) -> 
 
 @router.get("/advisory/global/packages", response_model=list[PackageOut])
 async def list_global_packages(
+    include_drafts: bool = False,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    result = await db.execute(
-        select(Package).where(Package.client_id == None).order_by(Package.created_at.desc())  # noqa: E711
-    )
+    """Global packages visible for fork into client scope. Defaults to
+    ACTIVE only — DRAFT and INACTIVE rows are hidden from CA-portal
+    SEs. CMs can pass `include_drafts=true` to see everything in their
+    own admin views."""
+    q = select(Package).where(Package.client_id == None)  # noqa: E711
+    if not include_drafts:
+        q = q.where(Package.status == PackageStatus.ACTIVE)
+    q = q.order_by(Package.created_at.desc())
+    result = await db.execute(q)
     return result.scalars().all()
 
 
@@ -1619,34 +1626,147 @@ async def delete_global_practice(
     await db.commit()
 
 
+async def _wipe_package_recipe_content(db: AsyncSession, package_id: str) -> dict:
+    """Delete every Timeline / Practice / Element under a Package — the
+    "recipe content" copied from the global. Leaves PackageLocations,
+    PackageAuthors, PackageVariables alone since those are CCA Step 2
+    setup curated by the SE locally and were never part of the fork."""
+    timelines = (await db.execute(
+        select(Timeline).where(Timeline.package_id == package_id)
+    )).scalars().all()
+    tl_count = len(timelines)
+    practice_count = 0
+    element_count = 0
+    for tl in timelines:
+        practices = (await db.execute(
+            select(Practice).where(Practice.timeline_id == tl.id)
+        )).scalars().all()
+        practice_count += len(practices)
+        for p in practices:
+            elements = (await db.execute(
+                select(Element).where(Element.practice_id == p.id)
+            )).scalars().all()
+            element_count += len(elements)
+            for el in elements:
+                await db.delete(el)
+            await db.delete(p)
+        await db.delete(tl)
+    await db.flush()
+    return {
+        "timelines_replaced": tl_count,
+        "practices_replaced": practice_count,
+        "elements_replaced": element_count,
+    }
+
+
 @router.post("/client/{client_id}/packages/{pkg_id}/fork", response_model=PackageOut, status_code=201)
 async def fork_global_package(
     client_id: str,
     pkg_id: str,
+    force: bool = False,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Deep-copy a global package (all timelines + practices + elements) to a client."""
+    """Deep-copy a global package (all timelines + practices + elements)
+    into a client.
+
+    First fork (no existing local copy of this global): creates a new
+    local Package with the parent_global_id lineage and deep-copies
+    timelines / practices / elements.
+
+    Re-fork (existing local copy detected):
+      • Default — refuses with 409 + structured `existing` summary so
+        the CA portal can show a "this will overwrite your local
+        edits" warning.
+      • `?force=true` — wipes the existing local copy's recipe
+        content (Timelines / Practices / Elements) and re-copies fresh
+        from the global. Refreshes the Package header fields (name,
+        type, duration, start_date_label, description) to the global's
+        current values. The Package row itself, plus the SE's own
+        CCA Step 2 setup (PackageLocations, PackageAuthors,
+        PackageVariables), are preserved.
+
+    Publish gate: only ACTIVE global packages may be forked. DRAFT
+    is CM work-in-progress; INACTIVE is a superseded version.
+    """
     src = (await db.execute(
         select(Package).where(Package.id == pkg_id, Package.client_id == None)  # noqa: E711
     )).scalar_one_or_none()
     if not src:
         raise HTTPException(status_code=404, detail="Global package not found")
 
-    # Create the local copy
-    copy = Package(
-        client_id=client_id,
-        parent_global_id=src.id,
-        crop_cosh_id=src.crop_cosh_id,
-        name=src.name,
-        package_type=src.package_type,
-        duration_days=src.duration_days,
-        start_date_label_cosh_id=src.start_date_label_cosh_id,
-        description=src.description,
-        created_by=current_user.id,
-    )
-    db.add(copy)
-    await db.flush()
+    if src.status != PackageStatus.ACTIVE:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "global_package_not_published",
+                "message": (
+                    "This global package has not been published (or has "
+                    "been deactivated). Ask the CM to publish it before "
+                    "forking."
+                ),
+                "current_status": src.status.value if hasattr(src.status, "value") else src.status,
+            },
+        )
+
+    existing = (await db.execute(
+        select(Package).where(
+            Package.client_id == client_id,
+            Package.parent_global_id == pkg_id,
+        )
+    )).scalar_one_or_none()
+
+    if existing and not force:
+        tl_count = (await db.execute(
+            select(func.count()).select_from(Timeline).where(
+                Timeline.package_id == existing.id,
+            )
+        )).scalar() or 0
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "import_would_overwrite",
+                "message": (
+                    "This package is already forked into this client. "
+                    "Re-forking will overwrite the existing local copy's "
+                    "timelines and practices. SE-curated locations, authors, "
+                    "and parameter-variable assignments are preserved. "
+                    "Send force=true to confirm."
+                ),
+                "existing": {
+                    "package_id": existing.id,
+                    "timeline_count": tl_count,
+                },
+            },
+        )
+
+    if existing:
+        # Force-overwrite path: wipe the existing recipe content + reuse
+        # the Package row. Refresh header fields to the global's
+        # current values.
+        await _wipe_package_recipe_content(db, existing.id)
+        existing.crop_cosh_id = src.crop_cosh_id
+        existing.name = src.name
+        existing.package_type = src.package_type
+        existing.duration_days = src.duration_days
+        existing.start_date_label_cosh_id = src.start_date_label_cosh_id
+        existing.description = src.description
+        await db.flush()
+        copy = existing
+    else:
+        copy = Package(
+            client_id=client_id,
+            parent_global_id=src.id,
+            crop_cosh_id=src.crop_cosh_id,
+            name=src.name,
+            package_type=src.package_type,
+            duration_days=src.duration_days,
+            start_date_label_cosh_id=src.start_date_label_cosh_id,
+            description=src.description,
+            created_by=current_user.id,
+        )
+        db.add(copy)
+        await db.flush()
 
     # Load source timelines + practices + elements
     tl_result = await db.execute(
@@ -1703,13 +1823,19 @@ async def fork_global_package(
 
 @router.get("/advisory/global/pg-recommendations", response_model=list[PGRecommendationOut])
 async def list_global_pg(
+    include_drafts: bool = False,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    result = await db.execute(
-        select(PGRecommendation).where(PGRecommendation.client_id == None)  # noqa: E711
-        .order_by(PGRecommendation.created_at.desc())
-    )
+    """Global PG recommendations visible for import into client scope.
+    Defaults to ACTIVE only — DRAFT and INACTIVE rows are hidden from
+    CA-portal SEs. CMs can pass `include_drafts=true` to see
+    everything in their own admin views."""
+    q = select(PGRecommendation).where(PGRecommendation.client_id == None)  # noqa: E711
+    if not include_drafts:
+        q = q.where(PGRecommendation.status == "ACTIVE")
+    q = q.order_by(PGRecommendation.created_at.desc())
+    result = await db.execute(q)
     return result.scalars().all()
 
 
@@ -2013,6 +2139,23 @@ async def import_global_pg(
     )).scalar_one_or_none()
     if not src:
         raise HTTPException(status_code=404, detail="Global PG recommendation not found")
+
+    # Publish gate: only ACTIVE global PGs may be imported. DRAFTs are
+    # CM-curated work-in-progress; INACTIVE rows are superseded versions.
+    # Either signals the source isn't fit for client consumption.
+    if src.status != "ACTIVE":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "global_pg_not_published",
+                "message": (
+                    "This global PG recommendation has not been published "
+                    "(or has been deactivated). Ask the CM to publish it "
+                    "before importing."
+                ),
+                "current_status": src.status,
+            },
+        )
 
     existing = (await db.execute(
         select(PGRecommendation).where(

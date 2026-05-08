@@ -45,6 +45,7 @@ async def _seed_global_pg_with_content(
         problem_group_cosh_id=problem_group_cosh_id,
         client_id=None,
         application_type="SPRAY",
+        status="ACTIVE",  # publish gate: only ACTIVE globals are importable
     )
     db.add(pg)
     await db.flush()
