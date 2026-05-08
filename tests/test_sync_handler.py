@@ -122,21 +122,22 @@ async def test_core_upsert_updates_existing(db):
 async def test_connect_extracts_endpoints_from_positions(db):
     """pest_diagnosis_chain row from a positions-dict payload — adapter
     reshapes into the typed endpoints array, role = each position's
-    target entity_type."""
+    target entity_type. priority_rank is a Core, surfaced as the 9th
+    position pointing at a priority_rank Core item."""
     log = await _new_log(db)
     await process_payload(db, _payload(_batch(
         "pest_diagnosis_chain",
         {
             "cosh_id": "pdc:0001",
             "status": "active",
-            "priority_rank": 1,
             "positions": _positions(
-                (1, "crop",        "crop:tomato"),
-                (2, "crop_stage",  "stage:fruiting"),
-                (3, "pest",        "pest:fruit_borer"),
-                (4, "pest_stage",  "infest:early"),
-                (5, "part",        "part:fruit"),
-                (7, "symptom",     "sym:bored_holes"),
+                (1, "crop",          "crop:tomato"),
+                (2, "crop_stage",    "stage:fruiting"),
+                (3, "pest",          "pest:fruit_borer"),
+                (4, "pest_stage",    "infest:early"),
+                (5, "part",          "part:fruit"),
+                (7, "symptom",       "sym:bored_holes"),
+                (9, "priority_rank", "pr:1"),
                 # positions 6 (sub_part) and 8 (sub_symptom) absent
             ),
         },
@@ -150,18 +151,19 @@ async def test_connect_extracts_endpoints_from_positions(db):
 
     by_role = {ep["role"]: ep["cosh_id"] for ep in row.endpoints}
     assert by_role == {
-        "crop":       "crop:tomato",
-        "crop_stage": "stage:fruiting",
-        "pest":       "pest:fruit_borer",
-        "pest_stage": "infest:early",
-        "part":       "part:fruit",
-        "symptom":    "sym:bored_holes",
+        "crop":          "crop:tomato",
+        "crop_stage":    "stage:fruiting",
+        "pest":          "pest:fruit_borer",
+        "pest_stage":    "infest:early",
+        "part":          "part:fruit",
+        "symptom":       "sym:bored_holes",
+        "priority_rank": "pr:1",
     }
-    # priority_rank lands in metadata as a row-level scalar
-    assert row.metadata_ == {"priority_rank": 1}
+    # No row-level scalar attributes today — metadata stays empty.
+    assert row.metadata_ in (None, {})
     # Endpoints retain position numbers for ordered Compound Connects
     positions_in_endpoints = {ep["position"] for ep in row.endpoints}
-    assert positions_in_endpoints == {1, 2, 3, 4, 5, 7}
+    assert positions_in_endpoints == {1, 2, 3, 4, 5, 7, 9}
 
 
 @requires_docker

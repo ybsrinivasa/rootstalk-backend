@@ -217,13 +217,24 @@ async def test_answer_session_404_for_other_farmer(db):
 @requires_docker
 @pytest.mark.asyncio
 async def test_priority_rank_demotes_problem_through_live_router(db):
-    """End-to-end check that `priority_rank` in cosh_connect_rows.metadata_
-    is honoured by the live router. Two problems share LEAF+Colour_Change,
+    """End-to-end check that `priority_rank` (now a Core, surfaced as
+    a position on the Pest Diagnosis Connect) is dereferenced and
+    honoured by the live router. Two problems share LEAF+Colour_Change,
     but one has it at rank 2 (with a rank-1 symptom elsewhere). YES on
     Colour_Change must demote the ranked problem and diagnose the
     unranked one."""
     farmer = await make_user(db)
     sub = await _seed_subscription(db, farmer)
+
+    # Priority-rank Cores: one item per rank value, with metadata.rank.
+    db.add(CoshCoreItem(
+        cosh_id="pr:1", core_type="priority_rank", status="active",
+        translations={"en": "1"}, metadata_={"rank": 1},
+    ))
+    db.add(CoshCoreItem(
+        cosh_id="pr:2", core_type="priority_rank", status="active",
+        translations={"en": "2"}, metadata_={"rank": 2},
+    ))
 
     # Ranked pest: LEAF+Spots is rank 1, LEAF+Colour_Change is rank 2.
     db.add(CoshConnectRow(
@@ -231,28 +242,30 @@ async def test_priority_rank_demotes_problem_through_live_router(db):
         connect_type="pest_diagnosis_chain",
         status="active",
         endpoints=[
-            {"role": "crop",       "cosh_id": CROP},
-            {"role": "crop_stage", "cosh_id": STAGE},
-            {"role": "pest",       "cosh_id": "pest:ranked"},
-            {"role": "part",       "cosh_id": "part:leaf"},
-            {"role": "symptom",    "cosh_id": "symptom:spots"},
+            {"role": "crop",          "cosh_id": CROP},
+            {"role": "crop_stage",    "cosh_id": STAGE},
+            {"role": "pest",          "cosh_id": "pest:ranked"},
+            {"role": "part",          "cosh_id": "part:leaf"},
+            {"role": "symptom",       "cosh_id": "symptom:spots"},
+            {"role": "priority_rank", "cosh_id": "pr:1"},
         ],
-        metadata_={"priority_rank": 1},
+        metadata_=None,
     ))
     db.add(CoshConnectRow(
         connect_id="pdc:ranked-colour",
         connect_type="pest_diagnosis_chain",
         status="active",
         endpoints=[
-            {"role": "crop",       "cosh_id": CROP},
-            {"role": "crop_stage", "cosh_id": STAGE},
-            {"role": "pest",       "cosh_id": "pest:ranked"},
-            {"role": "part",       "cosh_id": "part:leaf"},
-            {"role": "symptom",    "cosh_id": "symptom:colour"},
+            {"role": "crop",          "cosh_id": CROP},
+            {"role": "crop_stage",    "cosh_id": STAGE},
+            {"role": "pest",          "cosh_id": "pest:ranked"},
+            {"role": "part",          "cosh_id": "part:leaf"},
+            {"role": "symptom",       "cosh_id": "symptom:colour"},
+            {"role": "priority_rank", "cosh_id": "pr:2"},
         ],
-        metadata_={"priority_rank": 2},
+        metadata_=None,
     ))
-    # Unranked sibling — only has Colour_Change.
+    # Unranked sibling — only has Colour_Change, no priority_rank endpoint.
     db.add(CoshConnectRow(
         connect_id="pdc:unranked-colour",
         connect_type="pest_diagnosis_chain",
@@ -286,6 +299,62 @@ async def test_priority_rank_demotes_problem_through_live_router(db):
     )
     assert out["status"] == "DIAGNOSED"
     assert out["diagnosed_problem_cosh_id"] == "pest:unranked"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_priority_rank_translation_fallback(db):
+    """When the priority_rank Core item carries the rank as
+    translations.en (digit string) instead of metadata.rank, the
+    loader's fallback path still resolves it correctly."""
+    farmer = await make_user(db)
+    sub = await _seed_subscription(db, farmer)
+
+    # Rank value lives only in translations.en — no metadata.rank.
+    db.add(CoshCoreItem(
+        cosh_id="pr:translatedonly", core_type="priority_rank",
+        status="active",
+        translations={"en": "1"},
+        metadata_=None,
+    ))
+    db.add(CoshConnectRow(
+        connect_id="pdc:t1",
+        connect_type="pest_diagnosis_chain",
+        status="active",
+        endpoints=[
+            {"role": "crop",          "cosh_id": CROP},
+            {"role": "crop_stage",    "cosh_id": STAGE},
+            {"role": "pest",          "cosh_id": "pest:tonly"},
+            {"role": "part",          "cosh_id": "part:leaf"},
+            {"role": "symptom",       "cosh_id": "symptom:fallback"},
+            {"role": "priority_rank", "cosh_id": "pr:translatedonly"},
+        ],
+        metadata_=None,
+    ))
+    db.add(CoshConnectRow(
+        connect_id="pdc:t2",
+        connect_type="pest_diagnosis_chain",
+        status="active",
+        endpoints=[
+            {"role": "crop",       "cosh_id": CROP},
+            {"role": "crop_stage", "cosh_id": STAGE},
+            {"role": "pest",       "cosh_id": "pest:tonly"},
+            {"role": "part",       "cosh_id": "part:leaf"},
+            {"role": "symptom",    "cosh_id": "symptom:other"},
+        ],
+        metadata_=None,
+    ))
+    await db.commit()
+
+    # Rank loaded via the fallback parses "1" → 1; the diagnosis
+    # algorithm sees rank=1 on the first row, no rank on the second.
+    from app.modules.farmpundit.diagnosis_router import (
+        _load_problem_symptom_rows,
+    )
+    rows = await _load_problem_symptom_rows(db, CROP, STAGE)
+    by_id = {r.symptom_cosh_id: r for r in rows}
+    assert by_id["symptom:fallback"].priority_rank == 1
+    assert by_id["symptom:other"].priority_rank is None
 
 
 @requires_docker

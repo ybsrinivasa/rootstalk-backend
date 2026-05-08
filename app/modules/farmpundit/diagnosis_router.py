@@ -80,6 +80,39 @@ class AnswerRequest(BaseModel):
 
 # ── Helper: load symptom rows from Cosh cache ─────────────────────────────────
 
+async def _load_priority_rank_values(
+    db: AsyncSession, rank_cosh_ids: set[str],
+) -> dict[str, int]:
+    """Resolve a set of `priority_rank` Core cosh_ids to their integer
+    rank values. Reads `metadata.rank: int` first; falls back to
+    parsing `translations.en` as an int. Per
+    docs/COSH_2_SYNC_CONTRACT.md §8.1, Cosh designer can put the
+    value in either place."""
+    if not rank_cosh_ids:
+        return {}
+    rows = (await db.execute(
+        select(CoshCoreItem).where(
+            CoshCoreItem.cosh_id.in_(rank_cosh_ids),
+            CoshCoreItem.core_type == "priority_rank",
+            CoshCoreItem.status == "active",
+        )
+    )).scalars().all()
+    out: dict[str, int] = {}
+    for row in rows:
+        meta_rank = (row.metadata_ or {}).get("rank")
+        if isinstance(meta_rank, int):
+            out[row.cosh_id] = meta_rank
+            continue
+        # Fallback: translations.en as a digit string.
+        en = (row.translations or {}).get("en")
+        if isinstance(en, str) and en.strip().lstrip("-").isdigit():
+            try:
+                out[row.cosh_id] = int(en.strip())
+            except ValueError:
+                pass
+    return out
+
+
 async def _load_problem_symptom_rows(
     db: AsyncSession,
     crop_cosh_id: str,
@@ -91,8 +124,12 @@ async def _load_problem_symptom_rows(
 
     Endpoints follow the Cosh-side `entity_type` vocabulary as their
     role names (see docs/COSH_2_SYNC_CONTRACT.md): crop, crop_stage,
-    pest, pest_stage, part, sub_part, symptom, sub_symptom. priority_rank
-    rides as a row-level scalar in metadata.
+    pest, pest_stage, part, sub_part, symptom, sub_symptom,
+    priority_rank.
+
+    `priority_rank` is itself a Core (per §8.1); its endpoint cosh_id
+    points at a `priority_rank` Core item whose `metadata.rank` (or
+    `translations.en` fallback) carries the integer value.
 
     Crop / crop_stage filters run in-memory after the type-and-status
     filter — at V1 row counts (thousands), JSONB-array filters at SQL
@@ -104,37 +141,43 @@ async def _load_problem_symptom_rows(
     result = await db.execute(q)
     raw = result.scalars().all()
 
-    rows: list[ProblemSymptomRow] = []
+    # First pass: filter rows + collect the set of priority_rank Core
+    # cosh_ids referenced. One batch lookup beats N point lookups.
+    accepted: list[tuple[CoshConnectRow, dict]] = []
+    rank_cosh_ids: set[str] = set()
     for r in raw:
         endpoints = {ep["role"]: ep["cosh_id"] for ep in (r.endpoints or [])
                      if ep.get("role") and ep.get("cosh_id")}
 
-        # Crop scope — every row must match the farmer's crop.
         if endpoints.get("crop") != crop_cosh_id:
             continue
-        # CropStage scope — when provided, narrows further.
         if crop_stage_cosh_id and endpoints.get("crop_stage") != crop_stage_cosh_id:
             continue
 
-        # Required leaves for BL-08's dichotomous walk.
-        pest = endpoints.get("pest")
-        part = endpoints.get("part")
-        symptom = endpoints.get("symptom")
-        if not pest or not part or not symptom:
+        if not endpoints.get("pest") or not endpoints.get("part") \
+                or not endpoints.get("symptom"):
             continue
 
-        meta = r.metadata_ or {}
-        raw_rank = meta.get("priority_rank")
+        accepted.append((r, endpoints))
+        rk = endpoints.get("priority_rank")
+        if rk:
+            rank_cosh_ids.add(rk)
+
+    rank_values = await _load_priority_rank_values(db, rank_cosh_ids)
+
+    rows: list[ProblemSymptomRow] = []
+    for _r, endpoints in accepted:
+        rank_id = endpoints.get("priority_rank")
         rows.append(ProblemSymptomRow(
-            pest_cosh_id=pest,
-            part_cosh_id=part,
-            symptom_cosh_id=symptom,
+            pest_cosh_id=endpoints["pest"],
+            part_cosh_id=endpoints["part"],
+            symptom_cosh_id=endpoints["symptom"],
             crop_cosh_id=endpoints.get("crop"),
             crop_stage_cosh_id=endpoints.get("crop_stage"),
             pest_stage_cosh_id=endpoints.get("pest_stage"),
             sub_part_cosh_id=endpoints.get("sub_part"),
             sub_symptom_cosh_id=endpoints.get("sub_symptom"),
-            priority_rank=raw_rank if isinstance(raw_rank, int) else None,
+            priority_rank=rank_values.get(rank_id) if rank_id else None,
         ))
     return rows
 

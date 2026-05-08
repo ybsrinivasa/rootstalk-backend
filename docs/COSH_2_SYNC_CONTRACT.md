@@ -151,32 +151,19 @@ sentinel-valued) so downstream consumers see the position as missing.
 
 ---
 
-## 6. Optional scalar attributes per Connect
+## 6. Reserved — was scalar attributes per Connect
 
-Some Connects carry **scalar (non-cosh_id) attributes** that aren't
-positions. Today only one is needed:
+Earlier draft of this contract carried row-level scalar attributes for
+Connects (e.g. `priority_rank` as a top-level int field on
+`pest_diagnosis_chain` rows). That special case is removed.
 
-### 6.1 `pest_diagnosis_chain` — `priority_rank`
+`priority_rank` is now a Core (see §8.1) and rides as a position on
+the Pest Diagnosis Connect (§8.2 / §11.2). The same shape supports any
+future "ranked" attribute on any Connect via Core ↔ position only.
 
-`priority_rank` is an integer, expert-curated. Used by RootsTalk's BL-08
-diagnosis algorithm to demote problems whose top-priority symptom
-wasn't reported.
-
-Cosh emits it as a row-level attribute alongside `cosh_id` /
-`status` / `positions`:
-
-```json
-{
-  "cosh_id": "...",
-  "entity_type": "pest_diagnosis_chain",
-  "status": "active",
-  "priority_rank": 1,
-  "positions": { ... }
-}
-```
-
-If absent, RootsTalk treats the row as unranked. (Mixing ranked and
-unranked rows of the same pest is supported — see BL-08 spec.)
+If a Connect needs a value that genuinely can't be modelled as a Core
+(e.g. a free-text label, a continuous numeric measurement), this
+section will be revived for that case. None today.
 
 ---
 
@@ -222,6 +209,7 @@ labels listed below.
 | `number_unit` | Unit for plant counts | |
 | `itk_name` | ITK (indigenous technical knowledge) name | |
 | `maturity_index` | Harvest-stage maturity indicator | |
+| `priority_rank` | Expert-curated rank within a diagnosis row's pest (1 = top) | One Core item per rank value. The numeric rank lives in `metadata.rank: int` (or, fallback, in `translations.en` as a digit string). |
 | `problem_group` | PG cluster of related Pests | `parent_cosh_id` empty |
 | `specific_problem` | SP under a PG | `parent_cosh_id` = the PG's cosh_id |
 | `brand` | Trade name / brand | `parent_cosh_id` = CNI's cosh_id; `metadata.manufacturer_name` carries the manufacturer string |
@@ -230,7 +218,7 @@ labels listed below.
 
 | `entity_type_label` | Schema (positions) | Row attributes |
 |---|---|---|
-| `pest_diagnosis_chain` | `[1: crop, 2: crop_stage, 3: pest, 4: pest_stage, 5: part, 6: sub_part, 7: symptom, 8: sub_symptom]` — all CORE node_type | `priority_rank: int` |
+| `pest_diagnosis_chain` | `[1: crop, 2: crop_stage, 3: pest, 4: pest_stage, 5: part, 6: sub_part, 7: symptom, 8: sub_symptom, 9: priority_rank]` — all CORE node_type | — |
 | `<crop>_pest_images` (one per crop, e.g. `tomato_pest_images`, `paddy_pest_images`, ...) | `[1: pest_diagnosis_chain (CONNECT), 2: media (CORE)]` | — |
 
 For image Connects, one row pairs one `pest_diagnosis_chain` row with
@@ -330,6 +318,10 @@ Per the architectural rule confirmed 2026-05-07:
       "relationship_display_name": "Specifically" },
     { "position_number": 8, "node_type": "CORE",
       "entity_type": "sub_symptom",
+      "relationship_to_next": "RANKED_AS",
+      "relationship_display_name": "Ranked As" },
+    { "position_number": 9, "node_type": "CORE",
+      "entity_type": "priority_rank",
       "relationship_to_next": null,
       "relationship_display_name": null }
   ],
@@ -338,7 +330,6 @@ Per the architectural rule confirmed 2026-05-07:
       "cosh_id": "row-uuid-1",
       "entity_type": "pest_diagnosis_chain",
       "status": "active",
-      "priority_rank": 1,
       "positions": {
         "1": { "cosh_id": "<paddy uuid>",         "entity_type": "crop" },
         "2": { "cosh_id": "<tillering uuid>",     "entity_type": "crop_stage" },
@@ -347,8 +338,33 @@ Per the architectural rule confirmed 2026-05-07:
         "5": { "cosh_id": "<stem uuid>",          "entity_type": "part" },
         "6": { "cosh_id": "<BlankBox sentinel>",  "entity_type": "sub_part" },
         "7": { "cosh_id": "<bored_holes uuid>",   "entity_type": "symptom" },
-        "8": { "cosh_id": "<BlankBox sentinel>",  "entity_type": "sub_symptom" }
+        "8": { "cosh_id": "<BlankBox sentinel>",  "entity_type": "sub_symptom" },
+        "9": { "cosh_id": "<rank-1 uuid>",        "entity_type": "priority_rank" }
       }
+    }
+  ]
+}
+```
+
+The matching priority_rank Core item:
+
+```json
+{
+  "entity_type": "priority_rank",
+  "items": [
+    {
+      "cosh_id": "<rank-1 uuid>",
+      "entity_type": "priority_rank",
+      "status": "active",
+      "translations": { "en": "1" },
+      "metadata": { "rank": 1 }
+    },
+    {
+      "cosh_id": "<rank-2 uuid>",
+      "entity_type": "priority_rank",
+      "status": "active",
+      "translations": { "en": "2" },
+      "metadata": { "rank": 2 }
     }
   ]
 }
@@ -434,10 +450,11 @@ ingest depending on which side ships first.
 1. **BlankBox sentinel** — pin exact spelling (§5).
 2. **Cosh designer**: tag all entities in §8 to the `rootstalk`
    product and set canonical `entity_type_label` per the table.
-3. **Cosh emitter**: confirm `priority_rank` is added as a row
-   attribute on `pest_diagnosis_chain` rows (§6.1). If Cosh adds
-   `priority_rank` as a real column on `connect_data_items`, this
-   document doesn't change — only the emit code does.
+3. **Cosh designer**: create the `priority_rank` Core (§8.1) with one
+   item per rank value (rank 1, 2, 3, …) and ensure each item carries
+   the numeric value in `metadata.rank: int`. Then add position 9
+   (entity_type=`priority_rank`) to the `pest_diagnosis_chain`
+   schema and populate it on each diagnosis row that needs ranking.
 4. **`<crop>_pest_images`** — Cosh designer creates one Connect per
    crop covered in V1 (paddy, tomato, ...). Each follows the §8.2
    schema.
