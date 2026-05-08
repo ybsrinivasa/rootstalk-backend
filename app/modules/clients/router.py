@@ -1092,6 +1092,37 @@ async def register_promoter(
     if not existing_role:
         db.add(UserRole(user_id=user.id, role_type=role_type))
 
+    # Spec §11.2 — Facilitator-Promoter is exclusive per company
+    # ("one company at a time"). Dealer-Promoter is multi-company by
+    # design. If this user has an ACTIVE FACILITATOR row at any
+    # OTHER client, refuse with a structured 409 so the CA gets a
+    # clear path forward (deactivate at the previous company first).
+    # Privacy: never name the other client — the CA doesn't need to
+    # know, and surfacing it would leak cross-client info.
+    if promoter_type == "FACILITATOR":
+        active_elsewhere = (await db.execute(
+            select(ClientPromoter).where(
+                ClientPromoter.user_id == user.id,
+                ClientPromoter.promoter_type == "FACILITATOR",
+                ClientPromoter.status == "ACTIVE",
+                ClientPromoter.client_id != client_id,
+            )
+        )).scalar_one_or_none()
+        if active_elsewhere:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "facilitator_already_active_elsewhere",
+                    "message": (
+                        "This person is already registered as an active "
+                        "Facilitator at another company. Per spec §11.2, a "
+                        "Facilitator-Promoter can only be active at one "
+                        "company at a time. They must be deactivated at the "
+                        "previous company before being registered here."
+                    ),
+                },
+            )
+
     # Link to this client
     existing_cp = (await db.execute(
         select(ClientPromoter).where(
