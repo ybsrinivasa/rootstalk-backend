@@ -442,7 +442,12 @@ async def toggle_client_status(
 
 @router.get("/portal/{short_name}/branding")
 async def get_portal_branding(short_name: str, db: AsyncSession = Depends(get_db)):
-    """Public endpoint — returns branding for the login page."""
+    """Public endpoint — returns branding + the client-level payment
+    configuration for the CA portal. The CA portal caches this in
+    localStorage right after login and reads it in pages that need to
+    display the payment model or gate UI affordances on it (e.g. the
+    dashboard banner, hiding "Subscribe" tiles for COMPANY_PAYS clients
+    in future PWA work)."""
     result = await db.execute(
         select(Client).where(Client.short_name == short_name, Client.status == ClientStatus.ACTIVE)
     )
@@ -460,6 +465,8 @@ async def get_portal_branding(short_name: str, db: AsyncSession = Depends(get_db
         "logo_url": client.logo_url,
         "primary_colour": client.primary_colour,
         "org_type_cosh_ids": list(org_types),
+        "payment_model": client.payment_model.value
+            if hasattr(client.payment_model, "value") else client.payment_model,
     }
 
 
@@ -486,6 +493,8 @@ async def get_client_info_by_id(
         "support_phone": client.support_phone, "office_phone": client.office_phone,
         "website": client.website, "social_links": client.social_links or {},
         "org_type_cosh_ids": list(org_types),
+        "payment_model": client.payment_model.value
+            if hasattr(client.payment_model, "value") else client.payment_model,
     }
 
 

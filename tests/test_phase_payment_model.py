@@ -191,3 +191,32 @@ async def test_self_subscribe_404_when_client_missing(db):
             db=db, current_user=farmer,
         )
     assert ei.value.status_code == 404
+
+
+# ── Portal branding endpoint surfaces payment_model ─────────────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_portal_branding_returns_payment_model(db):
+    """The CA portal pulls the value from /portal/{short_name}/branding
+    right after login and caches it in localStorage. Both COMPANY_PAYS
+    and FARMER_PAYS values surface as the canonical enum string."""
+    from app.modules.clients.router import get_portal_branding
+
+    cp = await make_client(
+        db, full_name="CP Co", payment_model=PaymentModel.COMPANY_PAYS,
+    )
+    cp.short_name = "cpco"
+    cp.status = ClientStatus.ACTIVE
+    fp = await make_client(
+        db, full_name="FP Co", payment_model=PaymentModel.FARMER_PAYS,
+    )
+    fp.short_name = "fpco"
+    fp.status = ClientStatus.ACTIVE
+    await db.commit()
+
+    out_cp = await get_portal_branding(short_name="cpco", db=db)
+    assert out_cp["payment_model"] == "COMPANY_PAYS"
+
+    out_fp = await get_portal_branding(short_name="fpco", db=db)
+    assert out_fp["payment_model"] == "FARMER_PAYS"
