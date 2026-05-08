@@ -112,6 +112,10 @@ class ClientOut(BaseModel):
     rejection_reason: Optional[str] = None
     approved_at: Optional[datetime] = None
     created_at: datetime
+    # Computed by the route — env-driven (`{FRONTEND_BASE_URL}/login/<short_name>`).
+    # Reserved Optional in the schema so legacy callers / response_model
+    # validation tolerate rows where the route hasn't computed it.
+    login_url: Optional[str] = None
 
     class Config:
         from_attributes = True

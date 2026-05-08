@@ -195,6 +195,47 @@ async def test_self_subscribe_404_when_client_missing(db):
 
 # ── Portal branding endpoint surfaces payment_model ─────────────────────────
 
+# ── Regenerate-link resets status (post-rejection retry) ───────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_regenerate_link_resets_rejected_status(db, monkeypatch):
+    """A client whose previous submission was rejected gets a fresh
+    onboarding link from the SA. Regenerate must reset
+    status=PENDING_REVIEW and clear rejection_reason — otherwise the
+    CA's submit hits the status guard and reports "already been used".
+    Surfaced 2026-05-08 in testing-server flow."""
+    from app.modules.clients.router import regenerate_link
+
+    sa = await make_user(db, name="SA")
+    sa.email = "yb@eywa.farm"
+    monkeypatch.setattr(settings, "sa_email", "yb@eywa.farm")
+    monkeypatch.setattr(settings, "frontend_base_url", "https://rstalk-ca.eywa.farm")
+    monkeypatch.setattr(settings, "environment", "staging")
+    monkeypatch.setattr(settings, "email_smtp_user", "")
+
+    client = await make_client(db)
+    client.status = ClientStatus.REJECTED
+    client.rejection_reason = "Address verification failed"
+    client.onboarding_link_token = "old-token"
+    await db.commit()
+
+    out = await regenerate_link(
+        client_id=client.id, db=db, current_user=sa,
+    )
+    assert out.client_id == client.id
+
+    from sqlalchemy import select
+    refreshed = (await db.execute(
+        select(Client).where(Client.id == client.id)
+    )).scalar_one()
+    assert refreshed.status == ClientStatus.PENDING_REVIEW
+    assert refreshed.rejection_reason is None
+    assert refreshed.onboarding_link_token != "old-token"
+
+
+# ── Portal branding endpoint surfaces payment_model ─────────────────────────
+
 @requires_docker
 @pytest.mark.asyncio
 async def test_portal_branding_returns_payment_model(db):

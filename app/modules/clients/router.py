@@ -143,6 +143,16 @@ async def check_short_name(
     return {"available": existing is None, "short_name": short_name.lower().strip()}
 
 
+def _client_to_out(client: Client) -> ClientOut:
+    """Convert a Client row to ClientOut and fill in the env-driven
+    login_url. Centralised so list, get, and other admin endpoints
+    return a consistent shape — no rootstalk.in / wrong-host hardcoding
+    on the frontend."""
+    out = ClientOut.model_validate(client)
+    out.login_url = f"{_base_url()}/login/{client.short_name}"
+    return out
+
+
 @router.get("/admin/clients", response_model=list[ClientOut])
 async def list_clients(
     status_filter: str = None,
@@ -154,7 +164,7 @@ async def list_clients(
     if status_filter:
         q = q.where(Client.status == status_filter)
     result = await db.execute(q)
-    return result.scalars().all()
+    return [_client_to_out(c) for c in result.scalars().all()]
 
 
 @router.get("/admin/clients/{client_id}", response_model=ClientOut)
@@ -168,7 +178,7 @@ async def get_client(
     client = result.scalar_one_or_none()
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
-    return client
+    return _client_to_out(client)
 
 
 # ── SA: Initiate onboarding ────────────────────────────────────────────────────
@@ -236,6 +246,16 @@ async def regenerate_link(
     expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
     client.onboarding_link_token = token
     client.onboarding_link_expires_at = expires_at
+
+    # Reset the lifecycle so the new link is genuinely usable. Without
+    # this, a client whose previous submission was REJECTED would have
+    # status=REJECTED here; the submit endpoint's
+    # `status != PENDING_REVIEW` guard would then fire on every retry
+    # with the message "This onboarding link has already been used".
+    # Surfaced 2026-05-08 in testing-server flow.
+    client.status = ClientStatus.PENDING_REVIEW
+    client.rejection_reason = None
+
     await db.commit()
 
     link = f"{_base_url()}/onboarding/{token}"
