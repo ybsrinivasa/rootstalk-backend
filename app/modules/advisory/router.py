@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.dependencies import get_current_user
@@ -1900,43 +1900,19 @@ async def get_client_pg(
     return pg
 
 
-@router.post("/client/{client_id}/pg-recommendations/import/{global_pg_id}", response_model=PGRecommendationOut, status_code=201)
-async def import_global_pg(
-    client_id: str,
-    global_pg_id: str,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """Deep-copy a global PG recommendation to a client, creating an independent local copy."""
-    src = (await db.execute(
-        select(PGRecommendation).where(PGRecommendation.id == global_pg_id, PGRecommendation.client_id == None)  # noqa: E711
-    )).scalar_one_or_none()
-    if not src:
-        raise HTTPException(status_code=404, detail="Global PG recommendation not found")
-
-    # Check for existing import
-    existing = (await db.execute(
-        select(PGRecommendation).where(
-            PGRecommendation.client_id == client_id,
-            PGRecommendation.parent_id == global_pg_id,
-        )
-    )).scalar_one_or_none()
-    if existing:
-        raise HTTPException(status_code=409, detail="This PG recommendation is already imported. Edit the existing local copy.")
-
-    copy = PGRecommendation(
-        problem_group_cosh_id=src.problem_group_cosh_id,
-        client_id=client_id,
-        parent_id=global_pg_id,
-        application_type=src.application_type,
+async def _copy_pg_content_into(
+    db: AsyncSession, *, src_pg: PGRecommendation, target_pg: PGRecommendation,
+) -> None:
+    """Deep-copy timelines / practices / elements from one PGRecommendation
+    onto another. Caller is responsible for clearing existing target
+    content first if overwriting. Used by both Global → Local PG import
+    and any future PG content moves."""
+    tl_result = await db.execute(
+        select(PGTimeline).where(PGTimeline.pg_recommendation_id == src_pg.id)
     )
-    db.add(copy)
-    await db.flush()
-
-    tl_result = await db.execute(select(PGTimeline).where(PGTimeline.pg_recommendation_id == src.id))
     for src_tl in tl_result.scalars().all():
         new_tl = PGTimeline(
-            pg_recommendation_id=copy.id,
+            pg_recommendation_id=target_pg.id,
             name=src_tl.name,
             from_type=src_tl.from_type,
             from_value=src_tl.from_value,
@@ -1945,7 +1921,9 @@ async def import_global_pg(
         db.add(new_tl)
         await db.flush()
 
-        p_result = await db.execute(select(PGPractice).where(PGPractice.timeline_id == src_tl.id))
+        p_result = await db.execute(
+            select(PGPractice).where(PGPractice.timeline_id == src_tl.id)
+        )
         for src_p in p_result.scalars().all():
             new_p = PGPractice(
                 timeline_id=new_tl.id,
@@ -1959,7 +1937,9 @@ async def import_global_pg(
             db.add(new_p)
             await db.flush()
 
-            el_result = await db.execute(select(PGElement).where(PGElement.practice_id == src_p.id))
+            el_result = await db.execute(
+                select(PGElement).where(PGElement.practice_id == src_p.id)
+            )
             for src_el in el_result.scalars().all():
                 db.add(PGElement(
                     practice_id=new_p.id,
@@ -1970,9 +1950,120 @@ async def import_global_pg(
                     display_order=src_el.display_order,
                 ))
 
+
+async def _wipe_pg_content(db: AsyncSession, pg_id: str) -> dict:
+    """Delete every PGTimeline / PGPractice / PGElement under a PG.
+    Returns counts so the caller can report what was overwritten."""
+    timelines = (await db.execute(
+        select(PGTimeline).where(PGTimeline.pg_recommendation_id == pg_id)
+    )).scalars().all()
+    tl_count = len(timelines)
+    practice_count = 0
+    element_count = 0
+    for tl in timelines:
+        practices = (await db.execute(
+            select(PGPractice).where(PGPractice.timeline_id == tl.id)
+        )).scalars().all()
+        practice_count += len(practices)
+        for p in practices:
+            elements = (await db.execute(
+                select(PGElement).where(PGElement.practice_id == p.id)
+            )).scalars().all()
+            element_count += len(elements)
+            for el in elements:
+                await db.delete(el)
+            await db.delete(p)
+        await db.delete(tl)
+    await db.flush()
+    return {
+        "timelines_replaced": tl_count,
+        "practices_replaced": practice_count,
+        "elements_replaced": element_count,
+    }
+
+
+@router.post("/client/{client_id}/pg-recommendations/import/{global_pg_id}", response_model=PGRecommendationOut, status_code=201)
+async def import_global_pg(
+    client_id: str,
+    global_pg_id: str,
+    force: bool = False,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Deep-copy a global PG recommendation into a client.
+
+    First import: creates a fresh local PGRecommendation linked to the
+    global via parent_id, with all timelines / practices / elements
+    deep-copied.
+
+    Re-import (existing local copy detected):
+      • Default — refuses with 409 + structured `existing` summary so
+        the CA portal can show the SE a "this will overwrite your
+        local edits" warning.
+      • `?force=true` — wipes the existing local copy's content and
+        re-imports fresh from the global. Local copy keeps its same
+        primary key (so triggered references stay intact); only its
+        timelines / practices / elements are replaced.
+    """
+    src = (await db.execute(
+        select(PGRecommendation).where(
+            PGRecommendation.id == global_pg_id,
+            PGRecommendation.client_id == None,  # noqa: E711
+        )
+    )).scalar_one_or_none()
+    if not src:
+        raise HTTPException(status_code=404, detail="Global PG recommendation not found")
+
+    existing = (await db.execute(
+        select(PGRecommendation).where(
+            PGRecommendation.client_id == client_id,
+            PGRecommendation.parent_id == global_pg_id,
+        )
+    )).scalar_one_or_none()
+
+    if existing and not force:
+        # Tally what would be overwritten so the CA portal can show
+        # a meaningful confirmation dialog.
+        tl_count = (await db.execute(
+            select(func.count()).select_from(PGTimeline).where(
+                PGTimeline.pg_recommendation_id == existing.id,
+            )
+        )).scalar() or 0
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "import_would_overwrite",
+                "message": (
+                    "This PG recommendation is already imported. Re-importing "
+                    "will overwrite the existing local copy's timelines and "
+                    "practices. Send force=true to confirm."
+                ),
+                "existing": {
+                    "pg_recommendation_id": existing.id,
+                    "timeline_count": tl_count,
+                },
+            },
+        )
+
+    if existing:
+        # Force-overwrite path: wipe existing content + reuse the row.
+        await _wipe_pg_content(db, existing.id)
+        target = existing
+    else:
+        target = PGRecommendation(
+            problem_group_cosh_id=src.problem_group_cosh_id,
+            client_id=client_id,
+            parent_id=global_pg_id,
+            application_type=src.application_type,
+        )
+        db.add(target)
+        await db.flush()
+
+    await _copy_pg_content_into(db, src_pg=src, target_pg=target)
+
     await db.commit()
-    await db.refresh(copy)
-    return copy
+    await db.refresh(target)
+    return target
 
 
 @router.post("/client/{client_id}/pg-recommendations/{pg_id}/publish")
@@ -2214,6 +2305,166 @@ async def delete_sp_timeline(
     if tl:
         await db.delete(tl)
         await db.commit()
+
+
+async def _wipe_sp_content(db: AsyncSession, sp_id: str) -> dict:
+    """Delete every SPTimeline / SPPractice / SPElement under an SP.
+    Mirrors `_wipe_pg_content` for the SP-side import overwrite path."""
+    timelines = (await db.execute(
+        select(SPTimeline).where(SPTimeline.sp_recommendation_id == sp_id)
+    )).scalars().all()
+    tl_count = len(timelines)
+    practice_count = 0
+    element_count = 0
+    for tl in timelines:
+        practices = (await db.execute(
+            select(SPPractice).where(SPPractice.timeline_id == tl.id)
+        )).scalars().all()
+        practice_count += len(practices)
+        for p in practices:
+            elements = (await db.execute(
+                select(SPElement).where(SPElement.practice_id == p.id)
+            )).scalars().all()
+            element_count += len(elements)
+            for el in elements:
+                await db.delete(el)
+            await db.delete(p)
+        await db.delete(tl)
+    await db.flush()
+    return {
+        "timelines_replaced": tl_count,
+        "practices_replaced": practice_count,
+        "elements_replaced": element_count,
+    }
+
+
+@router.post(
+    "/client/{client_id}/sp-recommendations/{sp_id}/import-from-pg/{local_pg_id}",
+    response_model=SPRecommendationOut,
+    status_code=201,
+)
+async def import_pg_into_sp(
+    client_id: str,
+    sp_id: str,
+    local_pg_id: str,
+    force: bool = False,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Deep-copy a LOCAL PG recommendation's content (timelines /
+    practices / elements) into an existing SP recommendation as a
+    starting point. The SE then customises from there.
+
+    Source PG must belong to the same client. Cross-client imports
+    are blocked at the 404 level (no information leak about other
+    clients' data).
+
+    First import (SP has no timelines yet): copies content directly.
+    Re-import (SP already has content):
+      • Default — refuses with 409 + structured `existing` summary
+        so the CA portal can show a "this will overwrite your local
+        edits" warning.
+      • `?force=true` — wipes existing SP content and re-imports
+        fresh from the source PG. SP recommendation row keeps its
+        same primary key.
+
+    The SP must already exist (created via
+    POST /client/{id}/sp-recommendations). This endpoint adds
+    content; it doesn't create the SP itself."""
+    sp = (await db.execute(
+        select(SPRecommendation).where(
+            SPRecommendation.id == sp_id,
+            SPRecommendation.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if sp is None:
+        raise HTTPException(status_code=404, detail="SP recommendation not found")
+
+    src_pg = (await db.execute(
+        select(PGRecommendation).where(
+            PGRecommendation.id == local_pg_id,
+            PGRecommendation.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if src_pg is None:
+        # 404 — could be wrong id OR cross-client. Same response
+        # either way; no info leak.
+        raise HTTPException(status_code=404, detail="Local PG recommendation not found")
+
+    existing_tl_count = (await db.execute(
+        select(func.count()).select_from(SPTimeline).where(
+            SPTimeline.sp_recommendation_id == sp_id,
+        )
+    )).scalar() or 0
+
+    if existing_tl_count > 0 and not force:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "import_would_overwrite",
+                "message": (
+                    "This SP recommendation already has content. Re-importing "
+                    "from a PG will overwrite its existing timelines and "
+                    "practices. Send force=true to confirm."
+                ),
+                "existing": {
+                    "sp_recommendation_id": sp_id,
+                    "timeline_count": existing_tl_count,
+                },
+            },
+        )
+
+    if existing_tl_count > 0:
+        await _wipe_sp_content(db, sp_id)
+
+    # Deep-copy: PGTimeline → SPTimeline, PGPractice → SPPractice,
+    # PGElement → SPElement. Same field shapes; just different tables.
+    pg_timelines = (await db.execute(
+        select(PGTimeline).where(PGTimeline.pg_recommendation_id == src_pg.id)
+    )).scalars().all()
+    for src_tl in pg_timelines:
+        new_tl = SPTimeline(
+            sp_recommendation_id=sp_id,
+            name=src_tl.name,
+            from_type=src_tl.from_type,
+            from_value=src_tl.from_value,
+            to_value=src_tl.to_value,
+        )
+        db.add(new_tl)
+        await db.flush()
+
+        src_practices = (await db.execute(
+            select(PGPractice).where(PGPractice.timeline_id == src_tl.id)
+        )).scalars().all()
+        for src_p in src_practices:
+            new_p = SPPractice(
+                timeline_id=new_tl.id,
+                l0_type=src_p.l0_type,
+                l1_type=src_p.l1_type,
+                l2_type=src_p.l2_type,
+                display_order=src_p.display_order,
+                is_special_input=src_p.is_special_input,
+                frequency_days=src_p.frequency_days,
+            )
+            db.add(new_p)
+            await db.flush()
+
+            src_elements = (await db.execute(
+                select(PGElement).where(PGElement.practice_id == src_p.id)
+            )).scalars().all()
+            for src_el in src_elements:
+                db.add(SPElement(
+                    practice_id=new_p.id,
+                    element_type=src_el.element_type,
+                    cosh_ref=src_el.cosh_ref,
+                    value=src_el.value,
+                    unit_cosh_id=src_el.unit_cosh_id,
+                    display_order=src_el.display_order,
+                ))
+
+    await db.commit()
+    await db.refresh(sp)
+    return sp
 
 
 @router.post("/client/{client_id}/sp-recommendations/{sp_id}/publish")
