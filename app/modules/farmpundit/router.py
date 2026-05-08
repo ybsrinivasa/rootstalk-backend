@@ -64,6 +64,46 @@ QUERY_EXPIRE_DAYS = 7
 FREE_QUERIES_PER_COMPANY = 6
 
 
+async def _assert_portal_member(
+    db: AsyncSession, user_id: str, client_id: str,
+) -> None:
+    """V1 minimum membership gate on FarmPundit-management endpoints.
+
+    Caller must have an active ClientUser row at this client (any
+    role: CA, Subject Expert, Field Manager, etc). Without this, a
+    JWT-authed portal user of one client could call FarmPundit-
+    management endpoints on another client by guessing the URL —
+    the M7 finding from the 2026-05-08 audit.
+
+    Pre-fix scope was on V2 backlog (broader `_require_client_role`
+    audit, ~30 advisory mutating endpoints). This is a focused V1
+    patch on the FarmPundit module specifically. Stable error code
+    `client_membership_required` mirrors the CM-side
+    `cm_assignment_required` shape used by the Global → Local pipe.
+    """
+    from app.modules.clients.models import ClientUser
+    from app.modules.platform.models import StatusEnum
+
+    enrolled = (await db.execute(
+        select(ClientUser).where(
+            ClientUser.user_id == user_id,
+            ClientUser.client_id == client_id,
+            ClientUser.status == StatusEnum.ACTIVE,
+        )
+    )).scalar_one_or_none()
+    if enrolled is None:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "client_membership_required",
+                "message": (
+                    "Only portal users enrolled at this client may "
+                    "perform this action."
+                ),
+            },
+        )
+
+
 # ── FarmPundit Profile ─────────────────────────────────────────────────────────
 
 class PunditProfileCreate(BaseModel):
@@ -195,6 +235,7 @@ async def invite_pundit(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_portal_member(db, current_user.id, client_id)
     profile = (await db.execute(
         select(FarmPunditProfile).where(FarmPunditProfile.user_id == request.pundit_user_id)
     )).scalar_one_or_none()
@@ -558,6 +599,7 @@ async def create_standard_response(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_portal_member(db, current_user.id, client_id)
     sr = StandardResponse(
         client_id=client_id,
         crop_cosh_id=data.get("crop_cosh_id"),
@@ -615,6 +657,7 @@ async def search_pundits(
     their values intersect the query — i.e. "experts who support
     Karnataka OR Tamil Nadu", not AND. Empty list = no filter applied.
     """
+    await _assert_portal_member(db, current_user.id, client_id)
     q = select(FarmPunditProfile).where(FarmPunditProfile.declaration_accepted == True)  # noqa: E712
     if education:
         q = q.where(FarmPunditProfile.education == education)
@@ -709,6 +752,7 @@ async def list_company_pundits(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_portal_member(db, current_user.id, client_id)
     result = await db.execute(
         select(ClientFarmPundit).where(ClientFarmPundit.client_id == client_id)
         .order_by(ClientFarmPundit.onboarded_at)
@@ -755,6 +799,7 @@ async def list_company_pundit_invitations(
     distinguish "invited and waiting" from "never sent" — both look
     like 'no expert' in the My Experts tab.
     """
+    await _assert_portal_member(db, current_user.id, client_id)
     invitations = (await db.execute(
         select(PunditInvitation).where(
             PunditInvitation.client_id == client_id,
@@ -792,6 +837,7 @@ async def deactivate_company_pundit(
     current_user: User = Depends(get_current_user),
 ):
     """Deactivate a FarmPundit from this company. They keep active queries until resolved."""
+    await _assert_portal_member(db, current_user.id, client_id)
     cp = (await db.execute(
         select(ClientFarmPundit).where(ClientFarmPundit.id == cp_id, ClientFarmPundit.client_id == client_id)
     )).scalar_one_or_none()
@@ -818,6 +864,7 @@ async def reactivate_company_pundit(
     original position. Only paths through `change_role` clear the
     sequence (Primary→Panel), so the reactivation case is genuinely
     a no-op on routing data."""
+    await _assert_portal_member(db, current_user.id, client_id)
     cp = (await db.execute(
         select(ClientFarmPundit).where(
             ClientFarmPundit.id == cp_id,
@@ -861,6 +908,7 @@ async def change_company_pundit_role(
       Panel  → Primary: assign the next available sequence so the
                        reactivated pundit lands at the end.
     """
+    await _assert_portal_member(db, current_user.id, client_id)
     cp = (await db.execute(
         select(ClientFarmPundit).where(
             ClientFarmPundit.id == cp_id,
@@ -924,6 +972,7 @@ async def delete_company_pundit(
     untouched — the expert can still be invited by another company,
     and their query/response history under THIS company stays
     intact (those reference `pundit_id` not `client_pundit_id`)."""
+    await _assert_portal_member(db, current_user.id, client_id)
     cp = (await db.execute(
         select(ClientFarmPundit).where(
             ClientFarmPundit.id == cp_id,
@@ -960,13 +1009,62 @@ async def toggle_promoter_pundit(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Field Manager designates a facilitator FarmPundit as a Promoter-Pundit."""
+    """Field Manager designates a facilitator FarmPundit as a
+    Promoter-Pundit.
+
+    Spec §14.2: "Must be a Promoter first — being a facilitator alone
+    is not sufficient." Translated to data-model terms, the pundit's
+    user must already have an ACTIVE `ClientPromoter` row at this
+    client with `promoter_type=FACILITATOR`. Dealer-Promoters and
+    Company-designated Promoters are not eligible — the Promoter-
+    Pundit role is specifically for Facilitator-Promoters who are
+    additionally FarmPundits.
+
+    Toggling OFF (removing the PP designation) is unconditionally
+    allowed — that's just clearing a flag.
+    """
+    await _assert_portal_member(db, current_user.id, client_id)
     cp = (await db.execute(
         select(ClientFarmPundit).where(ClientFarmPundit.id == cp_id, ClientFarmPundit.client_id == client_id)
     )).scalar_one_or_none()
     if not cp:
         raise HTTPException(status_code=404, detail="Company pundit not found")
-    cp.is_promoter_pundit = data.get("is_promoter_pundit", not cp.is_promoter_pundit)
+
+    new_value = data.get("is_promoter_pundit", not cp.is_promoter_pundit)
+    if new_value and not cp.is_promoter_pundit:
+        # Eligibility check on enabling — skip on toggle-off and on
+        # idempotent toggle-on (already PP).
+        from app.modules.clients.models import ClientPromoter
+
+        profile = (await db.execute(
+            select(FarmPunditProfile).where(FarmPunditProfile.id == cp.pundit_id)
+        )).scalar_one_or_none()
+        if profile is None:
+            raise HTTPException(status_code=404, detail="FarmPundit profile not found")
+
+        promoter = (await db.execute(
+            select(ClientPromoter).where(
+                ClientPromoter.client_id == client_id,
+                ClientPromoter.user_id == profile.user_id,
+                ClientPromoter.promoter_type == "FACILITATOR",
+                ClientPromoter.status == "ACTIVE",
+            )
+        )).scalar_one_or_none()
+        if promoter is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "promoter_pundit_requires_facilitator_promoter",
+                    "message": (
+                        "Per spec §14.2, a Promoter-Pundit must first be a "
+                        "Facilitator-Promoter at this company. Register them "
+                        "as a Facilitator on the Field Manager page before "
+                        "marking them as a Promoter-Pundit."
+                    ),
+                },
+            )
+
+    cp.is_promoter_pundit = new_value
     await db.commit()
     return {"is_promoter_pundit": cp.is_promoter_pundit}
 
@@ -1163,6 +1261,7 @@ async def list_company_queries(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_portal_member(db, current_user.id, client_id)
     q = select(Query).where(Query.client_id == client_id).order_by(Query.created_at.desc())
     if status_filter:
         q = q.where(Query.status == status_filter)

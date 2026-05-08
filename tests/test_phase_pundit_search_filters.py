@@ -28,7 +28,15 @@ from app.modules.farmpundit.router import (
     list_company_pundit_invitations, search_pundits,
 )
 from tests.conftest import requires_docker
-from tests.factories import make_client, make_user
+from tests.factories import make_client, make_client_user, make_user
+
+
+async def _ca_user_for(db, *, client):
+    """Seed a CA portal user enrolled at the given client so the
+    FarmPundit endpoints' `_assert_portal_member` gate accepts."""
+    user = await make_user(db, name=f"CA-{client.short_name}")
+    await make_client_user(db, user=user, client=client)
+    return user
 
 
 async def _make_full_pundit(
@@ -77,7 +85,7 @@ async def test_search_multi_state_returns_union(db):
         client_id=client.id,
         state_cosh_ids=["state_karnataka", "state_tamil_nadu"],
         expertise_domains=[], language_codes=[], crop_groups=[],
-        db=db, current_user=None,
+        db=db, current_user=await _ca_user_for(db, client=client),
     )
     names = {r["name"] for r in results}
     assert names == {"K-only", "TN-only"}
@@ -98,7 +106,7 @@ async def test_search_multi_expertise_returns_union(db):
         state_cosh_ids=[],
         expertise_domains=["plant_protection", "plant_nutrition"],
         language_codes=[], crop_groups=[],
-        db=db, current_user=None,
+        db=db, current_user=await _ca_user_for(db, client=client),
     )
     assert {r["name"] for r in results} == {"Protection", "Nutrition"}
 
@@ -117,7 +125,7 @@ async def test_search_multi_language_returns_union(db):
         state_cosh_ids=[], expertise_domains=[],
         language_codes=["kn", "ta"],
         crop_groups=[],
-        db=db, current_user=None,
+        db=db, current_user=await _ca_user_for(db, client=client),
     )
     assert {r["name"] for r in results} == {"Kannada-only", "Tamil-only"}
 
@@ -135,7 +143,7 @@ async def test_search_multi_crop_group_returns_union(db):
         client_id=client.id,
         state_cosh_ids=[], expertise_domains=[], language_codes=[],
         crop_groups=["cereals", "fruit_trees"],
-        db=db, current_user=None,
+        db=db, current_user=await _ca_user_for(db, client=client),
     )
     assert {r["name"] for r in results} == {"Cereals", "Fruits"}
 
@@ -153,7 +161,7 @@ async def test_search_cultivation_type_filter(db):
         client_id=client.id,
         state_cosh_ids=[], expertise_domains=[], language_codes=[], crop_groups=[],
         cultivation_type="greenhouse",
-        db=db, current_user=None,
+        db=db, current_user=await _ca_user_for(db, client=client),
     )
     assert {r["name"] for r in results} == {"Greenhouse"}
 
@@ -184,7 +192,7 @@ async def test_search_combines_multi_and_single_filters(db):
         state_cosh_ids=["state_karnataka"],
         expertise_domains=[], language_codes=[], crop_groups=[],
         education="DOCTORATE",
-        db=db, current_user=None,
+        db=db, current_user=await _ca_user_for(db, client=client),
     )
     assert {r["name"] for r in results} == {"K + Doc"}
 
@@ -205,7 +213,7 @@ async def test_search_empty_filters_returns_all_with_declaration(db):
     results = await search_pundits(
         client_id=client.id,
         state_cosh_ids=[], expertise_domains=[], language_codes=[], crop_groups=[],
-        db=db, current_user=None,
+        db=db, current_user=await _ca_user_for(db, client=client),
     )
     names = {r["name"] for r in results}
     assert "A" in names and "B" in names and "C" not in names
@@ -231,7 +239,7 @@ async def test_pending_invitations_listed_with_profile_info(db):
     await db.commit()
 
     out = await list_company_pundit_invitations(
-        client_id=client.id, status="PENDING", db=db, current_user=None,
+        client_id=client.id, status="PENDING", db=db, current_user=await _ca_user_for(db, client=client),
     )
     assert len(out) == 1
     assert out[0]["name"] == "Invited Expert"
@@ -257,7 +265,7 @@ async def test_pending_invitations_respect_phone_privacy(db):
     await db.commit()
 
     out = await list_company_pundit_invitations(
-        client_id=client.id, status="PENDING", db=db, current_user=None,
+        client_id=client.id, status="PENDING", db=db, current_user=await _ca_user_for(db, client=client),
     )
     assert out[0]["phone"] is None
 
@@ -283,7 +291,7 @@ async def test_pending_invitations_excludes_accepted(db):
     await db.commit()
 
     out = await list_company_pundit_invitations(
-        client_id=client.id, status="PENDING", db=db, current_user=None,
+        client_id=client.id, status="PENDING", db=db, current_user=await _ca_user_for(db, client=client),
     )
     assert {r["name"] for r in out} == {"Pending"}
 

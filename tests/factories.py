@@ -96,6 +96,26 @@ async def make_client(db: AsyncSession, **kw) -> Client:
     return c
 
 
+async def make_client_user(
+    db: AsyncSession, *, user: User, client: Client,
+    role: ClientUserRole = ClientUserRole.CA,
+    status: StatusEnum = StatusEnum.ACTIVE,
+) -> ClientUser:
+    """Seed a ClientUser row so the user passes the FarmPundit
+    module's membership gate (`_assert_portal_member`). Used by
+    tests that exercise the FarmPundit-management endpoints.
+
+    Default role is CA — change via `role=` for tests that need a
+    specific role (e.g. SUBJECT_EXPERT for standard-response
+    tests, FIELD_MANAGER for Promoter-Pundit tests)."""
+    cu = ClientUser(
+        client_id=client.id, user_id=user.id, role=role, status=status,
+    )
+    db.add(cu)
+    await db.flush()
+    return cu
+
+
 async def make_cm_assignment(
     db: AsyncSession, *, user: User, client: Client,
     rights: CMRights = CMRights.EDIT,

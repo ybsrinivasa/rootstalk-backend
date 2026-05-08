@@ -29,8 +29,17 @@ from app.modules.clients.router import (
 )
 from tests.conftest import requires_docker
 from tests.factories import (
-    make_client, make_package, make_subscription, make_user,
+    make_client, make_client_user, make_package, make_subscription, make_user,
 )
+
+
+async def _ca_user_for(db, *, client):
+    """A real CA portal user the FarmPundit endpoints' membership
+    gate (`_assert_portal_member`) will accept. Seeds a User + a
+    matching ClientUser row, returns the User."""
+    user = await make_user(db, name=f"CA-{client.short_name}")
+    await make_client_user(db, user=user, client=client)
+    return user
 
 
 async def _enrol(db, *, client, profile, role: PunditRole = PunditRole.PRIMARY,
@@ -86,7 +95,7 @@ async def test_reactivate_pundit_flips_status_back(db):
     await db.commit()
 
     out = await reactivate_company_pundit(
-        client_id=client.id, cp_id=cp.id, db=db, current_user=None,
+        client_id=client.id, cp_id=cp.id, db=db, current_user=await _ca_user_for(db, client=client),
     )
     assert out["status"] == "ACTIVE"
     await db.refresh(cp)
@@ -104,7 +113,7 @@ async def test_reactivate_already_active_pundit_400(db):
 
     with pytest.raises(HTTPException) as ei:
         await reactivate_company_pundit(
-            client_id=client.id, cp_id=cp.id, db=db, current_user=None,
+            client_id=client.id, cp_id=cp.id, db=db, current_user=await _ca_user_for(db, client=client),
         )
     assert ei.value.status_code == 400
 
@@ -126,7 +135,7 @@ async def test_change_role_primary_to_panel_clears_sequence(db):
     await change_company_pundit_role(
         client_id=client.id, cp_id=cp.id,
         request=PunditRoleChange(role=PunditRole.PANEL),
-        db=db, current_user=None,
+        db=db, current_user=await _ca_user_for(db, client=client),
     )
     await db.refresh(cp)
     assert cp.role == PunditRole.PANEL
@@ -155,7 +164,7 @@ async def test_change_role_panel_to_primary_assigns_sequence(db):
     out = await change_company_pundit_role(
         client_id=client.id, cp_id=cp_c.id,
         request=PunditRoleChange(role=PunditRole.PRIMARY),
-        db=db, current_user=None,
+        db=db, current_user=await _ca_user_for(db, client=client),
     )
     assert out["role"] == "PRIMARY"
     # _next_round_robin_sequence returns count(Primaries) + 1 = 3 here.
@@ -177,7 +186,7 @@ async def test_change_role_blocked_when_active_status(db):
         await change_company_pundit_role(
             client_id=client.id, cp_id=cp.id,
             request=PunditRoleChange(role=PunditRole.PANEL),
-            db=db, current_user=None,
+            db=db, current_user=await _ca_user_for(db, client=client),
         )
     assert ei.value.status_code == 409
     assert "Deactivate" in ei.value.detail
@@ -200,7 +209,7 @@ async def test_change_role_blocked_when_holding_active_queries(db):
         await change_company_pundit_role(
             client_id=client.id, cp_id=cp.id,
             request=PunditRoleChange(role=PunditRole.PANEL),
-            db=db, current_user=None,
+            db=db, current_user=await _ca_user_for(db, client=client),
         )
     assert ei.value.status_code == 409
     assert "active query" in ei.value.detail
@@ -220,7 +229,7 @@ async def test_change_role_to_same_role_400(db):
         await change_company_pundit_role(
             client_id=client.id, cp_id=cp.id,
             request=PunditRoleChange(role=PunditRole.PRIMARY),
-            db=db, current_user=None,
+            db=db, current_user=await _ca_user_for(db, client=client),
         )
     assert ei.value.status_code == 400
 
@@ -239,7 +248,7 @@ async def test_delete_removes_client_pundit_row_keeps_profile(db):
     await db.commit()
 
     await delete_company_pundit(
-        client_id=client.id, cp_id=cp.id, db=db, current_user=None,
+        client_id=client.id, cp_id=cp.id, db=db, current_user=await _ca_user_for(db, client=client),
     )
 
     from sqlalchemy import select
@@ -264,7 +273,7 @@ async def test_delete_blocked_when_active_status(db):
 
     with pytest.raises(HTTPException) as ei:
         await delete_company_pundit(
-            client_id=client.id, cp_id=cp.id, db=db, current_user=None,
+            client_id=client.id, cp_id=cp.id, db=db, current_user=await _ca_user_for(db, client=client),
         )
     assert ei.value.status_code == 409
 
@@ -282,7 +291,7 @@ async def test_delete_blocked_when_holding_active_queries(db):
 
     with pytest.raises(HTTPException) as ei:
         await delete_company_pundit(
-            client_id=client.id, cp_id=cp.id, db=db, current_user=None,
+            client_id=client.id, cp_id=cp.id, db=db, current_user=await _ca_user_for(db, client=client),
         )
     assert ei.value.status_code == 409
     assert "active query" in ei.value.detail
@@ -314,7 +323,7 @@ async def test_list_pundits_includes_active_query_count(db):
     await db.commit()
 
     out = await list_company_pundits(
-        client_id=client.id, db=db, current_user=None,
+        client_id=client.id, db=db, current_user=await _ca_user_for(db, client=client),
     )
     by_name = {row["name"]: row for row in out}
     assert by_name["WithQueries"]["active_query_count"] == 2
