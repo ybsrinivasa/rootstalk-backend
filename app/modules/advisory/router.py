@@ -1042,6 +1042,8 @@ async def import_timeline(
             l2_type=src_p.l2_type,
             display_order=src_p.display_order,
             is_special_input=src_p.is_special_input,
+            common_name_cosh_id=src_p.common_name_cosh_id,
+            frequency_days=src_p.frequency_days,
         )
         db.add(new_p)
         await db.flush()
@@ -1673,6 +1675,8 @@ async def fork_global_package(
                 l2_type=src_p.l2_type,
                 display_order=src_p.display_order,
                 is_special_input=src_p.is_special_input,
+                common_name_cosh_id=src_p.common_name_cosh_id,
+                frequency_days=src_p.frequency_days,
             )
             db.add(new_p)
             await db.flush()
@@ -1950,6 +1954,7 @@ async def import_global_pg(
                 l2_type=src_p.l2_type,
                 display_order=src_p.display_order,
                 is_special_input=src_p.is_special_input,
+                frequency_days=src_p.frequency_days,
             )
             db.add(new_p)
             await db.flush()
