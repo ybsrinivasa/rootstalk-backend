@@ -198,6 +198,7 @@ async def initiate_onboarding(
         ca_phone=request.ca_phone,
         ca_email=request.ca_email,
         is_manufacturer=request.is_manufacturer,
+        payment_model=request.payment_model,
         status=ClientStatus.PENDING_REVIEW,
         onboarding_link_token=token,
         onboarding_link_expires_at=expires_at,

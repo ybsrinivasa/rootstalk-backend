@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 import pytest
 from fastapi import HTTPException
 
-from app.modules.clients.models import Client, ClientStatus
+from app.modules.clients.models import Client, ClientStatus, PaymentModel
 from app.modules.clients.router import (
     approve_client, get_public_client_branding,
 )
@@ -41,6 +41,7 @@ async def _make_branded_client(
         primary_colour="#1A5C2A",
         secondary_colour="#F5C518",
         status=status,
+        payment_model=PaymentModel.FARMER_PAYS,
     )
     db.add(c)
     await db.flush()
@@ -128,6 +129,7 @@ async def test_branding_handles_partially_filled_client(db):
         full_name="Bare Client", short_name="bare",
         ca_name="CA", ca_phone="+91", ca_email="ca-bare@test.local",
         status=ClientStatus.ACTIVE,
+        payment_model=PaymentModel.FARMER_PAYS,
     )
     db.add(c)
     await db.commit()
@@ -177,6 +179,7 @@ async def test_approve_client_email_uses_env_driven_login_url(db, monkeypatch):
         ca_name="ICL CA", ca_phone="+919000000000",
         ca_email="ca-icl@test.local",
         status=ClientStatus.PENDING_REVIEW,
+        payment_model=PaymentModel.FARMER_PAYS,
     )
     db.add(client)
     await db.commit()

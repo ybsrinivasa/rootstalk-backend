@@ -1,7 +1,9 @@
 from pydantic import BaseModel, EmailStr
 from typing import Optional, List
 from datetime import datetime
-from app.modules.clients.models import ClientStatus, ClientUserRole, CMRights, CMPrivilege
+from app.modules.clients.models import (
+    ClientStatus, ClientUserRole, CMRights, CMPrivilege, PaymentModel,
+)
 from app.modules.platform.models import StatusEnum
 
 
@@ -14,6 +16,7 @@ class ClientInitiate(BaseModel):
     ca_phone: str
     ca_email: EmailStr
     is_manufacturer: bool = False
+    payment_model: PaymentModel  # mandatory — spec §11.1
 
 
 # ── CA submits their side ──────────────────────────────────────────────────────
@@ -52,6 +55,7 @@ class ClientEdit(BaseModel):
     ca_phone: Optional[str] = None
     ca_email: Optional[EmailStr] = None
     is_manufacturer: Optional[bool] = None
+    payment_model: Optional[PaymentModel] = None
     # CA-side fields (SA can update post-approval)
     display_name: Optional[str] = None
     tagline: Optional[str] = None
@@ -100,6 +104,7 @@ class ClientOut(BaseModel):
     support_phone: Optional[str] = None
     office_phone: Optional[str] = None
     is_manufacturer: bool
+    payment_model: PaymentModel
     status: ClientStatus
     ca_name: str
     ca_phone: str

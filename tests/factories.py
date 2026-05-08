@@ -25,7 +25,7 @@ from app.modules.advisory.models import (
 )
 from app.modules.clients.models import (
     Client, ClientCrop, ClientUser, ClientUserRole,
-    CMClientAssignment, CMRights,
+    CMClientAssignment, CMRights, PaymentModel,
 )
 from app.modules.platform.models import StatusEnum, User
 from app.modules.subscriptions.models import (
@@ -89,6 +89,7 @@ async def make_client(db: AsyncSession, **kw) -> Client:
         ca_name=kw.get("ca_name", "Test CA"),
         ca_phone=kw.get("ca_phone", _short("+91")),
         ca_email=kw.get("ca_email", _short("ca") + "@test.local"),
+        payment_model=kw.get("payment_model", PaymentModel.FARMER_PAYS),
     )
     db.add(c)
     await db.flush()

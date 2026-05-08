@@ -693,7 +693,32 @@ async def create_subscription(
     `/payment/verify` confirms payment. The 3-day SubscriptionWaitlist
     expiry row that used to gate "company tops up" is no longer
     written — there's nothing to wait for.
+
+    Per spec §11.1, only clients with payment_model=FARMER_PAYS allow
+    farmer self-subscription. Clients in COMPANY_PAYS mode reject this
+    endpoint with 422 — farmers must instead be assigned via Promoter.
     """
+    from app.modules.clients.models import PaymentModel as _PaymentModel
+
+    client = (await db.execute(
+        select(Client).where(Client.id == request.client_id)
+    )).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status_code=404, detail="Client not found")
+    if client.payment_model == _PaymentModel.COMPANY_PAYS:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "self_subscribe_not_allowed",
+                "message": (
+                    "This company is configured for Company Pays — only "
+                    "company-designated promoters can assign packages to "
+                    "farmers. Self-subscription is not available."
+                ),
+                "client_payment_model": client.payment_model.value,
+            },
+        )
+
     sub = Subscription(
         farmer_user_id=current_user.id,
         client_id=request.client_id,

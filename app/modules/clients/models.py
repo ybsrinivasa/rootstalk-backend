@@ -48,6 +48,24 @@ class CMPrivilege(str, enum.Enum):
     VOLUME_CALCULATIONS = "VOLUME_CALCULATIONS"
 
 
+class PaymentModel(str, enum.Enum):
+    """Per spec §11.1 — client-level subscription configuration.
+
+    COMPANY_PAYS: farmers cannot self-subscribe; only Promoters assign
+                  packages on behalf of the company. Pool required.
+
+    FARMER_PAYS:  farmers can self-subscribe (paying directly), AND
+                  the company can additionally assign via Promoters.
+                  Pool required for the company-assignment side.
+
+    The label "Farmer Pays" refers to availability of farmer self-
+    subscription, not an exclusive model — under FARMER_PAYS the
+    company still retains the option to assign via Promoters.
+    """
+    COMPANY_PAYS = "COMPANY_PAYS"
+    FARMER_PAYS = "FARMER_PAYS"
+
+
 # ── Tables ─────────────────────────────────────────────────────────────────────
 
 class Client(Base):
@@ -69,6 +87,9 @@ class Client(Base):
     support_phone: Mapped[str] = mapped_column(String(20), nullable=True)
     office_phone: Mapped[str] = mapped_column(String(20), nullable=True)
     is_manufacturer: Mapped[bool] = mapped_column(Boolean, default=False)
+    payment_model: Mapped[PaymentModel] = mapped_column(
+        SAEnum(PaymentModel), nullable=False,
+    )
     status: Mapped[ClientStatus] = mapped_column(SAEnum(ClientStatus), default=ClientStatus.PENDING_REVIEW)
     onboarding_link_token: Mapped[str] = mapped_column(Text, nullable=True)
     onboarding_link_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)

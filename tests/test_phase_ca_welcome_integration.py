@@ -22,7 +22,7 @@ import pytest
 from app.config import settings
 from app.modules.clients import service as clients_service
 from app.modules.clients.models import (
-    Client, ClientStatus, ClientUserRole,
+    Client, ClientStatus, ClientUserRole, PaymentModel,
 )
 from app.modules.clients.router import add_portal_user
 from app.modules.clients.schemas import PortalUserCreate
@@ -36,6 +36,7 @@ async def _seed_active_client(db, *, short_name="khaza", full_name="Khaza Seeds 
         full_name=full_name, short_name=short_name,
         ca_name="Test CA", ca_phone="+910000000000", ca_email=f"ca-{short_name}@test.local",
         status=ClientStatus.ACTIVE,
+        payment_model=PaymentModel.FARMER_PAYS,
     )
     db.add(c)
     await db.flush()
