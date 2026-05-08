@@ -344,6 +344,20 @@ async def submit_onboarding(
     client.social_links = request.social_links
     client.onboarding_link_token = None  # invalidate link after use
 
+    # Clear any prior org_type rows before re-creating from this
+    # submission. Handles the rejected → regenerated → resubmitted
+    # case cleanly (each resubmission replaces the previous selection
+    # rather than accumulating duplicates). ClientOrganisationType
+    # has no unique constraint, so prior code silently added
+    # duplicates on each resubmit.
+    existing_org_types = (await db.execute(
+        select(ClientOrganisationType).where(
+            ClientOrganisationType.client_id == client.id,
+        )
+    )).scalars().all()
+    for ot in existing_org_types:
+        await db.delete(ot)
+
     for cosh_id in request.org_type_cosh_ids:
         db.add(ClientOrganisationType(client_id=client.id, org_type_cosh_id=cosh_id))
 
