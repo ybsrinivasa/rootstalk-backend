@@ -234,6 +234,81 @@ async def test_regenerate_link_resets_rejected_status(db, monkeypatch):
     assert refreshed.onboarding_link_token != "old-token"
 
 
+# ── Onboarding logo-upload (public, token-authed) ──────────────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_onboarding_logo_upload_with_valid_token(db):
+    """The CA isn't logged in during onboarding. The token-scoped
+    upload endpoint must accept the upload (no auth header) when the
+    URL token matches a PENDING_REVIEW client."""
+    from io import BytesIO
+    from fastapi import UploadFile
+    from app.modules.clients.router import upload_onboarding_logo
+
+    client = await make_client(db)
+    client.status = ClientStatus.PENDING_REVIEW
+    client.onboarding_link_token = "valid-onboarding-token"
+    await db.commit()
+
+    file = UploadFile(
+        filename="logo.png",
+        file=BytesIO(b"\x89PNG\r\n\x1a\nfake-png-bytes"),
+        headers={"content-type": "image/png"},
+    )
+    out = await upload_onboarding_logo(
+        token="valid-onboarding-token", file=file, db=db,
+    )
+    assert "url" in out and "key" in out
+    assert out["key"].startswith("logos/")  # dev fallback path
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_onboarding_logo_upload_rejects_invalid_token(db):
+    from io import BytesIO
+    from fastapi import HTTPException, UploadFile
+    from app.modules.clients.router import upload_onboarding_logo
+
+    file = UploadFile(
+        filename="logo.png",
+        file=BytesIO(b"x"),
+        headers={"content-type": "image/png"},
+    )
+    with pytest.raises(HTTPException) as ei:
+        await upload_onboarding_logo(
+            token="never-issued", file=file, db=db,
+        )
+    assert ei.value.status_code == 404
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_onboarding_logo_upload_rejects_used_token(db):
+    """A token whose client is no longer PENDING_REVIEW (already
+    submitted, or rejected) should be refused — same boundary the
+    submit endpoint enforces."""
+    from io import BytesIO
+    from fastapi import HTTPException, UploadFile
+    from app.modules.clients.router import upload_onboarding_logo
+
+    client = await make_client(db)
+    client.status = ClientStatus.ACTIVE
+    client.onboarding_link_token = "stale-token"
+    await db.commit()
+
+    file = UploadFile(
+        filename="logo.png",
+        file=BytesIO(b"x"),
+        headers={"content-type": "image/png"},
+    )
+    with pytest.raises(HTTPException) as ei:
+        await upload_onboarding_logo(
+            token="stale-token", file=file, db=db,
+        )
+    assert ei.value.status_code == 400
+
+
 # ── Portal branding endpoint surfaces payment_model ─────────────────────────
 
 @requires_docker

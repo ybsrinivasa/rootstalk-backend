@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -285,6 +285,32 @@ async def get_onboarding_context(token: str, db: AsyncSession = Depends(get_db))
         "ca_email": client.ca_email,
         "is_manufacturer": client.is_manufacturer,
     }
+
+
+@router.post("/onboarding/{token}/logo-upload")
+async def upload_onboarding_logo(
+    token: str,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Public logo-upload endpoint scoped to a specific onboarding
+    token. Same auth boundary as `/onboarding/{token}/submit` —
+    presenting a valid, unexpired token authorises the upload. The
+    underlying S3 logic is shared with `/media/upload` via
+    `upload_to_s3()` in app.modules.media.router.
+
+    The CA isn't logged in yet during onboarding, so they can't use
+    the authed `/media/upload` endpoint. This endpoint exists
+    specifically to close that gap without opening up unauthenticated
+    uploads to the world."""
+    from app.modules.media.router import upload_to_s3
+
+    client = await get_client_by_token(db, token)
+    if not client:
+        raise HTTPException(status_code=404, detail="Invalid or expired onboarding link")
+    if client.status != ClientStatus.PENDING_REVIEW:
+        raise HTTPException(status_code=400, detail="This onboarding link has already been used")
+    return await upload_to_s3(file, folder="logos")
 
 
 @router.post("/onboarding/{token}/submit", response_model=ClientOut)
