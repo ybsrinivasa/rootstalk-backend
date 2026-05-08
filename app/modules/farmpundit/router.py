@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi import Query as QueryParam  # avoid clash with farmpundit.Query model
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -587,18 +588,33 @@ async def search_standard_responses(
 @router.get("/client/{client_id}/pundit-search")
 async def search_pundits(
     client_id: str,
-    state_cosh_id: Optional[str] = None,
-    expertise_domain: Optional[str] = None,
-    language_code: Optional[str] = None,
+    # Multi-value filters per spec §14.3 Step 1 — state/expertise/language/
+    # crop-group are explicitly multi-select. FastAPI treats list[str] +
+    # Query() as repeated query params (?state_cosh_ids=a&state_cosh_ids=b).
+    state_cosh_ids: list[str] = QueryParam(default=[]),
+    expertise_domains: list[str] = QueryParam(default=[]),
+    language_codes: list[str] = QueryParam(default=[]),
+    crop_groups: list[str] = QueryParam(default=[]),
+    # Single-value filters per spec §14.3 Step 1.
     education: Optional[str] = None,
     experience_band: Optional[str] = None,
     support_method: Optional[str] = None,
-    crop_group: Optional[str] = None,
+    cultivation_type: Optional[str] = None,
     phone: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Multi-filter search across all registered FarmPundits (declaration_accepted=True)."""
+    """Multi-filter search across all registered FarmPundits (declaration_accepted=True).
+
+    Spec §14.3 Step 1 — eight filter fields. Four are multi-select
+    (state, expertise, language, crop group) and four single-select
+    (education, experience, support method, cultivation type). Phone
+    is a search aid, not in spec.
+
+    Multi-value semantics: a pundit matches a multi-filter if ANY of
+    their values intersect the query — i.e. "experts who support
+    Karnataka OR Tamil Nadu", not AND. Empty list = no filter applied.
+    """
     q = select(FarmPunditProfile).where(FarmPunditProfile.declaration_accepted == True)  # noqa: E712
     if education:
         q = q.where(FarmPunditProfile.education == education)
@@ -606,38 +622,49 @@ async def search_pundits(
         q = q.where(FarmPunditProfile.experience_band == experience_band)
     if support_method:
         q = q.where(FarmPunditProfile.support_method == support_method)
+    if cultivation_type:
+        q = q.where(FarmPunditProfile.cultivation_type == cultivation_type)
 
     profiles = (await db.execute(q)).scalars().all()
 
-    # Filter by support area, language, expertise domain in Python (small dataset)
-    if state_cosh_id:
+    # Multi-value filters resolved via membership in the joined table.
+    # Each multi-filter intersects with the running profile set.
+    if state_cosh_ids:
         area_pundit_ids = {
             r.pundit_id for r in (await db.execute(
-                select(FarmPunditSupportArea).where(FarmPunditSupportArea.state_cosh_id == state_cosh_id)
+                select(FarmPunditSupportArea).where(
+                    FarmPunditSupportArea.state_cosh_id.in_(state_cosh_ids)
+                )
             )).scalars().all()
         }
         profiles = [p for p in profiles if p.id in area_pundit_ids]
 
-    if expertise_domain:
+    if expertise_domains:
         domain_pundit_ids = {
             r.pundit_id for r in (await db.execute(
-                select(FarmPunditExpertise).where(FarmPunditExpertise.domain == expertise_domain)
+                select(FarmPunditExpertise).where(
+                    FarmPunditExpertise.domain.in_(expertise_domains)
+                )
             )).scalars().all()
         }
         profiles = [p for p in profiles if p.id in domain_pundit_ids]
 
-    if language_code:
+    if language_codes:
         lang_pundit_ids = {
             r.pundit_id for r in (await db.execute(
-                select(FarmPunditLanguage).where(FarmPunditLanguage.language_code == language_code)
+                select(FarmPunditLanguage).where(
+                    FarmPunditLanguage.language_code.in_(language_codes)
+                )
             )).scalars().all()
         }
         profiles = [p for p in profiles if p.id in lang_pundit_ids]
 
-    if crop_group:
+    if crop_groups:
         cg_pundit_ids = {
             r.pundit_id for r in (await db.execute(
-                select(FarmPunditCropGroup).where(FarmPunditCropGroup.crop_group_cosh_id == crop_group)
+                select(FarmPunditCropGroup).where(
+                    FarmPunditCropGroup.crop_group_cosh_id.in_(crop_groups)
+                )
             )).scalars().all()
         }
         profiles = [p for p in profiles if p.id in cg_pundit_ids]
@@ -705,6 +732,50 @@ async def list_company_pundits(
             "is_promoter_pundit": cp.is_promoter_pundit,
             "round_robin_sequence": cp.round_robin_sequence,
             "onboarded_at": cp.onboarded_at,
+        })
+    return out
+
+
+@router.get("/client/{client_id}/pundit-invitations")
+async def list_company_pundit_invitations(
+    client_id: str,
+    status: str = "PENDING",
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Invitations the CA has sent that haven't been accepted yet.
+
+    Spec §14.3 Step 3 — the CA invites; the expert accepts in the PWA.
+    Until acceptance, the expert is NOT enrolled — `ClientFarmPundit`
+    has no row for them. Without this listing the CA portal can't
+    distinguish "invited and waiting" from "never sent" — both look
+    like 'no expert' in the My Experts tab.
+    """
+    invitations = (await db.execute(
+        select(PunditInvitation).where(
+            PunditInvitation.client_id == client_id,
+            PunditInvitation.status == status,
+        ).order_by(PunditInvitation.created_at.desc())
+    )).scalars().all()
+
+    out = []
+    for inv in invitations:
+        profile = (await db.execute(
+            select(FarmPunditProfile).where(FarmPunditProfile.id == inv.pundit_id)
+        )).scalar_one_or_none()
+        user = (await db.execute(
+            select(User).where(User.id == profile.user_id)
+        )).scalar_one_or_none() if profile else None
+        out.append({
+            "id": inv.id,
+            "pundit_id": inv.pundit_id,
+            "name": user.name if user else None,
+            "phone": user.phone if (user and profile and not profile.phone_hidden) else None,
+            "email": profile.email if profile else None,
+            "role": inv.role.value if hasattr(inv.role, "value") else str(inv.role),
+            "status": inv.status,
+            "rejection_reason": inv.rejection_reason,
+            "created_at": inv.created_at,
         })
     return out
 

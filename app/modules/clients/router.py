@@ -1101,7 +1101,10 @@ async def register_promoter(
         )
     )).scalar_one_or_none()
     if existing_cp:
-        raise HTTPException(status_code=409, detail="This person is already registered as a {promoter_type} for this client")
+        raise HTTPException(
+            status_code=409,
+            detail=f"This person is already registered as a {promoter_type.title()} for this client.",
+        )
 
     cp = ClientPromoter(
         client_id=client_id,
