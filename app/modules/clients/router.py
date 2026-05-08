@@ -1142,6 +1142,34 @@ async def deactivate_promoter(
     return {"status": "INACTIVE"}
 
 
+@router.put("/client/{client_id}/field-manager/promoters/{promoter_id}/reactivate")
+async def reactivate_promoter(
+    client_id: str,
+    promoter_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Inverse of deactivate — flip status back to ACTIVE so the
+    promoter can resume assigning packages. Same Promoter user_id;
+    same ClientPromoter row, no re-onboarding needed."""
+    cp = (await db.execute(
+        select(ClientPromoter).where(
+            ClientPromoter.id == promoter_id,
+            ClientPromoter.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if not cp:
+        raise HTTPException(status_code=404, detail="Promoter not found")
+    if cp.status == "ACTIVE":
+        raise HTTPException(
+            status_code=400,
+            detail="This promoter is already active.",
+        )
+    cp.status = "ACTIVE"
+    await db.commit()
+    return {"status": "ACTIVE"}
+
+
 # ── Field Manager: Get farmers for assignment ──────────────────────────────────
 
 @router.get("/client/{client_id}/field-manager/farmers")

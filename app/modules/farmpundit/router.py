@@ -722,6 +722,9 @@ async def list_company_pundits(
         user = (await db.execute(
             select(User).where(User.id == profile.user_id)
         )).scalar_one_or_none() if profile else None
+        active_query_count = await _count_active_queries_for_pundit(
+            db, client_id=client_id, pundit_id=cp.pundit_id,
+        )
         out.append({
             "id": cp.id,
             "pundit_id": cp.pundit_id,
@@ -731,6 +734,7 @@ async def list_company_pundits(
             "status": cp.status,
             "is_promoter_pundit": cp.is_promoter_pundit,
             "round_robin_sequence": cp.round_robin_sequence,
+            "active_query_count": active_query_count,
             "onboarded_at": cp.onboarded_at,
         })
     return out
@@ -796,6 +800,156 @@ async def deactivate_company_pundit(
     cp.status = "INACTIVE"
     await db.commit()
     return {"status": "INACTIVE"}
+
+
+@router.put("/client/{client_id}/pundits/{cp_id}/reactivate")
+async def reactivate_company_pundit(
+    client_id: str,
+    cp_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Bring an INACTIVE FarmPundit back into rotation.
+
+    Spec §14.5 covers the *deactivate* flow but is silent on undoing
+    a deactivation. In V1 we treat reactivate as the simple inverse:
+    flip status back to ACTIVE; the existing round_robin_sequence is
+    preserved on deactivate so reactivation slots them back in their
+    original position. Only paths through `change_role` clear the
+    sequence (Primary→Panel), so the reactivation case is genuinely
+    a no-op on routing data."""
+    cp = (await db.execute(
+        select(ClientFarmPundit).where(
+            ClientFarmPundit.id == cp_id,
+            ClientFarmPundit.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if not cp:
+        raise HTTPException(status_code=404, detail="Company pundit not found")
+    if cp.status == "ACTIVE":
+        raise HTTPException(
+            status_code=400,
+            detail="This FarmPundit is already active.",
+        )
+    cp.status = "ACTIVE"
+    await db.commit()
+    return {"status": "ACTIVE"}
+
+
+class PunditRoleChange(BaseModel):
+    role: PunditRole
+
+
+@router.put("/client/{client_id}/pundits/{cp_id}/role")
+async def change_company_pundit_role(
+    client_id: str,
+    cp_id: str,
+    request: PunditRoleChange,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Spec §14.5: role change Primary↔Panel is allowed only after
+    the FarmPundit has been deactivated AND all their active queries
+    have been resolved or returned. The deactivate→drain→change-role
+    sequence prevents in-flight queries from drifting between role
+    semantics (e.g. a Panel pundit suddenly holding what was a
+    Primary-routed query).
+
+    Side effect on routing data:
+      Primary → Panel: clear round_robin_sequence (Panel pundits don't
+                       participate in the round-robin sequence).
+      Panel  → Primary: assign the next available sequence so the
+                       reactivated pundit lands at the end.
+    """
+    cp = (await db.execute(
+        select(ClientFarmPundit).where(
+            ClientFarmPundit.id == cp_id,
+            ClientFarmPundit.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if not cp:
+        raise HTTPException(status_code=404, detail="Company pundit not found")
+
+    if cp.status != "INACTIVE":
+        raise HTTPException(
+            status_code=409,
+            detail="Deactivate this FarmPundit before changing their role. Per spec §14.5, role changes happen only after active queries clear.",
+        )
+
+    active_count = await _count_active_queries_for_pundit(
+        db, client_id=client_id, pundit_id=cp.pundit_id,
+    )
+    if active_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=f"This FarmPundit is still holding {active_count} active query/queries. Wait until all are resolved or returned before changing their role.",
+        )
+
+    current_role = cp.role.value if hasattr(cp.role, "value") else str(cp.role)
+    new_role = request.role.value if hasattr(request.role, "value") else str(request.role)
+    if current_role == new_role:
+        raise HTTPException(
+            status_code=400,
+            detail=f"This FarmPundit is already a {new_role.title()} expert.",
+        )
+
+    # Compute next sequence BEFORE flipping role — autoflush would
+    # otherwise include this row in the Primary count and yield a
+    # sequence one too high.
+    if new_role == "PRIMARY":
+        next_seq = await _next_round_robin_sequence(db, client_id)
+        cp.role = request.role
+        cp.round_robin_sequence = next_seq
+    else:  # PANEL
+        cp.role = request.role
+        cp.round_robin_sequence = None
+
+    await db.commit()
+    return {"role": new_role, "round_robin_sequence": cp.round_robin_sequence}
+
+
+@router.delete("/client/{client_id}/pundits/{cp_id}", status_code=204)
+async def delete_company_pundit(
+    client_id: str,
+    cp_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Remove a FarmPundit from this company entirely (spec §14.5
+    last bullet: "If deleted: removed from company's list. Their PWA
+    profile remains — they can still be invited by other companies").
+
+    Same gate as role-change: must be INACTIVE with zero active
+    queries. The PWA-side `FarmPunditProfile` row is deliberately
+    untouched — the expert can still be invited by another company,
+    and their query/response history under THIS company stays
+    intact (those reference `pundit_id` not `client_pundit_id`)."""
+    cp = (await db.execute(
+        select(ClientFarmPundit).where(
+            ClientFarmPundit.id == cp_id,
+            ClientFarmPundit.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if not cp:
+        raise HTTPException(status_code=404, detail="Company pundit not found")
+
+    if cp.status != "INACTIVE":
+        raise HTTPException(
+            status_code=409,
+            detail="Deactivate this FarmPundit before removing them.",
+        )
+
+    active_count = await _count_active_queries_for_pundit(
+        db, client_id=client_id, pundit_id=cp.pundit_id,
+    )
+    if active_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=f"This FarmPundit is still holding {active_count} active query/queries. Wait until all are resolved or returned before removing them.",
+        )
+
+    await db.delete(cp)
+    await db.commit()
 
 
 @router.put("/client/{client_id}/pundits/{cp_id}/promoter-pundit")
@@ -1138,6 +1292,26 @@ async def _next_round_robin_sequence(db: AsyncSession, client_id: str) -> int:
     )
     existing = result.scalars().all()
     return len(existing) + 1
+
+
+async def _count_active_queries_for_pundit(
+    db: AsyncSession, *, client_id: str, pundit_id: str,
+) -> int:
+    """Active = NEW / FORWARDED / RETURNED, currently held by this
+    pundit. Used to gate role-change and delete in spec §14.5."""
+    from sqlalchemy import func
+    result = await db.execute(
+        select(func.count(Query.id)).where(
+            Query.client_id == client_id,
+            Query.current_holder_id == pundit_id,
+            Query.status.in_([
+                QueryStatus.NEW,
+                QueryStatus.FORWARDED,
+                QueryStatus.RETURNED,
+            ]),
+        )
+    )
+    return result.scalar() or 0
 
 
 async def _trigger_cha_for_query(db: AsyncSession, query: Query, problem_cosh_id: str):
