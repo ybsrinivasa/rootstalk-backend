@@ -1,7 +1,7 @@
 import uuid
 import enum
 from datetime import datetime, timezone
-from sqlalchemy import String, Text, Boolean, Integer, DateTime, ForeignKey, UniqueConstraint
+from sqlalchemy import String, Text, Boolean, Integer, DateTime, ForeignKey, UniqueConstraint, JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database import Base
 
@@ -204,12 +204,38 @@ class QueryResponse(Base):
 
 
 class StandardResponse(Base):
-    """Company Q&A library. Created by Subject Experts."""
+    """Company Q&A library — spec §14.9.
+
+    Subject Experts curate a library of standard question/answer
+    pairs for their company. FarmPundits browse the library while
+    responding to farmer queries; they can pick a closest-matching
+    standard answer and forward it as-is (no edit; can layer their
+    own additional guidance on top).
+
+    `crop_cosh_id` nullable supports both crop-specific and crop-
+    agnostic entries per spec.
+
+    V1 answer body is text + media. The spec also allows answers to
+    embed full Timelines/Practices/Elements (same structure as a CHA
+    plan); that integration is deferred to V1.1 — see
+    project_rootstalk_audit_facilitator_dealer_farmpundit.md.
+    """
     __tablename__ = "standard_responses"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     client_id: Mapped[str] = mapped_column(String(36), ForeignKey("clients.id"), nullable=False)
     crop_cosh_id: Mapped[str] = mapped_column(String(100), nullable=True)
     question_text: Mapped[str] = mapped_column(Text, nullable=False)
+    answer_text: Mapped[str] = mapped_column(Text, nullable=True)
+    # JSON list of {media_type, url, caption?} entries. Media types
+    # mirror what QueryResponseMedia accepts (IMAGE / VIDEO / AUDIO /
+    # HYPERLINK). Persisted as JSON because the v1 surface is a
+    # simple list and doesn't need a separate join table; if an
+    # author-side moderation flow lands later it can move to a row-
+    # per-asset table without touching consumers.
+    answer_media: Mapped[list] = mapped_column(JSON, nullable=True)
     created_by: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow,
+    )

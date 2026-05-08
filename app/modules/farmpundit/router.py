@@ -591,6 +591,77 @@ async def query_history(
 
 
 # ── Standard Q&A Library ──────────────────────────────────────────────────────
+# Spec §14.9. Subject Experts curate a library of standard
+# question/answer pairs; FarmPundits pick from it when responding to
+# farmer queries (no edit; can layer additional guidance on top).
+# V1 answer body is text + media; Timelines/Practices integration
+# deferred to V1.1.
+
+
+def _serialise_standard_response(sr: StandardResponse) -> dict:
+    return {
+        "id": sr.id,
+        "client_id": sr.client_id,
+        "crop_cosh_id": sr.crop_cosh_id,
+        "question_text": sr.question_text,
+        "answer_text": sr.answer_text,
+        "answer_media": sr.answer_media or [],
+        "created_by": sr.created_by,
+        "created_at": sr.created_at,
+        "updated_at": sr.updated_at,
+    }
+
+
+def _validate_standard_response_payload(data: dict) -> None:
+    """Shared input validation for POST + PUT. The spec doesn't
+    mandate an answer at creation time (a SE might draft a question
+    list first and fill answers later), so answer_text is optional.
+    Question is mandatory."""
+    question = data.get("question_text")
+    if not question or not str(question).strip():
+        raise HTTPException(status_code=422, detail="question_text is required.")
+
+    media = data.get("answer_media")
+    if media is not None:
+        if not isinstance(media, list):
+            raise HTTPException(
+                status_code=422,
+                detail="answer_media must be a list of {media_type, url, caption?}.",
+            )
+        for item in media:
+            if not isinstance(item, dict) or not item.get("url"):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Each answer_media entry needs a url.",
+                )
+
+
+@router.get("/client/{client_id}/standard-responses")
+async def list_standard_responses(
+    client_id: str,
+    crop_cosh_id: Optional[str] = None,
+    search: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CA-portal-facing list. Filter by crop (None = crop-agnostic
+    only when explicitly passed as the literal string 'AGNOSTIC';
+    omitted = no crop filter at all) and/or by free-text search
+    against question_text. Returns full payload — answer body
+    included — because the SE list page renders both."""
+    await _assert_portal_member(db, current_user.id, client_id)
+    q = select(StandardResponse).where(
+        StandardResponse.client_id == client_id,
+    ).order_by(StandardResponse.created_at.desc())
+    if crop_cosh_id == "AGNOSTIC":
+        q = q.where(StandardResponse.crop_cosh_id.is_(None))
+    elif crop_cosh_id:
+        q = q.where(StandardResponse.crop_cosh_id == crop_cosh_id)
+    if search:
+        q = q.where(StandardResponse.question_text.ilike(f"%{search}%"))
+    rows = (await db.execute(q)).scalars().all()
+    return [_serialise_standard_response(r) for r in rows]
+
 
 @router.post("/client/{client_id}/standard-responses", status_code=201)
 async def create_standard_response(
@@ -600,15 +671,77 @@ async def create_standard_response(
     current_user: User = Depends(get_current_user),
 ):
     await _assert_portal_member(db, current_user.id, client_id)
+    _validate_standard_response_payload(data)
     sr = StandardResponse(
         client_id=client_id,
-        crop_cosh_id=data.get("crop_cosh_id"),
-        question_text=data["question_text"],
+        crop_cosh_id=data.get("crop_cosh_id") or None,
+        question_text=str(data["question_text"]).strip(),
+        answer_text=(str(data.get("answer_text") or "").strip() or None),
+        answer_media=data.get("answer_media") or None,
         created_by=current_user.id,
     )
     db.add(sr)
     await db.commit()
-    return {"id": sr.id}
+    await db.refresh(sr)
+    return _serialise_standard_response(sr)
+
+
+@router.put("/client/{client_id}/standard-responses/{sr_id}")
+async def update_standard_response(
+    client_id: str,
+    sr_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Edit an existing entry. Spec §14.9 says FarmPundits cannot
+    modify standard answers — that's a Pundit-side rule on the
+    response flow, not an SE-side rule on the library itself. The
+    library curator (SE) can refine entries freely."""
+    await _assert_portal_member(db, current_user.id, client_id)
+    _validate_standard_response_payload(data)
+
+    sr = (await db.execute(
+        select(StandardResponse).where(
+            StandardResponse.id == sr_id,
+            StandardResponse.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if not sr:
+        raise HTTPException(status_code=404, detail="Standard response not found")
+
+    sr.question_text = str(data["question_text"]).strip()
+    sr.answer_text = (str(data.get("answer_text") or "").strip() or None)
+    sr.answer_media = data.get("answer_media") or None
+    sr.crop_cosh_id = data.get("crop_cosh_id") or None
+    await db.commit()
+    await db.refresh(sr)
+    return _serialise_standard_response(sr)
+
+
+@router.delete("/client/{client_id}/standard-responses/{sr_id}", status_code=204)
+async def delete_standard_response(
+    client_id: str,
+    sr_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Hard delete. Note: a deleted entry that's already been
+    referenced by a QueryResponse via standard_response_id remains
+    referenced — the FK is nullable on the response side so this
+    won't break, but the breadcrumb is broken. Acceptable for V1
+    (deletion is a curator action, not a frequent flow)."""
+    await _assert_portal_member(db, current_user.id, client_id)
+    sr = (await db.execute(
+        select(StandardResponse).where(
+            StandardResponse.id == sr_id,
+            StandardResponse.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if not sr:
+        raise HTTPException(status_code=404, detail="Standard response not found")
+    await db.delete(sr)
+    await db.commit()
 
 
 @router.get("/pundit/standard-responses")
@@ -618,11 +751,14 @@ async def search_standard_responses(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Pundit-side search — used while responding to a farmer's
+    query. Same shape as the CA-side list but no auth-membership
+    gate (Pundits act on behalf of multiple companies)."""
     q = select(StandardResponse).where(StandardResponse.client_id == client_id)
     if search:
         q = q.where(StandardResponse.question_text.ilike(f"%{search}%"))
-    result = await db.execute(q)
-    return result.scalars().all()
+    rows = (await db.execute(q)).scalars().all()
+    return [_serialise_standard_response(r) for r in rows]
 
 
 # ── FarmPundit search (Client Portal CA) ──────────────────────────────────────
