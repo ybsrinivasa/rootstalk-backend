@@ -42,6 +42,50 @@ def _require_sa(current_user: User):
         raise HTTPException(status_code=403, detail="Super Admin access required")
 
 
+async def _assert_unique_legal_ids(
+    db: AsyncSession,
+    *,
+    self_client_id: str,
+    gst_number: str | None,
+    pan_number: str | None,
+) -> None:
+    """Ensure GST/PAN aren't already in use by another client.
+
+    Postgres has unique constraints on both columns (clients.models),
+    so a clash without this pre-check surfaces as an IntegrityError →
+    raw 500. The CA can't act on a 500 — they don't know what to fix.
+    A structured 422 lets the onboarding form pin the message to the
+    right field instead of dumping a generic banner. Surfaced
+    2026-05-08 in testing-server flow when the testing crew reused a
+    PAN across two onboarding stubs."""
+    if gst_number:
+        clash = (await db.execute(
+            select(Client.id).where(
+                Client.gst_number == gst_number,
+                Client.id != self_client_id,
+            )
+        )).scalar_one_or_none()
+        if clash:
+            raise HTTPException(status_code=422, detail={
+                "field": "gst_number",
+                "code": "gst_already_registered",
+                "message": "This GST number is already registered to another client. Please verify and re-enter, or contact RootsTalk support if you believe this is an error.",
+            })
+    if pan_number:
+        clash = (await db.execute(
+            select(Client.id).where(
+                Client.pan_number == pan_number,
+                Client.id != self_client_id,
+            )
+        )).scalar_one_or_none()
+        if clash:
+            raise HTTPException(status_code=422, detail={
+                "field": "pan_number",
+                "code": "pan_already_registered",
+                "message": "This PAN number is already registered to another client. Please verify and re-enter, or contact RootsTalk support if you believe this is an error.",
+            })
+
+
 def _base_url() -> str:
     """Public base URL for **CA-facing** links — the onboarding magic
     link (`/onboarding/{token}`) and the post-approval branded login
@@ -330,6 +374,13 @@ async def submit_onboarding(
         raise HTTPException(status_code=422, detail="GST number must be 15 characters")
     if len(request.pan_number) != 10:
         raise HTTPException(status_code=422, detail="PAN number must be 10 characters")
+
+    await _assert_unique_legal_ids(
+        db,
+        self_client_id=client.id,
+        gst_number=request.gst_number.upper(),
+        pan_number=request.pan_number.upper(),
+    )
 
     client.display_name = request.display_name
     client.tagline = request.tagline
