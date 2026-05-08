@@ -43,14 +43,27 @@ def _require_sa(current_user: User):
 
 
 def _base_url() -> str:
-    """Public base URL for CA-facing links (onboarding magic link, post-
-    approval portal URL). Single Next.js app at this host serves the
-    SA portal at `/` and per-client portals at `/{short_name}` —
-    path-based multi-tenant routing.
+    """Public base URL for **CA-facing** links — the onboarding magic
+    link (`/onboarding/{token}`) and the post-approval branded login
+    URL (`/login/{short_name}`). Both routes live in the client-portal
+    Next.js app, NOT the SA admin app.
+
+    Production deployment topology:
+      One Next.js app at `rootstalk.eywa.farm` serves the SA portal
+      at `/` and per-client portals at `/{short_name}` via path-based
+      multi-tenant routing. The same host is correct here.
+
+    Testing-server topology (per docs/SETUP_TESTING_SERVER.md):
+      Two Next.js apps. SA at `rstalk.eywa.farm`, CA at
+      `rstalk-ca.eywa.farm`. Subdomain-based split. **This env var
+      MUST point at the CA portal subdomain** — the SA portal has no
+      `/onboarding/{token}` or `/login/{short_name}` route and would
+      404 if the email's link were stitched against it.
 
     Resolution order:
     1. `FRONTEND_BASE_URL` env var (the only path for non-dev envs).
-    2. Dev fallback `http://localhost:3004` if `environment=development`.
+    2. Dev fallback `http://localhost:3004` (the client-portal dev
+       port — see project_rootstalk_ports.md).
 
     No production fallback. The startup gate in `app/main.py` refuses
     to boot a non-dev process if `FRONTEND_BASE_URL` is unset, but if

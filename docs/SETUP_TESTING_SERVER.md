@@ -153,7 +153,21 @@ SA_PASSWORD=<your strong SA password>
 
 # Frontend / CORS — non-dev REQUIRES FRONTEND_BASE_URL or the API
 # refuses to boot (see app/main.py).
-FRONTEND_BASE_URL=https://rstalk.eywa.farm
+#
+# IMPORTANT: FRONTEND_BASE_URL is the host backend uses to construct
+# CA-facing links — the onboarding magic link (/onboarding/<token>) and
+# the post-approval branded login URL (/login/<short_name>). Both routes
+# live ONLY in the client-portal app (rstalk-ca.eywa.farm), NOT in the
+# SA admin app at rstalk.eywa.farm. So this MUST point at the CA portal,
+# not the SA portal — otherwise CAs clicking the onboarding email get a
+# 404 from the SA app.
+#
+# In production where one Next.js app at rootstalk.eywa.farm serves both
+# the SA portal at "/" and per-client portals at "/{short_name}" via
+# path-based multi-tenant routing, the prod equivalent is the unified
+# host. Testing splits them by subdomain, so the CA portal subdomain
+# is the right pointer here.
+FRONTEND_BASE_URL=https://rstalk-ca.eywa.farm
 ALLOWED_ORIGINS=https://rstalk.eywa.farm,https://rstalk-ca.eywa.farm,https://rstalk-pwa.eywa.farm
 
 # Email (Gmail SMTP)
