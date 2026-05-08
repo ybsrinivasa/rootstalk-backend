@@ -1383,11 +1383,6 @@ async def _get_next_pundit_for_query(
     )).scalar_one_or_none()
 
 
-# Keep old name as alias for backward compat
-async def _get_next_round_robin_pundit(db: AsyncSession, client_id: str) -> Optional[FarmPunditProfile]:
-    return await _get_next_pundit_for_query(db, client_id, "")
-
-
 async def _next_round_robin_sequence(db: AsyncSession, client_id: str) -> int:
     result = await db.execute(
         select(ClientFarmPundit).where(

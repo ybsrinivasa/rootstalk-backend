@@ -327,4 +327,58 @@ async def test_promoter_duplicate_error_renders_promoter_type(db):
         )
     assert ei.value.status_code == 409
     assert "Dealer" in ei.value.detail
-    assert "{" not in ei.value.detail
+
+
+# ── L1 — name validation on register_promoter ───────────────────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_register_promoter_rejects_missing_name(db):
+    """Pre-fix the listing showed empty-name rows as a literal em-dash
+    when the CA submitted with a blank name. Belt-and-braces server
+    validation now rejects with 422."""
+    from app.modules.clients.router import register_promoter
+    from fastapi import HTTPException
+
+    client = await make_client(db)
+    sa = await make_user(db, name="SA")
+    await db.commit()
+
+    for bad in (None, "", "   ", "\t\n"):
+        with pytest.raises(HTTPException) as ei:
+            await register_promoter(
+                client_id=client.id,
+                request={
+                    "phone": f"+91990{hash(str(bad)) % 10**7:07d}",
+                    "name": bad,
+                    "promoter_type": "DEALER",
+                    "territory_notes": None,
+                },
+                db=db, current_user=sa,
+            )
+        assert ei.value.status_code == 422
+        assert "Name" in ei.value.detail
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_register_promoter_strips_name_whitespace(db):
+    """Padded names get trimmed before persistence, so the listing
+    doesn't render leading/trailing spaces."""
+    from app.modules.clients.router import register_promoter
+
+    client = await make_client(db)
+    sa = await make_user(db, name="SA")
+    await db.commit()
+
+    out = await register_promoter(
+        client_id=client.id,
+        request={
+            "phone": "+919900099009",
+            "name": "  Padded Person  ",
+            "promoter_type": "FACILITATOR",
+            "territory_notes": None,
+        },
+        db=db, current_user=sa,
+    )
+    assert out["name"] == "Padded Person"

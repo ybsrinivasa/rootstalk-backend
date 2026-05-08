@@ -1066,6 +1066,14 @@ async def register_promoter(
 
     if promoter_type not in ("DEALER", "FACILITATOR"):
         raise HTTPException(status_code=422, detail="promoter_type must be DEALER or FACILITATOR")
+    # L1 (audit polish, 2026-05-09): require non-empty name. Pre-fix
+    # the endpoint accepted None / "" / "   " and the listing pages
+    # rendered empty-name rows as a literal em-dash. The frontend
+    # already has `required` on the input, so this is the
+    # belt-and-braces server-side guard against bypassing the form.
+    if not name or not str(name).strip():
+        raise HTTPException(status_code=422, detail="Name is required.")
+    name = str(name).strip()
 
     # Find or create user by phone
     existing_user = None
