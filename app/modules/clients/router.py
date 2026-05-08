@@ -1125,6 +1125,38 @@ async def register_promoter(
     }
 
 
+@router.get("/admin/users/exists")
+async def lookup_user_by_phone(
+    phone: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Pre-flight check used by the CA portal's Promoter register form.
+
+    When the CA fills in a phone number, the form blurs and hits this
+    endpoint so it can show inline whether the phone already
+    corresponds to a RootsTalk user. Without this, the
+    register-promoter call silently attaches a ClientPromoter row to
+    an existing User (intended behaviour — same person CAN be a
+    promoter at multiple companies) but the CA gets no signal that
+    they're attaching an existing user vs creating a fresh account.
+
+    Privacy: returns only `exists: bool` and `name` (the existing
+    User's display name). No cross-client information leaks — the CA
+    can't tell which other companies the user is a promoter at, only
+    that the user exists. Same surface area as the existing
+    register-promoter call (which also reveals existence by 409
+    behaviour), so this isn't a new fish-the-phone-book vector."""
+    if not phone:
+        raise HTTPException(status_code=422, detail="phone is required")
+    existing = (await db.execute(
+        select(User).where(User.phone == phone)
+    )).scalar_one_or_none()
+    if existing:
+        return {"exists": True, "name": existing.name}
+    return {"exists": False, "name": None}
+
+
 @router.put("/client/{client_id}/field-manager/promoters/{promoter_id}/deactivate")
 async def deactivate_promoter(
     client_id: str,
