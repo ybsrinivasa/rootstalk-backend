@@ -24,6 +24,9 @@ from app.services.bl08_diagnosis_path import (
     run_diagnosis_step, get_available_plant_parts, get_problem_list,
     ProblemSymptomRow, DiagnosisAnswer,
 )
+from app.services.diagnosis_images import (
+    build_google_images_query, find_reference_images, google_images_url,
+)
 
 router = APIRouter(tags=["Diagnosis"])
 
@@ -464,6 +467,84 @@ async def explain_symptom_route(
         language_name=request.language_name,
     )
     return {"explanation": text, "language_code": request.language_code}
+
+
+# ── Reference images for the current question (5C / 5D) ──────────────────────
+
+class ReferenceImagesRequest(BaseModel):
+    crop_cosh_id: str
+    crop_stage_cosh_id: Optional[str] = None
+    plant_part_cosh_id: str
+    symptom_cosh_id: str
+    sub_part_cosh_id: Optional[str] = None
+    sub_symptom_cosh_id: Optional[str] = None
+    language_code: str = "en"
+
+
+@router.post("/diagnosis/reference-images")
+async def get_reference_images(
+    request: ReferenceImagesRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Returns reference images Cosh has curated for the farmer's
+    current question, plus a Google Images fallback URL the PWA always
+    has on hand. The two together cover both the happy path (curated
+    images shown in a carousel) and the gap path (no images yet —
+    farmer taps the Google link or the ⓘ tooltip).
+
+    The API field `plant_part_cosh_id` is kept for backward-compat with
+    the diagnosis flow's existing terminology; internally it maps to the
+    Cosh role `part`.
+
+    Returns a flat shape:
+    ```
+    {
+      "images": [{"cosh_id", "url", "media_type", "caption"}, ...],
+      "google_images_url":   "https://...",
+      "google_images_query": "Powdery mildew on leaves of Tomato",
+      "language_code":       "en"
+    }
+    ```
+
+    `images: []` is the no-image fallback signal — PWA renders the
+    "no reference image, see Google Images and tap ⓘ" message in the
+    farmer's locale."""
+    images = await find_reference_images(
+        db,
+        crop_cosh_id=request.crop_cosh_id,
+        crop_stage_cosh_id=request.crop_stage_cosh_id,
+        part_cosh_id=request.plant_part_cosh_id,
+        symptom_cosh_id=request.symptom_cosh_id,
+        sub_part_cosh_id=request.sub_part_cosh_id,
+        sub_symptom_cosh_id=request.sub_symptom_cosh_id,
+        language_code=request.language_code,
+    )
+
+    query = await build_google_images_query(
+        db,
+        crop_cosh_id=request.crop_cosh_id,
+        part_cosh_id=request.plant_part_cosh_id,
+        symptom_cosh_id=request.symptom_cosh_id,
+        sub_part_cosh_id=request.sub_part_cosh_id,
+        sub_symptom_cosh_id=request.sub_symptom_cosh_id,
+        language_code=request.language_code,
+    )
+
+    return {
+        "images": [
+            {
+                "cosh_id":    img.cosh_id,
+                "url":        img.url,
+                "media_type": img.media_type,
+                "caption":    img.caption,
+            }
+            for img in images
+        ],
+        "google_images_url":   google_images_url(query) if query else None,
+        "google_images_query": query or None,
+        "language_code":       request.language_code,
+    }
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
