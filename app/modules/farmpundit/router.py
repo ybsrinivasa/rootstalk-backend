@@ -1048,6 +1048,11 @@ async def toggle_promoter_pundit(
                 ClientPromoter.user_id == profile.user_id,
                 ClientPromoter.promoter_type == "FACILITATOR",
                 ClientPromoter.status == "ACTIVE",
+                # Onboarded Facilitator alone isn't enough — they
+                # must additionally be marked as a Promoter (the
+                # is_promoter flag on the ClientPromoter row, added
+                # in the Option C separation 2026-05-08).
+                ClientPromoter.is_promoter == True,  # noqa: E712
             )
         )).scalar_one_or_none()
         if promoter is None:
@@ -1057,9 +1062,10 @@ async def toggle_promoter_pundit(
                     "code": "promoter_pundit_requires_facilitator_promoter",
                     "message": (
                         "Per spec §14.2, a Promoter-Pundit must first be a "
-                        "Facilitator-Promoter at this company. Register them "
-                        "as a Facilitator on the Field Manager page before "
-                        "marking them as a Promoter-Pundit."
+                        "Facilitator-Promoter at this company. The candidate "
+                        "must be onboarded as a Facilitator AND marked as a "
+                        "Promoter on the Field Manager page before being "
+                        "designated as a Promoter-Pundit."
                     ),
                 },
             )

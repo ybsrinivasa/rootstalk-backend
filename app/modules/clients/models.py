@@ -209,7 +209,31 @@ class CMPrivilegeModel(Base):
 
 
 class ClientPromoter(Base):
-    """Links a Dealer or Facilitator user to a client. Registered by Field Manager."""
+    """Links a Dealer or Facilitator user to a client.
+
+    Architectural note (Option C, 2026-05-08): the table name is
+    historical. A row in this table is the **company-onboarding link**
+    for a Dealer or Facilitator — that is, the act of a Field Manager
+    recognising the user as a member of this company's Dealer or
+    Facilitator ecosystem. Per the user's described model, a row
+    here doesn't automatically make the user a *Promoter* (someone
+    who can assign packages to farmers). The `is_promoter` flag on
+    top of the link is what designates them as a Promoter.
+
+    Pre-Option-C semantics conflated the two — every row was treated
+    as a Promoter. The Alembic migration backfills existing rows to
+    `is_promoter=True` to preserve current behaviour. New rows
+    created by the existing CA-portal flow also default to True
+    until the V1.1 redesign separates the onboarding step from the
+    Promoter-designation step in the UI.
+
+    Eligibility rules:
+      Plain Facilitator (is_promoter=False) — multi-company OK.
+      Facilitator-Promoter (FACILITATOR + is_promoter=True) — exclusive
+        per spec §11.2 ("one company at a time"). Enforced in
+        register_promoter and in any future `mark_as_promoter` toggle.
+      Dealer / Dealer-Promoter — multi-company always.
+    """
     __tablename__ = "client_promoters"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
@@ -217,6 +241,7 @@ class ClientPromoter(Base):
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
     promoter_type: Mapped[str] = mapped_column(String(20), nullable=False)  # DEALER / FACILITATOR
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
+    is_promoter: Mapped[bool] = mapped_column(default=True, nullable=False)
     territory_notes: Mapped[str] = mapped_column(Text, nullable=True)
     registered_by: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
     registered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

@@ -1040,6 +1040,7 @@ async def list_promoters(
             "id": cp.id, "user_id": user.id,
             "name": user.name, "phone": user.phone, "email": user.email,
             "promoter_type": cp.promoter_type, "status": cp.status,
+            "is_promoter": cp.is_promoter,
             "territory_notes": cp.territory_notes, "registered_at": cp.registered_at,
         }
         for cp, user in rows
@@ -1093,32 +1094,44 @@ async def register_promoter(
         db.add(UserRole(user_id=user.id, role_type=role_type))
 
     # Spec §11.2 — Facilitator-Promoter is exclusive per company
-    # ("one company at a time"). Dealer-Promoter is multi-company by
-    # design. If this user has an ACTIVE FACILITATOR row at any
-    # OTHER client, refuse with a structured 409 so the CA gets a
-    # clear path forward (deactivate at the previous company first).
-    # Privacy: never name the other client — the CA doesn't need to
-    # know, and surfacing it would leak cross-client info.
+    # ("one company at a time"). The user's described model
+    # (2026-05-08) refines this: a plain Facilitator (onboarded but
+    # not yet marked as a Promoter) is multi-company OK; only the
+    # Facilitator-PROMOTER combination is exclusive.
+    #
+    # The check therefore looks at `is_promoter=True` on the other
+    # client's row, NOT just the existence of the Facilitator row.
+    # This gate is meaningful only when the new registration would
+    # itself be a Promoter (`is_promoter` defaults to True under the
+    # current pre-V1.1 flow — the existing CA-portal still creates
+    # rows that are immediately Promoters). When V1.1 lands and the
+    # Mark-as-Promoter step becomes a separate UI action, this gate
+    # will move to that endpoint with the same logic.
+    #
+    # Dealer-Promoters stay multi-company per spec.
+    # Privacy: never name the other client.
     if promoter_type == "FACILITATOR":
-        active_elsewhere = (await db.execute(
+        active_promoter_elsewhere = (await db.execute(
             select(ClientPromoter).where(
                 ClientPromoter.user_id == user.id,
                 ClientPromoter.promoter_type == "FACILITATOR",
                 ClientPromoter.status == "ACTIVE",
+                ClientPromoter.is_promoter == True,  # noqa: E712
                 ClientPromoter.client_id != client_id,
             )
         )).scalar_one_or_none()
-        if active_elsewhere:
+        if active_promoter_elsewhere:
             raise HTTPException(
                 status_code=409,
                 detail={
                     "code": "facilitator_already_active_elsewhere",
                     "message": (
-                        "This person is already registered as an active "
-                        "Facilitator at another company. Per spec §11.2, a "
+                        "This person is already an active Facilitator-"
+                        "Promoter at another company. Per spec §11.2, a "
                         "Facilitator-Promoter can only be active at one "
-                        "company at a time. They must be deactivated at the "
-                        "previous company before being registered here."
+                        "company at a time. They must be unmarked as a "
+                        "Promoter (or deactivated) at the previous company "
+                        "before being registered as a Promoter here."
                     ),
                 },
             )
@@ -1152,6 +1165,7 @@ async def register_promoter(
         "id": cp.id, "user_id": user.id,
         "name": user.name, "phone": user.phone,
         "promoter_type": cp.promoter_type, "status": cp.status,
+        "is_promoter": cp.is_promoter,
         "territory_notes": cp.territory_notes, "registered_at": cp.registered_at,
     }
 
