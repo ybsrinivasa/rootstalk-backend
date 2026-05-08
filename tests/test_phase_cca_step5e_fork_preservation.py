@@ -239,8 +239,11 @@ async def test_import_global_pg_preserves_frequency_days(db):
 @requires_docker
 @pytest.mark.asyncio
 async def test_import_global_pg_idempotent_returns_409_on_duplicate(db):
-    """Re-importing the same global PG is a 409. Locks the existing
-    contract so repeated imports don't silently duplicate."""
+    """Re-importing the same global PG without ?force=true returns a
+    structured 409 — the CA portal renders this as the "this will
+    overwrite your local edits" warning. The structured shape was
+    introduced in the 2026-05-08 CHA imports work; before that this
+    test asserted the legacy free-text "already imported" message."""
     from fastapi import HTTPException
 
     user = await make_user(db, name="GlobalSE")
@@ -262,11 +265,11 @@ async def test_import_global_pg_idempotent_returns_409_on_duplicate(db):
         db=db, current_user=user,
     )
 
-    # Second one is rejected.
+    # Second one without force is rejected with the structured envelope.
     with pytest.raises(HTTPException) as exc:
         await import_global_pg(
             client_id=client.id, global_pg_id=global_pg.id,
             db=db, current_user=user,
         )
     assert exc.value.status_code == 409
-    assert "already imported" in exc.value.detail.lower()
+    assert exc.value.detail["code"] == "import_would_overwrite"
