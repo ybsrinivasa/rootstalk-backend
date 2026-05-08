@@ -25,6 +25,7 @@ from app.modules.advisory.models import (
 )
 from app.modules.clients.models import (
     Client, ClientCrop, ClientUser, ClientUserRole,
+    CMClientAssignment, CMRights,
 )
 from app.modules.platform.models import StatusEnum, User
 from app.modules.subscriptions.models import (
@@ -92,6 +93,24 @@ async def make_client(db: AsyncSession, **kw) -> Client:
     db.add(c)
     await db.flush()
     return c
+
+
+async def make_cm_assignment(
+    db: AsyncSession, *, user: User, client: Client,
+    rights: CMRights = CMRights.EDIT,
+    status: StatusEnum = StatusEnum.ACTIVE,
+) -> CMClientAssignment:
+    """Seed an active CMClientAssignment so the user passes
+    `_assert_cm_can_edit_client` for `client`. Used by tests that
+    exercise the Global → Local import endpoints (fork_global_package,
+    import_global_pg, import_pg_into_sp)."""
+    assignment = CMClientAssignment(
+        cm_user_id=user.id, client_id=client.id,
+        rights=rights, status=status,
+    )
+    db.add(assignment)
+    await db.flush()
+    return assignment
 
 
 async def make_package(db: AsyncSession, client: Client, **kw) -> Package:

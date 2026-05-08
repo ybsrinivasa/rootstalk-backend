@@ -30,7 +30,8 @@ from app.modules.advisory.router import (
 )
 from tests.conftest import requires_docker
 from tests.factories import (
-    make_client, make_crop_reference, make_package, make_timeline, make_user,
+    make_client, make_cm_assignment, make_crop_reference, make_package,
+    make_timeline, make_user,
 )
 
 
@@ -69,6 +70,7 @@ async def test_fork_package_preserves_practice_fields(db):
 
     # Client forks it.
     client = await make_client(db, name="ForkingClient")
+    await make_cm_assignment(db, user=user, client=client)
     await db.commit()
 
     forked = await fork_global_package(
@@ -218,6 +220,7 @@ async def test_import_global_pg_preserves_frequency_days(db):
     await db.commit()
 
     client = await make_client(db, name="ImportingClient")
+    await make_cm_assignment(db, user=user, client=client)
     await db.commit()
 
     imported = await import_global_pg(
@@ -259,6 +262,7 @@ async def test_import_global_pg_idempotent_returns_409_on_duplicate(db):
     await db.commit()
 
     client = await make_client(db, name="Importer")
+    await make_cm_assignment(db, user=user, client=client)
     await db.commit()
 
     # First import succeeds.

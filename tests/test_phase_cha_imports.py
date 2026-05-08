@@ -31,7 +31,7 @@ from app.modules.advisory.router import (
     import_global_pg, import_pg_into_sp,
 )
 from tests.conftest import requires_docker
-from tests.factories import make_client, make_user
+from tests.factories import make_client, make_cm_assignment, make_user
 
 
 # ── Seed helpers ────────────────────────────────────────────────────────────
@@ -80,6 +80,7 @@ async def test_global_pg_import_initial(db):
     user = await make_user(db, name="SE")
     src = await _seed_global_pg_with_content(db)
     client = await make_client(db)
+    await make_cm_assignment(db, user=user, client=client)
     await db.commit()
 
     out = await import_global_pg(
@@ -113,6 +114,7 @@ async def test_global_pg_reimport_without_force_returns_409_with_summary(db):
     user = await make_user(db, name="SE")
     src = await _seed_global_pg_with_content(db)
     client = await make_client(db)
+    await make_cm_assignment(db, user=user, client=client)
     await db.commit()
 
     # First import succeeds.
@@ -143,6 +145,7 @@ async def test_global_pg_reimport_with_force_overwrites(db):
     user = await make_user(db, name="SE")
     src = await _seed_global_pg_with_content(db)
     client = await make_client(db)
+    await make_cm_assignment(db, user=user, client=client)
     await db.commit()
 
     # First import.
@@ -183,6 +186,7 @@ async def test_global_pg_reimport_with_force_overwrites(db):
 async def test_global_pg_import_404_when_global_missing(db):
     user = await make_user(db, name="SE")
     client = await make_client(db)
+    await make_cm_assignment(db, user=user, client=client)
     await db.commit()
 
     with pytest.raises(HTTPException) as exc:
@@ -245,6 +249,7 @@ async def _seed_empty_sp(
 async def test_pg_to_sp_initial_import_copies_all_content(db):
     user = await make_user(db, name="SE")
     client = await make_client(db)
+    await make_cm_assignment(db, user=user, client=client)
     pg = await _seed_local_pg(db, client_id=client.id)
     sp = await _seed_empty_sp(db, client_id=client.id)
     await db.commit()
@@ -279,6 +284,7 @@ async def test_pg_to_sp_initial_import_copies_all_content(db):
 async def test_pg_to_sp_reimport_without_force_returns_409(db):
     user = await make_user(db, name="SE")
     client = await make_client(db)
+    await make_cm_assignment(db, user=user, client=client)
     pg = await _seed_local_pg(db, client_id=client.id)
     sp = await _seed_empty_sp(db, client_id=client.id)
     await db.commit()
@@ -306,6 +312,7 @@ async def test_pg_to_sp_reimport_without_force_returns_409(db):
 async def test_pg_to_sp_reimport_with_force_overwrites(db):
     user = await make_user(db, name="SE")
     client = await make_client(db)
+    await make_cm_assignment(db, user=user, client=client)
     pg = await _seed_local_pg(db, client_id=client.id)
     sp = await _seed_empty_sp(db, client_id=client.id)
     await db.commit()
@@ -343,6 +350,10 @@ async def test_pg_to_sp_cross_client_source_404(db):
     user = await make_user(db, name="SE")
     client_a = await make_client(db, full_name="Client A")
     client_b = await make_client(db, full_name="Client B")
+    # User is CM on client_a only — the import target gate passes; the
+    # cross-client SOURCE PG check then returns 404. Confirms the gates
+    # compose in the right order (auth → not-found, not auth → not-found).
+    await make_cm_assignment(db, user=user, client=client_a)
     other_pg = await _seed_local_pg(db, client_id=client_b.id)
     sp_a = await _seed_empty_sp(db, client_id=client_a.id)
     await db.commit()
@@ -360,6 +371,7 @@ async def test_pg_to_sp_cross_client_source_404(db):
 async def test_pg_to_sp_404_when_sp_missing(db):
     user = await make_user(db, name="SE")
     client = await make_client(db)
+    await make_cm_assignment(db, user=user, client=client)
     pg = await _seed_local_pg(db, client_id=client.id)
     await db.commit()
 

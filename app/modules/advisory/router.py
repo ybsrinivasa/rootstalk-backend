@@ -98,6 +98,45 @@ def _raise_timeline_validation(e: TimelineValidationError):
     )
 
 
+async def _assert_cm_can_edit_client(
+    db: AsyncSession, user_id: str, client_id: str,
+) -> None:
+    """Authorisation gate for Global → Local exports of CCA / CHA
+    content. Only an active CM with EDIT rights to the target client
+    may import / fork content into that client's scope.
+
+    Raises 403 with stable code `cm_assignment_required`. Used by
+    fork_global_package, import_global_pg, import_pg_into_sp.
+
+    Note: this is the V1 boundary check on the import pipe only. The
+    broader `_require_client_role` audit (covering ~30 advisory
+    mutating endpoints) remains a V2 task.
+    """
+    from app.modules.clients.models import CMClientAssignment, CMRights
+    from app.modules.platform.models import StatusEnum
+
+    assignment = (await db.execute(
+        select(CMClientAssignment).where(
+            CMClientAssignment.cm_user_id == user_id,
+            CMClientAssignment.client_id == client_id,
+            CMClientAssignment.status == StatusEnum.ACTIVE,
+            CMClientAssignment.rights == CMRights.EDIT,
+        )
+    )).scalar_one_or_none()
+    if assignment is None:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "cm_assignment_required",
+                "message": (
+                    "Only a Content Manager with active EDIT rights for "
+                    "this client may import or fork content into the "
+                    "client's scope."
+                ),
+            },
+        )
+
+
 def _raise_l2_element_validation(e: L2ElementValidationError):
     """Map L2ElementValidationError to a 422 carrying the full error list
     so the CA portal can render every failed rule at once instead of
@@ -1626,69 +1665,31 @@ async def delete_global_practice(
     await db.commit()
 
 
-async def _wipe_package_recipe_content(db: AsyncSession, package_id: str) -> dict:
-    """Delete every Timeline / Practice / Element under a Package — the
-    "recipe content" copied from the global. Leaves PackageLocations,
-    PackageAuthors, PackageVariables alone since those are CCA Step 2
-    setup curated by the SE locally and were never part of the fork."""
-    timelines = (await db.execute(
-        select(Timeline).where(Timeline.package_id == package_id)
-    )).scalars().all()
-    tl_count = len(timelines)
-    practice_count = 0
-    element_count = 0
-    for tl in timelines:
-        practices = (await db.execute(
-            select(Practice).where(Practice.timeline_id == tl.id)
-        )).scalars().all()
-        practice_count += len(practices)
-        for p in practices:
-            elements = (await db.execute(
-                select(Element).where(Element.practice_id == p.id)
-            )).scalars().all()
-            element_count += len(elements)
-            for el in elements:
-                await db.delete(el)
-            await db.delete(p)
-        await db.delete(tl)
-    await db.flush()
-    return {
-        "timelines_replaced": tl_count,
-        "practices_replaced": practice_count,
-        "elements_replaced": element_count,
-    }
-
-
 @router.post("/client/{client_id}/packages/{pkg_id}/fork", response_model=PackageOut, status_code=201)
 async def fork_global_package(
     client_id: str,
     pkg_id: str,
-    force: bool = False,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Deep-copy a global package (all timelines + practices + elements)
-    into a client.
+    into a client. **Once-per-client-lifetime rule applies** — a
+    given global package can be forked into a given client at most
+    once. After the fork, the local copy lives entirely independently;
+    re-forking the same global is permanently 409. The SE either edits
+    the existing local copy or (separately) deletes it before any
+    re-import is even possible.
 
-    First fork (no existing local copy of this global): creates a new
-    local Package with the parent_global_id lineage and deep-copies
-    timelines / practices / elements.
-
-    Re-fork (existing local copy detected):
-      • Default — refuses with 409 + structured `existing` summary so
-        the CA portal can show a "this will overwrite your local
-        edits" warning.
-      • `?force=true` — wipes the existing local copy's recipe
-        content (Timelines / Practices / Elements) and re-copies fresh
-        from the global. Refreshes the Package header fields (name,
-        type, duration, start_date_label, description) to the global's
-        current values. The Package row itself, plus the SE's own
-        CCA Step 2 setup (PackageLocations, PackageAuthors,
-        PackageVariables), are preserved.
+    Authorisation:
+      Only a CM with an active EDIT-rights `CMClientAssignment` for
+      this client may fork. Any other caller — including SEs at the
+      same client — gets 403.
 
     Publish gate: only ACTIVE global packages may be forked. DRAFT
     is CM work-in-progress; INACTIVE is a superseded version.
     """
+    await _assert_cm_can_edit_client(db, current_user.id, client_id)
+
     src = (await db.execute(
         select(Package).where(Package.id == pkg_id, Package.client_id == None)  # noqa: E711
     )).scalar_one_or_none()
@@ -1716,7 +1717,7 @@ async def fork_global_package(
         )
     )).scalar_one_or_none()
 
-    if existing and not force:
+    if existing:
         tl_count = (await db.execute(
             select(func.count()).select_from(Timeline).where(
                 Timeline.package_id == existing.id,
@@ -1725,13 +1726,13 @@ async def fork_global_package(
         raise HTTPException(
             status_code=409,
             detail={
-                "code": "import_would_overwrite",
+                "code": "package_already_forked",
                 "message": (
-                    "This package is already forked into this client. "
-                    "Re-forking will overwrite the existing local copy's "
-                    "timelines and practices. SE-curated locations, authors, "
-                    "and parameter-variable assignments are preserved. "
-                    "Send force=true to confirm."
+                    "This global package has already been forked into "
+                    "this client. A package can be forked into a client "
+                    "only once in the client's lifetime — edit the "
+                    "existing local copy or delete it before any future "
+                    "re-import is possible."
                 ),
                 "existing": {
                     "package_id": existing.id,
@@ -1740,33 +1741,19 @@ async def fork_global_package(
             },
         )
 
-    if existing:
-        # Force-overwrite path: wipe the existing recipe content + reuse
-        # the Package row. Refresh header fields to the global's
-        # current values.
-        await _wipe_package_recipe_content(db, existing.id)
-        existing.crop_cosh_id = src.crop_cosh_id
-        existing.name = src.name
-        existing.package_type = src.package_type
-        existing.duration_days = src.duration_days
-        existing.start_date_label_cosh_id = src.start_date_label_cosh_id
-        existing.description = src.description
-        await db.flush()
-        copy = existing
-    else:
-        copy = Package(
-            client_id=client_id,
-            parent_global_id=src.id,
-            crop_cosh_id=src.crop_cosh_id,
-            name=src.name,
-            package_type=src.package_type,
-            duration_days=src.duration_days,
-            start_date_label_cosh_id=src.start_date_label_cosh_id,
-            description=src.description,
-            created_by=current_user.id,
-        )
-        db.add(copy)
-        await db.flush()
+    copy = Package(
+        client_id=client_id,
+        parent_global_id=src.id,
+        crop_cosh_id=src.crop_cosh_id,
+        name=src.name,
+        package_type=src.package_type,
+        duration_days=src.duration_days,
+        start_date_label_cosh_id=src.start_date_label_cosh_id,
+        description=src.description,
+        created_by=current_user.id,
+    )
+    db.add(copy)
+    await db.flush()
 
     # Load source timelines + practices + elements
     tl_result = await db.execute(
@@ -2131,6 +2118,8 @@ async def import_global_pg(
         primary key (so triggered references stay intact); only its
         timelines / practices / elements are replaced.
     """
+    await _assert_cm_can_edit_client(db, current_user.id, client_id)
+
     src = (await db.execute(
         select(PGRecommendation).where(
             PGRecommendation.id == global_pg_id,
@@ -2514,6 +2503,8 @@ async def import_pg_into_sp(
     The SP must already exist (created via
     POST /client/{id}/sp-recommendations). This endpoint adds
     content; it doesn't create the SP itself."""
+    await _assert_cm_can_edit_client(db, current_user.id, client_id)
+
     sp = (await db.execute(
         select(SPRecommendation).where(
             SPRecommendation.id == sp_id,

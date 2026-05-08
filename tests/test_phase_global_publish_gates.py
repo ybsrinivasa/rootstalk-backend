@@ -28,7 +28,7 @@ from app.modules.advisory.router import (
     list_global_pg,
 )
 from tests.conftest import requires_docker
-from tests.factories import make_client, make_user
+from tests.factories import make_client, make_cm_assignment, make_user
 
 
 # ── Seed helpers ────────────────────────────────────────────────────────────
@@ -131,6 +131,7 @@ async def test_import_draft_pg_rejected_422(db):
     user = await make_user(db, name="SE")
     pg = await _seed_global_pg(db, status="DRAFT")
     client = await make_client(db)
+    await make_cm_assignment(db, user=user, client=client)
     await db.commit()
 
     with pytest.raises(HTTPException) as exc:
@@ -149,6 +150,7 @@ async def test_import_inactive_pg_also_rejected(db):
     user = await make_user(db, name="SE")
     pg = await _seed_global_pg(db, status="INACTIVE")
     client = await make_client(db)
+    await make_cm_assignment(db, user=user, client=client)
     await db.commit()
 
     with pytest.raises(HTTPException) as exc:
@@ -166,6 +168,7 @@ async def test_fork_draft_package_rejected_422(db):
     user = await make_user(db, name="SE")
     pkg = await _seed_global_pkg(db, name="DraftPkg", status=PackageStatus.DRAFT)
     client = await make_client(db)
+    await make_cm_assignment(db, user=user, client=client)
     await db.commit()
 
     with pytest.raises(HTTPException) as exc:
@@ -177,12 +180,12 @@ async def test_fork_draft_package_rejected_422(db):
     assert exc.value.detail["code"] == "global_package_not_published"
 
 
-# ── Package-fork overwrite (?force=true) ────────────────────────────────────
+# ── Package fork: once-per-client-lifetime ─────────────────────────────────
 
 @requires_docker
 @pytest.mark.asyncio
 async def test_fork_package_initial_succeeds(db):
-    user = await make_user(db, name="SE")
+    user = await make_user(db, name="CM")
     pkg = await _seed_global_pkg(db, name="GPaddy", status=PackageStatus.ACTIVE)
     # One Timeline + one Practice on the global so we can verify deep-copy.
     tl = Timeline(
@@ -199,6 +202,7 @@ async def test_fork_package_initial_succeeds(db):
     await db.flush()
 
     client = await make_client(db, full_name="C1")
+    await make_cm_assignment(db, user=user, client=client)
     await db.commit()
 
     out = await fork_global_package(
@@ -214,8 +218,13 @@ async def test_fork_package_initial_succeeds(db):
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_refork_package_without_force_returns_409(db):
-    user = await make_user(db, name="SE")
+async def test_refork_same_package_into_same_client_permanently_blocked(db):
+    """A given global package can be forked into a given client at
+    most ONCE in the client's lifetime. The second attempt is hard-
+    blocked with a stable 409 — there is no force=true overwrite.
+    SE/CM either edits the existing local copy or deletes it (a
+    separate operation) before any future re-import can be attempted."""
+    user = await make_user(db, name="CM")
     pkg = await _seed_global_pkg(db, name="GPaddy", status=PackageStatus.ACTIVE)
     tl = Timeline(
         package_id=pkg.id, name="GTL",
@@ -224,6 +233,7 @@ async def test_refork_package_without_force_returns_409(db):
     db.add(tl)
     await db.flush()
     client = await make_client(db, full_name="C1")
+    await make_cm_assignment(db, user=user, client=client)
     await db.commit()
 
     # Initial fork.
@@ -232,58 +242,71 @@ async def test_refork_package_without_force_returns_409(db):
         db=db, current_user=user,
     )
 
-    # Re-fork without force fails with the structured 409.
+    # Re-fork is permanently blocked.
     with pytest.raises(HTTPException) as exc:
         await fork_global_package(
             client_id=client.id, pkg_id=pkg.id,
-            force=False, db=db, current_user=user,
+            db=db, current_user=user,
         )
     assert exc.value.status_code == 409
-    assert exc.value.detail["code"] == "import_would_overwrite"
+    assert exc.value.detail["code"] == "package_already_forked"
     assert exc.value.detail["existing"]["timeline_count"] == 1
+
+
+# ── CM authorisation ────────────────────────────────────────────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_fork_rejected_when_user_has_no_cm_assignment(db):
+    """Caller without an active CMClientAssignment for the target
+    client gets 403 even if the global package is ACTIVE."""
+    user = await make_user(db, name="RandomUser")
+    pkg = await _seed_global_pkg(db, name="GPaddy", status=PackageStatus.ACTIVE)
+    client = await make_client(db, full_name="ClientA")
+    await db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await fork_global_package(
+            client_id=client.id, pkg_id=pkg.id,
+            db=db, current_user=user,
+        )
+    assert exc.value.status_code == 403
+    assert exc.value.detail["code"] == "cm_assignment_required"
 
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_refork_package_with_force_overwrites_recipe_content(db):
-    """Force re-fork wipes Timelines/Practices/Elements and re-copies
-    from the global. Package row is preserved (same id)."""
-    user = await make_user(db, name="SE")
+async def test_fork_rejected_when_cm_assigned_to_different_client(db):
+    """A CM assigned to client B cannot fork into client A."""
+    user = await make_user(db, name="CM-of-B")
     pkg = await _seed_global_pkg(db, name="GPaddy", status=PackageStatus.ACTIVE)
-    tl = Timeline(
-        package_id=pkg.id, name="GTL-original",
-        from_type=TimelineFromType.DAS, from_value=0, to_value=15,
-    )
-    db.add(tl)
-    await db.flush()
-    client = await make_client(db, full_name="C1")
+    client_a = await make_client(db, full_name="ClientA")
+    client_b = await make_client(db, full_name="ClientB")
+    await make_cm_assignment(db, user=user, client=client_b)
     await db.commit()
 
-    forked = await fork_global_package(
-        client_id=client.id, pkg_id=pkg.id,
-        db=db, current_user=user,
-    )
-    fork_id_before = forked.id
+    with pytest.raises(HTTPException) as exc:
+        await fork_global_package(
+            client_id=client_a.id, pkg_id=pkg.id,
+            db=db, current_user=user,
+        )
+    assert exc.value.status_code == 403
 
-    # SE adds a custom timeline locally.
-    db.add(Timeline(
-        package_id=forked.id, name="SE custom",
-        from_type=TimelineFromType.DAS, from_value=20, to_value=30,
-    ))
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_import_global_pg_requires_cm_assignment(db):
+    user = await make_user(db, name="RandomUser")
+    pg = await _seed_global_pg(db, status="ACTIVE")
+    client = await make_client(db)
     await db.commit()
-    assert len((await db.execute(
-        select(Timeline).where(Timeline.package_id == forked.id)
-    )).scalars().all()) == 2
 
-    # Force re-fork — custom wiped, only global's timeline remains.
-    out = await fork_global_package(
-        client_id=client.id, pkg_id=pkg.id,
-        force=True, db=db, current_user=user,
-    )
-    assert out.id == fork_id_before  # row preserved
+    with pytest.raises(HTTPException) as exc:
+        await import_global_pg(
+            client_id=client.id, global_pg_id=pg.id,
+            db=db, current_user=user,
+        )
+    assert exc.value.status_code == 403
+    assert exc.value.detail["code"] == "cm_assignment_required"
 
-    after_tls = (await db.execute(
-        select(Timeline).where(Timeline.package_id == out.id)
-    )).scalars().all()
-    assert len(after_tls) == 1
-    assert after_tls[0].name == "GTL-original"
+
