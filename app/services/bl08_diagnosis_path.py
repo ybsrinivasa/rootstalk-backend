@@ -3,8 +3,15 @@ BL-08 — Diagnosis Path Construction Algorithm
 Pure function service. No database access.
 Spec: RootsTalk_Dev_BusinessLogic.pdf §BL-08, AGR §8
 
-Data source: problem_to_symptom rows from cosh_connect_rows.
-Each row: one problem's known manifestation on a specific plant part + symptom combination.
+Data source: pest_diagnosis_chain rows from cosh_connect_rows.
+Each row encodes one expert-curated diagnostic path: for a given Crop
+at a given CropStage, a given Pest at a given PestStage manifests as
+a specific Symptom (optionally narrowed by sub_part / sub_symptom)
+on a specific Part of the plant.
+
+Role names mirror Cosh's entity_type vocabulary end-to-end (see
+docs/COSH_2_SYNC_CONTRACT.md): crop, crop_stage, pest, pest_stage,
+part, sub_part, symptom, sub_symptom.
 """
 import random
 from dataclasses import dataclass, field
@@ -14,17 +21,34 @@ from collections import Counter
 
 @dataclass
 class ProblemSymptomRow:
-    """One row from cosh_connect_rows WHERE connect_type='problem_to_symptom'."""
-    problem_cosh_id: str
-    plant_part_cosh_id: str
+    """One row from cosh_connect_rows WHERE connect_type='pest_diagnosis_chain'.
+
+    Each row's `pest_cosh_id` is the diagnosable problem this row contributes to.
+    The dichotomous algorithm narrows down to a unique pest_cosh_id."""
+
+    pest_cosh_id: str
+    part_cosh_id: str
     symptom_cosh_id: str
+    crop_cosh_id: Optional[str] = None
+    crop_stage_cosh_id: Optional[str] = None
+    pest_stage_cosh_id: Optional[str] = None
     sub_part_cosh_id: Optional[str] = None
     sub_symptom_cosh_id: Optional[str] = None
-    # Optional rank of this symptom *within this problem* (1 = top priority).
-    # When ANY of a problem's rows have a rank set, a YES on a row whose rank
-    # is greater than the problem's minimum rank permanently demotes that
-    # problem (BL-08 Priority Ranking, Option A — audit 2026-05-05).
+    # Optional rank of this symptom *within this pest* (1 = top priority).
+    # When ANY of a pest's rows have a rank set, a YES on a row whose rank
+    # is greater than the pest's minimum rank permanently demotes that
+    # pest (BL-08 Priority Ranking, Option A — audit 2026-05-05).
     priority_rank: Optional[int] = None
+
+    # Backward-compat aliases for callers that use the legacy field names.
+    # New callers should use pest_cosh_id / part_cosh_id directly.
+    @property
+    def problem_cosh_id(self) -> str:
+        return self.pest_cosh_id
+
+    @property
+    def plant_part_cosh_id(self) -> str:
+        return self.part_cosh_id
 
 
 @dataclass

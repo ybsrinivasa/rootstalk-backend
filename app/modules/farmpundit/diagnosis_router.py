@@ -79,38 +79,56 @@ class AnswerRequest(BaseModel):
 
 async def _load_problem_symptom_rows(
     db: AsyncSession,
+    crop_cosh_id: str,
     crop_stage_cosh_id: Optional[str],
 ) -> list[ProblemSymptomRow]:
-    """Load problem_to_symptom rows from cosh_connect_rows. Endpoints
-    are stored as a typed array of {role, cosh_id}; we pivot them back
-    into the BL-08 dataclass shape. crop_stage_cosh_id (when given)
-    filters via metadata JSONB."""
+    """Load `pest_diagnosis_chain` rows from cosh_connect_rows, filter
+    by the farmer's Crop (always) and CropStage (when given), and
+    pivot the typed endpoints into the BL-08 dataclass shape.
+
+    Endpoints follow the Cosh-side `entity_type` vocabulary as their
+    role names (see docs/COSH_2_SYNC_CONTRACT.md): crop, crop_stage,
+    pest, pest_stage, part, sub_part, symptom, sub_symptom. priority_rank
+    rides as a row-level scalar in metadata.
+
+    Crop / crop_stage filters run in-memory after the type-and-status
+    filter — at V1 row counts (thousands), JSONB-array filters at SQL
+    level aren't worth the GIN-index complexity yet."""
     q = select(CoshConnectRow).where(
-        CoshConnectRow.connect_type == "problem_to_symptom",
+        CoshConnectRow.connect_type == "pest_diagnosis_chain",
         CoshConnectRow.status == "active",
     )
-    if crop_stage_cosh_id:
-        q = q.where(
-            CoshConnectRow.metadata_.op("->>")("crop_stage_cosh_id") == crop_stage_cosh_id
-        )
-
     result = await db.execute(q)
-    rows_raw = result.scalars().all()
+    raw = result.scalars().all()
 
     rows: list[ProblemSymptomRow] = []
-    for r in rows_raw:
-        # Pivot endpoints array → role-keyed dict
+    for r in raw:
         endpoints = {ep["role"]: ep["cosh_id"] for ep in (r.endpoints or [])
                      if ep.get("role") and ep.get("cosh_id")}
-        if not endpoints.get("problem") or not endpoints.get("plant_part") \
-                or not endpoints.get("symptom"):
+
+        # Crop scope — every row must match the farmer's crop.
+        if endpoints.get("crop") != crop_cosh_id:
             continue
+        # CropStage scope — when provided, narrows further.
+        if crop_stage_cosh_id and endpoints.get("crop_stage") != crop_stage_cosh_id:
+            continue
+
+        # Required leaves for BL-08's dichotomous walk.
+        pest = endpoints.get("pest")
+        part = endpoints.get("part")
+        symptom = endpoints.get("symptom")
+        if not pest or not part or not symptom:
+            continue
+
         meta = r.metadata_ or {}
         raw_rank = meta.get("priority_rank")
         rows.append(ProblemSymptomRow(
-            problem_cosh_id=endpoints["problem"],
-            plant_part_cosh_id=endpoints["plant_part"],
-            symptom_cosh_id=endpoints["symptom"],
+            pest_cosh_id=pest,
+            part_cosh_id=part,
+            symptom_cosh_id=symptom,
+            crop_cosh_id=endpoints.get("crop"),
+            crop_stage_cosh_id=endpoints.get("crop_stage"),
+            pest_stage_cosh_id=endpoints.get("pest_stage"),
             sub_part_cosh_id=endpoints.get("sub_part"),
             sub_symptom_cosh_id=endpoints.get("sub_symptom"),
             priority_rank=raw_rank if isinstance(raw_rank, int) else None,
@@ -133,7 +151,7 @@ async def get_plant_parts_for_crop(
     current_user: User = Depends(get_current_user),
 ):
     """Step 1: Get available plant parts for this crop+stage. Farmer selects one."""
-    rows = await _load_problem_symptom_rows(db, crop_stage_cosh_id)
+    rows = await _load_problem_symptom_rows(db, crop_cosh_id, crop_stage_cosh_id)
     parts = get_available_plant_parts(rows)
     return [
         {
@@ -169,7 +187,9 @@ async def start_diagnosis(
     if sub is None:
         raise HTTPException(status_code=404, detail="Subscription not found")
 
-    rows = await _load_problem_symptom_rows(db, request.crop_stage_cosh_id)
+    rows = await _load_problem_symptom_rows(
+        db, request.crop_cosh_id, request.crop_stage_cosh_id,
+    )
 
     if not rows:
         return {
@@ -227,7 +247,9 @@ async def answer_question(
         raise HTTPException(status_code=422, detail="answer must be 'YES' or 'NO'")
 
     # Reload all rows
-    rows = await _load_problem_symptom_rows(db, session.crop_stage_cosh_id)
+    rows = await _load_problem_symptom_rows(
+        db, session.crop_cosh_id, session.crop_stage_cosh_id,
+    )
 
     # Append new answer
     new_answer = DiagnosisAnswer(
@@ -337,7 +359,7 @@ async def list_problems_for_crop(
     current_user: User = Depends(get_current_user),
 ):
     """'I Know the Problem' — returns problems filtered to crop+stage+part."""
-    rows = await _load_problem_symptom_rows(db, crop_stage_cosh_id)
+    rows = await _load_problem_symptom_rows(db, crop_cosh_id, crop_stage_cosh_id)
     problem_ids = get_problem_list(rows, plant_part=plant_part_cosh_id)
 
     result = []
@@ -378,7 +400,9 @@ async def analyse_image_with_claude(
     The result can be used to pre-fill the diagnosis path or skip to direct diagnosis.
     """
     # Load known problems from Cosh cache for this crop+stage to help Claude match IDs
-    rows = await _load_problem_symptom_rows(db, request.crop_stage_cosh_id)
+    rows = await _load_problem_symptom_rows(
+        db, request.crop_cosh_id, request.crop_stage_cosh_id,
+    )
     known_problem_ids = list(dict.fromkeys(r.problem_cosh_id for r in rows))
 
     known_problem_names: list[str] = []

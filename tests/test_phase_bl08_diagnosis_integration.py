@@ -29,30 +29,38 @@ STAGE = "stage:vegetative"
 
 
 async def _seed_diagnosis_data(db):
-    """Seed two `problem_to_symptom` rows for two distinct problems on
-    the same plant_part. Algorithm asks one question; YES diagnoses one,
-    NO narrows to the other."""
+    """Seed two `pest_diagnosis_chain` rows for two distinct pests on
+    the same crop+stage+part. Algorithm asks one question; YES diagnoses
+    one, NO narrows to the other.
+
+    Endpoint role names mirror Cosh's entity_type vocabulary
+    (see docs/COSH_2_SYNC_CONTRACT.md): crop, crop_stage, pest,
+    pest_stage, part, sub_part, symptom, sub_symptom."""
     db.add(CoshConnectRow(
-        connect_id="pts:p1-leaf-spot",
-        connect_type="problem_to_symptom",
+        connect_id="pdc:p1-leaf-spot",
+        connect_type="pest_diagnosis_chain",
         status="active",
         endpoints=[
-            {"role": "problem", "cosh_id": "problem:leaf-blight"},
-            {"role": "plant_part", "cosh_id": "part:leaf"},
-            {"role": "symptom", "cosh_id": "symptom:spot"},
+            {"role": "crop",       "cosh_id": CROP, "position": 1},
+            {"role": "crop_stage", "cosh_id": STAGE, "position": 2},
+            {"role": "pest",       "cosh_id": "pest:leaf-blight", "position": 3},
+            {"role": "part",       "cosh_id": "part:leaf", "position": 5},
+            {"role": "symptom",    "cosh_id": "symptom:spot", "position": 7},
         ],
-        metadata_={"crop_stage_cosh_id": STAGE},
+        metadata_=None,
     ))
     db.add(CoshConnectRow(
-        connect_id="pts:p2-leaf-yellow",
-        connect_type="problem_to_symptom",
+        connect_id="pdc:p2-leaf-yellow",
+        connect_type="pest_diagnosis_chain",
         status="active",
         endpoints=[
-            {"role": "problem", "cosh_id": "problem:nutrient-deficiency"},
-            {"role": "plant_part", "cosh_id": "part:leaf"},
-            {"role": "symptom", "cosh_id": "symptom:yellow"},
+            {"role": "crop",       "cosh_id": CROP, "position": 1},
+            {"role": "crop_stage", "cosh_id": STAGE, "position": 2},
+            {"role": "pest",       "cosh_id": "pest:nutrient-deficiency", "position": 3},
+            {"role": "part",       "cosh_id": "part:leaf", "position": 5},
+            {"role": "symptom",    "cosh_id": "symptom:yellow", "position": 7},
         ],
-        metadata_={"crop_stage_cosh_id": STAGE},
+        metadata_=None,
     ))
     await db.commit()
 
@@ -171,7 +179,7 @@ async def test_yes_answer_diagnoses_when_pool_collapses_to_one(db):
     # YES on a unique-per-problem (part, symptom) → exactly one problem left.
     assert out["status"] == "DIAGNOSED"
     assert out["diagnosed_problem_cosh_id"] in (
-        "problem:leaf-blight", "problem:nutrient-deficiency",
+        "pest:leaf-blight", "pest:nutrient-deficiency",
     )
 
 
@@ -217,40 +225,46 @@ async def test_priority_rank_demotes_problem_through_live_router(db):
     farmer = await make_user(db)
     sub = await _seed_subscription(db, farmer)
 
-    # Ranked problem: LEAF+Spots is rank 1, LEAF+Colour_Change is rank 2.
+    # Ranked pest: LEAF+Spots is rank 1, LEAF+Colour_Change is rank 2.
     db.add(CoshConnectRow(
-        connect_id="pts:ranked-spots",
-        connect_type="problem_to_symptom",
+        connect_id="pdc:ranked-spots",
+        connect_type="pest_diagnosis_chain",
         status="active",
         endpoints=[
-            {"role": "problem", "cosh_id": "problem:ranked"},
-            {"role": "plant_part", "cosh_id": "part:leaf"},
-            {"role": "symptom", "cosh_id": "symptom:spots"},
+            {"role": "crop",       "cosh_id": CROP},
+            {"role": "crop_stage", "cosh_id": STAGE},
+            {"role": "pest",       "cosh_id": "pest:ranked"},
+            {"role": "part",       "cosh_id": "part:leaf"},
+            {"role": "symptom",    "cosh_id": "symptom:spots"},
         ],
-        metadata_={"crop_stage_cosh_id": STAGE, "priority_rank": 1},
+        metadata_={"priority_rank": 1},
     ))
     db.add(CoshConnectRow(
-        connect_id="pts:ranked-colour",
-        connect_type="problem_to_symptom",
+        connect_id="pdc:ranked-colour",
+        connect_type="pest_diagnosis_chain",
         status="active",
         endpoints=[
-            {"role": "problem", "cosh_id": "problem:ranked"},
-            {"role": "plant_part", "cosh_id": "part:leaf"},
-            {"role": "symptom", "cosh_id": "symptom:colour"},
+            {"role": "crop",       "cosh_id": CROP},
+            {"role": "crop_stage", "cosh_id": STAGE},
+            {"role": "pest",       "cosh_id": "pest:ranked"},
+            {"role": "part",       "cosh_id": "part:leaf"},
+            {"role": "symptom",    "cosh_id": "symptom:colour"},
         ],
-        metadata_={"crop_stage_cosh_id": STAGE, "priority_rank": 2},
+        metadata_={"priority_rank": 2},
     ))
     # Unranked sibling — only has Colour_Change.
     db.add(CoshConnectRow(
-        connect_id="pts:unranked-colour",
-        connect_type="problem_to_symptom",
+        connect_id="pdc:unranked-colour",
+        connect_type="pest_diagnosis_chain",
         status="active",
         endpoints=[
-            {"role": "problem", "cosh_id": "problem:unranked"},
-            {"role": "plant_part", "cosh_id": "part:leaf"},
-            {"role": "symptom", "cosh_id": "symptom:colour"},
+            {"role": "crop",       "cosh_id": CROP},
+            {"role": "crop_stage", "cosh_id": STAGE},
+            {"role": "pest",       "cosh_id": "pest:unranked"},
+            {"role": "part",       "cosh_id": "part:leaf"},
+            {"role": "symptom",    "cosh_id": "symptom:colour"},
         ],
-        metadata_={"crop_stage_cosh_id": STAGE},
+        metadata_=None,
     ))
     await db.commit()
 
@@ -271,7 +285,7 @@ async def test_priority_rank_demotes_problem_through_live_router(db):
         db=db, current_user=farmer,
     )
     assert out["status"] == "DIAGNOSED"
-    assert out["diagnosed_problem_cosh_id"] == "problem:unranked"
+    assert out["diagnosed_problem_cosh_id"] == "pest:unranked"
 
 
 @requires_docker

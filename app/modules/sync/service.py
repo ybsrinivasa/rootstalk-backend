@@ -5,34 +5,44 @@ Processes incoming sync payloads from Cosh and persists them into:
   • cosh_core_items            — flat Cosh entities (Cores).
   • cosh_connect_rows          — N-ary Connects with typed endpoints.
 
-Classification & adapter
-------------------------
-Today Cosh emits a flat payload (`entity_batches[].items[]` with
-`parent_cosh_id`, optional `secondary_parent_cosh_id`, `metadata`).
-The adapter classifies each item by `entity_type`:
+Built to the contract in docs/COSH_2_SYNC_CONTRACT.md. That document is
+the alignment reference between Cosh 2.0's emitter and this ingest;
+any divergence is resolved there before either side patches code.
 
-  • Connect entity_types (today: only `problem_to_symptom`) — the
-    payload's metadata holds the endpoint cosh_ids under per-role keys
-    (problem_cosh_id, plant_part_cosh_id, …). The adapter pulls them
-    out via `CONNECT_ENDPOINT_ROLES` and writes a typed `endpoints`
-    array. The remainder of `metadata` (priority_rank, crop_stage_cosh_id,
-    etc.) lands on `cosh_connect_rows.metadata_`.
+Classification rule (§4 of the contract)
+----------------------------------------
+Each incoming item is routed by **payload shape**, not by a hardcoded
+entity_type list:
 
-  • Cores (everything else) — the payload's `parent_cosh_id` carries
-    onto `cosh_core_items.parent_cosh_id`; metadata stays as-is.
-    `secondary_parent_cosh_id` is unused going forward and is dropped.
+  • item has `positions` dict  → Connect → cosh_connect_rows
+  • item has `translations`    → Core    → cosh_core_items
 
-When Cosh later emits native typed Connect payloads (with `endpoints`
-directly in the item), the adapter detects the array and bypasses the
-metadata extraction. So this code is forward-compatible without a
-second migration.
+This means new Cosh entities (new image Connects per crop, new Cores
+for ITKs, etc.) onboard with zero backend code change. Cosh stays the
+schema authority.
 
-Field Mapping document (pending)
---------------------------------
-A field-mapping doc will be locked once Cosh 2.0's first production
-sync is verified end-to-end against this endpoint. Any divergence
-between Cosh's actual emit and this contract is resolved by adjusting
-Cosh's payload — not by patching this service.
+Connect endpoints adapter
+-------------------------
+Cosh emits a `positions` dict keyed by stringified position number:
+
+    {"1": {"cosh_id": "...", "entity_type": "crop"},
+     "2": {"cosh_id": "...", "entity_type": "crop_stage"},
+     ...}
+
+The adapter reshapes this into our internal endpoints array:
+
+    [{"role": "crop",       "cosh_id": "...", "position": 1},
+     {"role": "crop_stage", "cosh_id": "...", "position": 2},
+     ...]
+
+`role` mirrors Cosh's `entity_type` for the target — same vocabulary
+end-to-end so consumers (BL-08, image lookup) read by Cosh's role
+names without translation.
+
+BlankBox sentinel (§5 of the contract)
+--------------------------------------
+A position whose value is the BlankBox sentinel is dropped from the
+endpoints array — downstream code sees the position as absent.
 """
 from datetime import datetime, timezone
 from typing import Optional
@@ -44,62 +54,64 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.modules.sync.models import CoshConnectRow, CoshCoreItem, CoshSyncLog
 
 
-# ── Classification & endpoint-role adapter ──────────────────────────────────
+# ── BlankBox sentinel ───────────────────────────────────────────────────────
+# Set per Cosh's chosen spelling. The contract doc tracks this; both
+# sides reference the same constant. Pin both common spellings until
+# Cosh confirms.
 
-CONNECT_ENTITY_TYPES: frozenset[str] = frozenset({
-    "problem_to_symptom",
+BLANK_BOX_VALUES: frozenset[str] = frozenset({
+    "BlankBox",
+    "Blank Box",
 })
 
-# For each Connect entity_type, mapping from endpoint role → metadata key
-# in the legacy flat payload. The adapter uses this to extract endpoints
-# when the item doesn't already have a typed `endpoints` array.
-CONNECT_ENDPOINT_ROLES: dict[str, dict[str, str]] = {
-    "problem_to_symptom": {
-        "problem":     "problem_cosh_id",
-        "plant_part":  "plant_part_cosh_id",
-        "symptom":     "symptom_cosh_id",
-        "sub_part":    "sub_part_cosh_id",
-        "sub_symptom": "sub_symptom_cosh_id",
-    },
-}
+
+def _is_blank_box(value: Optional[str]) -> bool:
+    return value is not None and value in BLANK_BOX_VALUES
 
 
-def _is_connect(entity_type: str) -> bool:
-    return entity_type in CONNECT_ENTITY_TYPES
+# ── Connect-vs-Core classification (shape-driven) ───────────────────────────
+
+def _is_connect(item: dict) -> bool:
+    """An item is a Connect when it carries a non-empty `positions`
+    dict. Otherwise it's a Core (must carry `translations`)."""
+    positions = item.get("positions")
+    return isinstance(positions, dict) and bool(positions)
 
 
-def _extract_endpoints(entity_type: str, item: dict) -> list[dict]:
-    """Build the endpoints array for a Connect row.
+# ── Connect-positions adapter ───────────────────────────────────────────────
 
-    Native typed payload has `endpoints` directly. Legacy flat payload
-    has endpoint cosh_ids in `metadata` under per-role keys; the
-    adapter pulls them out via CONNECT_ENDPOINT_ROLES."""
-    native = item.get("endpoints")
-    if isinstance(native, list) and native:
-        return native
+def _extract_endpoints(item: dict) -> list[dict]:
+    """Reshape Cosh's `positions` dict into our endpoints array.
 
-    role_map = CONNECT_ENDPOINT_ROLES.get(entity_type, {})
-    metadata = item.get("metadata") or {}
+    Drops:
+      • positions whose `cosh_id` is missing or BlankBox-sentinel-valued
+      • positions whose `entity_type` is missing
+    Sorts by integer position number for stable ordering.
+    """
+    positions = item.get("positions") or {}
     out: list[dict] = []
-    for role, meta_key in role_map.items():
-        cosh_id = metadata.get(meta_key)
-        if cosh_id:
-            out.append({"role": role, "cosh_id": cosh_id})
+    for pos_num_str, pos in sorted(positions.items(), key=lambda kv: int(kv[0])):
+        cosh_id = pos.get("cosh_id")
+        role = pos.get("entity_type")
+        if not cosh_id or not role:
+            continue
+        if _is_blank_box(cosh_id):
+            continue
+        out.append({
+            "role": role,
+            "cosh_id": cosh_id,
+            "position": int(pos_num_str),
+        })
     return out
 
 
-def _connect_metadata_clean(entity_type: str, item: dict) -> Optional[dict]:
-    """Strip the role-keyed cosh_ids out of metadata when writing a
-    Connect row — those values now live in `endpoints`, so keeping
-    them in metadata too would duplicate the truth-source."""
-    metadata = item.get("metadata")
-    if not metadata:
-        return None
-    role_map = CONNECT_ENDPOINT_ROLES.get(entity_type, {})
-    if not role_map:
-        return metadata
-    cleaned = {k: v for k, v in metadata.items() if k not in role_map.values()}
-    return cleaned or None
+def _connect_row_metadata(item: dict) -> Optional[dict]:
+    """Connect rows carry scalar attributes outside `positions` (e.g.
+    `priority_rank` on pest_diagnosis_chain). Pull every top-level
+    field that isn't part of the protocol envelope into metadata."""
+    reserved = {"cosh_id", "entity_type", "status", "positions"}
+    extras = {k: v for k, v in item.items() if k not in reserved}
+    return extras or None
 
 
 # ── Upserts ─────────────────────────────────────────────────────────────────
@@ -114,8 +126,7 @@ async def upsert_core_item(
     translations: dict,
     metadata: Optional[dict],
 ) -> str:
-    """Upsert into cosh_core_items. Translations must include `en`.
-    Returns 'inserted' or 'updated'."""
+    """Upsert into cosh_core_items. Translations must include `en`."""
     if not translations.get("en"):
         raise ValueError("Missing required translation: en")
     now = datetime.now(timezone.utc)
@@ -150,8 +161,7 @@ async def upsert_connect_row(
     status: str,
     metadata: Optional[dict],
 ) -> str:
-    """Upsert into cosh_connect_rows. `endpoints` must be a non-empty
-    list of {role, cosh_id} dicts. Returns 'inserted' or 'updated'."""
+    """Upsert into cosh_connect_rows. `endpoints` must be non-empty."""
     if not endpoints:
         raise ValueError(
             f"Connect {connect_type} for {connect_id!r} has no endpoints"
@@ -180,12 +190,16 @@ async def upsert_connect_row(
 # ── Full-sync inactivation ──────────────────────────────────────────────────
 
 async def inactivate_absent_entities(
-    db: AsyncSession, entity_type: str, seen_ids: set[str],
+    db: AsyncSession,
+    *,
+    entity_type: str,
+    is_connect_batch: bool,
+    seen_ids: set[str],
 ) -> None:
-    """Full sync: mark any active rows of this entity_type whose id is
-    not in `seen_ids` as inactive. Routes to cosh_core_items or
-    cosh_connect_rows by classification."""
-    if _is_connect(entity_type):
+    """Full sync: mark active rows of this entity_type whose id is not
+    in `seen_ids` as inactive. Routes to cosh_core_items or
+    cosh_connect_rows by the batch's classification."""
+    if is_connect_batch:
         q = update(CoshConnectRow).where(
             CoshConnectRow.connect_type == entity_type,
             CoshConnectRow.status == "active",
@@ -208,10 +222,12 @@ async def inactivate_absent_entities(
 async def process_payload(
     db: AsyncSession, payload: dict, sync_log: CoshSyncLog,
 ) -> dict:
-    """Process the full sync payload: write each item to the
-    appropriate typed table (cosh_core_items or cosh_connect_rows)
-    based on its entity_type. Returns the summary body the sync
-    endpoint hands back to Cosh."""
+    """Process a sync payload per the Cosh 2.0 contract.
+
+    Each batch's items are classified by shape (positions ⇒ Connect,
+    translations ⇒ Core) and upserted into the appropriate typed
+    table. Mixed-shape batches are technically supported but unusual —
+    Cosh's emitter sends one shape per batch."""
     sync_mode = payload.get("sync_mode", "incremental")
     entity_batches = payload.get("entity_batches", [])
 
@@ -224,6 +240,10 @@ async def process_payload(
         entity_type = batch.get("entity_type")
         items = batch.get("items", [])
 
+        # Classify the batch by inspecting its first valid item.
+        # Empty batches are skipped silently.
+        batch_is_connect = any(_is_connect(i) for i in items)
+
         batch_inserted = 0
         batch_updated = 0
         batch_failed = 0
@@ -235,21 +255,20 @@ async def process_payload(
             try:
                 if not cosh_id:
                     raise ValueError("Missing cosh_id")
-                translations = item.get("translations", {})
                 item_status = item.get("status", "active")
-                metadata = item.get("metadata")
 
-                if _is_connect(entity_type):
-                    endpoints = _extract_endpoints(entity_type, item)
+                if _is_connect(item):
+                    endpoints = _extract_endpoints(item)
                     action = await upsert_connect_row(
                         db=db,
                         connect_id=cosh_id,
                         connect_type=entity_type,
                         endpoints=endpoints,
                         status=item_status,
-                        metadata=_connect_metadata_clean(entity_type, item),
+                        metadata=_connect_row_metadata(item),
                     )
                 else:
+                    translations = item.get("translations", {})
                     action = await upsert_core_item(
                         db=db,
                         cosh_id=cosh_id,
@@ -257,7 +276,7 @@ async def process_payload(
                         parent_cosh_id=item.get("parent_cosh_id"),
                         status=item_status,
                         translations=translations,
-                        metadata=metadata,
+                        metadata=item.get("metadata"),
                     )
 
                 seen_ids.add(cosh_id)
@@ -272,7 +291,12 @@ async def process_payload(
 
         # Full sync: inactivate any (entity_type) rows not seen this run
         if sync_mode == "full":
-            await inactivate_absent_entities(db, entity_type, seen_ids)
+            await inactivate_absent_entities(
+                db,
+                entity_type=entity_type,
+                is_connect_batch=batch_is_connect,
+                seen_ids=seen_ids,
+            )
 
         total_inserted += batch_inserted
         total_updated += batch_updated
