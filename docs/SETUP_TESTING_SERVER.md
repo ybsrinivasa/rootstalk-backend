@@ -198,7 +198,20 @@ cd ~/apps/rootstalk-backend
 venv/bin/python scripts/check_smtp.py
 ```
 
-For the three Next.js apps, set `NEXT_PUBLIC_API_BASE_URL=https://rstalkapi.eywa.farm` in each app's `.env.production` (or wherever the frontend repo expects environment config; check each repo's `.env.example`).
+For the three Next.js apps, set `NEXT_PUBLIC_API_URL=https://rstalkapi.eywa.farm`
+in each app's `.env.production` (or `.env.local`, depending on the
+deploy convention you use). All three apps — rootstalk-frontend (SA),
+rootstalk-client-portal (CA), rootstalk-pwa — read this exact name
+from `process.env.NEXT_PUBLIC_API_URL` in `lib/api.ts`. Earlier
+revisions of this doc said `NEXT_PUBLIC_API_BASE_URL` — that was a
+typo; the apps don't read that name and would silently fall back to
+`http://localhost:8001`, producing "Network Error" in the browser
+when the deployed user submits any form.
+
+**IMPORTANT**: Next.js bakes `NEXT_PUBLIC_*` vars at **build time**,
+not runtime. After setting the env var, you must run `npm run build`
+again before restarting the service — restarting alone won't pick up
+the new value.
 
 ## Step 6 — systemd services
 
