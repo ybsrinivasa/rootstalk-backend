@@ -1119,50 +1119,7 @@ async def register_promoter(
             },
         )
 
-    # Spec §11.2 — Facilitator-Promoter is exclusive per company
-    # ("one company at a time"). The user's described model
-    # (2026-05-08) refines this: a plain Facilitator (onboarded but
-    # not yet marked as a Promoter) is multi-company OK; only the
-    # Facilitator-PROMOTER combination is exclusive.
-    #
-    # The check therefore looks at `is_promoter=True` on the other
-    # client's row, NOT just the existence of the Facilitator row.
-    # This gate is meaningful only when the new registration would
-    # itself be a Promoter (`is_promoter` defaults to True under the
-    # current pre-V1.1 flow — the existing CA-portal still creates
-    # rows that are immediately Promoters). When V1.1 lands and the
-    # Mark-as-Promoter step becomes a separate UI action, this gate
-    # will move to that endpoint with the same logic.
-    #
-    # Dealer-Promoters stay multi-company per spec.
-    # Privacy: never name the other client.
-    if promoter_type == "FACILITATOR":
-        active_promoter_elsewhere = (await db.execute(
-            select(ClientPromoter).where(
-                ClientPromoter.user_id == user.id,
-                ClientPromoter.promoter_type == "FACILITATOR",
-                ClientPromoter.status == "ACTIVE",
-                ClientPromoter.is_promoter == True,  # noqa: E712
-                ClientPromoter.client_id != client_id,
-            )
-        )).scalar_one_or_none()
-        if active_promoter_elsewhere:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "facilitator_already_active_elsewhere",
-                    "message": (
-                        "This person is already an active Facilitator-"
-                        "Promoter at another company. Per spec §11.2, a "
-                        "Facilitator-Promoter can only be active at one "
-                        "company at a time. They must be unmarked as a "
-                        "Promoter (or deactivated) at the previous company "
-                        "before being registered as a Promoter here."
-                    ),
-                },
-            )
-
-    # Link to this client
+    # Same-client duplicate check.
     existing_cp = (await db.execute(
         select(ClientPromoter).where(
             ClientPromoter.client_id == client_id,
@@ -1176,10 +1133,18 @@ async def register_promoter(
             detail=f"This person is already registered as a {promoter_type.title()} for this client.",
         )
 
+    # V1.1 Item 4 (2026-05-09): onboarding ≠ Promoter designation
+    # per spec §11.2 ("Onboarding and Promoter designation are
+    # separate steps" for Facilitator-Promoters). Newly-onboarded
+    # rows default to `is_promoter=False`. The FM marks them as a
+    # Promoter explicitly via PUT
+    # /field-manager/promoters/{id}/promoter-flag, where the
+    # spec §11.2 Facilitator-uniqueness check now lives.
     cp = ClientPromoter(
         client_id=client_id,
         user_id=user.id,
         promoter_type=promoter_type,
+        is_promoter=False,
         territory_notes=territory_notes,
         registered_by=current_user.id,
     )
@@ -1366,6 +1331,86 @@ async def reactivate_promoter(
     cp.status = "ACTIVE"
     await db.commit()
     return {"status": "ACTIVE"}
+
+
+@router.put("/client/{client_id}/field-manager/promoters/{promoter_id}/promoter-flag")
+async def toggle_promoter_flag(
+    client_id: str,
+    promoter_id: str,
+    request: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Mark or unmark this onboarded Dealer / Facilitator as a
+    Promoter — V1.1 Item 4 (2026-05-09).
+
+    Per spec §11.2, "Onboarding and Promoter designation are
+    separate steps." Onboarding (register_promoter) creates the
+    row with `is_promoter=False`. This endpoint flips the flag
+    and is the single place the spec §11.2 Facilitator-Promoter
+    exclusivity rule lives now.
+
+      - Marking a Dealer as Promoter: always allowed.
+      - Marking a Facilitator as Promoter: refused (409) if the
+        same user is already an active Facilitator-Promoter at any
+        OTHER client. Privacy: never names the other client.
+      - Unmarking is unconditional and releases the M9 lock for
+        the same user at other clients.
+    """
+    is_promoter = bool(request.get("is_promoter", True))
+
+    cp = (await db.execute(
+        select(ClientPromoter).where(
+            ClientPromoter.id == promoter_id,
+            ClientPromoter.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if not cp:
+        raise HTTPException(status_code=404, detail="Promoter row not found")
+    if cp.status != "ACTIVE":
+        raise HTTPException(
+            status_code=409,
+            detail="Reactivate this person before changing their Promoter status.",
+        )
+
+    if is_promoter and not cp.is_promoter:
+        # Spec §11.2 Facilitator-Promoter exclusivity. Dealer-Promoters
+        # are explicitly multi-company per spec; Dealers skip the gate.
+        if cp.promoter_type == "FACILITATOR":
+            active_elsewhere = (await db.execute(
+                select(ClientPromoter).where(
+                    ClientPromoter.user_id == cp.user_id,
+                    ClientPromoter.promoter_type == "FACILITATOR",
+                    ClientPromoter.status == "ACTIVE",
+                    ClientPromoter.is_promoter == True,  # noqa: E712
+                    ClientPromoter.client_id != client_id,
+                )
+            )).scalar_one_or_none()
+            if active_elsewhere:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "facilitator_already_active_elsewhere",
+                        "message": (
+                            "This person is already an active Facilitator-"
+                            "Promoter at another company. Per spec §11.2, a "
+                            "Facilitator-Promoter can only be active at one "
+                            "company at a time. They must be unmarked as a "
+                            "Promoter (or deactivated) at the previous "
+                            "company before being marked as a Promoter here."
+                        ),
+                    },
+                )
+
+    cp.is_promoter = is_promoter
+    await db.commit()
+    await db.refresh(cp)
+    return {
+        "id": cp.id,
+        "is_promoter": cp.is_promoter,
+        "promoter_type": cp.promoter_type,
+        "status": cp.status,
+    }
 
 
 # ── Field Manager: Get farmers for assignment ──────────────────────────────────

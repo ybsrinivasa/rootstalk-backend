@@ -42,10 +42,10 @@ from tests.factories import (
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_register_promoter_defaults_is_promoter_true(db):
-    """Backward-compatible default. Pre-V1.1, the existing CA-portal
-    register flow continues to produce rows that ARE Promoters. This
-    locks in the migration backfill semantics."""
+async def test_register_promoter_defaults_is_promoter_false(db):
+    """V1.1 Item 4 (2026-05-09): onboarding ≠ Promoter designation
+    per spec §11.2. New rows default to is_promoter=False; the FM
+    flips the flag explicitly via the toggle endpoint."""
     sa = await make_user(db, name="SA")
     client = await make_client(db)
     await make_self_registered_user(db, phone="+919900111100", role="FACILITATOR")
@@ -59,7 +59,7 @@ async def test_register_promoter_defaults_is_promoter_true(db):
         },
         db=db, current_user=sa,
     )
-    assert out["is_promoter"] is True
+    assert out["is_promoter"] is False
 
 
 # ── M9: gate moves to is_promoter flag ──────────────────────────────────────
@@ -68,67 +68,100 @@ async def test_register_promoter_defaults_is_promoter_true(db):
 @pytest.mark.asyncio
 async def test_facilitator_non_promoter_at_other_client_does_not_block(db):
     """A Facilitator who is onboarded at client A but NOT marked as
-    a Promoter (is_promoter=False) doesn't block registration at
-    client B. Only the Facilitator-PROMOTER combination is exclusive
-    per spec §11.2 — the user's clarification on 2026-05-08."""
+    a Promoter (is_promoter=False) doesn't block onboarding OR
+    promoter-marking at client B. Only the Facilitator-PROMOTER
+    combination is exclusive per spec §11.2."""
+    from app.modules.clients.router import (
+        register_promoter, toggle_promoter_flag,
+    )
+
     sa = await make_user(db, name="SA")
     client_a = await make_client(db)
     client_b = await make_client(db)
-    user = await make_self_registered_user(db, phone="+919900111101", role="FACILITATOR", name="Mover")
-    # Manually craft a non-promoter Facilitator row at A. The current
-    # register_promoter endpoint defaults is_promoter=True, so we
-    # bypass it to set up the V1.1-style state directly.
-    db.add(ClientPromoter(
-        client_id=client_a.id, user_id=user.id,
-        promoter_type="FACILITATOR", status="ACTIVE",
-        is_promoter=False, registered_by=sa.id,
-    ))
+    await make_self_registered_user(db, phone="+919900111101", role="FACILITATOR", name="Mover")
     await db.commit()
 
-    out = await register_promoter(
-        client_id=client_b.id,
-        request={
-            "phone": "+919900111101",
-            "promoter_type": "FACILITATOR", "territory_notes": None,
-        },
+    # Onboarded at A — is_promoter defaults to False (Item 4 default).
+    await register_promoter(
+        client_id=client_a.id,
+        request={"phone": "+919900111101", "promoter_type": "FACILITATOR"},
         db=db, current_user=sa,
     )
-    assert out["promoter_type"] == "FACILITATOR"
+
+    # Onboard at B — also fine (plain Facilitator multi-company OK).
+    out_b = await register_promoter(
+        client_id=client_b.id,
+        request={"phone": "+919900111101", "promoter_type": "FACILITATOR"},
+        db=db, current_user=sa,
+    )
+    assert out_b["is_promoter"] is False
+
+    # Mark Promoter at B — A has is_promoter=False so the gate
+    # doesn't fire. B becomes the sole Facilitator-Promoter.
+    toggled = await toggle_promoter_flag(
+        client_id=client_b.id, promoter_id=out_b["id"],
+        request={"is_promoter": True},
+        db=db, current_user=sa,
+    )
+    assert toggled["is_promoter"] is True
 
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_facilitator_promoter_at_other_client_still_blocks(db):
-    """When the Facilitator at the other client IS a Promoter
-    (is_promoter=True), registration here as a Promoter is still
-    rejected — same spec §11.2 rule, just expressed via the flag."""
+async def test_facilitator_promoter_at_other_client_blocks_toggle(db):
+    """V1.1 Item 4: when the Facilitator at A is marked as Promoter,
+    marking the same user as Promoter at B is refused — the spec
+    §11.2 exclusivity gate now lives on the toggle endpoint."""
+    from app.modules.clients.router import (
+        register_promoter, toggle_promoter_flag,
+    )
+
     sa = await make_user(db, name="SA")
     client_a = await make_client(db)
     client_b = await make_client(db)
     await make_self_registered_user(db, phone="+919900111102", role="FACILITATOR", name="Locked")
     await db.commit()
 
-    # First-time registration at A — defaults is_promoter=True.
-    await register_promoter(
+    out_a = await register_promoter(
         client_id=client_a.id,
-        request={
-            "phone": "+919900111102",
-            "promoter_type": "FACILITATOR", "territory_notes": None,
-        },
+        request={"phone": "+919900111102", "promoter_type": "FACILITATOR"},
+        db=db, current_user=sa,
+    )
+    out_b = await register_promoter(
+        client_id=client_b.id,
+        request={"phone": "+919900111102", "promoter_type": "FACILITATOR"},
         db=db, current_user=sa,
     )
 
+    # A marks them as Promoter — fine.
+    await toggle_promoter_flag(
+        client_id=client_a.id, promoter_id=out_a["id"],
+        request={"is_promoter": True},
+        db=db, current_user=sa,
+    )
+
+    # B tries to mark them as Promoter — refused.
     with pytest.raises(HTTPException) as ei:
-        await register_promoter(
-            client_id=client_b.id,
-            request={
-                "phone": "+919900111102",
-                "promoter_type": "FACILITATOR", "territory_notes": None,
-            },
+        await toggle_promoter_flag(
+            client_id=client_b.id, promoter_id=out_b["id"],
+            request={"is_promoter": True},
             db=db, current_user=sa,
         )
     assert ei.value.status_code == 409
     assert ei.value.detail["code"] == "facilitator_already_active_elsewhere"
+
+    # After A unmarks, B can mark — exclusivity releases.
+    await toggle_promoter_flag(
+        client_id=client_a.id, promoter_id=out_a["id"],
+        request={"is_promoter": False},
+        db=db, current_user=sa,
+    )
+    out = await toggle_promoter_flag(
+        client_id=client_b.id, promoter_id=out_b["id"],
+        request={"is_promoter": True},
+        db=db, current_user=sa,
+    )
+    assert out["is_promoter"] is True
 
 
 # ── M5: PP eligibility now requires is_promoter=True ────────────────────────

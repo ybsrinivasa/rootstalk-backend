@@ -55,29 +55,43 @@ async def test_facilitator_register_at_first_client_succeeds(db):
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_facilitator_blocked_at_second_client(db):
-    """The same Facilitator at client A cannot also register at
-    client B while still active at A. Structured 409 detail so the
-    frontend can pin the message + display 'deactivate at the other
-    company first'."""
+async def test_facilitator_marked_promoter_blocks_marking_at_second_client(db):
+    """V1.1 Item 4 (2026-05-09): the §11.2 Facilitator-Promoter
+    exclusivity gate moved to the toggle endpoint. Onboarding a
+    Facilitator at multiple clients is fine; what's exclusive is
+    being MARKED as a Promoter at more than one. Structured 409
+    detail so the frontend can pin the message + display
+    'unmark at the other company first'."""
+    from app.modules.clients.router import toggle_promoter_flag
+
     sa = await make_user(db, name="SA")
     client_a = await make_client(db)
     client_b = await make_client(db)
     await make_self_registered_user(db, phone="+919900000002", role="FACILITATOR")
     await db.commit()
 
-    # First registration — at client A.
-    await register_promoter(
-        client_id=client_a.id,
-        request=_payload(phone="+919900000002"),
+    # Both onboardings succeed (plain Facilitator multi-company OK).
+    out_a = await register_promoter(
+        client_id=client_a.id, request=_payload(phone="+919900000002"),
+        db=db, current_user=sa,
+    )
+    out_b = await register_promoter(
+        client_id=client_b.id, request=_payload(phone="+919900000002"),
         db=db, current_user=sa,
     )
 
-    # Same person attempts to register at client B.
+    # A marks them as Promoter — fine.
+    await toggle_promoter_flag(
+        client_id=client_a.id, promoter_id=out_a["id"],
+        request={"is_promoter": True},
+        db=db, current_user=sa,
+    )
+
+    # B tries to mark them as Promoter — refused.
     with pytest.raises(HTTPException) as ei:
-        await register_promoter(
-            client_id=client_b.id,
-            request=_payload(phone="+919900000002"),
+        await toggle_promoter_flag(
+            client_id=client_b.id, promoter_id=out_b["id"],
+            request={"is_promoter": True},
             db=db, current_user=sa,
         )
     assert ei.value.status_code == 409
@@ -117,35 +131,46 @@ async def test_dealer_register_at_multiple_clients_allowed(db):
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_facilitator_can_move_after_deactivation(db):
-    """When the previous-client Facilitator row is INACTIVE, the
-    person can be registered at a new client. The check looks at
-    status=ACTIVE only — supporting the move-between-companies flow."""
+async def test_facilitator_promoter_can_move_after_deactivation(db):
+    """The exclusivity check looks at status=ACTIVE only — a
+    Facilitator-Promoter at a deactivated A row no longer blocks
+    marking the same user as Promoter at B. Supports the
+    move-between-companies flow."""
+    from app.modules.clients.router import toggle_promoter_flag
+
     sa = await make_user(db, name="SA")
     client_a = await make_client(db)
     client_b = await make_client(db)
     await make_self_registered_user(db, phone="+919900000004", role="FACILITATOR")
     await db.commit()
 
+    # Onboard at both, mark Promoter at A.
     out_a = await register_promoter(
-        client_id=client_a.id,
-        request=_payload(phone="+919900000004"),
+        client_id=client_a.id, request=_payload(phone="+919900000004"),
         db=db, current_user=sa,
     )
-    # Manually flip the A row to INACTIVE — same effect as calling the
-    # deactivate endpoint, but more direct for this test.
+    out_b = await register_promoter(
+        client_id=client_b.id, request=_payload(phone="+919900000004"),
+        db=db, current_user=sa,
+    )
+    await toggle_promoter_flag(
+        client_id=client_a.id, promoter_id=out_a["id"],
+        request={"is_promoter": True}, db=db, current_user=sa,
+    )
+
+    # Deactivate the A row → exclusivity lock releases.
     cp_a = (await db.execute(
         select(ClientPromoter).where(ClientPromoter.id == out_a["id"])
     )).scalar_one()
     cp_a.status = "INACTIVE"
     await db.commit()
 
-    out_b = await register_promoter(
-        client_id=client_b.id,
-        request=_payload(phone="+919900000004"),
-        db=db, current_user=sa,
+    # B can now mark Promoter.
+    out = await toggle_promoter_flag(
+        client_id=client_b.id, promoter_id=out_b["id"],
+        request={"is_promoter": True}, db=db, current_user=sa,
     )
-    assert out_b["promoter_type"] == "FACILITATOR"
+    assert out["is_promoter"] is True
 
 
 @requires_docker
