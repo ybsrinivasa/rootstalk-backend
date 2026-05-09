@@ -1980,17 +1980,91 @@ async def nearby_dealers(
     order_type: Optional[str] = None,
     lat: Optional[float] = None,
     lng: Optional[float] = None,
+    order_id: Optional[str] = None,
+    client_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Returns up to 5 nearest dealers filtered by order type (PESTICIDE/FERTILISER/SEED)."""
+    """Returns up to 5 nearest dealers filtered by order type
+    (PESTICIDE/FERTILISER/SEED).
+
+    V1.1 Item 6 (2026-05-09) — Locked-Brand routing per spec § and
+    user clarification 2026-05-09:
+      - Dealer pool always restricted to onboarded dealers (any
+        active ClientPromoter row of type DEALER somewhere).
+      - If `order_id` supplied: derive `client_id` from the order
+        and detect locked-brand items (any item whose Practice has
+        an Element with element_type='brand' AND a non-null
+        cosh_ref).
+      - **Locked**: pool further restricted to dealers onboarded by
+        the order's client. Tier = LOCKED_MATCH.
+      - **Unlocked but client_id known**: client-onboarded dealers
+        get FIRST_DEALER_ADVANTAGE tier; other onboarded dealers
+        get OPEN tier. Both returned, sorted by tier then distance.
+      - **No client context**: all onboarded dealers, tier OPEN.
+
+    The locked-brand restriction is to dealers onboarded by the
+    *order's client*, NOT by the brand's manufacturer. Per user
+    2026-05-09: "do not link it with any particular Manufacturer
+    of a Brand; it is linked to the dealers who have been
+    onboarded by that client".
+    """
+    from app.modules.clients.models import ClientPromoter
+
     await _assert_active_facilitator(db, current_user.id)
     if lat is None:
         lat = float(current_user.gps_lat) if current_user.gps_lat else 0.0
     if lng is None:
         lng = float(current_user.gps_lng) if current_user.gps_lng else 0.0
 
-    profiles = (await db.execute(select(DealerProfile))).scalars().all()
+    # Resolve order context: derive target client + locked-brand
+    # status from the order's items.
+    has_locked = False
+    target_client_id = client_id
+    if order_id:
+        order = (await db.execute(
+            select(Order).where(Order.id == order_id)
+        )).scalar_one_or_none()
+        if order:
+            target_client_id = order.client_id
+            order_items = (await db.execute(
+                select(OrderItem).where(OrderItem.order_id == order_id)
+            )).scalars().all()
+            practice_ids = [it.practice_id for it in order_items if it.practice_id]
+            if practice_ids:
+                from app.modules.advisory.models import Element
+                els = (await db.execute(
+                    select(Element).where(
+                        Element.practice_id.in_(practice_ids),
+                        Element.element_type == "brand",
+                        Element.cosh_ref.isnot(None),
+                    )
+                )).scalars().all()
+                has_locked = bool(els)
+
+    # Build the onboarded-dealer pool.
+    onboarded_q = select(ClientPromoter).where(
+        ClientPromoter.promoter_type == "DEALER",
+        ClientPromoter.status == "ACTIVE",
+    )
+    if has_locked and target_client_id:
+        # Locked: hard-restrict to this client's onboarded dealers.
+        onboarded_q = onboarded_q.where(
+            ClientPromoter.client_id == target_client_id,
+        )
+    onboarded_rows = (await db.execute(onboarded_q)).scalars().all()
+    onboarded_user_ids = {p.user_id for p in onboarded_rows}
+    client_onboarded_user_ids = (
+        {p.user_id for p in onboarded_rows if p.client_id == target_client_id}
+        if target_client_id else set()
+    )
+
+    if not onboarded_user_ids:
+        return []
+
+    profiles = (await db.execute(
+        select(DealerProfile).where(DealerProfile.user_id.in_(onboarded_user_ids))
+    )).scalars().all()
 
     category_map = {"PESTICIDE": "PESTICIDES", "FERTILISER": "FERTILISERS", "SEED": "SEEDS"}
     required_cat = category_map.get(order_type or "", "") if order_type else None
@@ -2005,20 +2079,30 @@ async def nearby_dealers(
             continue
         dist = _haversine(lat, lng, float(profile.shop_gps_lat), float(profile.shop_gps_lng))
         dealer = (await db.execute(select(User).where(User.id == profile.user_id))).scalar_one_or_none()
-        if dealer:
-            results.append({
-                "user_id": dealer.id,
-                "name": dealer.name,
-                "phone": dealer.phone,
-                "shop_name": profile.shop_name,
-                "shop_address": profile.shop_address,
-                "sell_categories": profile.sell_categories or [],
-                "distance_km": round(dist, 1),
-                "shop_gps_lat": float(profile.shop_gps_lat),
-                "shop_gps_lng": float(profile.shop_gps_lng),
-            })
+        if not dealer:
+            continue
+        if has_locked:
+            tier = "LOCKED_MATCH"
+        elif profile.user_id in client_onboarded_user_ids:
+            tier = "FIRST_DEALER_ADVANTAGE"
+        else:
+            tier = "OPEN"
+        results.append({
+            "user_id": dealer.id,
+            "name": dealer.name,
+            "phone": dealer.phone,
+            "shop_name": profile.shop_name,
+            "shop_address": profile.shop_address,
+            "sell_categories": profile.sell_categories or [],
+            "distance_km": round(dist, 1),
+            "shop_gps_lat": float(profile.shop_gps_lat),
+            "shop_gps_lng": float(profile.shop_gps_lng),
+            "tier": tier,
+        })
 
-    results.sort(key=lambda x: x["distance_km"])
+    # Sort: tier priority, then distance.
+    tier_rank = {"LOCKED_MATCH": 0, "FIRST_DEALER_ADVANTAGE": 0, "OPEN": 1}
+    results.sort(key=lambda x: (tier_rank.get(x["tier"], 99), x["distance_km"]))
     return results[:5]
 
 
