@@ -2293,6 +2293,18 @@ async def add_client_pg_practice(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Local-PG practice — same UCAT shape as global-PG and Q&A."""
+    try:
+        await assert_l2_elements_valid(
+            db,
+            l2_type=request.l2_type,
+            elements=request.elements,
+            is_special_input=request.is_special_input,
+            frequency_days=request.frequency_days,
+        )
+    except L2ElementValidationError as e:
+        _raise_l2_element_validation(e)
+
     practice = PGPractice(
         timeline_id=tl_id,
         l0_type=request.l0_type,
@@ -2300,8 +2312,19 @@ async def add_client_pg_practice(
         l2_type=request.l2_type,
         display_order=request.display_order,
         is_special_input=request.is_special_input,
+        frequency_days=request.frequency_days,
     )
     db.add(practice)
+    await db.flush()
+    for el in request.elements:
+        db.add(PGElement(
+            practice_id=practice.id,
+            element_type=el.element_type,
+            cosh_ref=el.cosh_ref,
+            value=el.value,
+            unit_cosh_id=el.unit_cosh_id,
+            display_order=el.display_order,
+        ))
     await db.commit()
     await db.refresh(practice)
     return practice
@@ -2410,6 +2433,18 @@ async def add_sp_practice(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """SP practice — same UCAT shape as PG and Q&A."""
+    try:
+        await assert_l2_elements_valid(
+            db,
+            l2_type=request.l2_type,
+            elements=request.elements,
+            is_special_input=request.is_special_input,
+            frequency_days=request.frequency_days,
+        )
+    except L2ElementValidationError as e:
+        _raise_l2_element_validation(e)
+
     practice = SPPractice(
         timeline_id=tl_id,
         l0_type=request.l0_type,
@@ -2417,8 +2452,19 @@ async def add_sp_practice(
         l2_type=request.l2_type,
         display_order=request.display_order,
         is_special_input=request.is_special_input,
+        frequency_days=request.frequency_days,
     )
     db.add(practice)
+    await db.flush()
+    for el in request.elements:
+        db.add(SPElement(
+            practice_id=practice.id,
+            element_type=el.element_type,
+            cosh_ref=el.cosh_ref,
+            value=el.value,
+            unit_cosh_id=el.unit_cosh_id,
+            display_order=el.display_order,
+        ))
     await db.commit()
     await db.refresh(practice)
     return practice
@@ -2648,6 +2694,17 @@ async def add_qa_practice(
     )).scalar_one_or_none()
     if not tl:
         raise HTTPException(status_code=404, detail="Timeline not found")
+
+    try:
+        await assert_l2_elements_valid(
+            db,
+            l2_type=request.l2_type,
+            elements=request.elements,
+            is_special_input=request.is_special_input,
+            frequency_days=request.frequency_days,
+        )
+    except L2ElementValidationError as e:
+        _raise_l2_element_validation(e)
 
     practice = PGPractice(
         timeline_id=tl_id,
