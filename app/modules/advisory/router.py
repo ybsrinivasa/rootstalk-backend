@@ -25,6 +25,7 @@ from app.modules.advisory.schemas import (
     PGRecommendationCreate, PGRecommendationOut, PGTimelineCreate, PGTimelineOut, PGPracticeCreate,
     SPRecommendationCreate, SPRecommendationOut, SPTimelineCreate, SPTimelineOut, SPPracticeCreate,
     QATimelineCreate, QAPracticeCreate,
+    ElementIn,
 )
 from app.modules.advisory.models import (
     PGRecommendation, PGTimeline, PGPractice, PGElement,
@@ -158,6 +159,123 @@ def _raise_l2_element_validation(e: L2ElementValidationError):
             ],
         },
     )
+
+
+# ── Element-level CRUD helpers (Round 2 — element-level authoring) ─────────
+
+def _element_row_to_in(row) -> ElementIn:
+    """Coerce a persisted Element / PGElement / SPElement row back into
+    the ElementIn shape the L2 validator consumes. Used when we need to
+    re-validate a Practice's full element set after a per-element edit."""
+    return ElementIn(
+        element_type=row.element_type,
+        cosh_ref=row.cosh_ref,
+        value=row.value,
+        unit_cosh_id=row.unit_cosh_id,
+        display_order=row.display_order,
+    )
+
+
+def _element_row_to_out(row) -> dict:
+    return {
+        "id": row.id,
+        "element_type": row.element_type,
+        "cosh_ref": row.cosh_ref,
+        "value": row.value,
+        "unit_cosh_id": row.unit_cosh_id,
+        "display_order": row.display_order,
+    }
+
+
+async def _revalidate_practice_elements(db, practice, expected_elements):
+    """Run the L2 rule book over the proposed element set for a Practice.
+    Same envelope as the create-time validator — 422 with the full error
+    list — so the CA portal renders consistent feedback regardless of
+    whether the SE saved the whole Practice or just tweaked one
+    element."""
+    try:
+        await assert_l2_elements_valid(
+            db,
+            l2_type=practice.l2_type,
+            elements=expected_elements,
+            is_special_input=practice.is_special_input,
+            frequency_days=practice.frequency_days,
+        )
+    except L2ElementValidationError as e:
+        _raise_l2_element_validation(e)
+
+
+async def _add_practice_element(db, *, practice, element_model, body):
+    existing = (await db.execute(
+        select(element_model).where(element_model.practice_id == practice.id)
+    )).scalars().all()
+    expected = [_element_row_to_in(e) for e in existing] + [body]
+    await _revalidate_practice_elements(db, practice, expected)
+
+    new_row = element_model(practice_id=practice.id, **body.model_dump())
+    db.add(new_row)
+    await db.commit()
+    await db.refresh(new_row)
+    return new_row
+
+
+async def _update_practice_element(
+    db, *, practice, element_model, element_id, body,
+):
+    element = (await db.execute(
+        select(element_model).where(
+            element_model.id == element_id,
+            element_model.practice_id == practice.id,
+        )
+    )).scalar_one_or_none()
+    if not element:
+        raise HTTPException(status_code=404, detail="Element not found")
+    siblings = (await db.execute(
+        select(element_model).where(
+            element_model.practice_id == practice.id,
+            element_model.id != element_id,
+        )
+    )).scalars().all()
+    expected = [_element_row_to_in(s) for s in siblings] + [body]
+    await _revalidate_practice_elements(db, practice, expected)
+
+    element.element_type = body.element_type
+    element.cosh_ref = body.cosh_ref
+    element.value = body.value
+    element.unit_cosh_id = body.unit_cosh_id
+    element.display_order = body.display_order
+    await db.commit()
+    await db.refresh(element)
+    return element
+
+
+async def _delete_practice_element(
+    db, *, practice, element_model, element_id,
+):
+    """Validate the *remaining* element set still satisfies the rule book
+    before persisting the delete. Pre-Round-2, an SE could re-save the
+    whole Practice with a missing mandatory and get an immediate 422; the
+    per-element delete preserves that guarantee. To wipe a mandatory
+    element entirely, the SE deletes the whole Practice."""
+    element = (await db.execute(
+        select(element_model).where(
+            element_model.id == element_id,
+            element_model.practice_id == practice.id,
+        )
+    )).scalar_one_or_none()
+    if not element:
+        raise HTTPException(status_code=404, detail="Element not found")
+    siblings = (await db.execute(
+        select(element_model).where(
+            element_model.practice_id == practice.id,
+            element_model.id != element_id,
+        )
+    )).scalars().all()
+    expected = [_element_row_to_in(s) for s in siblings]
+    await _revalidate_practice_elements(db, practice, expected)
+
+    await db.delete(element)
+    await db.commit()
 
 
 async def _assert_timeline_name_unique(
@@ -1177,6 +1295,69 @@ async def delete_practice(
     await db.commit()
 
 
+# ── CCA per-element CRUD (Round 2) ─────────────────────────────────────────
+
+async def _load_cca_practice(db, *, timeline_id: str, practice_id: str):
+    practice = (await db.execute(
+        select(Practice).where(
+            Practice.id == practice_id,
+            Practice.timeline_id == timeline_id,
+        )
+    )).scalar_one_or_none()
+    if not practice:
+        raise HTTPException(status_code=404, detail="Practice not found")
+    return practice
+
+
+@router.post(
+    "/client/{client_id}/timelines/{timeline_id}/practices/{practice_id}/elements",
+    status_code=201,
+)
+async def add_cca_element(
+    client_id: str, timeline_id: str, practice_id: str,
+    body: ElementIn,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    practice = await _load_cca_practice(db, timeline_id=timeline_id, practice_id=practice_id)
+    new = await _add_practice_element(
+        db, practice=practice, element_model=Element, body=body,
+    )
+    return _element_row_to_out(new)
+
+
+@router.put(
+    "/client/{client_id}/timelines/{timeline_id}/practices/{practice_id}/elements/{element_id}",
+)
+async def update_cca_element(
+    client_id: str, timeline_id: str, practice_id: str, element_id: str,
+    body: ElementIn,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    practice = await _load_cca_practice(db, timeline_id=timeline_id, practice_id=practice_id)
+    updated = await _update_practice_element(
+        db, practice=practice, element_model=Element,
+        element_id=element_id, body=body,
+    )
+    return _element_row_to_out(updated)
+
+
+@router.delete(
+    "/client/{client_id}/timelines/{timeline_id}/practices/{practice_id}/elements/{element_id}",
+    status_code=204,
+)
+async def delete_cca_element(
+    client_id: str, timeline_id: str, practice_id: str, element_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    practice = await _load_cca_practice(db, timeline_id=timeline_id, practice_id=practice_id)
+    await _delete_practice_element(
+        db, practice=practice, element_model=Element, element_id=element_id,
+    )
+
+
 # ── Relations ──────────────────────────────────────────────────────────────────
 
 @router.post("/client/{client_id}/timelines/{timeline_id}/relations", status_code=201)
@@ -1666,6 +1847,57 @@ async def delete_global_practice(
     await db.commit()
 
 
+# ── CHA global-Practice per-element CRUD (Round 2) ─────────────────────────
+
+@router.post(
+    "/advisory/global/packages/{pkg_id}/timelines/{tl_id}/practices/{practice_id}/elements",
+    status_code=201,
+)
+async def add_global_cca_element(
+    pkg_id: str, tl_id: str, practice_id: str,
+    body: ElementIn,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    practice = await _load_cca_practice(db, timeline_id=tl_id, practice_id=practice_id)
+    new = await _add_practice_element(
+        db, practice=practice, element_model=Element, body=body,
+    )
+    return _element_row_to_out(new)
+
+
+@router.put(
+    "/advisory/global/packages/{pkg_id}/timelines/{tl_id}/practices/{practice_id}/elements/{element_id}",
+)
+async def update_global_cca_element(
+    pkg_id: str, tl_id: str, practice_id: str, element_id: str,
+    body: ElementIn,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    practice = await _load_cca_practice(db, timeline_id=tl_id, practice_id=practice_id)
+    updated = await _update_practice_element(
+        db, practice=practice, element_model=Element,
+        element_id=element_id, body=body,
+    )
+    return _element_row_to_out(updated)
+
+
+@router.delete(
+    "/advisory/global/packages/{pkg_id}/timelines/{tl_id}/practices/{practice_id}/elements/{element_id}",
+    status_code=204,
+)
+async def delete_global_cca_element(
+    pkg_id: str, tl_id: str, practice_id: str, element_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    practice = await _load_cca_practice(db, timeline_id=tl_id, practice_id=practice_id)
+    await _delete_practice_element(
+        db, practice=practice, element_model=Element, element_id=element_id,
+    )
+
+
 @router.post("/client/{client_id}/packages/{pkg_id}/fork", response_model=PackageOut, status_code=201)
 async def fork_global_package(
     client_id: str,
@@ -1927,6 +2159,69 @@ async def add_global_pg_practice(
     await db.commit()
     await db.refresh(practice)
     return practice
+
+
+# ── CHA global-PG per-element CRUD (Round 2) ───────────────────────────────
+
+async def _load_pg_practice_by_timeline(db, *, timeline_id: str, practice_id: str):
+    practice = (await db.execute(
+        select(PGPractice).where(
+            PGPractice.id == practice_id,
+            PGPractice.timeline_id == timeline_id,
+        )
+    )).scalar_one_or_none()
+    if not practice:
+        raise HTTPException(status_code=404, detail="Practice not found")
+    return practice
+
+
+@router.post(
+    "/advisory/global/pg-recommendations/{pg_id}/timelines/{tl_id}/practices/{practice_id}/elements",
+    status_code=201,
+)
+async def add_global_pg_element(
+    pg_id: str, tl_id: str, practice_id: str,
+    body: ElementIn,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    practice = await _load_pg_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
+    new = await _add_practice_element(
+        db, practice=practice, element_model=PGElement, body=body,
+    )
+    return _element_row_to_out(new)
+
+
+@router.put(
+    "/advisory/global/pg-recommendations/{pg_id}/timelines/{tl_id}/practices/{practice_id}/elements/{element_id}",
+)
+async def update_global_pg_element(
+    pg_id: str, tl_id: str, practice_id: str, element_id: str,
+    body: ElementIn,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    practice = await _load_pg_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
+    updated = await _update_practice_element(
+        db, practice=practice, element_model=PGElement,
+        element_id=element_id, body=body,
+    )
+    return _element_row_to_out(updated)
+
+
+@router.delete(
+    "/advisory/global/pg-recommendations/{pg_id}/timelines/{tl_id}/practices/{practice_id}/elements/{element_id}",
+    status_code=204,
+)
+async def delete_global_pg_element(
+    pg_id: str, tl_id: str, practice_id: str, element_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    practice = await _load_pg_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
+    await _delete_practice_element(
+        db, practice=practice, element_model=PGElement, element_id=element_id,
+    )
 
 
 @router.delete("/advisory/global/pg-recommendations/{pg_id}/timelines/{tl_id}", status_code=204)
@@ -2330,6 +2625,57 @@ async def add_client_pg_practice(
     return practice
 
 
+# ── CHA local-PG per-element CRUD (Round 2) ────────────────────────────────
+
+@router.post(
+    "/client/{client_id}/pg-recommendations/{pg_id}/timelines/{tl_id}/practices/{practice_id}/elements",
+    status_code=201,
+)
+async def add_client_pg_element(
+    client_id: str, pg_id: str, tl_id: str, practice_id: str,
+    body: ElementIn,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    practice = await _load_pg_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
+    new = await _add_practice_element(
+        db, practice=practice, element_model=PGElement, body=body,
+    )
+    return _element_row_to_out(new)
+
+
+@router.put(
+    "/client/{client_id}/pg-recommendations/{pg_id}/timelines/{tl_id}/practices/{practice_id}/elements/{element_id}",
+)
+async def update_client_pg_element(
+    client_id: str, pg_id: str, tl_id: str, practice_id: str, element_id: str,
+    body: ElementIn,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    practice = await _load_pg_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
+    updated = await _update_practice_element(
+        db, practice=practice, element_model=PGElement,
+        element_id=element_id, body=body,
+    )
+    return _element_row_to_out(updated)
+
+
+@router.delete(
+    "/client/{client_id}/pg-recommendations/{pg_id}/timelines/{tl_id}/practices/{practice_id}/elements/{element_id}",
+    status_code=204,
+)
+async def delete_client_pg_element(
+    client_id: str, pg_id: str, tl_id: str, practice_id: str, element_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    practice = await _load_pg_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
+    await _delete_practice_element(
+        db, practice=practice, element_model=PGElement, element_id=element_id,
+    )
+
+
 @router.delete("/client/{client_id}/pg-recommendations/{pg_id}/timelines/{tl_id}", status_code=204)
 async def delete_client_pg_timeline(
     client_id: str,
@@ -2468,6 +2814,69 @@ async def add_sp_practice(
     await db.commit()
     await db.refresh(practice)
     return practice
+
+
+# ── CHA local-SP per-element CRUD (Round 2) ────────────────────────────────
+
+async def _load_sp_practice_by_timeline(db, *, timeline_id: str, practice_id: str):
+    practice = (await db.execute(
+        select(SPPractice).where(
+            SPPractice.id == practice_id,
+            SPPractice.timeline_id == timeline_id,
+        )
+    )).scalar_one_or_none()
+    if not practice:
+        raise HTTPException(status_code=404, detail="Practice not found")
+    return practice
+
+
+@router.post(
+    "/client/{client_id}/sp-recommendations/{sp_id}/timelines/{tl_id}/practices/{practice_id}/elements",
+    status_code=201,
+)
+async def add_sp_element(
+    client_id: str, sp_id: str, tl_id: str, practice_id: str,
+    body: ElementIn,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    practice = await _load_sp_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
+    new = await _add_practice_element(
+        db, practice=practice, element_model=SPElement, body=body,
+    )
+    return _element_row_to_out(new)
+
+
+@router.put(
+    "/client/{client_id}/sp-recommendations/{sp_id}/timelines/{tl_id}/practices/{practice_id}/elements/{element_id}",
+)
+async def update_sp_element(
+    client_id: str, sp_id: str, tl_id: str, practice_id: str, element_id: str,
+    body: ElementIn,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    practice = await _load_sp_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
+    updated = await _update_practice_element(
+        db, practice=practice, element_model=SPElement,
+        element_id=element_id, body=body,
+    )
+    return _element_row_to_out(updated)
+
+
+@router.delete(
+    "/client/{client_id}/sp-recommendations/{sp_id}/timelines/{tl_id}/practices/{practice_id}/elements/{element_id}",
+    status_code=204,
+)
+async def delete_sp_element(
+    client_id: str, sp_id: str, tl_id: str, practice_id: str, element_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    practice = await _load_sp_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
+    await _delete_practice_element(
+        db, practice=practice, element_model=SPElement, element_id=element_id,
+    )
 
 
 @router.delete("/client/{client_id}/sp-recommendations/{sp_id}/timelines/{tl_id}", status_code=204)
@@ -2755,6 +3164,95 @@ async def add_qa_practice(
             for e in elements
         ],
     }
+
+
+# ── Q&A per-element CRUD (Round 2) ─────────────────────────────────────────
+
+async def _assert_qa_practice_path(
+    db, *, current_user, client_id: str, sr_id: str,
+    tl_id: str, practice_id: str,
+):
+    """Q&A authoring is gated on portal-member auth + sr-belongs-to-client.
+    The practice itself must live under the named QA timeline (which in
+    turn lives under the named standard_response_id)."""
+    from app.modules.farmpundit.router import _assert_portal_member
+    await _assert_portal_member(db, current_user.id, client_id)
+    await _assert_sr_belongs_to_client(db, sr_id, client_id)
+    tl = (await db.execute(
+        select(PGTimeline).where(
+            PGTimeline.id == tl_id,
+            PGTimeline.standard_response_id == sr_id,
+        )
+    )).scalar_one_or_none()
+    if not tl:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+    practice = (await db.execute(
+        select(PGPractice).where(
+            PGPractice.id == practice_id,
+            PGPractice.timeline_id == tl_id,
+        )
+    )).scalar_one_or_none()
+    if not practice:
+        raise HTTPException(status_code=404, detail="Practice not found")
+    return practice
+
+
+@router.post(
+    "/client/{client_id}/standard-responses/{sr_id}/timelines/{tl_id}/practices/{practice_id}/elements",
+    status_code=201,
+)
+async def add_qa_element(
+    client_id: str, sr_id: str, tl_id: str, practice_id: str,
+    body: ElementIn,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    practice = await _assert_qa_practice_path(
+        db, current_user=current_user, client_id=client_id,
+        sr_id=sr_id, tl_id=tl_id, practice_id=practice_id,
+    )
+    new = await _add_practice_element(
+        db, practice=practice, element_model=PGElement, body=body,
+    )
+    return _element_row_to_out(new)
+
+
+@router.put(
+    "/client/{client_id}/standard-responses/{sr_id}/timelines/{tl_id}/practices/{practice_id}/elements/{element_id}",
+)
+async def update_qa_element(
+    client_id: str, sr_id: str, tl_id: str, practice_id: str, element_id: str,
+    body: ElementIn,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    practice = await _assert_qa_practice_path(
+        db, current_user=current_user, client_id=client_id,
+        sr_id=sr_id, tl_id=tl_id, practice_id=practice_id,
+    )
+    updated = await _update_practice_element(
+        db, practice=practice, element_model=PGElement,
+        element_id=element_id, body=body,
+    )
+    return _element_row_to_out(updated)
+
+
+@router.delete(
+    "/client/{client_id}/standard-responses/{sr_id}/timelines/{tl_id}/practices/{practice_id}/elements/{element_id}",
+    status_code=204,
+)
+async def delete_qa_element(
+    client_id: str, sr_id: str, tl_id: str, practice_id: str, element_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    practice = await _assert_qa_practice_path(
+        db, current_user=current_user, client_id=client_id,
+        sr_id=sr_id, tl_id=tl_id, practice_id=practice_id,
+    )
+    await _delete_practice_element(
+        db, practice=practice, element_model=PGElement, element_id=element_id,
+    )
 
 
 @router.delete(
