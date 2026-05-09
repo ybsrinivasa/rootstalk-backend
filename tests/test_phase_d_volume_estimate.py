@@ -27,7 +27,8 @@ from app.modules.sync.models import VolumeFormula
 from app.services.crop_measure import AREA_WISE, PLANT_WISE, set_measure
 from tests.conftest import requires_docker
 from tests.factories import (
-    make_client, make_package, make_subscription, make_user,
+    make_client, make_onboarded_dealer, make_package, make_subscription,
+    make_user,
 )
 
 
@@ -47,8 +48,11 @@ async def _seed_volume_estimate_scenario(
     """Build the full chain Subscription → Order → OrderItem → Practice
     → Timeline → Package + crop_measure + a single matching VolumeFormula.
     """
-    user = await make_user(db)
     client = await make_client(db)
+    # Volume-estimate is a Dealer endpoint (V1.1 Item 5 gate), so
+    # the test user must be an onboarded Dealer. The same user
+    # also doubles as the farmer for fixture brevity.
+    user = await make_onboarded_dealer(db, client=client)
     package = await make_package(db, client)
     package.crop_cosh_id = CROP
     sub = await make_subscription(
@@ -268,8 +272,8 @@ async def test_estimate_uses_applications_element_when_present(db):
 @pytest.mark.asyncio
 async def test_estimate_blocks_when_application_method_missing(db):
     """Practice has no application_method element → APPLICATION_METHOD_MISSING."""
-    user = await make_user(db)
     client = await make_client(db)
+    user = await make_onboarded_dealer(db, client=client)
     package = await make_package(db, client)
     package.crop_cosh_id = CROP
     sub = await make_subscription(db, farmer=user, client=client, package=package)

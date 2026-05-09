@@ -24,8 +24,9 @@ from app.modules.orders.router import (
 )
 from tests.conftest import requires_docker
 from tests.factories import (
-    make_client, make_element, make_package, make_practice, make_relation,
-    make_subscription, make_timeline, make_user,
+    make_client, make_element, make_onboarded_dealer, make_package,
+    make_practice, make_relation, make_subscription, make_timeline,
+    make_user,
 )
 
 
@@ -34,7 +35,7 @@ async def _seed_brand_locked_order(db):
     dealer user so the dealer-side endpoints can be called.
     """
     farmer = await make_user(db, name="Farmer")
-    dealer = await make_user(db, name="Dealer")
+    dealer = await make_onboarded_dealer(db, name="Dealer")
     client = await make_client(db)
     package = await make_package(db, client)
     sub = await make_subscription(
@@ -112,7 +113,7 @@ async def test_brand_options_uses_snapshot_after_master_edit(db):
 async def test_brand_options_falls_back_to_master_when_snapshot_id_null(db):
     """Pre-Phase-3 order item (snapshot_id NULL) falls back to master."""
     farmer = await make_user(db, name="Farmer")
-    dealer = await make_user(db, name="Dealer")
+    dealer = await make_onboarded_dealer(db, name="Dealer")
     client = await make_client(db)
     package = await make_package(db, client)
     sub = await make_subscription(
@@ -163,7 +164,7 @@ async def test_dealer_order_detail_locked_brand_uses_snapshot(db):
     """In the dealer order detail, has_locked_brand on relation Options must
     come from the snapshot, not master."""
     farmer = await make_user(db, name="Farmer")
-    dealer = await make_user(db, name="Dealer")
+    dealer = await make_onboarded_dealer(db, name="Dealer")
     client = await make_client(db)
     package = await make_package(db, client)
     sub = await make_subscription(

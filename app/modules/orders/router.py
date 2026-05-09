@@ -431,6 +431,7 @@ async def list_dealer_orders(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_active_dealer(db, current_user.id)
     result = await db.execute(
         select(Order).where(
             Order.dealer_user_id == current_user.id,
@@ -597,6 +598,7 @@ async def select_option(
     /available endpoint.
     Body: { option_index: int }
     """
+    await _assert_active_dealer(db, current_user.id)
     from app.services.relations import decode_role
 
     option_index = data.get("option_index")
@@ -651,9 +653,11 @@ async def check_duplicate(
     """Runtime duplicate check for a candidate Option.
     Compares its common_name_cosh_ids against AVAILABLE items in OTHER Parts of
     the order (any relation, plus standalone). Special inputs are exempt.
+
     Body: { option_index: int }
     Returns: { would_duplicate, duplicate_input_name, suggested_alternatives }
     """
+    await _assert_active_dealer(db, current_user.id)
     from app.services.relations import decode_role
 
     option_index = data.get("option_index")
@@ -735,6 +739,7 @@ async def mark_option_not_available(
     their current state, allowing the dealer to choose another Option.
     Body: { option_index: int }
     """
+    await _assert_active_dealer(db, current_user.id)
     from app.services.relations import decode_role
 
     option_index = data.get("option_index")
@@ -942,6 +947,7 @@ async def generate_packing_list(
     current_user: User = Depends(get_current_user),
 ):
     """Generate and store packing list. PDF generation wired to S3 in production."""
+    await _assert_active_dealer(db, current_user.id)
     existing = (await db.execute(
         select(PackingList).where(PackingList.order_id == order_id)
     )).scalar_one_or_none()
@@ -960,6 +966,7 @@ async def mark_packing_list_shared(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_active_dealer(db, current_user.id)
     pl = (await db.execute(select(PackingList).where(PackingList.order_id == order_id))).scalar_one_or_none()
     if not pl:
         raise HTTPException(status_code=404, detail="Packing list not found")
@@ -978,6 +985,7 @@ async def list_facilitator_orders(
     current_user: User = Depends(get_current_user),
 ):
     """Orders routed to this facilitator for handling."""
+    await _assert_active_facilitator(db, current_user.id)
     q = select(Order).where(Order.facilitator_user_id == current_user.id).order_by(Order.created_at.desc())
     if status_filter:
         q = q.where(Order.status == status_filter)
@@ -1007,6 +1015,7 @@ async def route_order_to_dealer(
     current_user: User = Depends(get_current_user),
 ):
     """Facilitator assigns a dealer to handle a specific order."""
+    await _assert_active_facilitator(db, current_user.id)
     order = (await db.execute(
         select(Order).where(Order.id == order_id, Order.facilitator_user_id == current_user.id)
     )).scalar_one_or_none()
@@ -1026,6 +1035,7 @@ async def get_facilitator_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_active_facilitator(db, current_user.id)
     order = (await db.execute(
         select(Order).where(Order.id == order_id, Order.facilitator_user_id == current_user.id)
     )).scalar_one_or_none()
@@ -1065,6 +1075,7 @@ async def get_dealer_order(
     compat) and a new `relations` array. Each relation lists Parts → Options →
     items with progressive-reveal flags.
     """
+    await _assert_active_dealer(db, current_user.id)
     from app.services.relations import decode_role
 
     order = (await db.execute(
@@ -1258,6 +1269,7 @@ async def report_missing_brand(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_active_dealer(db, current_user.id)
     report = MissingBrandReport(
         dealer_user_id=current_user.id,
         order_item_id=data["order_item_id"],
@@ -1315,6 +1327,7 @@ async def get_item_brand_options(
     the frozen snapshot — SE edits to master practice elements after order
     placement do not change what the dealer sees for THIS order.
     """
+    await _assert_active_dealer(db, current_user.id)
     item = await _get_order_item(db, item_id, order_id)
     snapshot = None
     if item.snapshot_id:
@@ -1434,6 +1447,7 @@ async def accept_order(
     current_user: User = Depends(get_current_user),
 ):
     """BL-10: Dealer accepts order, transitions SENT → PROCESSING."""
+    await _assert_active_dealer(db, current_user.id)
     order = (await db.execute(
         select(Order).where(Order.id == order_id, Order.dealer_user_id == current_user.id)
     )).scalar_one_or_none()
@@ -1455,6 +1469,7 @@ async def get_packing_list(
     current_user: User = Depends(get_current_user),
 ):
     """Returns structured packing list content for approved/completed orders."""
+    await _assert_active_dealer(db, current_user.id)
     order = (await db.execute(
         select(Order).where(Order.id == order_id, Order.dealer_user_id == current_user.id)
     )).scalar_one_or_none()
@@ -1522,6 +1537,7 @@ async def get_volume_estimate(
     elements; callers can override via query params (e.g. when the dealer
     is mid-pick and wants a preview).
     """
+    await _assert_active_dealer(db, current_user.id)
     from app.modules.advisory.models import Package
     from app.services.crop_measure import get_measure
 
@@ -1802,6 +1818,7 @@ async def delete_dealer_order(
     current_user: User = Depends(get_current_user),
 ):
     """Dealer can delete order only after packing list has been shared."""
+    await _assert_active_dealer(db, current_user.id)
     order = (await db.execute(
         select(Order).where(Order.id == order_id, Order.dealer_user_id == current_user.id)
     )).scalar_one_or_none()
@@ -1823,6 +1840,7 @@ async def dealer_promoted_farmers(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_active_dealer(db, current_user.id)
     return await _promoted_farmers(db, current_user.id)
 
 
@@ -1831,6 +1849,7 @@ async def facilitator_promoted_farmers(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_active_facilitator(db, current_user.id)
     return await _promoted_farmers(db, current_user.id)
 
 
@@ -1870,6 +1889,7 @@ async def facilitator_accept_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_active_facilitator(db, current_user.id)
     order = (await db.execute(
         select(Order).where(Order.id == order_id, Order.facilitator_user_id == current_user.id)
     )).scalar_one_or_none()
@@ -1889,6 +1909,7 @@ async def facilitator_reject_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_active_facilitator(db, current_user.id)
     order = (await db.execute(
         select(Order).where(Order.id == order_id, Order.facilitator_user_id == current_user.id)
     )).scalar_one_or_none()
@@ -1909,6 +1930,7 @@ async def confirm_delivery(
     current_user: User = Depends(get_current_user),
 ):
     """Facilitator marks delivery done. Only enabled after delivery list shared."""
+    await _assert_active_facilitator(db, current_user.id)
     order = (await db.execute(
         select(Order).where(Order.id == order_id, Order.facilitator_user_id == current_user.id)
     )).scalar_one_or_none()
@@ -1929,6 +1951,7 @@ async def return_to_farmer(
     current_user: User = Depends(get_current_user),
 ):
     """Facilitator returns NOT_AVAILABLE items to farmer when unable to source."""
+    await _assert_active_facilitator(db, current_user.id)
     order = (await db.execute(
         select(Order).where(Order.id == order_id, Order.facilitator_user_id == current_user.id)
     )).scalar_one_or_none()
@@ -1961,6 +1984,7 @@ async def nearby_dealers(
     current_user: User = Depends(get_current_user),
 ):
     """Returns up to 5 nearest dealers filtered by order type (PESTICIDE/FERTILISER/SEED)."""
+    await _assert_active_facilitator(db, current_user.id)
     if lat is None:
         lat = float(current_user.gps_lat) if current_user.gps_lat else 0.0
     if lng is None:
@@ -2013,6 +2037,7 @@ async def facilitator_payment_requests(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_active_facilitator(db, current_user.id)
     result = await db.execute(
         select(SubscriptionPaymentRequest).where(
             SubscriptionPaymentRequest.requested_from_user_id == current_user.id,
@@ -2030,6 +2055,7 @@ async def facilitator_decline_payment(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_active_facilitator(db, current_user.id)
     req = (await db.execute(
         select(SubscriptionPaymentRequest).where(
             SubscriptionPaymentRequest.id == request_id,
@@ -2078,11 +2104,80 @@ async def _get_farmer_order(db: AsyncSession, order_id: str, farmer_user_id: str
     return order
 
 
+async def _assert_active_dealer(db: AsyncSession, user_id: str) -> None:
+    """V1.1 Item 5 (2026-05-09): dealer-side endpoints require the
+    user to be onboarded as an active Dealer at at least one company.
+    Per the five-ecosystem architecture, a self-claimed UserRole.
+    DEALER is the prerequisite to onboarding but doesn't itself
+    authorise order-side actions — onboarding by a company is what
+    RootsTalk treats as authentication. User confirmed 2026-05-08:
+    "It is only when at least one company onboards a dealer that the
+    dealer can receive orders".
+
+    NOT scoped to a specific client — the user can act on orders
+    from any company once any one company has onboarded them.
+    """
+    from app.modules.clients.models import ClientPromoter
+
+    onboarded = (await db.execute(
+        select(ClientPromoter).where(
+            ClientPromoter.user_id == user_id,
+            ClientPromoter.promoter_type == "DEALER",
+            ClientPromoter.status == "ACTIVE",
+        ).limit(1)
+    )).scalar_one_or_none()
+    if onboarded is None:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "not_an_active_dealer",
+                "message": (
+                    "You aren't currently onboarded as a Dealer at any "
+                    "RootsTalk company. Ask a Field Manager to onboard "
+                    "you first."
+                ),
+            },
+        )
+
+
+async def _assert_active_facilitator(db: AsyncSession, user_id: str) -> None:
+    """Mirror of `_assert_active_dealer` for facilitator-side
+    endpoints. Same rule: at least one ACTIVE FACILITATOR
+    ClientPromoter row required."""
+    from app.modules.clients.models import ClientPromoter
+
+    onboarded = (await db.execute(
+        select(ClientPromoter).where(
+            ClientPromoter.user_id == user_id,
+            ClientPromoter.promoter_type == "FACILITATOR",
+            ClientPromoter.status == "ACTIVE",
+        ).limit(1)
+    )).scalar_one_or_none()
+    if onboarded is None:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "not_an_active_facilitator",
+                "message": (
+                    "You aren't currently onboarded as a Facilitator at "
+                    "any RootsTalk company. Ask a Field Manager to "
+                    "onboard you first."
+                ),
+            },
+        )
+
+
 async def _get_dealer_order(db: AsyncSession, order_id: str, dealer_user_id: str) -> Order:
     """Mirrors _get_farmer_order for the dealer side. Returns 404 (no
     existence leak) when the order doesn't exist OR is assigned to a
     different dealer — closes the BL-10 audit privilege gap where the
-    dealer endpoints accepted any authenticated user."""
+    dealer endpoints accepted any authenticated user.
+
+    Also runs the V1.1 Item 5 onboarding gate so every dealer endpoint
+    that resolves an order through this helper inherits the auth
+    check for free.
+    """
+    await _assert_active_dealer(db, dealer_user_id)
     result = await db.execute(
         select(Order).where(Order.id == order_id, Order.dealer_user_id == dealer_user_id)
     )

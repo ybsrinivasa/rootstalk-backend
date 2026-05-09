@@ -22,8 +22,8 @@ from app.modules.orders.router import mark_item_available
 from app.modules.sync.models import CoshCoreItem
 from tests.conftest import requires_docker
 from tests.factories import (
-    make_client, make_element, make_package, make_practice, make_subscription,
-    make_timeline, make_user,
+    make_client, make_element, make_onboarded_dealer, make_package,
+    make_practice, make_subscription, make_timeline, make_user,
 )
 
 
@@ -31,8 +31,8 @@ async def _seed_dealer_orderitem(db):
     """Sub + dealer + order + a single PENDING order item ready to mark
     AVAILABLE. Returns the order, item, and dealer."""
     farmer = await make_user(db)
-    dealer = await make_user(db)
     client = await make_client(db)
+    dealer = await make_onboarded_dealer(db, client=client)
     package = await make_package(db, client)
     sub = await make_subscription(
         db, farmer=farmer, client=client, package=package,

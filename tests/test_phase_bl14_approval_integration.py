@@ -23,8 +23,8 @@ from app.modules.orders.models import (
 from app.modules.orders.router import get_farmer_order_detail
 from tests.conftest import requires_docker
 from tests.factories import (
-    make_client, make_element, make_package, make_practice, make_subscription,
-    make_timeline, make_user,
+    make_client, make_element, make_onboarded_dealer, make_onboarded_facilitator,
+    make_package, make_practice, make_subscription, make_timeline, make_user,
 )
 
 
@@ -33,8 +33,8 @@ async def _seed_farmer_order_with_item(db, item_status: OrderItemStatus):
     a populated brand_name in the requested item status. Returns
     (farmer, order, item)."""
     farmer = await make_user(db, name="Farmer V")
-    dealer = await make_user(db, name="Dealer V")
     client = await make_client(db)
+    dealer = await make_onboarded_dealer(db, client=client, name="Dealer V")
     package = await make_package(db, client)
     sub = await make_subscription(db, farmer=farmer, client=client, package=package)
     sub.crop_start_date = datetime.now(timezone.utc) - timedelta(days=10)
@@ -140,9 +140,12 @@ async def _seed_pending_order_for_submit(db, *, with_facilitator: bool = True):
     submit_for_approval. Returns (farmer, dealer, facilitator, order)
     — facilitator may be None when with_facilitator=False."""
     farmer = await make_user(db, name="Farmer S")
-    dealer = await make_user(db, name="Dealer S")
-    facilitator = await make_user(db, name="Facilitator S") if with_facilitator else None
     client = await make_client(db)
+    dealer = await make_onboarded_dealer(db, client=client, name="Dealer S")
+    facilitator = (
+        await make_onboarded_facilitator(db, client=client, name="Facilitator S")
+        if with_facilitator else None
+    )
     package = await make_package(db, client)
     sub = await make_subscription(db, farmer=farmer, client=client, package=package)
     sub.crop_start_date = datetime.now(timezone.utc) - timedelta(days=10)

@@ -96,6 +96,48 @@ async def make_client(db: AsyncSession, **kw) -> Client:
     return c
 
 
+async def make_onboarded_dealer(
+    db: AsyncSession, *, client: Client | None = None, name: str = "Dealer",
+) -> User:
+    """Seed a User + UserRole.DEALER + ACTIVE ClientPromoter row.
+
+    Used by tests that operate on /dealer/* endpoints — V1.1 Item 5
+    requires the caller to have at least one active Dealer onboarding.
+    The ClientPromoter row is pinned to a fresh client by default;
+    pass `client=` to attach to an existing one.
+    """
+    from app.modules.platform.models import RoleType, UserRole
+    from app.modules.clients.models import ClientPromoter
+
+    user = await make_user(db, name=name)
+    db.add(UserRole(user_id=user.id, role_type=RoleType.DEALER))
+    target_client = client if client is not None else await make_client(db)
+    db.add(ClientPromoter(
+        client_id=target_client.id, user_id=user.id,
+        promoter_type="DEALER", status="ACTIVE",
+    ))
+    await db.flush()
+    return user
+
+
+async def make_onboarded_facilitator(
+    db: AsyncSession, *, client: Client | None = None, name: str = "Facilitator",
+) -> User:
+    """Mirror of `make_onboarded_dealer` for the Facilitator side."""
+    from app.modules.platform.models import RoleType, UserRole
+    from app.modules.clients.models import ClientPromoter
+
+    user = await make_user(db, name=name)
+    db.add(UserRole(user_id=user.id, role_type=RoleType.FACILITATOR))
+    target_client = client if client is not None else await make_client(db)
+    db.add(ClientPromoter(
+        client_id=target_client.id, user_id=user.id,
+        promoter_type="FACILITATOR", status="ACTIVE",
+    ))
+    await db.flush()
+    return user
+
+
 async def make_self_registered_user(
     db: AsyncSession, *, phone: str, role: str, name: str = "Pwa User",
 ) -> User:

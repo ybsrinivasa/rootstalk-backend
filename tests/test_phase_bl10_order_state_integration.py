@@ -24,8 +24,8 @@ from app.modules.orders.router import (
 )
 from tests.conftest import requires_docker
 from tests.factories import (
-    make_client, make_element, make_package, make_practice, make_subscription,
-    make_timeline, make_user,
+    make_client, make_element, make_onboarded_dealer, make_package,
+    make_practice, make_subscription, make_timeline, make_user,
 )
 
 
@@ -36,8 +36,11 @@ async def _seed_order_with_item(
     """Seed farmer + dealer + sub + practice + Order + one OrderItem in
     the requested statuses. Returns (order, item, farmer, dealer)."""
     farmer = await make_user(db, name="Farmer A")
-    dealer = await make_user(db, name="Dealer A")
     client = await make_client(db)
+    # V1.1 Item 5: dealer must be onboarded at *some* client to pass
+    # the order-routing auth gate. Onboard against the order's client
+    # for tidiness (the gate isn't client-scoped though).
+    dealer = await make_onboarded_dealer(db, client=client, name="Dealer A")
     package = await make_package(db, client)
     sub = await make_subscription(db, farmer=farmer, client=client, package=package)
     sub.crop_start_date = datetime.now(timezone.utc) - timedelta(days=10)
@@ -106,7 +109,7 @@ async def test_reject_item_rejects_other_farmer(db):
 async def test_mark_available_rejects_other_dealer(db):
     """Dealer B cannot mark items available on dealer A's order."""
     order, item, _, _ = await _seed_order_with_item(db)
-    dealer_b = await make_user(db, name="Other Dealer")
+    dealer_b = await make_onboarded_dealer(db, name="Other Dealer")
     with pytest.raises(HTTPException) as exc:
         await mark_item_available(
             order_id=order.id, item_id=item.id,
@@ -120,7 +123,7 @@ async def test_mark_available_rejects_other_dealer(db):
 @pytest.mark.asyncio
 async def test_postpone_rejects_other_dealer(db):
     order, item, _, _ = await _seed_order_with_item(db)
-    dealer_b = await make_user(db, name="Other Dealer")
+    dealer_b = await make_onboarded_dealer(db, name="Other Dealer")
     with pytest.raises(HTTPException) as exc:
         await postpone_item(
             order_id=order.id, item_id=item.id,
@@ -134,7 +137,7 @@ async def test_postpone_rejects_other_dealer(db):
 @pytest.mark.asyncio
 async def test_mark_unavailable_rejects_other_dealer(db):
     order, item, _, _ = await _seed_order_with_item(db)
-    dealer_b = await make_user(db, name="Other Dealer")
+    dealer_b = await make_onboarded_dealer(db, name="Other Dealer")
     with pytest.raises(HTTPException) as exc:
         await mark_item_unavailable(
             order_id=order.id, item_id=item.id,
@@ -147,7 +150,7 @@ async def test_mark_unavailable_rejects_other_dealer(db):
 @pytest.mark.asyncio
 async def test_submit_for_approval_rejects_other_dealer(db):
     order, _, _, _ = await _seed_order_with_item(db)
-    dealer_b = await make_user(db, name="Other Dealer")
+    dealer_b = await make_onboarded_dealer(db, name="Other Dealer")
     with pytest.raises(HTTPException) as exc:
         await submit_for_approval(
             order_id=order.id, data={"items": {}},
