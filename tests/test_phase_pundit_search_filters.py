@@ -28,7 +28,9 @@ from app.modules.farmpundit.router import (
     list_company_pundit_invitations, search_pundits,
 )
 from tests.conftest import requires_docker
-from tests.factories import make_client, make_client_user, make_user
+from tests.factories import (
+    make_client, make_client_user, make_self_registered_user, make_user,
+)
 
 
 async def _ca_user_for(db, *, client):
@@ -308,10 +310,11 @@ async def test_promoter_duplicate_error_renders_promoter_type(db):
 
     client = await make_client(db)
     sa_user = await make_user(db, name="SA")
+    await make_self_registered_user(db, phone="+919900000000", role="DEALER")
     await db.commit()
 
     payload = {
-        "phone": "+919900000000", "name": "Repeat Person",
+        "phone": "+919900000000",
         "promoter_type": "DEALER", "territory_notes": None,
     }
     await register_promoter(
@@ -329,14 +332,14 @@ async def test_promoter_duplicate_error_renders_promoter_type(db):
     assert "Dealer" in ei.value.detail
 
 
-# ── L1 — name validation on register_promoter ───────────────────────────────
+# ── V1.1 Item 3 — FM cannot create users; must self-register first ──────────
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_register_promoter_rejects_missing_name(db):
-    """Pre-fix the listing showed empty-name rows as a literal em-dash
-    when the CA submitted with a blank name. Belt-and-braces server
-    validation now rejects with 422."""
+async def test_register_promoter_rejects_unknown_phone(db):
+    """V1.1 Item 3 (2026-05-09): FM no longer creates Users. A phone
+    that doesn't match an existing User → structured 422 telling the
+    FM to ask the person to self-register first."""
     from app.modules.clients.router import register_promoter
     from fastapi import HTTPException
 
@@ -344,41 +347,44 @@ async def test_register_promoter_rejects_missing_name(db):
     sa = await make_user(db, name="SA")
     await db.commit()
 
-    for bad in (None, "", "   ", "\t\n"):
-        with pytest.raises(HTTPException) as ei:
-            await register_promoter(
-                client_id=client.id,
-                request={
-                    "phone": f"+91990{hash(str(bad)) % 10**7:07d}",
-                    "name": bad,
-                    "promoter_type": "DEALER",
-                    "territory_notes": None,
-                },
-                db=db, current_user=sa,
-            )
-        assert ei.value.status_code == 422
-        assert "Name" in ei.value.detail
+    with pytest.raises(HTTPException) as ei:
+        await register_promoter(
+            client_id=client.id,
+            request={
+                "phone": "+919999911111",
+                "promoter_type": "DEALER",
+                "territory_notes": None,
+            },
+            db=db, current_user=sa,
+        )
+    assert ei.value.status_code == 422
+    assert ei.value.detail["code"] == "user_not_self_registered"
 
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_register_promoter_strips_name_whitespace(db):
-    """Padded names get trimmed before persistence, so the listing
-    doesn't render leading/trailing spaces."""
+async def test_register_promoter_rejects_user_without_role(db):
+    """The phone matches an existing User but they haven't claimed
+    the DEALER / FACILITATOR role. FM cannot give the role; user
+    must do it themselves on the PWA."""
     from app.modules.clients.router import register_promoter
+    from fastapi import HTTPException
 
     client = await make_client(db)
     sa = await make_user(db, name="SA")
+    plain_user = await make_user(db, name="Just a Farmer")
+    plain_user.phone = "+919900099009"
     await db.commit()
 
-    out = await register_promoter(
-        client_id=client.id,
-        request={
-            "phone": "+919900099009",
-            "name": "  Padded Person  ",
-            "promoter_type": "FACILITATOR",
-            "territory_notes": None,
-        },
-        db=db, current_user=sa,
-    )
-    assert out["name"] == "Padded Person"
+    with pytest.raises(HTTPException) as ei:
+        await register_promoter(
+            client_id=client.id,
+            request={
+                "phone": "+919900099009",
+                "promoter_type": "DEALER",
+                "territory_notes": None,
+            },
+            db=db, current_user=sa,
+        )
+    assert ei.value.status_code == 422
+    assert ei.value.detail["code"] == "user_lacks_self_claimed_role"

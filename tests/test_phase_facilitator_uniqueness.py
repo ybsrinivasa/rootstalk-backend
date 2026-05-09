@@ -19,12 +19,17 @@ from sqlalchemy import select
 from app.modules.clients.models import ClientPromoter
 from app.modules.clients.router import register_promoter
 from tests.conftest import requires_docker
-from tests.factories import make_client, make_user
+from tests.factories import (
+    make_client, make_self_registered_user, make_user,
+)
 
 
-def _payload(*, name="Person", phone, promoter_type="FACILITATOR"):
+def _payload(*, phone, promoter_type="FACILITATOR"):
+    """V1.1 Item 3 (2026-05-09): name no longer accepted — comes
+    from the pre-seeded User. The FM endpoint takes phone +
+    promoter_type + optional territory_notes only."""
     return {
-        "phone": phone, "name": name,
+        "phone": phone,
         "promoter_type": promoter_type, "territory_notes": None,
     }
 
@@ -37,6 +42,7 @@ async def test_facilitator_register_at_first_client_succeeds(db):
     """Sanity check — first-time Facilitator registration is allowed."""
     sa = await make_user(db, name="SA")
     client = await make_client(db)
+    await make_self_registered_user(db, phone="+919900000001", role="FACILITATOR")
     await db.commit()
 
     out = await register_promoter(
@@ -57,6 +63,7 @@ async def test_facilitator_blocked_at_second_client(db):
     sa = await make_user(db, name="SA")
     client_a = await make_client(db)
     client_b = await make_client(db)
+    await make_self_registered_user(db, phone="+919900000002", role="FACILITATOR")
     await db.commit()
 
     # First registration — at client A.
@@ -90,6 +97,7 @@ async def test_dealer_register_at_multiple_clients_allowed(db):
     sa = await make_user(db, name="SA")
     client_a = await make_client(db)
     client_b = await make_client(db)
+    await make_self_registered_user(db, phone="+919900000003", role="DEALER")
     await db.commit()
 
     await register_promoter(
@@ -116,6 +124,7 @@ async def test_facilitator_can_move_after_deactivation(db):
     sa = await make_user(db, name="SA")
     client_a = await make_client(db)
     client_b = await make_client(db)
+    await make_self_registered_user(db, phone="+919900000004", role="FACILITATOR")
     await db.commit()
 
     out_a = await register_promoter(
@@ -148,6 +157,10 @@ async def test_facilitator_dealer_at_different_clients_allowed(db):
     sa = await make_user(db, name="SA")
     client_a = await make_client(db)
     client_b = await make_client(db)
+    # Same User has both roles claimed (Dealer + Facilitator).
+    user = await make_self_registered_user(db, phone="+919900000005", role="DEALER")
+    from app.modules.platform.models import RoleType, UserRole
+    db.add(UserRole(user_id=user.id, role_type=RoleType.FACILITATOR))
     await db.commit()
 
     # Dealer at A first.
@@ -174,6 +187,7 @@ async def test_existing_same_client_facilitator_still_blocked(db):
     "already registered at this client" error path)."""
     sa = await make_user(db, name="SA")
     client = await make_client(db)
+    await make_self_registered_user(db, phone="+919900000006", role="FACILITATOR")
     await db.commit()
 
     await register_promoter(

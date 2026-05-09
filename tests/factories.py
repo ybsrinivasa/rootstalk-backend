@@ -96,6 +96,29 @@ async def make_client(db: AsyncSession, **kw) -> Client:
     return c
 
 
+async def make_self_registered_user(
+    db: AsyncSession, *, phone: str, role: str, name: str = "Pwa User",
+) -> User:
+    """Seed a User with phone + a UserRole entry — i.e. someone who
+    has self-registered as a Dealer or Facilitator on the PWA.
+
+    Used by tests that exercise the FM `register_promoter` flow:
+    post-V1.1 Item 3, the FM endpoint refuses to create users itself
+    and 422s if the user hasn't self-claimed the role first. Tests
+    that previously called `register_promoter` with a fresh phone
+    must now pre-seed via this helper.
+
+    `role` is a string ("DEALER" / "FACILITATOR" / etc) — looked up
+    in RoleType to keep the call sites readable."""
+    from app.modules.platform.models import RoleType, UserRole
+
+    user = await make_user(db, name=name)
+    user.phone = phone
+    db.add(UserRole(user_id=user.id, role_type=RoleType[role]))
+    await db.flush()
+    return user
+
+
 async def make_client_user(
     db: AsyncSession, *, user: User, client: Client,
     role: ClientUserRole = ClientUserRole.CA,

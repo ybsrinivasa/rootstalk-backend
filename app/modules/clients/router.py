@@ -1054,52 +1054,70 @@ async def register_promoter(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Register a dealer or facilitator with this client. Creates user account if needed."""
+    """Recognise a self-registered Dealer or Facilitator at this
+    client. Per the five-ecosystem architecture (2026-05-08), the
+    user must have already self-registered as a Dealer / Facilitator
+    on the PWA — the FM's job is recognition, not creation. The
+    pre-V1.1 flow that silently created Users from the FM modal was
+    replaced 2026-05-09; FMs now type a phone, see the user's
+    self-registered profile, and click Onboard.
+
+    Required gates (all 422 with structured detail on failure):
+      - Phone matches an existing User (no silent creation).
+      - User has the corresponding UserRole (DEALER / FACILITATOR).
+        If they don't, ask them to self-register on the PWA first
+        — the FM cannot give the role on their behalf.
+      - The Facilitator-Promoter exclusivity rule from §11.2 still
+        applies (see block below).
+    """
     from app.modules.platform.models import RoleType, UserRole
-    from app.modules.auth.service import hash_password
-    import secrets
 
     phone = request.get("phone")
-    name = request.get("name")
     promoter_type = request.get("promoter_type", "DEALER").upper()
     territory_notes = request.get("territory_notes")
 
     if promoter_type not in ("DEALER", "FACILITATOR"):
         raise HTTPException(status_code=422, detail="promoter_type must be DEALER or FACILITATOR")
-    # L1 (audit polish, 2026-05-09): require non-empty name. Pre-fix
-    # the endpoint accepted None / "" / "   " and the listing pages
-    # rendered empty-name rows as a literal em-dash. The frontend
-    # already has `required` on the input, so this is the
-    # belt-and-braces server-side guard against bypassing the form.
-    if not name or not str(name).strip():
-        raise HTTPException(status_code=422, detail="Name is required.")
-    name = str(name).strip()
+    if not phone or not str(phone).strip():
+        raise HTTPException(status_code=422, detail="Phone is required.")
+    phone = str(phone).strip()
 
-    # Find or create user by phone
-    existing_user = None
-    if phone:
-        existing_user = (await db.execute(
-            select(User).where(User.phone == phone)
-        )).scalar_one_or_none()
-
-    if existing_user:
-        user = existing_user
-    else:
-        user = User(
-            phone=phone,
-            name=name,
-            language_code="en",
-        )
-        db.add(user)
-        await db.flush()
-
-    # Assign system role (DEALER / FACILITATOR) if not already
-    role_type = RoleType.DEALER if promoter_type == "DEALER" else RoleType.FACILITATOR
-    existing_role = (await db.execute(
-        select(UserRole).where(UserRole.user_id == user.id, UserRole.role_type == role_type)
+    user = (await db.execute(
+        select(User).where(User.phone == phone)
     )).scalar_one_or_none()
-    if not existing_role:
-        db.add(UserRole(user_id=user.id, role_type=role_type))
+    if user is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "user_not_self_registered",
+                "message": (
+                    "No RootsTalk user with this phone. The person "
+                    "must register on the RootsTalk PWA first; you can "
+                    "then onboard them here."
+                ),
+            },
+        )
+
+    role_type = RoleType.DEALER if promoter_type == "DEALER" else RoleType.FACILITATOR
+    has_role = (await db.execute(
+        select(UserRole).where(
+            UserRole.user_id == user.id,
+            UserRole.role_type == role_type,
+            UserRole.status == StatusEnum.ACTIVE,
+        )
+    )).scalar_one_or_none()
+    if has_role is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "user_lacks_self_claimed_role",
+                "message": (
+                    f"This person hasn't self-registered as a {promoter_type.title()} "
+                    "on the RootsTalk PWA. Ask them to do that first; the FM cannot "
+                    "give the role on their behalf."
+                ),
+            },
+        )
 
     # Spec §11.2 — Facilitator-Promoter is exclusive per company
     # ("one company at a time"). The user's described model
@@ -1175,6 +1193,101 @@ async def register_promoter(
         "promoter_type": cp.promoter_type, "status": cp.status,
         "is_promoter": cp.is_promoter,
         "territory_notes": cp.territory_notes, "registered_at": cp.registered_at,
+    }
+
+
+@router.get("/admin/users/lookup-for-onboarding")
+async def lookup_user_for_onboarding(
+    phone: str,
+    client_id: str,
+    promoter_type: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Rich phone lookup for the Field Manager onboarding modal —
+    drives the phone-only UX (V1.1 Item 3, 2026-05-09).
+
+    The FM types a phone, modal blurs and calls this endpoint, then
+    renders one of four states:
+      - exists=False                             → "User must self-register first"
+      - exists=True, has_role=False              → "Has not claimed Dealer/Facilitator yet"
+      - exists=True, has_role=True, onboarded=True  → "Already onboarded at this company"
+      - exists=True, has_role=True, onboarded=False → ready to onboard; show profile preview
+
+    Privacy: returns only this client's view (already_onboarded scoped
+    to client_id; never names other clients the user is onboarded at).
+    For Dealers, the public-ish DealerProfile fields are returned so
+    the FM can verify identity (shop name, address, GPS, sell
+    categories). Government-licence URLs are also returned because
+    KK confirmed offline verification of pesticide / fertiliser
+    licences is part of the FM's onboarding workflow.
+    """
+    from app.modules.platform.models import RoleType, UserRole
+    from app.modules.orders.models import DealerProfile
+
+    promoter_type = promoter_type.upper()
+    if promoter_type not in ("DEALER", "FACILITATOR"):
+        raise HTTPException(
+            status_code=422,
+            detail="promoter_type must be DEALER or FACILITATOR",
+        )
+
+    user = (await db.execute(
+        select(User).where(User.phone == phone)
+    )).scalar_one_or_none()
+    if user is None:
+        return {
+            "exists": False, "user": None, "has_role": False,
+            "already_onboarded": False, "dealer_profile": None,
+        }
+
+    role_type = RoleType.DEALER if promoter_type == "DEALER" else RoleType.FACILITATOR
+    has_role = (await db.execute(
+        select(UserRole).where(
+            UserRole.user_id == user.id,
+            UserRole.role_type == role_type,
+            UserRole.status == StatusEnum.ACTIVE,
+        )
+    )).scalar_one_or_none() is not None
+
+    already_onboarded = (await db.execute(
+        select(ClientPromoter).where(
+            ClientPromoter.user_id == user.id,
+            ClientPromoter.client_id == client_id,
+            ClientPromoter.promoter_type == promoter_type,
+            ClientPromoter.status == "ACTIVE",
+        )
+    )).scalar_one_or_none() is not None
+
+    dealer_profile = None
+    if promoter_type == "DEALER" and has_role:
+        dp = (await db.execute(
+            select(DealerProfile).where(DealerProfile.user_id == user.id)
+        )).scalar_one_or_none()
+        if dp:
+            dealer_profile = {
+                "shop_name": dp.shop_name,
+                "shop_address": dp.shop_address,
+                "sell_categories": dp.sell_categories or [],
+                "shop_photo_url": dp.shop_photo_url,
+                "shop_registration_url": dp.shop_registration_url,
+                "pesticide_licence_url": dp.pesticide_licence_url,
+                "fertiliser_licence_url": dp.fertiliser_licence_url,
+                "shop_gps_lat": float(dp.shop_gps_lat) if dp.shop_gps_lat else None,
+                "shop_gps_lng": float(dp.shop_gps_lng) if dp.shop_gps_lng else None,
+            }
+
+    return {
+        "exists": True,
+        "user": {
+            "id": user.id,
+            "name": user.name,
+            "phone": user.phone,
+            "photo_url": user.photo_url,
+        },
+        "has_role": has_role,
+        "already_onboarded": already_onboarded,
+        "dealer_profile": dealer_profile,
     }
 
 

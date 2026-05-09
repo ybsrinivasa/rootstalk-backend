@@ -34,7 +34,7 @@ from app.modules.farmpundit.models import (
 from app.modules.farmpundit.router import toggle_promoter_pundit
 from tests.conftest import requires_docker
 from tests.factories import (
-    make_client, make_client_user, make_user,
+    make_client, make_client_user, make_self_registered_user, make_user,
 )
 
 
@@ -48,12 +48,13 @@ async def test_register_promoter_defaults_is_promoter_true(db):
     locks in the migration backfill semantics."""
     sa = await make_user(db, name="SA")
     client = await make_client(db)
+    await make_self_registered_user(db, phone="+919900111100", role="FACILITATOR")
     await db.commit()
 
     out = await register_promoter(
         client_id=client.id,
         request={
-            "phone": "+919900111100", "name": "Default Promoter",
+            "phone": "+919900111100",
             "promoter_type": "FACILITATOR", "territory_notes": None,
         },
         db=db, current_user=sa,
@@ -73,8 +74,7 @@ async def test_facilitator_non_promoter_at_other_client_does_not_block(db):
     sa = await make_user(db, name="SA")
     client_a = await make_client(db)
     client_b = await make_client(db)
-    user = await make_user(db, name="Mover")
-    user.phone = "+919900111101"
+    user = await make_self_registered_user(db, phone="+919900111101", role="FACILITATOR", name="Mover")
     # Manually craft a non-promoter Facilitator row at A. The current
     # register_promoter endpoint defaults is_promoter=True, so we
     # bypass it to set up the V1.1-style state directly.
@@ -88,7 +88,7 @@ async def test_facilitator_non_promoter_at_other_client_does_not_block(db):
     out = await register_promoter(
         client_id=client_b.id,
         request={
-            "phone": "+919900111101", "name": "Mover",
+            "phone": "+919900111101",
             "promoter_type": "FACILITATOR", "territory_notes": None,
         },
         db=db, current_user=sa,
@@ -105,13 +105,14 @@ async def test_facilitator_promoter_at_other_client_still_blocks(db):
     sa = await make_user(db, name="SA")
     client_a = await make_client(db)
     client_b = await make_client(db)
+    await make_self_registered_user(db, phone="+919900111102", role="FACILITATOR", name="Locked")
     await db.commit()
 
     # First-time registration at A — defaults is_promoter=True.
     await register_promoter(
         client_id=client_a.id,
         request={
-            "phone": "+919900111102", "name": "Locked",
+            "phone": "+919900111102",
             "promoter_type": "FACILITATOR", "territory_notes": None,
         },
         db=db, current_user=sa,
@@ -121,7 +122,7 @@ async def test_facilitator_promoter_at_other_client_still_blocks(db):
         await register_promoter(
             client_id=client_b.id,
             request={
-                "phone": "+919900111102", "name": "Locked",
+                "phone": "+919900111102",
                 "promoter_type": "FACILITATOR", "territory_notes": None,
             },
             db=db, current_user=sa,
