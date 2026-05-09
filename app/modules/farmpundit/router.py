@@ -1236,11 +1236,29 @@ async def get_query_detail_pundit(
         )).scalars().all()
         response_media = [{"media_type": m.media_type, "url": m.url, "caption": m.caption} for m in rm_result]
 
+    # Resolve the picked Standard Response (if any) for the
+    # response card label. UCAT pipe-3 (commit a6fd376 onwards):
+    # the Pundit can pick a standard answer; that fires the QA
+    # advisory pipe. The frontend renders a "Q&A — <question>"
+    # marker on the response card when this is set.
+    standard_response_question = None
+    if response is not None and response.standard_response_id:
+        sr_row = (await db.execute(
+            select(StandardResponse).where(
+                StandardResponse.id == response.standard_response_id,
+            )
+        )).scalar_one_or_none()
+        standard_response_question = sr_row.question_text if sr_row else None
+
     return {
         "id": query.id,
         "title": query.title,
         "description": query.description,
         "severity": query.severity,
+        # client_id surfaces to the response screen so it can search
+        # the right company's standard library (the search endpoint
+        # is client-scoped per spec §14.9).
+        "client_id": query.client_id,
         "crop_cosh_id": query.crop_cosh_id,
         "crop_age": query.crop_age,
         "status": query.status,
@@ -1259,6 +1277,8 @@ async def get_query_detail_pundit(
         ],
         "response": {
             "problem_cosh_id": response.problem_cosh_id,
+            "standard_response_id": response.standard_response_id,
+            "standard_response_question": standard_response_question,
             "text": response.text,
             "media": response_media,
             "created_at": response.created_at,
