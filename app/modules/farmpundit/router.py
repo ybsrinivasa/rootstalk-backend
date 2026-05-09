@@ -599,13 +599,17 @@ async def query_history(
 
 
 def _serialise_standard_response(sr: StandardResponse) -> dict:
+    """Serialise the entry's metadata only. The advisory body
+    (Timelines + Practices + Elements) is fetched via the timelines
+    endpoints — same shape as PG/SP. Pre-L4-real this serialiser
+    also returned answer_text + answer_media; those columns were
+    dropped in migration `4b8e2c1a93f5` because they overlapped
+    with the QueryResponse-side free-form fallback."""
     return {
         "id": sr.id,
         "client_id": sr.client_id,
         "crop_cosh_id": sr.crop_cosh_id,
         "question_text": sr.question_text,
-        "answer_text": sr.answer_text,
-        "answer_media": sr.answer_media or [],
         "created_by": sr.created_by,
         "created_at": sr.created_at,
         "updated_at": sr.updated_at,
@@ -613,27 +617,13 @@ def _serialise_standard_response(sr: StandardResponse) -> dict:
 
 
 def _validate_standard_response_payload(data: dict) -> None:
-    """Shared input validation for POST + PUT. The spec doesn't
-    mandate an answer at creation time (a SE might draft a question
-    list first and fill answers later), so answer_text is optional.
-    Question is mandatory."""
+    """Shared input validation for POST + PUT. Question is mandatory;
+    crop_cosh_id is optional (null = crop-agnostic per spec §14.9).
+    Advisory body lives on the linked timelines, not on this row,
+    so there's nothing else to validate here."""
     question = data.get("question_text")
     if not question or not str(question).strip():
         raise HTTPException(status_code=422, detail="question_text is required.")
-
-    media = data.get("answer_media")
-    if media is not None:
-        if not isinstance(media, list):
-            raise HTTPException(
-                status_code=422,
-                detail="answer_media must be a list of {media_type, url, caption?}.",
-            )
-        for item in media:
-            if not isinstance(item, dict) or not item.get("url"):
-                raise HTTPException(
-                    status_code=422,
-                    detail="Each answer_media entry needs a url.",
-                )
 
 
 @router.get("/client/{client_id}/standard-responses")
@@ -676,8 +666,6 @@ async def create_standard_response(
         client_id=client_id,
         crop_cosh_id=data.get("crop_cosh_id") or None,
         question_text=str(data["question_text"]).strip(),
-        answer_text=(str(data.get("answer_text") or "").strip() or None),
-        answer_media=data.get("answer_media") or None,
         created_by=current_user.id,
     )
     db.add(sr)
@@ -711,8 +699,6 @@ async def update_standard_response(
         raise HTTPException(status_code=404, detail="Standard response not found")
 
     sr.question_text = str(data["question_text"]).strip()
-    sr.answer_text = (str(data.get("answer_text") or "").strip() or None)
-    sr.answer_media = data.get("answer_media") or None
     sr.crop_cosh_id = data.get("crop_cosh_id") or None
     await db.commit()
     await db.refresh(sr)

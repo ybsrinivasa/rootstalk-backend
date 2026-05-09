@@ -1,18 +1,18 @@
-"""Standard Q&A library — L4 of the audit (2026-05-09).
+"""Standard Q&A library — entry-level CRUD (L4-real Sub-batch 1).
 
-Spec §14.9. Subject Experts curate question/answer pairs for their
-company; FarmPundits pick from the library when responding to
+Spec §14.9. Subject Experts curate a library of question-rooted
+advisories; FarmPundits pick the closest match while responding to
 farmer queries.
 
-V1 surface (this batch):
-- GET    /client/{cid}/standard-responses     (CA-portal list)
-- POST   /client/{cid}/standard-responses     (create)
-- PUT    /client/{cid}/standard-responses/{id} (edit)
-- DELETE /client/{cid}/standard-responses/{id}
-- GET    /pundit/standard-responses           (Pundit search; existed)
+Pre-L4-real (commit 40f4238 earlier today) the model carried
+`answer_text` + `answer_media` as the advisory body. That was the
+"notepad" cut and got dropped in migration `4b8e2c1a93f5` once we
+adopted UCAT — Q&A advisories carry full Timelines (in
+`pg_timelines`, polymorphic by Sub-batch 1) the same way PG and SP
+do.
 
-Answer body for V1 is text + media (JSON list). Timelines /
-Practices integration deferred to V1.1 — see audit memory.
+This test file covers entry-level CRUD only. Timeline / Practice /
+Element CRUD lands in Sub-batch 2.
 """
 from __future__ import annotations
 
@@ -31,18 +31,16 @@ from tests.factories import make_client, make_client_user, make_user
 
 
 async def _se_for(db, *, client):
-    """Subject Expert (any portal member, in V1 the gate is
-    membership-only) for the standard-responses endpoints."""
     user = await make_user(db, name=f"SE-{client.short_name}")
     await make_client_user(db, user=user, client=client)
     return user
 
 
-# ── create + list ───────────────────────────────────────────────────────────
+# ── create ──────────────────────────────────────────────────────────────────
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_create_returns_full_payload(db):
+async def test_create_returns_metadata(db):
     client = await make_client(db)
     se = await _se_for(db, client=client)
     await db.commit()
@@ -51,37 +49,32 @@ async def test_create_returns_full_payload(db):
         client_id=client.id,
         data={
             "question_text": "Why are leaves yellowing in young paddy?",
-            "answer_text": "Likely nitrogen deficiency. Apply urea at 40kg/ha.",
             "crop_cosh_id": "crop:paddy",
         },
         db=db, current_user=se,
     )
     assert out["question_text"].startswith("Why are leaves")
-    assert out["answer_text"].startswith("Likely nitrogen")
     assert out["crop_cosh_id"] == "crop:paddy"
     assert out["created_by"] == se.id
-    assert out["answer_media"] == []  # serialiser normalises None → []
+    # The advisory body lives on linked timelines — it's not in this
+    # response. Sub-batch 2 will add the timeline endpoints.
+    assert "answer_text" not in out
+    assert "answer_media" not in out
 
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_create_strips_whitespace_and_empties(db):
-    """Padding gets trimmed; an all-whitespace answer_text becomes
-    None so the listing doesn't render empty quotes."""
+async def test_create_strips_whitespace(db):
     client = await make_client(db)
     se = await _se_for(db, client=client)
     await db.commit()
 
     out = await create_standard_response(
         client_id=client.id,
-        data={
-            "question_text": "  Q?  ",
-            "answer_text": "   ",
-        },
+        data={"question_text": "  Q?  "},
         db=db, current_user=se,
     )
     assert out["question_text"] == "Q?"
-    assert out["answer_text"] is None
 
 
 @requires_docker
@@ -102,67 +95,11 @@ async def test_create_requires_question_text(db):
         assert "question_text" in ei.value.detail
 
 
-@requires_docker
-@pytest.mark.asyncio
-async def test_create_validates_media_shape(db):
-    """answer_media must be a list of dicts each with a `url`. Bad
-    shapes are rejected with 422 instead of being silently persisted."""
-    client = await make_client(db)
-    se = await _se_for(db, client=client)
-    await db.commit()
-
-    # Not a list.
-    with pytest.raises(HTTPException) as ei:
-        await create_standard_response(
-            client_id=client.id,
-            data={
-                "question_text": "Q?",
-                "answer_media": {"url": "http://x"},
-            },
-            db=db, current_user=se,
-        )
-    assert ei.value.status_code == 422
-
-    # List with a missing url.
-    with pytest.raises(HTTPException) as ei:
-        await create_standard_response(
-            client_id=client.id,
-            data={
-                "question_text": "Q?",
-                "answer_media": [{"media_type": "IMAGE"}],
-            },
-            db=db, current_user=se,
-        )
-    assert ei.value.status_code == 422
-
-
-@requires_docker
-@pytest.mark.asyncio
-async def test_create_persists_media_list(db):
-    client = await make_client(db)
-    se = await _se_for(db, client=client)
-    await db.commit()
-
-    media = [
-        {"media_type": "IMAGE", "url": "https://cdn/a.jpg", "caption": "Diagnosis"},
-        {"media_type": "HYPERLINK", "url": "https://kvk.example/paddy"},
-    ]
-    out = await create_standard_response(
-        client_id=client.id,
-        data={"question_text": "Q?", "answer_media": media},
-        db=db, current_user=se,
-    )
-    assert len(out["answer_media"]) == 2
-    assert out["answer_media"][0]["caption"] == "Diagnosis"
-
-
 # ── list filters ────────────────────────────────────────────────────────────
 
 @requires_docker
 @pytest.mark.asyncio
 async def test_list_returns_client_scoped_only(db):
-    """Client A's list never leaks Client B's entries — each client
-    has its own library."""
     client_a = await make_client(db)
     client_b = await make_client(db)
     se_a = await _se_for(db, client=client_a)
@@ -189,8 +126,6 @@ async def test_list_returns_client_scoped_only(db):
 @requires_docker
 @pytest.mark.asyncio
 async def test_list_filters_by_crop_or_agnostic(db):
-    """`crop_cosh_id=AGNOSTIC` returns only entries with no crop set;
-    a real crop_cosh_id filters to that crop; omitted = no filter."""
     client = await make_client(db)
     se = await _se_for(db, client=client)
     await db.commit()
@@ -265,7 +200,7 @@ async def test_update_persists_new_values(db):
 
     created = await create_standard_response(
         client_id=client.id,
-        data={"question_text": "Old Q", "answer_text": "Old A"},
+        data={"question_text": "Old Q"},
         db=db, current_user=se,
     )
 
@@ -273,20 +208,17 @@ async def test_update_persists_new_values(db):
         client_id=client.id, sr_id=created["id"],
         data={
             "question_text": "New Q",
-            "answer_text": "New A",
             "crop_cosh_id": "crop:wheat",
         },
         db=db, current_user=se,
     )
     assert updated["question_text"] == "New Q"
-    assert updated["answer_text"] == "New A"
     assert updated["crop_cosh_id"] == "crop:wheat"
 
 
 @requires_docker
 @pytest.mark.asyncio
 async def test_update_404_for_other_clients_response(db):
-    """Cannot edit another client's response by guessing the id."""
     client_a = await make_client(db)
     client_b = await make_client(db)
     se_a = await _se_for(db, client=client_a)
@@ -335,7 +267,6 @@ async def test_delete_removes_row(db):
 @requires_docker
 @pytest.mark.asyncio
 async def test_delete_404_for_other_clients_response(db):
-    """Same cross-client guard as update."""
     client_a = await make_client(db)
     client_b = await make_client(db)
     se_a = await _se_for(db, client=client_a)
@@ -372,14 +303,14 @@ async def test_list_rejects_non_member(db):
     assert ei.value.status_code == 403
 
 
-# ── pundit-side search backward-compat ──────────────────────────────────────
+# ── pundit-side search ──────────────────────────────────────────────────────
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_pundit_search_unchanged_shape_includes_answer_body(db):
-    """The Pundit-side search now returns the full payload (was
-    raw rows pre-fix). The Pundit's response screen needs the
-    answer_text + answer_media to render the standard answer."""
+async def test_pundit_search_returns_metadata(db):
+    """The Pundit-side search returns the entry's question + crop —
+    enough to render the picker. Timelines come via a separate
+    fetch when the Pundit selects an entry (Sub-batch 2 / 6)."""
     client = await make_client(db)
     se = await _se_for(db, client=client)
     pundit = await make_user(db, name="Pundit")
@@ -387,10 +318,7 @@ async def test_pundit_search_unchanged_shape_includes_answer_body(db):
 
     await create_standard_response(
         client_id=client.id,
-        data={
-            "question_text": "How to control aphids?",
-            "answer_text": "Spray neem oil 5ml/L weekly.",
-        },
+        data={"question_text": "How to control aphids?"},
         db=db, current_user=se,
     )
 
@@ -399,4 +327,106 @@ async def test_pundit_search_unchanged_shape_includes_answer_body(db):
         db=db, current_user=pundit,
     )
     assert len(out) == 1
-    assert out[0]["answer_text"] == "Spray neem oil 5ml/L weekly."
+    assert out[0]["question_text"] == "How to control aphids?"
+
+
+# ── pg_timelines polymorphism: dual-FK CHECK ────────────────────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_pg_timelines_check_constraint_rejects_dual_parent(db):
+    """A row with BOTH pg_recommendation_id and standard_response_id
+    set must fail the DB CHECK. This is the invariant that makes
+    `parent_kind` a sound derivation — exactly one parent, ever."""
+    from app.modules.advisory.models import (
+        PGRecommendation, PGTimeline,
+    )
+    from sqlalchemy.exc import IntegrityError
+
+    client = await make_client(db)
+    await db.commit()
+
+    pg = PGRecommendation(
+        problem_group_cosh_id="pg:test",
+        client_id=client.id,
+        application_type="SPRAY",
+        status="DRAFT",
+    )
+    db.add(pg)
+    await db.flush()
+
+    sr = StandardResponse(
+        client_id=client.id, question_text="Q?",
+    )
+    db.add(sr)
+    await db.flush()
+
+    db.add(PGTimeline(
+        pg_recommendation_id=pg.id,
+        standard_response_id=sr.id,  # both set — violates CHECK
+        name="Bad timeline",
+        from_value=0, to_value=7,
+    ))
+    with pytest.raises(IntegrityError):
+        await db.flush()
+    await db.rollback()
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_pg_timelines_check_constraint_rejects_zero_parents(db):
+    """Symmetric: NEITHER parent set is also a violation."""
+    from app.modules.advisory.models import PGTimeline
+    from sqlalchemy.exc import IntegrityError
+
+    client = await make_client(db)
+    await db.commit()
+
+    db.add(PGTimeline(
+        pg_recommendation_id=None,
+        standard_response_id=None,  # zero parents — violates CHECK
+        name="Orphan timeline",
+        from_value=0, to_value=7,
+    ))
+    with pytest.raises(IntegrityError):
+        await db.flush()
+    await db.rollback()
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_pg_timeline_parent_kind_property(db):
+    """The Python-side `parent_kind` derivation reads 'PG' or 'QA'
+    based on which FK is set. No schema column; pure read-side
+    convenience for the unified advisory-render service."""
+    from app.modules.advisory.models import (
+        PGRecommendation, PGTimeline,
+    )
+
+    client = await make_client(db)
+    await db.commit()
+
+    pg = PGRecommendation(
+        problem_group_cosh_id="pg:test",
+        client_id=client.id,
+        application_type="SPRAY",
+        status="DRAFT",
+    )
+    db.add(pg)
+    sr = StandardResponse(client_id=client.id, question_text="Q?")
+    db.add(sr)
+    await db.flush()
+
+    pg_tl = PGTimeline(
+        pg_recommendation_id=pg.id, name="PG-rooted",
+        from_value=0, to_value=7,
+    )
+    qa_tl = PGTimeline(
+        standard_response_id=sr.id, name="QA-rooted",
+        from_value=0, to_value=7, from_type="DAYS_AFTER_RESPONSE",
+    )
+    db.add_all([pg_tl, qa_tl])
+    await db.flush()
+
+    assert pg_tl.parent_kind == "PG"
+    assert qa_tl.parent_kind == "QA"

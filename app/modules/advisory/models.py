@@ -3,7 +3,7 @@ import enum
 from datetime import datetime, timezone
 from sqlalchemy import (
     String, Text, Boolean, Integer, DateTime, ForeignKey,
-    Enum as SAEnum, UniqueConstraint, Index
+    Enum as SAEnum, UniqueConstraint, Index, CheckConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database import Base
@@ -358,17 +358,56 @@ class PGRecommendation(Base):
 
 
 class PGTimeline(Base):
+    """Timeline rooted at a CHA Problem-Group recommendation OR a
+    Q&A standard response (UCAT pipe-3, spec §14.9). The table name
+    is historical — table hosts both PG-rooted and QA-rooted
+    timelines as of 2026-05-09. Cosmetic rename to `advisory_
+    timelines` deferred to V1.1.
+
+    Exactly one of `pg_recommendation_id` / `standard_response_id`
+    is set per row, enforced by the DB-level CHECK
+    `pg_timelines_one_parent_chk`. `parent_kind` is a Python-side
+    convenience for read code; no schema column.
+    """
     __tablename__ = "pg_timelines"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
-    pg_recommendation_id: Mapped[str] = mapped_column(String(36), ForeignKey("pg_recommendations.id"), nullable=False)
+    pg_recommendation_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("pg_recommendations.id"), nullable=True,
+    )
+    standard_response_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("standard_responses.id"), nullable=True,
+    )
     name: Mapped[str] = mapped_column(String(500), nullable=False)
     from_type: Mapped[str] = mapped_column(String(30), default="DAYS_AFTER_DETECTION")
     from_value: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     to_value: Mapped[int] = mapped_column(Integer, nullable=False)
 
-    pg_recommendation: Mapped["PGRecommendation"] = relationship("PGRecommendation", back_populates="timelines")
+    pg_recommendation: Mapped["PGRecommendation"] = relationship(
+        "PGRecommendation", back_populates="timelines",
+    )
     practices: Mapped[list["PGPractice"]] = relationship("PGPractice", back_populates="timeline")
+
+    __table_args__ = (
+        # Mirror the migration's CHECK so create_all-based test
+        # DBs enforce the same invariant. Postgres-only syntax
+        # (CASE-based count) — fine, the project is Postgres-only.
+        CheckConstraint(
+            "(CASE WHEN pg_recommendation_id IS NOT NULL THEN 1 ELSE 0 END) "
+            "+ (CASE WHEN standard_response_id IS NOT NULL THEN 1 ELSE 0 END) = 1",
+            name="pg_timelines_one_parent_chk",
+        ),
+    )
+
+    @property
+    def parent_kind(self) -> str:
+        """'PG' if rooted at a PG recommendation, 'QA' if rooted at a
+        Standard Response. Read-only derivation — no schema column.
+        Useful for the unified advisory-render service that walks
+        timelines across UCAT pipes."""
+        if self.standard_response_id is not None:
+            return "QA"
+        return "PG"
 
 
 class PGPractice(Base):

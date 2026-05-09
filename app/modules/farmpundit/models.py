@@ -1,7 +1,7 @@
 import uuid
 import enum
 from datetime import datetime, timezone
-from sqlalchemy import String, Text, Boolean, Integer, DateTime, ForeignKey, UniqueConstraint, JSON
+from sqlalchemy import String, Text, Boolean, Integer, DateTime, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database import Base
 
@@ -204,21 +204,29 @@ class QueryResponse(Base):
 
 
 class StandardResponse(Base):
-    """Company Q&A library — spec §14.9.
+    """Company Q&A library — spec §14.9 (UCAT third pipe).
 
-    Subject Experts curate a library of standard question/answer
-    pairs for their company. FarmPundits browse the library while
-    responding to farmer queries; they can pick a closest-matching
-    standard answer and forward it as-is (no edit; can layer their
-    own additional guidance on top).
+    Subject Experts curate a library of question + Timeline-rooted
+    advisories for their company. FarmPundits pick the closest-
+    matching standard response while responding to farmer queries;
+    the response's Timelines (with their full Practice → Element
+    structure) merge into the farmer's advisory just like a PG/SP
+    CHA recommendation, with a Pundit-origin icon on the cards.
+
+    UCAT (Universal Crop Advisory Template): the Timeline → Practice
+    → Element shape is identical across all three advisory pipes
+    (CCA / CHA / Q&A). The only thing that differs is the trigger /
+    anchor — for Q&A, the trigger is the Pundit's pick and the
+    anchor unit is "days after response delivered to farmer".
 
     `crop_cosh_id` nullable supports both crop-specific and crop-
     agnostic entries per spec.
 
-    V1 answer body is text + media. The spec also allows answers to
-    embed full Timelines/Practices/Elements (same structure as a CHA
-    plan); that integration is deferred to V1.1 — see
-    project_rootstalk_audit_facilitator_dealer_farmpundit.md.
+    Schema reuse: a Q&A timeline is just a row in `pg_timelines`
+    with `standard_response_id` set and `pg_recommendation_id=NULL`.
+    The CHECK constraint `pg_timelines_one_parent_chk` enforces
+    exactly-one parent. Practices and Elements are reused as-is
+    (they FK to timeline_id only). Adding QA cost zero new tables.
     """
     __tablename__ = "standard_responses"
 
@@ -226,14 +234,6 @@ class StandardResponse(Base):
     client_id: Mapped[str] = mapped_column(String(36), ForeignKey("clients.id"), nullable=False)
     crop_cosh_id: Mapped[str] = mapped_column(String(100), nullable=True)
     question_text: Mapped[str] = mapped_column(Text, nullable=False)
-    answer_text: Mapped[str] = mapped_column(Text, nullable=True)
-    # JSON list of {media_type, url, caption?} entries. Media types
-    # mirror what QueryResponseMedia accepts (IMAGE / VIDEO / AUDIO /
-    # HYPERLINK). Persisted as JSON because the v1 surface is a
-    # simple list and doesn't need a separate join table; if an
-    # author-side moderation flow lands later it can move to a row-
-    # per-asset table without touching consumers.
-    answer_media: Mapped[list] = mapped_column(JSON, nullable=True)
     created_by: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
