@@ -21,7 +21,7 @@ from app.services.bl12_query_state import (
     can_reject as bl12_can_reject,
     validate_transition as validate_query_transition,
 )
-from app.modules.subscriptions.models import Subscription
+from app.modules.subscriptions.models import Subscription, SubscriptionStatus
 
 router = APIRouter(tags=["FarmPundit"])
 
@@ -438,9 +438,17 @@ async def respond_to_query(
     query.status = QueryStatus.RESPONDED
     query.current_holder_id = None
 
-    # BL-12 / §14.7: If pundit identified a crop health problem → trigger CHA delivery
+    # The Pundit's response can carry one of three branches per the
+    # UCAT three-pipe model (see project_rootstalk_ucat.md):
+    #   1. problem_cosh_id set    → CHA pipe (§14.7)
+    #   2. standard_response_id   → Q&A pipe (§14.9)
+    #   3. text/media only        → degraded fallback (no advisory
+    #                               trigger; reaches farmer via
+    #                               QueryResponse on a separate page)
     if data.get("problem_cosh_id"):
         await _trigger_cha_for_query(db, query, data["problem_cosh_id"])
+    elif data.get("standard_response_id"):
+        await _trigger_qa_for_query(db, query, data["standard_response_id"])
 
     await db.commit()
     return {"status": "RESPONDED", "response_id": response.id}
@@ -1571,4 +1579,62 @@ async def _trigger_cha_for_query(db: AsyncSession, query: Query, problem_cosh_id
         triggered_by="QUERY",
         problem_name=resolved.problem_name,
         parent_pg_cosh_id=resolved.parent_pg_cosh_id,
+    ))
+
+
+async def _trigger_qa_for_query(
+    db: AsyncSession, query: Query, standard_response_id: str,
+):
+    """§14.9: When a Pundit picks a Standard Response, deliver the
+    advisory's Timelines into the farmer's plan. Mirrors
+    `_trigger_cha_for_query` — same TriggeredCHAEntry table — but
+    `recommendation_type='QA'` and `recommendation_id` points at the
+    Standard Response. The PWA-side render branches on
+    recommendation_type to walk the right Timeline source: PG/SP go
+    via pg_recommendations.id / sp_recommendations.id, QA goes via
+    standard_responses.id (which after Sub-batch 1 is a valid
+    parent of pg_timelines).
+
+    Silent no-op (matches CHA path) when:
+      - the Pundit picked a SR that doesn't belong to the query's
+        client (cross-client guess);
+      - the farmer has no active subscription with this client.
+    These are diagnostic-only edge cases; logging not warranted.
+    """
+    from app.modules.farmpundit.models import StandardResponse
+    from app.modules.subscriptions.models import TriggeredCHAEntry
+
+    sr = (await db.execute(
+        select(StandardResponse).where(
+            StandardResponse.id == standard_response_id,
+            StandardResponse.client_id == query.client_id,
+        )
+    )).scalar_one_or_none()
+    if not sr:
+        return
+
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.farmer_user_id == query.farmer_user_id,
+            Subscription.client_id == query.client_id,
+            Subscription.status == SubscriptionStatus.ACTIVE,
+        ).order_by(Subscription.created_at.desc()).limit(1)
+    )).scalar_one_or_none()
+    if not sub:
+        return
+
+    # problem_name ≈ what farmer-side cards show. For QA, the
+    # question is the most useful label. Truncate to fit the column.
+    label = (sr.question_text or "")[:500]
+
+    db.add(TriggeredCHAEntry(
+        subscription_id=sub.id,
+        farmer_user_id=query.farmer_user_id,
+        client_id=query.client_id,
+        problem_cosh_id=None,           # not a CHA problem
+        recommendation_type="QA",
+        recommendation_id=sr.id,
+        triggered_by="QUERY",
+        problem_name=label,
+        parent_pg_cosh_id=None,
     ))

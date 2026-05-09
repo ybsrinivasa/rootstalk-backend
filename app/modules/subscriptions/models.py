@@ -185,18 +185,29 @@ class ConditionalAnswer(Base):
 
 
 class TriggeredCHAEntry(Base):
-    """CHA recommendation triggered by diagnosis (BL-08) or FarmPundit query response."""
+    """Advisory entries triggered into a farmer's plan by a Pundit
+    response or self-diagnosis. Despite the historical name (CHA-
+    flavoured), this row hosts entries from BOTH advisory pipes that
+    flow through a query response per UCAT — CHA and Q&A. The
+    `recommendation_type` field discriminates: 'PG' / 'SP' for CHA,
+    'QA' for the Q&A library.
+
+    `problem_cosh_id` is nullable post-2026-05-09 — Q&A entries are
+    rooted in a question rather than a Cosh-side problem identifier,
+    so the column has no meaningful value for them. CHA paths
+    continue to populate it.
+    """
     __tablename__ = "triggered_cha_entries"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     subscription_id: Mapped[str] = mapped_column(String(36), ForeignKey("subscriptions.id"), nullable=False)
     farmer_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
     client_id: Mapped[str] = mapped_column(String(36), ForeignKey("clients.id"), nullable=False)
-    problem_cosh_id: Mapped[str] = mapped_column(String(200), nullable=False)
-    recommendation_type: Mapped[str] = mapped_column(String(5), nullable=False)  # SP | PG
+    problem_cosh_id: Mapped[str] = mapped_column(String(200), nullable=True)
+    recommendation_type: Mapped[str] = mapped_column(String(5), nullable=False)  # SP | PG | QA
     recommendation_id: Mapped[str] = mapped_column(String(36), nullable=False)
     triggered_by: Mapped[str] = mapped_column(String(20), nullable=False)        # DIAGNOSIS | QUERY | DIRECT
     triggered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
-    problem_name: Mapped[str] = mapped_column(String(500), nullable=True)    # display name e.g. "Leaf Blast"
-    parent_pg_cosh_id: Mapped[str] = mapped_column(String(200), nullable=True)  # resolved parent PG
+    problem_name: Mapped[str] = mapped_column(String(500), nullable=True)    # display name; CHA: problem; QA: question text
+    parent_pg_cosh_id: Mapped[str] = mapped_column(String(200), nullable=True)  # resolved parent PG (CHA only)
