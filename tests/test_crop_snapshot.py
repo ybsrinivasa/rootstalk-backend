@@ -15,13 +15,11 @@ from app.services.crop_snapshot import (
 
 
 _DEFAULT_TRANSLATIONS = {"en": "Paddy"}
-_DEFAULT_METADATA = {"scientific_name": "Oryza sativa"}
 
 
-def _cosh(translations=..., metadata=..., status="active"):
+def _cosh(translations=..., status="active"):
     return SimpleNamespace(
         translations=_DEFAULT_TRANSLATIONS if translations is ... else translations,
-        metadata_=_DEFAULT_METADATA if metadata is ... else metadata,
         status=status,
     )
 
@@ -31,9 +29,11 @@ def _measure(value="AREA_WISE"):
 
 
 def test_happy_path_returns_full_snapshot():
+    """V1 (post 2026-05-09 live Cosh sync): scientific_name is None
+    until the Scientific Names Connect ships separately."""
     snap = build_snapshot_from_rows(_cosh(), _measure())
     assert snap == CropSnapshot(
-        name_en="Paddy", scientific_name="Oryza sativa",
+        name_en="Paddy", scientific_name=None,
         area_or_plant="AREA_WISE",
     )
 
@@ -43,28 +43,11 @@ def test_plant_wise_measure_carried_through():
     assert snap.area_or_plant == "PLANT_WISE"
 
 
-def test_missing_scientific_name_is_none_not_error():
-    """Not all crops have scientific names — leave the snapshot
-    field NULL rather than refuse to add the crop."""
-    snap = build_snapshot_from_rows(
-        _cosh(metadata={}), _measure(),
-    )
-    assert snap.scientific_name is None
-
-
-def test_metadata_with_blank_scientific_name_normalises_to_none():
-    """Empty string masquerading as a value would surface as a real
-    string downstream — coerce to None at the snapshot boundary so
-    NULL semantics are consistent."""
-    snap = build_snapshot_from_rows(
-        _cosh(metadata={"scientific_name": ""}), _measure(),
-    )
-    assert snap.scientific_name is None
-
-
-def test_metadata_none_is_safe():
-    """Cosh entry with no metadata at all should not error."""
-    snap = build_snapshot_from_rows(_cosh(metadata=None), _measure())
+def test_scientific_name_is_always_none_in_v1():
+    """V1 doesn't source scientific names from Cosh — separate Connect
+    will land that data later. Confirm the snapshot consistently
+    returns None regardless of any legacy metadata field on cosh_row."""
+    snap = build_snapshot_from_rows(_cosh(), _measure())
     assert snap.scientific_name is None
 
 

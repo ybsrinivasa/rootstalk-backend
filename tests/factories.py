@@ -47,29 +47,76 @@ async def make_user(db: AsyncSession, **kw) -> User:
 
 async def make_crop_reference(
     db: AsyncSession, cosh_id: str, *,
-    name: str = "Paddy", scientific_name: str | None = "Oryza sativa",
+    name: str = "Paddy", scientific_name: str | None = None,
     measure: str = "AREA_WISE", status: str = "active",
 ) -> tuple[CoshCoreItem, CropMeasure]:
-    """Seed a Cosh crop entity + its system-level area/plant mapping.
+    """Seed a Cosh biological_name + Crop classification + measure.
 
-    Required when a test exercises CCA Step 1 add_crop, since add_crop
-    refuses to create a ClientCrop unless these reference rows exist
-    (CropSnapshot 422 path). Idempotent: re-seeding the same cosh_id
-    is a no-op.
+    Mirrors the post 2026-05-09 live-sync shape:
+      • CoshCoreItem(core_type='biological_names', cosh_id=...)
+      • CoshConnectRow(connect_type='biological_names_and_roles',
+        endpoints=[{role: biological_names, cosh_id: <name>},
+                   {role: roles_of_biological_names, cosh_id: CROP_UUID}])
+      • CoshCoreItem(core_type='roles_of_biological_names',
+        cosh_id=CROP_UUID)  — idempotent
+      • CropMeasure(crop_cosh_id=..., measure=...)
+
+    Required when a test exercises CCA Step 1 add_crop. Idempotent on
+    cosh_id. The `scientific_name` parameter is accepted for back-
+    compat with existing call sites but ignored — V1 doesn't source
+    scientific names from Cosh until that Core's Connect ships.
     """
+    from app.modules.sync.models import CoshConnectRow
+    from app.services.cosh_constants import (
+        COSH_BIOLOGICAL_NAMES_CORE, COSH_NAME_ROLE_CONNECT,
+        COSH_ROLES_CORE, COSH_ROLE_CROP_UUID,
+    )
+
     existing_ref = (await db.execute(
         select(CoshCoreItem).where(
             CoshCoreItem.cosh_id == cosh_id,
-            CoshCoreItem.core_type == "crop",
+            CoshCoreItem.core_type == COSH_BIOLOGICAL_NAMES_CORE,
         )
     )).scalar_one_or_none()
     if existing_ref is None:
         existing_ref = CoshCoreItem(
-            cosh_id=cosh_id, core_type="crop", status=status,
-            translations={"en": name},
-            metadata_={"scientific_name": scientific_name} if scientific_name else None,
+            cosh_id=cosh_id, core_type=COSH_BIOLOGICAL_NAMES_CORE,
+            status=status, translations={"en": name},
         )
         db.add(existing_ref)
+
+    # Seed the Crop role item — once per test session.
+    crop_role = (await db.execute(
+        select(CoshCoreItem).where(
+            CoshCoreItem.cosh_id == COSH_ROLE_CROP_UUID,
+            CoshCoreItem.core_type == COSH_ROLES_CORE,
+        )
+    )).scalar_one_or_none()
+    if crop_role is None:
+        db.add(CoshCoreItem(
+            cosh_id=COSH_ROLE_CROP_UUID, core_type=COSH_ROLES_CORE,
+            status="active", translations={"en": "Crop"},
+        ))
+
+    # Connect this name to the Crop role.
+    connect_id = f"connect:{cosh_id}:crop"
+    existing_connect = (await db.execute(
+        select(CoshConnectRow).where(
+            CoshConnectRow.connect_id == connect_id,
+            CoshConnectRow.connect_type == COSH_NAME_ROLE_CONNECT,
+        )
+    )).scalar_one_or_none()
+    if existing_connect is None:
+        db.add(CoshConnectRow(
+            connect_id=connect_id, connect_type=COSH_NAME_ROLE_CONNECT,
+            status="active",
+            endpoints=[
+                {"role": COSH_BIOLOGICAL_NAMES_CORE,
+                 "cosh_id": cosh_id, "position": 1},
+                {"role": COSH_ROLES_CORE,
+                 "cosh_id": COSH_ROLE_CROP_UUID, "position": 2},
+            ],
+        ))
 
     existing_measure = (await db.execute(
         select(CropMeasure).where(CropMeasure.crop_cosh_id == cosh_id)

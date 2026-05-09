@@ -270,7 +270,7 @@ async def test_caption_in_requested_language(db):
 @requires_docker
 @pytest.mark.asyncio
 async def test_google_query_uses_farmer_language(db):
-    await _seed_core_translation(db, cosh_id=CROP, core_type="crop",
+    await _seed_core_translation(db, cosh_id=CROP, core_type="biological_names",
                                  en="Tomato", kn="ಟೊಮೆಟೊ")
     await _seed_core_translation(db, cosh_id=PART, core_type="part",
                                  en="Leaf", kn="ಎಲೆ")
@@ -308,7 +308,7 @@ async def test_endpoint_returns_images_when_present(db):
     await _seed_image_link(db, connect_id="lnk1",
                            connect_type="tomato_pest_images",
                            pest_diagnosis_id="pdc:r1", media_id="med:img1")
-    await _seed_core_translation(db, cosh_id=CROP, core_type="crop",
+    await _seed_core_translation(db, cosh_id=CROP, core_type="biological_names",
                                  en="Tomato")
     await _seed_core_translation(db, cosh_id=PART, core_type="part",
                                  en="Leaf")
@@ -336,7 +336,7 @@ async def test_endpoint_returns_images_when_present(db):
 async def test_endpoint_returns_empty_images_with_google_fallback(db):
     """No-image fallback path: empty list + the Google URL is still
     populated so the PWA can offer it."""
-    await _seed_core_translation(db, cosh_id=CROP, core_type="crop",
+    await _seed_core_translation(db, cosh_id=CROP, core_type="biological_names",
                                  en="Tomato")
     await _seed_core_translation(db, cosh_id=PART, core_type="part",
                                  en="Leaf")

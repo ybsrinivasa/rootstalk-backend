@@ -719,6 +719,33 @@ async def list_crops(
     ]
 
 
+@router.get("/client/{client_id}/available-crops")
+async def list_available_crops(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CA-portal "Add Crop" picker — Cosh's full Crop universe minus
+    crops this client already has on the belt. Returns
+    `[{cosh_id, name_en, status}]` sorted by English name.
+
+    Note: until the Area/Plant Connect ships, the CA can browse but
+    `add_crop` will 422 with `crop_missing_measure` for any pick. The
+    picker is still useful — the SA team can stage area/plant typing
+    in `crop_measures` for the names CAs actually want."""
+    from app.services.cosh_crop_view import list_crops as list_cosh_crops
+    all_crops = await list_cosh_crops(db)
+
+    already_added = (await db.execute(
+        select(ClientCrop.crop_cosh_id).where(
+            ClientCrop.client_id == client_id,
+            ClientCrop.removed_at.is_(None),
+        )
+    )).scalars().all()
+    already_set = set(already_added)
+    return [c for c in all_crops if c["cosh_id"] not in already_set]
+
+
 @router.post("/client/{client_id}/crops", response_model=CropOut, status_code=201)
 async def add_crop(
     client_id: str,

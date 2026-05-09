@@ -358,16 +358,17 @@ async def test_re_add_does_not_revive_independent_inactive(db):
 @requires_docker
 @pytest.mark.asyncio
 async def test_add_crop_populates_snapshot_fields(db):
-    """Snapshot rule: at CA-add time, crop_name_en /
-    crop_scientific_name / crop_area_or_plant are captured from
-    Cosh + CropMeasure so the company's CCA configuration is frozen
-    against future Cosh-side drift."""
+    """Snapshot rule: at CA-add time, crop_name_en / crop_area_or_plant
+    are captured from Cosh + CropMeasure so the company's CCA
+    configuration is frozen against future Cosh-side drift.
+
+    crop_scientific_name is None in V1 — the Scientific Names Cosh
+    Core has its own Connect that hasn't shipped yet. Snapshotting
+    will start populating this field once that Connect arrives."""
     client = await make_client(db)
     user = await make_user(db, name="CA")
     await make_crop_reference(
-        db, "crop:coconut",
-        name="Coconut", scientific_name="Cocos nucifera",
-        measure="PLANT_WISE",
+        db, "crop:coconut", name="Coconut", measure="PLANT_WISE",
     )
     await db.commit()
 
@@ -376,7 +377,7 @@ async def test_add_crop_populates_snapshot_fields(db):
         db=db, current_user=user,
     )
     assert out.crop_name_en == "Coconut"
-    assert out.crop_scientific_name == "Cocos nucifera"
+    assert out.crop_scientific_name is None
     assert out.crop_area_or_plant == "PLANT_WISE"
 
 
@@ -403,20 +404,42 @@ async def test_add_crop_422_when_cosh_entity_missing(db):
 @requires_docker
 @pytest.mark.asyncio
 async def test_add_crop_422_when_measure_missing(db):
-    """Cosh entity exists but no CropMeasure row — SA must seed the
-    area/plant typing first. Fail closed; never default."""
+    """biological_names row exists AND is classified as Crop, but no
+    CropMeasure row — SA must seed the area/plant typing first. Fail
+    closed; never default. (Until the Area/Plant Connect lands, this
+    is the expected baseline state for any crop CA wants to add.)"""
+    from app.modules.sync.models import CoshConnectRow
+    from app.services.cosh_constants import (
+        COSH_BIOLOGICAL_NAMES_CORE, COSH_NAME_ROLE_CONNECT,
+        COSH_ROLES_CORE, COSH_ROLE_CROP_UUID,
+    )
+
     client = await make_client(db)
     user = await make_user(db, name="CA")
     db.add(CoshCoreItem(
-        cosh_id="crop:no_measure", core_type="crop", status="active",
-        translations={"en": "MysteryCrop"},
+        cosh_id="bn:no_measure", core_type=COSH_BIOLOGICAL_NAMES_CORE,
+        status="active", translations={"en": "MysteryCrop"},
+    ))
+    db.add(CoshCoreItem(
+        cosh_id=COSH_ROLE_CROP_UUID, core_type=COSH_ROLES_CORE,
+        status="active", translations={"en": "Crop"},
+    ))
+    db.add(CoshConnectRow(
+        connect_id="c:no_measure", connect_type=COSH_NAME_ROLE_CONNECT,
+        status="active",
+        endpoints=[
+            {"role": COSH_BIOLOGICAL_NAMES_CORE, "cosh_id": "bn:no_measure",
+             "position": 1},
+            {"role": COSH_ROLES_CORE, "cosh_id": COSH_ROLE_CROP_UUID,
+             "position": 2},
+        ],
     ))
     await db.commit()
 
     with pytest.raises(HTTPException) as ei:
         await add_crop(
             client_id=client.id,
-            request=CropCreate(crop_cosh_id="crop:no_measure"),
+            request=CropCreate(crop_cosh_id="bn:no_measure"),
             db=db, current_user=user,
         )
     assert ei.value.status_code == 422
@@ -451,15 +474,13 @@ async def test_add_crop_422_when_cosh_inactive(db):
 async def test_re_add_refreshes_snapshot_from_current_cosh(db):
     """User's explicit decision (2026-05-06): on re-add after a
     soft-removal, the snapshot is re-taken fresh from current Cosh
-    state — not preserved from the original add. So if SA fixes a
-    scientific name in Cosh while the crop was off the belt, the
-    re-add picks up the corrected value."""
+    state — not preserved from the original add. So if SA fixes the
+    English name in Cosh while the crop was off the belt, the re-add
+    picks up the corrected value."""
     client = await make_client(db)
     user = await make_user(db, name="CA")
     cosh_row, _ = await make_crop_reference(
-        db, "crop:fennel",
-        name="Fennel", scientific_name="OldName",
-        measure="AREA_WISE",
+        db, "crop:fennel", name="Fennel", measure="AREA_WISE",
     )
     await db.commit()
 
@@ -472,7 +493,7 @@ async def test_re_add_refreshes_snapshot_from_current_cosh(db):
     )).scalar_one()
     await remove_crop(client_id=client.id, crop_id=crop.id, db=db, current_user=user)
 
-    cosh_row.metadata_ = {"scientific_name": "Foeniculum vulgare"}
+    cosh_row.translations = {"en": "Saunf"}  # SA fixes the name in Cosh
     await db.commit()
 
     out = await add_crop(
@@ -480,7 +501,7 @@ async def test_re_add_refreshes_snapshot_from_current_cosh(db):
         db=db, current_user=user,
     )
     assert out.id == crop.id
-    assert out.crop_scientific_name == "Foeniculum vulgare"
+    assert out.crop_name_en == "Saunf"
 
 
 # ── Batch 1C: PoP create/publish membership gate ─────────────────────────────

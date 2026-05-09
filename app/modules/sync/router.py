@@ -94,6 +94,24 @@ async def get_sync_log(
     ]
 
 
+# ── SA-portal CM crop browse (post-Cosh-sync 2026-05-09) ───────────────────
+
+@router.get("/admin/cosh/crops")
+async def list_cosh_crops(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SA-portal CM browse — full crop universe Cosh has classified.
+    Returns `[{cosh_id, name_en, status}]` sorted by English name.
+
+    The list grows as Cosh curators classify more biological_names as
+    Crop via the `biological_names_and_roles` Connect; sync runs are
+    incremental, so no RootsTalk action is needed when Cosh adds new
+    crops — just appears here on next page refresh."""
+    from app.services.cosh_crop_view import list_crops
+    return await list_crops(db)
+
+
 # ── Volume Formulas API (CM with VOLUME_CALCULATIONS privilege) ────────────────
 
 @router.get("/admin/volume-formulas")
