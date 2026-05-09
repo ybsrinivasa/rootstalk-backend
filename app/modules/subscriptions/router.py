@@ -872,6 +872,20 @@ async def set_start_date(
                 tl_ranges.append(TimelineDateRange(
                     id=f"pg_{pg_tl.id}", from_date=from_d, to_date=to_d, is_cha=True,
                 ))
+        elif cha.recommendation_type == "QA":
+            # UCAT pipe-3: Q&A timelines live in pg_timelines too,
+            # discriminated by standard_response_id. Anchor and lock
+            # behaviour mirror PG/SP — they're CHA-flavoured for
+            # date-shift purposes (don't move on crop_start change).
+            qa_timelines = (await db.execute(
+                select(PGTimeline).where(PGTimeline.standard_response_id == cha.recommendation_id)
+            )).scalars().all()
+            for qa_tl in qa_timelines:
+                from_d = triggered_d + timedelta(days=qa_tl.from_value)
+                to_d = triggered_d + timedelta(days=qa_tl.to_value)
+                tl_ranges.append(TimelineDateRange(
+                    id=f"qa_{qa_tl.id}", from_date=from_d, to_date=to_d, is_cha=True,
+                ))
 
     # Compute shifts
     shifts, delta_days = compute_date_shifts(tl_ranges, old_start, new_start, today, active_items)
@@ -1986,6 +2000,46 @@ async def get_today_advisory(
                         from_date=from_d, to_date=to_d,
                         created_at=cha.triggered_at.date() if hasattr(cha.triggered_at, 'date') else today,
                         practices=stubs, source="CHA",
+                    ))
+                    tl_date_map[cha_tl_id] = (from_d, to_d, 0)
+            elif cha.recommendation_type == "QA":
+                # UCAT pipe-3: Q&A timelines live in pg_timelines via
+                # standard_response_id. Mirror PG branch but keyed
+                # off the polymorphic FK and labelled with the
+                # question text (cha.problem_name set by
+                # _trigger_qa_for_query). source="QA" so the PWA
+                # can render the Pundit-origin icon.
+                qa_timelines = (await db.execute(
+                    select(PGTimeline).where(PGTimeline.standard_response_id == cha.recommendation_id)
+                )).scalars().all()
+                for qa_tl in qa_timelines:
+                    qa_snap = (await db.execute(
+                        select(LockedTimelineSnapshot).where(
+                            LockedTimelineSnapshot.subscription_id == sub.id,
+                            LockedTimelineSnapshot.timeline_id == qa_tl.id,
+                            LockedTimelineSnapshot.source == "QA",
+                        )
+                    )).scalar_one_or_none()
+                    if qa_snap is not None:
+                        meta = metadata_from_content(qa_snap.content)
+                    else:
+                        meta = metadata_from_content({"timeline": {
+                            "from_type": "DAS",
+                            "from_value": int(qa_tl.from_value),
+                            "to_value": int(qa_tl.to_value),
+                        }})
+                    from_d, to_d = cha_calendar_dates(meta, cha.triggered_at.date())
+                    if not (from_d <= today <= to_d):
+                        continue
+                    content, _locked = await resolve_cha_content(db, sub.id, qa_tl.id, "QA")
+                    stubs = render_cha_from_content(content)
+                    cha_tl_id = f"cha-qa-{qa_tl.id}"
+                    question_label = cha.problem_name or "Pundit response"
+                    tl_windows.append(TLWindow(
+                        id=cha_tl_id, name=f"Q&A — {question_label}: {qa_tl.name}",
+                        from_date=from_d, to_date=to_d,
+                        created_at=cha.triggered_at.date() if hasattr(cha.triggered_at, 'date') else today,
+                        practices=stubs, source="QA",
                     ))
                     tl_date_map[cha_tl_id] = (from_d, to_d, 0)
 

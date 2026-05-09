@@ -308,6 +308,42 @@ async def test_delete_practice_removes_elements_too(db):
 
 @requires_docker
 @pytest.mark.asyncio
+async def test_serialise_cha_timeline_accepts_qa_source(db):
+    """Sub-batch 5 extension: `serialise_cha_timeline` now accepts
+    source='QA' alongside 'PG'/'SP'. The QA source uses the same
+    physical PG tables (UCAT polymorphism) so the serialiser just
+    routes through the PG model trio."""
+    from app.services.snapshot import serialise_cha_timeline
+
+    client = await make_client(db)
+    se = await _se_for(db, client=client)
+    sr_id = await _seed_sr(db, client=client, se=se)
+    await db.commit()
+
+    tl = await add_qa_timeline(
+        client_id=client.id, sr_id=sr_id,
+        request=QATimelineCreate(name="Recovery", to_value=14),
+        db=db, current_user=se,
+    )
+    await add_qa_practice(
+        client_id=client.id, sr_id=sr_id, tl_id=tl["id"],
+        request=QAPracticeCreate(
+            l0_type="INPUT", l1_type="PESTICIDE",
+            elements=[ElementIn(element_type="DOSE", value="5", unit_cosh_id="ml/L")],
+        ),
+        db=db, current_user=se,
+    )
+    await db.commit()
+
+    serialised = await serialise_cha_timeline(db, tl["id"], "QA")
+    assert serialised["source"] == "QA"
+    assert serialised["timeline"]["name"] == "Recovery"
+    assert len(serialised["practices"]) == 1
+    assert serialised["practices"][0]["elements"][0]["element_type"] == "DOSE"
+
+
+@requires_docker
+@pytest.mark.asyncio
 async def test_endpoints_reject_non_member(db):
     """Membership gate identical to the rest of the standard-response
     surface — outsiders get 403 from the assert_portal_member call,

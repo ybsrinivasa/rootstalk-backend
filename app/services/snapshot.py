@@ -204,21 +204,31 @@ async def serialise_timeline(db: AsyncSession, timeline_id: str) -> dict:
 async def serialise_cha_timeline(
     db: AsyncSession, timeline_id: str, source: str
 ) -> dict:
-    """Serialise a CHA timeline + its children. `source` must be 'PG' or 'SP'.
+    """Serialise a CHA / Q&A timeline + its children. `source` must be
+    'PG', 'SP', or 'QA'.
 
-    CHA practices currently have no relations / conditional questions in the
-    schema — only practices + elements. CHA snapshot dates anchor to
-    triggered_at (stored on the TriggeredCHAEntry, not in the snapshot) and
-    do NOT shift with crop_start (Rule 3, second clause).
+    CHA / QA practices currently have no relations / conditional
+    questions in the schema — only practices + elements. CHA / QA
+    snapshot dates anchor to triggered_at (stored on the
+    TriggeredCHAEntry, not in the snapshot) and do NOT shift with
+    crop_start (Rule 3, second clause).
+
+    'QA' uses the same physical tables as 'PG' (UCAT pipe-3 reuse, see
+    project_rootstalk_ucat.md). The string remains 'QA' so the
+    LockedTimelineSnapshot's `source` discriminator distinguishes
+    Q&A-rooted from PG-rooted snapshots even though they're stored
+    in the same tables.
 
     Raises ValueError on bad source or missing timeline.
     """
-    if source == "PG":
+    if source == "PG" or source == "QA":
+        # QA timelines live in pg_timelines via the dual-FK
+        # polymorphism. Practices and elements are reused as-is.
         TLModel, PracticeModel, ElementModel = PGTimeline, PGPractice, PGElement
     elif source == "SP":
         TLModel, PracticeModel, ElementModel = SPTimeline, SPPractice, SPElement
     else:
-        raise ValueError(f"source must be 'PG' or 'SP', got {source!r}")
+        raise ValueError(f"source must be 'PG', 'SP', or 'QA', got {source!r}")
 
     tl = (
         await db.execute(select(TLModel).where(TLModel.id == timeline_id))
