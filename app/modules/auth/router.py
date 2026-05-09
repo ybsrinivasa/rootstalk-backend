@@ -17,7 +17,7 @@ from app.modules.auth.service import (
 from app.modules.auth.models import EmailOTP
 from app.modules.clients.service import _send_email
 from app.modules.clients.models import Client, ClientUser, ClientStatus
-from app.modules.platform.models import User, StatusEnum
+from app.modules.platform.models import User, StatusEnum, UserRole, RoleType
 from app.services.sms_service import send_otp_sms
 from app.dependencies import get_current_user
 
@@ -327,6 +327,68 @@ async def confirm_delete_account(
     return {"detail": "Account scheduled for deletion. You can restore it by signing in within 30 days."}
 
 
+# ── Self-claim a PWA ecosystem role ────────────────────────────────────────────
+
+# Roles a User can claim for themselves via PWA. FARMER is implicit
+# (every PWA user starts as one); FARM_PUNDIT has its own richer
+# registration flow at `/pundit/profile`; the rest (CONTENT_MANAGER,
+# RELATIONSHIP_MANAGER, BUSINESS_MANAGER) are Neytiri-side internal
+# roles assigned by the SA admin UI, not self-claimable.
+SELF_CLAIMABLE_ROLES = {"DEALER", "FACILITATOR"}
+
+
+@router.post("/me/claim-role", status_code=200)
+async def claim_role(
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Self-claim a PWA ecosystem role (Dealer / Facilitator).
+
+    Per the five-ecosystem architecture (see five_ecosystems memory):
+    a user *registers themselves* in their ecosystem before any
+    company recognises them. This endpoint creates the UserRole row
+    that flips the role on for the PWA. Profile completion happens
+    on the role-specific profile page (/dealer/profile or
+    /facilitator/profile) which already exists.
+
+    The user can act in their ecosystem after this — but most
+    consequential actions (receiving orders, assigning advisories
+    as a Promoter) gate on company-onboarding via ClientPromoter,
+    which is a separate step the FM does. Until then, the user is
+    "available for company recognition."
+
+    Idempotent: claiming an already-held role is a 200 no-op so
+    pages can fire-and-forget on landing.
+    """
+    role_str = (data.get("role") or "").upper()
+    if role_str not in SELF_CLAIMABLE_ROLES:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "role_not_self_claimable",
+                "message": (
+                    f"Only {sorted(SELF_CLAIMABLE_ROLES)} can be self-claimed. "
+                    "FARMER is implicit; FARM_PUNDIT has its own registration "
+                    "flow; internal roles are assigned by RootsTalk admin."
+                ),
+            },
+        )
+
+    role_type = RoleType[role_str]
+    existing = (await db.execute(
+        select(UserRole).where(
+            UserRole.user_id == current_user.id,
+            UserRole.role_type == role_type,
+        )
+    )).scalar_one_or_none()
+    if existing is None:
+        db.add(UserRole(user_id=current_user.id, role_type=role_type))
+        await db.commit()
+
+    return {"role": role_str, "status": "ACTIVE"}
+
+
 # ── Shared ─────────────────────────────────────────────────────────────────────
 
 @router.get("/me", response_model=UserOut)
@@ -352,6 +414,23 @@ async def get_me(current_user: User = Depends(get_current_user), db: AsyncSessio
     )).scalars().all()
     for p in promoters:
         role = p.promoter_type.upper()
+        if role not in pwa_roles:
+            pwa_roles.append(role)
+
+    # Self-claimed roles (DEALER / FACILITATOR) — added 2026-05-09
+    # alongside the /me/claim-role endpoint. Without this, a user
+    # who registered as a Dealer but isn't yet onboarded by any
+    # company wouldn't see DEALER in their pwa_roles and the PWA
+    # would gate them out of /dealer/* pages.
+    self_claimed = (await db.execute(
+        select(UserRole).where(
+            UserRole.user_id == current_user.id,
+            UserRole.status == StatusEnum.ACTIVE,
+            UserRole.role_type.in_([RoleType.DEALER, RoleType.FACILITATOR]),
+        )
+    )).scalars().all()
+    for r in self_claimed:
+        role = r.role_type.value if hasattr(r.role_type, "value") else str(r.role_type)
         if role not in pwa_roles:
             pwa_roles.append(role)
 
