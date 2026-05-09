@@ -479,7 +479,7 @@ async def test_re_add_refreshes_snapshot_from_current_cosh(db):
     picks up the corrected value."""
     client = await make_client(db)
     user = await make_user(db, name="CA")
-    cosh_row, _ = await make_crop_reference(
+    cosh_row = await make_crop_reference(
         db, "crop:fennel", name="Fennel", measure="AREA_WISE",
     )
     await db.commit()

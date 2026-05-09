@@ -1,28 +1,29 @@
-"""Crop → Measure (Area-wise vs Plant-wise) service.
+"""Crop → Measure (Area-wise vs Plant-wise) — Cosh-sourced (Round 3, 2026-05-09).
 
-Wraps the `crop_measures` table so the rest of the codebase doesn't have
-to know about validation rules or the eventual Cosh-sync placeholder.
+Pre-Round-3 this file wrapped the local `crop_measures` table with `get_measure`
+/ `set_measure` / `list_measures`. Cosh now owns this data: the
+`crop_area_plant_wise` Connect links each Crop biological_name to one of two
+Core items (Area-wise / Plant-wise), and RootsTalk reads through.
 
-Today the values are seeded manually by SA via the admin endpoints in
-`app/modules/sync/router.py`. When Cosh integration ships, those
-endpoints will be supplemented (or replaced) by a sync flow that writes
-`synced_from_cosh_at` on each row.
+Public API surface (callers continue to import these names):
+  • `get_measure(db, cosh_id)` — None when Cosh hasn't classified yet.
+  • `AREA_WISE` / `PLANT_WISE` / `VALID_MEASURES` — string tokens for
+    downstream comparisons (BL-06, plant-wise additional elements, etc.).
 
-Design notes:
-- Validation lives here (not in the schema) so we can extend with a
-  third Measure type later without an enum migration.
-- `set_measure` is upsert semantics — a CA-side change overwrites the
-  same crop_cosh_id row instead of creating duplicates. Idempotent.
-- Reads are cheap (one row per crop); no caching layer for now.
+`set_measure` and `list_measures` were removed. Cosh is the writer; the
+SA admin endpoints under `/admin/crop-measures` either read through to
+Cosh or were dropped (see `app/modules/sync/router.py`).
+
+The local `crop_measures` table is no longer read or written by
+production code. Schema cleanup is a separate ticket.
 """
 from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.sync.models import CropMeasure
+from app.services.cosh_crop_view import get_measure_for_biological_name
 
 
 AREA_WISE = "AREA_WISE"
@@ -31,49 +32,10 @@ VALID_MEASURES = {AREA_WISE, PLANT_WISE}
 
 
 async def get_measure(db: AsyncSession, crop_cosh_id: str) -> Optional[str]:
-    """Return the Measure for a crop, or None if no row exists.
+    """Return the Measure for a crop, or None if Cosh hasn't classified it yet.
 
     BL-06 callers should treat None as a configuration error (refuse to
     estimate) rather than silently defaulting — silent fallback would
-    mask a missing seed and the SA gets no signal.
+    mask a missing classification on the Cosh side.
     """
-    row = (await db.execute(
-        select(CropMeasure).where(CropMeasure.crop_cosh_id == crop_cosh_id)
-    )).scalar_one_or_none()
-    return row.measure if row is not None else None
-
-
-async def set_measure(
-    db: AsyncSession, *, crop_cosh_id: str, measure: str,
-    user_id: Optional[str] = None,
-) -> CropMeasure:
-    """Upsert: create or update the row for `crop_cosh_id`. Caller commits."""
-    if measure not in VALID_MEASURES:
-        raise ValueError(
-            f"measure must be one of {sorted(VALID_MEASURES)}, got {measure!r}"
-        )
-
-    row = (await db.execute(
-        select(CropMeasure).where(CropMeasure.crop_cosh_id == crop_cosh_id)
-    )).scalar_one_or_none()
-
-    if row is None:
-        row = CropMeasure(
-            crop_cosh_id=crop_cosh_id,
-            measure=measure,
-            updated_by_user_id=user_id,
-        )
-        db.add(row)
-    else:
-        row.measure = measure
-        row.updated_by_user_id = user_id
-
-    await db.flush()
-    return row
-
-
-async def list_measures(db: AsyncSession) -> list[CropMeasure]:
-    """Return every crop_measure row, ordered by crop_cosh_id."""
-    return list((await db.execute(
-        select(CropMeasure).order_by(CropMeasure.crop_cosh_id)
-    )).scalars().all())
+    return await get_measure_for_biological_name(db, crop_cosh_id)

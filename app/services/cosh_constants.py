@@ -30,3 +30,24 @@ COSH_ROLE_BIO_CONTROL_AGENT_UUID = "7f2f5283-e427-484a-a5b8-40181d633fa2"
 # the role string, so these match the Core slugs above.
 ENDPOINT_ROLE_BIOLOGICAL_NAME = COSH_BIOLOGICAL_NAMES_CORE
 ENDPOINT_ROLE_OF_NAME = COSH_ROLES_CORE
+
+# ── Area/Plant-wise classification (Round 3, 2026-05-09) ───────────────────
+
+# Core hosting the two area-plant-wise items (Area-wise / Plant-wise).
+COSH_AREA_PLANT_WISE_CORE = "area_plant_wise"
+
+# Connect linking biological_names (classified as Crop) to one of the
+# area_plant_wise items.
+COSH_CROP_AREA_PLANT_CONNECT = "crop_area_plant_wise"
+
+# Stable UUIDs of the two typing items.
+COSH_AREA_WISE_UUID = "89e4d7d5-ac70-460f-9aa4-9c00ca5808a2"
+COSH_PLANT_WISE_UUID = "1bf6f539-89bb-4d45-ae88-68606761deae"
+
+# RootsTalk-side measure tokens that downstream code (BL-06 volume calc,
+# plant-wise additional elements, etc.) compares against. Maps
+# Cosh-side UUIDs to the stable string tokens RootsTalk uses.
+COSH_UUID_TO_MEASURE = {
+    COSH_AREA_WISE_UUID: "AREA_WISE",
+    COSH_PLANT_WISE_UUID: "PLANT_WISE",
+}

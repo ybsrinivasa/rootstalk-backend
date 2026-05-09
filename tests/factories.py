@@ -49,27 +49,35 @@ async def make_crop_reference(
     db: AsyncSession, cosh_id: str, *,
     name: str = "Paddy", scientific_name: str | None = None,
     measure: str = "AREA_WISE", status: str = "active",
-) -> tuple[CoshCoreItem, CropMeasure]:
-    """Seed a Cosh biological_name + Crop classification + measure.
+) -> CoshCoreItem:
+    """Seed a Cosh biological_name + Crop classification + Area/Plant typing.
 
-    Mirrors the post 2026-05-09 live-sync shape:
+    Mirrors the post 2026-05-09 live-sync shape (Round 1 + Round 3):
       • CoshCoreItem(core_type='biological_names', cosh_id=...)
       • CoshConnectRow(connect_type='biological_names_and_roles',
-        endpoints=[{role: biological_names, cosh_id: <name>},
-                   {role: roles_of_biological_names, cosh_id: CROP_UUID}])
+        endpoints=[<name>, CROP_UUID])
       • CoshCoreItem(core_type='roles_of_biological_names',
-        cosh_id=CROP_UUID)  — idempotent
-      • CropMeasure(crop_cosh_id=..., measure=...)
+        cosh_id=CROP_UUID) — idempotent
+      • CoshCoreItem(core_type='area_plant_wise', AREA/PLANT UUIDs) —
+        idempotent
+      • CoshConnectRow(connect_type='crop_area_plant_wise',
+        endpoints=[<name>, AREA_WISE_UUID|PLANT_WISE_UUID])
 
     Required when a test exercises CCA Step 1 add_crop. Idempotent on
-    cosh_id. The `scientific_name` parameter is accepted for back-
-    compat with existing call sites but ignored — V1 doesn't source
-    scientific names from Cosh until that Core's Connect ships.
+    cosh_id. `scientific_name` accepted for back-compat with existing
+    call sites but ignored — V1 doesn't source scientific names from
+    Cosh until that Core's Connect ships.
+
+    `measure=None` skips the area_plant_wise wiring — useful for tests
+    that need a Crop-classified-but-untyped name (mirrors the 27 of
+    144 V1 crops still pending Cosh classification at first sync).
     """
     from app.modules.sync.models import CoshConnectRow
     from app.services.cosh_constants import (
-        COSH_BIOLOGICAL_NAMES_CORE, COSH_NAME_ROLE_CONNECT,
-        COSH_ROLES_CORE, COSH_ROLE_CROP_UUID,
+        COSH_AREA_PLANT_WISE_CORE, COSH_AREA_WISE_UUID,
+        COSH_BIOLOGICAL_NAMES_CORE, COSH_CROP_AREA_PLANT_CONNECT,
+        COSH_NAME_ROLE_CONNECT, COSH_PLANT_WISE_UUID, COSH_ROLES_CORE,
+        COSH_ROLE_CROP_UUID,
     )
 
     existing_ref = (await db.execute(
@@ -85,7 +93,7 @@ async def make_crop_reference(
         )
         db.add(existing_ref)
 
-    # Seed the Crop role item — once per test session.
+    # Seed the Crop role item once per test session.
     crop_role = (await db.execute(
         select(CoshCoreItem).where(
             CoshCoreItem.cosh_id == COSH_ROLE_CROP_UUID,
@@ -118,15 +126,55 @@ async def make_crop_reference(
             ],
         ))
 
-    existing_measure = (await db.execute(
-        select(CropMeasure).where(CropMeasure.crop_cosh_id == cosh_id)
-    )).scalar_one_or_none()
-    if existing_measure is None:
-        existing_measure = CropMeasure(crop_cosh_id=cosh_id, measure=measure)
-        db.add(existing_measure)
+    # Area/Plant typing — Round 3.
+    if measure is not None:
+        measure_uuid = (
+            COSH_AREA_WISE_UUID if measure == "AREA_WISE"
+            else COSH_PLANT_WISE_UUID if measure == "PLANT_WISE"
+            else None
+        )
+        if measure_uuid is None:
+            raise ValueError(
+                f"measure must be 'AREA_WISE' / 'PLANT_WISE' / None, got {measure!r}"
+            )
+        # Seed the measure Core item idempotently.
+        ap_row = (await db.execute(
+            select(CoshCoreItem).where(
+                CoshCoreItem.cosh_id == measure_uuid,
+                CoshCoreItem.core_type == COSH_AREA_PLANT_WISE_CORE,
+            )
+        )).scalar_one_or_none()
+        if ap_row is None:
+            db.add(CoshCoreItem(
+                cosh_id=measure_uuid, core_type=COSH_AREA_PLANT_WISE_CORE,
+                status="active",
+                translations={"en": (
+                    "Area-wise" if measure == "AREA_WISE" else "Plant-wise"
+                )},
+            ))
+        # Connect this name to the measure.
+        ap_connect_id = f"connect:{cosh_id}:measure"
+        existing_ap = (await db.execute(
+            select(CoshConnectRow).where(
+                CoshConnectRow.connect_id == ap_connect_id,
+                CoshConnectRow.connect_type == COSH_CROP_AREA_PLANT_CONNECT,
+            )
+        )).scalar_one_or_none()
+        if existing_ap is None:
+            db.add(CoshConnectRow(
+                connect_id=ap_connect_id,
+                connect_type=COSH_CROP_AREA_PLANT_CONNECT,
+                status="active",
+                endpoints=[
+                    {"role": COSH_BIOLOGICAL_NAMES_CORE,
+                     "cosh_id": cosh_id, "position": 1},
+                    {"role": COSH_AREA_PLANT_WISE_CORE,
+                     "cosh_id": measure_uuid, "position": 2},
+                ],
+            ))
 
     await db.flush()
-    return existing_ref, existing_measure
+    return existing_ref
 
 
 async def make_client(db: AsyncSession, **kw) -> Client:

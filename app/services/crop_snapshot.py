@@ -33,9 +33,11 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.sync.models import CoshCoreItem, CropMeasure
+from app.modules.sync.models import CoshCoreItem
 from app.services.cosh_constants import COSH_BIOLOGICAL_NAMES_CORE
-from app.services.cosh_crop_view import is_crop_in_cosh
+from app.services.cosh_crop_view import (
+    get_measure_for_biological_name, is_crop_in_cosh,
+)
 
 
 @dataclass(frozen=True)
@@ -57,14 +59,17 @@ class CropSnapshotError(Exception):
 
 def build_snapshot_from_rows(
     cosh_row: Optional[CoshCoreItem],
-    measure_row: Optional[CropMeasure],
+    measure: Optional[str],
 ) -> CropSnapshot:
-    """Pure: assemble a snapshot from already-loaded ORM rows.
+    """Pure: assemble a snapshot from a loaded biological_name row + a
+    pre-derived measure string. The measure is sourced from the Cosh
+    `crop_area_plant_wise` Connect (Round 3, 2026-05-09); pre Round 3
+    this argument was an ORM row off the local `crop_measures` table.
 
     Raises `CropSnapshotError` for the four ways this can go wrong:
     cosh row missing, cosh row inactive, English name missing,
-    measure row missing. The router maps each to a 422 with the
-    `code` carried on the exception.
+    measure unset. The router maps each to a 422 with the `code`
+    carried on the exception.
     """
     if cosh_row is None:
         raise CropSnapshotError(
@@ -85,33 +90,32 @@ def build_snapshot_from_rows(
             "This crop has no English translation in Cosh. Ask SA to fix the entry.",
         )
 
-    if measure_row is None:
+    if measure is None:
         raise CropSnapshotError(
             "crop_missing_measure",
-            "This crop has no AREA-wise / PLANT-wise mapping. "
-            "Ask SA to seed crop_measures before adding the crop.",
+            "This crop has no Area-wise / Plant-wise classification in "
+            "Cosh yet. Ask the Cosh curator to tag it via the "
+            "`crop_area_plant_wise` Connect.",
         )
 
     # scientific_name will be sourced from a separate Cosh Core +
     # Connect when those ship. Left None on V1 snapshots.
-    scientific_name = None
-
     return CropSnapshot(
         name_en=name_en,
-        scientific_name=scientific_name,
-        area_or_plant=measure_row.measure,
+        scientific_name=None,
+        area_or_plant=measure,
     )
 
 
 async def fetch_snapshot(db: AsyncSession, crop_cosh_id: str) -> CropSnapshot:
-    """Async wrapper: load the two source rows and delegate to the
-    pure builder. Used on CA add and CA re-add (fresh snapshot in
-    both cases — the user explicitly chose this on 2026-05-06).
+    """Async wrapper: load the biological_name row + walk Cosh's two
+    relevant Connects, then delegate to the pure builder. Used on CA
+    add and CA re-add (fresh snapshot in both cases — the user
+    explicitly chose this on 2026-05-06).
 
     Verifies the cosh_id is **classified as Crop** in Cosh — a Pest
     or Bio Control Agent UUID would otherwise pass the row-fetch but
-    has no business being added as a crop. The classification check
-    walks the `biological_names_and_roles` Connect.
+    has no business being added as a crop.
     """
     cosh_row = (await db.execute(
         select(CoshCoreItem).where(
@@ -128,7 +132,5 @@ async def fetch_snapshot(db: AsyncSession, crop_cosh_id: str) -> CropSnapshot:
             "the Crops list.",
         )
 
-    measure_row = (await db.execute(
-        select(CropMeasure).where(CropMeasure.crop_cosh_id == crop_cosh_id)
-    )).scalar_one_or_none()
-    return build_snapshot_from_rows(cosh_row, measure_row)
+    measure = await get_measure_for_biological_name(db, crop_cosh_id)
+    return build_snapshot_from_rows(cosh_row, measure)

@@ -24,9 +24,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.sync.models import CoshConnectRow, CoshCoreItem
 from app.services.cosh_constants import (
+    COSH_AREA_PLANT_WISE_CORE,
     COSH_BIOLOGICAL_NAMES_CORE,
+    COSH_CROP_AREA_PLANT_CONNECT,
     COSH_NAME_ROLE_CONNECT,
     COSH_ROLE_CROP_UUID,
+    COSH_UUID_TO_MEASURE,
     ENDPOINT_ROLE_BIOLOGICAL_NAME,
     ENDPOINT_ROLE_OF_NAME,
 )
@@ -106,3 +109,61 @@ async def is_crop_in_cosh(db: AsyncSession, crop_cosh_id: str) -> bool:
     name rows — pure UUID membership."""
     crop_ids = await _crop_classified_biological_name_ids(db)
     return crop_cosh_id in crop_ids
+
+
+# ── Area/Plant-wise typing (Round 3, 2026-05-09) ───────────────────────────
+
+async def get_measure_for_biological_name(
+    db: AsyncSession, cosh_id: str,
+) -> str | None:
+    """Walk the `crop_area_plant_wise` Connect to derive AREA_WISE /
+    PLANT_WISE for a biological_name. Returns None if no active Connect
+    row classifies this name (e.g. one of the 27 V1 crops still
+    awaiting Cosh-side classification at first sync).
+
+    Replaces the legacy `crop_measures` table read. Cosh is now the
+    canonical source — RootsTalk does not mirror the value locally.
+    """
+    rows = (await db.execute(
+        select(CoshConnectRow).where(
+            CoshConnectRow.connect_type == COSH_CROP_AREA_PLANT_CONNECT,
+            CoshConnectRow.status == "active",
+        )
+    )).scalars().all()
+
+    for row in rows:
+        endpoints = row.endpoints or []
+        # Connect row matches when one endpoint is our biological_name.
+        names_in_row = [
+            ep.get("cosh_id") for ep in endpoints
+            if ep.get("role") == COSH_BIOLOGICAL_NAMES_CORE
+        ]
+        if cosh_id not in names_in_row:
+            continue
+        # Read the area_plant_wise endpoint and map UUID → token.
+        for ep in endpoints:
+            if ep.get("role") == COSH_AREA_PLANT_WISE_CORE:
+                measure = COSH_UUID_TO_MEASURE.get(ep.get("cosh_id"))
+                if measure:
+                    return measure
+    return None
+
+
+async def list_crops_with_measure(db: AsyncSession) -> list[dict]:
+    """Admin/CM-facing extended listing: crops + their measure + a
+    flag highlighting which ones still need Cosh-side classification.
+    Used by `GET /admin/crop-measures`.
+
+    Combines both Connects in a single sweep (Crop classification +
+    area_plant_wise) so the page can show "X of N crops still need
+    Area-wise / Plant-wise typing on the Cosh side"."""
+    crops = await list_crops(db)
+    out = []
+    for c in crops:
+        measure = await get_measure_for_biological_name(db, c["cosh_id"])
+        out.append({
+            "crop_cosh_id": c["cosh_id"],
+            "name_en": c["name_en"],
+            "measure": measure,
+        })
+    return out

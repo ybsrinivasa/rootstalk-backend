@@ -24,11 +24,11 @@ from app.modules.orders.models import (
 )
 from app.modules.orders.router import get_volume_estimate
 from app.modules.sync.models import VolumeFormula
-from app.services.crop_measure import AREA_WISE, PLANT_WISE, set_measure
+from app.services.crop_measure import AREA_WISE, PLANT_WISE
 from tests.conftest import requires_docker
 from tests.factories import (
-    make_client, make_onboarded_dealer, make_package, make_subscription,
-    make_user,
+    make_client, make_crop_reference, make_onboarded_dealer, make_package,
+    make_subscription, make_user,
 )
 
 
@@ -103,9 +103,11 @@ async def _seed_volume_estimate_scenario(
     )
     db.add(item)
 
-    # Seed crop measure (the gate).
-    if seed_crop_measure:
-        await set_measure(db, crop_cosh_id=CROP, measure=measure)
+    # Seed crop name + Cosh-side Area/Plant typing (the gate).
+    await make_crop_reference(
+        db, CROP, name="Tomato",
+        measure=measure if seed_crop_measure else None,
+    )
 
     # Seed a matching volume_formula row.
     db.add(VolumeFormula(
@@ -307,7 +309,7 @@ async def test_estimate_blocks_when_application_method_missing(db):
         status=OrderItemStatus.PENDING, volume_unit="kg",
     )
     db.add(item)
-    await set_measure(db, crop_cosh_id=CROP, measure=AREA_WISE)
+    await make_crop_reference(db, CROP, name="Tomato", measure=AREA_WISE)
     await db.commit()
 
     out = await get_volume_estimate(

@@ -19,7 +19,7 @@ from __future__ import annotations
 import pytest
 
 from app.modules.clients.models import ClientCrop
-from app.modules.sync.models import CoshConnectRow, CoshCoreItem, CropMeasure
+from app.modules.sync.models import CoshConnectRow, CoshCoreItem
 from app.modules.sync.router import list_cosh_crops
 from app.modules.clients.router import list_available_crops
 from app.services.cosh_constants import (
@@ -187,8 +187,28 @@ async def test_empty_universe_returns_empty_list(db):
 @requires_docker
 @pytest.mark.asyncio
 async def test_fetch_snapshot_succeeds_for_classified_crop(db):
+    """Crop classification (Round 1) + Area/Plant typing (Round 3) both
+    present → snapshot succeeds. Adding a Tomato area_plant_wise
+    Connect row directly is more pointed than spinning up the helper
+    factory here (this test predates the factory's measure support)."""
+    from app.services.cosh_constants import (
+        COSH_AREA_PLANT_WISE_CORE, COSH_AREA_WISE_UUID,
+        COSH_CROP_AREA_PLANT_CONNECT,
+    )
     await _seed_live_cosh_shape(db)
-    db.add(CropMeasure(crop_cosh_id="bn:tomato", measure="AREA_WISE"))
+    db.add(CoshCoreItem(
+        cosh_id=COSH_AREA_WISE_UUID, core_type=COSH_AREA_PLANT_WISE_CORE,
+        translations={"en": "Area-wise"}, status="active",
+    ))
+    db.add(CoshConnectRow(
+        connect_id="ap:tomato", connect_type=COSH_CROP_AREA_PLANT_CONNECT,
+        status="active",
+        endpoints=[
+            {"role": "biological_names", "cosh_id": "bn:tomato", "position": 1},
+            {"role": COSH_AREA_PLANT_WISE_CORE, "cosh_id": COSH_AREA_WISE_UUID,
+             "position": 2},
+        ],
+    ))
     await db.commit()
 
     snapshot = await fetch_snapshot(db, "bn:tomato")
@@ -205,7 +225,6 @@ async def test_fetch_snapshot_refuses_pest_uuid(db):
     as crop_cosh_id, the snapshot path 422s with a stable code rather
     than silently letting the pest into the company's crop belt."""
     await _seed_live_cosh_shape(db)
-    db.add(CropMeasure(crop_cosh_id="bn:aphid", measure="AREA_WISE"))
     await db.commit()
 
     with pytest.raises(CropSnapshotError) as exc:
@@ -217,7 +236,6 @@ async def test_fetch_snapshot_refuses_pest_uuid(db):
 @pytest.mark.asyncio
 async def test_fetch_snapshot_refuses_bca_uuid(db):
     await _seed_live_cosh_shape(db)
-    db.add(CropMeasure(crop_cosh_id="bn:trichogramma", measure="AREA_WISE"))
     await db.commit()
 
     with pytest.raises(CropSnapshotError) as exc:
@@ -228,12 +246,14 @@ async def test_fetch_snapshot_refuses_bca_uuid(db):
 @requires_docker
 @pytest.mark.asyncio
 async def test_fetch_snapshot_blocks_when_measure_missing(db):
-    """Until the Area/Plant Connect ships, every CA add 422s with
-    `crop_missing_measure`. This is intentional — the picker shows
-    the universe; the form action waits for measure data."""
+    """For the V1 crops Cosh hasn't yet classified Area/Plant-wise (27
+    of 144 at first sync), the snapshot path 422s with
+    `crop_missing_measure`. The picker still surfaces the name; the
+    form action waits for the curator to add the area_plant_wise tag
+    in Cosh."""
     await _seed_live_cosh_shape(db)
     await db.commit()
-    # No CropMeasure row for bn:tomato.
+    # No `crop_area_plant_wise` Connect row for bn:tomato.
 
     with pytest.raises(CropSnapshotError) as exc:
         await fetch_snapshot(db, "bn:tomato")
@@ -263,7 +283,6 @@ async def test_available_crops_excludes_already_added(db):
     await _seed_live_cosh_shape(db)
     client = await make_client(db)
     user = await make_user(db, name="CA")
-    db.add(CropMeasure(crop_cosh_id="bn:tomato", measure="AREA_WISE"))
     db.add(ClientCrop(
         client_id=client.id, crop_cosh_id="bn:tomato",
         crop_name_en="Tomato", crop_area_or_plant="AREA_WISE",
