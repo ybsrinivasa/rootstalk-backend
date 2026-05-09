@@ -24,6 +24,7 @@ from app.modules.advisory.schemas import (
     RelationCreate, ConditionalQuestionCreate, PracticeConditionalCreate,
     PGRecommendationCreate, PGRecommendationOut, PGTimelineCreate, PGTimelineOut, PGPracticeCreate,
     SPRecommendationCreate, SPRecommendationOut, SPTimelineCreate, SPTimelineOut, SPPracticeCreate,
+    QATimelineCreate, QAPracticeCreate,
 )
 from app.modules.advisory.models import (
     PGRecommendation, PGTimeline, PGPractice, PGElement,
@@ -2437,6 +2438,312 @@ async def delete_sp_timeline(
     if tl:
         await db.delete(tl)
         await db.commit()
+
+
+# ── Client Q&A Library timelines (UCAT pipe-3, spec §14.9) ──────────────────
+# These endpoints write into the same `pg_timelines` / `pg_practices` /
+# `pg_elements` tables as the CHA endpoints above; the difference is the
+# parent — `standard_response_id` instead of `pg_recommendation_id`.
+# Practices and Elements are reused as-is. The DB CHECK
+# `pg_timelines_one_parent_chk` guarantees a row never has both parents.
+
+async def _assert_sr_belongs_to_client(
+    db: AsyncSession, sr_id: str, client_id: str,
+):
+    """Look up a StandardResponse and assert it belongs to the
+    target client. 404 on miss or cross-client (same shape on both
+    so the existence of other clients' rows isn't leaked).
+
+    Imported lazily because StandardResponse lives in the farmpundit
+    module — the static import at the top of this file would create
+    a cycle since farmpundit.router imports from advisory tables."""
+    from app.modules.farmpundit.models import StandardResponse
+
+    sr = (await db.execute(
+        select(StandardResponse).where(
+            StandardResponse.id == sr_id,
+            StandardResponse.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if not sr:
+        raise HTTPException(status_code=404, detail="Standard response not found")
+    return sr
+
+
+@router.get("/client/{client_id}/standard-responses/{sr_id}/timelines")
+async def list_qa_timelines(
+    client_id: str,
+    sr_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Full advisory tree under a Standard Response — Timelines with
+    nested Practices and Elements. The CA-portal editor renders the
+    whole tree at once; the Pundit picker only needs the metadata
+    so it goes through the simpler farmpundit search endpoint."""
+    from app.modules.farmpundit.router import _assert_portal_member
+    await _assert_portal_member(db, current_user.id, client_id)
+    await _assert_sr_belongs_to_client(db, sr_id, client_id)
+
+    timelines = (await db.execute(
+        select(PGTimeline).where(
+            PGTimeline.standard_response_id == sr_id,
+        ).order_by(PGTimeline.from_value, PGTimeline.id)
+    )).scalars().all()
+
+    out = []
+    for tl in timelines:
+        practices = (await db.execute(
+            select(PGPractice).where(PGPractice.timeline_id == tl.id)
+            .order_by(PGPractice.display_order)
+        )).scalars().all()
+        practice_dicts = []
+        for p in practices:
+            elements = (await db.execute(
+                select(PGElement).where(PGElement.practice_id == p.id)
+                .order_by(PGElement.display_order)
+            )).scalars().all()
+            practice_dicts.append({
+                "id": p.id,
+                "timeline_id": p.timeline_id,
+                "l0_type": p.l0_type,
+                "l1_type": p.l1_type,
+                "l2_type": p.l2_type,
+                "display_order": p.display_order,
+                "is_special_input": p.is_special_input,
+                "frequency_days": p.frequency_days,
+                "elements": [
+                    {
+                        "id": e.id,
+                        "element_type": e.element_type,
+                        "cosh_ref": e.cosh_ref,
+                        "value": e.value,
+                        "unit_cosh_id": e.unit_cosh_id,
+                        "display_order": e.display_order,
+                    }
+                    for e in elements
+                ],
+            })
+        out.append({
+            "id": tl.id,
+            "standard_response_id": tl.standard_response_id,
+            "parent_kind": tl.parent_kind,
+            "name": tl.name,
+            "from_type": tl.from_type,
+            "from_value": tl.from_value,
+            "to_value": tl.to_value,
+            "practices": practice_dicts,
+        })
+    return out
+
+
+@router.post("/client/{client_id}/standard-responses/{sr_id}/timelines", status_code=201)
+async def add_qa_timeline(
+    client_id: str,
+    sr_id: str,
+    request: QATimelineCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.modules.farmpundit.router import _assert_portal_member
+    await _assert_portal_member(db, current_user.id, client_id)
+    await _assert_sr_belongs_to_client(db, sr_id, client_id)
+
+    tl = PGTimeline(
+        standard_response_id=sr_id,
+        # pg_recommendation_id stays None — the DB CHECK enforces
+        # exactly-one-parent so this row can never drift into a
+        # dual-parent state.
+        name=request.name,
+        from_type=request.from_type,
+        from_value=request.from_value,
+        to_value=request.to_value,
+    )
+    db.add(tl)
+    await db.commit()
+    await db.refresh(tl)
+    return {
+        "id": tl.id,
+        "standard_response_id": tl.standard_response_id,
+        "parent_kind": tl.parent_kind,
+        "name": tl.name,
+        "from_type": tl.from_type,
+        "from_value": tl.from_value,
+        "to_value": tl.to_value,
+    }
+
+
+@router.delete(
+    "/client/{client_id}/standard-responses/{sr_id}/timelines/{tl_id}",
+    status_code=204,
+)
+async def delete_qa_timeline(
+    client_id: str,
+    sr_id: str,
+    tl_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cascade-deletes the timeline's practices and elements via the
+    SQLAlchemy session's delete-orphan cascade behaviour. Practice
+    and Element FKs to timeline_id / practice_id remain intact in
+    the schema — the cascade is application-level via SQLAlchemy
+    relationships, matching the existing PG/SP delete patterns."""
+    from app.modules.farmpundit.router import _assert_portal_member
+    await _assert_portal_member(db, current_user.id, client_id)
+    await _assert_sr_belongs_to_client(db, sr_id, client_id)
+
+    tl = (await db.execute(
+        select(PGTimeline).where(
+            PGTimeline.id == tl_id,
+            PGTimeline.standard_response_id == sr_id,
+        )
+    )).scalar_one_or_none()
+    if not tl:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    # Manually delete practices and elements first — SQLAlchemy
+    # relationships on PGTimeline don't carry cascade='delete' (it
+    # would require a back_populates change that ripples through
+    # CHA tests). Mirrors the PG delete pattern though PG's delete
+    # endpoint relies on the caller having no practices yet.
+    practices = (await db.execute(
+        select(PGPractice).where(PGPractice.timeline_id == tl_id)
+    )).scalars().all()
+    for p in practices:
+        elements = (await db.execute(
+            select(PGElement).where(PGElement.practice_id == p.id)
+        )).scalars().all()
+        for e in elements:
+            await db.delete(e)
+        await db.delete(p)
+    await db.delete(tl)
+    await db.commit()
+
+
+@router.post(
+    "/client/{client_id}/standard-responses/{sr_id}/timelines/{tl_id}/practices",
+    status_code=201,
+)
+async def add_qa_practice(
+    client_id: str,
+    sr_id: str,
+    tl_id: str,
+    request: QAPracticeCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Create a Practice on a Q&A timeline with its Elements inline.
+    Mirrors PGPracticeCreate exactly — UCAT means Practice + Element
+    shapes are pipe-agnostic."""
+    from app.modules.farmpundit.router import _assert_portal_member
+    await _assert_portal_member(db, current_user.id, client_id)
+    await _assert_sr_belongs_to_client(db, sr_id, client_id)
+
+    tl = (await db.execute(
+        select(PGTimeline).where(
+            PGTimeline.id == tl_id,
+            PGTimeline.standard_response_id == sr_id,
+        )
+    )).scalar_one_or_none()
+    if not tl:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    practice = PGPractice(
+        timeline_id=tl_id,
+        l0_type=request.l0_type,
+        l1_type=request.l1_type,
+        l2_type=request.l2_type,
+        display_order=request.display_order,
+        is_special_input=request.is_special_input,
+        frequency_days=request.frequency_days,
+    )
+    db.add(practice)
+    await db.flush()
+
+    for el in request.elements:
+        db.add(PGElement(
+            practice_id=practice.id,
+            element_type=el.element_type,
+            cosh_ref=el.cosh_ref,
+            value=el.value,
+            unit_cosh_id=el.unit_cosh_id,
+            display_order=el.display_order,
+        ))
+    await db.commit()
+    await db.refresh(practice)
+
+    elements = (await db.execute(
+        select(PGElement).where(PGElement.practice_id == practice.id)
+        .order_by(PGElement.display_order)
+    )).scalars().all()
+    return {
+        "id": practice.id,
+        "timeline_id": practice.timeline_id,
+        "l0_type": practice.l0_type,
+        "l1_type": practice.l1_type,
+        "l2_type": practice.l2_type,
+        "display_order": practice.display_order,
+        "is_special_input": practice.is_special_input,
+        "frequency_days": practice.frequency_days,
+        "elements": [
+            {
+                "id": e.id,
+                "element_type": e.element_type,
+                "cosh_ref": e.cosh_ref,
+                "value": e.value,
+                "unit_cosh_id": e.unit_cosh_id,
+                "display_order": e.display_order,
+            }
+            for e in elements
+        ],
+    }
+
+
+@router.delete(
+    "/client/{client_id}/standard-responses/{sr_id}/timelines/{tl_id}/practices/{p_id}",
+    status_code=204,
+)
+async def delete_qa_practice(
+    client_id: str,
+    sr_id: str,
+    tl_id: str,
+    p_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.modules.farmpundit.router import _assert_portal_member
+    await _assert_portal_member(db, current_user.id, client_id)
+    await _assert_sr_belongs_to_client(db, sr_id, client_id)
+
+    practice = (await db.execute(
+        select(PGPractice).where(
+            PGPractice.id == p_id,
+            PGPractice.timeline_id == tl_id,
+        )
+    )).scalar_one_or_none()
+    if not practice:
+        raise HTTPException(status_code=404, detail="Practice not found")
+
+    # Same parent-walk validation as the timeline endpoints — make
+    # sure the timeline really belongs to this Standard Response
+    # before deleting under it.
+    tl = (await db.execute(
+        select(PGTimeline).where(
+            PGTimeline.id == tl_id,
+            PGTimeline.standard_response_id == sr_id,
+        )
+    )).scalar_one_or_none()
+    if not tl:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    elements = (await db.execute(
+        select(PGElement).where(PGElement.practice_id == p_id)
+    )).scalars().all()
+    for e in elements:
+        await db.delete(e)
+    await db.delete(practice)
+    await db.commit()
 
 
 async def _wipe_sp_content(db: AsyncSession, sp_id: str) -> dict:

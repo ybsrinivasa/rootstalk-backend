@@ -235,7 +235,13 @@ class PGPracticeOut(BaseModel):
 
 class PGTimelineOut(BaseModel):
     id: str
-    pg_recommendation_id: str
+    # Both parents are nullable since pg_timelines is polymorphic
+    # post-2026-05-09 (UCAT pipe-3 / commit 4b8e2c1a93f5). Exactly
+    # one of these is populated per row, enforced by the DB CHECK
+    # `pg_timelines_one_parent_chk`.
+    pg_recommendation_id: Optional[str] = None
+    standard_response_id: Optional[str] = None
+    parent_kind: Optional[str] = None  # 'PG' | 'QA' — derived
     name: str
     from_type: str
     from_value: int
@@ -244,6 +250,29 @@ class PGTimelineOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class QATimelineCreate(BaseModel):
+    """Q&A timeline creation. Same shape as PGTimelineCreate but the
+    anchor unit defaults to DAYS_AFTER_RESPONSE — the unit that
+    matches the spec §14.9 framing ("days after the Pundit's
+    response is delivered to the farmer")."""
+    name: str
+    from_type: str = "DAYS_AFTER_RESPONSE"
+    from_value: int = 0
+    to_value: int
+
+
+class QAPracticeCreate(BaseModel):
+    """Q&A practice creation. Identical to PGPracticeCreate by design —
+    UCAT means Practice and Element shapes are pipe-agnostic."""
+    l0_type: str
+    l1_type: Optional[str] = None
+    l2_type: Optional[str] = None
+    display_order: int = 0
+    is_special_input: bool = False
+    frequency_days: Optional[int] = None
+    elements: List["ElementIn"] = []
 
 
 class PGRecommendationOut(BaseModel):
