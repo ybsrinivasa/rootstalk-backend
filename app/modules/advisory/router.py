@@ -2690,6 +2690,81 @@ async def import_global_pg(
     return target
 
 
+async def _check_pg_publish_readiness(
+    db: AsyncSession, *, pg: PGRecommendation,
+) -> list[dict]:
+    """Returns the missing-list — empty when ready. Used by both the
+    publish endpoint (raises 422 on non-empty) and the read-only
+    publish-readiness endpoint (returns the list verbatim)."""
+    missing: list[dict] = []
+
+    if not pg.area_or_plant:
+        missing.append({
+            "code": "missing_area_or_plant",
+            "message": (
+                "This recommendation has no bundle (area-wise / plant-wise) "
+                "set. Pick one before publishing."
+            ),
+        })
+
+    tl_count = (await db.execute(
+        select(func.count()).select_from(PGTimeline).where(
+            PGTimeline.pg_recommendation_id == pg.id,
+        )
+    )).scalar() or 0
+    if tl_count == 0:
+        missing.append({
+            "code": "no_timelines",
+            "message": (
+                "Add at least one timeline before publishing. A bundle "
+                "without any guidance has nothing to advise on."
+            ),
+        })
+
+    return missing
+
+
+@router.get("/client/{client_id}/pg-recommendations/{pg_id}/publish-readiness")
+async def get_pg_publish_readiness(
+    client_id: str,
+    pg_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Read-only check of every gate `publish_client_pg` runs. Same
+    response shape as the package /publish-readiness — frontend can
+    render either with the same gate-panel component."""
+    pg = (await db.execute(
+        select(PGRecommendation).where(
+            PGRecommendation.id == pg_id, PGRecommendation.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if not pg:
+        raise HTTPException(status_code=404, detail="PG recommendation not found")
+
+    base = {"version": pg.version, "status": pg.status}
+
+    transition = validate_publish_transition(pg.status)
+    if not transition.allowed:
+        return {
+            **base,
+            "ready": False,
+            "blocker_code": transition.error_code,
+            "missing": [{"code": transition.error_code, "message": transition.message}],
+        }
+
+    missing = await _check_pg_publish_readiness(db, pg=pg)
+    if missing:
+        return {
+            **base,
+            "ready": False,
+            "blocker_code": "publish_blocked_missing_fields",
+            "missing": missing,
+        }
+
+    return {**base, "ready": True}
+
+
 @router.post("/client/{client_id}/pg-recommendations/{pg_id}/publish")
 async def publish_client_pg(
     client_id: str,
@@ -2706,10 +2781,25 @@ async def publish_client_pg(
     if not res.allowed:
         _raise_publish_transition(res)
 
+    # CHA hub Round 4: content checklist must be clean before
+    # publish. Mirrors the CCA Step 2C checklist gate. Surfaces every
+    # missing item in one 422 so the CA portal renders a checklist.
+    missing = await _check_pg_publish_readiness(db, pg=pg)
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "publish_blocked_missing_fields",
+                "message": "Cannot publish — checklist not clean.",
+                "missing": missing,
+            },
+        )
+
     prev = (await db.execute(
         select(PGRecommendation).where(
             PGRecommendation.problem_group_cosh_id == pg.problem_group_cosh_id,
             PGRecommendation.client_id == client_id,
+            PGRecommendation.area_or_plant == pg.area_or_plant,
             PGRecommendation.status == "ACTIVE",
             PGRecommendation.id != pg.id,
         )

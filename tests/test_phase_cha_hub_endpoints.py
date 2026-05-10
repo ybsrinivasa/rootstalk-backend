@@ -431,3 +431,139 @@ async def test_create_client_pg_allows_both_bundles_for_same_pg(db):
     )
     assert a.id != b.id
     assert {a.area_or_plant, b.area_or_plant} == {"AREA_WISE", "PLANT_WISE"}
+
+
+# ── publish-readiness ──────────────────────────────────────────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_pg_readiness_ready_when_timeline_present(db):
+    from app.modules.advisory.router import get_pg_publish_readiness
+    from tests.factories import make_pg_timeline
+    client = await make_client(db)
+    user = await make_user(db, name="SE")
+    pg = PGRecommendation(
+        problem_group_cosh_id="pg:fungal_diseases", client_id=client.id,
+        area_or_plant="AREA_WISE", status="DRAFT",
+    )
+    db.add(pg); await db.flush()
+    await make_pg_timeline(db, pg)
+    await db.commit()
+
+    out = await get_pg_publish_readiness(
+        client_id=client.id, pg_id=pg.id, db=db, current_user=user,
+    )
+    assert out["ready"] is True
+    assert out["status"] == "DRAFT"
+    assert out["version"] == pg.version
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_pg_readiness_flags_no_timelines(db):
+    from app.modules.advisory.router import get_pg_publish_readiness
+    client = await make_client(db)
+    user = await make_user(db, name="SE")
+    pg = PGRecommendation(
+        problem_group_cosh_id="pg:fungal_diseases", client_id=client.id,
+        area_or_plant="AREA_WISE", status="DRAFT",
+    )
+    db.add(pg)
+    await db.commit()
+
+    out = await get_pg_publish_readiness(
+        client_id=client.id, pg_id=pg.id, db=db, current_user=user,
+    )
+    assert out["ready"] is False
+    assert out["blocker_code"] == "publish_blocked_missing_fields"
+    assert any(m["code"] == "no_timelines" for m in out["missing"])
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_pg_readiness_flags_missing_bundle(db):
+    """Defensive: if a PG row exists with area_or_plant=NULL (e.g. a
+    legacy global row that never got the bundle tag), readiness flags
+    it. Won't happen for client-local rows post-Round-3 but matters
+    for any pre-existing data and for SP later."""
+    from app.modules.advisory.router import get_pg_publish_readiness
+    from tests.factories import make_pg_timeline
+    client = await make_client(db)
+    user = await make_user(db, name="SE")
+    pg = PGRecommendation(
+        problem_group_cosh_id="pg:fungal_diseases", client_id=client.id,
+        area_or_plant=None, status="DRAFT",
+    )
+    db.add(pg); await db.flush()
+    await make_pg_timeline(db, pg)
+    await db.commit()
+
+    out = await get_pg_publish_readiness(
+        client_id=client.id, pg_id=pg.id, db=db, current_user=user,
+    )
+    assert out["ready"] is False
+    assert any(m["code"] == "missing_area_or_plant" for m in out["missing"])
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_pg_publish_422_on_empty_recommendation(db):
+    """Publishing an empty PG (no timelines) now 422s — pre-Round-4
+    it would silently succeed, leaving farmers subscribed to a
+    no-op recommendation."""
+    from fastapi import HTTPException
+    from app.modules.advisory.router import publish_client_pg
+    client = await make_client(db)
+    user = await make_user(db, name="SE")
+    pg = PGRecommendation(
+        problem_group_cosh_id="pg:fungal_diseases", client_id=client.id,
+        area_or_plant="AREA_WISE", status="DRAFT",
+    )
+    db.add(pg)
+    await db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await publish_client_pg(
+            client_id=client.id, pg_id=pg.id, db=db, current_user=user,
+        )
+    assert exc.value.status_code == 422
+    assert exc.value.detail["code"] == "publish_blocked_missing_fields"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_pg_publish_only_deactivates_same_bundle_siblings(db):
+    """Publishing a v2 area-wise bundle must NOT deactivate the
+    plant-wise sibling — bundles are independent. Round 1 made each
+    (PG, bundle) a separate row; Round 4 carries that through to
+    publish-side deactivation."""
+    from app.modules.advisory.router import publish_client_pg
+    from sqlalchemy import select as _sel
+    from tests.factories import make_pg_timeline
+    client = await make_client(db)
+    user = await make_user(db, name="SE")
+    aw_old = PGRecommendation(
+        problem_group_cosh_id="pg:fungal_diseases", client_id=client.id,
+        area_or_plant="AREA_WISE", status="ACTIVE",
+    )
+    aw_new = PGRecommendation(
+        problem_group_cosh_id="pg:fungal_diseases", client_id=client.id,
+        area_or_plant="AREA_WISE", status="DRAFT",
+    )
+    pw_active = PGRecommendation(
+        problem_group_cosh_id="pg:fungal_diseases", client_id=client.id,
+        area_or_plant="PLANT_WISE", status="ACTIVE",
+    )
+    db.add_all([aw_old, aw_new, pw_active])
+    await db.flush()
+    await make_pg_timeline(db, aw_new)
+    await db.commit()
+
+    await publish_client_pg(
+        client_id=client.id, pg_id=aw_new.id, db=db, current_user=user,
+    )
+    refreshed = (await db.execute(_sel(PGRecommendation))).scalars().all()
+    by_id = {r.id: r for r in refreshed}
+    assert by_id[aw_new.id].status == "ACTIVE"
+    assert by_id[aw_old.id].status == "INACTIVE"   # same bundle deactivated
+    assert by_id[pw_active.id].status == "ACTIVE"  # other bundle untouched

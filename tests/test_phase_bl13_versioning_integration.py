@@ -158,12 +158,16 @@ async def test_pg_first_publish_lands_at_version_1(db):
     """PGRecommendation has no published_at column, so the service
     uses status=='DRAFT' as the first-publish signal. Verify the same
     off-by-one fix applies here."""
+    from tests.factories import make_pg_timeline
+
     sa = await make_user(db, name="SA")
     client = await make_client(db)
     pg = await make_pg_recommendation(db, problem_group_cosh_id="pg:leaf-blight")
     pg.client_id = client.id
     pg.status = "DRAFT"
     pg.version = 1
+    # CHA hub Round 4: publish gate now requires ≥1 timeline.
+    await make_pg_timeline(db, pg)
     await db.commit()
 
     out = await publish_client_pg(
