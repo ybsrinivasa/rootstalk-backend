@@ -288,3 +288,146 @@ async def test_cha_practices_excludes_qa_rooted_timelines(db):
     # The QA practice is not in the CHA list.
     assert all(p["recommendation_id"] for p in out["items"])
     assert out["total"] == 3  # the 3 CHA practices, no QA one
+
+
+# ── create_client_pg ───────────────────────────────────────────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_create_client_pg_happy_path(db):
+    """SE creates a fresh local PG bundle from scratch (no import).
+    Returns 201 with the new row; status defaults to DRAFT; version 1."""
+    from app.modules.advisory.router import create_client_pg
+    from app.modules.advisory.schemas import PGRecommendationCreate
+    client = await make_client(db)
+    user = await make_user(db, name="SE")
+    await db.commit()
+
+    out = await create_client_pg(
+        client_id=client.id,
+        request=PGRecommendationCreate(
+            problem_group_cosh_id="pg:fungal_diseases",
+            area_or_plant="AREA_WISE",
+        ),
+        db=db, current_user=user,
+    )
+    assert out.problem_group_cosh_id == "pg:fungal_diseases"
+    assert out.area_or_plant == "AREA_WISE"
+    assert out.status == "DRAFT"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_create_client_pg_rejects_missing_bundle(db):
+    """area_or_plant is required — a bundle without it isn't authorable."""
+    from fastapi import HTTPException
+    from app.modules.advisory.router import create_client_pg
+    from app.modules.advisory.schemas import PGRecommendationCreate
+    client = await make_client(db)
+    user = await make_user(db, name="SE")
+    await db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await create_client_pg(
+            client_id=client.id,
+            request=PGRecommendationCreate(
+                problem_group_cosh_id="pg:fungal_diseases",
+                area_or_plant=None,
+            ),
+            db=db, current_user=user,
+        )
+    assert exc.value.status_code == 422
+    assert exc.value.detail["code"] == "area_or_plant_required"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_create_client_pg_rejects_unknown_pg(db):
+    """V1 PG list is hardcoded — refuse cosh_ids not in it. Will become
+    a Cosh-Connect membership check when that Connect ships."""
+    from fastapi import HTTPException
+    from app.modules.advisory.router import create_client_pg
+    from app.modules.advisory.schemas import PGRecommendationCreate
+    client = await make_client(db)
+    user = await make_user(db, name="SE")
+    await db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await create_client_pg(
+            client_id=client.id,
+            request=PGRecommendationCreate(
+                problem_group_cosh_id="pg:does_not_exist",
+                area_or_plant="AREA_WISE",
+            ),
+            db=db, current_user=user,
+        )
+    assert exc.value.status_code == 422
+    assert exc.value.detail["code"] == "unknown_problem_group"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_create_client_pg_409_on_duplicate_bundle(db):
+    """Bundle uniqueness: (client, PG, area_or_plant) is one bundle.
+    Re-creating returns 409 with pointer to the existing bundle so
+    the CA portal can offer 'open the existing one' instead of a
+    confusing duplicate."""
+    from fastapi import HTTPException
+    from app.modules.advisory.router import create_client_pg
+    from app.modules.advisory.schemas import PGRecommendationCreate
+    client = await make_client(db)
+    user = await make_user(db, name="SE")
+    await db.commit()
+
+    await create_client_pg(
+        client_id=client.id,
+        request=PGRecommendationCreate(
+            problem_group_cosh_id="pg:fungal_diseases",
+            area_or_plant="AREA_WISE",
+        ),
+        db=db, current_user=user,
+    )
+    with pytest.raises(HTTPException) as exc:
+        await create_client_pg(
+            client_id=client.id,
+            request=PGRecommendationCreate(
+                problem_group_cosh_id="pg:fungal_diseases",
+                area_or_plant="AREA_WISE",
+            ),
+            db=db, current_user=user,
+        )
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "bundle_already_exists"
+    assert "pg_recommendation_id" in exc.value.detail["existing"]
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_create_client_pg_allows_both_bundles_for_same_pg(db):
+    """The (client, PG, area_or_plant) constraint MUST allow both
+    bundles for the same PG — area-wise and plant-wise are
+    independent authoring units per the user's framing."""
+    from app.modules.advisory.router import create_client_pg
+    from app.modules.advisory.schemas import PGRecommendationCreate
+    client = await make_client(db)
+    user = await make_user(db, name="SE")
+    await db.commit()
+
+    a = await create_client_pg(
+        client_id=client.id,
+        request=PGRecommendationCreate(
+            problem_group_cosh_id="pg:fungal_diseases",
+            area_or_plant="AREA_WISE",
+        ),
+        db=db, current_user=user,
+    )
+    b = await create_client_pg(
+        client_id=client.id,
+        request=PGRecommendationCreate(
+            problem_group_cosh_id="pg:fungal_diseases",
+            area_or_plant="PLANT_WISE",
+        ),
+        db=db, current_user=user,
+    )
+    assert a.id != b.id
+    assert {a.area_or_plant, b.area_or_plant} == {"AREA_WISE", "PLANT_WISE"}

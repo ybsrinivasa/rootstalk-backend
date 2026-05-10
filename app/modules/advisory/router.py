@@ -2406,6 +2406,90 @@ async def list_client_pg(
     return result.scalars().all()
 
 
+@router.post(
+    "/client/{client_id}/pg-recommendations",
+    response_model=PGRecommendationOut, status_code=201,
+)
+async def create_client_pg(
+    client_id: str,
+    request: PGRecommendationCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Create a fresh client-local PG recommendation bundle. Used by the
+    SE who wants to author from scratch instead of importing from
+    Global. Per the bundle model (CHA hub Round 1, 2026-05-10):
+
+    - `area_or_plant` is required at this layer ('AREA_WISE' /
+      'PLANT_WISE') — a bundle without it isn't authorable.
+    - `(client_id, problem_group_cosh_id, area_or_plant)` is unique:
+      one bundle per (PG, side) per client. Re-creating returns 409
+      with a pointer to the existing bundle.
+    - `problem_group_cosh_id` is validated against the V1 hardcoded
+      PG list (will become a Cosh-Connect membership check once the
+      `problem_group` Connect ships)."""
+    from app.services.cha_problem_groups import is_known_problem_group
+
+    if request.area_or_plant not in ("AREA_WISE", "PLANT_WISE"):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "area_or_plant_required",
+                "message": (
+                    "area_or_plant must be 'AREA_WISE' or 'PLANT_WISE' — "
+                    "the bundle side defines which crops this recommendation "
+                    "applies to."
+                ),
+            },
+        )
+
+    if not is_known_problem_group(request.problem_group_cosh_id):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "unknown_problem_group",
+                "message": (
+                    "This problem_group_cosh_id is not in the supported list. "
+                    "Pick from the CHA · Problems screen."
+                ),
+            },
+        )
+
+    existing = (await db.execute(
+        select(PGRecommendation).where(
+            PGRecommendation.client_id == client_id,
+            PGRecommendation.problem_group_cosh_id == request.problem_group_cosh_id,
+            PGRecommendation.area_or_plant == request.area_or_plant,
+        )
+    )).scalar_one_or_none()
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "bundle_already_exists",
+                "message": (
+                    "A bundle for this Problem and side already exists. "
+                    "Edit the existing bundle instead of creating a new one."
+                ),
+                "existing": {
+                    "pg_recommendation_id": existing.id,
+                    "status": existing.status,
+                    "version": existing.version,
+                },
+            },
+        )
+
+    pg = PGRecommendation(
+        problem_group_cosh_id=request.problem_group_cosh_id,
+        client_id=client_id,
+        area_or_plant=request.area_or_plant,
+    )
+    db.add(pg)
+    await db.commit()
+    await db.refresh(pg)
+    return pg
+
+
 @router.get("/client/{client_id}/pg-recommendations/{pg_id}", response_model=PGRecommendationOut)
 async def get_client_pg(
     client_id: str,
