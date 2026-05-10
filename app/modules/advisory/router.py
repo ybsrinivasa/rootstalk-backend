@@ -500,6 +500,97 @@ async def update_package(
     return pkg
 
 
+@router.get("/client/{client_id}/packages/{package_id}/publish-readiness")
+async def get_publish_readiness(
+    client_id: str, package_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Read-only check of every gate `publish_package` runs before
+    flipping a DRAFT to ACTIVE. Lets the CA portal render a live
+    "what's missing" checklist on the package detail page so the SE
+    sees the gap before clicking Publish, instead of bouncing off a
+    422 each time.
+
+    Returns `{ready: true, version, status}` when every gate is clear,
+    or `{ready: false, status, missing: [{code, message, ...}], blocker_code}`
+    when one fails. `blocker_code` is the same `code` `publish_package`
+    would surface in its 422 — the missing list mirrors that 422's
+    `missing` array shape so the frontend can render either response
+    with the same component."""
+    from app.services.crop_lifecycle import (
+        CropNotOnBeltError, assert_crop_on_belt,
+    )
+    from app.services.pv_consistency import (
+        PVConsistencyError, assert_pv_consistency_for_package,
+    )
+    from app.services.pv_uniqueness import (
+        PVConflictError, assert_pv_unique_for_package,
+    )
+
+    pkg = await _get_package(db, package_id, client_id)
+
+    base = {
+        "version": pkg.version,
+        "status": pkg.status.value,
+    }
+
+    try:
+        await assert_crop_on_belt(
+            db, client_id=client_id, crop_cosh_id=pkg.crop_cosh_id,
+        )
+    except CropNotOnBeltError as e:
+        return {
+            **base,
+            "ready": False,
+            "blocker_code": e.code,
+            "missing": [{"code": e.code, "message": str(e)}],
+        }
+
+    try:
+        await assert_package_publish_ready(db, package=pkg)
+    except PublishBlockedError as e:
+        return {
+            **base,
+            "ready": False,
+            "blocker_code": e.code,
+            "missing": [
+                {"code": m.code, "message": m.message, **(m.extra or {})}
+                for m in e.missing
+            ],
+        }
+
+    try:
+        await assert_pv_unique_for_package(db, package=pkg)
+    except PVConflictError as e:
+        return {
+            **base,
+            "ready": False,
+            "blocker_code": e.code,
+            "missing": [
+                {"code": e.code, "message": str(e),
+                 "conflicts": [c.__dict__ if hasattr(c, "__dict__") else c
+                               for c in e.conflicts]},
+            ],
+        }
+
+    try:
+        await assert_pv_consistency_for_package(db, package=pkg)
+    except PVConsistencyError as e:
+        return {
+            **base,
+            "ready": False,
+            "blocker_code": e.code,
+            "missing": [
+                {"code": e.code, "message": str(e),
+                 "violations": [v.__dict__ if hasattr(v, "__dict__") else v
+                                for v in e.violations]},
+            ],
+        }
+
+    return {**base, "ready": True}
+
+
 @router.post("/client/{client_id}/packages/{package_id}/publish", response_model=PackageOut)
 async def publish_package(
     client_id: str, package_id: str,
