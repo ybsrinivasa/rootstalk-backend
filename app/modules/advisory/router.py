@@ -530,9 +530,28 @@ async def get_publish_readiness(
 
     pkg = await _get_package(db, package_id, client_id)
 
+    # Subscription head-count for the publish confirmation context.
+    # BL-13 versioning is *in-place* — there are no frozen older
+    # version snapshots; every existing ACTIVE/WAITLISTED subscriber
+    # on this package_id will see the new version's content the
+    # moment it publishes. Surfacing the count here lets the CA
+    # portal explain that truthfully.
+    from app.modules.subscriptions.models import (
+        Subscription, SubscriptionStatus,
+    )
+    sub_count_q = select(func.count()).select_from(Subscription).where(
+        Subscription.package_id == pkg.id,
+        Subscription.status.in_(
+            (SubscriptionStatus.ACTIVE, SubscriptionStatus.WAITLISTED),
+        ),
+    )
+    subscriber_count = (await db.execute(sub_count_q)).scalar() or 0
+
     base = {
         "version": pkg.version,
         "status": pkg.status.value,
+        "published_at": pkg.published_at,
+        "subscriber_count": subscriber_count,
     }
 
     try:

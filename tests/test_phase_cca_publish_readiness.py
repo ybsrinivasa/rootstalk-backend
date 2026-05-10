@@ -45,6 +45,53 @@ async def test_readiness_returns_ready_true_for_complete_package(db):
     assert out["ready"] is True
     assert out["status"] == "ACTIVE"  # factory creates ACTIVE; gate-check still applies
     assert out["version"] == pkg.version
+    # Round 6: published_at + subscriber_count surfaced for UI context.
+    # Fresh package: no published_at, no subscribers.
+    assert out["published_at"] is None
+    assert out["subscriber_count"] == 0
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_readiness_carries_subscriber_count(db):
+    """Round 6: BL-13 versioning is in-place — every existing
+    subscriber on this package_id will see the new version. The
+    readiness response surfaces that count so the CA portal's
+    publish-confirmation modal can show "X subscribers will move to
+    v{N+1}" truthfully. WAITLISTED + ACTIVE both count; LAPSED /
+    CANCELLED don't."""
+    from app.modules.subscriptions.models import (
+        Subscription, SubscriptionStatus, SubscriptionType,
+    )
+    client = await make_client(db)
+    user = await make_user(db, name="SE")
+    pkg = await make_package(db, client, name="With Subs", crop_cosh_id="crop:test")
+    farmer1 = await make_user(db, name="F1")
+    farmer2 = await make_user(db, name="F2")
+    farmer3 = await make_user(db, name="F3")
+    farmer4 = await make_user(db, name="F4")
+    db.add_all([
+        Subscription(farmer_user_id=farmer1.id, client_id=client.id,
+                     package_id=pkg.id, subscription_type=SubscriptionType.SELF,
+                     status=SubscriptionStatus.ACTIVE),
+        Subscription(farmer_user_id=farmer2.id, client_id=client.id,
+                     package_id=pkg.id, subscription_type=SubscriptionType.SELF,
+                     status=SubscriptionStatus.ACTIVE),
+        Subscription(farmer_user_id=farmer3.id, client_id=client.id,
+                     package_id=pkg.id, subscription_type=SubscriptionType.SELF,
+                     status=SubscriptionStatus.WAITLISTED),
+        # LAPSED — does not count toward "will see new version".
+        Subscription(farmer_user_id=farmer4.id, client_id=client.id,
+                     package_id=pkg.id, subscription_type=SubscriptionType.SELF,
+                     status=SubscriptionStatus.LAPSED),
+    ])
+    await db.commit()
+
+    out = await get_publish_readiness(
+        client_id=client.id, package_id=pkg.id,
+        db=db, current_user=user,
+    )
+    assert out["subscriber_count"] == 3  # 2 ACTIVE + 1 WAITLISTED, LAPSED excluded
 
 
 # ── Missing locations ──────────────────────────────────────────────────────
