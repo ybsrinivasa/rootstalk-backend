@@ -2962,6 +2962,34 @@ async def delete_client_pg_element(
     )
 
 
+@router.delete(
+    "/client/{client_id}/pg-recommendations/{pg_id}/timelines/{tl_id}/practices/{practice_id}",
+    status_code=204,
+)
+async def delete_client_pg_practice(
+    client_id: str, pg_id: str, tl_id: str, practice_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Remove a practice from a client-local PG recommendation. Cascade
+    drops its elements via ORM. Mirror of delete_practice on CCA."""
+    practice = (await db.execute(
+        select(PGPractice).where(
+            PGPractice.id == practice_id,
+            PGPractice.timeline_id == tl_id,
+        )
+    )).scalar_one_or_none()
+    if not practice:
+        raise HTTPException(status_code=404, detail="Practice not found")
+    elems = (await db.execute(
+        select(PGElement).where(PGElement.practice_id == practice.id)
+    )).scalars().all()
+    for e in elems:
+        await db.delete(e)
+    await db.delete(practice)
+    await db.commit()
+
+
 @router.delete("/client/{client_id}/pg-recommendations/{pg_id}/timelines/{tl_id}", status_code=204)
 async def delete_client_pg_timeline(
     client_id: str,

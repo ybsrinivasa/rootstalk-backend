@@ -567,3 +567,44 @@ async def test_pg_publish_only_deactivates_same_bundle_siblings(db):
     assert by_id[aw_new.id].status == "ACTIVE"
     assert by_id[aw_old.id].status == "INACTIVE"   # same bundle deactivated
     assert by_id[pw_active.id].status == "ACTIVE"  # other bundle untouched
+
+
+# ── delete_client_pg_practice ──────────────────────────────────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_delete_client_pg_practice_cascades_elements(db):
+    """Round 5: PG practice delete + element cascade. Mirror of CCA's
+    delete_practice. Without this endpoint the SE could only nuke the
+    whole timeline to drop one practice — too coarse."""
+    from app.modules.advisory.router import delete_client_pg_practice
+    from sqlalchemy import select as _sel
+    client = await make_client(db)
+    user = await make_user(db, name="SE")
+    pg = PGRecommendation(
+        problem_group_cosh_id="pg:fungal_diseases", client_id=client.id,
+        area_or_plant="AREA_WISE", status="DRAFT",
+    )
+    db.add(pg); await db.flush()
+    tl = PGTimeline(pg_recommendation_id=pg.id, name="W1", from_value=0, to_value=7)
+    db.add(tl); await db.flush()
+    practice = PGPractice(
+        timeline_id=tl.id, l0_type="INPUT",
+        l1_type="PESTICIDE", l2_type="CHEMICAL_PESTICIDES",
+        display_order=0,
+    )
+    db.add(practice); await db.flush()
+    db.add(PGElement(
+        practice_id=practice.id, element_type="DOSAGE",
+        value="2", unit_cosh_id="kg/ha",
+    ))
+    await db.commit()
+
+    await delete_client_pg_practice(
+        client_id=client.id, pg_id=pg.id, tl_id=tl.id, practice_id=practice.id,
+        db=db, current_user=user,
+    )
+    practices = (await db.execute(_sel(PGPractice))).scalars().all()
+    elements = (await db.execute(_sel(PGElement))).scalars().all()
+    assert practices == []
+    assert elements == []
