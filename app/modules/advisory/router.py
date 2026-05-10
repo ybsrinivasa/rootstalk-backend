@@ -4863,3 +4863,257 @@ async def cha_sp_list_practices(
         })
 
     return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+# ── QA Hub list endpoints (2026-05-10) ─────────────────────────────────────
+# UCAT pipe-3 — Q&A library. Mirror of CCA/CHA hub patterns. Per user
+# 2026-05-10: QA crops = CA's full shortlist (no CHA-enabled
+# intersection). SE picks a crop first, then authors a Standard
+# Response under that crop. Standard Responses themselves use the
+# existing /client/{cid}/standard-responses CRUD; this section adds
+# the cross-cutting list endpoints + the eligible-crops surface.
+
+@router.get("/client/{client_id}/qa/eligible-crops")
+async def qa_eligible_crops(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Crops the SE may author Q&A standard responses for. **No CHA
+    intersection**: every crop the CA has shortlisted is fair game
+    for Q&A authoring (a question may be crop-bound or
+    crop-agnostic, but the picker only surfaces the CA's belt
+    crops). Plus a synthetic 'Crop-agnostic' entry for questions
+    that don't belong to any crop."""
+    rows = (await db.execute(
+        select(ClientCrop).where(
+            ClientCrop.client_id == client_id,
+            ClientCrop.removed_at.is_(None),
+        )
+    )).scalars().all()
+    cosh_ids = {c.crop_cosh_id for c in rows}
+    crop_names = await _crop_names_by_cosh_id(db, cosh_ids)
+    return [
+        {
+            "crop_cosh_id": c.crop_cosh_id,
+            "name_en": crop_names.get(c.crop_cosh_id, c.crop_cosh_id),
+        }
+        for c in sorted(
+            rows, key=lambda r: crop_names.get(r.crop_cosh_id, r.crop_cosh_id).lower()
+        )
+    ]
+
+
+@router.get("/client/{client_id}/qa/standard-responses")
+async def qa_list_standard_responses(
+    client_id: str,
+    crop_cosh_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Denormalised list of Standard Responses. Adds friendly crop
+    name + timeline_count to the rows so the QA · Standard Responses
+    screen renders without N+1. Filter chip: ?crop_cosh_id=. The
+    special value `__AGNOSTIC__` filters to crop-agnostic SRs
+    (question_text without a crop attached)."""
+    from app.modules.farmpundit.models import StandardResponse
+
+    q = select(StandardResponse).where(StandardResponse.client_id == client_id)
+    if crop_cosh_id == "__AGNOSTIC__":
+        q = q.where(StandardResponse.crop_cosh_id.is_(None))
+    elif crop_cosh_id:
+        q = q.where(StandardResponse.crop_cosh_id == crop_cosh_id)
+    q = q.order_by(StandardResponse.updated_at.desc())
+
+    srs = (await db.execute(q)).scalars().all()
+    if not srs:
+        return []
+
+    sr_ids = [s.id for s in srs]
+    tl_counts = dict((await db.execute(
+        select(PGTimeline.standard_response_id, func.count())
+        .where(PGTimeline.standard_response_id.in_(sr_ids))
+        .group_by(PGTimeline.standard_response_id)
+    )).all())
+
+    crop_ids = {s.crop_cosh_id for s in srs if s.crop_cosh_id}
+    crop_names = await _crop_names_by_cosh_id(db, crop_ids)
+
+    return [
+        {
+            "id": s.id,
+            "question_text": s.question_text,
+            "crop_cosh_id": s.crop_cosh_id,
+            "crop_name_en": (
+                crop_names.get(s.crop_cosh_id, s.crop_cosh_id)
+                if s.crop_cosh_id else None
+            ),
+            "timeline_count": tl_counts.get(s.id, 0),
+            "created_at": s.created_at,
+            "updated_at": s.updated_at,
+        }
+        for s in srs
+    ]
+
+
+@router.get("/client/{client_id}/qa/timelines")
+async def qa_list_timelines(
+    client_id: str,
+    standard_response_id: Optional[str] = None,
+    crop_cosh_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cross-SR timeline list. Walks the polymorphic `pg_timelines`
+    table for rows with `standard_response_id IS NOT NULL` (excluding
+    PG-rooted rows). Chips: ?standard_response_id=, ?crop_cosh_id=."""
+    from app.modules.farmpundit.models import StandardResponse
+
+    q = (
+        select(PGTimeline, StandardResponse)
+        .join(StandardResponse, PGTimeline.standard_response_id == StandardResponse.id)
+        .where(StandardResponse.client_id == client_id)
+    )
+    if standard_response_id:
+        q = q.where(PGTimeline.standard_response_id == standard_response_id)
+    if crop_cosh_id == "__AGNOSTIC__":
+        q = q.where(StandardResponse.crop_cosh_id.is_(None))
+    elif crop_cosh_id:
+        q = q.where(StandardResponse.crop_cosh_id == crop_cosh_id)
+    q = q.order_by(PGTimeline.from_value)
+
+    rows = (await db.execute(q)).all()
+    if not rows:
+        return []
+
+    tl_ids = [tl.id for tl, _ in rows]
+    practice_counts = dict((await db.execute(
+        select(PGPractice.timeline_id, func.count())
+        .where(PGPractice.timeline_id.in_(tl_ids))
+        .group_by(PGPractice.timeline_id)
+    )).all())
+
+    crop_ids = {sr.crop_cosh_id for _, sr in rows if sr.crop_cosh_id}
+    crop_names = await _crop_names_by_cosh_id(db, crop_ids)
+
+    return [
+        {
+            "id": tl.id,
+            "name": tl.name,
+            "from_type": tl.from_type if isinstance(tl.from_type, str)
+            else getattr(tl.from_type, "value", str(tl.from_type)),
+            "from_value": tl.from_value,
+            "to_value": tl.to_value,
+            "standard_response_id": sr.id,
+            "question_text": sr.question_text,
+            "crop_cosh_id": sr.crop_cosh_id,
+            "crop_name_en": (
+                crop_names.get(sr.crop_cosh_id, sr.crop_cosh_id)
+                if sr.crop_cosh_id else None
+            ),
+            "practice_count": practice_counts.get(tl.id, 0),
+        }
+        for tl, sr in rows
+    ]
+
+
+@router.get("/client/{client_id}/qa/practices")
+async def qa_list_practices(
+    client_id: str,
+    standard_response_id: Optional[str] = None,
+    crop_cosh_id: Optional[str] = None,
+    timeline_id: Optional[str] = None,
+    l1: Optional[str] = None,
+    l2: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cross-timeline QA practice list. Same shape as /cha/practices
+    and /cha-sp/practices. Paginated."""
+    from app.modules.farmpundit.models import StandardResponse
+
+    if limit < 1 or limit > 500:
+        raise HTTPException(status_code=422, detail={"code": "invalid_limit", "message": "limit must be 1..500"})
+    if offset < 0:
+        raise HTTPException(status_code=422, detail={"code": "invalid_offset", "message": "offset must be >= 0"})
+
+    q = (
+        select(PGPractice, PGTimeline, StandardResponse)
+        .join(PGTimeline, PGPractice.timeline_id == PGTimeline.id)
+        .join(StandardResponse, PGTimeline.standard_response_id == StandardResponse.id)
+        .where(StandardResponse.client_id == client_id)
+    )
+    if standard_response_id:
+        q = q.where(PGTimeline.standard_response_id == standard_response_id)
+    if crop_cosh_id == "__AGNOSTIC__":
+        q = q.where(StandardResponse.crop_cosh_id.is_(None))
+    elif crop_cosh_id:
+        q = q.where(StandardResponse.crop_cosh_id == crop_cosh_id)
+    if timeline_id:
+        q = q.where(PGPractice.timeline_id == timeline_id)
+    if l1:
+        q = q.where(PGPractice.l1_type == l1)
+    if l2:
+        q = q.where(PGPractice.l2_type == l2)
+
+    total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar() or 0
+
+    q = q.order_by(StandardResponse.created_at.desc(), PGTimeline.from_value, PGPractice.display_order)
+    q = q.offset(offset).limit(limit)
+
+    rows = (await db.execute(q)).all()
+    if not rows:
+        return {"items": [], "total": total, "limit": limit, "offset": offset}
+
+    practice_ids = [pr.id for pr, _, _ in rows]
+    elements_by_practice: dict[str, list[PGElement]] = {}
+    if practice_ids:
+        elem_rows = (await db.execute(
+            select(PGElement).where(PGElement.practice_id.in_(practice_ids))
+            .order_by(PGElement.display_order)
+        )).scalars().all()
+        for e in elem_rows:
+            elements_by_practice.setdefault(e.practice_id, []).append(e)
+
+    crop_ids = {sr.crop_cosh_id for _, _, sr in rows if sr.crop_cosh_id}
+    crop_names = await _crop_names_by_cosh_id(db, crop_ids)
+
+    items = []
+    for practice, timeline, sr in rows:
+        elements = elements_by_practice.get(practice.id, [])
+        brand = next(
+            (e.cosh_ref for e in elements if e.element_type == "BRAND_NAME" and e.cosh_ref),
+            None,
+        )
+        dosage = next(
+            (e for e in elements if e.element_type == "DOSAGE" and (e.value or e.cosh_ref)),
+            None,
+        )
+        dosage_summary = (
+            f"{dosage.value} {dosage.unit_cosh_id}" if dosage and dosage.unit_cosh_id
+            else (dosage.value if dosage else None)
+        )
+        items.append({
+            "id": practice.id,
+            "l0_type": practice.l0_type if isinstance(practice.l0_type, str)
+            else getattr(practice.l0_type, "value", str(practice.l0_type)),
+            "l1_type": practice.l1_type,
+            "l2_type": practice.l2_type,
+            "is_special_input": practice.is_special_input,
+            "frequency_days": practice.frequency_days,
+            "brand_cosh_id": brand,
+            "dosage_summary": dosage_summary,
+            "timeline_id": timeline.id,
+            "timeline_name": timeline.name,
+            "standard_response_id": sr.id,
+            "question_text": sr.question_text,
+            "crop_cosh_id": sr.crop_cosh_id,
+            "crop_name_en": (
+                crop_names.get(sr.crop_cosh_id, sr.crop_cosh_id)
+                if sr.crop_cosh_id else None
+            ),
+        })
+
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
