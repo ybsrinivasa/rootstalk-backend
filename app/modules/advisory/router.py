@@ -3777,6 +3777,112 @@ async def import_pg_into_sp(
     return sp
 
 
+@router.get("/client/{client_id}/sp-recommendations/{sp_id}", response_model=SPRecommendationOut)
+async def get_client_sp(
+    client_id: str, sp_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    sp = (await db.execute(
+        select(SPRecommendation).where(
+            SPRecommendation.id == sp_id, SPRecommendation.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if not sp:
+        raise HTTPException(status_code=404, detail="SP recommendation not found")
+    return sp
+
+
+@router.delete(
+    "/client/{client_id}/sp-recommendations/{sp_id}/timelines/{tl_id}/practices/{practice_id}",
+    status_code=204,
+)
+async def delete_client_sp_practice(
+    client_id: str, sp_id: str, tl_id: str, practice_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Mirror of delete_client_pg_practice. Cascades the practice's
+    elements via ORM."""
+    from app.modules.advisory.models import SPElement, SPPractice
+    practice = (await db.execute(
+        select(SPPractice).where(
+            SPPractice.id == practice_id, SPPractice.timeline_id == tl_id,
+        )
+    )).scalar_one_or_none()
+    if not practice:
+        raise HTTPException(status_code=404, detail="Practice not found")
+    elems = (await db.execute(
+        select(SPElement).where(SPElement.practice_id == practice.id)
+    )).scalars().all()
+    for e in elems:
+        await db.delete(e)
+    await db.delete(practice)
+    await db.commit()
+
+
+async def _check_sp_publish_readiness(
+    db: AsyncSession, *, sp: SPRecommendation,
+) -> list[dict]:
+    """Mirror of `_check_pg_publish_readiness`. SP-specific gates:
+    crop_cosh_id set + at least one timeline."""
+    missing: list[dict] = []
+    if not sp.crop_cosh_id:
+        missing.append({
+            "code": "missing_crop_cosh_id",
+            "message": (
+                "This SP recommendation has no crop set — pre-Round-1 "
+                "rows might be NULL. Re-create the recommendation."
+            ),
+        })
+    tl_count = (await db.execute(
+        select(func.count()).select_from(SPTimeline).where(
+            SPTimeline.sp_recommendation_id == sp.id,
+        )
+    )).scalar() or 0
+    if tl_count == 0:
+        missing.append({
+            "code": "no_timelines",
+            "message": (
+                "Add at least one timeline before publishing. A bundle "
+                "without any guidance has nothing to advise on."
+            ),
+        })
+    return missing
+
+
+@router.get("/client/{client_id}/sp-recommendations/{sp_id}/publish-readiness")
+async def get_sp_publish_readiness(
+    client_id: str, sp_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Read-only check of every gate `publish_sp` runs. Same envelope
+    shape as the package + PG readiness endpoints — frontend renders
+    all three with the same gate-panel component."""
+    sp = (await db.execute(
+        select(SPRecommendation).where(
+            SPRecommendation.id == sp_id, SPRecommendation.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if not sp:
+        raise HTTPException(status_code=404, detail="SP recommendation not found")
+
+    base = {"version": sp.version, "status": sp.status}
+
+    transition = validate_publish_transition(sp.status)
+    if not transition.allowed:
+        return {**base, "ready": False, "blocker_code": transition.error_code,
+                "missing": [{"code": transition.error_code, "message": transition.message}]}
+
+    missing = await _check_sp_publish_readiness(db, sp=sp)
+    if missing:
+        return {**base, "ready": False, "blocker_code": "publish_blocked_missing_fields",
+                "missing": missing}
+
+    return {**base, "ready": True}
+
+
 @router.post("/client/{client_id}/sp-recommendations/{sp_id}/publish")
 async def publish_sp(
     client_id: str,
@@ -3793,9 +3899,29 @@ async def publish_sp(
     if not res.allowed:
         _raise_publish_transition(res)
 
+    # CHA-SP hub Round 3: content checklist must be clean before
+    # publish (mirror of PG Round 4). Empty SPs leaving farmers
+    # subscribed to a no-op recommendation is the failure mode this
+    # gate prevents.
+    missing = await _check_sp_publish_readiness(db, sp=sp)
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "publish_blocked_missing_fields",
+                "message": "Cannot publish — checklist not clean.",
+                "missing": missing,
+            },
+        )
+
+    # Sibling-deactivation scoped by (client, crop, specific_problem)
+    # — pre-Round-3 it scoped only by sp_cosh_id which would have
+    # failed if two crops happen to share an sp_cosh_id (they
+    # shouldn't post-Round-1, but defensive).
     prev = (await db.execute(
         select(SPRecommendation).where(
             SPRecommendation.specific_problem_cosh_id == sp.specific_problem_cosh_id,
+            SPRecommendation.crop_cosh_id == sp.crop_cosh_id,
             SPRecommendation.client_id == client_id,
             SPRecommendation.status == "ACTIVE",
             SPRecommendation.id != sp.id,
