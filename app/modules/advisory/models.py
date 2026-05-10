@@ -449,13 +449,20 @@ class PGElement(Base):
 
 
 class SPRecommendation(Base):
-    """Specific Problem recommendations — always client-level."""
+    """Specific Problem recommendations — always client-level.
+
+    A specific problem is crop-bound by definition (e.g. "Tomato Late
+    Blight"). The SE picks a crop first, then a specific problem from
+    that crop's list. `crop_cosh_id` snapshots the crop at create
+    time — user clarified 2026-05-10. No bundle dimension (PG's area/
+    plant split doesn't apply: the crop already implies the typing).
+    """
     __tablename__ = "sp_recommendations"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     specific_problem_cosh_id: Mapped[str] = mapped_column(String(100), nullable=False)
     client_id: Mapped[str] = mapped_column(String(36), ForeignKey("clients.id"), nullable=False)
-    application_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    crop_cosh_id: Mapped[str] = mapped_column(String(100), nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="DRAFT")
     version: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

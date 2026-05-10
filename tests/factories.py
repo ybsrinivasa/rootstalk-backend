@@ -565,7 +565,8 @@ async def make_sp_recommendation(
 ) -> SPRecommendation:
     sp = SPRecommendation(
         specific_problem_cosh_id=kw.get("specific_problem_cosh_id", "sp:test"),
-        client_id=client.id, application_type="LOCAL",
+        client_id=client.id,
+        crop_cosh_id=kw.get("crop_cosh_id", "crop:test"),
     )
     db.add(sp)
     await db.flush()

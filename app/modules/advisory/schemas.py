@@ -296,7 +296,9 @@ class PGRecommendationOut(BaseModel):
 
 class SPRecommendationCreate(BaseModel):
     specific_problem_cosh_id: str
-    application_type: str
+    # CHA-SP hub: crop is picked before the specific problem; snapshot
+    # it on the row for fast filtering + audit clarity.
+    crop_cosh_id: str
 
 
 class SPTimelineCreate(BaseModel):
@@ -347,7 +349,7 @@ class SPRecommendationOut(BaseModel):
     id: str
     specific_problem_cosh_id: str
     client_id: str
-    application_type: str
+    crop_cosh_id: Optional[str] = None
     status: str
     version: int
     created_at: datetime

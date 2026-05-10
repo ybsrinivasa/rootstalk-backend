@@ -3031,7 +3031,7 @@ async def create_client_sp(
     sp = SPRecommendation(
         specific_problem_cosh_id=request.specific_problem_cosh_id,
         client_id=client_id,
-        application_type=request.application_type,
+        crop_cosh_id=request.crop_cosh_id,
     )
     db.add(sp)
     await db.commit()
@@ -4411,6 +4411,329 @@ async def cha_list_practices(
             ),
             "area_or_plant": rec.area_or_plant,
             "recommendation_status": rec.status,
+        })
+
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+# ── CHA-SP Hub list endpoints (2026-05-10) ──────────────────────────────────
+# Mirror of the CHA-PG hub for Specific Problem recommendations.
+# Crop-keyed instead of PG-keyed: SE picks a crop (from the
+# CA ∩ CM-CHA-enabled intersection) → picks a specific problem from
+# that crop's list → creates a recommendation for (client, crop, SP).
+
+@router.get("/client/{client_id}/cha-sp/eligible-crops")
+async def cha_sp_eligible_crops(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Crops the SE may author specific-problem recommendations for.
+
+    User locked 2026-05-10: this is the **intersection** of
+    (a) crops the CA has shortlisted for the company (`ClientCrop`,
+    not soft-removed) and (b) crops the CM has enabled for CHA at
+    the platform level (`CropHealthCrop`, status=ACTIVE).
+
+    Surfaced on the SE-side picker AND on the CA-side Setup → Crops
+    page (informational: "of your N crops, M have CHA-SP authoring
+    enabled by RootsTalk")."""
+    from app.modules.sync.models import CropHealthCrop
+
+    client_crops = (await db.execute(
+        select(ClientCrop).where(
+            ClientCrop.client_id == client_id,
+            ClientCrop.removed_at.is_(None),
+        )
+    )).scalars().all()
+    client_set = {c.crop_cosh_id for c in client_crops}
+
+    health_rows = (await db.execute(
+        select(CropHealthCrop).where(CropHealthCrop.status == "ACTIVE")
+    )).scalars().all()
+    health_set = {r.crop_cosh_id for r in health_rows}
+
+    eligible = client_set & health_set
+
+    crop_names = await _crop_names_by_cosh_id(db, eligible)
+
+    return [
+        {
+            "crop_cosh_id": cid,
+            "name_en": crop_names.get(cid, cid),
+            "is_eligible": True,
+        }
+        for cid in sorted(eligible, key=lambda c: crop_names.get(c, c).lower())
+    ]
+
+
+@router.get("/client/{client_id}/cha-sp/specific-problems")
+async def cha_sp_specific_problems(
+    client_id: str,
+    crop_cosh_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """V1 stopgap — list of specific problems for the given crop,
+    drawn from `cha_specific_problems._SPECIFIC_PROBLEMS_V1`. When
+    Cosh ships the `specific_problem` Connect, swap the source in
+    `list_specific_problems_for_crop()`; this endpoint stays.
+
+    Each row carries a `taken_by_recommendation_id` when an SP
+    bundle for (this client, crop, SP) already exists, so the SE
+    sees at a glance which problems have been authored against and
+    can navigate straight into the existing bundle."""
+    from app.services.cha_specific_problems import list_specific_problems_for_crop
+
+    problems = list_specific_problems_for_crop(crop_cosh_id)
+    if not problems:
+        return []
+
+    sp_ids = [p["cosh_id"] for p in problems]
+    existing = (await db.execute(
+        select(SPRecommendation).where(
+            SPRecommendation.client_id == client_id,
+            SPRecommendation.crop_cosh_id == crop_cosh_id,
+            SPRecommendation.specific_problem_cosh_id.in_(sp_ids),
+        )
+    )).scalars().all()
+    taken: dict[str, dict] = {
+        e.specific_problem_cosh_id: {
+            "id": e.id, "status": e.status, "version": e.version,
+        } for e in existing
+    }
+
+    return [
+        {**p, "existing": taken.get(p["cosh_id"])}
+        for p in problems
+    ]
+
+
+@router.get("/client/{client_id}/cha-sp/recommendations")
+async def cha_sp_list_recommendations(
+    client_id: str,
+    crop_cosh_id: Optional[str] = None,
+    status: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SP recommendation list with denormalised crop name + SP name +
+    timeline_count. Filter chips: ?crop_cosh_id= and ?status=."""
+    q = select(SPRecommendation).where(SPRecommendation.client_id == client_id)
+    if crop_cosh_id:
+        q = q.where(SPRecommendation.crop_cosh_id == crop_cosh_id)
+    if status:
+        q = q.where(SPRecommendation.status == status)
+    q = q.order_by(SPRecommendation.created_at.desc())
+
+    sps = (await db.execute(q)).scalars().all()
+    if not sps:
+        return []
+
+    sp_ids = [s.id for s in sps]
+    tl_counts = dict((await db.execute(
+        select(SPTimeline.sp_recommendation_id, func.count())
+        .where(SPTimeline.sp_recommendation_id.in_(sp_ids))
+        .group_by(SPTimeline.sp_recommendation_id)
+    )).all())
+
+    crop_ids = {s.crop_cosh_id for s in sps if s.crop_cosh_id}
+    crop_names = await _crop_names_by_cosh_id(db, crop_ids)
+
+    # SP friendly names from the V1 hardcoded list — for any
+    # `specific_problem_cosh_id` we don't recognise, fall back to the
+    # raw cosh_id.
+    from app.services.cha_specific_problems import _SPECIFIC_PROBLEMS_V1
+    sp_names: dict[str, str] = {}
+    for crop_id, items in _SPECIFIC_PROBLEMS_V1.items():
+        for it in items:
+            sp_names[it["cosh_id"]] = it["name_en"]
+
+    return [
+        {
+            "id": s.id,
+            "specific_problem_cosh_id": s.specific_problem_cosh_id,
+            "specific_problem_name_en": sp_names.get(
+                s.specific_problem_cosh_id, s.specific_problem_cosh_id,
+            ),
+            "crop_cosh_id": s.crop_cosh_id,
+            "crop_name_en": crop_names.get(s.crop_cosh_id, s.crop_cosh_id) if s.crop_cosh_id else None,
+            "status": s.status,
+            "version": s.version,
+            "timeline_count": tl_counts.get(s.id, 0),
+            "created_at": s.created_at,
+        }
+        for s in sps
+    ]
+
+
+@router.get("/client/{client_id}/cha-sp/timelines")
+async def cha_sp_list_timelines(
+    client_id: str,
+    crop_cosh_id: Optional[str] = None,
+    recommendation_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cross-recommendation SP timeline list with denormalised crop +
+    SP context + practice count. Chips: ?crop_cosh_id=,
+    ?recommendation_id=."""
+    from app.modules.advisory.models import SPPractice
+
+    q = (
+        select(SPTimeline, SPRecommendation)
+        .join(SPRecommendation, SPTimeline.sp_recommendation_id == SPRecommendation.id)
+        .where(SPRecommendation.client_id == client_id)
+    )
+    if crop_cosh_id:
+        q = q.where(SPRecommendation.crop_cosh_id == crop_cosh_id)
+    if recommendation_id:
+        q = q.where(SPTimeline.sp_recommendation_id == recommendation_id)
+    q = q.order_by(SPTimeline.from_value)
+
+    rows = (await db.execute(q)).all()
+    if not rows:
+        return []
+
+    tl_ids = [tl.id for tl, _ in rows]
+    practice_counts = dict((await db.execute(
+        select(SPPractice.timeline_id, func.count())
+        .where(SPPractice.timeline_id.in_(tl_ids))
+        .group_by(SPPractice.timeline_id)
+    )).all())
+
+    crop_ids = {sp.crop_cosh_id for _, sp in rows if sp.crop_cosh_id}
+    crop_names = await _crop_names_by_cosh_id(db, crop_ids)
+
+    from app.services.cha_specific_problems import _SPECIFIC_PROBLEMS_V1
+    sp_names: dict[str, str] = {}
+    for _, items in _SPECIFIC_PROBLEMS_V1.items():
+        for it in items:
+            sp_names[it["cosh_id"]] = it["name_en"]
+
+    return [
+        {
+            "id": tl.id,
+            "name": tl.name,
+            "from_type": tl.from_type,
+            "from_value": tl.from_value,
+            "to_value": tl.to_value,
+            "recommendation_id": sp.id,
+            "specific_problem_cosh_id": sp.specific_problem_cosh_id,
+            "specific_problem_name_en": sp_names.get(
+                sp.specific_problem_cosh_id, sp.specific_problem_cosh_id,
+            ),
+            "crop_cosh_id": sp.crop_cosh_id,
+            "crop_name_en": crop_names.get(sp.crop_cosh_id, sp.crop_cosh_id) if sp.crop_cosh_id else None,
+            "recommendation_status": sp.status,
+            "practice_count": practice_counts.get(tl.id, 0),
+        }
+        for tl, sp in rows
+    ]
+
+
+@router.get("/client/{client_id}/cha-sp/practices")
+async def cha_sp_list_practices(
+    client_id: str,
+    crop_cosh_id: Optional[str] = None,
+    recommendation_id: Optional[str] = None,
+    timeline_id: Optional[str] = None,
+    l1: Optional[str] = None,
+    l2: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cross-timeline SP practice list with brand + dosage summary +
+    full breadcrumb. Paginated. Same cross-cutting power as the
+    CHA-PG / CCA practice lists."""
+    from app.modules.advisory.models import SPElement, SPPractice
+
+    if limit < 1 or limit > 500:
+        raise HTTPException(status_code=422, detail={"code": "invalid_limit", "message": "limit must be 1..500"})
+    if offset < 0:
+        raise HTTPException(status_code=422, detail={"code": "invalid_offset", "message": "offset must be >= 0"})
+
+    q = (
+        select(SPPractice, SPTimeline, SPRecommendation)
+        .join(SPTimeline, SPPractice.timeline_id == SPTimeline.id)
+        .join(SPRecommendation, SPTimeline.sp_recommendation_id == SPRecommendation.id)
+        .where(SPRecommendation.client_id == client_id)
+    )
+    if crop_cosh_id:
+        q = q.where(SPRecommendation.crop_cosh_id == crop_cosh_id)
+    if recommendation_id:
+        q = q.where(SPTimeline.sp_recommendation_id == recommendation_id)
+    if timeline_id:
+        q = q.where(SPPractice.timeline_id == timeline_id)
+    if l1:
+        q = q.where(SPPractice.l1_type == l1)
+    if l2:
+        q = q.where(SPPractice.l2_type == l2)
+
+    total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar() or 0
+
+    q = q.order_by(SPRecommendation.specific_problem_cosh_id, SPTimeline.from_value, SPPractice.display_order)
+    q = q.offset(offset).limit(limit)
+    rows = (await db.execute(q)).all()
+    if not rows:
+        return {"items": [], "total": total, "limit": limit, "offset": offset}
+
+    practice_ids = [pr.id for pr, _, _ in rows]
+    elements_by_practice: dict[str, list[SPElement]] = {}
+    if practice_ids:
+        elem_rows = (await db.execute(
+            select(SPElement).where(SPElement.practice_id.in_(practice_ids))
+            .order_by(SPElement.display_order)
+        )).scalars().all()
+        for e in elem_rows:
+            elements_by_practice.setdefault(e.practice_id, []).append(e)
+
+    crop_ids = {sp.crop_cosh_id for _, _, sp in rows if sp.crop_cosh_id}
+    crop_names = await _crop_names_by_cosh_id(db, crop_ids)
+
+    from app.services.cha_specific_problems import _SPECIFIC_PROBLEMS_V1
+    sp_names: dict[str, str] = {}
+    for _, items in _SPECIFIC_PROBLEMS_V1.items():
+        for it in items:
+            sp_names[it["cosh_id"]] = it["name_en"]
+
+    items = []
+    for practice, timeline, sp in rows:
+        elements = elements_by_practice.get(practice.id, [])
+        brand = next(
+            (e.cosh_ref for e in elements if e.element_type == "BRAND_NAME" and e.cosh_ref),
+            None,
+        )
+        dosage = next(
+            (e for e in elements if e.element_type == "DOSAGE" and (e.value or e.cosh_ref)),
+            None,
+        )
+        dosage_summary = (
+            f"{dosage.value} {dosage.unit_cosh_id}" if dosage and dosage.unit_cosh_id
+            else (dosage.value if dosage else None)
+        )
+        items.append({
+            "id": practice.id,
+            "l0_type": practice.l0_type if isinstance(practice.l0_type, str)
+            else getattr(practice.l0_type, "value", str(practice.l0_type)),
+            "l1_type": practice.l1_type,
+            "l2_type": practice.l2_type,
+            "is_special_input": practice.is_special_input,
+            "frequency_days": practice.frequency_days,
+            "brand_cosh_id": brand,
+            "dosage_summary": dosage_summary,
+            "timeline_id": timeline.id,
+            "timeline_name": timeline.name,
+            "recommendation_id": sp.id,
+            "specific_problem_cosh_id": sp.specific_problem_cosh_id,
+            "specific_problem_name_en": sp_names.get(
+                sp.specific_problem_cosh_id, sp.specific_problem_cosh_id,
+            ),
+            "crop_cosh_id": sp.crop_cosh_id,
+            "crop_name_en": crop_names.get(sp.crop_cosh_id, sp.crop_cosh_id) if sp.crop_cosh_id else None,
+            "recommendation_status": sp.status,
         })
 
     return {"items": items, "total": total, "limit": limit, "offset": offset}

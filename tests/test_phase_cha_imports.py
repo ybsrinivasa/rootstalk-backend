@@ -237,7 +237,7 @@ async def _seed_empty_sp(
 ) -> SPRecommendation:
     sp = SPRecommendation(
         specific_problem_cosh_id=specific_problem_cosh_id,
-        client_id=client_id, application_type="SPRAY",
+        client_id=client_id, crop_cosh_id="crop:test",
     )
     db.add(sp)
     await db.flush()
