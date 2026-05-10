@@ -341,13 +341,20 @@ class RelationConditional(Base):
 # ── Domain 4: CHA — Problem Groups and Specific Problems ──────────────────────
 
 class PGRecommendation(Base):
-    """Problem Group recommendations — global (client_id=NULL) or client-local."""
+    """Problem Group recommendations — global (client_id=NULL) or client-local.
+
+    A PG is crop-agnostic; the discriminator that splits bundles is
+    `area_or_plant` ('AREA_WISE' / 'PLANT_WISE') — user clarified
+    2026-05-10: each (client, problem_group, area_or_plant) is its
+    own bundle with its own publish lifecycle. Imports map one-to-one
+    (global's area-wise → local's area-wise).
+    """
     __tablename__ = "pg_recommendations"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     problem_group_cosh_id: Mapped[str] = mapped_column(String(100), nullable=False)
     client_id: Mapped[str] = mapped_column(String(36), ForeignKey("clients.id"), nullable=True)
-    application_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    area_or_plant: Mapped[str] = mapped_column(String(20), nullable=True)
     parent_id: Mapped[str] = mapped_column(String(36), ForeignKey("pg_recommendations.id"), nullable=True)
     imported_from_global_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="DRAFT")

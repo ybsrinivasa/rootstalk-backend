@@ -56,7 +56,7 @@ async def _seed_global_pg(
     pg = PGRecommendation(
         problem_group_cosh_id=problem_group_cosh_id,
         client_id=None,
-        application_type="SPRAY",
+        area_or_plant="AREA_WISE",
         status=status,
     )
     db.add(pg)

@@ -168,7 +168,7 @@ async def _seed_local_pg_timeline(db):
     await make_client_user(db, user=se, client=client)
     pg = PGRecommendation(
         problem_group_cosh_id="pg:test", client_id=client.id,
-        application_type="LOCAL",
+        area_or_plant="AREA_WISE",
     )
     db.add(pg)
     await db.flush()

@@ -193,7 +193,7 @@ async def test_import_global_pg_preserves_frequency_days(db):
     global_pg = PGRecommendation(
         problem_group_cosh_id="pg:fungal",
         client_id=None,
-        application_type="SPRAY",
+        area_or_plant="AREA_WISE",
         status="ACTIVE",  # publish gate
     )
     db.add(global_pg)
@@ -254,7 +254,7 @@ async def test_import_global_pg_idempotent_returns_409_on_duplicate(db):
     global_pg = PGRecommendation(
         problem_group_cosh_id="pg:fungal",
         client_id=None,
-        application_type="SPRAY",
+        area_or_plant="AREA_WISE",
         status="ACTIVE",  # publish gate
     )
     db.add(global_pg)

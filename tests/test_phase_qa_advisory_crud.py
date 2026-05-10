@@ -188,7 +188,7 @@ async def test_delete_timeline_rejects_pg_owned_timeline_via_qa_url(db):
 
     pg = PGRecommendation(
         problem_group_cosh_id="pg:test",
-        client_id=client.id, application_type="SPRAY", status="DRAFT",
+        client_id=client.id, area_or_plant="AREA_WISE", status="DRAFT",
     )
     db.add(pg)
     await db.flush()

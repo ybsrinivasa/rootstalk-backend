@@ -517,7 +517,8 @@ async def make_practice_conditional(
 async def make_pg_recommendation(db: AsyncSession, **kw) -> PGRecommendation:
     pg = PGRecommendation(
         problem_group_cosh_id=kw.get("problem_group_cosh_id", "pg:test"),
-        application_type="GLOBAL",
+        client_id=kw.get("client_id"),
+        area_or_plant=kw.get("area_or_plant", "AREA_WISE"),
     )
     db.add(pg)
     await db.flush()

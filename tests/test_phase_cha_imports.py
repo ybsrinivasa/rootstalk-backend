@@ -44,7 +44,7 @@ async def _seed_global_pg_with_content(
     pg = PGRecommendation(
         problem_group_cosh_id=problem_group_cosh_id,
         client_id=None,
-        application_type="SPRAY",
+        area_or_plant="AREA_WISE",
         status="ACTIVE",  # publish gate: only ACTIVE globals are importable
     )
     db.add(pg)
@@ -208,7 +208,7 @@ async def _seed_local_pg(
         problem_group_cosh_id=problem_group_cosh_id,
         client_id=client_id,
         parent_id=None,
-        application_type="SPRAY",
+        area_or_plant="AREA_WISE",
     )
     db.add(pg)
     await db.flush()

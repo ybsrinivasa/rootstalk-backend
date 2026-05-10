@@ -2180,7 +2180,7 @@ async def create_global_pg(
     pg = PGRecommendation(
         problem_group_cosh_id=request.problem_group_cosh_id,
         client_id=None,
-        application_type=request.application_type,
+        area_or_plant=request.area_or_plant,
     )
     db.add(pg)
     await db.commit()
@@ -2594,7 +2594,7 @@ async def import_global_pg(
             problem_group_cosh_id=src.problem_group_cosh_id,
             client_id=client_id,
             parent_id=global_pg_id,
-            application_type=src.application_type,
+            area_or_plant=src.area_or_plant,
         )
         db.add(target)
         await db.flush()
@@ -3923,6 +3923,292 @@ async def cca_list_practices(
             "package_status": package.status.value,
             "crop_cosh_id": package.crop_cosh_id,
             "crop_name_en": crop_names.get(package.crop_cosh_id, package.crop_cosh_id),
+        })
+
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+# ── CHA Hub list endpoints (2026-05-10) ─────────────────────────────────────
+# Mirror of /cca/* for Problem-Group recommendations. Four screens:
+# Problems / Recommendations / Timelines / Practices, each with chip
+# filters that follow the SE's drill-down. PG is crop-agnostic; the
+# bundle dimension is `area_or_plant`.
+
+@router.get("/client/{client_id}/cha/problems")
+async def cha_list_problems(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List of Problem-Groups the SE can author against. Each row
+    carries the per-bundle status — area-wise / plant-wise — so the
+    SE can see at a glance which PGs are complete, in progress, or
+    untouched.
+
+    PG list source is `app/services/cha_problem_groups.py` (a
+    hardcoded V1 stopgap). When Cosh ships the `problem_group`
+    Connect, swap the source there; this endpoint stays the same."""
+    from app.services.cha_problem_groups import list_problem_groups
+
+    pgs = list_problem_groups()
+
+    # Aggregate the company's existing recommendations by (PG, bundle).
+    rec_q = (await db.execute(
+        select(
+            PGRecommendation.problem_group_cosh_id,
+            PGRecommendation.area_or_plant,
+            PGRecommendation.status,
+        ).where(PGRecommendation.client_id == client_id)
+    )).all()
+    bundle_status: dict[tuple[str, str], str] = {}
+    for pg_id, ap, status in rec_q:
+        if ap:
+            bundle_status[(pg_id, ap)] = status
+
+    return [
+        {
+            "cosh_id": pg["cosh_id"],
+            "name_en": pg["name_en"],
+            "status": pg["status"],
+            "area_wise_status": bundle_status.get((pg["cosh_id"], "AREA_WISE")),
+            "plant_wise_status": bundle_status.get((pg["cosh_id"], "PLANT_WISE")),
+        }
+        for pg in pgs
+    ]
+
+
+@router.get("/client/{client_id}/cha/recommendations")
+async def cha_list_recommendations(
+    client_id: str,
+    problem_group_cosh_id: Optional[str] = None,
+    area_or_plant: Optional[str] = None,
+    status: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Bundle-level list. One row per (PG × area_or_plant). Chips:
+    ?problem_group_cosh_id=, ?area_or_plant=, ?status=. Each row
+    denormalises the friendly PG name + a timeline_count so the
+    table is rendered without N+1."""
+    from app.services.cha_problem_groups import list_problem_groups
+
+    q = select(PGRecommendation).where(PGRecommendation.client_id == client_id)
+    if problem_group_cosh_id:
+        q = q.where(PGRecommendation.problem_group_cosh_id == problem_group_cosh_id)
+    if area_or_plant:
+        q = q.where(PGRecommendation.area_or_plant == area_or_plant)
+    if status:
+        q = q.where(PGRecommendation.status == status)
+    q = q.order_by(PGRecommendation.created_at.desc())
+
+    recs = (await db.execute(q)).scalars().all()
+    if not recs:
+        return []
+
+    rec_ids = [r.id for r in recs]
+    tl_counts = dict((await db.execute(
+        select(PGTimeline.pg_recommendation_id, func.count())
+        .where(PGTimeline.pg_recommendation_id.in_(rec_ids))
+        .group_by(PGTimeline.pg_recommendation_id)
+    )).all())
+
+    pg_names = {p["cosh_id"]: p["name_en"] for p in list_problem_groups()}
+
+    return [
+        {
+            "id": r.id,
+            "problem_group_cosh_id": r.problem_group_cosh_id,
+            "problem_group_name_en": pg_names.get(
+                r.problem_group_cosh_id, r.problem_group_cosh_id,
+            ),
+            "area_or_plant": r.area_or_plant,
+            "status": r.status,
+            "version": r.version,
+            "imported_from_global_at": r.imported_from_global_at,
+            "timeline_count": tl_counts.get(r.id, 0),
+            "created_at": r.created_at,
+        }
+        for r in recs
+    ]
+
+
+@router.get("/client/{client_id}/cha/timelines")
+async def cha_list_timelines(
+    client_id: str,
+    problem_group_cosh_id: Optional[str] = None,
+    recommendation_id: Optional[str] = None,
+    area_or_plant: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cross-recommendation timeline list with denormalised PG +
+    bundle context + practice count. Chips: ?problem_group_cosh_id=,
+    ?recommendation_id=, ?area_or_plant=. Filters out QA-rooted
+    timelines (those live under standard_response_id)."""
+    from app.services.cha_problem_groups import list_problem_groups
+
+    q = (
+        select(PGTimeline, PGRecommendation)
+        .join(PGRecommendation, PGTimeline.pg_recommendation_id == PGRecommendation.id)
+        .where(
+            PGRecommendation.client_id == client_id,
+            PGTimeline.pg_recommendation_id.isnot(None),
+        )
+    )
+    if problem_group_cosh_id:
+        q = q.where(PGRecommendation.problem_group_cosh_id == problem_group_cosh_id)
+    if recommendation_id:
+        q = q.where(PGTimeline.pg_recommendation_id == recommendation_id)
+    if area_or_plant:
+        q = q.where(PGRecommendation.area_or_plant == area_or_plant)
+    q = q.order_by(PGRecommendation.problem_group_cosh_id, PGTimeline.from_value)
+
+    rows = (await db.execute(q)).all()
+    if not rows:
+        return []
+
+    tl_ids = [tl.id for tl, _ in rows]
+    practice_counts = dict((await db.execute(
+        select(PGPractice.timeline_id, func.count())
+        .where(PGPractice.timeline_id.in_(tl_ids))
+        .group_by(PGPractice.timeline_id)
+    )).all())
+
+    pg_names = {p["cosh_id"]: p["name_en"] for p in list_problem_groups()}
+
+    return [
+        {
+            "id": tl.id,
+            "name": tl.name,
+            "from_type": tl.from_type if isinstance(tl.from_type, str)
+            else getattr(tl.from_type, "value", str(tl.from_type)),
+            "from_value": tl.from_value,
+            "to_value": tl.to_value,
+            "recommendation_id": rec.id,
+            "problem_group_cosh_id": rec.problem_group_cosh_id,
+            "problem_group_name_en": pg_names.get(
+                rec.problem_group_cosh_id, rec.problem_group_cosh_id,
+            ),
+            "area_or_plant": rec.area_or_plant,
+            "recommendation_status": rec.status,
+            "practice_count": practice_counts.get(tl.id, 0),
+        }
+        for tl, rec in rows
+    ]
+
+
+@router.get("/client/{client_id}/cha/practices")
+async def cha_list_practices(
+    client_id: str,
+    problem_group_cosh_id: Optional[str] = None,
+    recommendation_id: Optional[str] = None,
+    timeline_id: Optional[str] = None,
+    area_or_plant: Optional[str] = None,
+    l1: Optional[str] = None,
+    l2: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cross-timeline CHA practice list. Same cross-cutting power as
+    /cca/practices — "every PESTICIDE practice in any of our PG
+    recommendations" type queries. Paginated."""
+    from app.services.cha_problem_groups import list_problem_groups
+
+    if limit < 1 or limit > 500:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_limit", "message": "limit must be 1..500"},
+        )
+    if offset < 0:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_offset", "message": "offset must be >= 0"},
+        )
+
+    q = (
+        select(PGPractice, PGTimeline, PGRecommendation)
+        .join(PGTimeline, PGPractice.timeline_id == PGTimeline.id)
+        .join(PGRecommendation, PGTimeline.pg_recommendation_id == PGRecommendation.id)
+        .where(
+            PGRecommendation.client_id == client_id,
+            PGTimeline.pg_recommendation_id.isnot(None),
+        )
+    )
+    if problem_group_cosh_id:
+        q = q.where(PGRecommendation.problem_group_cosh_id == problem_group_cosh_id)
+    if recommendation_id:
+        q = q.where(PGTimeline.pg_recommendation_id == recommendation_id)
+    if timeline_id:
+        q = q.where(PGPractice.timeline_id == timeline_id)
+    if area_or_plant:
+        q = q.where(PGRecommendation.area_or_plant == area_or_plant)
+    if l1:
+        q = q.where(PGPractice.l1_type == l1)
+    if l2:
+        q = q.where(PGPractice.l2_type == l2)
+
+    total = (await db.execute(
+        select(func.count()).select_from(q.subquery())
+    )).scalar() or 0
+
+    q = q.order_by(
+        PGRecommendation.problem_group_cosh_id, PGTimeline.from_value,
+        PGPractice.display_order,
+    ).offset(offset).limit(limit)
+
+    rows = (await db.execute(q)).all()
+    if not rows:
+        return {"items": [], "total": total, "limit": limit, "offset": offset}
+
+    practice_ids = [pr.id for pr, _, _ in rows]
+    elements_by_practice: dict[str, list[PGElement]] = {}
+    if practice_ids:
+        elem_rows = (await db.execute(
+            select(PGElement)
+            .where(PGElement.practice_id.in_(practice_ids))
+            .order_by(PGElement.display_order)
+        )).scalars().all()
+        for e in elem_rows:
+            elements_by_practice.setdefault(e.practice_id, []).append(e)
+
+    pg_names = {p["cosh_id"]: p["name_en"] for p in list_problem_groups()}
+
+    items = []
+    for practice, timeline, rec in rows:
+        elements = elements_by_practice.get(practice.id, [])
+        brand = next(
+            (e.cosh_ref for e in elements if e.element_type == "BRAND_NAME" and e.cosh_ref),
+            None,
+        )
+        dosage = next(
+            (e for e in elements if e.element_type == "DOSAGE" and (e.value or e.cosh_ref)),
+            None,
+        )
+        dosage_summary = (
+            f"{dosage.value} {dosage.unit_cosh_id}" if dosage and dosage.unit_cosh_id
+            else (dosage.value if dosage else None)
+        )
+        items.append({
+            "id": practice.id,
+            "l0_type": practice.l0_type if isinstance(practice.l0_type, str)
+            else getattr(practice.l0_type, "value", str(practice.l0_type)),
+            "l1_type": practice.l1_type,
+            "l2_type": practice.l2_type,
+            "is_special_input": practice.is_special_input,
+            "frequency_days": practice.frequency_days,
+            "brand_cosh_id": brand,
+            "dosage_summary": dosage_summary,
+            "timeline_id": timeline.id,
+            "timeline_name": timeline.name,
+            "recommendation_id": rec.id,
+            "problem_group_cosh_id": rec.problem_group_cosh_id,
+            "problem_group_name_en": pg_names.get(
+                rec.problem_group_cosh_id, rec.problem_group_cosh_id,
+            ),
+            "area_or_plant": rec.area_or_plant,
+            "recommendation_status": rec.status,
         })
 
     return {"items": items, "total": total, "limit": limit, "offset": offset}

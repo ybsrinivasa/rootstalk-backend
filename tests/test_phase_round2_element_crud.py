@@ -376,7 +376,7 @@ async def _seed_local_pg_l2none_practice(db):
     se = await make_user(db, name="SE-PG-local")
     pg = PGRecommendation(
         problem_group_cosh_id="pg:test", client_id=client.id,
-        application_type="LOCAL",
+        area_or_plant="AREA_WISE",
     )
     db.add(pg); await db.flush()
     tl = PGTimeline(

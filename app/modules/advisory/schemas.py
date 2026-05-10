@@ -199,7 +199,10 @@ class PracticeConditionalCreate(BaseModel):
 
 class PGRecommendationCreate(BaseModel):
     problem_group_cosh_id: str
-    application_type: str  # e.g. SPRAY, DRENCH, SOIL
+    # CHA-hub: each (client, PG, area_or_plant) is its own bundle.
+    # Required for client-local creates; tolerated as None on legacy
+    # global rows (will be filled by Cosh-side authoring later).
+    area_or_plant: Optional[str] = None
 
 
 class PGTimelineCreate(BaseModel):
@@ -280,7 +283,7 @@ class PGRecommendationOut(BaseModel):
     problem_group_cosh_id: str
     client_id: Optional[str] = None
     parent_id: Optional[str] = None
-    application_type: str
+    area_or_plant: Optional[str] = None
     status: str
     version: int
     created_at: datetime

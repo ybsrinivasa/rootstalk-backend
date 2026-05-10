@@ -349,7 +349,7 @@ async def test_pg_timelines_check_constraint_rejects_dual_parent(db):
     pg = PGRecommendation(
         problem_group_cosh_id="pg:test",
         client_id=client.id,
-        application_type="SPRAY",
+        area_or_plant="AREA_WISE",
         status="DRAFT",
     )
     db.add(pg)
@@ -409,7 +409,7 @@ async def test_pg_timeline_parent_kind_property(db):
     pg = PGRecommendation(
         problem_group_cosh_id="pg:test",
         client_id=client.id,
-        application_type="SPRAY",
+        area_or_plant="AREA_WISE",
         status="DRAFT",
     )
     db.add(pg)
