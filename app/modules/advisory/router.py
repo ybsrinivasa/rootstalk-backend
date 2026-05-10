@@ -31,7 +31,9 @@ from app.modules.advisory.models import (
     PGRecommendation, PGTimeline, PGPractice, PGElement,
     SPRecommendation, SPTimeline, SPPractice, SPElement,
 )
-from app.modules.clients.models import ClientUser, ClientUserRole
+from app.modules.clients.models import ClientCrop, ClientUser, ClientUserRole
+from app.modules.sync.models import CoshCoreItem
+from app.services.cosh_constants import COSH_BIOLOGICAL_NAMES_CORE
 from app.services.bl13_versioning import (
     compute_publish_version, validate_publish_transition,
 )
@@ -3497,3 +3499,320 @@ async def publish_sp(
     await db.commit()
     await db.refresh(sp)
     return sp
+
+
+# ── CCA Hub list endpoints (2026-05-10) ─────────────────────────────────────
+# Four screens — Crops, Packages, Timelines, Practices — that the SE can
+# navigate independently or via drill-down. Each endpoint returns the
+# denormalised join needed to render its row without N+1 follow-ups.
+# Filter chips (?crop_cosh_id=, ?package_id=, ?timeline_id=) follow the
+# user's selection and are independently clearable.
+
+async def _crop_names_by_cosh_id(db: AsyncSession, cosh_ids: set[str]) -> dict[str, str]:
+    """Look up English names for a set of biological_name cosh_ids.
+    Returns {cosh_id: name_en} — missing cosh_ids are absent (caller
+    falls back to the raw id)."""
+    if not cosh_ids:
+        return {}
+    rows = (await db.execute(
+        select(CoshCoreItem).where(
+            CoshCoreItem.cosh_id.in_(cosh_ids),
+            CoshCoreItem.core_type == COSH_BIOLOGICAL_NAMES_CORE,
+        )
+    )).scalars().all()
+    return {
+        r.cosh_id: (r.translations or {}).get("en", r.cosh_id)
+        for r in rows
+    }
+
+
+@router.get("/client/{client_id}/cca/crops")
+async def cca_list_crops(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Crop-level list for the four-screen CCA hub. Each row carries a
+    package-status breakdown ({DRAFT, ACTIVE, INACTIVE}) so the SE can
+    see at a glance which crops have advisory work in flight."""
+    crops = (await db.execute(
+        select(ClientCrop)
+        .where(ClientCrop.client_id == client_id, ClientCrop.removed_at.is_(None))
+        .order_by(ClientCrop.crop_name_en)
+    )).scalars().all()
+
+    counts_q = (await db.execute(
+        select(Package.crop_cosh_id, Package.status, func.count())
+        .where(Package.client_id == client_id)
+        .group_by(Package.crop_cosh_id, Package.status)
+    )).all()
+    counts: dict[str, dict[str, int]] = {}
+    for crop_cosh_id, status, n in counts_q:
+        counts.setdefault(crop_cosh_id, {})[status.value if hasattr(status, "value") else str(status)] = n
+
+    last_q = (await db.execute(
+        select(Package.crop_cosh_id, func.max(Package.updated_at))
+        .where(Package.client_id == client_id)
+        .group_by(Package.crop_cosh_id)
+    )).all()
+    last_edited = {crop_cosh_id: ts for crop_cosh_id, ts in last_q}
+
+    # Fall back to Cosh's biological_names translations when the
+    # per-client snapshot is empty — keeps the SE view friendly even
+    # for crops registered before snapshots were captured or via
+    # factory-seeded test fixtures.
+    crop_name_fallback = await _crop_names_by_cosh_id(
+        db, {c.crop_cosh_id for c in crops if not c.crop_name_en},
+    )
+    return [
+        {
+            "crop_cosh_id": c.crop_cosh_id,
+            "name_en": (
+                c.crop_name_en
+                or crop_name_fallback.get(c.crop_cosh_id)
+                or c.crop_cosh_id
+            ),
+            "area_or_plant": c.crop_area_or_plant,
+            "added_at": c.added_at,
+            "package_counts": counts.get(c.crop_cosh_id, {}),
+            "last_edited": last_edited.get(c.crop_cosh_id),
+        }
+        for c in crops
+    ]
+
+
+@router.get("/client/{client_id}/cca/packages")
+async def cca_list_packages(
+    client_id: str,
+    crop_cosh_id: Optional[str] = None,
+    status: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Package-level list with denormalised crop name + counts of
+    timelines and locations + last-edited. Filter chips:
+    ?crop_cosh_id= and ?status= (DRAFT/ACTIVE/INACTIVE)."""
+    q = select(Package).where(Package.client_id == client_id)
+    if crop_cosh_id:
+        q = q.where(Package.crop_cosh_id == crop_cosh_id)
+    if status:
+        try:
+            q = q.where(Package.status == PackageStatus(status))
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "invalid_status", "message": f"Unknown status {status!r}"},
+            )
+    q = q.order_by(Package.updated_at.desc().nullslast(), Package.created_at.desc())
+
+    packages = (await db.execute(q)).scalars().all()
+    if not packages:
+        return []
+
+    pids = [p.id for p in packages]
+    tl_counts = dict((await db.execute(
+        select(Timeline.package_id, func.count())
+        .where(Timeline.package_id.in_(pids))
+        .group_by(Timeline.package_id)
+    )).all())
+    from app.modules.advisory.models import PackageLocation
+    loc_counts = dict((await db.execute(
+        select(PackageLocation.package_id, func.count())
+        .where(PackageLocation.package_id.in_(pids))
+        .group_by(PackageLocation.package_id)
+    )).all())
+
+    crop_ids = {p.crop_cosh_id for p in packages}
+    crop_names = await _crop_names_by_cosh_id(db, crop_ids)
+
+    return [
+        {
+            "id": p.id,
+            "name": p.name,
+            "crop_cosh_id": p.crop_cosh_id,
+            "crop_name_en": crop_names.get(p.crop_cosh_id, p.crop_cosh_id),
+            "package_type": p.package_type.value,
+            "status": p.status.value,
+            "version": p.version,
+            "duration_days": p.duration_days,
+            "description": p.description,
+            "timeline_count": tl_counts.get(p.id, 0),
+            "location_count": loc_counts.get(p.id, 0),
+            "created_at": p.created_at,
+            "updated_at": p.updated_at,
+        }
+        for p in packages
+    ]
+
+
+@router.get("/client/{client_id}/cca/timelines")
+async def cca_list_timelines(
+    client_id: str,
+    crop_cosh_id: Optional[str] = None,
+    package_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cross-package timeline list with denormalised package + crop
+    info and a practice count per timeline. Filter chips:
+    ?crop_cosh_id= and ?package_id=."""
+    q = (
+        select(Timeline, Package)
+        .join(Package, Timeline.package_id == Package.id)
+        .where(Package.client_id == client_id)
+    )
+    if crop_cosh_id:
+        q = q.where(Package.crop_cosh_id == crop_cosh_id)
+    if package_id:
+        q = q.where(Timeline.package_id == package_id)
+    q = q.order_by(Package.name, Timeline.display_order, Timeline.from_value)
+
+    rows = (await db.execute(q)).all()
+    if not rows:
+        return []
+
+    tl_ids = [tl.id for tl, _ in rows]
+    practice_counts = dict((await db.execute(
+        select(Practice.timeline_id, func.count())
+        .where(Practice.timeline_id.in_(tl_ids))
+        .group_by(Practice.timeline_id)
+    )).all())
+
+    crop_ids = {p.crop_cosh_id for _, p in rows}
+    crop_names = await _crop_names_by_cosh_id(db, crop_ids)
+
+    return [
+        {
+            "id": tl.id,
+            "name": tl.name,
+            "from_type": tl.from_type.value if hasattr(tl.from_type, "value") else str(tl.from_type),
+            "from_value": tl.from_value,
+            "to_value": tl.to_value,
+            "display_order": tl.display_order,
+            "package_id": pkg.id,
+            "package_name": pkg.name,
+            "package_status": pkg.status.value,
+            "crop_cosh_id": pkg.crop_cosh_id,
+            "crop_name_en": crop_names.get(pkg.crop_cosh_id, pkg.crop_cosh_id),
+            "practice_count": practice_counts.get(tl.id, 0),
+        }
+        for tl, pkg in rows
+    ]
+
+
+@router.get("/client/{client_id}/cca/practices")
+async def cca_list_practices(
+    client_id: str,
+    crop_cosh_id: Optional[str] = None,
+    package_id: Optional[str] = None,
+    timeline_id: Optional[str] = None,
+    l0: Optional[str] = None,
+    l1: Optional[str] = None,
+    l2: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cross-timeline practice list with denormalised timeline / package
+    / crop + brand + dosage summary. Filter chips at every level plus
+    L0/L1/L2 type filters. Paginated (default limit 100). Cross-cutting
+    queries like 'all practices in any package using brand X' work by
+    scoping with ?crop_cosh_id=...&l1=PESTICIDE — the brand-level filter
+    falls out of the L2-bound element list."""
+    if limit < 1 or limit > 500:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_limit", "message": "limit must be 1..500"},
+        )
+    if offset < 0:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_offset", "message": "offset must be >= 0"},
+        )
+
+    q = (
+        select(Practice, Timeline, Package)
+        .join(Timeline, Practice.timeline_id == Timeline.id)
+        .join(Package, Timeline.package_id == Package.id)
+        .where(Package.client_id == client_id)
+    )
+    if crop_cosh_id:
+        q = q.where(Package.crop_cosh_id == crop_cosh_id)
+    if package_id:
+        q = q.where(Timeline.package_id == package_id)
+    if timeline_id:
+        q = q.where(Practice.timeline_id == timeline_id)
+    if l0:
+        q = q.where(Practice.l0_type == l0)
+    if l1:
+        q = q.where(Practice.l1_type == l1)
+    if l2:
+        q = q.where(Practice.l2_type == l2)
+
+    total = (await db.execute(
+        select(func.count()).select_from(q.subquery())
+    )).scalar() or 0
+
+    q = q.order_by(Package.name, Timeline.display_order, Practice.display_order)
+    q = q.offset(offset).limit(limit)
+
+    rows = (await db.execute(q)).all()
+    if not rows:
+        return {"items": [], "total": total, "limit": limit, "offset": offset}
+
+    practice_ids = [pr.id for pr, _, _ in rows]
+    elements_by_practice: dict[str, list[Element]] = {}
+    if practice_ids:
+        elem_rows = (await db.execute(
+            select(Element)
+            .where(Element.practice_id.in_(practice_ids))
+            .order_by(Element.display_order)
+        )).scalars().all()
+        for e in elem_rows:
+            elements_by_practice.setdefault(e.practice_id, []).append(e)
+
+    crop_ids = {p.crop_cosh_id for _, _, p in rows}
+    crop_names = await _crop_names_by_cosh_id(db, crop_ids)
+
+    items = []
+    for practice, timeline, package in rows:
+        elements = elements_by_practice.get(practice.id, [])
+        # Pull a few key elements for the summary column.
+        common_name = next(
+            (e.cosh_ref for e in elements if e.element_type == "COMMON_NAME" and e.cosh_ref),
+            None,
+        )
+        brand_cosh_id = next(
+            (e.cosh_ref for e in elements if e.element_type == "BRAND_NAME" and e.cosh_ref),
+            None,
+        )
+        dosage = next(
+            (e for e in elements if e.element_type == "DOSAGE" and (e.value or e.cosh_ref)),
+            None,
+        )
+        dosage_summary = (
+            f"{dosage.value} {dosage.unit_cosh_id}" if dosage and dosage.unit_cosh_id
+            else (dosage.value if dosage else None)
+        )
+        items.append({
+            "id": practice.id,
+            "l0_type": practice.l0_type.value if hasattr(practice.l0_type, "value") else str(practice.l0_type),
+            "l1_type": practice.l1_type,
+            "l2_type": practice.l2_type,
+            "display_order": practice.display_order,
+            "is_special_input": practice.is_special_input,
+            "frequency_days": practice.frequency_days,
+            "common_name_cosh_id": common_name,
+            "brand_cosh_id": brand_cosh_id,
+            "dosage_summary": dosage_summary,
+            "timeline_id": timeline.id,
+            "timeline_name": timeline.name,
+            "package_id": package.id,
+            "package_name": package.name,
+            "package_status": package.status.value,
+            "crop_cosh_id": package.crop_cosh_id,
+            "crop_name_en": crop_names.get(package.crop_cosh_id, package.crop_cosh_id),
+        })
+
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
