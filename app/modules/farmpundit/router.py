@@ -1585,7 +1585,17 @@ async def _trigger_cha_for_query(db: AsyncSession, query: Query, problem_cosh_id
     if not sub:
         return
 
-    resolved = await resolve_cha_recommendation(db, query.client_id, problem_cosh_id)
+    # Pass the subscription's crop so the resolver scopes PG to the
+    # right area-wise / plant-wise bundle (post-CHA-PG-Round-1).
+    from app.modules.advisory.models import Package as _Pkg
+    package = (await db.execute(
+        select(_Pkg).where(_Pkg.id == sub.package_id)
+    )).scalar_one_or_none()
+    sub_crop = package.crop_cosh_id if package else None
+
+    resolved = await resolve_cha_recommendation(
+        db, query.client_id, problem_cosh_id, crop_cosh_id=sub_crop,
+    )
     if not resolved:
         return
 

@@ -34,19 +34,34 @@ async def resolve_cha_recommendation(
     db: AsyncSession,
     client_id: str,
     problem_cosh_id: str,
+    crop_cosh_id: Optional[str] = None,
 ) -> Optional[ResolvedCHA]:
     """
     Full SP→PG hierarchy lookup.
 
     Steps:
     1. Check cosh_core_items: is problem_cosh_id a specific_problem or a problem_group?
-    2. If specific_problem: try SP recommendation (client). Get parent PG ID.
-    3. Try PG recommendation (client-specific).
-    4. Try PG recommendation (global).
+    2. If specific_problem: try SP recommendation (client) — filter by
+       crop_cosh_id when provided. Get parent PG ID.
+    3. Try PG recommendation (client-specific) — filter by area_or_plant
+       matching the crop's typing when crop_cosh_id is provided.
+    4. Try PG recommendation (global) — same filter.
     5. Return first match, or None.
+
+    The `crop_cosh_id` argument is needed because PG recommendations
+    are bundled per `area_or_plant` post-CHA-PG-Round-1 (2026-05-10):
+    a single (client, problem_group) can host both an area-wise
+    bundle and a plant-wise bundle. Without the crop, the resolver
+    would arbitrarily return one — a regression. Pass the
+    subscription's crop here to land on the right bundle.
+
+    SP rows are also crop-bound (post-SP-Round-1); the `crop_cosh_id`
+    filter is defensive — sp_cosh_ids are crop-unique by Cosh design,
+    but the row-level filter mirrors the PG bundle pattern.
     """
     from app.modules.sync.models import CoshCoreItem
     from app.modules.advisory.models import SPRecommendation, PGRecommendation
+    from app.services.cosh_crop_view import get_measure_for_biological_name
 
     # Step 1: Identify the entity type from cosh_core_items
     cosh_entry = (await db.execute(
@@ -67,15 +82,24 @@ async def resolve_cha_recommendation(
         parent_pg_cosh_id = problem_cosh_id
         problem_name = (cosh_entry.translations or {}).get("en", problem_cosh_id) if cosh_entry else problem_cosh_id
 
+    # Derive the crop's area/plant typing once — used to scope PG to
+    # the right bundle. None when crop_cosh_id is not supplied or
+    # when Cosh hasn't classified the crop yet (then PG filter
+    # falls back to "any bundle").
+    crop_measure: Optional[str] = None
+    if crop_cosh_id:
+        crop_measure = await get_measure_for_biological_name(db, crop_cosh_id)
+
     # Step 2: SP recommendation (client-specific, only for specific_problems)
     if is_specific_problem:
-        sp = (await db.execute(
-            select(SPRecommendation).where(
-                SPRecommendation.specific_problem_cosh_id == problem_cosh_id,
-                SPRecommendation.client_id == client_id,
-                SPRecommendation.status == "ACTIVE",
-            )
-        )).scalar_one_or_none()
+        sp_q = select(SPRecommendation).where(
+            SPRecommendation.specific_problem_cosh_id == problem_cosh_id,
+            SPRecommendation.client_id == client_id,
+            SPRecommendation.status == "ACTIVE",
+        )
+        if crop_cosh_id:
+            sp_q = sp_q.where(SPRecommendation.crop_cosh_id == crop_cosh_id)
+        sp = (await db.execute(sp_q)).scalar_one_or_none()
 
         if sp:
             return ResolvedCHA(
@@ -88,13 +112,14 @@ async def resolve_cha_recommendation(
 
     # Step 3: PG recommendation (client-specific)
     if parent_pg_cosh_id:
-        pg_client = (await db.execute(
-            select(PGRecommendation).where(
-                PGRecommendation.problem_group_cosh_id == parent_pg_cosh_id,
-                PGRecommendation.client_id == client_id,
-                PGRecommendation.status == "ACTIVE",
-            )
-        )).scalar_one_or_none()
+        pg_q = select(PGRecommendation).where(
+            PGRecommendation.problem_group_cosh_id == parent_pg_cosh_id,
+            PGRecommendation.client_id == client_id,
+            PGRecommendation.status == "ACTIVE",
+        )
+        if crop_measure:
+            pg_q = pg_q.where(PGRecommendation.area_or_plant == crop_measure)
+        pg_client = (await db.execute(pg_q)).scalar_one_or_none()
 
         if pg_client:
             # Get PG name from cache if not already resolved
@@ -110,13 +135,16 @@ async def resolve_cha_recommendation(
             )
 
         # Step 4: PG recommendation (global)
-        pg_global = (await db.execute(
-            select(PGRecommendation).where(
-                PGRecommendation.problem_group_cosh_id == parent_pg_cosh_id,
-                PGRecommendation.client_id == None,  # noqa: E711
-                PGRecommendation.status == "ACTIVE",
+        pg_global_q = select(PGRecommendation).where(
+            PGRecommendation.problem_group_cosh_id == parent_pg_cosh_id,
+            PGRecommendation.client_id == None,  # noqa: E711
+            PGRecommendation.status == "ACTIVE",
+        )
+        if crop_measure:
+            pg_global_q = pg_global_q.where(
+                PGRecommendation.area_or_plant == crop_measure,
             )
-        )).scalar_one_or_none()
+        pg_global = (await db.execute(pg_global_q)).scalar_one_or_none()
 
         if pg_global:
             pg_name = problem_name

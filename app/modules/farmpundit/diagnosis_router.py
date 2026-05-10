@@ -208,6 +208,85 @@ async def get_plant_parts_for_crop(
     ]
 
 
+@router.get("/diagnosis/eligibility/{subscription_id}")
+async def get_diagnosis_eligibility(
+    subscription_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Read-only check: can this farmer hit Diagnose for this
+    subscription? Returns `{eligible, reason_code?, message?}`.
+
+    Two server-side gates (the farmer-PWA Diagnose button greys
+    when either fails):
+      - `crop_not_on_belt` — the CA soft-removed the crop from
+        their company shortlist (existing subs continue but
+        diagnosis would have nothing curated).
+      - `cha_not_enabled` — RootsTalk hasn't enabled CHA on this
+        crop at the platform (`CropHealthCrop.status != ACTIVE`).
+
+    If both pass, eligible=true and the front-end un-greys the
+    button. The "no start date" gate stays client-side — it's a
+    farmer-fillable field, not a CA / platform decision.
+    """
+    from app.modules.advisory.models import Package
+    from app.modules.clients.models import ClientCrop
+    from app.modules.subscriptions.models import Subscription
+    from app.modules.sync.models import CropHealthCrop
+
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    package = (await db.execute(
+        select(Package).where(Package.id == sub.package_id)
+    )).scalar_one_or_none()
+    if not package:
+        raise HTTPException(status_code=404, detail="Subscription's package not found")
+
+    # Gate 1: crop on the CA's current belt.
+    on_belt = (await db.execute(
+        select(ClientCrop).where(
+            ClientCrop.client_id == sub.client_id,
+            ClientCrop.crop_cosh_id == package.crop_cosh_id,
+            ClientCrop.removed_at.is_(None),
+        )
+    )).scalar_one_or_none()
+    if not on_belt:
+        return {
+            "eligible": False,
+            "reason_code": "crop_not_on_belt",
+            "message": (
+                "Your company stopped offering this crop. Diagnosis is "
+                "available only for currently-supported crops."
+            ),
+        }
+
+    # Gate 2: CHA enabled at the platform level.
+    cha_enabled = (await db.execute(
+        select(CropHealthCrop).where(
+            CropHealthCrop.crop_cosh_id == package.crop_cosh_id,
+            CropHealthCrop.status == "ACTIVE",
+        )
+    )).scalar_one_or_none()
+    if not cha_enabled:
+        return {
+            "eligible": False,
+            "reason_code": "cha_not_enabled",
+            "message": (
+                "RootsTalk hasn't enabled crop-health diagnosis on this "
+                "crop yet. Check back later or ask your company."
+            ),
+        }
+
+    return {"eligible": True}
+
+
 @router.post("/diagnosis/start", status_code=201)
 async def start_diagnosis(
     request: StartDiagnosisRequest,
@@ -638,7 +717,17 @@ async def _trigger_cha_from_diagnosis(db: AsyncSession, session: DiagnosisSessio
     if not sub:
         return
 
-    resolved = await resolve_cha_recommendation(db, sub.client_id, problem_cosh_id)
+    # Pass the subscription's crop so the resolver scopes PG to the
+    # right area-wise / plant-wise bundle.
+    from app.modules.advisory.models import Package as _Pkg
+    package = (await db.execute(
+        select(_Pkg).where(_Pkg.id == sub.package_id)
+    )).scalar_one_or_none()
+    sub_crop = package.crop_cosh_id if package else None
+
+    resolved = await resolve_cha_recommendation(
+        db, sub.client_id, problem_cosh_id, crop_cosh_id=sub_crop,
+    )
     if not resolved:
         return
 
