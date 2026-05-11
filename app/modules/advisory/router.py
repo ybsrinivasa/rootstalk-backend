@@ -1845,6 +1845,112 @@ async def get_global_package(
     return pkg
 
 
+@router.get("/advisory/global/packages/{pkg_id}/push-status")
+async def get_global_package_push_status(
+    pkg_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SA-portal helper: for each client this CM can edit, report
+    whether the Global Package has been pushed and (if so) what
+    state the client's lineage is in.
+
+    Shape (per entry):
+      client_id, client_name: identifying.
+      already_pushed: bool — any Local row exists for
+        (client_id, parent_global_id=pkg_id).
+      pushed_at: ISO timestamp of the earliest Local row in the
+        lineage (i.e., first contact). NULL when not yet pushed.
+      latest_local_published_at: ISO timestamp of the most
+        recently published Local row in the lineage. NULL when
+        the SE hasn't published anything yet (e.g., the CM-push
+        DRAFT is still sitting in DRAFT). The CM compares this
+        to the Global's `published_at` to spot clients that
+        haven't pulled a fresh version.
+      has_pending_draft: bool — true if any DRAFT exists in the
+        client's lineage right now (typically an in-flight SE
+        edit or SE pull that hasn't been published yet).
+
+    Auth: caller must be a CM (any active CMClientAssignment).
+    Returns 404 if the Global Package doesn't exist. Returns
+    empty list if the CM has no active assignments — the SA-portal
+    push surface is then non-actionable for this Global.
+    """
+    src = (await db.execute(
+        select(Package).where(
+            Package.id == pkg_id, Package.client_id == None,  # noqa: E711
+        )
+    )).scalar_one_or_none()
+    if not src:
+        raise HTTPException(status_code=404, detail="Global package not found")
+
+    from app.modules.clients.models import (
+        Client, CMClientAssignment, CMRights,
+    )
+    from app.modules.platform.models import StatusEnum
+
+    assignments = (await db.execute(
+        select(CMClientAssignment).where(
+            CMClientAssignment.cm_user_id == current_user.id,
+            CMClientAssignment.status == StatusEnum.ACTIVE,
+            CMClientAssignment.rights == CMRights.EDIT,
+        )
+    )).scalars().all()
+    if not assignments:
+        return []
+
+    client_ids = [a.client_id for a in assignments]
+    clients_by_id = {
+        c.id: c for c in (await db.execute(
+            select(Client).where(Client.id.in_(client_ids))
+        )).scalars().all()
+    }
+
+    local_rows = (await db.execute(
+        select(Package).where(
+            Package.parent_global_id == pkg_id,
+            Package.client_id.in_(client_ids),
+        )
+    )).scalars().all()
+    rows_by_client: dict[str, list[Package]] = {}
+    for r in local_rows:
+        rows_by_client.setdefault(r.client_id, []).append(r)
+
+    out = []
+    for cid in client_ids:
+        client = clients_by_id.get(cid)
+        if not client:
+            continue
+        rows = rows_by_client.get(cid, [])
+        pushed_at = None
+        latest_pub = None
+        has_pending_draft = False
+        for r in rows:
+            if pushed_at is None or r.created_at < pushed_at:
+                pushed_at = r.created_at
+            if r.published_at is not None:
+                if latest_pub is None or r.published_at > latest_pub:
+                    latest_pub = r.published_at
+            if r.status == PackageStatus.DRAFT:
+                has_pending_draft = True
+        out.append({
+            "client_id": cid,
+            "client_name": (
+                client.display_name or client.full_name or client.short_name
+            ),
+            "already_pushed": bool(rows),
+            "pushed_at": pushed_at.isoformat() if pushed_at else None,
+            "latest_local_published_at": (
+                latest_pub.isoformat() if latest_pub else None
+            ),
+            "has_pending_draft": has_pending_draft,
+        })
+    # Stable ordering: not-yet-pushed clients first (actionable
+    # for the CM), then by client name.
+    out.sort(key=lambda e: (e["already_pushed"], e["client_name"]))
+    return out
+
+
 @router.post("/advisory/global/packages/{pkg_id}/publish", response_model=PackageOut)
 async def publish_global_package(
     pkg_id: str,
