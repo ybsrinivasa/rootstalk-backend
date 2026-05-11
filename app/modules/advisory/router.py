@@ -13,7 +13,7 @@ from app.modules.advisory.models import (
     ParameterTranslation, VariableTranslation, TranslationStatus,
     Timeline, Practice, Element, Relation,
     ConditionalQuestion, PracticeConditional, RelationConditional,
-    PackageStatus, PackageType, PackageCreatedVia,
+    PackageStatus, PackageType, PackageCreatedVia, ParameterSource,
 )
 from app.modules.advisory.schemas import (
     PackageCreate, PackageUpdate, PackageOut,
@@ -917,10 +917,15 @@ async def list_parameters(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Returns the client's own CUSTOM parameters AND the Global
+    parameters (client_id IS NULL) for this crop. Globals are
+    visible after push so the SE can see + assign the inherited
+    fingerprint. Locked 2026-05-11 in the Global PV work (Batch 9)."""
+    from sqlalchemy import or_
     result = await db.execute(
         select(Parameter).where(
             Parameter.crop_cosh_id == crop_cosh_id,
-            Parameter.client_id == client_id,
+            or_(Parameter.client_id == client_id, Parameter.client_id == None),  # noqa: E711
         ).order_by(Parameter.display_order)
     )
     return result.scalars().all()
@@ -2225,6 +2230,166 @@ async def get_global_package_push_status(
     return out
 
 
+# ── Global Parameters / Variables / PackageVariables (Batch 9, 2026-05-11) ──
+#
+# Globals carry their own PV signature so the CM can distinguish multiple
+# Packages for the same crop (e.g. "Tomato — Drip" vs "Tomato — Flood").
+# On push, the Local PackageVariable rows reference these Global Parameter
+# and Variable rows directly — no cloning, since Parameters with
+# client_id=NULL are visible across all clients. The client-side §4.2
+# sibling check then sees the inherited fingerprint and behaves correctly.
+
+@router.get("/advisory/global/parameters")
+async def list_global_parameters(
+    crop_cosh_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List Global Parameters for a crop (client_id IS NULL)."""
+    result = await db.execute(
+        select(Parameter).where(
+            Parameter.crop_cosh_id == crop_cosh_id,
+            Parameter.client_id == None,  # noqa: E711
+        ).order_by(Parameter.display_order)
+    )
+    return result.scalars().all()
+
+
+@router.post("/advisory/global/parameters", status_code=201)
+async def create_global_parameter(
+    request: ParameterCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Create a CUSTOM Global Parameter. Visible to every Local
+    Package via FK from PackageVariable; the SA-portal authors them,
+    Local Packages reference them after push."""
+    param = Parameter(
+        crop_cosh_id=request.crop_cosh_id,
+        client_id=None,
+        name=request.name,
+        source=ParameterSource.CUSTOM,
+        display_order=request.display_order,
+    )
+    db.add(param)
+    await db.commit()
+    await db.refresh(param)
+    return param
+
+
+@router.get("/advisory/global/parameters/{parameter_id}/variables")
+async def list_global_variables(
+    parameter_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List Variables for a Global Parameter."""
+    # Defence: refuse to list variables off a client-scoped Parameter
+    # through this endpoint — keep the global/local separation clear.
+    param = (await db.execute(
+        select(Parameter).where(
+            Parameter.id == parameter_id, Parameter.client_id == None,  # noqa: E711
+        )
+    )).scalar_one_or_none()
+    if param is None:
+        raise HTTPException(status_code=404, detail="Global parameter not found")
+    result = await db.execute(
+        select(Variable).where(Variable.parameter_id == parameter_id)
+        .order_by(Variable.created_at)
+    )
+    return result.scalars().all()
+
+
+@router.post("/advisory/global/parameters/{parameter_id}/variables", status_code=201)
+async def create_global_variable(
+    parameter_id: str,
+    request: VariableCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Add a Variable to a Global Parameter."""
+    param = (await db.execute(
+        select(Parameter).where(
+            Parameter.id == parameter_id, Parameter.client_id == None,  # noqa: E711
+        )
+    )).scalar_one_or_none()
+    if param is None:
+        raise HTTPException(status_code=404, detail="Global parameter not found")
+    var = Variable(parameter_id=parameter_id, name=request.name)
+    db.add(var)
+    await db.commit()
+    await db.refresh(var)
+    return var
+
+
+@router.get("/advisory/global/packages/{pkg_id}/variables")
+async def list_global_package_variables(
+    pkg_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List the parameter→variable fingerprint set on a Global Package.
+    Defaults to empty when none assigned yet."""
+    pkg = (await db.execute(
+        select(Package).where(
+            Package.id == pkg_id, Package.client_id == None,  # noqa: E711
+        )
+    )).scalar_one_or_none()
+    if pkg is None:
+        raise HTTPException(status_code=404, detail="Global package not found")
+    rows = (await db.execute(
+        select(PackageVariable).where(PackageVariable.package_id == pkg_id)
+    )).scalars().all()
+    return [
+        {
+            "parameter_id": pv.parameter_id,
+            "variable_id": pv.variable_id,
+        }
+        for pv in rows
+    ]
+
+
+@router.put("/advisory/global/packages/{pkg_id}/variables")
+async def set_global_package_variables(
+    pkg_id: str,
+    request: PackageVariableSet,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Set the parameter→variable fingerprint on a Global Package.
+
+    No §4.2 sibling check here — that's a client-side rule (multiple
+    PoPs sharing districts at the same client). At Global scope,
+    two Tomato PoPs co-existing is the *intent*: different farmer
+    profiles. The CM uses PVs to make them distinguishable on push.
+    """
+    pkg = (await db.execute(
+        select(Package).where(
+            Package.id == pkg_id, Package.client_id == None,  # noqa: E711
+        )
+    )).scalar_one_or_none()
+    if pkg is None:
+        raise HTTPException(status_code=404, detail="Global package not found")
+    existing = (await db.execute(
+        select(PackageVariable).where(PackageVariable.package_id == pkg_id)
+    )).scalars().all()
+    for pv in existing:
+        await db.delete(pv)
+    # Flush before adding the new rows — otherwise SQLAlchemy may
+    # batch the INSERTs ahead of the DELETEs in the same flush and
+    # the (package_id, parameter_id) unique constraint trips when
+    # the new assignment reuses a previously-set parameter_id.
+    await db.flush()
+    for assignment in request.assignments:
+        db.add(PackageVariable(
+            package_id=pkg_id,
+            parameter_id=assignment["parameter_id"],
+            variable_id=assignment["variable_id"],
+        ))
+    await db.commit()
+    return {"detail": f"{len(request.assignments)} parameter-variable assignments saved"}
+
+
 @router.post("/advisory/global/packages/{pkg_id}/publish", response_model=PackageOut)
 async def publish_global_package(
     pkg_id: str,
@@ -2609,6 +2774,20 @@ async def push_global_package(
     db.add(copy)
     await db.flush()
     await _deep_copy_package_content(db, src.id, copy.id)
+    # PVs (Batch 9, 2026-05-11): copy the Global's parameter-variable
+    # signature so the Local inherits the discriminator. Parameter +
+    # Variable rows are NOT cloned — Global Parameters (client_id IS
+    # NULL) are usable as FK from any Local PackageVariable. Saves
+    # the SE from manually re-assigning the same signature post-pull.
+    src_pvs = (await db.execute(
+        select(PackageVariable).where(PackageVariable.package_id == src.id)
+    )).scalars().all()
+    for pv in src_pvs:
+        db.add(PackageVariable(
+            package_id=copy.id,
+            parameter_id=pv.parameter_id,
+            variable_id=pv.variable_id,
+        ))
     await db.commit()
     await db.refresh(copy)
     return copy
@@ -2699,6 +2878,18 @@ async def pull_global_package(
     db.add(copy)
     await db.flush()
     await _deep_copy_package_content(db, src.id, copy.id)
+    # PVs (Batch 9): same rationale as push — pulled Locals inherit
+    # the Global's parameter-variable signature so the SE doesn't
+    # re-assign it on every refresh.
+    src_pvs = (await db.execute(
+        select(PackageVariable).where(PackageVariable.package_id == src.id)
+    )).scalars().all()
+    for pv in src_pvs:
+        db.add(PackageVariable(
+            package_id=copy.id,
+            parameter_id=pv.parameter_id,
+            variable_id=pv.variable_id,
+        ))
     await db.commit()
     await db.refresh(copy)
     return copy
