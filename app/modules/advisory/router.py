@@ -466,6 +466,63 @@ async def get_package(
     return pkg
 
 
+@router.get("/client/{client_id}/packages/{package_id}/lineage")
+async def get_package_lineage(
+    client_id: str, package_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """All rows in the lineage of `package_id` — i.e. rows sharing
+    (client_id, crop_cosh_id, name). Multi-row versioning (locked
+    2026-05-11) keeps prior published versions as INACTIVE history
+    rows; this endpoint feeds the version-history navigator on the
+    CA-portal Local Package detail page.
+
+    Ordered by version descending (newest first), with DRAFTs at
+    the top regardless of their version field (DRAFTs default to
+    version=1 and only get a lineage version on publish).
+
+    Returns:
+      [{id, status, version, published_at, created_at, created_via,
+        source_version_id, is_current}, ...]
+      where `is_current` flags the row the caller is viewing.
+    """
+    await _assert_client_user_can_edit(db, current_user.id, client_id)
+    pkg = await _get_package(db, package_id, client_id)
+
+    rows = (await db.execute(
+        select(Package).where(
+            Package.client_id == client_id,
+            Package.crop_cosh_id == pkg.crop_cosh_id,
+            Package.name == pkg.name,
+        ).order_by(Package.version.desc(), Package.created_at.desc())
+    )).scalars().all()
+
+    def sort_key(p: Package):
+        # DRAFTs sit at the top (most recent edit cycle); within
+        # PUBLISHED + INACTIVE, order by version desc then
+        # created_at desc to keep the newest visible first.
+        is_draft = 0 if p.status == PackageStatus.DRAFT else 1
+        return (is_draft, -p.version, -p.created_at.timestamp())
+
+    return [
+        {
+            "id": r.id,
+            "status": r.status.value if hasattr(r.status, "value") else r.status,
+            "version": r.version,
+            "published_at": r.published_at.isoformat() if r.published_at else None,
+            "created_at": r.created_at.isoformat(),
+            "created_via": (
+                r.created_via.value if r.created_via and hasattr(r.created_via, "value")
+                else r.created_via
+            ),
+            "source_version_id": r.source_version_id,
+            "is_current": r.id == package_id,
+        }
+        for r in sorted(rows, key=sort_key)
+    ]
+
+
 @router.put("/client/{client_id}/packages/{package_id}", response_model=PackageOut)
 async def update_package(
     client_id: str, package_id: str,
