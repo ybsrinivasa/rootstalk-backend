@@ -2461,6 +2461,41 @@ async def publish_global_package(
     return pkg
 
 
+# ── Practice taxonomy + element specs (2026-05-11) ─────────────────────────
+# L0 → L1 → L2 hierarchy + per-L2 element rules. Pure-data
+# endpoints used by both the SA and CA portals to render
+# cascading Practice dropdowns and element forms. No auth gate
+# — the taxonomy itself is non-sensitive reference data shared
+# across all roles.
+
+@router.get("/practice-taxonomy")
+async def get_practice_taxonomy_endpoint(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.practice_taxonomy import get_practice_taxonomy
+    return get_practice_taxonomy()
+
+
+@router.get("/practice-taxonomy/elements/{l2_type}")
+async def get_l2_element_spec(
+    l2_type: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.practice_taxonomy import list_l2_elements
+    elements = list_l2_elements(l2_type)
+    if elements is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "unknown_l2_type",
+                "message": f"L2 type {l2_type!r} is not in the rule book.",
+            },
+        )
+    return {"l2_type": l2_type, "elements": elements}
+
+
 @router.get("/advisory/global/packages/{pkg_id}/timelines", response_model=list[TimelineOut])
 async def list_global_timelines(
     pkg_id: str,
