@@ -2124,6 +2124,50 @@ async def get_global_package(
     return pkg
 
 
+@router.put("/advisory/global/packages/{pkg_id}", response_model=PackageOut)
+async def update_global_package(
+    pkg_id: str,
+    request: PackageUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Edit a Global Package's name / duration / start-date label /
+    description after creation. `package_type` and `crop_cosh_id`
+    stay immutable — changing crop on a published template would
+    orphan content semantics; package_type drives duration rules.
+
+    Mirrors the client-scoped `update_package` validator: duration
+    range-checked for ANNUAL, locked at 365 for PERENNIAL.
+    """
+    pkg = (await db.execute(
+        select(Package).where(
+            Package.id == pkg_id, Package.client_id == None,  # noqa: E711
+        )
+    )).scalar_one_or_none()
+    if not pkg:
+        raise HTTPException(status_code=404, detail="Global package not found")
+    update_data = request.model_dump(exclude_unset=True)
+
+    if "duration_days" in update_data:
+        try:
+            update_data["duration_days"] = validate_package_duration_for_update(
+                package_type=pkg.package_type.value,
+                current_duration=pkg.duration_days,
+                new_duration=update_data["duration_days"],
+            )
+        except PackageValidationError as e:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": e.code, "message": e.message},
+            )
+
+    for field, value in update_data.items():
+        setattr(pkg, field, value)
+    await db.commit()
+    await db.refresh(pkg)
+    return pkg
+
+
 @router.get("/advisory/global/packages/{pkg_id}/push-status")
 async def get_global_package_push_status(
     pkg_id: str,
