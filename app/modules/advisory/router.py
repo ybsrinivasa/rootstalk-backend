@@ -13,7 +13,7 @@ from app.modules.advisory.models import (
     ParameterTranslation, VariableTranslation, TranslationStatus,
     Timeline, Practice, Element, Relation,
     ConditionalQuestion, PracticeConditional, RelationConditional,
-    PackageStatus, PackageType,
+    PackageStatus, PackageType, PackageCreatedVia,
 )
 from app.modules.advisory.schemas import (
     PackageCreate, PackageUpdate, PackageOut,
@@ -2010,37 +2010,117 @@ async def delete_global_cca_element(
     )
 
 
-@router.post("/client/{client_id}/packages/{pkg_id}/fork", response_model=PackageOut, status_code=201)
-async def fork_global_package(
-    client_id: str,
-    pkg_id: str,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """Deep-copy a global package (all timelines + practices + elements)
-    into a client. **Once-per-client-lifetime rule applies** — a
-    given global package can be forked into a given client at most
-    once. After the fork, the local copy lives entirely independently;
-    re-forking the same global is permanently 409. The SE either edits
-    the existing local copy or (separately) deletes it before any
-    re-import is even possible.
+async def _deep_copy_package_content(
+    db: AsyncSession, src_id: str, dst_id: str,
+) -> None:
+    """Copy all timelines + practices + elements from `src_id` →
+    `dst_id`. Used by push, pull, and SE clone-to-draft (Batch 3).
 
-    Authorisation:
-      Only a CM with an active EDIT-rights `CMClientAssignment` for
-      this client may fork. Any other caller — including SEs at the
-      same client — gets 403.
-
-    Publish gate: only ACTIVE global packages may be forked. DRAFT
-    is CM work-in-progress; INACTIVE is a superseded version.
+    Does NOT touch package-level fields (name, package_type,
+    duration_days, locations, authors, package_variables) — caller
+    is responsible for setting those on the destination row before
+    invoking. Commits are not issued here; the caller controls the
+    transaction boundary.
     """
-    await _assert_cm_can_edit_client(db, current_user.id, client_id)
+    tl_result = await db.execute(
+        select(Timeline).where(Timeline.package_id == src_id)
+        .order_by(Timeline.display_order)
+    )
+    for src_tl in tl_result.scalars().all():
+        new_tl = Timeline(
+            package_id=dst_id,
+            name=src_tl.name,
+            from_type=src_tl.from_type,
+            from_value=src_tl.from_value,
+            to_value=src_tl.to_value,
+            display_order=src_tl.display_order,
+        )
+        db.add(new_tl)
+        await db.flush()
 
+        p_result = await db.execute(
+            select(Practice).where(Practice.timeline_id == src_tl.id)
+            .order_by(Practice.display_order)
+        )
+        for src_p in p_result.scalars().all():
+            new_p = Practice(
+                timeline_id=new_tl.id,
+                l0_type=src_p.l0_type,
+                l1_type=src_p.l1_type,
+                l2_type=src_p.l2_type,
+                display_order=src_p.display_order,
+                is_special_input=src_p.is_special_input,
+                common_name_cosh_id=src_p.common_name_cosh_id,
+                frequency_days=src_p.frequency_days,
+            )
+            db.add(new_p)
+            await db.flush()
+
+            el_result = await db.execute(
+                select(Element).where(Element.practice_id == src_p.id)
+                .order_by(Element.display_order)
+            )
+            for src_el in el_result.scalars().all():
+                db.add(Element(
+                    practice_id=new_p.id,
+                    element_type=src_el.element_type,
+                    cosh_ref=src_el.cosh_ref,
+                    value=src_el.value,
+                    unit_cosh_id=src_el.unit_cosh_id,
+                    display_order=src_el.display_order,
+                ))
+
+
+async def _assert_client_user_can_edit(
+    db: AsyncSession, user_id: str, client_id: str,
+) -> None:
+    """Authorisation gate for SE-side actions on a Client's local
+    Packages (pull from Global; future clone-to-draft etc).
+
+    Today's eligible roles: any ACTIVE ClientUser whose role can
+    edit advisory content for the client. V1 is permissive — every
+    ClientUser status=ACTIVE qualifies, since onboarding is small
+    and role-level granularity comes in V2 alongside the wider
+    `_require_client_role` audit.
+
+    Raises 403 with stable code `client_user_required`.
+    """
+    from app.modules.clients.models import ClientUser
+    from app.modules.platform.models import StatusEnum
+
+    cu = (await db.execute(
+        select(ClientUser).where(
+            ClientUser.user_id == user_id,
+            ClientUser.client_id == client_id,
+            ClientUser.status == StatusEnum.ACTIVE,
+        )
+    )).scalar_one_or_none()
+    if cu is None:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "client_user_required",
+                "message": (
+                    "Only an active staff member of this client may "
+                    "pull a new version of a Global Package."
+                ),
+            },
+        )
+
+
+async def _load_global_active_or_422(
+    db: AsyncSession, pkg_id: str,
+) -> Package:
+    """Common prologue for push + pull: fetch Global Package with
+    client_id=NULL and status=ACTIVE. 404 if not Global; 422 if not
+    ACTIVE (DRAFT = CM-WIP; INACTIVE = superseded)."""
     src = (await db.execute(
-        select(Package).where(Package.id == pkg_id, Package.client_id == None)  # noqa: E711
+        select(Package).where(
+            Package.id == pkg_id, Package.client_id == None,  # noqa: E711
+        )
     )).scalar_one_or_none()
     if not src:
         raise HTTPException(status_code=404, detail="Global package not found")
-
     if src.status != PackageStatus.ACTIVE:
         raise HTTPException(
             status_code=422,
@@ -2049,19 +2129,48 @@ async def fork_global_package(
                 "message": (
                     "This global package has not been published (or has "
                     "been deactivated). Ask the CM to publish it before "
-                    "forking."
+                    "pushing or pulling."
                 ),
-                "current_status": src.status.value if hasattr(src.status, "value") else src.status,
+                "current_status": (
+                    src.status.value if hasattr(src.status, "value") else src.status
+                ),
             },
         )
+    return src
+
+
+@router.post("/client/{client_id}/packages/{pkg_id}/push", response_model=PackageOut, status_code=201)
+async def push_global_package(
+    client_id: str,
+    pkg_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """**CM push — first contact only**. A CM with active EDIT
+    rights on `client_id` deep-copies the Global Package into the
+    client's scope as a DRAFT (Local v1). The SE then publishes
+    when they're ready (legal-review gate).
+
+    Locked 2026-05-11 in
+    `project_rootstalk_global_to_local_pipe.md`: a Global Package
+    can be pushed to a Client exactly **once** (regardless of any
+    history rows from later SE pulls / republishes). Re-pushing is
+    permanently 409 `package_already_pushed` — subsequent versions
+    are pulled by the SE, not pushed by the CM.
+
+    Auth: 403 `cm_assignment_required` if not a CM with active
+    EDIT rights for this client. Publish gate: 422
+    `global_package_not_published` if the Global isn't ACTIVE.
+    """
+    await _assert_cm_can_edit_client(db, current_user.id, client_id)
+    src = await _load_global_active_or_422(db, pkg_id)
 
     existing = (await db.execute(
         select(Package).where(
             Package.client_id == client_id,
             Package.parent_global_id == pkg_id,
-        )
+        ).limit(1)
     )).scalar_one_or_none()
-
     if existing:
         tl_count = (await db.execute(
             select(func.count()).select_from(Timeline).where(
@@ -2071,13 +2180,12 @@ async def fork_global_package(
         raise HTTPException(
             status_code=409,
             detail={
-                "code": "package_already_forked",
+                "code": "package_already_pushed",
                 "message": (
-                    "This global package has already been forked into "
-                    "this client. A package can be forked into a client "
-                    "only once in the client's lifetime — edit the "
-                    "existing local copy or delete it before any future "
-                    "re-import is possible."
+                    "This Global Package has already been pushed to this "
+                    "client. First contact happens once per client; "
+                    "subsequent versions are pulled by the SE from the "
+                    "CA portal, not pushed again from the SA portal."
                 ),
                 "existing": {
                     "package_id": existing.id,
@@ -2096,56 +2204,102 @@ async def fork_global_package(
         start_date_label_cosh_id=src.start_date_label_cosh_id,
         description=src.description,
         created_by=current_user.id,
+        status=PackageStatus.DRAFT,
+        created_via=PackageCreatedVia.CM_PUSH,
     )
     db.add(copy)
     await db.flush()
+    await _deep_copy_package_content(db, src.id, copy.id)
+    await db.commit()
+    await db.refresh(copy)
+    return copy
 
-    # Load source timelines + practices + elements
-    tl_result = await db.execute(
-        select(Timeline).where(Timeline.package_id == src.id).order_by(Timeline.display_order)
+
+# Backward-compat alias for the renamed endpoint. The CA-portal
+# Import button still calls /fork while we migrate the UI to the
+# SA-portal Push surface (Batch 5). Drop this route + the alias
+# once the frontend is cut over.
+@router.post("/client/{client_id}/packages/{pkg_id}/fork", response_model=PackageOut, status_code=201)
+async def fork_global_package(
+    client_id: str,
+    pkg_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """DEPRECATED. Routes to `push_global_package`. Tests and the
+    transitional CA-portal Import button call this name."""
+    return await push_global_package(
+        client_id=client_id, pkg_id=pkg_id,
+        db=db, current_user=current_user,
     )
-    for src_tl in tl_result.scalars().all():
-        new_tl = Timeline(
-            package_id=copy.id,
-            name=src_tl.name,
-            from_type=src_tl.from_type,
-            from_value=src_tl.from_value,
-            to_value=src_tl.to_value,
-            display_order=src_tl.display_order,
+
+
+@router.post("/client/{client_id}/packages/{pkg_id}/pull", response_model=PackageOut, status_code=201)
+async def pull_global_package(
+    client_id: str,
+    pkg_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """**SE pull — refresh from Global**. Requires that the CM has
+    already pushed this Global to this client at least once. Deep-
+    copies Global's current content into a new Local Package row,
+    status=DRAFT, alongside any existing PUBLISHED Local. The SE
+    reviews v_n DRAFT against the live PUBLISHED in the editor;
+    only publishing the DRAFT actually swaps farmers over.
+
+    **Single-DRAFT invariant**: at most one DRAFT row per
+    (client_id, parent_global_id) at any time. If a prior DRAFT
+    exists (e.g. abandoned earlier pull), it's auto-flipped to
+    INACTIVE before the new DRAFT is created.
+
+    Auth: any ACTIVE ClientUser for this client. 403
+    `client_user_required` otherwise. Refusal codes: 422
+    `global_package_not_published`, 422 `package_not_pushed_yet`.
+    """
+    await _assert_client_user_can_edit(db, current_user.id, client_id)
+    src = await _load_global_active_or_422(db, pkg_id)
+
+    siblings = (await db.execute(
+        select(Package).where(
+            Package.client_id == client_id,
+            Package.parent_global_id == pkg_id,
         )
-        db.add(new_tl)
-        await db.flush()
-
-        p_result = await db.execute(
-            select(Practice).where(Practice.timeline_id == src_tl.id).order_by(Practice.display_order)
+    )).scalars().all()
+    if not siblings:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "package_not_pushed_yet",
+                "message": (
+                    "This Global Package has not been pushed to this "
+                    "client yet. The CM must push it from the SA portal "
+                    "before the SE can pull subsequent versions."
+                ),
+            },
         )
-        for src_p in p_result.scalars().all():
-            new_p = Practice(
-                timeline_id=new_tl.id,
-                l0_type=src_p.l0_type,
-                l1_type=src_p.l1_type,
-                l2_type=src_p.l2_type,
-                display_order=src_p.display_order,
-                is_special_input=src_p.is_special_input,
-                common_name_cosh_id=src_p.common_name_cosh_id,
-                frequency_days=src_p.frequency_days,
-            )
-            db.add(new_p)
-            await db.flush()
 
-            el_result = await db.execute(
-                select(Element).where(Element.practice_id == src_p.id).order_by(Element.display_order)
-            )
-            for src_el in el_result.scalars().all():
-                db.add(Element(
-                    practice_id=new_p.id,
-                    element_type=src_el.element_type,
-                    cosh_ref=src_el.cosh_ref,
-                    value=src_el.value,
-                    unit_cosh_id=src_el.unit_cosh_id,
-                    display_order=src_el.display_order,
-                ))
+    # Single-DRAFT invariant — flip prior DRAFTs to INACTIVE.
+    for sib in siblings:
+        if sib.status == PackageStatus.DRAFT:
+            sib.status = PackageStatus.INACTIVE
 
+    copy = Package(
+        client_id=client_id,
+        parent_global_id=src.id,
+        crop_cosh_id=src.crop_cosh_id,
+        name=src.name,
+        package_type=src.package_type,
+        duration_days=src.duration_days,
+        start_date_label_cosh_id=src.start_date_label_cosh_id,
+        description=src.description,
+        created_by=current_user.id,
+        status=PackageStatus.DRAFT,
+        created_via=PackageCreatedVia.SE_PULL_DRAFT,
+    )
+    db.add(copy)
+    await db.flush()
+    await _deep_copy_package_content(db, src.id, copy.id)
     await db.commit()
     await db.refresh(copy)
     return copy

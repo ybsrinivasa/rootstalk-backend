@@ -249,7 +249,7 @@ async def test_refork_same_package_into_same_client_permanently_blocked(db):
             db=db, current_user=user,
         )
     assert exc.value.status_code == 409
-    assert exc.value.detail["code"] == "package_already_forked"
+    assert exc.value.detail["code"] == "package_already_pushed"
     assert exc.value.detail["existing"]["timeline_count"] == 1
 
 

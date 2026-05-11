@@ -124,15 +124,15 @@ class Package(Base):
     timelines: Mapped[list["Timeline"]] = relationship("Timeline", back_populates="package")
 
     __table_args__ = (
-        # Partial unique: name uniqueness is enforced only on
-        # non-INACTIVE rows so multi-row history can keep prior
-        # versions with identical names. DRAFT + PUBLISHED siblings
-        # at the same (client, crop) still can't collide.
+        # Partial unique: name uniqueness fires only on ACTIVE
+        # rows so the SE-pull flow can hold v1 PUBLISHED + v2 DRAFT
+        # with the same inherited Global name without colliding.
+        # Single-DRAFT invariant is enforced in app code, not here.
         Index(
             "uq_package_client_crop_name_active",
             "client_id", "crop_cosh_id", "name",
             unique=True,
-            postgresql_where="status <> 'INACTIVE'",
+            postgresql_where="status = 'ACTIVE'",
         ),
         Index(
             "ix_packages_client_parent_status",
