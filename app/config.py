@@ -79,6 +79,15 @@ class Settings(BaseSettings):
     # unset, and `_base_url()` falls back to the production value.
     frontend_base_url: str = ""
 
+    # SA portal base URL — used by the Neytiri (SA / CM / RM)
+    # welcome email. Production tops both portals on the same host
+    # (`rootstalk.eywa.farm` serves SA at `/` and CA at `/{short_name}`),
+    # so this can be left empty in production and the welcome
+    # email falls back to `frontend_base_url`. Testing topology
+    # splits them by subdomain (SA at `rstalk.eywa.farm`, CA at
+    # `rstalk-ca.eywa.farm`) — set `SA_PORTAL_URL` explicitly there.
+    sa_portal_url: str = ""
+
     # Environment
     environment: str = "development"
 

@@ -264,9 +264,28 @@ async def _get_neytiri_user(db: AsyncSession, user_id: str) -> User:
     return user
 
 
+def _sa_portal_url() -> str:
+    """Resolve the SA portal URL used in Neytiri welcome emails.
+
+    Resolution order:
+      1. `SA_PORTAL_URL` env var — required in non-dev when the SA
+         portal is on a separate subdomain (testing topology).
+      2. `FRONTEND_BASE_URL` — fine for production where SA and CA
+         share the same host (`rootstalk.eywa.farm`).
+      3. Dev fallback `http://localhost:3002` (the SA-portal dev
+         port — see project_rootstalk_ports.md).
+    """
+    from app.config import settings
+    if settings.sa_portal_url:
+        return settings.sa_portal_url.rstrip("/")
+    if settings.frontend_base_url:
+        return settings.frontend_base_url.rstrip("/")
+    return "http://localhost:3002"
+
+
 def _send_neytiri_welcome_email(email: str, name: str, temp_password: str, roles: list[str]):
     role_str = ", ".join(roles)
-    portal_url = "https://coshdev.eywa.farm/admin"
+    portal_url = _sa_portal_url()
     subject = "Your RootsTalk Admin Portal account"
     plain = f"""Hi {name or ''},
 
