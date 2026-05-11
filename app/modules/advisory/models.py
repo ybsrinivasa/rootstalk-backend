@@ -30,6 +30,25 @@ class PackageStatus(str, enum.Enum):
     INACTIVE = "INACTIVE"
 
 
+class PackageCreatedVia(str, enum.Enum):
+    """Audit/lineage marker for how a Local Package row came into
+    being. Locked 2026-05-11; see
+    project_rootstalk_global_to_local_pipe.md for the multi-row
+    versioning model.
+
+    CM_PUSH              First-contact push from a CM (SA portal).
+    SE_PULL_DRAFT        SE pulled a refreshed version from Global.
+    SE_EDIT_DRAFT        SE cloned the current PUBLISHED to a new
+                         DRAFT to make self-edits.
+    SE_ROLLBACK_PUBLISH  SE published a historical row's content as
+                         a new PUBLISHED version (rollback).
+    """
+    CM_PUSH = "CM_PUSH"
+    SE_PULL_DRAFT = "SE_PULL_DRAFT"
+    SE_EDIT_DRAFT = "SE_EDIT_DRAFT"
+    SE_ROLLBACK_PUBLISH = "SE_ROLLBACK_PUBLISH"
+
+
 class ParameterSource(str, enum.Enum):
     COSH = "COSH"
     CUSTOM = "CUSTOM"
@@ -88,13 +107,37 @@ class Package(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
     cascade_inactivated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # Multi-row versioning (2026-05-11). NULL on pre-migration rows;
+    # populated on every newly created row from this point on.
+    created_via: Mapped[PackageCreatedVia] = mapped_column(
+        SAEnum(PackageCreatedVia, name="packagecreatedvia"), nullable=True,
+    )
+    # Lineage pointer for SE_ROLLBACK_PUBLISH — the historical row
+    # whose content this row was published from. NULL otherwise.
+    source_version_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("packages.id"), nullable=True,
+    )
+
     locations: Mapped[list["PackageLocation"]] = relationship("PackageLocation", back_populates="package")
     authors: Mapped[list["PackageAuthor"]] = relationship("PackageAuthor", back_populates="package")
     package_variables: Mapped[list["PackageVariable"]] = relationship("PackageVariable", back_populates="package")
     timelines: Mapped[list["Timeline"]] = relationship("Timeline", back_populates="package")
 
     __table_args__ = (
-        UniqueConstraint("client_id", "crop_cosh_id", "name", name="uq_package_client_crop_name"),
+        # Partial unique: name uniqueness is enforced only on
+        # non-INACTIVE rows so multi-row history can keep prior
+        # versions with identical names. DRAFT + PUBLISHED siblings
+        # at the same (client, crop) still can't collide.
+        Index(
+            "uq_package_client_crop_name_active",
+            "client_id", "crop_cosh_id", "name",
+            unique=True,
+            postgresql_where="status <> 'INACTIVE'",
+        ),
+        Index(
+            "ix_packages_client_parent_status",
+            "client_id", "parent_global_id", "status",
+        ),
     )
 
 
