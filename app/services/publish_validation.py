@@ -233,10 +233,16 @@ async def assert_package_publish_ready(
 
     siblings_with_shared: list[dict] = []
     if this_districts:
+        # Lineage exclusion (multi-row versioning locked 2026-05-11):
+        # other rows that share (client, crop, name) are different
+        # versions of the SAME logical PoP, not §4.2 "siblings".
+        # Without this, every clone-to-draft → publish trips the gate
+        # because v_n DRAFT shares districts with v_{n-1} ACTIVE.
         sibling_pkgs = (await db.execute(
             select(Package).where(
                 Package.client_id == package.client_id,
                 Package.crop_cosh_id == package.crop_cosh_id,
+                Package.name != package.name,
                 Package.id != package.id,
                 Package.status.in_([PackageStatus.DRAFT, PackageStatus.ACTIVE]),
             )

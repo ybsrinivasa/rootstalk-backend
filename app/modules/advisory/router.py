@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.dependencies import get_current_user
@@ -673,6 +673,14 @@ async def publish_package(
         _raise_publish_transition(res)
 
     # Inactivate current ACTIVE version for same crop in same client
+    # AND migrate any subscriptions to the new ACTIVE row. Multi-row
+    # versioning (locked 2026-05-11): farmers stay on the live
+    # PUBLISHED row automatically, no opt-in. Snapshots on the
+    # demoted row become orphaned but harmless; first /today view
+    # after migration takes fresh snapshots on the new row's
+    # timeline ids.
+    from app.modules.subscriptions.models import Subscription
+
     existing_active = (await db.execute(
         select(Package).where(
             Package.client_id == client_id,
@@ -683,9 +691,20 @@ async def publish_package(
     )).scalars().all()
     for active in existing_active:
         active.status = PackageStatus.INACTIVE
+        await db.execute(
+            update(Subscription)
+            .where(Subscription.package_id == active.id)
+            .values(package_id=package_id)
+        )
 
-    pkg.version = compute_publish_version(
-        current_version=pkg.version, was_published=pkg.published_at is not None,
+    # Multi-row versioning: version monotonically increases across
+    # the lineage (rows sharing client + crop + name), not just on
+    # this row. A clone-to-draft + publish of v_n+1 must show
+    # max(lineage) + 1, even though the DRAFT row itself starts at
+    # version=1. The legacy compute_publish_version path only saw
+    # `pkg.version` and missed history rows.
+    pkg.version = await _next_lineage_version(
+        db, client_id=client_id, crop_cosh_id=pkg.crop_cosh_id, name=pkg.name,
     )
     pkg.status = PackageStatus.ACTIVE
     pkg.published_at = datetime.now(timezone.utc)
@@ -2303,6 +2322,250 @@ async def pull_global_package(
     await db.commit()
     await db.refresh(copy)
     return copy
+
+
+async def _deep_copy_package_metadata(
+    db: AsyncSession, src_id: str, dst_id: str,
+) -> None:
+    """Copy locations + authors + package_variables. Used by
+    clone-to-draft and rollback-publish where the destination row
+    must be a fully-formed Local Package (locations/authors are
+    required by the publish-readiness gate). Push/pull deliberately
+    skip this since they originate from Global (no client-scoped
+    metadata to copy)."""
+    for loc in (await db.execute(
+        select(PackageLocation).where(PackageLocation.package_id == src_id)
+    )).scalars().all():
+        db.add(PackageLocation(
+            package_id=dst_id,
+            state_cosh_id=loc.state_cosh_id,
+            district_cosh_id=loc.district_cosh_id,
+        ))
+    for a in (await db.execute(
+        select(PackageAuthor).where(PackageAuthor.package_id == src_id)
+    )).scalars().all():
+        db.add(PackageAuthor(
+            package_id=dst_id, user_id=a.user_id,
+            designation=a.designation,
+            professional_profile=a.professional_profile,
+            display_order=a.display_order,
+        ))
+    for pv in (await db.execute(
+        select(PackageVariable).where(PackageVariable.package_id == src_id)
+    )).scalars().all():
+        db.add(PackageVariable(
+            package_id=dst_id, parameter_id=pv.parameter_id,
+            variable_id=pv.variable_id,
+        ))
+    await db.flush()
+
+
+async def _next_lineage_version(
+    db: AsyncSession, *, client_id: str, crop_cosh_id: str, name: str,
+) -> int:
+    """Return max(version) + 1 across rows in the lineage that
+    have been published at least once (`published_at IS NOT NULL`).
+
+    Filtering on `published_at` rather than status lets fresh
+    DRAFTs / never-published rows out of the calculation regardless
+    of their `version` default. Old tests that seed
+    `status=ACTIVE, published_at=NULL` rows (a quirk of the
+    factory) continue to land at v=1 on their first real publish.
+
+    Cases this gets right:
+      • Fresh DRAFT first publish — no published siblings → 0+1=1.
+      • In-place republish (legacy BL-13) — pkg.published_at set
+        on first publish; second publish sees pkg in lineage at
+        v=1 → v=2.
+      • INACTIVE republish — pkg.published_at set, v=3 → v=4.
+      • Multi-row v_n publish — lineage of n-1 published rows
+        (predecessor + history) → v=n.
+      • Rollback-publish — same lineage; new row not yet in DB.
+    """
+    max_v = (await db.execute(
+        select(func.max(Package.version)).where(
+            Package.client_id == client_id,
+            Package.crop_cosh_id == crop_cosh_id,
+            Package.name == name,
+            Package.published_at.is_not(None),
+        )
+    )).scalar() or 0
+    return int(max_v) + 1
+
+
+@router.post(
+    "/client/{client_id}/packages/{package_id}/clone-to-draft",
+    response_model=PackageOut, status_code=201,
+)
+async def clone_to_draft(
+    client_id: str,
+    package_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """**SE starts a new edit cycle**. Takes the current ACTIVE row
+    in a lineage and creates a new DRAFT with deep-copied content
+    + locations + authors + PVs. The DRAFT is the SE's working
+    surface for the next publish.
+
+    Source must be ACTIVE and Local. Historical INACTIVE rows are
+    handled by `rollback-publish` (creates a PUBLISHED row directly,
+    no DRAFT step) per the user's locked model.
+
+    Single-DRAFT invariant: any existing DRAFT in the same lineage
+    (client + crop + name) is auto-flipped to INACTIVE.
+    """
+    await _assert_client_user_can_edit(db, current_user.id, client_id)
+    src = await _get_package(db, package_id, client_id)
+    if src.status != PackageStatus.ACTIVE:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "clone_source_not_active",
+                "message": (
+                    "clone-to-draft requires the current ACTIVE row of "
+                    "the lineage as the source. To republish historical "
+                    "content, use rollback-publish."
+                ),
+                "current_status": (
+                    src.status.value if hasattr(src.status, "value")
+                    else src.status
+                ),
+            },
+        )
+
+    existing_draft = (await db.execute(
+        select(Package).where(
+            Package.client_id == client_id,
+            Package.crop_cosh_id == src.crop_cosh_id,
+            Package.name == src.name,
+            Package.status == PackageStatus.DRAFT,
+        )
+    )).scalar_one_or_none()
+    if existing_draft:
+        existing_draft.status = PackageStatus.INACTIVE
+
+    new_draft = Package(
+        client_id=client_id,
+        parent_global_id=src.parent_global_id,
+        crop_cosh_id=src.crop_cosh_id,
+        name=src.name,
+        package_type=src.package_type,
+        duration_days=src.duration_days,
+        start_date_label_cosh_id=src.start_date_label_cosh_id,
+        description=src.description,
+        created_by=current_user.id,
+        status=PackageStatus.DRAFT,
+        created_via=PackageCreatedVia.SE_EDIT_DRAFT,
+    )
+    db.add(new_draft)
+    await db.flush()
+    await _deep_copy_package_content(db, src.id, new_draft.id)
+    await _deep_copy_package_metadata(db, src.id, new_draft.id)
+    await db.commit()
+    await db.refresh(new_draft)
+    return new_draft
+
+
+@router.post(
+    "/client/{client_id}/packages/{package_id}/rollback-publish",
+    response_model=PackageOut, status_code=201,
+)
+async def rollback_publish(
+    client_id: str,
+    package_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """**SE republishes a historical row's content as a new ACTIVE
+    version**. Locked 2026-05-11:
+        > "If he goes back to his older versions and publishes one
+        >  of them, then a new version is created. The new draft
+        >  becomes inactive (just like the others)."
+
+    Demotes the current ACTIVE in the lineage to INACTIVE, discards
+    any in-flight DRAFT (flips to INACTIVE), and creates a new
+    ACTIVE row with `created_via=SE_ROLLBACK_PUBLISH` and
+    `source_version_id` pointing at the historical source.
+    Subscriptions migrate to the new row (BL-13 farmer-side spirit
+    preserved).
+
+    Source can be any Local row at this client (PUBLISHED ACTIVE or
+    INACTIVE history). Skips the publish-readiness gate since the
+    source content was already validated when it was first
+    published.
+    """
+    await _assert_client_user_can_edit(db, current_user.id, client_id)
+    src = await _get_package(db, package_id, client_id)
+    if src.client_id is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "rollback_source_must_be_local",
+                "message": "Cannot rollback-publish a Global Package.",
+            },
+        )
+
+    from app.modules.subscriptions.models import Subscription
+
+    prior_actives = (await db.execute(
+        select(Package).where(
+            Package.client_id == client_id,
+            Package.crop_cosh_id == src.crop_cosh_id,
+            Package.name == src.name,
+            Package.status == PackageStatus.ACTIVE,
+        )
+    )).scalars().all()
+    drafts = (await db.execute(
+        select(Package).where(
+            Package.client_id == client_id,
+            Package.crop_cosh_id == src.crop_cosh_id,
+            Package.name == src.name,
+            Package.status == PackageStatus.DRAFT,
+        )
+    )).scalars().all()
+    for prior in prior_actives:
+        prior.status = PackageStatus.INACTIVE
+    for d in drafts:
+        d.status = PackageStatus.INACTIVE
+
+    new_version = await _next_lineage_version(
+        db, client_id=client_id,
+        crop_cosh_id=src.crop_cosh_id, name=src.name,
+    )
+
+    new_active = Package(
+        client_id=client_id,
+        parent_global_id=src.parent_global_id,
+        crop_cosh_id=src.crop_cosh_id,
+        name=src.name,
+        package_type=src.package_type,
+        duration_days=src.duration_days,
+        start_date_label_cosh_id=src.start_date_label_cosh_id,
+        description=src.description,
+        created_by=current_user.id,
+        status=PackageStatus.ACTIVE,
+        version=new_version,
+        published_at=datetime.now(timezone.utc),
+        published_by=current_user.id,
+        created_via=PackageCreatedVia.SE_ROLLBACK_PUBLISH,
+        source_version_id=src.id,
+    )
+    db.add(new_active)
+    await db.flush()
+    await _deep_copy_package_content(db, src.id, new_active.id)
+    await _deep_copy_package_metadata(db, src.id, new_active.id)
+
+    for prior in prior_actives:
+        await db.execute(
+            update(Subscription)
+            .where(Subscription.package_id == prior.id)
+            .values(package_id=new_active.id)
+        )
+
+    await db.commit()
+    await db.refresh(new_active)
+    return new_active
 
 
 # ── Global PG Recommendations ──────────────────────────────────────────────────

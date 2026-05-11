@@ -116,10 +116,14 @@ async def assert_pv_consistency_for_package(
     if not this_districts:
         return
 
+    # Lineage exclusion: same (client, crop, name) = same logical
+    # PoP at different versions (multi-row versioning locked
+    # 2026-05-11). They are not §4.2 siblings.
     sibling_pkgs = (await db.execute(
         select(Package).where(
             Package.client_id == package.client_id,
             Package.crop_cosh_id == package.crop_cosh_id,
+            Package.name != package.name,
             Package.id != package.id,
             Package.status.in_([PackageStatus.DRAFT, PackageStatus.ACTIVE]),
         )
