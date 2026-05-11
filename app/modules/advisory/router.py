@@ -1850,19 +1850,236 @@ async def _get_timeline(db: AsyncSession, timeline_id: str, package_id: str) -> 
 @router.get("/advisory/global/packages", response_model=list[PackageOut])
 async def list_global_packages(
     include_drafts: bool = False,
+    crop_cosh_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Global packages visible for fork into client scope. Defaults to
     ACTIVE only — DRAFT and INACTIVE rows are hidden from CA-portal
     SEs. CMs can pass `include_drafts=true` to see everything in their
-    own admin views."""
+    own admin views.
+
+    `crop_cosh_id` filter feeds the SA-portal four-screen hub
+    drill-down from Crops → Packages.
+    """
     q = select(Package).where(Package.client_id == None)  # noqa: E711
     if not include_drafts:
         q = q.where(Package.status == PackageStatus.ACTIVE)
+    if crop_cosh_id:
+        q = q.where(Package.crop_cosh_id == crop_cosh_id)
     q = q.order_by(Package.created_at.desc())
     result = await db.execute(q)
     return result.scalars().all()
+
+
+# ── SA-portal four-screen hub (Cosh-crop universe + Global cross-cuts) ─────
+
+@router.get("/advisory/global/cca/crops")
+async def global_cca_list_crops(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SA-portal Crops screen — the full Cosh crop universe with
+    per-crop Global Package status counts. Mirrors the CA-portal's
+    `/client/{cid}/cca/crops` but scoped to Global (client_id IS NULL)
+    and sourced from every Cosh-classified crop, not a per-client
+    belt subset.
+
+    Per the locked 2026-05-11 model, CMs have access to every Cosh
+    crop for CCA authoring — even crops with zero Global Packages
+    show up so the CM can start one. Crops with no packages get an
+    empty `package_counts` dict.
+    """
+    from app.services.cosh_crop_view import list_crops as _list_cosh_crops
+
+    cosh_crops = await _list_cosh_crops(db)
+
+    counts_q = (await db.execute(
+        select(Package.crop_cosh_id, Package.status, func.count())
+        .where(Package.client_id == None)  # noqa: E711
+        .group_by(Package.crop_cosh_id, Package.status)
+    )).all()
+    counts: dict[str, dict[str, int]] = {}
+    for crop_cosh_id, status, n in counts_q:
+        counts.setdefault(crop_cosh_id, {})[
+            status.value if hasattr(status, "value") else str(status)
+        ] = n
+
+    last_q = (await db.execute(
+        select(Package.crop_cosh_id, func.max(Package.updated_at))
+        .where(Package.client_id == None)  # noqa: E711
+        .group_by(Package.crop_cosh_id)
+    )).all()
+    last_edited = {crop_cosh_id: ts for crop_cosh_id, ts in last_q}
+
+    return [
+        {
+            "crop_cosh_id": c.get("cosh_id"),
+            "name_en": c.get("name_en") or c.get("cosh_id"),
+            "package_counts": counts.get(c.get("cosh_id"), {}),
+            "last_edited": last_edited.get(c.get("cosh_id")),
+        }
+        for c in cosh_crops
+    ]
+
+
+@router.get("/advisory/global/cca/timelines")
+async def global_cca_list_timelines(
+    crop_cosh_id: Optional[str] = None,
+    package_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cross-Global-Package timeline list for the SA-portal Timelines
+    screen. Mirror of CA's `/client/{cid}/cca/timelines` but scoped
+    to `Package.client_id IS NULL`.
+    """
+    q = (
+        select(Timeline, Package)
+        .join(Package, Timeline.package_id == Package.id)
+        .where(Package.client_id == None)  # noqa: E711
+    )
+    if crop_cosh_id:
+        q = q.where(Package.crop_cosh_id == crop_cosh_id)
+    if package_id:
+        q = q.where(Timeline.package_id == package_id)
+    q = q.order_by(Package.name, Timeline.display_order, Timeline.from_value)
+
+    rows = (await db.execute(q)).all()
+    if not rows:
+        return []
+
+    tl_ids = [tl.id for tl, _ in rows]
+    practice_counts = dict((await db.execute(
+        select(Practice.timeline_id, func.count())
+        .where(Practice.timeline_id.in_(tl_ids))
+        .group_by(Practice.timeline_id)
+    )).all())
+
+    crop_ids = {p.crop_cosh_id for _, p in rows}
+    crop_names = await _crop_names_by_cosh_id(db, crop_ids)
+
+    return [
+        {
+            "id": tl.id,
+            "name": tl.name,
+            "from_type": tl.from_type.value if hasattr(tl.from_type, "value") else str(tl.from_type),
+            "from_value": tl.from_value,
+            "to_value": tl.to_value,
+            "display_order": tl.display_order,
+            "package_id": pkg.id,
+            "package_name": pkg.name,
+            "package_status": pkg.status.value,
+            "crop_cosh_id": pkg.crop_cosh_id,
+            "crop_name_en": crop_names.get(pkg.crop_cosh_id, pkg.crop_cosh_id),
+            "practice_count": practice_counts.get(tl.id, 0),
+        }
+        for tl, pkg in rows
+    ]
+
+
+@router.get("/advisory/global/cca/practices")
+async def global_cca_list_practices(
+    crop_cosh_id: Optional[str] = None,
+    package_id: Optional[str] = None,
+    timeline_id: Optional[str] = None,
+    l0: Optional[str] = None,
+    l1: Optional[str] = None,
+    l2: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cross-Global-Timeline practice list for the SA-portal Practices
+    screen. Mirror of CA's `/client/{cid}/cca/practices` but scoped
+    to `Package.client_id IS NULL`. Filter chips on every level
+    plus L0/L1/L2. Paginated (default 100).
+    """
+    if limit < 1 or limit > 500:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_limit", "message": "limit must be 1..500"},
+        )
+    if offset < 0:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_offset", "message": "offset must be >= 0"},
+        )
+
+    q = (
+        select(Practice, Timeline, Package)
+        .join(Timeline, Practice.timeline_id == Timeline.id)
+        .join(Package, Timeline.package_id == Package.id)
+        .where(Package.client_id == None)  # noqa: E711
+    )
+    if crop_cosh_id:
+        q = q.where(Package.crop_cosh_id == crop_cosh_id)
+    if package_id:
+        q = q.where(Timeline.package_id == package_id)
+    if timeline_id:
+        q = q.where(Practice.timeline_id == timeline_id)
+    if l0:
+        q = q.where(Practice.l0_type == l0)
+    if l1:
+        q = q.where(Practice.l1_type == l1)
+    if l2:
+        q = q.where(Practice.l2_type == l2)
+
+    total = (await db.execute(
+        select(func.count()).select_from(q.subquery())
+    )).scalar() or 0
+
+    q = q.order_by(Package.name, Timeline.display_order, Practice.display_order)
+    q = q.offset(offset).limit(limit)
+
+    rows = (await db.execute(q)).all()
+    if not rows:
+        return {"items": [], "total": total, "limit": limit, "offset": offset}
+
+    practice_ids = [pr.id for pr, _, _ in rows]
+    elements_by_practice: dict[str, list[Element]] = {}
+    if practice_ids:
+        elem_rows = (await db.execute(
+            select(Element)
+            .where(Element.practice_id.in_(practice_ids))
+            .order_by(Element.display_order)
+        )).scalars().all()
+        for e in elem_rows:
+            elements_by_practice.setdefault(e.practice_id, []).append(e)
+
+    crop_ids = {p.crop_cosh_id for _, _, p in rows}
+    crop_names = await _crop_names_by_cosh_id(db, crop_ids)
+
+    items = []
+    for pr, tl, pkg in rows:
+        elems = elements_by_practice.get(pr.id, [])
+        items.append({
+            "id": pr.id,
+            "l0_type": pr.l0_type.value if hasattr(pr.l0_type, "value") else str(pr.l0_type),
+            "l1_type": pr.l1_type,
+            "l2_type": pr.l2_type,
+            "display_order": pr.display_order,
+            "is_special_input": pr.is_special_input,
+            "frequency_days": pr.frequency_days,
+            "timeline_id": tl.id,
+            "timeline_name": tl.name,
+            "package_id": pkg.id,
+            "package_name": pkg.name,
+            "package_status": pkg.status.value,
+            "crop_cosh_id": pkg.crop_cosh_id,
+            "crop_name_en": crop_names.get(pkg.crop_cosh_id, pkg.crop_cosh_id),
+            "element_summary": [
+                {
+                    "element_type": e.element_type,
+                    "value": e.value,
+                    "unit_cosh_id": e.unit_cosh_id,
+                    "cosh_ref": e.cosh_ref,
+                }
+                for e in elems
+            ],
+        })
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
 
 
 @router.post("/advisory/global/packages", response_model=PackageOut, status_code=201)
