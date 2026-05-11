@@ -2480,12 +2480,32 @@ async def create_global_timeline(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Mirrors `create_timeline` for the Global scope. Runs the same
+    type/direction/sign validation against the parent Package's
+    package_type, plus pre-checks name uniqueness so duplicates
+    surface as a friendly 422 instead of a 500 from the DB unique
+    constraint.
+    """
     pkg = (await db.execute(
         select(Package).where(Package.id == pkg_id, Package.client_id == None)  # noqa: E711
     )).scalar_one_or_none()
     if not pkg:
         raise HTTPException(status_code=404, detail="Global package not found")
-    _validate_timeline(request)
+
+    try:
+        validate_timeline(
+            package_type=pkg.package_type.value,
+            from_type=request.from_type.value,
+            from_value=request.from_value,
+            to_value=request.to_value,
+        )
+    except TimelineValidationError as e:
+        _raise_timeline_validation(e)
+
+    await _assert_timeline_name_unique(
+        db, package_id=pkg_id, name=request.name,
+    )
+
     tl = Timeline(package_id=pkg_id, **request.model_dump())
     db.add(tl)
     await db.commit()
