@@ -31,6 +31,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sqlalchemy import delete, select
 
 from app.database import AsyncSessionLocal
+# Import every dependent module so Base.metadata has all related
+# tables registered before SQLAlchemy resolves FKs like
+# `parameters.client_id → clients.id`.
+import app.modules.clients.models  # noqa: F401
+import app.modules.platform.models  # noqa: F401
 from app.modules.advisory.models import (
     PackageVariable, Parameter, ParameterSource, Variable,
 )
