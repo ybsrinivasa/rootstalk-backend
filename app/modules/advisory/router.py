@@ -2480,11 +2480,24 @@ async def get_practice_taxonomy_endpoint(
 @router.get("/practice-taxonomy/elements/{l2_type}")
 async def get_l2_element_spec(
     l2_type: str,
+    crop_cosh_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Return element spec for an L2. When `crop_cosh_id` is
+    supplied, the plant-wise extras (VOLUME_PER_PLANT + UNIT)
+    are appended only if the crop is classified PLANT_WISE in
+    Cosh. AREA_WISE / unclassified crops, or callers that omit
+    the param, never see those fields.
+    """
+    from app.services.cosh_crop_view import get_measure_for_biological_name
     from app.services.practice_taxonomy import list_l2_elements
-    elements = list_l2_elements(l2_type)
+
+    measure = None
+    if crop_cosh_id:
+        measure = await get_measure_for_biological_name(db, crop_cosh_id)
+
+    elements = list_l2_elements(l2_type, crop_measure=measure)
     if elements is None:
         raise HTTPException(
             status_code=404,
@@ -2493,7 +2506,11 @@ async def get_l2_element_spec(
                 "message": f"L2 type {l2_type!r} is not in the rule book.",
             },
         )
-    return {"l2_type": l2_type, "elements": elements}
+    return {
+        "l2_type": l2_type,
+        "crop_measure": measure,
+        "elements": elements,
+    }
 
 
 @router.get("/advisory/global/packages/{pkg_id}/timelines", response_model=list[TimelineOut])

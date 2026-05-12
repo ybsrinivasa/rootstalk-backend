@@ -202,7 +202,11 @@ def get_practice_taxonomy() -> list[dict]:
     return out
 
 
-def list_l2_elements(l2_type: str) -> list[dict] | None:
+def list_l2_elements(
+    l2_type: str,
+    *,
+    crop_measure: str | None = None,
+) -> list[dict] | None:
     """Return the element-spec for a given L2 (as per the rule
     book), shaped for the frontend:
 
@@ -218,14 +222,17 @@ def list_l2_elements(l2_type: str) -> list[dict] | None:
     frontend renders "no elements defined" in that case.
 
     Plant-wise extras (VOLUME_PER_PLANT + VOLUME_PER_PLANT_UNIT)
-    are appended automatically for L2s in
-    PLANT_WISE_EXTRAS_APPLY_TO.
+    are appended **only when `crop_measure == "PLANT_WISE"` AND
+    the L2 opts in via PLANT_WISE_EXTRAS_APPLY_TO**. User decision
+    2026-05-11: AREA_WISE crops (or unclassified / no measure
+    supplied) should never see the plant-wise dosage fields —
+    they don't apply.
     """
     spec = get_l2_spec(l2_type)
     if spec is None:
         return None
     fields = list(spec.fields)
-    if applies_plant_wise_extras(l2_type):
+    if crop_measure == "PLANT_WISE" and applies_plant_wise_extras(l2_type):
         from app.services.l2_element_rules import PLANT_WISE_EXTRA_FIELDS
         fields.extend(PLANT_WISE_EXTRA_FIELDS)
     return [

@@ -79,16 +79,39 @@ def test_list_l2_elements_returns_rule_book_fields():
     # CHEMICAL_PESTICIDES has the brand triplet up top.
     assert "COMMON_NAME" in names
     assert "BRAND" in names or "BRAND_NAME" in names or any("BRAND" in n for n in names)
-    # Plant-wise extras appended since this L2 is in
-    # PLANT_WISE_EXTRAS_APPLY_TO.
+
+
+def test_list_l2_elements_no_crop_measure_omits_plant_wise(l2="CHEMICAL_PESTICIDES"):
+    """User decision 2026-05-11: when no crop_measure is supplied,
+    plant-wise dosage extras don't apply (default conservative).
+    Previously the rule book always appended them for opt-in L2s."""
+    out = list_l2_elements(l2)
+    assert out is not None
+    assert "VOLUME_PER_PLANT" not in {e["name"] for e in out}
+
+
+def test_list_l2_elements_plant_wise_crop_appends_extras():
+    """PLANT_WISE crop + opt-in L2 → VOLUME_PER_PLANT + UNIT
+    appended."""
+    out = list_l2_elements("CHEMICAL_PESTICIDES", crop_measure="PLANT_WISE")
+    assert out is not None
+    names = {e["name"] for e in out}
     assert "VOLUME_PER_PLANT" in names
     assert "VOLUME_PER_PLANT_UNIT" in names
 
 
-def test_list_l2_elements_does_not_append_plant_wise_for_excluded(l2_excluded="INSECT_TRAPS"):
-    """INSECT_TRAPS isn't in PLANT_WISE_EXTRAS_APPLY_TO; its element
-    spec must NOT include VOLUME_PER_PLANT."""
-    out = list_l2_elements(l2_excluded)
+def test_list_l2_elements_area_wise_crop_omits_plant_wise_extras():
+    """AREA_WISE crop never sees plant-wise dosage fields, even on
+    an opt-in L2."""
+    out = list_l2_elements("CHEMICAL_PESTICIDES", crop_measure="AREA_WISE")
+    assert out is not None
+    assert "VOLUME_PER_PLANT" not in {e["name"] for e in out}
+
+
+def test_list_l2_elements_excluded_l2_never_gets_extras():
+    """INSECT_TRAPS isn't in PLANT_WISE_EXTRAS_APPLY_TO — extras
+    don't appear even when crop is PLANT_WISE."""
+    out = list_l2_elements("INSECT_TRAPS", crop_measure="PLANT_WISE")
     assert out is not None
     assert "VOLUME_PER_PLANT" not in {e["name"] for e in out}
 
@@ -122,6 +145,67 @@ async def test_l2_elements_endpoint_happy_path(db):
     )
     assert out["l2_type"] == "CHEMICAL_PESTICIDES"
     assert any(e["name"] == "COMMON_NAME" for e in out["elements"])
+    assert out["crop_measure"] is None
+    # No crop_cosh_id → plant-wise extras omitted (conservative
+    # default).
+    assert "VOLUME_PER_PLANT" not in {e["name"] for e in out["elements"]}
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_l2_elements_endpoint_plant_wise_crop_appends_extras(db):
+    """When crop_cosh_id resolves to PLANT_WISE in the Cosh
+    crop_area_plant_wise Connect, the plant-wise extras land on the
+    response."""
+    from tests.factories import make_crop_reference
+    user = await make_user(db, name="x")
+    await make_crop_reference(
+        db, "crop:apple_test", name="Apple", measure="PLANT_WISE",
+    )
+    await db.commit()
+    out = await get_l2_element_spec(
+        l2_type="CHEMICAL_PESTICIDES",
+        crop_cosh_id="crop:apple_test",
+        db=db, current_user=user,
+    )
+    assert out["crop_measure"] == "PLANT_WISE"
+    names = {e["name"] for e in out["elements"]}
+    assert "VOLUME_PER_PLANT" in names
+    assert "VOLUME_PER_PLANT_UNIT" in names
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_l2_elements_endpoint_area_wise_crop_omits_extras(db):
+    """AREA_WISE crop never sees the plant-wise fields."""
+    from tests.factories import make_crop_reference
+    user = await make_user(db, name="x")
+    await make_crop_reference(
+        db, "crop:tomato_test", name="Tomato", measure="AREA_WISE",
+    )
+    await db.commit()
+    out = await get_l2_element_spec(
+        l2_type="CHEMICAL_PESTICIDES",
+        crop_cosh_id="crop:tomato_test",
+        db=db, current_user=user,
+    )
+    assert out["crop_measure"] == "AREA_WISE"
+    assert "VOLUME_PER_PLANT" not in {e["name"] for e in out["elements"]}
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_l2_elements_endpoint_unclassified_crop_omits_extras(db):
+    """Crop not classified in Cosh yet → measure is None → no
+    plant-wise extras. Mirrors the 27/144 unclassified V1 crops."""
+    user = await make_user(db, name="x")
+    out = await get_l2_element_spec(
+        l2_type="CHEMICAL_PESTICIDES",
+        crop_cosh_id="crop:ghost",
+        db=db, current_user=user,
+    )
+    assert out["crop_measure"] is None
+    assert "VOLUME_PER_PLANT" not in {e["name"] for e in out["elements"]}
 
 
 @requires_docker
