@@ -51,3 +51,14 @@ COSH_UUID_TO_MEASURE = {
     COSH_AREA_WISE_UUID: "AREA_WISE",
     COSH_PLANT_WISE_UUID: "PLANT_WISE",
 }
+
+# ── Package Parameters + Variables (synced 2026-05-12) ────────────────────
+#
+# Cosh ships a three-endpoint Connect that ties each crop to a
+# (parameter, variable) pair. The PoP signature picker on the
+# SA / CA portals reads through this Connect to surface, per crop,
+# the set of parameters and their applicable variables.
+
+COSH_PACKAGE_PARAMETERS_CORE = "package_parameters"
+COSH_PACKAGE_VARIABLES_CORE = "package_variables"
+COSH_CROPS_PARAMS_VARS_CONNECT = "crops_parameters_variables"

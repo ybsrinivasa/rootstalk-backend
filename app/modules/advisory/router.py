@@ -2289,12 +2289,19 @@ async def list_global_parameters(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """List Global Parameters for a crop (client_id IS NULL)."""
+    """List Global Parameters for a crop. Mirrors Cosh-side
+    `package_parameters` for this crop into the local table on
+    first read (Cosh shipped `crops_parameters_variables` Connect
+    on 2026-05-12), then returns the combined Cosh + CUSTOM set
+    visible to all clients via `client_id IS NULL`.
+    """
+    from app.services.cosh_pv_view import ensure_local_parameters_for_crop
+    await ensure_local_parameters_for_crop(db, crop_cosh_id)
     result = await db.execute(
         select(Parameter).where(
             Parameter.crop_cosh_id == crop_cosh_id,
             Parameter.client_id == None,  # noqa: E711
-        ).order_by(Parameter.display_order)
+        ).order_by(Parameter.display_order, Parameter.name)
     )
     return result.scalars().all()
 

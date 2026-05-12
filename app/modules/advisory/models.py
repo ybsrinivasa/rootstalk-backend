@@ -173,6 +173,10 @@ class Parameter(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     crop_cosh_id: Mapped[str] = mapped_column(String(100), nullable=False)
     client_id: Mapped[str] = mapped_column(String(36), ForeignKey("clients.id"), nullable=True)
+    # Mirror of a Cosh `package_parameters` entity. NULL on CUSTOM
+    # rows authored locally by a CM/SE. Set on Cosh-mirrored rows
+    # so we can dedup mirrored entries on subsequent syncs.
+    cosh_id: Mapped[str] = mapped_column(String(36), nullable=True)
     name: Mapped[str] = mapped_column(String(500), nullable=False)
     source: Mapped[ParameterSource] = mapped_column(SAEnum(ParameterSource), default=ParameterSource.COSH)
     display_order: Mapped[int] = mapped_column(Integer, default=0)
@@ -181,6 +185,18 @@ class Parameter(Base):
 
     translations: Mapped[list["ParameterTranslation"]] = relationship("ParameterTranslation", back_populates="parameter")
     variables: Mapped[list["Variable"]] = relationship("Variable", back_populates="parameter")
+
+    __table_args__ = (
+        # Partial unique: a Cosh parameter UUID may appear at most
+        # once per crop in the local mirror. CUSTOM rows (cosh_id
+        # NULL) are not constrained.
+        Index(
+            "uq_parameters_crop_cosh_id",
+            "crop_cosh_id", "cosh_id",
+            unique=True,
+            postgresql_where="cosh_id IS NOT NULL",
+        ),
+    )
 
 
 class ParameterTranslation(Base):
@@ -205,6 +221,9 @@ class Variable(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     parameter_id: Mapped[str] = mapped_column(String(36), ForeignKey("parameters.id"), nullable=False)
+    # Mirror of a Cosh `package_variables` entity. NULL on CUSTOM
+    # rows.
+    cosh_id: Mapped[str] = mapped_column(String(36), nullable=True)
     name: Mapped[str] = mapped_column(String(500), nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -214,7 +233,15 @@ class Variable(Base):
     translations: Mapped[list["VariableTranslation"]] = relationship("VariableTranslation", back_populates="variable")
     package_variables: Mapped[list["PackageVariable"]] = relationship("PackageVariable", back_populates="variable")
 
-    __table_args__ = (UniqueConstraint("parameter_id", "name"),)
+    __table_args__ = (
+        UniqueConstraint("parameter_id", "name"),
+        Index(
+            "uq_variables_parameter_cosh_id",
+            "parameter_id", "cosh_id",
+            unique=True,
+            postgresql_where="cosh_id IS NOT NULL",
+        ),
+    )
 
 
 class VariableTranslation(Base):
