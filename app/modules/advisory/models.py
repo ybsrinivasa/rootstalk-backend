@@ -65,6 +65,14 @@ class TimelineFromType(str, enum.Enum):
     CALENDAR = "CALENDAR"
 
 
+class TimelineStatus(str, enum.Enum):
+    """Batch 28 (2026-05-14): SE-controlled active/inactive state.
+    INACTIVE timelines stay visible on the SA portal with a badge
+    but are excluded from farmer advisory and BL-03 deduplication."""
+    ACTIVE = "ACTIVE"
+    INACTIVE = "INACTIVE"
+
+
 class PracticeL0(str, enum.Enum):
     INPUT = "INPUT"
     NON_INPUT = "NON_INPUT"
@@ -287,6 +295,12 @@ class Timeline(Base):
     from_value: Mapped[int] = mapped_column(Integer, nullable=False)
     to_value: Mapped[int] = mapped_column(Integer, nullable=False)
     display_order: Mapped[int] = mapped_column(Integer, default=0)
+    # Batch 28: SE marks INACTIVE to retire a timeline without losing
+    # its history. INACTIVE timelines stay visible on the SA portal
+    # with a badge but are excluded from farmer advisory.
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default="ACTIVE",
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     package: Mapped["Package"] = relationship("Package", back_populates="timelines")

@@ -18,7 +18,8 @@ from app.modules.advisory.models import (
 from app.modules.advisory.schemas import (
     PackageCreate, PackageUpdate, PackageOut,
     PackageLocationIn, PackageAuthorIn, PackageAuthorOut,
-    ParameterCreate, VariableCreate, PackageVariableSet,
+    ParameterCreate, ParameterUpdate, VariableCreate, VariableUpdate,
+    PackageVariableSet,
     TimelineCreate, TimelineUpdate, TimelineOut,
     PracticeCreate, PracticeOut,
     RelationCreate, ConditionalQuestionCreate, PracticeConditionalCreate,
@@ -938,6 +939,9 @@ async def create_parameter(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Atomic create — parameter + ≥ 2 variables in one transaction.
+    Schema's min_length=2 on variables returns 422 if violated.
+    Matches the SA portal contract from Batch 28."""
     from app.modules.advisory.models import ParameterSource
     param = Parameter(
         crop_cosh_id=request.crop_cosh_id,
@@ -947,6 +951,9 @@ async def create_parameter(
         display_order=request.display_order,
     )
     db.add(param)
+    await db.flush()
+    for v in request.variables:
+        db.add(Variable(parameter_id=param.id, name=v.name))
     await db.commit()
     await db.refresh(param)
     return param
@@ -1306,6 +1313,14 @@ async def update_timeline(
         )
     except TimelineValidationError as e:
         _raise_timeline_validation(e)
+
+    # Batch 28: validate status if provided. ACTIVE / INACTIVE only.
+    if "status" in update_data:
+        if update_data["status"] not in ("ACTIVE", "INACTIVE"):
+            raise HTTPException(status_code=422, detail={
+                "code": "invalid_status",
+                "message": "Timeline status must be ACTIVE or INACTIVE.",
+            })
 
     for field, value in update_data.items():
         setattr(tl, field, value)
@@ -2161,6 +2176,28 @@ async def update_global_package(
                 detail={"code": e.code, "message": e.message},
             )
 
+    # Batch 28: status toggle. SE can flip ACTIVE ↔ INACTIVE and may
+    # discard a DRAFT (DRAFT → INACTIVE), but cannot promote DRAFT →
+    # ACTIVE directly — that path goes through the publish endpoint
+    # which runs lineage migration. INACTIVE → ACTIVE is allowed so
+    # the SE can resurrect a retired package.
+    if "status" in update_data:
+        new_status_str = update_data.pop("status")
+        try:
+            new_status = PackageStatus(new_status_str)
+        except ValueError:
+            raise HTTPException(status_code=422, detail={
+                "code": "invalid_status",
+                "message": f"status must be one of {[s.value for s in PackageStatus]}",
+            })
+        if new_status != pkg.status:
+            if pkg.status == PackageStatus.DRAFT and new_status == PackageStatus.ACTIVE:
+                raise HTTPException(status_code=422, detail={
+                    "code": "publish_required",
+                    "message": "DRAFT → ACTIVE must go through the publish endpoint, not the status toggle.",
+                })
+            pkg.status = new_status
+
     for field, value in update_data.items():
         setattr(pkg, field, value)
     await db.commit()
@@ -2312,9 +2349,13 @@ async def create_global_parameter(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Create a CUSTOM Global Parameter. Visible to every Local
-    Package via FK from PackageVariable; the SA-portal authors them,
-    Local Packages reference them after push."""
+    """Create a CUSTOM Global Parameter together with its initial
+    variables. Atomic per Batch 28 (user 2026-05-14): a Parameter
+    must have ≥ 2 variables at creation; the schema's `min_length=2`
+    enforces this, returning 422 with field details when violated.
+
+    Visible to every Local Package via FK from PackageVariable; the
+    SA-portal authors them, Local Packages reference them after push."""
     param = Parameter(
         crop_cosh_id=request.crop_cosh_id,
         client_id=None,
@@ -2323,9 +2364,181 @@ async def create_global_parameter(
         display_order=request.display_order,
     )
     db.add(param)
+    await db.flush()  # need param.id for the variable rows
+    for v in request.variables:
+        db.add(Variable(parameter_id=param.id, name=v.name))
     await db.commit()
     await db.refresh(param)
     return param
+
+
+@router.put("/advisory/global/parameters/{parameter_id}")
+async def update_global_parameter(
+    parameter_id: str,
+    request: ParameterUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Rename or re-order a CUSTOM Global Parameter (Batch 28).
+    Refuses on Cosh-mirrored parameters — those track upstream Cosh
+    translations and shouldn't be edited locally."""
+    param = (await db.execute(
+        select(Parameter).where(
+            Parameter.id == parameter_id, Parameter.client_id == None,  # noqa: E711
+        )
+    )).scalar_one_or_none()
+    if param is None:
+        raise HTTPException(status_code=404, detail="Global parameter not found")
+    if param.source != ParameterSource.CUSTOM:
+        raise HTTPException(status_code=422, detail={
+            "code": "cosh_mirrored_parameter_readonly",
+            "message": "Cosh-mirrored parameters can't be edited; Cosh is the source of truth.",
+        })
+    update_data = request.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(param, field, value)
+    await db.commit()
+    await db.refresh(param)
+    return param
+
+
+@router.delete("/advisory/global/parameters/{parameter_id}", status_code=204)
+async def delete_global_parameter(
+    parameter_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete a CUSTOM Global Parameter and its variables. Refuses if
+    any PackageVariable still references it — SE must clear the
+    Package signature first. Refuses on Cosh-mirrored parameters."""
+    from app.modules.advisory.models import PackageVariable
+    param = (await db.execute(
+        select(Parameter).where(
+            Parameter.id == parameter_id, Parameter.client_id == None,  # noqa: E711
+        )
+    )).scalar_one_or_none()
+    if param is None:
+        raise HTTPException(status_code=404, detail="Global parameter not found")
+    if param.source != ParameterSource.CUSTOM:
+        raise HTTPException(status_code=422, detail={
+            "code": "cosh_mirrored_parameter_readonly",
+            "message": "Cosh-mirrored parameters can't be deleted; Cosh is the source of truth.",
+        })
+    in_use = (await db.execute(
+        select(PackageVariable).where(
+            PackageVariable.parameter_id == parameter_id,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if in_use is not None:
+        raise HTTPException(status_code=422, detail={
+            "code": "parameter_in_use",
+            "message": "Parameter is in use by one or more Package signatures. Clear those signatures first.",
+        })
+    # Cascade delete variables (no PackageVariable refs since we checked).
+    await db.execute(
+        Variable.__table__.delete().where(Variable.parameter_id == parameter_id)
+    )
+    await db.delete(param)
+    await db.commit()
+
+
+@router.put("/advisory/global/parameters/{parameter_id}/variables/{variable_id}")
+async def update_global_variable(
+    parameter_id: str, variable_id: str,
+    request: VariableUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Rename a Variable under a CUSTOM Global Parameter (Batch 28).
+    Refuses on Cosh-mirrored parameters."""
+    param = (await db.execute(
+        select(Parameter).where(
+            Parameter.id == parameter_id, Parameter.client_id == None,  # noqa: E711
+        )
+    )).scalar_one_or_none()
+    if param is None:
+        raise HTTPException(status_code=404, detail="Global parameter not found")
+    if param.source != ParameterSource.CUSTOM:
+        raise HTTPException(status_code=422, detail={
+            "code": "cosh_mirrored_parameter_readonly",
+            "message": "Cosh-mirrored parameters can't be edited; Cosh is the source of truth.",
+        })
+    var = (await db.execute(
+        select(Variable).where(
+            Variable.id == variable_id,
+            Variable.parameter_id == parameter_id,
+        )
+    )).scalar_one_or_none()
+    if var is None:
+        raise HTTPException(status_code=404, detail="Variable not found")
+    update_data = request.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(var, field, value)
+    await db.commit()
+    await db.refresh(var)
+    return var
+
+
+@router.delete(
+    "/advisory/global/parameters/{parameter_id}/variables/{variable_id}",
+    status_code=204,
+)
+async def delete_global_variable(
+    parameter_id: str, variable_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete a Variable from a CUSTOM Global Parameter. Refuses when
+    it would leave the parameter with fewer than 2 variables (Batch
+    28 invariant: a CUSTOM Parameter is never useful with < 2 vars).
+    Refuses on Cosh-mirrored parameters. Refuses if the variable is
+    in use by any PackageVariable."""
+    from app.modules.advisory.models import PackageVariable
+    param = (await db.execute(
+        select(Parameter).where(
+            Parameter.id == parameter_id, Parameter.client_id == None,  # noqa: E711
+        )
+    )).scalar_one_or_none()
+    if param is None:
+        raise HTTPException(status_code=404, detail="Global parameter not found")
+    if param.source != ParameterSource.CUSTOM:
+        raise HTTPException(status_code=422, detail={
+            "code": "cosh_mirrored_parameter_readonly",
+            "message": "Cosh-mirrored parameters can't be edited; Cosh is the source of truth.",
+        })
+    var = (await db.execute(
+        select(Variable).where(
+            Variable.id == variable_id,
+            Variable.parameter_id == parameter_id,
+        )
+    )).scalar_one_or_none()
+    if var is None:
+        raise HTTPException(status_code=404, detail="Variable not found")
+
+    sibling_count = (await db.execute(
+        select(func.count()).select_from(Variable).where(
+            Variable.parameter_id == parameter_id,
+        )
+    )).scalar()
+    if sibling_count <= 2:
+        raise HTTPException(status_code=422, detail={
+            "code": "min_two_variables",
+            "message": "A CUSTOM Parameter must have at least 2 variables.",
+        })
+
+    in_use = (await db.execute(
+        select(PackageVariable).where(
+            PackageVariable.variable_id == variable_id,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if in_use is not None:
+        raise HTTPException(status_code=422, detail={
+            "code": "variable_in_use",
+            "message": "Variable is in use by one or more Package signatures. Clear those signatures first.",
+        })
+
+    await db.delete(var)
+    await db.commit()
 
 
 @router.get("/advisory/global/parameters/{parameter_id}/variables")
@@ -2683,6 +2896,62 @@ async def create_global_timeline(
 
     tl = Timeline(package_id=pkg_id, **request.model_dump())
     db.add(tl)
+    await db.commit()
+    await db.refresh(tl)
+    return tl
+
+
+@router.put(
+    "/advisory/global/packages/{pkg_id}/timelines/{tl_id}",
+    response_model=TimelineOut,
+)
+async def update_global_timeline(
+    pkg_id: str, tl_id: str,
+    request: TimelineUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Edit a Global Timeline (Batch 28). Accepts name, from_value,
+    to_value, status. `from_type` is intentionally not editable —
+    type ↔ package consistency is fixed at create time. Mirrors the
+    client-scoped handler at /client/{client_id}/packages/.../timelines/{tl_id}
+    including name-uniqueness and direction validation."""
+    pkg = (await db.execute(
+        select(Package).where(
+            Package.id == pkg_id, Package.client_id == None,  # noqa: E711
+        )
+    )).scalar_one_or_none()
+    if pkg is None:
+        raise HTTPException(status_code=404, detail="Global package not found")
+    tl = await _get_timeline(db, tl_id, pkg_id)
+
+    update_data = request.model_dump(exclude_unset=True)
+    if "name" in update_data and update_data["name"] != tl.name:
+        await _assert_timeline_name_unique(
+            db, package_id=pkg_id, name=update_data["name"],
+            exclude_timeline_id=tl_id,
+        )
+
+    new_from = update_data.get("from_value", tl.from_value)
+    new_to = update_data.get("to_value", tl.to_value)
+    try:
+        validate_timeline(
+            package_type=pkg.package_type.value,
+            from_type=tl.from_type.value,
+            from_value=new_from, to_value=new_to,
+        )
+    except TimelineValidationError as e:
+        _raise_timeline_validation(e)
+
+    if "status" in update_data:
+        if update_data["status"] not in ("ACTIVE", "INACTIVE"):
+            raise HTTPException(status_code=422, detail={
+                "code": "invalid_status",
+                "message": "Timeline status must be ACTIVE or INACTIVE.",
+            })
+
+    for field, value in update_data.items():
+        setattr(tl, field, value)
     await db.commit()
     await db.refresh(tl)
     return tl

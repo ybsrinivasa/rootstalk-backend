@@ -35,8 +35,17 @@ from app.modules.advisory.router import (
     set_global_package_variables,
 )
 from app.modules.advisory.schemas import (
-    ParameterCreate, PackageVariableSet, VariableCreate,
+    ParameterCreate, PackageVariableSet, VariableCreate, VariableNameIn,
 )
+
+
+# Batch 28: ParameterCreate now requires ≥ 2 inline variables. These
+# two placeholders make the test seeds atomic without changing the
+# test's actual subject (most tests check the Parameter itself or
+# the join behaviour, not the seed variables). Names are deliberately
+# distinct from the per-test variables added via VariableCreate to
+# avoid the (parameter_id, name) unique-constraint collisions.
+_SEED_VARS = [VariableNameIn(name="__seed_a__"), VariableNameIn(name="__seed_b__")]
 from app.modules.clients.models import ClientCrop, ClientUserRole
 from app.modules.platform.models import StatusEnum
 from tests.conftest import requires_docker
@@ -69,6 +78,7 @@ async def test_create_global_parameter_lands_with_null_client(db):
     out = await create_global_parameter(
         request=ParameterCreate(
             crop_cosh_id="crop:tomato", name="Irrigation", display_order=0,
+            variables=_SEED_VARS,
         ),
         db=db, current_user=user,
     )
@@ -76,6 +86,14 @@ async def test_create_global_parameter_lands_with_null_client(db):
     assert out.crop_cosh_id == "crop:tomato"
     assert out.name == "Irrigation"
     assert out.source == ParameterSource.CUSTOM
+    # Batch 28 atomic create: the 2 seed variables are persisted in
+    # the same transaction.
+    from sqlalchemy import select
+    from app.modules.advisory.models import Variable
+    vars_ = (await db.execute(
+        select(Variable).where(Variable.parameter_id == out.id)
+    )).scalars().all()
+    assert sorted(v.name for v in vars_) == ["__seed_a__", "__seed_b__"]
 
 
 @requires_docker
@@ -107,7 +125,7 @@ async def test_list_global_parameters_excludes_client_scoped(db):
 async def test_create_global_variable_under_global_parameter(db):
     user = await make_user(db, name="CM")
     param = await create_global_parameter(
-        request=ParameterCreate(crop_cosh_id="crop:tomato", name="Irrigation"),
+        request=ParameterCreate(crop_cosh_id="crop:tomato", name="Irrigation", variables=_SEED_VARS),
         db=db, current_user=user,
     )
     drip = await create_global_variable(
@@ -122,7 +140,9 @@ async def test_create_global_variable_under_global_parameter(db):
         parameter_id=param.id, db=db, current_user=user,
     )
     names = {v.name for v in out}
-    assert names == {"Drip", "Flood"}
+    # Batch 28: param ships with 2 seed variables; this test then
+    # adds Drip + Flood via the per-variable endpoint. Total 4.
+    assert {"Drip", "Flood"} <= names
     assert drip.parameter_id == param.id
     assert flood.parameter_id == param.id
 
@@ -157,7 +177,7 @@ async def test_global_variable_refuses_client_scoped_parameter(db):
 async def test_set_and_list_global_package_variables(db):
     user = await make_user(db, name="CM")
     param = await create_global_parameter(
-        request=ParameterCreate(crop_cosh_id="crop:tomato", name="Irrigation"),
+        request=ParameterCreate(crop_cosh_id="crop:tomato", name="Irrigation", variables=_SEED_VARS),
         db=db, current_user=user,
     )
     drip = await create_global_variable(
@@ -189,7 +209,7 @@ async def test_set_global_package_variables_replaces_existing(db):
     assigned, not additive."""
     user = await make_user(db, name="CM")
     p = await create_global_parameter(
-        request=ParameterCreate(crop_cosh_id="crop:tomato", name="Irrigation"),
+        request=ParameterCreate(crop_cosh_id="crop:tomato", name="Irrigation", variables=_SEED_VARS),
         db=db, current_user=user,
     )
     v1 = await create_global_variable(
@@ -233,7 +253,7 @@ async def test_push_deep_copies_global_pv_signature_to_local(db):
     await make_cm_assignment(db, user=cm, client=client)
 
     param = await create_global_parameter(
-        request=ParameterCreate(crop_cosh_id="crop:tomato", name="Irrigation"),
+        request=ParameterCreate(crop_cosh_id="crop:tomato", name="Irrigation", variables=_SEED_VARS),
         db=db, current_user=cm,
     )
     drip = await create_global_variable(
@@ -274,7 +294,7 @@ async def test_pull_deep_copies_pv_signature_too(db):
     cu.status = StatusEnum.ACTIVE
 
     param = await create_global_parameter(
-        request=ParameterCreate(crop_cosh_id="crop:tomato", name="Irrigation"),
+        request=ParameterCreate(crop_cosh_id="crop:tomato", name="Irrigation", variables=_SEED_VARS),
         db=db, current_user=cm,
     )
     drip = await create_global_variable(
@@ -344,3 +364,201 @@ async def test_ca_list_parameters_includes_globals(db):
     assert "GlobalIrrigation" in names
     assert "ClientCustom" in names
     assert "OtherClient" not in names
+
+
+# ── Batch 28: atomic create min-2 + Custom CRUD ────────────────────────────
+
+@pytest.mark.asyncio
+async def test_parameter_create_rejects_fewer_than_2_variables():
+    """Schema enforces min_length=2 on variables. Pydantic raises
+    ValidationError at construction time — server returns 422."""
+    with pytest.raises(Exception):  # pydantic.ValidationError
+        ParameterCreate(
+            crop_cosh_id="crop:tomato", name="X",
+            variables=[VariableNameIn(name="solo")],
+        )
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_update_global_parameter_rename(db):
+    """PUT /advisory/global/parameters/{id} renames a CUSTOM
+    parameter."""
+    from app.modules.advisory.router import update_global_parameter
+    from app.modules.advisory.schemas import ParameterUpdate
+    user = await make_user(db, name="CM")
+    p = await create_global_parameter(
+        request=ParameterCreate(
+            crop_cosh_id="crop:tomato", name="Typo",
+            variables=_SEED_VARS,
+        ),
+        db=db, current_user=user,
+    )
+    out = await update_global_parameter(
+        parameter_id=p.id, request=ParameterUpdate(name="Corrected"),
+        db=db, current_user=user,
+    )
+    assert out.name == "Corrected"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_update_global_parameter_refuses_cosh_mirrored(db):
+    """COSH-mirrored parameters can't be edited (Cosh is the source
+    of truth). 422 with cosh_mirrored_parameter_readonly code."""
+    from app.modules.advisory.router import update_global_parameter
+    from app.modules.advisory.schemas import ParameterUpdate
+    user = await make_user(db, name="CM")
+    cosh_param = Parameter(
+        crop_cosh_id="crop:tomato", client_id=None,
+        name="Soil Type", source=ParameterSource.COSH,
+        cosh_id="cosh:soil_type",
+    )
+    db.add(cosh_param)
+    await db.commit()
+    with pytest.raises(HTTPException) as exc:
+        await update_global_parameter(
+            parameter_id=cosh_param.id,
+            request=ParameterUpdate(name="Edited"),
+            db=db, current_user=user,
+        )
+    assert exc.value.status_code == 422
+    assert exc.value.detail["code"] == "cosh_mirrored_parameter_readonly"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_delete_global_parameter_cascade(db):
+    """DELETE /advisory/global/parameters/{id} drops the parameter
+    and its variables when unused."""
+    from app.modules.advisory.router import delete_global_parameter
+    user = await make_user(db, name="CM")
+    p = await create_global_parameter(
+        request=ParameterCreate(
+            crop_cosh_id="crop:tomato", name="Toss",
+            variables=_SEED_VARS,
+        ),
+        db=db, current_user=user,
+    )
+    await delete_global_parameter(
+        parameter_id=p.id, db=db, current_user=user,
+    )
+    remaining = (await db.execute(
+        select(Parameter).where(Parameter.id == p.id)
+    )).scalar_one_or_none()
+    assert remaining is None
+    remaining_vars = (await db.execute(
+        select(Variable).where(Variable.parameter_id == p.id)
+    )).scalars().all()
+    assert remaining_vars == []
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_delete_global_parameter_in_use_blocked(db):
+    """DELETE refuses if any PackageVariable still references the
+    parameter — SE must clear the Package signature first."""
+    from app.modules.advisory.router import delete_global_parameter
+    user = await make_user(db, name="CM")
+    pkg = await _seed_global_pkg(db, crop="crop:tomato")
+    p = await create_global_parameter(
+        request=ParameterCreate(
+            crop_cosh_id="crop:tomato", name="InUse",
+            variables=_SEED_VARS,
+        ),
+        db=db, current_user=user,
+    )
+    v = (await db.execute(
+        select(Variable).where(Variable.parameter_id == p.id).limit(1)
+    )).scalar_one()
+    db.add(PackageVariable(
+        package_id=pkg.id, parameter_id=p.id, variable_id=v.id,
+    ))
+    await db.commit()
+    with pytest.raises(HTTPException) as exc:
+        await delete_global_parameter(
+            parameter_id=p.id, db=db, current_user=user,
+        )
+    assert exc.value.status_code == 422
+    assert exc.value.detail["code"] == "parameter_in_use"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_delete_global_variable_refuses_when_drops_below_2(db):
+    """Removing a variable that would leave the parameter with 1
+    variable is rejected with min_two_variables."""
+    from app.modules.advisory.router import delete_global_variable
+    user = await make_user(db, name="CM")
+    p = await create_global_parameter(
+        request=ParameterCreate(
+            crop_cosh_id="crop:tomato", name="Min2",
+            variables=_SEED_VARS,
+        ),
+        db=db, current_user=user,
+    )
+    vs = (await db.execute(
+        select(Variable).where(Variable.parameter_id == p.id)
+    )).scalars().all()
+    assert len(vs) == 2
+    with pytest.raises(HTTPException) as exc:
+        await delete_global_variable(
+            parameter_id=p.id, variable_id=vs[0].id,
+            db=db, current_user=user,
+        )
+    assert exc.value.status_code == 422
+    assert exc.value.detail["code"] == "min_two_variables"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_delete_global_variable_ok_when_3_remain(db):
+    """When the parameter has ≥ 3 variables, deleting one is allowed
+    (the post-delete count is still ≥ 2)."""
+    from app.modules.advisory.router import delete_global_variable
+    user = await make_user(db, name="CM")
+    p = await create_global_parameter(
+        request=ParameterCreate(
+            crop_cosh_id="crop:tomato", name="ThreeVars",
+            variables=_SEED_VARS,
+        ),
+        db=db, current_user=user,
+    )
+    extra = await create_global_variable(
+        parameter_id=p.id, request=VariableCreate(parameter_id=p.id, name="extra"),
+        db=db, current_user=user,
+    )
+    await delete_global_variable(
+        parameter_id=p.id, variable_id=extra.id,
+        db=db, current_user=user,
+    )
+    remaining = (await db.execute(
+        select(Variable).where(Variable.parameter_id == p.id)
+    )).scalars().all()
+    assert len(remaining) == 2
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_update_global_variable_rename(db):
+    """PUT /advisory/global/parameters/{id}/variables/{vid} renames a
+    variable under a CUSTOM parameter."""
+    from app.modules.advisory.router import update_global_variable
+    from app.modules.advisory.schemas import VariableUpdate
+    user = await make_user(db, name="CM")
+    p = await create_global_parameter(
+        request=ParameterCreate(
+            crop_cosh_id="crop:tomato", name="RenameVarParent",
+            variables=_SEED_VARS,
+        ),
+        db=db, current_user=user,
+    )
+    v = (await db.execute(
+        select(Variable).where(Variable.parameter_id == p.id).limit(1)
+    )).scalar_one()
+    out = await update_global_variable(
+        parameter_id=p.id, variable_id=v.id,
+        request=VariableUpdate(name="renamed"),
+        db=db, current_user=user,
+    )
+    assert out.name == "renamed"

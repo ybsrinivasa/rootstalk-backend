@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List
 from datetime import datetime
 from app.modules.advisory.models import PackageType, PackageStatus, TimelineFromType, PracticeL0, RelationType, ConditionalAnswer
@@ -23,6 +23,11 @@ class PackageUpdate(BaseModel):
     duration_days: Optional[int] = None
     start_date_label_cosh_id: Optional[str] = None
     description: Optional[str] = None
+    # Batch 28: SE-driven status toggle. ACTIVE ↔ INACTIVE freely;
+    # DRAFT → INACTIVE allowed (per user 2026-05-14: SE may want to
+    # discard a draft); DRAFT → ACTIVE blocked here — must go through
+    # the publish endpoint so lineage migration runs correctly.
+    status: Optional[str] = None
 
 
 class PackageLocationIn(BaseModel):
@@ -74,15 +79,39 @@ class PackageOut(BaseModel):
 
 # ── Parameters and Variables ───────────────────────────────────────────────────
 
+class VariableNameIn(BaseModel):
+    """Inline variable input for the atomic Parameter create endpoint
+    (Batch 28). The Parameter and its first ≥ 2 variables are
+    created in a single round-trip so a half-created Parameter (one
+    with zero or one variable) never exists in the DB."""
+    name: str
+
+
 class ParameterCreate(BaseModel):
     crop_cosh_id: str
     name: str
     display_order: int = 0
+    # Batch 28: a CUSTOM Parameter must ship with at least 2 variables
+    # at creation. Per user 2026-05-14 — a one-variable parameter is
+    # never semantically useful (PoP signature picker needs choices).
+    variables: list[VariableNameIn] = Field(..., min_length=2)
+
+
+class ParameterUpdate(BaseModel):
+    """Rename a CUSTOM Parameter (Batch 28). Only the display name is
+    editable; crop_cosh_id and source are immutable."""
+    name: Optional[str] = None
+    display_order: Optional[int] = None
 
 
 class VariableCreate(BaseModel):
     parameter_id: str
     name: str
+
+
+class VariableUpdate(BaseModel):
+    """Rename a Variable under a CUSTOM Parameter (Batch 28)."""
+    name: Optional[str] = None
 
 
 class PackageVariableSet(BaseModel):
@@ -104,6 +133,9 @@ class TimelineUpdate(BaseModel):
     name: Optional[str] = None
     from_value: Optional[int] = None
     to_value: Optional[int] = None
+    # Batch 28: SE toggles ACTIVE / INACTIVE. from_type stays immutable
+    # — type-vs-package consistency is fixed at create time.
+    status: Optional[str] = None
 
 
 class TimelineOut(BaseModel):
@@ -114,6 +146,7 @@ class TimelineOut(BaseModel):
     from_value: int
     to_value: int
     display_order: int
+    status: str = "ACTIVE"
     created_at: datetime
 
     class Config:
