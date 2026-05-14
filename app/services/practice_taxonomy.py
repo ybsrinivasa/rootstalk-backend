@@ -243,6 +243,7 @@ def list_l2_elements(
             "mandatory": f.mandatory,
             "mandatory_if_set": list(f.mandatory_if_set),
             "cascade_from": list(f.cascade_from),
+            "cascade_optional_inputs": list(f.cascade_optional_inputs),
             "auto_selected": f.auto_selected,
         }
         for f in fields

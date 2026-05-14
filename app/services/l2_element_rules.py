@@ -59,6 +59,14 @@ class FieldRule:
     mandatory_if_set: tuple[str, ...] = ()
     cascade_from: tuple[str, ...] = ()
     auto_selected: bool = False
+    # Optional cross-filter inputs the cascade can narrow on when set,
+    # but which don't gate UI enable-state the way cascade_from does.
+    # Example: BRAND_NAME's UI enables on COMMON_NAME alone (cascade_from),
+    # but if MANUFACTURER is also set, the cascade narrows further
+    # (cascade_optional_inputs). Validator merges both into the lookup
+    # inputs; frontend ignores `cascade_optional_inputs` for the
+    # disabled-until-parent-set check.
+    cascade_optional_inputs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -145,21 +153,31 @@ _INPUT_BRAND_TRIPLET: tuple[FieldRule, ...] = (
         "BRAND_NAME",
         source="cosh_cascade:brands_for_common_name_and_manufacturer",
         cascade_from=("COMMON_NAME",),
+        cascade_optional_inputs=("MANUFACTURER",),
     ),
 )
 
+# Per user 2026-05-14: FORMULATION and AI_CONCENTRATION are selectable
+# as soon as COMMON_NAME is picked (no longer gated on BRAND_NAME being
+# set first). The cascade is CN-driven: pick CN → see all formulations
+# / a.i. values that span the CN's trade names. Pick BRAND_NAME → list
+# narrows to that brand's specific formulation + a.i. Neither field is
+# auto-determined any more — SE picks freely.
+#
+# Variable name kept (it's module-internal); the AUTOCASCADE suffix is
+# historical from when the fields were auto_selected.
 _FORMULATION_AI_AUTOCASCADE: tuple[FieldRule, ...] = (
     FieldRule(
         "FORMULATION",
         source="cosh_cascade:formulation_for_brand",
-        cascade_from=("BRAND_NAME",),
-        auto_selected=True,
+        cascade_from=("COMMON_NAME",),
+        cascade_optional_inputs=("BRAND_NAME",),
     ),
     FieldRule(
         "AI_CONCENTRATION",
         source="cosh_cascade:ai_concentration_for_brand",
-        cascade_from=("BRAND_NAME",),
-        auto_selected=True,
+        cascade_from=("COMMON_NAME",),
+        cascade_optional_inputs=("BRAND_NAME",),
     ),
 )
 

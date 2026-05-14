@@ -289,7 +289,12 @@ async def _validate_value(
 
     if src.startswith("cosh_cascade:"):
         cascade_name = src.split(":", 1)[1]
-        inputs = {ref: _provided_value(by_name.get(ref)) for ref in fr.cascade_from}
+        # cascade_from is required parents; cascade_optional_inputs are
+        # cross-filter narrowing inputs that aren't gating but flow
+        # through when the SE has provided them. The dispatch decides
+        # per-cascade how to use each.
+        input_refs = list(fr.cascade_from) + list(fr.cascade_optional_inputs)
+        inputs = {ref: _provided_value(by_name.get(ref)) for ref in input_refs}
         options = await cache.cascade(cascade_name, inputs)
         valid_values = {o.value for o in options}
 

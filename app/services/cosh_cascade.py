@@ -117,56 +117,80 @@ async def brands_for_common_name_and_manufacturer(
 
 
 async def formulation_for_brand(
-    db: AsyncSession, brand_cosh_id: Optional[str],
+    db: AsyncSession,
+    brand_cosh_id: Optional[str],
+    common_name_cosh_id: Optional[str] = None,
 ) -> list[CascadeOption]:
-    """Auto-selected: the brand's own formulation_cosh_id from
-    metadata. Returns 0 or 1 option (auto-selected fields are
-    deterministic when the brand carries the linkage)."""
-    if not brand_cosh_id:
-        return []
-    brand = (await db.execute(
-        select(CoshCoreItem).where(
-            CoshCoreItem.cosh_id == brand_cosh_id,
-            CoshCoreItem.core_type == "brand",
-        )
-    )).scalar_one_or_none()
-    if not brand:
-        return []
-    fid = (brand.metadata_ or {}).get("formulation_cosh_id")
-    if not fid:
-        return []
-    fmt = (await db.execute(
-        select(CoshCoreItem).where(
-            CoshCoreItem.cosh_id == fid,
-            CoshCoreItem.core_type == "formulation",
-        )
-    )).scalar_one_or_none()
-    label = (fmt.translations or {}).get("en") if fmt and fmt.translations else None
-    return [CascadeOption(value=fid, label=label or fid)]
+    """Formulations under (brand | common_name) — Batch 27, 2026-05-14.
+
+    Routing:
+      - brand provided: legacy `brand` Core lookup (single auto-determined
+        formulation_cosh_id from the brand's metadata). Preserves the
+        existing test-fixture path that seeds synthetic `brand` Cores.
+      - brand=None, common_name provided: walks the real Cosh shape via
+        `cosh_options_view.list_formulations` — spans every trade name
+        sharing the common name. This is the path the production UX
+        exercises now that F is selectable on CN alone.
+      - both None: empty.
+    """
+    if brand_cosh_id:
+        brand = (await db.execute(
+            select(CoshCoreItem).where(
+                CoshCoreItem.cosh_id == brand_cosh_id,
+                CoshCoreItem.core_type == "brand",
+            )
+        )).scalar_one_or_none()
+        if not brand:
+            return []
+        fid = (brand.metadata_ or {}).get("formulation_cosh_id")
+        if not fid:
+            return []
+        fmt = (await db.execute(
+            select(CoshCoreItem).where(
+                CoshCoreItem.cosh_id == fid,
+                CoshCoreItem.core_type == "formulation",
+            )
+        )).scalar_one_or_none()
+        label = (fmt.translations or {}).get("en") if fmt and fmt.translations else None
+        return [CascadeOption(value=fid, label=label or fid)]
+    if common_name_cosh_id:
+        from app.services.cosh_options_view import list_formulations
+        items = await list_formulations(db, common_name_cosh_id=common_name_cosh_id)
+        return [CascadeOption(value=i["cosh_id"], label=i["name"]) for i in items]
+    return []
 
 
 async def ai_concentration_for_brand(
-    db: AsyncSession, brand_cosh_id: Optional[str],
+    db: AsyncSession,
+    brand_cosh_id: Optional[str],
+    common_name_cosh_id: Optional[str] = None,
 ) -> list[CascadeOption]:
-    """Auto-selected: the brand's a.i. concentration value from
-    metadata. Stored as a string (may be a label like "75% WP" or a
-    cosh_id pointing to a structured concentration entity)."""
-    if not brand_cosh_id:
-        return []
-    brand = (await db.execute(
-        select(CoshCoreItem).where(
-            CoshCoreItem.cosh_id == brand_cosh_id,
-            CoshCoreItem.core_type == "brand",
+    """a.i. concentration values — same routing as
+    `formulation_for_brand`. When brand provided, returns the brand's
+    single auto-determined a.i. (from metadata). When only common_name,
+    spans the CN's trade names via cosh_options_view."""
+    if brand_cosh_id:
+        brand = (await db.execute(
+            select(CoshCoreItem).where(
+                CoshCoreItem.cosh_id == brand_cosh_id,
+                CoshCoreItem.core_type == "brand",
+            )
+        )).scalar_one_or_none()
+        if not brand:
+            return []
+        ai = (brand.metadata_ or {}).get("ai_concentration") \
+            or (brand.metadata_ or {}).get("ai_concentration_cosh_id")
+        if not ai:
+            return []
+        ai = str(ai)
+        return [CascadeOption(value=ai, label=ai)]
+    if common_name_cosh_id:
+        from app.services.cosh_options_view import list_ai_concentrations
+        items = await list_ai_concentrations(
+            db, common_name_cosh_id=common_name_cosh_id,
         )
-    )).scalar_one_or_none()
-    if not brand:
-        return []
-    ai = (brand.metadata_ or {}).get("ai_concentration") \
-        or (brand.metadata_ or {}).get("ai_concentration_cosh_id")
-    if not ai:
-        return []
-    ai = str(ai)
-    return [CascadeOption(value=ai, label=ai)]
+        return [CascadeOption(value=i["cosh_id"], label=i["name"]) for i in items]
+    return []
 
 
 # ── Generic Core dropdowns (for `cosh_core:<slug>` sources) ────────────────
@@ -203,8 +227,11 @@ CASCADE_INPUTS: dict[str, tuple[str, ...]] = {
     # rule book; MANUFACTURER (when set) is consumed via inputs.get
     # at dispatch time.
     "brands_for_common_name_and_manufacturer": ("COMMON_NAME",),
-    "formulation_for_brand":                   ("BRAND_NAME",),
-    "ai_concentration_for_brand":              ("BRAND_NAME",),
+    # Batch 27: same pattern — F and a.i. cascade_from=("COMMON_NAME",)
+    # in the rule book; BRAND_NAME (when set) is an optional narrowing
+    # filter consumed at dispatch time.
+    "formulation_for_brand":                   ("COMMON_NAME",),
+    "ai_concentration_for_brand":              ("COMMON_NAME",),
 }
 
 
@@ -223,7 +250,13 @@ async def list_cascade_options(
             db, inputs.get("COMMON_NAME"), inputs.get("MANUFACTURER"),
         )
     if cascade_name == "formulation_for_brand":
-        return await formulation_for_brand(db, inputs.get("BRAND_NAME"))
+        return await formulation_for_brand(
+            db, inputs.get("BRAND_NAME"),
+            common_name_cosh_id=inputs.get("COMMON_NAME"),
+        )
     if cascade_name == "ai_concentration_for_brand":
-        return await ai_concentration_for_brand(db, inputs.get("BRAND_NAME"))
+        return await ai_concentration_for_brand(
+            db, inputs.get("BRAND_NAME"),
+            common_name_cosh_id=inputs.get("COMMON_NAME"),
+        )
     raise ValueError(f"Unknown cascade: {cascade_name}")

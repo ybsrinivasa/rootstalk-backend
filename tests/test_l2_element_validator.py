@@ -155,17 +155,23 @@ async def test_invalid_manufacturer_caught_via_cascade():
     assert violations[0].field_name == "MANUFACTURER"
 
 
-# ── Auto-selected fields ────────────────────────────────────────────────────
+# ── F + a.i. cascade (Batch 27 — no longer auto-selected) ───────────────────
+#
+# The pre-Batch-27 contract had FORMULATION and AI_CONCENTRATION
+# auto_selected with cascade_from=BRAND_NAME — meaning BRAND_NAME was
+# required before they activated, and once BRAND_NAME was set they
+# became mandatory and locked to the brand's single auto-determined
+# value. Per user 2026-05-14, the contract is now: F and AI are
+# CN-driven multi-option dropdowns; BRAND_NAME is just an optional
+# cross-filter. Neither is mandatory.
 
 @pytest.mark.asyncio
-async def test_auto_selected_must_match_cascade_output():
-    """FORMULATION value must equal the cascade's deterministic output."""
+async def test_formulation_picked_against_cn_scope_must_be_valid():
+    """SE picks F without BRAND_NAME. The cascade returns CN-scoped
+    options. Value not in that set → CASCADE_VIOLATION."""
     elements = [
         el("COMMON_NAME", cosh_ref="cn:imida"),
-        el("MANUFACTURER", cosh_ref="Bayer"),
-        el("BRAND_NAME", cosh_ref="brand:confidor"),
-        el("FORMULATION", cosh_ref="form:WRONG"),    # cascade says form:SC
-        el("AI_CONCENTRATION", cosh_ref="17.8% SL"),
+        el("FORMULATION", cosh_ref="form:WRONG"),    # not in CN's set
         el("APPLICATION_METHOD", cosh_ref="am:foliar_spray"),
         el("DOSAGE", value="0.5"),
         el("DOSAGE_UNIT", cosh_ref="du:ml_per_l"),
@@ -176,36 +182,30 @@ async def test_auto_selected_must_match_cascade_output():
         "dosage_unit":        [CascadeOption("du:ml_per_l", "ml/L")],
     }
     cascade = {
-        ("manufacturers_for_common_name", frozenset({("COMMON_NAME", "cn:imida")})):
-            [CascadeOption("Bayer", "Bayer")],
-        ("brands_for_common_name_and_manufacturer",
-         frozenset({("COMMON_NAME", "cn:imida")})):
-            [CascadeOption("brand:confidor", "Confidor")],
-        ("formulation_for_brand", frozenset({("BRAND_NAME", "brand:confidor")})):
-            [CascadeOption("form:SC", "SC")],
-        ("ai_concentration_for_brand", frozenset({("BRAND_NAME", "brand:confidor")})):
-            [CascadeOption("17.8% SL", "17.8% SL")],
+        # F cascade is CN-scoped now — BRAND_NAME absent from the key.
+        ("formulation_for_brand",
+         frozenset({("COMMON_NAME", "cn:imida"), ("BRAND_NAME", None)})):
+            [CascadeOption("form:SC", "SC"), CascadeOption("form:WP", "WP")],
     }
     with patches(core_returns=core, cascade_returns=cascade):
         r = await validate_l2_elements(
             db=None, l2_type="CHEMICAL_PESTICIDES", elements=elements,
         )
-    # Auto-selected check fires via CASCADE_VIOLATION first (value not in
-    # cascade output of one option). Either CASCADE_VIOLATION or
-    # AUTO_SELECTED_OVERRIDE is acceptable — both signal the same problem.
     flagged = [e for e in r.errors if e.field_name == "FORMULATION"]
     assert flagged, f"FORMULATION not flagged; errors={r.errors}"
-    assert flagged[0].code in ("CASCADE_VIOLATION", "AUTO_SELECTED_OVERRIDE")
+    assert flagged[0].code == "CASCADE_VIOLATION"
 
 
 @pytest.mark.asyncio
-async def test_auto_selected_missing_when_upstream_complete():
-    """BRAND_NAME set → FORMULATION must be present."""
+async def test_formulation_optional_when_brand_set():
+    """BRAND_NAME set, F omitted → no error. F is no longer
+    auto-required-when-upstream-complete (Batch 27)."""
     elements = [
         el("COMMON_NAME", cosh_ref="cn:imida"),
         el("MANUFACTURER", cosh_ref="Bayer"),
         el("BRAND_NAME", cosh_ref="brand:confidor"),
-        # FORMULATION / AI_CONCENTRATION omitted
+        # F + AI omitted on purpose — pre-Batch-27 this fired
+        # AUTO_SELECTED_MISSING; today it's allowed.
         el("APPLICATION_METHOD", cosh_ref="am:foliar_spray"),
         el("DOSAGE", value="0.5"),
         el("DOSAGE_UNIT", cosh_ref="du:ml_per_l"),
@@ -219,20 +219,38 @@ async def test_auto_selected_missing_when_upstream_complete():
         ("manufacturers_for_common_name", frozenset({("COMMON_NAME", "cn:imida")})):
             [CascadeOption("Bayer", "Bayer")],
         ("brands_for_common_name_and_manufacturer",
-         frozenset({("COMMON_NAME", "cn:imida")})):
+         frozenset({("COMMON_NAME", "cn:imida"), ("MANUFACTURER", "Bayer")})):
             [CascadeOption("brand:confidor", "Confidor")],
-        ("formulation_for_brand", frozenset({("BRAND_NAME", "brand:confidor")})):
-            [CascadeOption("form:SC", "SC")],
-        ("ai_concentration_for_brand", frozenset({("BRAND_NAME", "brand:confidor")})):
-            [CascadeOption("17.8% SL", "17.8% SL")],
     }
     with patches(core_returns=core, cascade_returns=cascade):
         r = await validate_l2_elements(
             db=None, l2_type="CHEMICAL_PESTICIDES", elements=elements,
         )
-    missing_auto = [e for e in r.errors if e.code == "AUTO_SELECTED_MISSING"]
-    flagged_fields = {e.field_name for e in missing_auto}
-    assert flagged_fields == {"FORMULATION", "AI_CONCENTRATION"}
+    assert not any(e.code in ("AUTO_SELECTED_MISSING", "AUTO_SELECTED_UNEXPECTED")
+                    for e in r.errors), r.errors
+
+
+@pytest.mark.asyncio
+async def test_formulation_optional_when_only_cn_set():
+    """CN set, F+AI+MFR+BRAND all omitted → no error. The user's
+    'CN + Formulation optional + dosage' use case (Batch 24) keeps
+    working — and F is genuinely optional, not implicitly required."""
+    elements = [
+        el("COMMON_NAME", cosh_ref="cn:imida"),
+        el("APPLICATION_METHOD", cosh_ref="am:foliar_spray"),
+        el("DOSAGE", value="0.5"),
+        el("DOSAGE_UNIT", cosh_ref="du:ml_per_l"),
+    ]
+    core = {
+        "common_name":        [CascadeOption("cn:imida", "Imidacloprid")],
+        "application_method": [CascadeOption("am:foliar_spray", "Foliar spray")],
+        "dosage_unit":        [CascadeOption("du:ml_per_l", "ml/L")],
+    }
+    with patches(core_returns=core):
+        r = await validate_l2_elements(
+            db=None, l2_type="CHEMICAL_PESTICIDES", elements=elements,
+        )
+    assert r.is_valid, r.errors
 
 
 # ── is_special_input invariant ──────────────────────────────────────────────
@@ -438,12 +456,18 @@ async def test_full_chemical_pesticide_happy_path():
     cascade = {
         ("manufacturers_for_common_name", frozenset({("COMMON_NAME", "cn:imida")})):
             [CascadeOption("Bayer", "Bayer")],
+        # Per Batch 24: BRAND cascade key includes the MANUFACTURER
+        # cross-filter when set.
         ("brands_for_common_name_and_manufacturer",
-         frozenset({("COMMON_NAME", "cn:imida")})):
+         frozenset({("COMMON_NAME", "cn:imida"), ("MANUFACTURER", "Bayer")})):
             [CascadeOption("brand:confidor", "Confidor")],
-        ("formulation_for_brand", frozenset({("BRAND_NAME", "brand:confidor")})):
+        # Per Batch 27: F + AI cascade keys are now CN-driven with
+        # BRAND_NAME as an optional cross-filter.
+        ("formulation_for_brand",
+         frozenset({("COMMON_NAME", "cn:imida"), ("BRAND_NAME", "brand:confidor")})):
             [CascadeOption("form:SC", "SC")],
-        ("ai_concentration_for_brand", frozenset({("BRAND_NAME", "brand:confidor")})):
+        ("ai_concentration_for_brand",
+         frozenset({("COMMON_NAME", "cn:imida"), ("BRAND_NAME", "brand:confidor")})):
             [CascadeOption("17.8% SL", "17.8% SL")],
     }
     with patches(core_returns=core, cascade_returns=cascade):
