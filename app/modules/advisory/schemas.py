@@ -114,6 +114,21 @@ class VariableUpdate(BaseModel):
     name: Optional[str] = None
 
 
+class VariableOut(BaseModel):
+    """Serialized Variable — Batch 35 (2026-05-14) introduces this to
+    surface `cosh_id` to the SA portal so it can gate per-variable
+    edit/delete (NULL = SE-added, editable; non-NULL = Cosh-mirrored,
+    read-only) independently of the parent Parameter's source."""
+    id: str
+    parameter_id: str
+    cosh_id: Optional[str] = None
+    name: str
+    status: str
+
+    class Config:
+        from_attributes = True
+
+
 class PackageVariableSet(BaseModel):
     """Set the parameter→variable fingerprint for a package."""
     assignments: List[dict]  # [{"parameter_id": ..., "variable_id": ...}]

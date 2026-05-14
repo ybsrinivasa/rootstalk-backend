@@ -18,7 +18,7 @@ from app.modules.advisory.models import (
 from app.modules.advisory.schemas import (
     PackageCreate, PackageUpdate, PackageOut,
     PackageLocationIn, PackageAuthorIn, PackageAuthorOut,
-    ParameterCreate, ParameterUpdate, VariableCreate, VariableUpdate,
+    ParameterCreate, ParameterUpdate, VariableCreate, VariableUpdate, VariableOut,
     PackageVariableSet,
     TimelineCreate, TimelineUpdate, TimelineOut,
     PracticeCreate, PracticeOut, PracticeWithElementsOut,
@@ -2597,15 +2597,19 @@ async def delete_global_parameter(
     await db.commit()
 
 
-@router.put("/advisory/global/parameters/{parameter_id}/variables/{variable_id}")
+@router.put("/advisory/global/parameters/{parameter_id}/variables/{variable_id}", response_model=VariableOut)
 async def update_global_variable(
     parameter_id: str, variable_id: str,
     request: VariableUpdate,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Rename a Variable under a CUSTOM Global Parameter (Batch 28).
-    Refuses on Cosh-mirrored parameters."""
+    """Rename a Variable under any Global Parameter. Batch 35
+    (2026-05-14): the gate moved from the parent Parameter's source
+    to THIS Variable's source. SE-added variables (Variable.cosh_id
+    NULL) are editable on either CUSTOM or COSH-mirrored parents —
+    only the Cosh-mirrored variables themselves (cosh_id non-NULL)
+    are read-only."""
     param = (await db.execute(
         select(Parameter).where(
             Parameter.id == parameter_id, Parameter.client_id == None,  # noqa: E711
@@ -2613,11 +2617,6 @@ async def update_global_variable(
     )).scalar_one_or_none()
     if param is None:
         raise HTTPException(status_code=404, detail="Global parameter not found")
-    if param.source != ParameterSource.CUSTOM:
-        raise HTTPException(status_code=422, detail={
-            "code": "cosh_mirrored_parameter_readonly",
-            "message": "Cosh-mirrored parameters can't be edited; Cosh is the source of truth.",
-        })
     var = (await db.execute(
         select(Variable).where(
             Variable.id == variable_id,
@@ -2626,6 +2625,11 @@ async def update_global_variable(
     )).scalar_one_or_none()
     if var is None:
         raise HTTPException(status_code=404, detail="Variable not found")
+    if var.cosh_id is not None:
+        raise HTTPException(status_code=422, detail={
+            "code": "cosh_mirrored_variable_readonly",
+            "message": "Cosh-mirrored variables can't be edited; Cosh is the source of truth.",
+        })
     update_data = request.model_dump(exclude_unset=True)
     for field, value in update_data.items():
         setattr(var, field, value)
@@ -2643,11 +2647,16 @@ async def delete_global_variable(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Delete a Variable from a CUSTOM Global Parameter. Refuses when
-    it would leave the parameter with fewer than 2 variables (Batch
-    28 invariant: a CUSTOM Parameter is never useful with < 2 vars).
-    Refuses on Cosh-mirrored parameters. Refuses if the variable is
-    in use by any PackageVariable."""
+    """Delete a Variable from a Global Parameter. Batch 35 gates on
+    `variable.cosh_id` (SE-added variables on Cosh-mirrored parents
+    are deletable; Cosh-mirrored variables themselves are not).
+
+    Min-2 invariant from Batch 28 applies only to CUSTOM parents
+    (a CUSTOM Parameter must keep ≥ 2 active variables). For
+    COSH-mirrored parents Cosh decides the floor, so SE deletes of
+    locally-added variables don't trip min-2.
+
+    Refuses if the variable is in use by any PackageVariable."""
     from app.modules.advisory.models import PackageVariable
     param = (await db.execute(
         select(Parameter).where(
@@ -2656,11 +2665,6 @@ async def delete_global_variable(
     )).scalar_one_or_none()
     if param is None:
         raise HTTPException(status_code=404, detail="Global parameter not found")
-    if param.source != ParameterSource.CUSTOM:
-        raise HTTPException(status_code=422, detail={
-            "code": "cosh_mirrored_parameter_readonly",
-            "message": "Cosh-mirrored parameters can't be edited; Cosh is the source of truth.",
-        })
     var = (await db.execute(
         select(Variable).where(
             Variable.id == variable_id,
@@ -2669,17 +2673,23 @@ async def delete_global_variable(
     )).scalar_one_or_none()
     if var is None:
         raise HTTPException(status_code=404, detail="Variable not found")
-
-    sibling_count = (await db.execute(
-        select(func.count()).select_from(Variable).where(
-            Variable.parameter_id == parameter_id,
-        )
-    )).scalar()
-    if sibling_count <= 2:
+    if var.cosh_id is not None:
         raise HTTPException(status_code=422, detail={
-            "code": "min_two_variables",
-            "message": "A CUSTOM Parameter must have at least 2 variables.",
+            "code": "cosh_mirrored_variable_readonly",
+            "message": "Cosh-mirrored variables can't be deleted; Cosh is the source of truth.",
         })
+
+    if param.source == ParameterSource.CUSTOM:
+        sibling_count = (await db.execute(
+            select(func.count()).select_from(Variable).where(
+                Variable.parameter_id == parameter_id,
+            )
+        )).scalar()
+        if sibling_count <= 2:
+            raise HTTPException(status_code=422, detail={
+                "code": "min_two_variables",
+                "message": "A CUSTOM Parameter must have at least 2 variables.",
+            })
 
     in_use = (await db.execute(
         select(PackageVariable).where(
@@ -2696,7 +2706,7 @@ async def delete_global_variable(
     await db.commit()
 
 
-@router.get("/advisory/global/parameters/{parameter_id}/variables")
+@router.get("/advisory/global/parameters/{parameter_id}/variables", response_model=list[VariableOut])
 async def list_global_variables(
     parameter_id: str,
     db: AsyncSession = Depends(get_db),
@@ -2719,7 +2729,7 @@ async def list_global_variables(
     return result.scalars().all()
 
 
-@router.post("/advisory/global/parameters/{parameter_id}/variables", status_code=201)
+@router.post("/advisory/global/parameters/{parameter_id}/variables", status_code=201, response_model=VariableOut)
 async def create_global_variable(
     parameter_id: str,
     request: VariableCreate,

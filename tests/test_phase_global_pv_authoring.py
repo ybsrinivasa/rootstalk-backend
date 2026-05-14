@@ -562,3 +562,140 @@ async def test_update_global_variable_rename(db):
         db=db, current_user=user,
     )
     assert out.name == "renamed"
+
+
+# ── Batch 35 (2026-05-14): per-variable edit/delete on COSH parents ─────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_update_se_added_variable_on_cosh_parent_allowed(db):
+    """A variable SE added to a Cosh-mirrored parent (Variable.cosh_id
+    NULL) is editable. The gate is on the variable's own cosh_id, not
+    the parent parameter's source."""
+    from app.modules.advisory.router import (
+        create_global_variable, update_global_variable,
+    )
+    from app.modules.advisory.schemas import VariableUpdate
+    user = await make_user(db, name="CM")
+    cosh_param = Parameter(
+        crop_cosh_id="crop:tomato", client_id=None,
+        name="Soil Type", source=ParameterSource.COSH,
+        cosh_id="cosh:soil_type",
+    )
+    db.add(cosh_param)
+    await db.commit()
+    extra = await create_global_variable(
+        parameter_id=cosh_param.id,
+        request=VariableCreate(parameter_id=cosh_param.id, name="se_added"),
+        db=db, current_user=user,
+    )
+    assert extra.cosh_id is None
+    out = await update_global_variable(
+        parameter_id=cosh_param.id, variable_id=extra.id,
+        request=VariableUpdate(name="se_renamed"),
+        db=db, current_user=user,
+    )
+    assert out.name == "se_renamed"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_update_cosh_mirrored_variable_refused(db):
+    """A variable whose cosh_id is non-NULL (Cosh-mirrored) is
+    read-only regardless of the parent parameter's source."""
+    from app.modules.advisory.router import update_global_variable
+    from app.modules.advisory.schemas import VariableUpdate
+    user = await make_user(db, name="CM")
+    cosh_param = Parameter(
+        crop_cosh_id="crop:tomato", client_id=None,
+        name="Soil Type", source=ParameterSource.COSH,
+        cosh_id="cosh:soil_type",
+    )
+    db.add(cosh_param)
+    await db.flush()
+    cosh_var = Variable(
+        parameter_id=cosh_param.id, name="Loamy",
+        cosh_id="cosh:soil_type:loamy",
+    )
+    db.add(cosh_var)
+    await db.commit()
+    with pytest.raises(HTTPException) as exc:
+        await update_global_variable(
+            parameter_id=cosh_param.id, variable_id=cosh_var.id,
+            request=VariableUpdate(name="renamed"),
+            db=db, current_user=user,
+        )
+    assert exc.value.status_code == 422
+    assert exc.value.detail["code"] == "cosh_mirrored_variable_readonly"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_delete_se_added_variable_on_cosh_parent_skips_min2(db):
+    """Deleting an SE-added variable on a Cosh-mirrored parent does
+    not trip the min-2 rule (Cosh decides the floor for COSH parents).
+    The deletion succeeds even when the post-delete sibling count
+    would be ≤ 2."""
+    from app.modules.advisory.router import (
+        create_global_variable, delete_global_variable,
+    )
+    user = await make_user(db, name="CM")
+    cosh_param = Parameter(
+        crop_cosh_id="crop:tomato", client_id=None,
+        name="Soil Type", source=ParameterSource.COSH,
+        cosh_id="cosh:soil_type",
+    )
+    db.add(cosh_param)
+    await db.flush()
+    # one Cosh-mirrored variable + one SE-added one (total 2)
+    cosh_var = Variable(
+        parameter_id=cosh_param.id, name="Loamy",
+        cosh_id="cosh:soil_type:loamy",
+    )
+    db.add(cosh_var)
+    await db.commit()
+    extra = await create_global_variable(
+        parameter_id=cosh_param.id,
+        request=VariableCreate(parameter_id=cosh_param.id, name="se_added"),
+        db=db, current_user=user,
+    )
+    # Post-delete sibling count would be 1 — for a CUSTOM parent this
+    # would 422; for COSH-mirrored it goes through.
+    await delete_global_variable(
+        parameter_id=cosh_param.id, variable_id=extra.id,
+        db=db, current_user=user,
+    )
+    remaining = (await db.execute(
+        select(Variable).where(Variable.parameter_id == cosh_param.id)
+    )).scalars().all()
+    assert len(remaining) == 1
+    assert remaining[0].id == cosh_var.id
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_delete_cosh_mirrored_variable_refused(db):
+    """The Cosh-mirrored variable itself can never be deleted via the
+    SA portal — Cosh is the source of truth."""
+    from app.modules.advisory.router import delete_global_variable
+    user = await make_user(db, name="CM")
+    cosh_param = Parameter(
+        crop_cosh_id="crop:tomato", client_id=None,
+        name="Soil Type", source=ParameterSource.COSH,
+        cosh_id="cosh:soil_type",
+    )
+    db.add(cosh_param)
+    await db.flush()
+    cosh_var = Variable(
+        parameter_id=cosh_param.id, name="Loamy",
+        cosh_id="cosh:soil_type:loamy",
+    )
+    db.add(cosh_var)
+    await db.commit()
+    with pytest.raises(HTTPException) as exc:
+        await delete_global_variable(
+            parameter_id=cosh_param.id, variable_id=cosh_var.id,
+            db=db, current_user=user,
+        )
+    assert exc.value.status_code == 422
+    assert exc.value.detail["code"] == "cosh_mirrored_variable_readonly"
