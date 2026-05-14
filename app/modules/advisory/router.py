@@ -2610,6 +2610,107 @@ async def cosh_ai_concentrations(
     )
 
 
+# ── Diagnosis lookups (Batch 21, 2026-05-14) ───────────────────────────────
+#
+# Cascading filter over the 9-endpoint `pest_diagnosis` Connect.
+# Each step narrows by the prior selections; BLANK BOX-aware
+# matching (see app/services/pest_diagnosis_view.py).
+
+@router.get("/diagnosis/crop-stages")
+async def diagnosis_crop_stages(
+    crop_cosh_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.pest_diagnosis_view import list_crop_stages
+    return await list_crop_stages(db, crop_cosh_id=crop_cosh_id)
+
+
+@router.get("/diagnosis/plant-parts")
+async def diagnosis_plant_parts(
+    crop_cosh_id: str,
+    crop_stage: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.pest_diagnosis_view import list_plant_parts
+    return await list_plant_parts(
+        db, crop_cosh_id=crop_cosh_id, crop_stage=crop_stage,
+    )
+
+
+@router.get("/diagnosis/plant-subparts")
+async def diagnosis_plant_subparts(
+    crop_cosh_id: str,
+    crop_stage: Optional[str] = None,
+    plant_part: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.pest_diagnosis_view import list_plant_subparts
+    return await list_plant_subparts(
+        db, crop_cosh_id=crop_cosh_id, crop_stage=crop_stage,
+        plant_part=plant_part,
+    )
+
+
+@router.get("/diagnosis/symptoms")
+async def diagnosis_symptoms(
+    crop_cosh_id: str,
+    crop_stage: Optional[str] = None,
+    plant_part: Optional[str] = None,
+    plant_subpart: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.pest_diagnosis_view import list_symptoms
+    return await list_symptoms(
+        db, crop_cosh_id=crop_cosh_id, crop_stage=crop_stage,
+        plant_part=plant_part, plant_subpart=plant_subpart,
+    )
+
+
+@router.get("/diagnosis/subsymptoms")
+async def diagnosis_subsymptoms(
+    crop_cosh_id: str,
+    crop_stage: Optional[str] = None,
+    plant_part: Optional[str] = None,
+    plant_subpart: Optional[str] = None,
+    symptom: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.pest_diagnosis_view import list_subsymptoms
+    return await list_subsymptoms(
+        db, crop_cosh_id=crop_cosh_id, crop_stage=crop_stage,
+        plant_part=plant_part, plant_subpart=plant_subpart,
+        symptom=symptom,
+    )
+
+
+@router.get("/diagnosis/candidates")
+async def diagnosis_candidates(
+    crop_cosh_id: str,
+    crop_stage: Optional[str] = None,
+    plant_part: Optional[str] = None,
+    plant_subpart: Optional[str] = None,
+    symptom: Optional[str] = None,
+    subsymptom: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Final diagnosis lookup — returns ranked candidate pests
+    (pest_cosh_id, pest_name, pest_stage, priority_rank). The
+    farmer-facing UI calls this once the cascade reaches subsymptom
+    (or earlier if the farmer wants a wider net)."""
+    from app.services.pest_diagnosis_view import list_candidates
+    return await list_candidates(
+        db, crop_cosh_id=crop_cosh_id, crop_stage=crop_stage,
+        plant_part=plant_part, plant_subpart=plant_subpart,
+        symptom=symptom, subsymptom=subsymptom,
+    )
+
+
 @router.get("/advisory/global/packages/{pkg_id}/timelines", response_model=list[TimelineOut])
 async def list_global_timelines(
     pkg_id: str,

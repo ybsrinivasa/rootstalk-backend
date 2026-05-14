@@ -96,6 +96,71 @@ COSH_TRADENAME_MANUFACTURER_CONNECT = "tradename_manufacturer"
 COSH_TRADENAME_FORMULATION_CONNECT = "tradename_formulation"
 COSH_TRADENAME_AI_CONNECT = "tradename_ai"
 
+# ── Pest Diagnosis (synced 2026-05-14) ────────────────────────────────────
+#
+# Cosh ships one Connect — `pest_diagnosis` — that's 9 endpoints wide
+# (the widest we've seen). Each row encodes:
+#
+#   pos 1: damage_symptoms             (top-level visible symptom)
+#   pos 2: damage_subsymptoms          (finer-grain symptom)
+#   pos 3: biological_names            ← the **pest**
+#   pos 4: pest_stages                 (pest's life stage)
+#   pos 5: plant_parts                 (affected plant part)
+#   pos 6: plant_subparts              (finer-grain plant part)
+#   pos 7: biological_names            ← the **crop**
+#   pos 8: crop_stages                 (crop's growth stage)
+#   pos 9: priority_rank_pests         (severity ranking, "0"..."5")
+#
+# The same `biological_names` Core appears at positions 3 and 7;
+# position number disambiguates the semantic role (pest vs crop).
+# Cosh's "one Core for all organisms" decision pays off here — the
+# structure stays clean without per-role Cores.
+#
+# First sync 2026-05-14: 6,266 active rows. Drives the farmer-facing
+# Diagnosis pipe end-to-end (after symptom-report UX).
+
+COSH_PEST_DIAGNOSIS_CONNECT = "pest_diagnosis"
+
+# Supporting Cores referenced by the Connect.
+COSH_DAMAGE_SYMPTOMS_CORE = "damage_symptoms"
+COSH_DAMAGE_SUBSYMPTOMS_CORE = "damage_subsymptoms"
+COSH_PEST_STAGES_CORE = "pest_stages"
+COSH_PLANT_PARTS_CORE = "plant_parts"
+COSH_PLANT_SUBPARTS_CORE = "plant_subparts"
+COSH_CROP_STAGES_CORE = "crop_stages"
+COSH_PRIORITY_RANK_PESTS_CORE = "priority_rank_pests"
+
+# Endpoint position constants (1-indexed, mirroring Cosh's wire shape).
+PD_POS_SYMPTOM = 1
+PD_POS_SUBSYMPTOM = 2
+PD_POS_PEST = 3
+PD_POS_PEST_STAGE = 4
+PD_POS_PLANT_PART = 5
+PD_POS_PLANT_SUBPART = 6
+PD_POS_CROP = 7
+PD_POS_CROP_STAGE = 8
+PD_POS_PRIORITY_RANK = 9
+
+# BLANK BOX sentinel UUIDs (pinned 2026-05-14 from the first prod sync).
+#
+# Semantics confirmed by user: BLANK BOX = "no data exists for this
+# dimension" — i.e., the row's constraint on that dimension is
+# vacuously satisfied. Behaves like a wildcard when filtering: when
+# the farmer specifies a value, rows with that endpoint = BLANK BOX
+# still match. NOT shown as a farmer-pickable option.
+#
+# Only the four dimensions below carry a BLANK BOX item in Cosh today.
+# The other three (damage_symptoms, pest_stages, priority_rank_pests)
+# match strictly. If Cosh later adds BLANK BOX to those Cores, extend
+# this mapping; the filter helper reads from it.
+
+PD_BLANK_BOX_BY_CORE: dict[str, str] = {
+    COSH_DAMAGE_SUBSYMPTOMS_CORE: "818bb871-ff52-4fb0-a95d-3d80ff40bb43",
+    COSH_PLANT_PARTS_CORE:        "15d12e37-9309-4899-ad7b-801bc8bb0a65",
+    COSH_PLANT_SUBPARTS_CORE:     "9cba3894-6022-4f9d-9aa7-b8685f567b74",
+    COSH_CROP_STAGES_CORE:        "c15d78e4-7f46-421b-9a9f-10ce080c45e3",
+}
+
 
 # Python rule-book L2 name → Cosh `l2_data` cosh_id. Built from
 # the first Cosh sync of `l2_data` (2026-05-14). L2 names that exist
