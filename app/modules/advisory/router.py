@@ -21,7 +21,7 @@ from app.modules.advisory.schemas import (
     ParameterCreate, ParameterUpdate, VariableCreate, VariableUpdate,
     PackageVariableSet,
     TimelineCreate, TimelineUpdate, TimelineOut,
-    PracticeCreate, PracticeOut,
+    PracticeCreate, PracticeOut, PracticeWithElementsOut,
     RelationCreate, ConditionalQuestionCreate, PracticeConditionalCreate,
     PGRecommendationCreate, PGRecommendationOut, PGTimelineCreate, PGTimelineOut, PGPracticeCreate,
     SPRecommendationCreate, SPRecommendationOut, SPTimelineCreate, SPTimelineOut, SPPracticeCreate,
@@ -1435,16 +1435,18 @@ async def import_timeline(
 
 # ── Practices ──────────────────────────────────────────────────────────────────
 
-@router.get("/client/{client_id}/timelines/{timeline_id}/practices", response_model=list[PracticeOut])
+@router.get("/client/{client_id}/timelines/{timeline_id}/practices", response_model=list[PracticeWithElementsOut])
 async def list_practices(
     client_id: str, timeline_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    result = await db.execute(
+    """Same shape as the global list (Batch 32) — practices bundled
+    with their elements + server-resolved English labels."""
+    practices = (await db.execute(
         select(Practice).where(Practice.timeline_id == timeline_id).order_by(Practice.display_order)
-    )
-    return result.scalars().all()
+    )).scalars().all()
+    return await _attach_elements_with_labels(db, practices)
 
 
 @router.post("/client/{client_id}/timelines/{timeline_id}/practices", response_model=PracticeOut, status_code=201)
@@ -2975,16 +2977,88 @@ async def delete_global_timeline(
     await db.commit()
 
 
-@router.get("/advisory/global/packages/{pkg_id}/timelines/{tl_id}/practices", response_model=list[PracticeOut])
+async def _attach_elements_with_labels(
+    db: AsyncSession, practices: list[Practice],
+) -> list[dict]:
+    """Bundle each Practice's element rows with rule-book labels +
+    server-resolved English display values (Batch 32). One pass over
+    the elements, one batched CoshCoreItem fetch for cosh_ref UUIDs.
+
+    `display_value` priority:
+      - cosh_ref: English name from CoshCoreItem.translations
+      - value: passes through verbatim (free-text, numeric, etc.)
+    """
+    from app.modules.advisory.models import Element
+    from app.modules.sync.models import CoshCoreItem
+    from app.services.practice_taxonomy import _label_from_id
+
+    if not practices:
+        return []
+    practice_ids = [p.id for p in practices]
+    elements = (await db.execute(
+        select(Element).where(Element.practice_id.in_(practice_ids))
+        .order_by(Element.practice_id, Element.display_order)
+    )).scalars().all()
+
+    # Batch-resolve every cosh_ref UUID to its English label.
+    cosh_ids = {e.cosh_ref for e in elements if e.cosh_ref}
+    en_by_id: dict[str, str] = {}
+    if cosh_ids:
+        cores = (await db.execute(
+            select(CoshCoreItem).where(
+                CoshCoreItem.cosh_id.in_(cosh_ids),
+                CoshCoreItem.status == "active",
+            )
+        )).scalars().all()
+        for c in cores:
+            t = c.translations or {}
+            en = t.get("en") or t.get("English")
+            if en:
+                en_by_id[c.cosh_id] = en
+
+    by_practice: dict[str, list[dict]] = {p.id: [] for p in practices}
+    for e in elements:
+        if e.cosh_ref:
+            display = en_by_id.get(e.cosh_ref) or e.cosh_ref
+        else:
+            display = e.value
+        by_practice.setdefault(e.practice_id, []).append({
+            "element_type": e.element_type,
+            "label": _label_from_id(e.element_type),
+            "cosh_ref": e.cosh_ref,
+            "value": e.value,
+            "unit_cosh_id": e.unit_cosh_id,
+            "display_value": display,
+            "display_order": e.display_order,
+        })
+
+    out: list[dict] = []
+    for p in practices:
+        out.append({
+            "id": p.id, "timeline_id": p.timeline_id,
+            "l0_type": p.l0_type, "l1_type": p.l1_type, "l2_type": p.l2_type,
+            "display_order": p.display_order,
+            "is_special_input": p.is_special_input,
+            "relation_id": p.relation_id,
+            "created_at": p.created_at,
+            "elements": by_practice.get(p.id, []),
+        })
+    return out
+
+
+@router.get("/advisory/global/packages/{pkg_id}/timelines/{tl_id}/practices", response_model=list[PracticeWithElementsOut])
 async def list_global_practices(
     pkg_id: str, tl_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    result = await db.execute(
+    """Practice index with elements + resolved English labels (Batch 32).
+    The SA portal expands a Practice row inline to show element values
+    without a second fetch."""
+    practices = (await db.execute(
         select(Practice).where(Practice.timeline_id == tl_id).order_by(Practice.display_order)
-    )
-    return result.scalars().all()
+    )).scalars().all()
+    return await _attach_elements_with_labels(db, practices)
 
 
 @router.post("/advisory/global/packages/{pkg_id}/timelines/{tl_id}/practices", response_model=PracticeOut, status_code=201)

@@ -188,6 +188,43 @@ class PracticeOut(BaseModel):
         from_attributes = True
 
 
+class ElementWithLabelOut(BaseModel):
+    """Element row enriched for read-back display (Batch 32).
+
+    `label` is the human-readable field name from the rule book
+    (e.g. "Common Name" for COMMON_NAME). `display_value` is the
+    server-resolved English name for `cosh_ref` references, or the
+    raw `value` for free-text / numeric fields. Frontend renders
+    `{label}: {display_value}` without any further lookups."""
+    element_type: str
+    label: str
+    cosh_ref: Optional[str] = None
+    value: Optional[str] = None
+    unit_cosh_id: Optional[str] = None
+    display_value: Optional[str] = None
+    display_order: int = 0
+
+
+class PracticeWithElementsOut(BaseModel):
+    """List shape for the Practice index (Batch 32) — bundles each
+    Practice with its resolved-label Element rows so the SA portal
+    can expand a Practice inline without a follow-on per-element
+    fetch."""
+    id: str
+    timeline_id: str
+    l0_type: PracticeL0
+    l1_type: Optional[str] = None
+    l2_type: Optional[str] = None
+    display_order: int
+    is_special_input: bool
+    relation_id: Optional[str] = None
+    created_at: datetime
+    elements: list[ElementWithLabelOut] = []
+
+    class Config:
+        from_attributes = True
+
+
 # ── Relations ──────────────────────────────────────────────────────────────────
 
 class RelationCreate(BaseModel):
