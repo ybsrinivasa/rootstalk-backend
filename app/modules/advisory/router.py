@@ -2520,6 +2520,96 @@ async def get_l2_element_spec(
     }
 
 
+# ── Cosh input options + cascades (2026-05-14) ─────────────────────────────
+#
+# Backs the Add Practice modal's per-L2 dropdowns + the four-stage brand
+# cascade (Common Name → Trade Name + Manufacturer → Formulation + a.i.).
+# All seven endpoints read through to Cosh-side Connects via
+# `app.services.cosh_options_view` — no local mirror.
+
+@router.get("/cosh/options/common-names")
+async def cosh_common_names_for_l2(
+    l2: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.cosh_options_view import list_common_names_for_l2
+    return await list_common_names_for_l2(db, l2)
+
+
+@router.get("/cosh/options/application-methods")
+async def cosh_application_methods_for_l2(
+    l2: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.cosh_options_view import list_application_methods_for_l2
+    return await list_application_methods_for_l2(db, l2)
+
+
+@router.get("/cosh/options/units")
+async def cosh_units_for_l2(
+    l2: str,
+    unit_type: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """`unit_type` is the rule-book slug (e.g. `dosage_unit`,
+    `volume_unit`, `time_unit`). Maps to a set of Cosh `unit_types`
+    UUIDs and filters the L2's units by that set."""
+    from app.services.cosh_options_view import list_units_for_l2
+    return await list_units_for_l2(db, l2, unit_type)
+
+
+@router.get("/cosh/options/trade-names")
+async def cosh_trade_names_for_common_name(
+    common_name: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.cosh_options_view import list_trade_names_for_common_name
+    return await list_trade_names_for_common_name(db, common_name)
+
+
+@router.get("/cosh/options/manufacturers")
+async def cosh_manufacturers_for_common_name(
+    common_name: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.cosh_options_view import list_manufacturers_for_common_name
+    return await list_manufacturers_for_common_name(db, common_name)
+
+
+@router.get("/cosh/options/formulations")
+async def cosh_formulations(
+    common_name: Optional[str] = None,
+    trade_name: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """When `trade_name` is supplied, narrows to formulations tied to
+    that one trade name; otherwise spans all trade names sharing the
+    given `common_name`."""
+    from app.services.cosh_options_view import list_formulations
+    return await list_formulations(
+        db, common_name_cosh_id=common_name, trade_name_cosh_id=trade_name,
+    )
+
+
+@router.get("/cosh/options/ai-concentrations")
+async def cosh_ai_concentrations(
+    common_name: Optional[str] = None,
+    trade_name: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.cosh_options_view import list_ai_concentrations
+    return await list_ai_concentrations(
+        db, common_name_cosh_id=common_name, trade_name_cosh_id=trade_name,
+    )
+
+
 @router.get("/advisory/global/packages/{pkg_id}/timelines", response_model=list[TimelineOut])
 async def list_global_timelines(
     pkg_id: str,
