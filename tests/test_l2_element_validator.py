@@ -89,9 +89,9 @@ async def test_brand_optional_even_when_manufacturer_set():
         el("DOSAGE_UNIT", cosh_ref="du:ml_per_l"),
     ]
     core = {
-        "common_name":        [CascadeOption("cn:imida", "Imidacloprid")],
-        "application_method": [CascadeOption("am:foliar_spray", "Foliar spray")],
-        "dosage_unit":        [CascadeOption("du:ml_per_l", "ml/L")],
+        "common_names_of_inputs": [CascadeOption("cn:imida", "Imidacloprid")],
+        "application_methods":    [CascadeOption("am:foliar_spray", "Foliar spray")],
+        "units_data":             [CascadeOption("du:ml_per_l", "ml/L")],
     }
     cascade = {
         ("manufacturers_for_common_name", frozenset({("COMMON_NAME", "cn:imida")})):
@@ -114,9 +114,9 @@ async def test_brand_optional_when_manufacturer_blank():
         el("DOSAGE_UNIT", cosh_ref="du:ml_per_l"),
     ]
     core = {
-        "common_name":        [CascadeOption("cn:imida", "Imidacloprid")],
-        "application_method": [CascadeOption("am:foliar_spray", "Foliar spray")],
-        "dosage_unit":        [CascadeOption("du:ml_per_l", "ml/L")],
+        "common_names_of_inputs": [CascadeOption("cn:imida", "Imidacloprid")],
+        "application_methods":    [CascadeOption("am:foliar_spray", "Foliar spray")],
+        "units_data":             [CascadeOption("du:ml_per_l", "ml/L")],
     }
     with patches(core_returns=core):
         r = await validate_l2_elements(
@@ -138,9 +138,9 @@ async def test_invalid_manufacturer_caught_via_cascade():
         el("DOSAGE_UNIT", cosh_ref="du:ml_per_l"),
     ]
     core = {
-        "common_name":        [CascadeOption("cn:imida", "Imidacloprid")],
-        "application_method": [CascadeOption("am:foliar_spray", "Foliar spray")],
-        "dosage_unit":        [CascadeOption("du:ml_per_l", "ml/L")],
+        "common_names_of_inputs": [CascadeOption("cn:imida", "Imidacloprid")],
+        "application_methods":    [CascadeOption("am:foliar_spray", "Foliar spray")],
+        "units_data":             [CascadeOption("du:ml_per_l", "ml/L")],
     }
     cascade = {
         ("manufacturers_for_common_name", frozenset({("COMMON_NAME", "cn:imida")})):
@@ -177,9 +177,9 @@ async def test_formulation_picked_against_cn_scope_must_be_valid():
         el("DOSAGE_UNIT", cosh_ref="du:ml_per_l"),
     ]
     core = {
-        "common_name":        [CascadeOption("cn:imida", "Imidacloprid")],
-        "application_method": [CascadeOption("am:foliar_spray", "Foliar spray")],
-        "dosage_unit":        [CascadeOption("du:ml_per_l", "ml/L")],
+        "common_names_of_inputs": [CascadeOption("cn:imida", "Imidacloprid")],
+        "application_methods":    [CascadeOption("am:foliar_spray", "Foliar spray")],
+        "units_data":             [CascadeOption("du:ml_per_l", "ml/L")],
     }
     cascade = {
         # F cascade is CN-scoped now — BRAND_NAME absent from the key.
@@ -211,9 +211,9 @@ async def test_formulation_optional_when_brand_set():
         el("DOSAGE_UNIT", cosh_ref="du:ml_per_l"),
     ]
     core = {
-        "common_name":        [CascadeOption("cn:imida", "Imidacloprid")],
-        "application_method": [CascadeOption("am:foliar_spray", "Foliar spray")],
-        "dosage_unit":        [CascadeOption("du:ml_per_l", "ml/L")],
+        "common_names_of_inputs": [CascadeOption("cn:imida", "Imidacloprid")],
+        "application_methods":    [CascadeOption("am:foliar_spray", "Foliar spray")],
+        "units_data":             [CascadeOption("du:ml_per_l", "ml/L")],
     }
     cascade = {
         ("manufacturers_for_common_name", frozenset({("COMMON_NAME", "cn:imida")})):
@@ -242,9 +242,9 @@ async def test_formulation_optional_when_only_cn_set():
         el("DOSAGE_UNIT", cosh_ref="du:ml_per_l"),
     ]
     core = {
-        "common_name":        [CascadeOption("cn:imida", "Imidacloprid")],
-        "application_method": [CascadeOption("am:foliar_spray", "Foliar spray")],
-        "dosage_unit":        [CascadeOption("du:ml_per_l", "ml/L")],
+        "common_names_of_inputs": [CascadeOption("cn:imida", "Imidacloprid")],
+        "application_methods":    [CascadeOption("am:foliar_spray", "Foliar spray")],
+        "units_data":             [CascadeOption("du:ml_per_l", "ml/L")],
     }
     with patches(core_returns=core):
         r = await validate_l2_elements(
@@ -264,9 +264,9 @@ async def test_adjuvants_requires_special_input_flag():
         el("DOSAGE_UNIT", cosh_ref="du:ml_per_l"),
     ]
     core = {
-        "common_name":        [CascadeOption("cn:silwet", "Silwet")],
-        "application_method": [CascadeOption("am:foliar_spray", "Foliar spray")],
-        "dosage_unit":        [CascadeOption("du:ml_per_l", "ml/L")],
+        "common_names_of_inputs": [CascadeOption("cn:silwet", "Silwet")],
+        "application_methods":    [CascadeOption("am:foliar_spray", "Foliar spray")],
+        "units_data":             [CascadeOption("du:ml_per_l", "ml/L")],
     }
     with patches(core_returns=core):
         r = await validate_l2_elements(
@@ -286,9 +286,9 @@ async def test_non_adjuvant_with_special_flag_rejected():
         el("DOSAGE_UNIT", cosh_ref="du:ml_per_l"),
     ]
     core = {
-        "common_name":        [CascadeOption("cn:imida", "Imidacloprid")],
-        "application_method": [CascadeOption("am:foliar_spray", "Foliar spray")],
-        "dosage_unit":        [CascadeOption("du:ml_per_l", "ml/L")],
+        "common_names_of_inputs": [CascadeOption("cn:imida", "Imidacloprid")],
+        "application_methods":    [CascadeOption("am:foliar_spray", "Foliar spray")],
+        "units_data":             [CascadeOption("du:ml_per_l", "ml/L")],
     }
     with patches(core_returns=core):
         r = await validate_l2_elements(
@@ -313,9 +313,9 @@ async def test_frequency_mismatch_flagged():
         el("FERTIGATION_INTERVAL", value="7"),  # Practice claims 5
     ]
     core = {
-        "dosage_unit":        [CascadeOption("du:kg_per_acre", "kg/acre")],
-        "formulation":        [CascadeOption("form:water_soluble", "Water-soluble")],
-        "application_method": [CascadeOption("am:fertigation", "Fertigation")],
+        "units_data":             [CascadeOption("du:kg_per_acre", "kg/acre")],
+        "formulations":           [CascadeOption("form:water_soluble", "Water-soluble")],
+        "application_methods":    [CascadeOption("am:fertigation", "Fertigation")],
     }
     with patches(core_returns=core):
         r = await validate_l2_elements(
@@ -341,9 +341,9 @@ async def test_frequency_match_passes():
         el("FERTIGATION_INTERVAL", value="7"),
     ]
     core = {
-        "dosage_unit":        [CascadeOption("du:kg_per_acre", "kg/acre")],
-        "formulation":        [CascadeOption("form:water_soluble", "Water-soluble")],
-        "application_method": [CascadeOption("am:fertigation", "Fertigation")],
+        "units_data":             [CascadeOption("du:kg_per_acre", "kg/acre")],
+        "formulations":           [CascadeOption("form:water_soluble", "Water-soluble")],
+        "application_methods":    [CascadeOption("am:fertigation", "Fertigation")],
     }
     with patches(core_returns=core):
         r = await validate_l2_elements(
@@ -368,9 +368,9 @@ async def test_volume_per_plant_unit_required_when_volume_set():
         # VOLUME_PER_PLANT_UNIT omitted
     ]
     core = {
-        "common_name":        [CascadeOption("cn:imida", "Imidacloprid")],
-        "application_method": [CascadeOption("am:foliar_spray", "Foliar spray")],
-        "dosage_unit":        [CascadeOption("du:ml_per_l", "ml/L")],
+        "common_names_of_inputs": [CascadeOption("cn:imida", "Imidacloprid")],
+        "application_methods":    [CascadeOption("am:foliar_spray", "Foliar spray")],
+        "units_data":             [CascadeOption("du:ml_per_l", "ml/L")],
     }
     with patches(core_returns=core):
         r = await validate_l2_elements(
@@ -392,8 +392,8 @@ async def test_plant_wise_extras_rejected_on_non_applicable_l2():
         el("VOLUME_PER_PLANT", value="0.5"),  # not allowed for INSECT_TRAPS
     ]
     core = {
-        "common_name": [CascadeOption("cn:trap", "Pheromone trap")],
-        "dosage_unit": [CascadeOption("du:per_acre", "per acre")],
+        "common_names_of_inputs": [CascadeOption("cn:trap", "Pheromone trap")],
+        "units_data":              [CascadeOption("du:per_acre", "per acre")],
     }
     with patches(core_returns=core):
         r = await validate_l2_elements(
@@ -449,9 +449,9 @@ async def test_full_chemical_pesticide_happy_path():
         el("INSTRUCTIONS", value="Apply early morning."),
     ]
     core = {
-        "common_name":        [CascadeOption("cn:imida", "Imidacloprid")],
-        "application_method": [CascadeOption("am:foliar_spray", "Foliar spray")],
-        "dosage_unit":        [CascadeOption("du:ml_per_l", "ml/L")],
+        "common_names_of_inputs": [CascadeOption("cn:imida", "Imidacloprid")],
+        "application_methods":    [CascadeOption("am:foliar_spray", "Foliar spray")],
+        "units_data":             [CascadeOption("du:ml_per_l", "ml/L")],
     }
     cascade = {
         ("manufacturers_for_common_name", frozenset({("COMMON_NAME", "cn:imida")})):

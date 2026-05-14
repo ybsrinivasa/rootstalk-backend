@@ -34,11 +34,11 @@ async def _seed_pesticide_cosh(db) -> None:
     Chemical Pesticide happy-path validation."""
     rows = [
         # Cores referenced by cosh_core: sources
-        CoshCoreItem(cosh_id="cn:imida", core_type="common_name",
+        CoshCoreItem(cosh_id="cn:imida", core_type="common_names_of_inputs",
                      translations={"en": "Imidacloprid"}, status="active"),
-        CoshCoreItem(cosh_id="am:foliar_spray", core_type="application_method",
+        CoshCoreItem(cosh_id="am:foliar_spray", core_type="application_methods",
                      translations={"en": "Foliar spray"}, status="active"),
-        CoshCoreItem(cosh_id="du:ml_per_l", core_type="dosage_unit",
+        CoshCoreItem(cosh_id="du:ml_per_l", core_type="units_data",
                      translations={"en": "ml/L"}, status="active"),
         # Brand row: parent=common_name, manufacturer in metadata
         CoshCoreItem(
@@ -52,7 +52,7 @@ async def _seed_pesticide_cosh(db) -> None:
             },
             status="active",
         ),
-        CoshCoreItem(cosh_id="form:SC", core_type="formulation",
+        CoshCoreItem(cosh_id="form:SC", core_type="formulations",
                      translations={"en": "SC"}, status="active"),
     ]
     for r in rows:
@@ -220,11 +220,11 @@ async def test_special_input_required_for_adjuvants(db):
     """ADJUVANTS L2 with is_special_input=False is rejected."""
     client, user, pkg, tl = await _setup_timeline(db)
     db.add_all([
-        CoshCoreItem(cosh_id="cn:silwet", core_type="common_name",
+        CoshCoreItem(cosh_id="cn:silwet", core_type="common_names_of_inputs",
                            translations={"en": "Silwet"}, status="active"),
-        CoshCoreItem(cosh_id="am:foliar", core_type="application_method",
+        CoshCoreItem(cosh_id="am:foliar", core_type="application_methods",
                            translations={"en": "Foliar"}, status="active"),
-        CoshCoreItem(cosh_id="du:ml", core_type="dosage_unit",
+        CoshCoreItem(cosh_id="du:ml", core_type="units_data",
                            translations={"en": "ml/L"}, status="active"),
     ])
     await db.commit()
@@ -258,11 +258,11 @@ async def test_frequency_days_persists_and_validates(db):
     saves successfully and persists the frequency_days column."""
     client, user, pkg, tl = await _setup_timeline(db)
     db.add_all([
-        CoshCoreItem(cosh_id="du:kg_acre", core_type="dosage_unit",
+        CoshCoreItem(cosh_id="du:kg_acre", core_type="units_data",
                            translations={"en": "kg/acre"}, status="active"),
-        CoshCoreItem(cosh_id="form:water_soluble", core_type="formulation",
+        CoshCoreItem(cosh_id="form:water_soluble", core_type="formulations",
                            translations={"en": "Water soluble"}, status="active"),
-        CoshCoreItem(cosh_id="am:fertigation", core_type="application_method",
+        CoshCoreItem(cosh_id="am:fertigation", core_type="application_methods",
                            translations={"en": "Fertigation"}, status="active"),
     ])
     await db.commit()
@@ -298,11 +298,11 @@ async def test_frequency_mismatch_returns_422(db):
     """Practice.frequency_days ≠ FERTIGATION_INTERVAL → 422."""
     client, user, pkg, tl = await _setup_timeline(db)
     db.add_all([
-        CoshCoreItem(cosh_id="du:kg_acre", core_type="dosage_unit",
+        CoshCoreItem(cosh_id="du:kg_acre", core_type="units_data",
                            translations={"en": "kg/acre"}, status="active"),
-        CoshCoreItem(cosh_id="form:water_soluble", core_type="formulation",
+        CoshCoreItem(cosh_id="form:water_soluble", core_type="formulations",
                            translations={"en": "Water soluble"}, status="active"),
-        CoshCoreItem(cosh_id="am:fertigation", core_type="application_method",
+        CoshCoreItem(cosh_id="am:fertigation", core_type="application_methods",
                            translations={"en": "Fertigation"}, status="active"),
     ])
     await db.commit()

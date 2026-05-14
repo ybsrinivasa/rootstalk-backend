@@ -59,15 +59,23 @@ from tests.factories import (
 # ── Shared cosh seeding (same as Round 1) ──────────────────────────────────
 
 async def _seed_pesticide_cosh(db) -> None:
+    # Batch 29: validator now resolves cosh_core: slugs to real Cosh
+    # `core_type` names. Test seeds updated to match — the values picked
+    # in test elements (cn:imida, am:foliar_spray, etc.) are valid
+    # provided their core_type matches what the validator now queries.
     rows = [
-        CoshCoreItem(cosh_id="cn:imida", core_type="common_name",
+        CoshCoreItem(cosh_id="cn:imida", core_type="common_names_of_inputs",
                      translations={"en": "Imidacloprid"}, status="active"),
-        CoshCoreItem(cosh_id="am:foliar_spray", core_type="application_method",
+        CoshCoreItem(cosh_id="am:foliar_spray", core_type="application_methods",
                      translations={"en": "Foliar spray"}, status="active"),
-        CoshCoreItem(cosh_id="am:soil_drench", core_type="application_method",
+        CoshCoreItem(cosh_id="am:soil_drench", core_type="application_methods",
                      translations={"en": "Soil drench"}, status="active"),
-        CoshCoreItem(cosh_id="du:ml_per_l", core_type="dosage_unit",
+        CoshCoreItem(cosh_id="du:ml_per_l", core_type="units_data",
                      translations={"en": "ml/L"}, status="active"),
+        # The legacy `brand` Core path still exists in the validator
+        # (it falls back to cosh_options_view when empty), so the
+        # synthetic brand row is still useful for testing the
+        # name-string contract in the legacy code-path.
         CoshCoreItem(
             cosh_id="brand:confidor", core_type="brand",
             parent_cosh_id="cn:imida",
@@ -79,7 +87,7 @@ async def _seed_pesticide_cosh(db) -> None:
             },
             status="active",
         ),
-        CoshCoreItem(cosh_id="form:SC", core_type="formulation",
+        CoshCoreItem(cosh_id="form:SC", core_type="formulations",
                      translations={"en": "SC"}, status="active"),
     ]
     for r in rows:

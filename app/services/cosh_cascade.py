@@ -62,10 +62,21 @@ class CascadeOption:
 async def manufacturers_for_common_name(
     db: AsyncSession, common_name_cosh_id: Optional[str],
 ) -> list[CascadeOption]:
-    """Distinct manufacturer name strings across active brand rows
-    whose parent is this CNI. Sorted case-insensitive by label."""
+    """Manufacturers visible under a CNI. Tries the legacy `brand`
+    Core path first (preserves existing test fixtures); when that
+    returns empty AND a common_name is supplied, falls through to
+    `cosh_options_view.list_manufacturers_for_common_name` which
+    walks the new Cosh shape via `tradename_commonname` →
+    `tradename_manufacturer` (Batch 29, 2026-05-14).
+
+    Legacy returns manufacturer NAME strings as the cascade value;
+    the new shape returns manufacturer COSH IDs. Validation passes
+    because the UX picks cosh_ids from /cosh/options/manufacturers
+    which itself uses the new shape — both ends agree on cosh_ids.
+    """
     if not common_name_cosh_id:
         return []
+    # Legacy `brand`-Core path (test fixtures seed this).
     result = await db.execute(
         select(CoshCoreItem).where(
             CoshCoreItem.core_type == "brand",
@@ -82,7 +93,14 @@ async def manufacturers_for_common_name(
         key = mn.lower()
         if key not in seen:
             seen[key] = CascadeOption(value=mn, label=mn)
-    return sorted(seen.values(), key=lambda o: o.label.lower())
+    if seen:
+        return sorted(seen.values(), key=lambda o: o.label.lower())
+    # Real-Cosh fallback (new shape — production path).
+    from app.services.cosh_options_view import list_manufacturers_for_common_name
+    items = await list_manufacturers_for_common_name(
+        db, common_name_cosh_id=common_name_cosh_id,
+    )
+    return [CascadeOption(value=i["cosh_id"], label=i["name"]) for i in items]
 
 
 async def brands_for_common_name_and_manufacturer(
@@ -91,13 +109,19 @@ async def brands_for_common_name_and_manufacturer(
     manufacturer_name: Optional[str],
 ) -> list[CascadeOption]:
     """Brand options under a CNI. The `manufacturer_name` filter is
-    OPTIONAL (Batch 24, 2026-05-14): when supplied, narrows to
-    brands made by that manufacturer (case-insensitive match); when
-    None, returns the full set of CN's brands. This mirrors the new
-    Add-Practice contract where MFR and BRAND_NAME are independent
-    optional peers. Sorted by display label."""
+    OPTIONAL (Batch 24, 2026-05-14): when supplied, narrows to brands
+    made by that manufacturer.
+
+    Tries the legacy `brand` Core path first (preserves test
+    fixtures); when that returns empty AND a common_name is supplied,
+    falls through to `cosh_options_view.list_trade_names_for_common_name`
+    which walks `tradename_commonname` Connect — and optionally
+    intersects with the manufacturer's brands via
+    `tradename_manufacturer` (Batch 29).
+    """
     if not common_name_cosh_id:
         return []
+    # Legacy `brand`-Core path.
     target = manufacturer_name.lower() if manufacturer_name else None
     result = await db.execute(
         select(CoshCoreItem).where(
@@ -113,7 +137,21 @@ async def brands_for_common_name_and_manufacturer(
             continue
         label = (row.translations or {}).get("en") or row.cosh_id
         options.append(CascadeOption(value=row.cosh_id, label=label))
-    return sorted(options, key=lambda o: o.label.lower())
+    if options:
+        return sorted(options, key=lambda o: o.label.lower())
+    # Real-Cosh fallback. `manufacturer_name` from the legacy contract
+    # is a display-name string; the new shape expects a manufacturer
+    # cosh_id. The validator dispatch flows cosh_ids through inputs
+    # (the rule book's MANUFACTURER field carries a cosh_ref), so
+    # what we receive here in production IS a cosh_id, not a display
+    # name. Pass it through.
+    from app.services.cosh_options_view import list_trade_names_for_common_name
+    items = await list_trade_names_for_common_name(
+        db,
+        common_name_cosh_id=common_name_cosh_id,
+        manufacturer_cosh_id=manufacturer_name,  # actually a cosh_id in prod
+    )
+    return [CascadeOption(value=i["cosh_id"], label=i["name"]) for i in items]
 
 
 async def formulation_for_brand(

@@ -108,18 +108,32 @@ PLANT_WISE_EXTRAS_APPLY_TO: frozenset[str] = frozenset({
 # strings. Real Cosh-side names get filled in at sync wiring; the validator
 # resolves slugs to entity_types via this map.
 
+# Per Batch 29 (2026-05-14): map rule-book slugs to the **real** Cosh
+# `core_type` slugs as shipped by the production sync (see
+# cosh_constants.py). The validator's list_core_options query is
+# `select(CoshCoreItem).where(core_type=<target>)`, so the right-hand
+# side must match what Cosh actually ships.
+#
+# All unit-flavoured slugs (dosage_unit, volume_unit, …) point at the
+# unified `units_data` Core; finer L2/unit_type filtering happens in
+# the UX layer via /cosh/options/units, but for validation purposes
+# "is this a real units_data cosh_id?" is the right check.
+#
+# `planting_material`, `itk_name`, `maturity_index` are not yet
+# shipped by Cosh — keep them mapped to their literal slugs so
+# validation returns INVALID_COSH_REF until those Cores arrive.
 COSH_CORE_SLUG_MAP: Mapping[str, str] = {
-    "common_name":        "common_name",
-    "application_method": "application_method",
-    "dosage_unit":        "dosage_unit",
-    "volume_unit":        "volume_unit",
-    "formulation":        "formulation",
-    "distance_unit":      "distance_unit",
-    "temperature_unit":   "temperature_unit",
-    "time_unit":          "time_unit",
-    "irrigation_unit":    "irrigation_unit",
+    "common_name":        "common_names_of_inputs",
+    "application_method": "application_methods",
+    "formulation":        "formulations",
+    "dosage_unit":        "units_data",
+    "volume_unit":        "units_data",
+    "distance_unit":      "units_data",
+    "temperature_unit":   "units_data",
+    "time_unit":          "units_data",
+    "irrigation_unit":    "units_data",
+    "number_unit":        "units_data",
     "planting_material":  "planting_material",
-    "number_unit":        "number_unit",
     "itk_name":           "itk_name",
     "maturity_index":     "maturity_index",
 }
