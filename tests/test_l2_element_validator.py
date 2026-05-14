@@ -289,7 +289,7 @@ async def test_frequency_mismatch_flagged():
         el("N_DOSAGE", value="100"),
         el("P_DOSAGE", value="50"),
         el("K_DOSAGE", value="50"),
-        el("UNIT_AREA_WISE", cosh_ref="du:kg_per_acre"),
+        el("UNIT", cosh_ref="du:kg_per_acre"),
         el("FORMULATION", cosh_ref="form:water_soluble"),
         el("APPLICATION_METHOD", cosh_ref="am:fertigation"),
         el("FERTIGATION_INTERVAL", value="7"),  # Practice claims 5
@@ -317,7 +317,7 @@ async def test_frequency_match_passes():
         el("N_DOSAGE", value="100"),
         el("P_DOSAGE", value="50"),
         el("K_DOSAGE", value="50"),
-        el("UNIT_AREA_WISE", cosh_ref="du:kg_per_acre"),
+        el("UNIT", cosh_ref="du:kg_per_acre"),
         el("FORMULATION", cosh_ref="form:water_soluble"),
         el("APPLICATION_METHOD", cosh_ref="am:fertigation"),
         el("FERTIGATION_INTERVAL", value="7"),

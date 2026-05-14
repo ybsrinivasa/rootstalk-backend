@@ -331,22 +331,27 @@ _FERTILIZER_RULES: dict[str, L2Spec] = {
         plant_wise_extras=True,
     ),
     "CHEMICAL_FERTILIZERS_NPK_DOSAGES": L2Spec(
+        # Per user 2026-05-14: don't split Unit into Area-wise vs
+        # Plant-wise here. Show one "Unit" dropdown carrying all three
+        # dosage-unit variants from the Cosh `dosage_unit` slug.
         fields=(
             FieldRule("N_DOSAGE", source="number_2dec", mandatory=True),
             FieldRule("P_DOSAGE", source="number_2dec", mandatory=True),
             FieldRule("K_DOSAGE", source="number_2dec", mandatory=True),
-            FieldRule("UNIT_AREA_WISE", source="cosh_core:dosage_unit", mandatory=True),
+            FieldRule("UNIT", source="cosh_core:dosage_unit", mandatory=True),
             FieldRule("FORMULATION", source="cosh_core:formulation", mandatory=True),
             FieldRule("APPLICATION_METHOD", source="cosh_core:application_method", mandatory=True),
             FieldRule("INSTRUCTIONS", source="text_area", mandatory=False),
         ),
     ),
     "FERTIGATION_NPK_DOSAGES": L2Spec(
+        # Same Unit unification as CHEMICAL_FERTILIZERS_NPK_DOSAGES
+        # (Batch 26, 2026-05-14).
         fields=(
             FieldRule("N_DOSAGE", source="number_2dec", mandatory=True),
             FieldRule("P_DOSAGE", source="number_2dec", mandatory=True),
             FieldRule("K_DOSAGE", source="number_2dec", mandatory=True),
-            FieldRule("UNIT_AREA_WISE", source="cosh_core:dosage_unit", mandatory=True),
+            FieldRule("UNIT", source="cosh_core:dosage_unit", mandatory=True),
             FieldRule("FORMULATION", source="cosh_core:formulation", mandatory=True),
             FieldRule("APPLICATION_METHOD", source="cosh_core:application_method", mandatory=True),
             *_FERTIGATION_FREQUENCY_TAIL,
