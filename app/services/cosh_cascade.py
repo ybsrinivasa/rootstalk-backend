@@ -159,17 +159,19 @@ async def formulation_for_brand(
     brand_cosh_id: Optional[str],
     common_name_cosh_id: Optional[str] = None,
 ) -> list[CascadeOption]:
-    """Formulations under (brand | common_name) — Batch 27, 2026-05-14.
+    """Formulations under a (brand, common_name) context.
 
-    Routing:
-      - brand provided: legacy `brand` Core lookup (single auto-determined
-        formulation_cosh_id from the brand's metadata). Preserves the
-        existing test-fixture path that seeds synthetic `brand` Cores.
-      - brand=None, common_name provided: walks the real Cosh shape via
-        `cosh_options_view.list_formulations` — spans every trade name
-        sharing the common name. This is the path the production UX
-        exercises now that F is selectable on CN alone.
-      - both None: empty.
+    Routing (Batches 27/29/31, 2026-05-14):
+      1. brand provided AND the legacy `brand` Core has it →
+         legacy auto-determined formulation_cosh_id from metadata.
+         Preserves test fixtures that seed synthetic `brand` Cores.
+      2. legacy lookup empty (e.g. brand_cosh_id is a `trade_names`
+         id from real Cosh sync, not a legacy brand) AND we have a
+         common_name → fall through to cosh_options_view with both
+         CN and TN filters so production-shape cosh_ids validate.
+      3. brand not provided AND common_name provided → cosh_options_view
+         CN-only span.
+      4. both missing → empty.
     """
     if brand_cosh_id:
         brand = (await db.execute(
@@ -178,19 +180,30 @@ async def formulation_for_brand(
                 CoshCoreItem.core_type == "brand",
             )
         )).scalar_one_or_none()
-        if not brand:
-            return []
-        fid = (brand.metadata_ or {}).get("formulation_cosh_id")
-        if not fid:
-            return []
-        fmt = (await db.execute(
-            select(CoshCoreItem).where(
-                CoshCoreItem.cosh_id == fid,
-                CoshCoreItem.core_type == "formulation",
+        if brand is not None:
+            fid = (brand.metadata_ or {}).get("formulation_cosh_id")
+            if not fid:
+                return []
+            fmt = (await db.execute(
+                select(CoshCoreItem).where(
+                    CoshCoreItem.cosh_id == fid,
+                    CoshCoreItem.core_type == "formulation",
+                )
+            )).scalar_one_or_none()
+            label = (fmt.translations or {}).get("en") if fmt and fmt.translations else None
+            return [CascadeOption(value=fid, label=label or fid)]
+        # Legacy `brand` Core didn't have it — fall through to the
+        # real-Cosh path (brand_cosh_id is a tradename cosh_id from
+        # the new shape).
+        if common_name_cosh_id:
+            from app.services.cosh_options_view import list_formulations
+            items = await list_formulations(
+                db,
+                common_name_cosh_id=common_name_cosh_id,
+                trade_name_cosh_id=brand_cosh_id,
             )
-        )).scalar_one_or_none()
-        label = (fmt.translations or {}).get("en") if fmt and fmt.translations else None
-        return [CascadeOption(value=fid, label=label or fid)]
+            return [CascadeOption(value=i["cosh_id"], label=i["name"]) for i in items]
+        return []
     if common_name_cosh_id:
         from app.services.cosh_options_view import list_formulations
         items = await list_formulations(db, common_name_cosh_id=common_name_cosh_id)
@@ -203,10 +216,10 @@ async def ai_concentration_for_brand(
     brand_cosh_id: Optional[str],
     common_name_cosh_id: Optional[str] = None,
 ) -> list[CascadeOption]:
-    """a.i. concentration values — same routing as
-    `formulation_for_brand`. When brand provided, returns the brand's
-    single auto-determined a.i. (from metadata). When only common_name,
-    spans the CN's trade names via cosh_options_view."""
+    """a.i. concentration values. Same routing as
+    `formulation_for_brand` — legacy `brand` Core first; on miss
+    AND common_name set, fall through to the new-shape lookup
+    with both CN and TN filters (Batch 31)."""
     if brand_cosh_id:
         brand = (await db.execute(
             select(CoshCoreItem).where(
@@ -214,14 +227,22 @@ async def ai_concentration_for_brand(
                 CoshCoreItem.core_type == "brand",
             )
         )).scalar_one_or_none()
-        if not brand:
-            return []
-        ai = (brand.metadata_ or {}).get("ai_concentration") \
-            or (brand.metadata_ or {}).get("ai_concentration_cosh_id")
-        if not ai:
-            return []
-        ai = str(ai)
-        return [CascadeOption(value=ai, label=ai)]
+        if brand is not None:
+            ai = (brand.metadata_ or {}).get("ai_concentration") \
+                or (brand.metadata_ or {}).get("ai_concentration_cosh_id")
+            if not ai:
+                return []
+            ai = str(ai)
+            return [CascadeOption(value=ai, label=ai)]
+        if common_name_cosh_id:
+            from app.services.cosh_options_view import list_ai_concentrations
+            items = await list_ai_concentrations(
+                db,
+                common_name_cosh_id=common_name_cosh_id,
+                trade_name_cosh_id=brand_cosh_id,
+            )
+            return [CascadeOption(value=i["cosh_id"], label=i["name"]) for i in items]
+        return []
     if common_name_cosh_id:
         from app.services.cosh_options_view import list_ai_concentrations
         items = await list_ai_concentrations(
