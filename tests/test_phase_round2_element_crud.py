@@ -136,23 +136,29 @@ async def _seed_cca_practice(db):
 
 
 async def _seed_cca_l2none_practice(db):
-    """l2_type=None practice with one INSTRUCTIONS element. Validator
-    bypasses, so add/edit/delete sequencing can be exercised without
-    fighting the strict allowlist."""
+    """l2_type=None practice with one element. Inserted via ORM so the
+    Batch 30 `l2_type_required` create-handler guard doesn't reject
+    it — the test's purpose is to exercise element CRUD lifecycle
+    without the strict per-L2 allowlist getting in the way, not to
+    test Practice create itself."""
     client = await make_client(db)
     se = await make_user(db, name="SE-CCA-N")
     await make_crop_reference(db, "crop:n", name="X")
     pkg = await make_package(db, client, name="P-N", crop_cosh_id="crop:n")
     tl = await make_timeline(db, pkg, name="TL-N")
     await db.commit()
-    practice = await create_practice(
-        client_id=client.id, timeline_id=tl.id,
-        request=PracticeCreate(
-            l0_type=PracticeL0.INPUT, l1_type=None, l2_type=None,
-            elements=[ElementIn(element_type="NOTE", value="seed")],
-        ),
-        db=db, current_user=se,
+    practice = Practice(
+        timeline_id=tl.id,
+        l0_type=PracticeL0.INPUT, l1_type=None, l2_type=None,
+        display_order=0, is_special_input=False,
     )
+    db.add(practice)
+    await db.flush()
+    db.add(Element(
+        practice_id=practice.id, element_type="NOTE", value="seed",
+    ))
+    await db.commit()
+    await db.refresh(practice)
     return client, se, tl, practice
 
 
@@ -587,14 +593,21 @@ async def test_delete_only_element_on_l2_none_practice_succeeds(db):
     pkg = await make_package(db, client, crop_cosh_id="crop:test")
     tl = await make_timeline(db, pkg)
     await db.commit()
-    practice = await create_practice(
-        client_id=client.id, timeline_id=tl.id,
-        request=PracticeCreate(
-            l0_type=PracticeL0.INPUT, l1_type=None, l2_type=None,
-            elements=[ElementIn(element_type="NOTES", value="x")],
-        ),
-        db=db, current_user=se,
+    # Inserted via ORM — Batch 30's create-handler guard rejects
+    # l2_type=None, but the test specifically needs a shell practice
+    # to exercise the empty-element-set helper path.
+    practice = Practice(
+        timeline_id=tl.id,
+        l0_type=PracticeL0.INPUT, l1_type=None, l2_type=None,
+        display_order=0, is_special_input=False,
     )
+    db.add(practice)
+    await db.flush()
+    db.add(Element(
+        practice_id=practice.id, element_type="NOTES", value="x",
+    ))
+    await db.commit()
+    await db.refresh(practice)
     elem = (await db.execute(
         select(Element).where(Element.practice_id == practice.id)
     )).scalar_one()

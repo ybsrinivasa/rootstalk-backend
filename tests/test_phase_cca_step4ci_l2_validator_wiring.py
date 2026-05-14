@@ -133,21 +133,26 @@ async def test_create_instructions_only_post_harvest_practice_passes(db):
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_l2_type_none_bypasses_validation(db):
-    """Defensive: practices without an L2 type (legacy / l0-only) skip
-    the rule book validation."""
+async def test_l2_type_none_rejected_with_422(db):
+    """Batch 30 (2026-05-14): the previously-defensive l2-None bypass
+    is now rejected at create time with 422 l2_type_required. Shell
+    Practices (l0-only, no L1/L2) carried no element spec and
+    surfaced in the UI as "INPUT · No sub-type" — a useless state we
+    closed off per user request."""
     client, user, pkg, tl = await _setup_timeline(db)
     await db.commit()
 
-    out = await create_practice(
-        client_id=client.id, timeline_id=tl.id,
-        request=PracticeCreate(
-            l0_type=PracticeL0.INPUT, l1_type=None, l2_type=None,
-            elements=[],
-        ),
-        db=db, current_user=user,
-    )
-    assert out.l2_type is None
+    with pytest.raises(HTTPException) as exc:
+        await create_practice(
+            client_id=client.id, timeline_id=tl.id,
+            request=PracticeCreate(
+                l0_type=PracticeL0.INPUT, l1_type=None, l2_type=None,
+                elements=[],
+            ),
+            db=db, current_user=user,
+        )
+    assert exc.value.status_code == 422
+    assert exc.value.detail["code"] == "l2_type_required"
 
 
 # ── Failure shapes — verify 422 envelope + stable error codes ───────────────

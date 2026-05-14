@@ -1457,7 +1457,14 @@ async def create_practice(
     """CCA Step 4 / Batch 4C-i.D: validates the proposed element list
     against the L2 rule book before persisting. Returns 422 with the
     full error list on rule violations (mandatory fields, cascade
-    integrity, special-input / frequency-based / plant-wise invariants)."""
+    integrity, special-input / frequency-based / plant-wise invariants).
+
+    Batch 30: l2_type is now required (no more "No sub-type" shells)."""
+    if not request.l2_type:
+        raise HTTPException(status_code=422, detail={
+            "code": "l2_type_required",
+            "message": "L2 type is required when creating a Practice.",
+        })
     try:
         await assert_l2_elements_valid(
             db,
@@ -2988,7 +2995,13 @@ async def create_global_practice(
     current_user: User = Depends(get_current_user),
 ):
     """CCA Step 4 / Batch 4C-i.D: same L2 element rule book validation
-    as the client-side create_practice route."""
+    as the client-side create_practice route. Batch 30 (2026-05-14):
+    l2_type required — no more "No sub-type" shells."""
+    if not request.l2_type:
+        raise HTTPException(status_code=422, detail={
+            "code": "l2_type_required",
+            "message": "L2 type is required when creating a Practice.",
+        })
     try:
         await assert_l2_elements_valid(
             db,
