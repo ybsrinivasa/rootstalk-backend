@@ -1498,6 +1498,57 @@ async def create_practice(
     return practice
 
 
+@router.put("/client/{client_id}/timelines/{timeline_id}/practices/{practice_id}", response_model=PracticeOut)
+async def update_practice(
+    client_id: str, timeline_id: str, practice_id: str,
+    request: PracticeCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Atomic Practice replace — same shape as the global PUT
+    (Batch 33). Runs the L2 validator before swapping elements."""
+    if not request.l2_type:
+        raise HTTPException(status_code=422, detail={
+            "code": "l2_type_required",
+            "message": "L2 type is required when updating a Practice.",
+        })
+    practice = (await db.execute(
+        select(Practice).where(
+            Practice.id == practice_id, Practice.timeline_id == timeline_id,
+        )
+    )).scalar_one_or_none()
+    if practice is None:
+        raise HTTPException(status_code=404, detail="Practice not found")
+
+    try:
+        await assert_l2_elements_valid(
+            db,
+            l2_type=request.l2_type,
+            elements=request.elements,
+            is_special_input=request.is_special_input,
+            frequency_days=request.frequency_days,
+        )
+    except L2ElementValidationError as e:
+        _raise_l2_element_validation(e)
+
+    practice.l0_type = request.l0_type
+    practice.l1_type = request.l1_type
+    practice.l2_type = request.l2_type
+    practice.display_order = request.display_order
+    practice.is_special_input = request.is_special_input
+    practice.frequency_days = request.frequency_days
+
+    await db.execute(
+        Element.__table__.delete().where(Element.practice_id == practice_id)
+    )
+    await db.flush()
+    for elem in request.elements:
+        db.add(Element(practice_id=practice_id, **elem.model_dump()))
+    await db.commit()
+    await db.refresh(practice)
+    return practice
+
+
 @router.delete("/client/{client_id}/timelines/{timeline_id}/practices/{practice_id}", status_code=204)
 async def delete_practice(
     client_id: str, timeline_id: str, practice_id: str,
@@ -3106,6 +3157,65 @@ async def create_global_practice(
     await db.flush()
     for elem in request.elements:
         db.add(Element(practice_id=practice.id, **elem.model_dump()))
+    await db.commit()
+    await db.refresh(practice)
+    return practice
+
+
+@router.put("/advisory/global/packages/{pkg_id}/timelines/{tl_id}/practices/{practice_id}", response_model=PracticeOut)
+async def update_global_practice(
+    pkg_id: str, tl_id: str, practice_id: str,
+    request: PracticeCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Replace a Global Practice atomically (Batch 33). Accepts the
+    full PracticeCreate shape — l0/l1/l2 + elements list +
+    is_special_input + frequency_days. Runs the same L2 element
+    validator as create, then deletes the existing element rows and
+    inserts the new ones in a single transaction. Practice id stays
+    stable so any downstream references (relation_id, etc.) survive."""
+    if not request.l2_type:
+        raise HTTPException(status_code=422, detail={
+            "code": "l2_type_required",
+            "message": "L2 type is required when updating a Practice.",
+        })
+    practice = (await db.execute(
+        select(Practice).where(
+            Practice.id == practice_id, Practice.timeline_id == tl_id,
+        )
+    )).scalar_one_or_none()
+    if practice is None:
+        raise HTTPException(status_code=404, detail="Practice not found")
+
+    try:
+        await assert_l2_elements_valid(
+            db,
+            l2_type=request.l2_type,
+            elements=request.elements,
+            is_special_input=request.is_special_input,
+            frequency_days=request.frequency_days,
+        )
+    except L2ElementValidationError as e:
+        _raise_l2_element_validation(e)
+
+    # Update the Practice scalar fields.
+    practice.l0_type = request.l0_type
+    practice.l1_type = request.l1_type
+    practice.l2_type = request.l2_type
+    practice.display_order = request.display_order
+    practice.is_special_input = request.is_special_input
+    practice.frequency_days = request.frequency_days
+
+    # Atomically replace the element set. Delete-then-insert in one
+    # transaction; clearing first means we don't have to diff the old
+    # vs new element_type sets.
+    await db.execute(
+        Element.__table__.delete().where(Element.practice_id == practice_id)
+    )
+    await db.flush()
+    for elem in request.elements:
+        db.add(Element(practice_id=practice_id, **elem.model_dump()))
     await db.commit()
     await db.refresh(practice)
     return practice
