@@ -301,7 +301,18 @@ async def list_candidates(
     Duplicates: multiple rows can share the same (pest, pest_stage)
     if they originate from different symptom/part routes within
     Cosh. We dedupe by (pest, pest_stage) and keep the row whose
-    rank resolves to the lowest int — i.e., the most urgent one."""
+    rank resolves to the lowest int — i.e., the most urgent one.
+
+    Each candidate also carries `image_urls` — the union of curated
+    images attached to every pest_diagnosis row that contributed to
+    that candidate (post-filter, post-dedup). Narrowed by the same
+    filter context as the candidate itself; never global "all images
+    of this pest". May be empty when Cosh hasn't yet curated images
+    for this candidate at this context."""
+    from app.services.pest_diagnosis_images_view import (
+        images_for_pest_diagnosis_rows,
+    )
+
     filters = DiagnosisFilters(
         crop_cosh_id=crop_cosh_id, crop_stage=crop_stage,
         plant_part=plant_part, plant_subpart=plant_subpart,
@@ -309,7 +320,10 @@ async def list_candidates(
     )
     rows = await _filter_rows(db, filters)
 
-    candidates: list[tuple[str, Optional[str], str]] = []
+    # Track each candidate's contributing pest_diagnosis row ids so we
+    # can attach images later (narrowed to the candidate's filter
+    # context, not the pest globally).
+    candidates: list[tuple[str, str, Optional[str], str]] = []
     pest_ids: set[str] = set()
     stage_ids: set[str] = set()
     rank_ids: set[str] = set()
@@ -319,7 +333,7 @@ async def list_candidates(
         if pest is None or rank is None:
             continue
         stage = _endpoint_at_position(r, PD_POS_PEST_STAGE)
-        candidates.append((pest, stage, rank))
+        candidates.append((r.connect_id, pest, stage, rank))
         pest_ids.add(pest)
         if stage is not None:
             stage_ids.add(stage)
@@ -337,26 +351,49 @@ async def list_candidates(
 
     # Dedupe by (pest, stage) keeping the row whose rank int is
     # lowest (= most urgent). Inactive pests drop out via the
-    # `pest in pest_names` check after name resolution.
+    # `pest in pest_names` check after name resolution. We also track
+    # ALL contributing row_ids per (pest, stage) for image lookup —
+    # the rank winner doesn't have a monopoly on image rights; any
+    # row that survived the filter contributes its images.
     best: dict[tuple[str, Optional[str]], tuple[int, str]] = {}
-    for pest, stage, rank_uuid in candidates:
+    contributing_rows: dict[tuple[str, Optional[str]], list[str]] = {}
+    for row_id, pest, stage, rank_uuid in candidates:
         if pest not in pest_names:
             continue
         rank_int = _priority_rank_int(rank_names.get(rank_uuid, "999"))
         key = (pest, stage)
         if key not in best or rank_int < best[key][0]:
             best[key] = (rank_int, rank_uuid)
+        contributing_rows.setdefault(key, []).append(row_id)
 
-    out = [
-        {
+    # Batch-fetch images for all contributing rows in a single Connect
+    # walk — keeps the candidates endpoint at O(crop) cost.
+    all_row_ids: set[str] = set()
+    for rows_list in contributing_rows.values():
+        all_row_ids.update(rows_list)
+    images_by_row = await images_for_pest_diagnosis_rows(
+        db, crop_cosh_id=crop_cosh_id, diag_row_ids=all_row_ids,
+    )
+
+    out: list[dict] = []
+    for (pest, stage), (rank_int, rank_uuid) in best.items():
+        # Union the images across every contributing row; dedup
+        # URLs while preserving the order each was first seen.
+        urls: list[str] = []
+        seen: set[str] = set()
+        for row_id in contributing_rows[(pest, stage)]:
+            for url in images_by_row.get(row_id, []):
+                if url not in seen:
+                    urls.append(url)
+                    seen.add(url)
+        out.append({
             "pest_cosh_id": pest,
             "pest_name": pest_names[pest],
             "pest_stage_cosh_id": stage,
             "pest_stage_name": stage_names.get(stage) if stage else None,
             "priority_rank_cosh_id": rank_uuid,
             "priority_rank": rank_int,
-        }
-        for (pest, stage), (rank_int, rank_uuid) in best.items()
-    ]
+            "image_urls": urls,
+        })
     out.sort(key=lambda x: (x["priority_rank"], x["pest_name"].casefold()))
     return out

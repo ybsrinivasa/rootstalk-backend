@@ -161,6 +161,37 @@ PD_BLANK_BOX_BY_CORE: dict[str, str] = {
     COSH_CROP_STAGES_CORE:        "c15d78e4-7f46-421b-9a9f-10ce080c45e3",
 }
 
+# ── Image Index + per-crop symptom images (synced 2026-05-14) ─────────────
+#
+# Cosh introduced a Connect-references-Connect pattern here. Two-step
+# lookup chain for any crop:
+#
+#   1. image_index Connect (2-endpoint, one row per crop with images):
+#        pos 1 — biological_names (the crop)
+#        pos 2 — symptom_image_slug Core item
+#      The pos-2 Core item's `translations.en` carries the *string*
+#      name of the per-crop image Connect (e.g. "tomato_symptom_images").
+#
+#   2. {crop}_symptom_images Connect (2-endpoint, one row per image
+#      attached to one pest_diagnosis row):
+#        pos 1 — pest_diagnosis (references a row of the
+#                pest_diagnosis Connect)
+#        pos 2 — images_{crop}_symptoms_core (image Core item).
+#                The image Core item's `metadata_.s3_path` carries the
+#                full HTTPS URL on Cosh's public-read S3 bucket.
+#
+# The image Core's slug is *not* stored in the index — it falls out
+# from the image Connect's own endpoint role on first read.
+
+COSH_IMAGE_INDEX_CONNECT = "image_index"
+COSH_SYMPTOM_IMAGE_SLUG_CORE = "symptom_image_slug"
+
+II_POS_CROP = 1
+II_POS_SLUG = 2
+
+SI_POS_DIAGNOSIS_ROW = 1
+SI_POS_IMAGE_CORE = 2
+
 
 # Python rule-book L2 name → Cosh `l2_data` cosh_id. Built from
 # the first Cosh sync of `l2_data` (2026-05-14). L2 names that exist

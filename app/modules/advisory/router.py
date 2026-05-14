@@ -2699,16 +2699,79 @@ async def diagnosis_candidates(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Final diagnosis lookup — returns ranked candidate pests
-    (pest_cosh_id, pest_name, pest_stage, priority_rank). The
-    farmer-facing UI calls this once the cascade reaches subsymptom
-    (or earlier if the farmer wants a wider net)."""
+    """Final diagnosis lookup — returns ranked candidate pests with
+    curated images. Each candidate carries `image_urls` scoped to
+    the filter context (post-cascade, post-dedup). Empty when Cosh
+    hasn't curated images for that pest at that context. Farmer-PWA
+    falls back to `/diagnosis/google-search-query` for visual
+    research in that case."""
     from app.services.pest_diagnosis_view import list_candidates
     return await list_candidates(
         db, crop_cosh_id=crop_cosh_id, crop_stage=crop_stage,
         plant_part=plant_part, plant_subpart=plant_subpart,
         symptom=symptom, subsymptom=subsymptom,
     )
+
+
+@router.get("/diagnosis/google-search-query")
+async def diagnosis_google_search_query(
+    crop_cosh_id: str,
+    crop_stage: Optional[str] = None,
+    plant_part: Optional[str] = None,
+    plant_subpart: Optional[str] = None,
+    symptom: Optional[str] = None,
+    subsymptom: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Build the context-aware Google Images search terms used by
+    any Symptom Node where the farmer wants to bail out to a
+    visual search (curated images absent, or just exploring).
+
+    Format: `<Crop> <Part> <Symptom>` — pest name intentionally
+    omitted (one Symptom Node fans out to many pests; biasing the
+    search toward one would skew the farmer's visual matching).
+    Subsymptom isn't used today; we may promote to subsymptom-level
+    specificity once farmer usage tells us whether the broader
+    symptom misses too much.
+
+    Returns `{"query": "..."}`. Empty string when nothing resolves
+    (frontend hides the button in that case)."""
+    from app.modules.sync.models import CoshCoreItem
+    from app.services.cosh_constants import (
+        COSH_BIOLOGICAL_NAMES_CORE,
+        COSH_DAMAGE_SYMPTOMS_CORE,
+        COSH_PLANT_PARTS_CORE,
+    )
+    from app.services.pest_diagnosis_images_view import build_google_search_query
+
+    # Same translation-resolution pattern as list_candidates, but
+    # for one cosh_id per dimension — keep it as one batched fetch
+    # per Core type for symmetry with the rest of the codebase.
+    async def _en(core_type: str, cosh_id: Optional[str]) -> Optional[str]:
+        if not cosh_id:
+            return None
+        core = (await db.execute(
+            select(CoshCoreItem).where(
+                CoshCoreItem.core_type == core_type,
+                CoshCoreItem.cosh_id == cosh_id,
+                CoshCoreItem.status == "active",
+            )
+        )).scalar_one_or_none()
+        if core is None:
+            return None
+        t = core.translations or {}
+        return t.get("en") or t.get("English")
+
+    crop_name = await _en(COSH_BIOLOGICAL_NAMES_CORE, crop_cosh_id)
+    part_name = await _en(COSH_PLANT_PARTS_CORE, plant_part)
+    sym_name = await _en(COSH_DAMAGE_SYMPTOMS_CORE, symptom)
+    query = build_google_search_query(
+        crop_name=crop_name,
+        plant_part_name=part_name,
+        symptom_name=sym_name,
+    )
+    return {"query": query}
 
 
 @router.get("/advisory/global/packages/{pkg_id}/timelines", response_model=list[TimelineOut])
