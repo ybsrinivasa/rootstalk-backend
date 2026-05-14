@@ -3023,6 +3023,13 @@ async def create_global_practice(
         frequency_days=request.frequency_days,
     )
     db.add(practice)
+    # Batch 31-followup: flush so practice.id (default=new_uuid) is
+    # materialised before we reference it on the Element rows. Mirrors
+    # the client-scoped handler. Without this, Element.practice_id was
+    # NULL → NotNullViolation at commit. The bug never surfaced before
+    # because the L2 validator rejected every prod request earlier in
+    # the chain (Batches 27/29/31 fixed that path).
+    await db.flush()
     for elem in request.elements:
         db.add(Element(practice_id=practice.id, **elem.model_dump()))
     await db.commit()
