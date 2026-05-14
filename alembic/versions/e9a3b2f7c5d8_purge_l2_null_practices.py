@@ -33,14 +33,11 @@ def upgrade():
         "DELETE FROM elements WHERE practice_id IN "
         "(SELECT id FROM practices WHERE l2_type IS NULL)"
     )
-    # Relation conditionals attached to shell practices.
+    # Per-practice conditionals attached to shell practices.
+    # (NB: relation_conditionals binds to relations, not practices;
+    # conditional_questions binds to timelines, not practices.)
     op.execute(
-        "DELETE FROM relation_conditionals WHERE practice_id IN "
-        "(SELECT id FROM practices WHERE l2_type IS NULL)"
-    )
-    # Per-practice conditional questions.
-    op.execute(
-        "DELETE FROM conditional_questions WHERE practice_id IN "
+        "DELETE FROM practice_conditionals WHERE practice_id IN "
         "(SELECT id FROM practices WHERE l2_type IS NULL)"
     )
     # The shells themselves.
