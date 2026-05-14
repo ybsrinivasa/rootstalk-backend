@@ -632,10 +632,8 @@ _MEDIA_RULES: dict[str, L2Spec] = {
         *_MEDIA_TITLE_DESCRIPTION,
         FieldRule("UPLOAD_AUDIO", source="media_audio", mandatory=True),
     )),
-    "MEDIA_VIDEO": L2Spec(fields=(
-        *_MEDIA_TITLE_DESCRIPTION,
-        FieldRule("UPLOAD_VIDEO", source="media_video", mandatory=True),
-    )),
+    # MEDIA_VIDEO removed Batch 36 — direct video upload deferred;
+    # SEs use MEDIA_HYPERLINK to point at YouTube/Drive instead.
     "MEDIA_HYPERLINK": L2Spec(fields=(
         *_MEDIA_TITLE_DESCRIPTION,
         FieldRule("HYPERLINK", source="hyperlink", mandatory=True),

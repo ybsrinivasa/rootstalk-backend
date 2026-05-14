@@ -8,25 +8,59 @@ from app.modules.platform.models import User
 
 router = APIRouter(tags=["Media"])
 
-ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
-MAX_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
+# Batch 36 (2026-05-14): widened from image-only to image + audio so
+# advisory authoring can attach voice notes. Video stays out of this
+# endpoint — SEs paste a hyperlink for video content instead.
+IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+AUDIO_CONTENT_TYPES = {
+    "audio/mpeg", "audio/mp3",
+    "audio/mp4", "audio/aac",
+    "audio/ogg", "audio/opus",
+    "audio/wav", "audio/x-wav", "audio/wave",
+    "audio/webm",
+}
+ALLOWED_CONTENT_TYPES = IMAGE_CONTENT_TYPES | AUDIO_CONTENT_TYPES
+# Audio voice-notes need more room than logos. 25 MB covers ~25 min
+# at 128 kbps mp3 — enough for a long advisory tip.
+MAX_SIZE_BYTES = 25 * 1024 * 1024
 
 
-async def upload_to_s3(file: UploadFile, folder: str) -> dict:
+async def upload_to_s3(
+    file: UploadFile,
+    folder: str,
+    *,
+    allowed_types: set[str] | None = None,
+    max_size_bytes: int | None = None,
+) -> dict:
     """Validate + upload a file to S3, return {url, key}. Caller is
     responsible for authorisation — this helper does no auth checks
     of its own. Used by both the authed /media/upload endpoint and
     the public onboarding-token-authed logo upload endpoint in
-    clients/router.py."""
-    if file.content_type not in ALLOWED_CONTENT_TYPES:
+    clients/router.py.
+
+    `allowed_types` and `max_size_bytes` let callers narrow the
+    content-type whitelist and size cap below the module-wide defaults
+    (image+audio, 25 MB) — logo uploads scope down to image-only at
+    5 MB, advisory authoring uses the module defaults."""
+    types = allowed_types or ALLOWED_CONTENT_TYPES
+    cap = max_size_bytes or MAX_SIZE_BYTES
+    if file.content_type not in types:
+        # Build a human-readable hint from the active whitelist.
+        if types == IMAGE_CONTENT_TYPES:
+            hint = "Use JPEG, PNG, WebP, or GIF."
+        elif types == AUDIO_CONTENT_TYPES:
+            hint = "Use MP3, AAC, OGG, WAV, or WebM."
+        else:
+            hint = "Use JPEG/PNG/WebP/GIF for images or MP3/AAC/OGG/WAV/WebM for audio."
         raise HTTPException(
             status_code=422,
-            detail=f"File type {file.content_type} not allowed. Use JPEG, PNG, WebP, or GIF.",
+            detail=f"File type {file.content_type} not allowed. {hint}",
         )
 
     content = await file.read()
-    if len(content) > MAX_SIZE_BYTES:
-        raise HTTPException(status_code=422, detail="File too large. Maximum size is 5 MB.")
+    if len(content) > cap:
+        mb = cap // (1024 * 1024)
+        raise HTTPException(status_code=422, detail=f"File too large. Maximum size is {mb} MB.")
 
     if not settings.aws_access_key_id or not settings.aws_s3_bucket_name:
         # Dev fallback — return a placeholder URL so the form flow is

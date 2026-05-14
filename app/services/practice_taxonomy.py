@@ -153,7 +153,10 @@ TAXONOMY: dict[str, dict[str, list[str]]] = {
         "MEDIA": [
             "MEDIA_IMAGE",
             "MEDIA_AUDIO",
-            "MEDIA_VIDEO",
+            # Direct video upload deferred (Batch 36, 2026-05-14) —
+            # raw video files are large and a poor fit for the
+            # in-app upload path. Experts host elsewhere (YouTube,
+            # Drive) and paste the URL via MEDIA_HYPERLINK instead.
             "MEDIA_HYPERLINK",
         ],
     },

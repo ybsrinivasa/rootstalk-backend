@@ -347,14 +347,21 @@ async def upload_onboarding_logo(
     the authed `/media/upload` endpoint. This endpoint exists
     specifically to close that gap without opening up unauthenticated
     uploads to the world."""
-    from app.modules.media.router import upload_to_s3
+    from app.modules.media.router import upload_to_s3, IMAGE_CONTENT_TYPES
 
     client = await get_client_by_token(db, token)
     if not client:
         raise HTTPException(status_code=404, detail="Invalid or expired onboarding link")
     if client.status != ClientStatus.PENDING_REVIEW:
         raise HTTPException(status_code=400, detail="This onboarding link has already been used")
-    return await upload_to_s3(file, folder="logos")
+    # Logos stay image-only with the original 5 MB cap; the widened
+    # 25 MB / +audio default is for advisory media authoring, not
+    # company branding artwork.
+    return await upload_to_s3(
+        file, folder="logos",
+        allowed_types=IMAGE_CONTENT_TYPES,
+        max_size_bytes=5 * 1024 * 1024,
+    )
 
 
 @router.post("/onboarding/{token}/submit", response_model=ClientOut)
