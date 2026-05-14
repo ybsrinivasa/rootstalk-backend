@@ -218,3 +218,39 @@ async def test_l2_elements_endpoint_404_for_unknown(db):
         )
     assert exc.value.status_code == 404
     assert exc.value.detail["code"] == "unknown_l2_type"
+
+
+# ── L2-level metadata flags (Batch 25) ─────────────────────────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_endpoint_exposes_is_special_input_flag(db):
+    """ADJUVANTS is the only L2 with is_special_input=True today.
+    Other L2s (e.g. CHEMICAL_PESTICIDES) should report False so the
+    frontend doesn't render the Special Input checkbox there."""
+    user = await make_user(db, name="x")
+    chem = await get_l2_element_spec(
+        l2_type="CHEMICAL_PESTICIDES", db=db, current_user=user,
+    )
+    assert chem["is_special_input"] is False
+    adj = await get_l2_element_spec(
+        l2_type="ADJUVANTS", db=db, current_user=user,
+    )
+    assert adj["is_special_input"] is True
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_endpoint_exposes_frequency_based_flag(db):
+    """FERTIGATION_NPK_DOSAGES is frequency-based (carries
+    FERTIGATION_INTERVAL); CHEMICAL_PESTICIDES is not. Frontend uses
+    the flag to decide whether to require frequency_days."""
+    user = await make_user(db, name="x")
+    chem = await get_l2_element_spec(
+        l2_type="CHEMICAL_PESTICIDES", db=db, current_user=user,
+    )
+    assert chem["frequency_based"] is False
+    fert = await get_l2_element_spec(
+        l2_type="FERTIGATION_NPK_DOSAGES", db=db, current_user=user,
+    )
+    assert fert["frequency_based"] is True

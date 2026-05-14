@@ -2498,7 +2498,7 @@ async def get_l2_element_spec(
     the param, never see those fields.
     """
     from app.services.cosh_crop_view import get_measure_for_biological_name
-    from app.services.practice_taxonomy import list_l2_elements
+    from app.services.practice_taxonomy import get_l2_meta, list_l2_elements
 
     measure = None
     if crop_cosh_id:
@@ -2513,10 +2513,19 @@ async def get_l2_element_spec(
                 "message": f"L2 type {l2_type!r} is not in the rule book.",
             },
         )
+    meta = get_l2_meta(l2_type) or {}
     return {
         "l2_type": l2_type,
         "crop_measure": measure,
         "elements": elements,
+        # L2-level flags from the rule book — the frontend uses
+        # these to decide which UI affordances to surface (e.g.
+        # Special Input checkbox shows only when is_special_input
+        # is True, frequency-days input shows only when
+        # frequency_based is True, …).
+        "is_special_input": meta.get("is_special_input", False),
+        "frequency_based": meta.get("frequency_based", False),
+        "plant_wise_extras": meta.get("plant_wise_extras", False),
     }
 
 

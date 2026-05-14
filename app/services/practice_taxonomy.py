@@ -249,6 +249,23 @@ def list_l2_elements(
     ]
 
 
+def get_l2_meta(l2_type: str) -> dict | None:
+    """L2-level metadata flags from the rule book — separate from
+    the per-field element specs. Used by the frontend to decide
+    whether to render UI affordances that only apply to certain L2s
+    (e.g. the Special Input checkbox is meaningful only for L2s
+    with `is_special_input=True`, which today is just ADJUVANTS).
+    Returns None when l2_type isn't in the rule book."""
+    spec = get_l2_spec(l2_type)
+    if spec is None:
+        return None
+    return {
+        "is_special_input": spec.is_special_input,
+        "frequency_based": spec.frequency_based,
+        "plant_wise_extras": spec.plant_wise_extras,
+    }
+
+
 # Lookup helpers used by tests + future validators.
 
 def is_known_l2(l2_type: str) -> bool:
