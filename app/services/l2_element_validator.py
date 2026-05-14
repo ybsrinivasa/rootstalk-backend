@@ -240,25 +240,31 @@ async def validate_l2_elements(
             message=f"Practice.is_special_input=True is only valid for ADJUVANTS L2",
         ))
 
-    # 4. frequency_based invariant: FERTIGATION_INTERVAL ↔ Practice.frequency_days
+    # 4. frequency_based invariant: <interval_field> ↔ Practice.frequency_days
+    # Batch 34: the interval field name varies by L2 family
+    # (FERTIGATION_INTERVAL / IRRIGATION_INTERVAL / REPEAT_INTERVAL).
+    # Look it up via FieldRule.is_interval rather than hardcoding.
     if spec.frequency_based:
-        interval_value = _provided_value(by_name.get("FERTIGATION_INTERVAL"))
-        if interval_value is not None:
-            try:
-                interval_int = int(float(interval_value))
-            except (TypeError, ValueError):
-                interval_int = None
-            if interval_int is not None and practice_frequency_days != interval_int:
-                errors.append(ValidationError(
-                    code="FREQUENCY_MISMATCH",
-                    field_name="FERTIGATION_INTERVAL",
-                    message=(f"Practice.frequency_days={practice_frequency_days} "
-                             f"must equal FERTIGATION_INTERVAL={interval_int}"),
-                    details={
-                        "practice_frequency_days": practice_frequency_days,
-                        "fertigation_interval": interval_int,
-                    },
-                ))
+        interval_field = next((f for f in spec.fields if f.is_interval), None)
+        if interval_field is not None:
+            interval_value = _provided_value(by_name.get(interval_field.name))
+            if interval_value is not None:
+                try:
+                    interval_int = int(float(interval_value))
+                except (TypeError, ValueError):
+                    interval_int = None
+                if interval_int is not None and practice_frequency_days != interval_int:
+                    errors.append(ValidationError(
+                        code="FREQUENCY_MISMATCH",
+                        field_name=interval_field.name,
+                        message=(f"Practice.frequency_days={practice_frequency_days} "
+                                 f"must equal {interval_field.name}={interval_int}"),
+                        details={
+                            "practice_frequency_days": practice_frequency_days,
+                            "interval_field": interval_field.name,
+                            "interval_value": interval_int,
+                        },
+                    ))
 
     return ValidationResult(is_valid=not errors, errors=errors)
 

@@ -67,6 +67,14 @@ class FieldRule:
     # inputs; frontend ignores `cascade_optional_inputs` for the
     # disabled-until-parent-set check.
     cascade_optional_inputs: tuple[str, ...] = ()
+    # Batch 34: marker for the "interval days" field on a
+    # frequency_based L2 (Fertigation, Irrigation, Instructions). The
+    # validator + handler use this to find the field instead of
+    # hardcoding the element name — each frequency-based L2 family
+    # has its own name (FERTIGATION_INTERVAL / IRRIGATION_INTERVAL /
+    # REPEAT_INTERVAL) so the SE sees a label appropriate to the
+    # practice family.
+    is_interval: bool = False
 
 
 @dataclass(frozen=True)
@@ -305,8 +313,25 @@ _SPECIAL_INPUT_RULES: dict[str, L2Spec] = {
 # filtered at the L2 level (cosh_core:formulation), NOT cascaded from Brand.
 
 _FERTIGATION_FREQUENCY_TAIL: tuple[FieldRule, ...] = (
-    FieldRule("FERTIGATION_INTERVAL", source="number_2dec", mandatory=True),
-    FieldRule("NO_OF_APPLICATIONS", source="auto_calculated"),
+    FieldRule("FERTIGATION_INTERVAL", source="number_2dec", mandatory=True, is_interval=True),
+    FieldRule("NUMBER_OF_APPLICATIONS", source="auto_calculated"),
+)
+
+
+# Batch 34: frequency tails for the other practice families that get
+# a repeated-application cadence. The element name differs per family
+# only so the rule-book → label rendering surfaces a contextual label
+# ("Fertigation Interval" / "Irrigation Interval" / "Repeat Interval").
+# All three share the same semantics: is_interval=True drives both the
+# validator's FREQUENCY_MISMATCH check and the handler's "interval
+# must produce ≥ 2 applications across the timeline" gate.
+_IRRIGATION_FREQUENCY_TAIL: tuple[FieldRule, ...] = (
+    FieldRule("IRRIGATION_INTERVAL", source="number_2dec", mandatory=True, is_interval=True),
+    FieldRule("NUMBER_OF_APPLICATIONS", source="auto_calculated"),
+)
+_INSTRUCTION_FREQUENCY_TAIL: tuple[FieldRule, ...] = (
+    FieldRule("REPEAT_INTERVAL", source="number_2dec", mandatory=True, is_interval=True),
+    FieldRule("NUMBER_OF_APPLICATIONS", source="auto_calculated"),
 )
 
 _FERTILIZER_RULES: dict[str, L2Spec] = {
@@ -512,11 +537,29 @@ _OTHER_NON_INPUT_RULES: dict[str, L2Spec] = {
         FieldRule("INSTRUCTIONS", source="text_area", mandatory=False),
     )),
 
-    "WATER_DRIP":      L2Spec(fields=_WATER_DURATION_FIELDS),
-    "WATER_SPRINKLER": L2Spec(fields=_WATER_DURATION_FIELDS),
-    "WATER_FURROW":    L2Spec(fields=_INSTRUCTIONS_ONLY_MANDATORY),
-    "WATER_FLOOD":     L2Spec(fields=_INSTRUCTIONS_ONLY_MANDATORY),
-    "WATER_BASIN":     L2Spec(fields=_INSTRUCTIONS_ONLY_MANDATORY),
+    # Batch 34: Irrigation practices repeat on an interval — every
+    # day, every 2 days, etc. SE sets IRRIGATION_INTERVAL; the modal
+    # surfaces NUMBER_OF_APPLICATIONS as read-only.
+    "WATER_DRIP":      L2Spec(
+        fields=(*_WATER_DURATION_FIELDS, *_IRRIGATION_FREQUENCY_TAIL),
+        frequency_based=True,
+    ),
+    "WATER_SPRINKLER": L2Spec(
+        fields=(*_WATER_DURATION_FIELDS, *_IRRIGATION_FREQUENCY_TAIL),
+        frequency_based=True,
+    ),
+    "WATER_FURROW":    L2Spec(
+        fields=(*_INSTRUCTIONS_ONLY_MANDATORY, *_IRRIGATION_FREQUENCY_TAIL),
+        frequency_based=True,
+    ),
+    "WATER_FLOOD":     L2Spec(
+        fields=(*_INSTRUCTIONS_ONLY_MANDATORY, *_IRRIGATION_FREQUENCY_TAIL),
+        frequency_based=True,
+    ),
+    "WATER_BASIN":     L2Spec(
+        fields=(*_INSTRUCTIONS_ONLY_MANDATORY, *_IRRIGATION_FREQUENCY_TAIL),
+        frequency_based=True,
+    ),
 
     "WEED_MANUAL": L2Spec(fields=_INSTRUCTIONS_ONLY_MANDATORY),
 
@@ -558,10 +601,18 @@ _OTHER_NON_INPUT_RULES: dict[str, L2Spec] = {
 # ── §2.7 General Instructions (1 L2) ────────────────────────────────────────
 
 _GENERAL_INSTRUCTIONS_RULES: dict[str, L2Spec] = {
-    "GENERAL_INSTRUCTIONS": L2Spec(fields=(
-        FieldRule("TITLE", source="text_area", mandatory=True),
-        FieldRule("INSTRUCTIONS", source="text_area", mandatory=False),
-    )),
+    # Batch 34: General Instructions can repeat at a fixed cadence
+    # (REPEAT_INTERVAL) the same way Fertigation and Irrigation do.
+    # SE picks "every day" / "every 2 days" / …; modal shows the
+    # computed NUMBER_OF_APPLICATIONS over the timeline window.
+    "GENERAL_INSTRUCTIONS": L2Spec(
+        fields=(
+            FieldRule("TITLE", source="text_area", mandatory=True),
+            FieldRule("INSTRUCTIONS", source="text_area", mandatory=False),
+            *_INSTRUCTION_FREQUENCY_TAIL,
+        ),
+        frequency_based=True,
+    ),
 }
 
 

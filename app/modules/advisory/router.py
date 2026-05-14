@@ -164,6 +164,91 @@ def _raise_l2_element_validation(e: L2ElementValidationError):
     )
 
 
+# ── Frequency-interval guard (Batch 34) ────────────────────────────────────
+#
+# Frequency-based L2s carry an INTERVAL element (FERTIGATION_INTERVAL /
+# IRRIGATION_INTERVAL / REPEAT_INTERVAL). The first application is
+# the day AFTER the timeline commences; subsequent applications fall
+# every `interval` days. Per user 2026-05-14, the interval must
+# produce ≥ 2 applications across the timeline window — if it'd
+# yield only one, the SE should use a non-frequency practice
+# instead. Formula:
+#
+#     duration  = |to_value - from_value|       (timeline span)
+#     N         = floor((duration - 1) / interval) + 1
+#
+# Rejected with `frequency_too_long` 422 when N < 2.
+
+def compute_number_of_applications(
+    from_value: int, to_value: int, interval: int,
+) -> int:
+    """Pure helper — kept module-public so tests and the eventual
+    farmer-advisory renderer can share the formula."""
+    duration = abs(to_value - from_value)
+    if interval <= 0 or duration < 1:
+        return 0
+    return (duration - 1) // interval + 1
+
+
+async def _assert_interval_fits_timeline(
+    db: AsyncSession, *,
+    l2_type: Optional[str], elements, timeline_id: str,
+) -> None:
+    """Raises 422 frequency_too_long when N < 2 for a frequency-based
+    L2. No-op for non-frequency L2s and when interval is missing /
+    unparseable (the L2 validator handles those error codes)."""
+    from app.services.l2_element_rules import get_l2_spec
+    if l2_type is None:
+        return
+    spec = get_l2_spec(l2_type)
+    if spec is None or not spec.frequency_based:
+        return
+    interval_field = next((f for f in spec.fields if f.is_interval), None)
+    if interval_field is None:
+        return
+    raw_value: Optional[str] = None
+    for e in elements:
+        et = e.element_type if hasattr(e, "element_type") else e.get("element_type")
+        if et != interval_field.name:
+            continue
+        v = e.value if hasattr(e, "value") else e.get("value")
+        raw_value = v if v is not None else None
+        break
+    if not raw_value:
+        return
+    try:
+        interval = int(str(raw_value).strip())
+    except (TypeError, ValueError):
+        return
+    timeline = (await db.execute(
+        select(Timeline).where(Timeline.id == timeline_id)
+    )).scalar_one_or_none()
+    if timeline is None:
+        return  # caller's 404 path will fire separately
+    n_apps = compute_number_of_applications(
+        from_value=timeline.from_value,
+        to_value=timeline.to_value,
+        interval=interval,
+    )
+    if n_apps < 2:
+        duration = abs(timeline.to_value - timeline.from_value)
+        raise HTTPException(status_code=422, detail={
+            "code": "frequency_too_long",
+            "message": (
+                f"Interval {interval} produces only {n_apps} application"
+                f"{'' if n_apps == 1 else 's'} across the timeline's "
+                f"{duration}-day window. Frequency practices repeat at "
+                f"least twice — either shorten the interval, lengthen "
+                f"the timeline, or use a non-frequency practice."
+            ),
+            "details": {
+                "interval": interval,
+                "timeline_duration_days": duration,
+                "number_of_applications": n_apps,
+            },
+        })
+
+
 # ── Element-level CRUD helpers (Round 2 — element-level authoring) ─────────
 
 def _element_row_to_in(row) -> ElementIn:
@@ -1477,6 +1562,11 @@ async def create_practice(
         )
     except L2ElementValidationError as e:
         _raise_l2_element_validation(e)
+    # Batch 34: frequency_too_long gate.
+    await _assert_interval_fits_timeline(
+        db, l2_type=request.l2_type,
+        elements=request.elements, timeline_id=timeline_id,
+    )
 
     practice = Practice(
         timeline_id=timeline_id,
@@ -1530,6 +1620,11 @@ async def update_practice(
         )
     except L2ElementValidationError as e:
         _raise_l2_element_validation(e)
+    # Batch 34: frequency_too_long gate.
+    await _assert_interval_fits_timeline(
+        db, l2_type=request.l2_type,
+        elements=request.elements, timeline_id=timeline_id,
+    )
 
     practice.l0_type = request.l0_type
     practice.l1_type = request.l1_type
@@ -3137,6 +3232,11 @@ async def create_global_practice(
         )
     except L2ElementValidationError as e:
         _raise_l2_element_validation(e)
+    # Batch 34: frequency_too_long gate.
+    await _assert_interval_fits_timeline(
+        db, l2_type=request.l2_type,
+        elements=request.elements, timeline_id=tl_id,
+    )
 
     practice = Practice(
         timeline_id=tl_id,
@@ -3198,6 +3298,11 @@ async def update_global_practice(
         )
     except L2ElementValidationError as e:
         _raise_l2_element_validation(e)
+    # Batch 34: frequency_too_long gate.
+    await _assert_interval_fits_timeline(
+        db, l2_type=request.l2_type,
+        elements=request.elements, timeline_id=tl_id,
+    )
 
     # Update the Practice scalar fields.
     practice.l0_type = request.l0_type

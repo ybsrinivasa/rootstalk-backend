@@ -326,7 +326,11 @@ async def test_frequency_mismatch_flagged():
     mismatches = [e for e in r.errors if e.code == "FREQUENCY_MISMATCH"]
     assert len(mismatches) == 1
     assert mismatches[0].details["practice_frequency_days"] == 5
-    assert mismatches[0].details["fertigation_interval"] == 7
+    # Batch 34: details key renamed from fertigation_interval →
+    # interval_value (generic across FERTIGATION/IRRIGATION/REPEAT
+    # interval fields).
+    assert mismatches[0].details["interval_value"] == 7
+    assert mismatches[0].details["interval_field"] == "FERTIGATION_INTERVAL"
 
 
 @pytest.mark.asyncio
