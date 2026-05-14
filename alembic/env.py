@@ -40,6 +40,7 @@ from app.modules.farmpundit.models import (
     ClientFarmPundit, PunditInvitation, Query, QueryMedia,
     QueryRemark, QueryResponse, StandardResponse,
 )
+from app.modules.diagnosis.models import DiagnosisSession  # noqa: F401
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.database_url_sync)

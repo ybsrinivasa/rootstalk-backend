@@ -26,7 +26,7 @@ from app.modules.advisory.models import (
     PGRecommendation, SPRecommendation,
 )
 from app.modules.clients.models import ClientCrop
-from app.modules.farmpundit.diagnosis_router import (
+from app.modules.diagnosis.router import (
     get_diagnosis_eligibility,
 )
 from app.modules.subscriptions.models import (
@@ -61,7 +61,7 @@ async def _seed_subscribed_farmer(db, *, crop_cosh_id="crop:test"):
 @requires_docker
 @pytest.mark.asyncio
 async def test_eligibility_true_when_belt_and_cha_both_active(db):
-    from app.modules.farmpundit.diagnosis_router import get_diagnosis_eligibility
+    from app.modules.diagnosis.router import get_diagnosis_eligibility
     client, farmer, sub = await _seed_subscribed_farmer(db)
     # Enable CHA on the crop.
     db.add(CropHealthCrop(crop_cosh_id="crop:test", status="ACTIVE"))
@@ -79,7 +79,7 @@ async def test_eligibility_blocks_when_crop_off_belt(db):
     """CA soft-removes the crop after the farmer subscribes — the
     subscription stays per Batch 1A, but the Diagnose button
     must grey on the farmer's app."""
-    from app.modules.farmpundit.diagnosis_router import get_diagnosis_eligibility
+    from app.modules.diagnosis.router import get_diagnosis_eligibility
     from sqlalchemy import select as _sel
     client, farmer, sub = await _seed_subscribed_farmer(db)
     db.add(CropHealthCrop(crop_cosh_id="crop:test", status="ACTIVE"))
@@ -103,7 +103,7 @@ async def test_eligibility_blocks_when_crop_off_belt(db):
 @pytest.mark.asyncio
 async def test_eligibility_blocks_when_cha_not_enabled(db):
     """Crop is on the belt but RootsTalk hasn't enabled CHA on it."""
-    from app.modules.farmpundit.diagnosis_router import get_diagnosis_eligibility
+    from app.modules.diagnosis.router import get_diagnosis_eligibility
     client, farmer, sub = await _seed_subscribed_farmer(db)
     # No CropHealthCrop row at all → cha_not_enabled.
     out = await get_diagnosis_eligibility(
@@ -119,7 +119,7 @@ async def test_eligibility_404s_for_other_farmers_subscription(db):
     """Defence: a farmer can't query eligibility for someone else's
     subscription_id. Symmetry with start_diagnosis's ownership gate."""
     from fastapi import HTTPException
-    from app.modules.farmpundit.diagnosis_router import get_diagnosis_eligibility
+    from app.modules.diagnosis.router import get_diagnosis_eligibility
     _, farmer1, sub = await _seed_subscribed_farmer(db)
     farmer2 = await make_user(db, name="Other Farmer")
     await db.commit()

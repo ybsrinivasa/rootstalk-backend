@@ -17,7 +17,7 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import select
 
-from app.modules.farmpundit.diagnosis_router import (
+from app.modules.diagnosis.router import (
     ReferenceImagesRequest, get_reference_images,
 )
 from app.modules.sync.models import CoshConnectRow, CoshCoreItem

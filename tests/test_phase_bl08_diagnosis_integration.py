@@ -12,7 +12,7 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
 
-from app.modules.farmpundit.diagnosis_router import (
+from app.modules.diagnosis.router import (
     AnswerRequest, DiagnosisSession, ExplainSymptomRequest,
     StartDiagnosisRequest, answer_question, explain_symptom_route,
     start_diagnosis,
@@ -348,7 +348,7 @@ async def test_priority_rank_translation_fallback(db):
 
     # Rank loaded via the fallback parses "1" → 1; the diagnosis
     # algorithm sees rank=1 on the first row, no rank on the second.
-    from app.modules.farmpundit.diagnosis_router import (
+    from app.modules.diagnosis.router import (
         _load_problem_symptom_rows,
     )
     rows = await _load_problem_symptom_rows(db, CROP, STAGE)
