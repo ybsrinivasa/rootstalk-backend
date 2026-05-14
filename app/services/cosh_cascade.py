@@ -90,11 +90,15 @@ async def brands_for_common_name_and_manufacturer(
     common_name_cosh_id: Optional[str],
     manufacturer_name: Optional[str],
 ) -> list[CascadeOption]:
-    """Brand options for a (CNI, manufacturer name) pair. Match on
-    manufacturer_name is case-insensitive. Sorted by display label."""
-    if not common_name_cosh_id or not manufacturer_name:
+    """Brand options under a CNI. The `manufacturer_name` filter is
+    OPTIONAL (Batch 24, 2026-05-14): when supplied, narrows to
+    brands made by that manufacturer (case-insensitive match); when
+    None, returns the full set of CN's brands. This mirrors the new
+    Add-Practice contract where MFR and BRAND_NAME are independent
+    optional peers. Sorted by display label."""
+    if not common_name_cosh_id:
         return []
-    target = manufacturer_name.lower()
+    target = manufacturer_name.lower() if manufacturer_name else None
     result = await db.execute(
         select(CoshCoreItem).where(
             CoshCoreItem.core_type == "brand",
@@ -105,7 +109,7 @@ async def brands_for_common_name_and_manufacturer(
     options: list[CascadeOption] = []
     for row in result.scalars().all():
         meta = row.metadata_ or {}
-        if (meta.get("manufacturer_name") or "").lower() != target:
+        if target is not None and (meta.get("manufacturer_name") or "").lower() != target:
             continue
         label = (row.translations or {}).get("en") or row.cosh_id
         options.append(CascadeOption(value=row.cosh_id, label=label))
@@ -194,7 +198,11 @@ async def list_core_options(
 
 CASCADE_INPUTS: dict[str, tuple[str, ...]] = {
     "manufacturers_for_common_name":           ("COMMON_NAME",),
-    "brands_for_common_name_and_manufacturer": ("COMMON_NAME", "MANUFACTURER"),
+    # Batch 24: MANUFACTURER is now an optional cross-filter, not a
+    # required upstream. Listed as ("COMMON_NAME",) to match the
+    # rule book; MANUFACTURER (when set) is consumed via inputs.get
+    # at dispatch time.
+    "brands_for_common_name_and_manufacturer": ("COMMON_NAME",),
     "formulation_for_brand":                   ("BRAND_NAME",),
     "ai_concentration_for_brand":              ("BRAND_NAME",),
 }

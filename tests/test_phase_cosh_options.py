@@ -333,6 +333,75 @@ async def test_manufacturers_walk_common_name_to_trade_names(db):
     assert [m["name"] for m in out2] == ["Syngenta"]
 
 
+# ── Bidirectional MFR ↔ TN filtering (Batch 24) ───────────────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_trade_names_narrowed_by_manufacturer(db):
+    """When MFR is supplied, trade-names list shrinks to that MFR's
+    brands (intersected with CN's set)."""
+    await _seed_brand_cascade_data(db)
+    # Imidacloprid has Confidor (Bayer) + Tatamida (Tata). Filter by Bayer
+    # → only Confidor.
+    bayer = await list_trade_names_for_common_name(
+        db, "cn:imidacloprid", manufacturer_cosh_id="mfr:bayer",
+    )
+    assert [t["name"] for t in bayer] == ["Confidor"]
+    # Filter by Tata → only Tatamida.
+    tata = await list_trade_names_for_common_name(
+        db, "cn:imidacloprid", manufacturer_cosh_id="mfr:tata",
+    )
+    assert [t["name"] for t in tata] == ["Tatamida"]
+    # Filter by an MFR that doesn't make any of CN's brands → empty.
+    syngenta = await list_trade_names_for_common_name(
+        db, "cn:imidacloprid", manufacturer_cosh_id="mfr:syngenta",
+    )
+    assert syngenta == []
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_manufacturers_narrowed_by_trade_name(db):
+    """When TN is supplied, manufacturers list shrinks to the single
+    maker of that brand."""
+    await _seed_brand_cascade_data(db)
+    bayer_only = await list_manufacturers_for_common_name(
+        db, "cn:imidacloprid", trade_name_cosh_id="tn:confidor",
+    )
+    assert [m["name"] for m in bayer_only] == ["Bayer"]
+    tata_only = await list_manufacturers_for_common_name(
+        db, "cn:imidacloprid", trade_name_cosh_id="tn:tatamida",
+    )
+    assert [m["name"] for m in tata_only] == ["Tata Rallis"]
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_manufacturers_with_mismatched_trade_name_returns_empty(db):
+    """Defence: if caller passes a TN that isn't in CN's brand set
+    (e.g. stale form state), we return empty rather than leaking a
+    cross-CN manufacturer."""
+    await _seed_brand_cascade_data(db)
+    # tn:vertimec is abamectin's brand, not imidacloprid's. Asking
+    # for imidacloprid manufacturers with vertimec filter → empty.
+    out = await list_manufacturers_for_common_name(
+        db, "cn:imidacloprid", trade_name_cosh_id="tn:vertimec",
+    )
+    assert out == []
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_unfiltered_calls_unchanged_after_optional_params(db):
+    """Backward-compat: callers that pass only `common_name` (no
+    cross-filter) get the same Batch 19 behaviour."""
+    await _seed_brand_cascade_data(db)
+    tns = await list_trade_names_for_common_name(db, "cn:imidacloprid")
+    assert sorted(t["name"] for t in tns) == ["Confidor", "Tatamida"]
+    mfrs = await list_manufacturers_for_common_name(db, "cn:imidacloprid")
+    assert sorted(m["name"] for m in mfrs) == ["Bayer", "Tata Rallis"]
+
+
 @requires_docker
 @pytest.mark.asyncio
 async def test_formulations_span_common_name_when_no_trade_name(db):

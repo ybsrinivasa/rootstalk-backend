@@ -203,20 +203,71 @@ async def _trade_names_for_common_name(
     return tn_ids
 
 
+async def _trade_names_for_manufacturer(
+    db: AsyncSession, manufacturer_cosh_id: str,
+) -> set[str]:
+    """Internal: set of trade_name cosh_ids made by the given
+    manufacturer."""
+    rows = await _walk_connect(
+        db, connect_type=COSH_TRADENAME_MANUFACTURER_CONNECT,
+    )
+    tn_ids: set[str] = set()
+    for r in rows:
+        ep = {e.get("role"): e.get("cosh_id") for e in (r.endpoints or [])}
+        if ep.get(COSH_INPUT_MANUFACTURERS_CORE) != manufacturer_cosh_id:
+            continue
+        tn = ep.get(COSH_TRADE_NAMES_CORE)
+        if tn:
+            tn_ids.add(tn)
+    return tn_ids
+
+
 async def list_trade_names_for_common_name(
-    db: AsyncSession, common_name_cosh_id: str,
+    db: AsyncSession,
+    common_name_cosh_id: str,
+    manufacturer_cosh_id: Optional[str] = None,
 ) -> list[dict]:
+    """Trade names available for the given common name. When
+    `manufacturer_cosh_id` is supplied, narrows to trade names made
+    by that manufacturer (intersection of CN's trade names and the
+    manufacturer's brands). When omitted, returns the full set of
+    CN's trade names — same as Batch 19 behaviour.
+
+    Used by the bidirectional MFR ↔ TN filter on the Add Practice
+    modal (Batch 24): expert can land on a trade name either by
+    drilling down from a manufacturer they remember, or by picking
+    the brand directly without ever touching the manufacturer."""
     tn_ids = await _trade_names_for_common_name(db, common_name_cosh_id)
+    if manufacturer_cosh_id:
+        tn_ids &= await _trade_names_for_manufacturer(
+            db, manufacturer_cosh_id,
+        )
     return await _resolve_names(
         db, core_type=COSH_TRADE_NAMES_CORE, cosh_ids=tn_ids,
     )
 
 
 async def list_manufacturers_for_common_name(
-    db: AsyncSession, common_name_cosh_id: str,
+    db: AsyncSession,
+    common_name_cosh_id: str,
+    trade_name_cosh_id: Optional[str] = None,
 ) -> list[dict]:
-    """Walk: common_name → trade names → manufacturers (dedup)."""
+    """Manufacturers in scope for the given common name. When
+    `trade_name_cosh_id` is supplied, narrows to the single
+    manufacturer that makes that trade name (and only if that brand
+    is itself in the CN's set — defends against caller mismatches).
+    When omitted, returns the full CN-scope set — same as Batch 19.
+
+    Walk: common_name → trade names → manufacturers (dedup); then
+    optionally intersect with the {manufacturer of trade_name}."""
     tn_ids = await _trade_names_for_common_name(db, common_name_cosh_id)
+    if trade_name_cosh_id:
+        # Defensive: only include the manufacturer if the trade_name
+        # is actually one of CN's brands (caller might pass a stale
+        # combo from a parallel form update).
+        if trade_name_cosh_id not in tn_ids:
+            return []
+        tn_ids = {trade_name_cosh_id}
     if not tn_ids:
         return []
     rows = await _walk_connect(

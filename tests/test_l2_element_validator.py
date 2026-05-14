@@ -70,14 +70,20 @@ async def test_missing_mandatory_fields_flagged():
 
 
 # ── mandatory_if_set ────────────────────────────────────────────────────────
+#
+# The legacy "BRAND_NAME mandatory_if_set=(MANUFACTURER,)" rule was
+# dropped in Batch 24 (2026-05-14, per user). MFR and BRAND_NAME are
+# now independent optional peers — bidirectional cascade in the UI,
+# but no validator constraint between them.
 
 @pytest.mark.asyncio
-async def test_brand_mandatory_when_manufacturer_set():
-    """If MANUFACTURER is filled, BRAND_NAME becomes mandatory."""
+async def test_brand_optional_even_when_manufacturer_set():
+    """MFR set without BRAND_NAME → still valid; no MISSING_CONDITIONAL."""
     elements = [
         el("COMMON_NAME", cosh_ref="cn:imida"),
         el("MANUFACTURER", cosh_ref="Bayer"),
-        # BRAND_NAME omitted
+        # BRAND_NAME omitted on purpose — expert remembers the maker
+        # but not the brand; this used to error, now it doesn't.
         el("APPLICATION_METHOD", cosh_ref="am:foliar_spray"),
         el("DOSAGE", value="0.5"),
         el("DOSAGE_UNIT", cosh_ref="du:ml_per_l"),
@@ -95,10 +101,7 @@ async def test_brand_mandatory_when_manufacturer_set():
         r = await validate_l2_elements(
             db=None, l2_type="CHEMICAL_PESTICIDES", elements=elements,
         )
-    conditional = [e for e in r.errors if e.code == "MISSING_CONDITIONAL"]
-    assert len(conditional) == 1
-    assert conditional[0].field_name == "BRAND_NAME"
-    assert conditional[0].details["because"] == "MANUFACTURER"
+    assert not any(e.code == "MISSING_CONDITIONAL" for e in r.errors), r.errors
 
 
 @pytest.mark.asyncio
@@ -176,7 +179,7 @@ async def test_auto_selected_must_match_cascade_output():
         ("manufacturers_for_common_name", frozenset({("COMMON_NAME", "cn:imida")})):
             [CascadeOption("Bayer", "Bayer")],
         ("brands_for_common_name_and_manufacturer",
-         frozenset({("COMMON_NAME", "cn:imida"), ("MANUFACTURER", "Bayer")})):
+         frozenset({("COMMON_NAME", "cn:imida")})):
             [CascadeOption("brand:confidor", "Confidor")],
         ("formulation_for_brand", frozenset({("BRAND_NAME", "brand:confidor")})):
             [CascadeOption("form:SC", "SC")],
@@ -216,7 +219,7 @@ async def test_auto_selected_missing_when_upstream_complete():
         ("manufacturers_for_common_name", frozenset({("COMMON_NAME", "cn:imida")})):
             [CascadeOption("Bayer", "Bayer")],
         ("brands_for_common_name_and_manufacturer",
-         frozenset({("COMMON_NAME", "cn:imida"), ("MANUFACTURER", "Bayer")})):
+         frozenset({("COMMON_NAME", "cn:imida")})):
             [CascadeOption("brand:confidor", "Confidor")],
         ("formulation_for_brand", frozenset({("BRAND_NAME", "brand:confidor")})):
             [CascadeOption("form:SC", "SC")],
@@ -436,7 +439,7 @@ async def test_full_chemical_pesticide_happy_path():
         ("manufacturers_for_common_name", frozenset({("COMMON_NAME", "cn:imida")})):
             [CascadeOption("Bayer", "Bayer")],
         ("brands_for_common_name_and_manufacturer",
-         frozenset({("COMMON_NAME", "cn:imida"), ("MANUFACTURER", "Bayer")})):
+         frozenset({("COMMON_NAME", "cn:imida")})):
             [CascadeOption("brand:confidor", "Confidor")],
         ("formulation_for_brand", frozenset({("BRAND_NAME", "brand:confidor")})):
             [CascadeOption("form:SC", "SC")],

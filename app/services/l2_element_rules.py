@@ -128,6 +128,14 @@ COSH_CASCADE_LOOKUPS: frozenset[str] = frozenset({
 
 _INPUT_BRAND_TRIPLET: tuple[FieldRule, ...] = (
     FieldRule("COMMON_NAME", source="cosh_core:common_name", mandatory=True),
+    # MANUFACTURER and BRAND_NAME are independent optional peers under
+    # COMMON_NAME. Either can be set without the other (Batch 24
+    # 2026-05-14): a seed-focused company may want to recommend a
+    # CN + formulation without binding to a specific brand, while
+    # another expert may remember the brand without the manufacturer.
+    # The frontend bidirectionally filters each list by the other's
+    # current value — see /cosh/options/{trade-names,manufacturers}
+    # which both accept the cross-filter query param.
     FieldRule(
         "MANUFACTURER",
         source="cosh_cascade:manufacturers_for_common_name",
@@ -136,8 +144,7 @@ _INPUT_BRAND_TRIPLET: tuple[FieldRule, ...] = (
     FieldRule(
         "BRAND_NAME",
         source="cosh_cascade:brands_for_common_name_and_manufacturer",
-        mandatory_if_set=("MANUFACTURER",),
-        cascade_from=("COMMON_NAME", "MANUFACTURER"),
+        cascade_from=("COMMON_NAME",),
     ),
 )
 

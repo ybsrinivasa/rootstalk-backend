@@ -2564,21 +2564,34 @@ async def cosh_units_for_l2(
 @router.get("/cosh/options/trade-names")
 async def cosh_trade_names_for_common_name(
     common_name: str,
+    manufacturer: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Trade names for a common name. Optional `manufacturer` narrows
+    the list to brands made by that manufacturer — used by the
+    bidirectional MFR ↔ TN filter on the Add Practice modal."""
     from app.services.cosh_options_view import list_trade_names_for_common_name
-    return await list_trade_names_for_common_name(db, common_name)
+    return await list_trade_names_for_common_name(
+        db, common_name, manufacturer_cosh_id=manufacturer,
+    )
 
 
 @router.get("/cosh/options/manufacturers")
 async def cosh_manufacturers_for_common_name(
     common_name: str,
+    trade_name: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Manufacturers in scope for a common name. Optional `trade_name`
+    narrows the list to the single manufacturer that makes that
+    brand — used by the bidirectional MFR ↔ TN filter on the Add
+    Practice modal."""
     from app.services.cosh_options_view import list_manufacturers_for_common_name
-    return await list_manufacturers_for_common_name(db, common_name)
+    return await list_manufacturers_for_common_name(
+        db, common_name, trade_name_cosh_id=trade_name,
+    )
 
 
 @router.get("/cosh/options/formulations")
