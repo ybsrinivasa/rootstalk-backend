@@ -75,12 +75,11 @@ def test_dbs_sign_zero_from_fails():
     assert ei.value.code == "timeline_invalid_sign"
 
 
-def test_dbs_sign_zero_to_fails():
-    """DBS to=0 means "ends at crop start" — boundary edge case
-    that's ambiguous with DAS from=0. Reject."""
-    with pytest.raises(TimelineValidationError) as ei:
-        validate_timeline_sign(from_type="DBS", from_value=10, to_value=0)
-    assert ei.value.code == "timeline_invalid_sign"
+def test_dbs_sign_zero_to_passes():
+    """Batch 39F (2026-05-15) per user spec: DBS to=0 means "ends at
+    the sowing moment" — the closing boundary that dovetails with
+    DAS from=0 (no overlap, no gap). Allowed."""
+    validate_timeline_sign(from_type="DBS", from_value=10, to_value=0)
 
 
 def test_dbs_sign_negative_fails():

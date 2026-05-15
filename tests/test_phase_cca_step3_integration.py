@@ -190,10 +190,34 @@ async def test_create_dbs_on_perennial_422(db):
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_create_dbs_with_zero_value_422(db):
-    """Spec: DBS values must be strictly positive (days BEFORE
-    crop start). from=0 means "0 days before" = the start day,
-    which is DAS territory."""
+async def test_create_dbs_with_zero_to_passes(db):
+    """Batch 39F (2026-05-15) per user spec: DBS to=0 is the closing
+    boundary at the sowing moment — adjacent to DAS from=0 with no
+    overlap. from_value must still be strictly positive (DBS from=0
+    would be DAS territory)."""
+    client = await make_client(db)
+    user = await make_user(db, name="Expert")
+    pkg = await _annual_paddy_package(db, client=client, user=user)
+
+    out = await create_timeline(
+        client_id=client.id, package_id=pkg.id,
+        request=TimelineCreate(
+            name="PreSowing", from_type=TimelineFromType.DBS,
+            from_value=10, to_value=0,
+        ),
+        db=db, current_user=user,
+    )
+    assert out.from_type == TimelineFromType.DBS
+    assert out.from_value == 10
+    assert out.to_value == 0
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_create_dbs_with_zero_from_still_422(db):
+    """DBS from=0 stays rejected — that's the sowing moment, which
+    DAS from=0 expresses. Two ways to author the same boundary would
+    create ambiguity."""
     client = await make_client(db)
     user = await make_user(db, name="Expert")
     pkg = await _annual_paddy_package(db, client=client, user=user)
@@ -202,12 +226,14 @@ async def test_create_dbs_with_zero_value_422(db):
         await create_timeline(
             client_id=client.id, package_id=pkg.id,
             request=TimelineCreate(
-                name="Zero", from_type=TimelineFromType.DBS,
-                from_value=10, to_value=0,
+                name="ZeroFrom", from_type=TimelineFromType.DBS,
+                from_value=0, to_value=0,
             ),
             db=db, current_user=user,
         )
-    assert ei.value.detail["code"] == "timeline_invalid_sign"
+    # Direction fires first when from == to; that's a clear enough
+    # error and still pins the rule.
+    assert ei.value.detail["code"] in ("timeline_invalid_sign", "timeline_invalid_direction")
 
 
 @requires_docker

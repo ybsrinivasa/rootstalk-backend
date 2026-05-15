@@ -11,7 +11,11 @@ Three rules from spec §5 enforced together at create / update / import:
    `from_type` is one enum value per Timeline, so cross-spanning a
    single Timeline isn't representable. The remaining gap is the
    *sign* of the values inside one type:
-   - DBS: both values strictly positive (days BEFORE start).
+   - DBS: from_value strictly positive (days BEFORE start),
+     to_value non-negative. `to_value=0` is allowed and means
+     "ends at the moment of sowing" — the closing boundary that
+     dovetails with DAS `from_value=0` (no overlap, no gap).
+     Batch 39F (2026-05-15) per user spec.
    - DAS: both values non-negative (start day onwards; from=0 is
      the start day).
    - CALENDAR: no sign rule (values are day-of-year ints).
@@ -73,14 +77,23 @@ def validate_timeline_direction(
 def validate_timeline_sign(
     *, from_type: str, from_value: int, to_value: int,
 ) -> None:
-    """DBS: both values strictly positive. DAS: both values
-    non-negative. CALENDAR: passes through (day-of-year semantics)."""
+    """DBS: from_value strictly positive, to_value non-negative
+    (Batch 39F — `to_value=0` is the closing boundary at the sowing
+    moment; the corresponding DAS `from_value=0` starts the next
+    instant, so no overlap). DAS: both values non-negative. CALENDAR:
+    passes through (day-of-year semantics)."""
     if from_type == FROM_TYPE_DBS:
-        if from_value <= 0 or to_value <= 0:
+        if from_value <= 0:
             raise TimelineValidationError(
                 "timeline_invalid_sign",
-                "DBS timeline values must be strictly positive (days "
-                "before crop start). Use DAS for the start day onwards.",
+                "DBS timeline `from_value` must be strictly positive "
+                "(days before crop start). Use DAS for the start day.",
+            )
+        if to_value < 0:
+            raise TimelineValidationError(
+                "timeline_invalid_sign",
+                "DBS timeline `to_value` cannot be negative. Use 0 to "
+                "close the DBS window at the sowing moment.",
             )
     elif from_type == FROM_TYPE_DAS:
         if from_value < 0 or to_value < 0:
