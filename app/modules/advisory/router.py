@@ -3475,6 +3475,21 @@ async def cosh_formulations(
     )
 
 
+@router.get("/cosh/options/incomplete-report")
+async def cosh_incomplete_report(
+    l2: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SA-facing audit of Cosh-side data gaps under the given L2's
+    completeness spec. Returns every CN under this L2 with each TN's
+    list of missing required connects. Use it to spot what needs to
+    be filled in on the Cosh side so the authoring dropdowns surface
+    more CNs."""
+    from app.services.cosh_options_view import list_incomplete_cosh_data_for_l2
+    return await list_incomplete_cosh_data_for_l2(db, l2)
+
+
 @router.get("/cosh/options/ai-concentrations")
 async def cosh_ai_concentrations(
     common_name: Optional[str] = None,

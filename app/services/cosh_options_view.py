@@ -171,6 +171,147 @@ async def _trade_names_in_connect(
     return out
 
 
+async def list_incomplete_cosh_data_for_l2(
+    db: AsyncSession, l2_type: str,
+) -> dict:
+    """Per-CN / per-TN completeness report — Batch 39D-report.
+
+    Mirrors the completeness logic but emits the data instead of
+    filtering. Per Common Name under the L2, lists every Trade Name
+    and which of the L2's required Cosh connects are missing on it.
+    The SA uses this to spot Cosh-side gaps and prioritise fixes.
+
+    Response shape::
+
+      {
+        "l2_type": "...",
+        "applicable": True | False,    # False = L2 has no spec
+        "required":   ["manufacturer", "formulation", "ai"],
+        "common_names": [
+          {
+            "cosh_id": "...",
+            "name":    "Imidacloprid",
+            "trade_names": [
+              {"cosh_id": "...", "name": "Confidor", "missing": []},
+              {"cosh_id": "...", "name": "Brand X",  "missing": ["formulation","ai"]}
+            ],
+            "has_complete_tn": True,    # ≥ 1 TN has every required connect
+            "no_trade_names":  False    # CN has no TN at all (orphan CN)
+          },
+          ...
+        ]
+      }
+    """
+    req = L2_COMPLETENESS_REQUIREMENTS.get(l2_type)
+    if not req:
+        return {
+            "l2_type": l2_type,
+            "applicable": False,
+            "required": [],
+            "common_names": [],
+        }
+    l2_uuid = _l2_uuid(l2_type)
+    if l2_uuid is None:
+        return {
+            "l2_type": l2_type,
+            "applicable": True,
+            "required": sorted(req),
+            "common_names": [],
+        }
+
+    # CNs under this L2 (active only — names resolved below).
+    cn_l2_rows = await _walk_connect(db, connect_type=COSH_COMMONNAMES_L2_CONNECT)
+    cn_ids: set[str] = set()
+    for r in cn_l2_rows:
+        ep = {e.get("role"): e.get("cosh_id") for e in (r.endpoints or [])}
+        if ep.get(COSH_L2_DATA_CORE) != l2_uuid:
+            continue
+        cn = ep.get(COSH_COMMON_NAMES_CORE)
+        if cn:
+            cn_ids.add(cn)
+
+    # Resolve active CN names.
+    cn_names: dict[str, str] = {}
+    if cn_ids:
+        cn_cores = (await db.execute(
+            select(CoshCoreItem).where(
+                CoshCoreItem.core_type == COSH_COMMON_NAMES_CORE,
+                CoshCoreItem.cosh_id.in_(cn_ids),
+                CoshCoreItem.status == "active",
+            )
+        )).scalars().all()
+        for c in cn_cores:
+            cn_names[c.cosh_id] = _translation_en(c, c.cosh_id)
+
+    # Per-required TN sets (all TN cosh_ids that appear in each connect).
+    tns_in_connect: dict[str, set[str]] = {}
+    for r in req:
+        tns_in_connect[r] = await _trade_names_in_connect(
+            db, _REQUIREMENT_TO_CONNECT[r],
+        )
+
+    # CN → TN mapping via tradename_commonname.
+    cn_to_tns: dict[str, set[str]] = {}
+    all_tn_ids: set[str] = set()
+    tncn_rows = await _walk_connect(
+        db, connect_type=COSH_TRADENAME_COMMONNAME_CONNECT,
+    )
+    for r in tncn_rows:
+        ep = {e.get("role"): e.get("cosh_id") for e in (r.endpoints or [])}
+        tn = ep.get(COSH_TRADE_NAMES_CORE)
+        cn = ep.get(COSH_COMMON_NAMES_CORE)
+        if tn and cn:
+            cn_to_tns.setdefault(cn, set()).add(tn)
+            all_tn_ids.add(tn)
+
+    # Resolve active TN names.
+    tn_names: dict[str, str] = {}
+    if all_tn_ids:
+        tn_cores = (await db.execute(
+            select(CoshCoreItem).where(
+                CoshCoreItem.core_type == COSH_TRADE_NAMES_CORE,
+                CoshCoreItem.cosh_id.in_(all_tn_ids),
+                CoshCoreItem.status == "active",
+            )
+        )).scalars().all()
+        for c in tn_cores:
+            tn_names[c.cosh_id] = _translation_en(c, c.cosh_id)
+
+    common_names: list[dict] = []
+    for cn_id in cn_ids:
+        if cn_id not in cn_names:
+            continue
+        tns = cn_to_tns.get(cn_id, set())
+        tn_details: list[dict] = []
+        has_complete = False
+        for tn_id in tns:
+            if tn_id not in tn_names:
+                continue
+            missing = [r for r in req if tn_id not in tns_in_connect[r]]
+            tn_details.append({
+                "cosh_id": tn_id,
+                "name": tn_names[tn_id],
+                "missing": sorted(missing),
+            })
+            if not missing:
+                has_complete = True
+        tn_details.sort(key=lambda x: x["name"].casefold())
+        common_names.append({
+            "cosh_id": cn_id,
+            "name": cn_names[cn_id],
+            "trade_names": tn_details,
+            "has_complete_tn": has_complete,
+            "no_trade_names": len(tn_details) == 0,
+        })
+    common_names.sort(key=lambda x: x["name"].casefold())
+    return {
+        "l2_type": l2_type,
+        "applicable": True,
+        "required": sorted(req),
+        "common_names": common_names,
+    }
+
+
 async def _complete_trade_names_for_l2(
     db: AsyncSession, l2_type: Optional[str],
 ) -> Optional[set[str]]:

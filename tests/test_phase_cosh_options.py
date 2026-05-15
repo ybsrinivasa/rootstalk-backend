@@ -38,6 +38,7 @@ from app.services.cosh_options_view import (
     list_application_methods_for_l2,
     list_common_names_for_l2,
     list_formulations,
+    list_incomplete_cosh_data_for_l2,
     list_manufacturers_for_common_name,
     list_trade_names_for_common_name,
     list_units_for_l2,
@@ -714,3 +715,96 @@ async def test_completeness_filter_omitted_l2_disables_filter(db, monkeypatch):
     # No l2_type → no filter. HalfBrand surfaces even without M/F/AI.
     out = await list_trade_names_for_common_name(db, "cn:imid")
     assert [t["name"] for t in out] == ["HalfBrand"]
+
+
+# ── Batch 39D-report — incomplete-report endpoint ──────────────────────────
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_incomplete_report_marks_missing_connects(db, monkeypatch):
+    """The report lists every CN under the L2 with each TN's set of
+    missing connects, plus per-CN summary flags has_complete_tn and
+    no_trade_names. SA uses this to spot Cosh-side gaps."""
+    _restore_completeness_spec(monkeypatch, {
+        "CHEMICAL_PESTICIDES": frozenset({"manufacturer", "formulation", "ai"}),
+    })
+    db.add(_core("cn:imid", COSH_COMMON_NAMES_CORE, "Imidacloprid"))
+    db.add(_core("cn:acephate", COSH_COMMON_NAMES_CORE, "Acephate"))
+    db.add(_core("cn:orphan", COSH_COMMON_NAMES_CORE, "Orphan CN"))
+    db.add(_core("tn:confidor", COSH_TRADE_NAMES_CORE, "Confidor"))
+    db.add(_core("tn:half", COSH_TRADE_NAMES_CORE, "HalfBrand"))
+    db.add(_core("mfr:bayer", COSH_INPUT_MANUFACTURERS_CORE, "Bayer"))
+    db.add(_core("mfr:upl", COSH_INPUT_MANUFACTURERS_CORE, "UPL"))
+    db.add(_core("f:wp", COSH_FORMULATIONS_CORE, "WP"))
+    db.add(_core("ai:17.8%", COSH_AI_CORE, "17.8%"))
+    for cn in ("cn:imid", "cn:acephate", "cn:orphan"):
+        db.add(_connect2(
+            f"cncn-{cn}", COSH_COMMONNAMES_L2_CONNECT,
+            COSH_COMMON_NAMES_CORE, cn,
+            COSH_L2_DATA_CORE, CHEM_PEST_L2_UUID,
+        ))
+    # Confidor has full M+F+AI for cn:imid. HalfBrand only has M for
+    # cn:acephate. cn:orphan has no TN at all.
+    db.add(_connect2(
+        "tncn-1", COSH_TRADENAME_COMMONNAME_CONNECT,
+        COSH_TRADE_NAMES_CORE, "tn:confidor",
+        COSH_COMMON_NAMES_CORE, "cn:imid",
+    ))
+    db.add(_connect2(
+        "tncn-2", COSH_TRADENAME_COMMONNAME_CONNECT,
+        COSH_TRADE_NAMES_CORE, "tn:half",
+        COSH_COMMON_NAMES_CORE, "cn:acephate",
+    ))
+    db.add(_connect2(
+        "tnmfr-1", COSH_TRADENAME_MANUFACTURER_CONNECT,
+        COSH_TRADE_NAMES_CORE, "tn:confidor",
+        COSH_INPUT_MANUFACTURERS_CORE, "mfr:bayer",
+    ))
+    db.add(_connect2(
+        "tnmfr-2", COSH_TRADENAME_MANUFACTURER_CONNECT,
+        COSH_TRADE_NAMES_CORE, "tn:half",
+        COSH_INPUT_MANUFACTURERS_CORE, "mfr:upl",
+    ))
+    db.add(_connect2(
+        "tnf-1", COSH_TRADENAME_FORMULATION_CONNECT,
+        COSH_TRADE_NAMES_CORE, "tn:confidor",
+        COSH_FORMULATIONS_CORE, "f:wp",
+    ))
+    db.add(_connect2(
+        "tnai-1", COSH_TRADENAME_AI_CONNECT,
+        COSH_TRADE_NAMES_CORE, "tn:confidor",
+        COSH_AI_CORE, "ai:17.8%",
+    ))
+    await db.commit()
+
+    report = await list_incomplete_cosh_data_for_l2(db, "CHEMICAL_PESTICIDES")
+    assert report["applicable"] is True
+    assert report["required"] == ["ai", "formulation", "manufacturer"]
+    cns = {cn["name"]: cn for cn in report["common_names"]}
+    assert set(cns.keys()) == {"Acephate", "Imidacloprid", "Orphan CN"}
+    # Imidacloprid → Confidor complete
+    assert cns["Imidacloprid"]["has_complete_tn"] is True
+    assert cns["Imidacloprid"]["no_trade_names"] is False
+    confidor = next(t for t in cns["Imidacloprid"]["trade_names"] if t["name"] == "Confidor")
+    assert confidor["missing"] == []
+    # Acephate → HalfBrand missing F+AI
+    assert cns["Acephate"]["has_complete_tn"] is False
+    half = next(t for t in cns["Acephate"]["trade_names"] if t["name"] == "HalfBrand")
+    assert half["missing"] == ["ai", "formulation"]
+    # Orphan CN → no TN at all
+    assert cns["Orphan CN"]["no_trade_names"] is True
+    assert cns["Orphan CN"]["trade_names"] == []
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_incomplete_report_l2_not_in_spec_returns_applicable_false(db):
+    """L2 with no completeness spec (e.g. NPK Dosages) returns
+    applicable=False so the UI can label it 'no filter for this L2'."""
+    report = await list_incomplete_cosh_data_for_l2(
+        db, "CHEMICAL_FERTILIZERS_NPK_DOSAGES",
+    )
+    assert report["applicable"] is False
+    assert report["required"] == []
+    assert report["common_names"] == []
