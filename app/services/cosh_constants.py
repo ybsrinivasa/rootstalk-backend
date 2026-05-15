@@ -230,6 +230,14 @@ UNIT_TYPE_SLUG_TO_COSH_UUIDS: dict[str, list[str]] = {
         "1c644e28-a81e-4f30-bbb3-d1f1a7b5e013",  # Dosage Unit
         "7762d0bb-9fba-48ae-9587-1af180f238b7",  # Dosage Unit (without dilution)
         "e6387449-da6a-464e-a769-dea3e8a32600",  # Dosage Unit (with dilution)
+        # Cosh classifies CHEMICAL_FERTILIZERS_NPK_DOSAGES units (g/plant,
+        # kg/acre, kg/plant) under the generic "Unit" type instead of one
+        # of the three "Dosage Unit" variants above. Including it here
+        # lets the l2_units_unittypes walk surface those rows for the
+        # NPK Dosage L2's UNIT dropdown (Batch 38, 2026-05-15). Only one
+        # L2 (CHEMICAL_FERTILIZERS_NPK_DOSAGES) uses this type today, so
+        # widening the slug doesn't cross-contaminate other L2s.
+        "11a14b5b-1bc9-4d15-8c9a-af1f7310578c",  # Unit
     ],
     "volume_unit":      ["0462580b-0c2f-4607-ace5-76a00055c3db"],
     "temperature_unit": ["0d433397-7998-4c52-b469-d5ac6645570d"],

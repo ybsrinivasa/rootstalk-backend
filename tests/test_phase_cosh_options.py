@@ -220,6 +220,43 @@ async def test_units_unknown_unit_type_returns_empty(db):
     assert out == []
 
 
+# Batch 38 regression — Cosh categorises CHEMICAL_FERTILIZERS_NPK_DOSAGES
+# units (g/plant, kg/acre, kg/plant) under a generic "Unit" unit_type
+# rather than one of the "Dosage Unit" variants. The dosage_unit slug
+# allow-list now includes that generic type so the connect walk
+# surfaces those rows; this test pins that contract in place.
+@requires_docker
+@pytest.mark.asyncio
+async def test_npk_dosage_generic_unit_type_surfaces_under_dosage_unit_slug(db):
+    npk_l2_uuid = PYTHON_L2_TO_COSH_UUID["CHEMICAL_FERTILIZERS_NPK_DOSAGES"]
+    generic_unit_type_uuid = "11a14b5b-1bc9-4d15-8c9a-af1f7310578c"
+    # Sanity: the slug allow-list must include the generic Unit type,
+    # otherwise this fix has regressed.
+    assert generic_unit_type_uuid in UNIT_TYPE_SLUG_TO_COSH_UUIDS["dosage_unit"]
+
+    db.add(_core("u:g/plant", COSH_UNITS_DATA_CORE, "g/plant"))
+    db.add(_core("u:kg/acre", COSH_UNITS_DATA_CORE, "kg/acre"))
+    db.add(_core("u:kg/plant", COSH_UNITS_DATA_CORE, "kg/plant"))
+    db.add(_core(generic_unit_type_uuid, COSH_UNIT_TYPES_CORE, "Unit"))
+    for cid, uid in (
+        ("npku-1", "u:g/plant"),
+        ("npku-2", "u:kg/acre"),
+        ("npku-3", "u:kg/plant"),
+    ):
+        db.add(_connect3(
+            cid, COSH_L2_UNITS_UNITTYPES_CONNECT,
+            COSH_L2_DATA_CORE, npk_l2_uuid,
+            COSH_UNITS_DATA_CORE, uid,
+            COSH_UNIT_TYPES_CORE, generic_unit_type_uuid,
+        ))
+    await db.commit()
+
+    out = await list_units_for_l2(
+        db, "CHEMICAL_FERTILIZERS_NPK_DOSAGES", "dosage_unit",
+    )
+    assert sorted(u["name"] for u in out) == ["g/plant", "kg/acre", "kg/plant"]
+
+
 # ── Trade names / manufacturers / formulations / a.i. ────────────────────
 
 async def _seed_brand_cascade_data(db):
