@@ -284,11 +284,17 @@ async def test_empty_relation_422(db):
     assert ei.value.detail["code"] == "relation_empty"
 
 
-# ── Structural: double brackets ──────────────────────────────────────────────
+# ── Structural: double brackets (Batch 39C-checks6 — saved Relations ────────
+# may now hold two compound Options in one Part. The "double bracket"
+# concept belongs to the SA-portal ADD TO LIST workflow, not to the
+# persisted Relation. See note on `_check_double_brackets`.)
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_double_brackets_422(db):
+async def test_double_brackets_now_saves(db):
+    """Per user 2026-05-15: `(A+B) or (C+D)` is a valid saved Relation.
+    The save proceeds end-to-end; the four practices land on the
+    relation_id; their roles encode the 3-D structure."""
     client, user, pkg, tl = await _setup_timeline(db)
     a = await _practice(db, timeline=tl, l1="PESTICIDE", common_name_cosh_id="cn:a")
     b = await _practice(db, timeline=tl, l1="PESTICIDE", common_name_cosh_id="cn:b")
@@ -296,17 +302,22 @@ async def test_double_brackets_422(db):
     d = await _practice(db, timeline=tl, l1="PESTICIDE", common_name_cosh_id="cn:d")
     await db.commit()
 
-    with pytest.raises(HTTPException) as ei:
-        await create_relation(
-            client_id=client.id, timeline_id=tl.id,
-            request=RelationCreate(
-                relation_type=RelationType.OR,
-                parts=[[[a.id, b.id], [c.id, d.id]]],
-            ),
-            db=db, current_user=user,
-        )
-    codes = {e["code"] for e in ei.value.detail["errors"]}
-    assert "relation_double_brackets" in codes
+    out = await create_relation(
+        client_id=client.id, timeline_id=tl.id,
+        request=RelationCreate(
+            relation_type=RelationType.OR,
+            parts=[[[a.id, b.id], [c.id, d.id]]],
+        ),
+        db=db, current_user=user,
+    )
+    assert out["relation_type"] == "OR"
+
+    refreshed = (await db.execute(
+        select(Practice).where(Practice.id.in_([a.id, b.id, c.id, d.id]))
+    )).scalars().all()
+    for p in refreshed:
+        assert p.relation_id == out["id"]
+        assert p.relation_role and p.relation_role.startswith("PART_1__OPT_")
 
 
 # ── Combinatorial: branch always duplicates ──────────────────────────────────

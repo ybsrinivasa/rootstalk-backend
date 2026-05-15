@@ -210,27 +210,35 @@ def test_practice_already_in_another_relation_fails():
     assert "relation_practice_already_in_relation" in codes
 
 
-# ── Structural: double brackets ──────────────────────────────────────────────
+# ── Structural: double brackets (Batch 39C-checks6 — saved Relations ────────
+# may now hold two compound Options in one Part. The "double bracket"
+# notion belongs to the SA-portal ADD TO LIST workflow, not to the
+# persisted Relation. See note on `_check_double_brackets`.)
 
-def test_double_brackets_fails():
-    """Spec: `(A+B) or (C+D)` rejected at any stage. Two compound
-    Options in the same Part is forbidden."""
-    with pytest.raises(RelationValidationFailed) as ei:
-        validate_relation_save(
-            relation_type="OR",
-            target_timeline_id="TL-1",
-            parts=[[["A", "B"], ["C", "D"]]],
-            practice_refs_by_id={
-                "A": _ref("A"), "B": _ref("B"),
-                "C": _ref("C"), "D": _ref("D"),
-            },
-            practice_meta={
-                "A": _meta(l1="PESTICIDE"), "B": _meta(l1="PESTICIDE"),
-                "C": _meta(l1="PESTICIDE"), "D": _meta(l1="PESTICIDE"),
-            },
-        )
-    codes = {e.code for e in ei.value.errors}
-    assert "relation_double_brackets" in codes
+def test_double_brackets_now_accepted_at_save():
+    """Per user 2026-05-15: `(A+B) or (C+D)` is a valid saved Relation
+    (no outer bracket exists when the relation is the final shape, not
+    a referenceable sub-expression). `_check_double_brackets` is no
+    longer wired into `validate_relation_save`."""
+    structure = validate_relation_save(
+        relation_type="OR",
+        target_timeline_id="TL-1",
+        parts=[[["A", "B"], ["C", "D"]]],
+        practice_refs_by_id={
+            "A": _ref("A", common="cn:a"), "B": _ref("B", common="cn:b"),
+            "C": _ref("C", common="cn:c"), "D": _ref("D", common="cn:d"),
+        },
+        practice_meta={
+            "A": _meta(l1="PESTICIDE"), "B": _meta(l1="PESTICIDE"),
+            "C": _meta(l1="PESTICIDE"), "D": _meta(l1="PESTICIDE"),
+        },
+    )
+    # One Part with two compound Options — the shape that used to be
+    # called "double brackets". Now allowed.
+    assert len(structure.parts) == 1
+    assert len(structure.parts[0].options) == 2
+    for opt in structure.parts[0].options:
+        assert opt.size == 2
 
 
 # ── Combinatorial duplicates ─────────────────────────────────────────────────
@@ -380,24 +388,25 @@ def test_practice_can_appear_multiple_times_within_relation():
 
 def test_multiple_violations_collected_in_one_response():
     """User-facing rule: a single failed save returns ALL violations
-    so the CA can fix them in one pass."""
+    so the CA can fix them in one pass. We pair a cross-L1 OR
+    violation with a cross-timeline one — both fire, both reach the
+    response. (Double-brackets is no longer a SAVE-time error per
+    Batch 39C-checks6, so we use a different second rule.)"""
     with pytest.raises(RelationValidationFailed) as ei:
         validate_relation_save(
             relation_type="OR",
             target_timeline_id="TL-1",
-            parts=[[["A", "B"], ["C", "D"]]],  # double brackets
+            parts=[[["A"], ["C"]]],
             practice_refs_by_id={
-                "A": _ref("A"), "B": _ref("B"),
-                "C": _ref("C"), "D": _ref("D"),
+                "A": _ref("A"), "C": _ref("C"),
             },
             practice_meta={
-                # Mixed L1: cross-l1 violation too
-                "A": _meta(l1="PESTICIDE"),
-                "B": _meta(l1="PESTICIDE"),
-                "C": _meta(l1="FERTILIZER"),
-                "D": _meta(l1="FERTILIZER"),
+                # Mixed L1 (PESTICIDE vs FERTILIZER) → cross-l1 violation
+                "A": _meta(l1="PESTICIDE", timeline_id="TL-1"),
+                # AND a cross-timeline practice for the second rule
+                "C": _meta(l1="FERTILIZER", timeline_id="TL-OTHER"),
             },
         )
     codes = {e.code for e in ei.value.errors}
     assert "relation_or_cross_l1" in codes
-    assert "relation_double_brackets" in codes
+    assert "relation_cross_timeline" in codes

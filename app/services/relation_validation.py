@@ -195,7 +195,18 @@ def _check_double_brackets(
     structure: RelationStructure,
 ) -> Optional[RelationValidationError]:
     """A Part may not contain more than one compound Option (size > 1).
-    Spec example: `(A+B) or (C+D)` — rejected at any stage."""
+    Spec example: `(A+B) or (C+D)` — rejected at any stage.
+
+    NOTE (Batch 39C-checks6, 2026-05-15): NOT called from
+    `validate_relation_save` any more. The double-bracket concept
+    applies to the SA-portal ADD TO LIST workflow only — a saved
+    Relation is not nested inside another expression, so there is
+    no outer bracket to worry about. The function stays here for
+    use by future authoring helpers (an exact server-side echo of
+    the frontend's `addToListShapeFailure`) and so the spec text in
+    RootsTalk_Relations_Reference.pdf still maps to a function. To
+    re-wire at SAVE, add the call back in `validate_relation_save`.
+    """
     for part in structure.parts:
         compound_options = [o for o in part.options if o.is_compound()]
         if len(compound_options) > 1:
@@ -377,8 +388,19 @@ def validate_relation_save(
         relation_type=relation_type,
     )
 
-    err = _check_double_brackets(structure)
-    if err: errors.append(err)
+    # Note (Batch 39C-checks6, 2026-05-15) — `_check_double_brackets`
+    # is deliberately NOT called here any more. Per user 2026-05-15:
+    # "(A+B) or (C+D) cannot be Added to List, because it forms a
+    # double bracket — but it can be Saved (there is no double bracket
+    # when Saved to form a relation)." The "double bracket" notion
+    # belongs to the authoring-time ADD TO LIST workflow on the SA
+    # portal, not to the persisted Relation. A saved Relation is just
+    # a Relation; it is not referenced by another expression, so no
+    # outer bracket exists around it. The function is kept defined
+    # below for use by future authoring helpers / tests; remove from
+    # this pipeline only. RootsTalk_Relations_Reference.pdf still
+    # lists `(A+B) or (C+D)` as forbidden — that section of the doc
+    # is superseded by this code's behaviour.
     err = _check_combinatorial_duplicates(structure)
     if err: errors.append(err)
 
