@@ -24,9 +24,11 @@ from app.modules.advisory.router import (
     delete_global_conditional_question, delete_global_relation,
     link_global_practice_conditional, link_global_relation_conditional,
     list_global_conditional_questions, list_global_relations_for_timeline,
+    update_global_conditional_question,
 )
 from app.modules.advisory.schemas import (
-    ConditionalQuestionCreate, PracticeConditionalCreate, RelationCreate,
+    CQAttachmentIn, CQReplace, ConditionalQuestionCreate,
+    PracticeConditionalCreate, RelationCreate,
 )
 from tests.conftest import requires_docker
 from tests.factories import make_client, make_package, make_timeline, make_user
@@ -546,3 +548,126 @@ async def test_delete_global_cq_refuses_client_scoped(db):
             question_id=cq.id, db=db, current_user=user,
         )
     assert exc.value.status_code == 404
+
+
+# ── Batch 39G — Edit Conditional Question ──────────────────────────────────
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_update_cq_replaces_question_text_and_attachments(db):
+    """PUT updates question text and re-binds the YES/NO sides
+    atomically. Switching attachments on the same CQ is allowed
+    because the existing rows are cleared first."""
+    pkg, tl, user = await _setup_global_timeline(db)
+    p1 = await _seed_practice(db, timeline=tl, common_name_cosh_id="cn:1")
+    p2 = await _seed_practice(db, timeline=tl, common_name_cosh_id="cn:2")
+    await db.commit()
+    q = await create_global_conditional_question(
+        pkg_id=pkg.id, timeline_id=tl.id,
+        request=ConditionalQuestionCreate(question_text="Has it rained?"),
+        db=db, current_user=user,
+    )
+    # Initial state: P1 on YES.
+    await link_global_practice_conditional(
+        practice_id=p1.id,
+        request=PracticeConditionalCreate(
+            practice_id=p1.id, question_id=q.id, answer=ConditionalAnswer.YES,
+        ),
+        db=db, current_user=user,
+    )
+
+    # Edit: rename + swap YES from P1 to P2, add P1 to NO.
+    out = await update_global_conditional_question(
+        question_id=q.id,
+        request=CQReplace(
+            question_text="Has it rained in the last 3 days?",
+            yes=CQAttachmentIn(kind="practice", id=p2.id),
+            no=CQAttachmentIn(kind="practice", id=p1.id),
+        ),
+        db=db, current_user=user,
+    )
+    assert out["question_text"] == "Has it rained in the last 3 days?"
+
+    listed = await list_global_conditional_questions(
+        pkg_id=pkg.id, timeline_id=tl.id, db=db, current_user=user,
+    )
+    row = listed[0]
+    assert row["question_text"] == "Has it rained in the last 3 days?"
+    assert row["yes"] == {"kind": "practice", "id": p2.id}
+    assert row["no"]  == {"kind": "practice", "id": p1.id}
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_update_cq_can_unbind_one_side(db):
+    """Passing yes=None / no=None clears that side."""
+    pkg, tl, user = await _setup_global_timeline(db)
+    p = await _seed_practice(db, timeline=tl, common_name_cosh_id="cn:1")
+    await db.commit()
+    q = await create_global_conditional_question(
+        pkg_id=pkg.id, timeline_id=tl.id,
+        request=ConditionalQuestionCreate(question_text="Q?"),
+        db=db, current_user=user,
+    )
+    await link_global_practice_conditional(
+        practice_id=p.id,
+        request=PracticeConditionalCreate(
+            practice_id=p.id, question_id=q.id, answer=ConditionalAnswer.YES,
+        ),
+        db=db, current_user=user,
+    )
+
+    # Clear YES, keep NO unbound (also originally unbound).
+    await update_global_conditional_question(
+        question_id=q.id,
+        request=CQReplace(question_text="Q?", yes=None, no=None),
+        db=db, current_user=user,
+    )
+    listed = await list_global_conditional_questions(
+        pkg_id=pkg.id, timeline_id=tl.id, db=db, current_user=user,
+    )
+    assert listed[0]["yes"] is None
+    assert listed[0]["no"]  is None
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_update_cq_refuses_client_scoped(db):
+    """The global PUT can't reach a client-scoped CQ."""
+    from tests.factories import make_client, make_package, make_timeline
+    client = await make_client(db)
+    user = await make_user(db, name="SA")
+    pkg = await make_package(db, client, name="ClientP")
+    tl = await make_timeline(db, pkg)
+    cq = ConditionalQuestion(timeline_id=tl.id, question_text="Q?")
+    db.add(cq)
+    await db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await update_global_conditional_question(
+            question_id=cq.id,
+            request=CQReplace(question_text="new"),
+            db=db, current_user=user,
+        )
+    assert exc.value.status_code == 404
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_update_cq_blank_question_text_422(db):
+    pkg, tl, user = await _setup_global_timeline(db)
+    await db.commit()
+    q = await create_global_conditional_question(
+        pkg_id=pkg.id, timeline_id=tl.id,
+        request=ConditionalQuestionCreate(question_text="Q?"),
+        db=db, current_user=user,
+    )
+    with pytest.raises(HTTPException) as exc:
+        await update_global_conditional_question(
+            question_id=q.id,
+            request=CQReplace(question_text="   "),
+            db=db, current_user=user,
+        )
+    assert exc.value.status_code == 422
+    assert exc.value.detail["code"] == "cq_question_text_required"

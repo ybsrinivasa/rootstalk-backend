@@ -274,6 +274,28 @@ class ConditionalQuestionCreate(BaseModel):
     display_order: int = 0
 
 
+class CQAttachmentIn(BaseModel):
+    """Batch 39G (2026-05-15) — one side (YES or NO) of a Conditional
+    Question's binding. `kind` distinguishes Path B (practice) from
+    Path A (relation). Used inside `CQReplace`."""
+    kind: str  # "practice" | "relation"
+    id: str
+
+
+class CQReplace(BaseModel):
+    """Atomic replace payload for `PUT /conditional-questions/{id}`.
+
+    The handler updates the question text and replaces both side
+    attachments in one transaction — wipe existing PracticeConditional
+    / RelationConditional rows for the CQ, then insert whatever YES /
+    NO carries (each may be None to leave that side unbound). Mirrors
+    the create-time spec so the SE's mental model is "one CQ row + at
+    most one Practice/Relation per answer side"."""
+    question_text: str
+    yes: Optional[CQAttachmentIn] = None
+    no: Optional[CQAttachmentIn] = None
+
+
 class PracticeConditionalCreate(BaseModel):
     practice_id: str
     question_id: str

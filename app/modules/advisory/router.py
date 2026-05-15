@@ -12,7 +12,8 @@ from app.modules.advisory.models import (
     Parameter, Variable, PackageVariable,
     ParameterTranslation, VariableTranslation, TranslationStatus,
     Timeline, Practice, Element, Relation,
-    ConditionalQuestion, PracticeConditional, RelationConditional,
+    ConditionalAnswer, ConditionalQuestion, PracticeConditional,
+    RelationConditional,
     PackageStatus, PackageType, PackageCreatedVia, ParameterSource,
 )
 from app.modules.advisory.schemas import (
@@ -22,7 +23,7 @@ from app.modules.advisory.schemas import (
     PackageVariableSet,
     TimelineCreate, TimelineUpdate, TimelineOut,
     PracticeCreate, PracticeOut, PracticeWithElementsOut,
-    RelationCreate, ConditionalQuestionCreate, PracticeConditionalCreate,
+    RelationCreate, ConditionalQuestionCreate, PracticeConditionalCreate, CQReplace,
     PGRecommendationCreate, PGRecommendationOut, PGTimelineCreate, PGTimelineOut, PGPracticeCreate,
     SPRecommendationCreate, SPRecommendationOut, SPTimelineCreate, SPTimelineOut, SPPracticeCreate,
     QATimelineCreate, QAPracticeCreate,
@@ -2408,6 +2409,131 @@ async def list_global_conditional_questions(
             "no":  side("NO"),
         })
     return out
+
+
+@router.put(
+    "/advisory/global/conditional-questions/{question_id}",
+)
+async def update_global_conditional_question(
+    question_id: str,
+    request: CQReplace,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Atomic replace: update the question text and rebind the YES /
+    NO sides in one transaction. Mirrors the create-time semantics —
+    each side is a Practice (Path B) or a Relation (Path A) or None.
+
+    Reuses the existing assert_*_can_be_linked_to_conditional checks
+    so the same conflict rules apply (an entity bound to a different
+    CQ is rejected; same-CQ rebinds are allowed because we clear all
+    of THIS CQ's existing rows first)."""
+    cq = (await db.execute(
+        select(ConditionalQuestion).where(ConditionalQuestion.id == question_id)
+    )).scalar_one_or_none()
+    if cq is None:
+        raise HTTPException(status_code=404, detail="Conditional Question not found")
+    pkg = (await db.execute(
+        select(Package)
+        .join(Timeline, Timeline.package_id == Package.id)
+        .where(Timeline.id == cq.timeline_id)
+    )).scalar_one_or_none()
+    if pkg is None or pkg.client_id is not None:
+        raise HTTPException(status_code=404, detail="Conditional Question is not on a Global package")
+
+    if not request.question_text.strip():
+        raise HTTPException(status_code=422, detail={
+            "code": "cq_question_text_required",
+            "message": "Question text is required.",
+        })
+
+    # Clear existing attachments for THIS CQ first, so a rebind to the
+    # same entity on the same CQ doesn't trip the
+    # "already in another conditional" guard. Entities bound to a
+    # DIFFERENT CQ are still rejected by the assert_* checks below.
+    await db.execute(
+        PracticeConditional.__table__.delete().where(
+            PracticeConditional.question_id == question_id
+        )
+    )
+    await db.execute(
+        RelationConditional.__table__.delete().where(
+            RelationConditional.question_id == question_id
+        )
+    )
+    await db.flush()
+
+    # Helper that validates + inserts one side. Mirrors the create-time
+    # link endpoints (Path B for practice, Path A for relation).
+    async def _bind(att, answer_value: str):
+        if att is None:
+            return
+        ans = ConditionalAnswer(answer_value)
+        if att.kind == "practice":
+            practice = (await db.execute(
+                select(Practice).where(Practice.id == att.id)
+            )).scalar_one_or_none()
+            if practice is None:
+                raise HTTPException(status_code=404, detail=f"Practice {att.id} not found")
+            existing_pc = (await db.execute(
+                select(PracticeConditional).where(
+                    PracticeConditional.practice_id == att.id,
+                )
+            )).scalar_one_or_none()
+            existing_q_id = existing_pc.question_id if existing_pc else None
+            try:
+                assert_practice_can_be_linked_to_conditional(
+                    practice_id=att.id,
+                    practice_relation_id=practice.relation_id,
+                    target_question_id=question_id,
+                    existing_question_id_for_practice=existing_q_id,
+                )
+            except ConditionalValidationError as e:
+                _raise_conditional_validation(e)
+            db.add(PracticeConditional(
+                practice_id=att.id, question_id=question_id, answer=ans,
+            ))
+        elif att.kind == "relation":
+            relation = (await db.execute(
+                select(Relation).where(Relation.id == att.id)
+            )).scalar_one_or_none()
+            if relation is None:
+                raise HTTPException(status_code=404, detail=f"Relation {att.id} not found")
+            existing_rc = (await db.execute(
+                select(RelationConditional).where(
+                    RelationConditional.relation_id == att.id,
+                )
+            )).scalar_one_or_none()
+            existing_q_id = existing_rc.question_id if existing_rc else None
+            try:
+                assert_relation_can_be_linked_to_conditional(
+                    relation_id=att.id,
+                    target_question_id=question_id,
+                    existing_question_id_for_relation=existing_q_id,
+                )
+            except ConditionalValidationError as e:
+                _raise_conditional_validation(e)
+            db.add(RelationConditional(
+                relation_id=att.id, question_id=question_id, answer=ans,
+            ))
+        else:
+            raise HTTPException(status_code=422, detail={
+                "code": "cq_attachment_unknown_kind",
+                "message": f"Unknown attachment kind: {att.kind!r}",
+            })
+
+    await _bind(request.yes, "YES")
+    await _bind(request.no, "NO")
+
+    cq.question_text = request.question_text.strip()
+    await db.commit()
+    await db.refresh(cq)
+    return {
+        "id": cq.id,
+        "timeline_id": cq.timeline_id,
+        "question_text": cq.question_text,
+        "display_order": cq.display_order,
+    }
 
 
 @router.delete(
