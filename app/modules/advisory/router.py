@@ -1580,8 +1580,15 @@ async def create_practice(
     db.add(practice)
     await db.flush()
 
-    for i, elem in enumerate(request.elements):
-        db.add(Element(practice_id=practice.id, **elem.model_dump()))
+    # Batch 39C-bugfix2 (2026-05-15): stamp display_order from the
+    # request position so the read-only practice card mirrors the
+    # rule-book / modal order. The client sends elements in
+    # rule-book order; the schema default of 0 was making every
+    # row tie and the read sort fell back to insertion order.
+    for idx, elem in enumerate(request.elements):
+        data = elem.model_dump()
+        data["display_order"] = idx
+        db.add(Element(practice_id=practice.id, **data))
 
     await db.commit()
     await db.refresh(practice)
@@ -1637,8 +1644,11 @@ async def update_practice(
         Element.__table__.delete().where(Element.practice_id == practice_id)
     )
     await db.flush()
-    for elem in request.elements:
-        db.add(Element(practice_id=practice_id, **elem.model_dump()))
+    # Batch 39C-bugfix2: stamp display_order from the request position.
+    for idx, elem in enumerate(request.elements):
+        data = elem.model_dump()
+        data["display_order"] = idx
+        db.add(Element(practice_id=practice_id, **data))
     await db.commit()
     await db.refresh(practice)
     return practice
@@ -3723,8 +3733,11 @@ async def create_global_practice(
     # because the L2 validator rejected every prod request earlier in
     # the chain (Batches 27/29/31 fixed that path).
     await db.flush()
-    for elem in request.elements:
-        db.add(Element(practice_id=practice.id, **elem.model_dump()))
+    # Batch 39C-bugfix2: stamp display_order from the request position.
+    for idx, elem in enumerate(request.elements):
+        data = elem.model_dump()
+        data["display_order"] = idx
+        db.add(Element(practice_id=practice.id, **data))
     await db.commit()
     await db.refresh(practice)
     return practice
@@ -3787,8 +3800,11 @@ async def update_global_practice(
         Element.__table__.delete().where(Element.practice_id == practice_id)
     )
     await db.flush()
-    for elem in request.elements:
-        db.add(Element(practice_id=practice_id, **elem.model_dump()))
+    # Batch 39C-bugfix2: stamp display_order from the request position.
+    for idx, elem in enumerate(request.elements):
+        data = elem.model_dump()
+        data["display_order"] = idx
+        db.add(Element(practice_id=practice_id, **data))
     await db.commit()
     await db.refresh(practice)
     return practice
