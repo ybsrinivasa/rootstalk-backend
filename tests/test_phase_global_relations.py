@@ -21,9 +21,9 @@ from app.modules.advisory.models import (
 )
 from app.modules.advisory.router import (
     create_global_conditional_question, create_global_relation,
-    delete_global_relation, link_global_practice_conditional,
-    link_global_relation_conditional, list_global_conditional_questions,
-    list_global_relations_for_timeline,
+    delete_global_conditional_question, delete_global_relation,
+    link_global_practice_conditional, link_global_relation_conditional,
+    list_global_conditional_questions, list_global_relations_for_timeline,
 )
 from app.modules.advisory.schemas import (
     ConditionalQuestionCreate, PracticeConditionalCreate, RelationCreate,
@@ -277,7 +277,12 @@ async def test_create_and_list_global_conditional_questions(db):
     listed = await list_global_conditional_questions(
         pkg_id=pkg.id, timeline_id=tl.id, db=db, current_user=user,
     )
-    assert [q.id for q in listed] == [q1.id, q2.id]
+    # Batch 39E: list returns enriched dicts with yes/no attachment
+    # buckets. With no attachments yet, both sides are None.
+    assert [q["id"] for q in listed] == [q1.id, q2.id]
+    for q in listed:
+        assert q["yes"] is None
+        assert q["no"] is None
 
 
 @requires_docker
@@ -402,3 +407,142 @@ async def test_list_folds_in_relation_conditional(db):
     assert cond["question_id"] == q.id
     assert cond["question_text"] == "Has the monsoon arrived?"
     assert cond["answer"] == "YES"
+
+
+# ── Batch 39E — CQ list with bundled YES/NO attachments + DELETE ────────────
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_list_cqs_bundles_yes_and_no_attachments(db):
+    """A CQ with a Practice on YES and a Relation on NO surfaces both
+    sides on the list endpoint. Either side may be a Practice (Path B)
+    or a Relation (Path A)."""
+    pkg, tl, user = await _setup_global_timeline(db)
+    p_yes = await _seed_practice(db, timeline=tl, common_name_cosh_id="cn:y")
+    p_a = await _seed_practice(db, timeline=tl, common_name_cosh_id="cn:a")
+    p_b = await _seed_practice(db, timeline=tl, common_name_cosh_id="cn:b")
+    await db.commit()
+    rel = await create_global_relation(
+        pkg_id=pkg.id, timeline_id=tl.id,
+        request=RelationCreate(
+            relation_type=RelationType.AND, parts=[[[p_a.id, p_b.id]]],
+        ),
+        db=db, current_user=user,
+    )
+    q = await create_global_conditional_question(
+        pkg_id=pkg.id, timeline_id=tl.id,
+        request=ConditionalQuestionCreate(question_text="Has it rained?"),
+        db=db, current_user=user,
+    )
+    # YES side → independent Practice (Path B).
+    await link_global_practice_conditional(
+        practice_id=p_yes.id,
+        request=PracticeConditionalCreate(
+            practice_id=p_yes.id, question_id=q.id, answer=ConditionalAnswer.YES,
+        ),
+        db=db, current_user=user,
+    )
+    # NO side → Relation (Path A).
+    await link_global_relation_conditional(
+        relation_id=rel["id"],
+        request=PracticeConditionalCreate(
+            practice_id="ignored", question_id=q.id, answer=ConditionalAnswer.NO,
+        ),
+        db=db, current_user=user,
+    )
+    listed = await list_global_conditional_questions(
+        pkg_id=pkg.id, timeline_id=tl.id, db=db, current_user=user,
+    )
+    assert len(listed) == 1
+    row = listed[0]
+    assert row["question_text"] == "Has it rained?"
+    assert row["yes"] == {"kind": "practice", "id": p_yes.id}
+    assert row["no"]  == {"kind": "relation", "id": rel["id"]}
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_delete_global_cq_clears_attachments(db):
+    """Dropping a CQ removes every PracticeConditional and
+    RelationConditional bound to it. The practices/relations
+    themselves remain — only the gating goes."""
+    pkg, tl, user = await _setup_global_timeline(db)
+    p = await _seed_practice(db, timeline=tl, common_name_cosh_id="cn:p")
+    p_a = await _seed_practice(db, timeline=tl, common_name_cosh_id="cn:a")
+    p_b = await _seed_practice(db, timeline=tl, common_name_cosh_id="cn:b")
+    await db.commit()
+    rel = await create_global_relation(
+        pkg_id=pkg.id, timeline_id=tl.id,
+        request=RelationCreate(
+            relation_type=RelationType.AND, parts=[[[p_a.id, p_b.id]]],
+        ),
+        db=db, current_user=user,
+    )
+    q = await create_global_conditional_question(
+        pkg_id=pkg.id, timeline_id=tl.id,
+        request=ConditionalQuestionCreate(question_text="Q?"),
+        db=db, current_user=user,
+    )
+    await link_global_practice_conditional(
+        practice_id=p.id,
+        request=PracticeConditionalCreate(
+            practice_id=p.id, question_id=q.id, answer=ConditionalAnswer.YES,
+        ),
+        db=db, current_user=user,
+    )
+    await link_global_relation_conditional(
+        relation_id=rel["id"],
+        request=PracticeConditionalCreate(
+            practice_id="ignored", question_id=q.id, answer=ConditionalAnswer.NO,
+        ),
+        db=db, current_user=user,
+    )
+
+    await delete_global_conditional_question(
+        question_id=q.id, db=db, current_user=user,
+    )
+    # CQ gone.
+    cq = (await db.execute(
+        select(ConditionalQuestion).where(ConditionalQuestion.id == q.id)
+    )).scalar_one_or_none()
+    assert cq is None
+    # PC + RC rows gone.
+    pcs = (await db.execute(
+        select(PracticeConditional).where(PracticeConditional.question_id == q.id)
+    )).scalars().all()
+    rcs = (await db.execute(
+        select(RelationConditional).where(RelationConditional.question_id == q.id)
+    )).scalars().all()
+    assert pcs == []
+    assert rcs == []
+    # Practices/Relation still alive.
+    p_still = (await db.execute(
+        select(Practice).where(Practice.id == p.id)
+    )).scalar_one_or_none()
+    assert p_still is not None
+    rel_still = (await db.execute(
+        select(Relation).where(Relation.id == rel["id"])
+    )).scalar_one_or_none()
+    assert rel_still is not None
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_delete_global_cq_refuses_client_scoped(db):
+    """A CQ on a client-scoped Timeline can't be deleted via the
+    global URL."""
+    from tests.factories import make_client, make_package, make_timeline
+    client = await make_client(db)
+    user = await make_user(db, name="SA")
+    pkg = await make_package(db, client, name="ClientP")
+    tl = await make_timeline(db, pkg)
+    cq = ConditionalQuestion(timeline_id=tl.id, question_text="Q?")
+    db.add(cq)
+    await db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await delete_global_conditional_question(
+            question_id=cq.id, db=db, current_user=user,
+        )
+    assert exc.value.status_code == 404

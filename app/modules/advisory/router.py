@@ -2357,16 +2357,98 @@ async def list_global_conditional_questions(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """List CQs on a Global Timeline. The IF authoring modal calls this
-    to populate a "use existing question" dropdown so the SE doesn't
-    retype recurring questions ('Is the crop infested with X?')."""
+    """List CQs on a Global Timeline, each bundled with its YES- and
+    NO-side attachments (Batch 39E, 2026-05-15). Either side may carry
+    a practice_id OR a relation_id (Path A or Path B) — or be null.
+    The SA portal CQ panel renders directly from this shape."""
     await _get_global_timeline(db, pkg_id, timeline_id)
     qs = (await db.execute(
         select(ConditionalQuestion).where(
             ConditionalQuestion.timeline_id == timeline_id,
         ).order_by(ConditionalQuestion.display_order, ConditionalQuestion.created_at)
     )).scalars().all()
-    return qs
+    if not qs:
+        return []
+    q_ids = [q.id for q in qs]
+    pcs = (await db.execute(
+        select(PracticeConditional).where(PracticeConditional.question_id.in_(q_ids))
+    )).scalars().all()
+    rcs = (await db.execute(
+        select(RelationConditional).where(RelationConditional.question_id.in_(q_ids))
+    )).scalars().all()
+    # Bucket attachments by (question_id, answer). User's model
+    # (2026-05-15) says at most one entity per (CQ, answer). The
+    # backend doesn't enforce that, so if multiple rows somehow exist
+    # we take the first deterministically and the UI surfaces only
+    # one — pre-existing data corruption would be visible elsewhere.
+    pc_by_key: dict[tuple[str, str], PracticeConditional] = {}
+    for pc in pcs:
+        key = (pc.question_id, pc.answer.value)
+        pc_by_key.setdefault(key, pc)
+    rc_by_key: dict[tuple[str, str], RelationConditional] = {}
+    for rc in rcs:
+        key = (rc.question_id, rc.answer.value)
+        rc_by_key.setdefault(key, rc)
+    out: list[dict] = []
+    for q in qs:
+        def side(answer: str) -> dict:
+            rc = rc_by_key.get((q.id, answer))
+            if rc is not None:
+                return {"kind": "relation", "id": rc.relation_id}
+            pc = pc_by_key.get((q.id, answer))
+            if pc is not None:
+                return {"kind": "practice", "id": pc.practice_id}
+            return None  # type: ignore
+        out.append({
+            "id": q.id,
+            "timeline_id": q.timeline_id,
+            "question_text": q.question_text,
+            "display_order": q.display_order,
+            "yes": side("YES"),
+            "no":  side("NO"),
+        })
+    return out
+
+
+@router.delete(
+    "/advisory/global/conditional-questions/{question_id}",
+    status_code=204,
+)
+async def delete_global_conditional_question(
+    question_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Drop a Conditional Question on a Global Timeline. Cascades by
+    deleting every PracticeConditional / RelationConditional row that
+    bound to this CQ (the practices / relations themselves stay in
+    place — only the gating goes). Path-Global mirror of the existing
+    client-scoped deletes."""
+    cq = (await db.execute(
+        select(ConditionalQuestion).where(ConditionalQuestion.id == question_id)
+    )).scalar_one_or_none()
+    if cq is None:
+        raise HTTPException(status_code=404, detail="Conditional Question not found")
+    pkg = (await db.execute(
+        select(Package)
+        .join(Timeline, Timeline.package_id == Package.id)
+        .where(Timeline.id == cq.timeline_id)
+    )).scalar_one_or_none()
+    if pkg is None or pkg.client_id is not None:
+        raise HTTPException(status_code=404, detail="Conditional Question is not on a Global package")
+    # Drop attachments first to satisfy any FK ordering.
+    await db.execute(
+        PracticeConditional.__table__.delete().where(
+            PracticeConditional.question_id == question_id
+        )
+    )
+    await db.execute(
+        RelationConditional.__table__.delete().where(
+            RelationConditional.question_id == question_id
+        )
+    )
+    await db.delete(cq)
+    await db.commit()
 
 
 @router.post(
