@@ -109,6 +109,101 @@ def _l2_uuid(l2_type: str) -> Optional[str]:
     return PYTHON_L2_TO_COSH_UUID.get(l2_type)
 
 
+# ── Per-L2 data-completeness filter (Batch 39D, 2026-05-15) ────────────────
+#
+# Per user 2026-05-15: an SE shouldn't be able to pick a Common Name / Trade
+# Name / Manufacturer / Formulation / a.i. on an L2 unless at least one
+# Trade Name under that L2 has a full set of Cosh-side connections. The
+# concrete rule is L2-specific: e.g. CHEMICAL_PESTICIDES requires MFR + F +
+# a.i.; MICROBIAL_PESTICIDES only requires MFR.
+#
+# Common Name is the anchor — a CN surfaces in `list_common_names_for_l2`
+# only if at least one of its Trade Names satisfies every required Cosh
+# connect. The same filter cascades to the Trade Name, Manufacturer,
+# Formulation, and a.i. dropdowns under that L2, so the SE never lands on
+# half-populated rows.
+#
+# `tradename_commonname` is implicit in every entry — that's how we find
+# Trade Names for a Common Name to begin with. The spec below lists the
+# *additional* Cosh connects each TN must populate.
+#
+# CHEMICAL_FERTILIZERS_NPK_DOSAGES and FERTIGATION_NPK_DOSAGES don't use
+# the Trade Name flow at all (handled via L2_TYPES_WITHOUT_TRADE_NAMES);
+# they're absent from this dict on purpose.
+
+L2_COMPLETENESS_REQUIREMENTS: dict[str, frozenset[str]] = {
+    "CHEMICAL_PESTICIDES":                      frozenset({"manufacturer", "formulation", "ai"}),
+    "CHEMICAL_HERBICIDES":                      frozenset({"manufacturer", "formulation", "ai"}),
+    "MICROBIAL_PESTICIDES":                     frozenset({"manufacturer"}),
+    "BOTANICAL_PESTICIDES":                     frozenset({"manufacturer"}),
+    "INSECT_BIOCONTROL_AGENTS":                 frozenset({"manufacturer"}),
+    "INSECT_TRAPS":                             frozenset({"manufacturer"}),
+    "OTHER_PESTICIDES":                         frozenset({"manufacturer"}),
+    "ADJUVANTS":                                frozenset({"manufacturer"}),
+    "MANURES":                                  frozenset({"manufacturer"}),
+    "CHEMICAL_FERTILIZER_PRODUCTS":             frozenset({"manufacturer", "formulation"}),
+    "CHEMICAL_FERTILIZER_FERTIGATION_PRODUCTS": frozenset({"manufacturer", "formulation"}),
+    "BIOFERTILIZERS":                           frozenset({"manufacturer"}),
+    "PGR_TONICS":                               frozenset({"manufacturer"}),
+    "SOIL_AMENDMENTS":                          frozenset({"manufacturer"}),
+}
+
+_REQUIREMENT_TO_CONNECT: dict[str, str] = {
+    "manufacturer": COSH_TRADENAME_MANUFACTURER_CONNECT,
+    "formulation":  COSH_TRADENAME_FORMULATION_CONNECT,
+    "ai":           COSH_TRADENAME_AI_CONNECT,
+}
+
+
+async def _trade_names_in_connect(
+    db: AsyncSession, connect_type: str,
+) -> set[str]:
+    """All Trade Name cosh_ids appearing in any active row of the given
+    `tradename_X` Connect. Used by `_complete_trade_names_for_l2`."""
+    rows = await _walk_connect(db, connect_type=connect_type)
+    out: set[str] = set()
+    for r in rows:
+        for ep in (r.endpoints or []):
+            if ep.get("role") == COSH_TRADE_NAMES_CORE:
+                tn = ep.get("cosh_id")
+                if tn:
+                    out.add(tn)
+    return out
+
+
+async def _complete_trade_names_for_l2(
+    db: AsyncSession, l2_type: Optional[str],
+) -> Optional[set[str]]:
+    """Return the set of Trade Name cosh_ids that satisfy every Cosh
+    connect required by this L2's completeness spec.
+
+    Return value semantics:
+      - None  → no filter applies (L2 not in the spec, or l2_type
+                wasn't supplied). Caller treats this as "every TN is
+                allowed" — preserves pre-39D behaviour.
+      - set() → spec applies but no TN passes (Cosh data is fully
+                broken for this L2). Caller returns an empty dropdown.
+      - {...} → the eligible TN set; downstream callers intersect
+                against this.
+
+    The intersection is computed once per request — if perf becomes a
+    problem at scale (the four connects are walked sequentially), add
+    a TTL cache here keyed on l2_type. Today the connects are small
+    enough that a per-request walk is well under 100 ms.
+    """
+    if not l2_type:
+        return None
+    req = L2_COMPLETENESS_REQUIREMENTS.get(l2_type)
+    if not req:
+        return None
+    result: Optional[set[str]] = None
+    for r in req:
+        connect = _REQUIREMENT_TO_CONNECT[r]
+        tn_set = await _trade_names_in_connect(db, connect)
+        result = tn_set if result is None else (result & tn_set)
+    return result if result is not None else set()
+
+
 # ── Per-L2 lookups ─────────────────────────────────────────────────────────
 
 async def list_common_names_for_l2(
@@ -126,6 +221,23 @@ async def list_common_names_for_l2(
         cn = ep.get(COSH_COMMON_NAMES_CORE)
         if cn:
             common_name_ids.add(cn)
+    # Batch 39D completeness filter — keep only CNs that link to at
+    # least one TN satisfying every required Cosh connect for this L2.
+    complete_tns = await _complete_trade_names_for_l2(db, l2_type)
+    if complete_tns is not None:
+        if not complete_tns:
+            return []
+        cn_with_complete_tn: set[str] = set()
+        cn_tn_rows = await _walk_connect(
+            db, connect_type=COSH_TRADENAME_COMMONNAME_CONNECT,
+        )
+        for r in cn_tn_rows:
+            ep = {e.get("role"): e.get("cosh_id") for e in (r.endpoints or [])}
+            tn = ep.get(COSH_TRADE_NAMES_CORE)
+            cn = ep.get(COSH_COMMON_NAMES_CORE)
+            if cn and tn and tn in complete_tns:
+                cn_with_complete_tn.add(cn)
+        common_name_ids &= cn_with_complete_tn
     return await _resolve_names(
         db, core_type=COSH_COMMON_NAMES_CORE, cosh_ids=common_name_ids,
     )
@@ -226,6 +338,7 @@ async def list_trade_names_for_common_name(
     db: AsyncSession,
     common_name_cosh_id: str,
     manufacturer_cosh_id: Optional[str] = None,
+    l2_type: Optional[str] = None,
 ) -> list[dict]:
     """Trade names available for the given common name. When
     `manufacturer_cosh_id` is supplied, narrows to trade names made
@@ -236,8 +349,14 @@ async def list_trade_names_for_common_name(
     Used by the bidirectional MFR ↔ TN filter on the Add Practice
     modal (Batch 24): expert can land on a trade name either by
     drilling down from a manufacturer they remember, or by picking
-    the brand directly without ever touching the manufacturer."""
+    the brand directly without ever touching the manufacturer.
+
+    `l2_type` opts into the Batch 39D completeness filter — only TNs
+    that satisfy every Cosh connect required for this L2 surface."""
     tn_ids = await _trade_names_for_common_name(db, common_name_cosh_id)
+    complete_tns = await _complete_trade_names_for_l2(db, l2_type)
+    if complete_tns is not None:
+        tn_ids &= complete_tns
     if manufacturer_cosh_id:
         tn_ids &= await _trade_names_for_manufacturer(
             db, manufacturer_cosh_id,
@@ -251,6 +370,7 @@ async def list_manufacturers_for_common_name(
     db: AsyncSession,
     common_name_cosh_id: str,
     trade_name_cosh_id: Optional[str] = None,
+    l2_type: Optional[str] = None,
 ) -> list[dict]:
     """Manufacturers in scope for the given common name. When
     `trade_name_cosh_id` is supplied, narrows to the single
@@ -259,8 +379,15 @@ async def list_manufacturers_for_common_name(
     When omitted, returns the full CN-scope set — same as Batch 19.
 
     Walk: common_name → trade names → manufacturers (dedup); then
-    optionally intersect with the {manufacturer of trade_name}."""
+    optionally intersect with the {manufacturer of trade_name}.
+
+    `l2_type` opts into the Batch 39D completeness filter — only TNs
+    that satisfy every Cosh connect required for this L2 contribute
+    a manufacturer."""
     tn_ids = await _trade_names_for_common_name(db, common_name_cosh_id)
+    complete_tns = await _complete_trade_names_for_l2(db, l2_type)
+    if complete_tns is not None:
+        tn_ids &= complete_tns
     if trade_name_cosh_id:
         # Defensive: only include the manufacturer if the trade_name
         # is actually one of CN's brands (caller might pass a stale
@@ -309,6 +436,7 @@ async def _resolve_trade_name_filter(
     db: AsyncSession,
     common_name_cosh_id: Optional[str],
     trade_name_cosh_id: Optional[str],
+    l2_type: Optional[str] = None,
 ) -> Optional[set[str]]:
     """Resolve the trade-name set to filter by, based on whether SE
     has picked Common Name only, or Common Name + Trade Name.
@@ -317,11 +445,19 @@ async def _resolve_trade_name_filter(
       None  → no filter could be built (no inputs given) → empty result
       set() → empty filter (e.g. common_name has no trade names) → empty result
       {...} → trade_name UUIDs to keep
-    """
+
+    `l2_type` opts into the Batch 39D completeness filter. When set,
+    the CN-only branch intersects with the L2's complete-TN set; the
+    TN-specific branch trusts the caller (the TN was surfaced by an
+    earlier dropdown that already applied the filter)."""
     if trade_name_cosh_id:
         return {trade_name_cosh_id}
     if common_name_cosh_id:
-        return await _trade_names_for_common_name(db, common_name_cosh_id)
+        tn_ids = await _trade_names_for_common_name(db, common_name_cosh_id)
+        complete_tns = await _complete_trade_names_for_l2(db, l2_type)
+        if complete_tns is not None:
+            tn_ids &= complete_tns
+        return tn_ids
     return None
 
 
@@ -329,12 +465,14 @@ async def list_formulations(
     db: AsyncSession,
     common_name_cosh_id: Optional[str] = None,
     trade_name_cosh_id: Optional[str] = None,
+    l2_type: Optional[str] = None,
 ) -> list[dict]:
     """Formulations filtered by SE's selection: when only Common Name
     is set, span all trade names sharing that common name; when Trade
-    Name is set, narrow to just that one."""
+    Name is set, narrow to just that one. `l2_type` opts into the
+    Batch 39D completeness filter."""
     tn_filter = await _resolve_trade_name_filter(
-        db, common_name_cosh_id, trade_name_cosh_id,
+        db, common_name_cosh_id, trade_name_cosh_id, l2_type,
     )
     if tn_filter is None or not tn_filter:
         return []
@@ -351,10 +489,12 @@ async def list_ai_concentrations(
     db: AsyncSession,
     common_name_cosh_id: Optional[str] = None,
     trade_name_cosh_id: Optional[str] = None,
+    l2_type: Optional[str] = None,
 ) -> list[dict]:
-    """a.i. (%) options. Same filter logic as formulations."""
+    """a.i. (%) options. Same filter logic as formulations. `l2_type`
+    opts into the Batch 39D completeness filter."""
     tn_filter = await _resolve_trade_name_filter(
-        db, common_name_cosh_id, trade_name_cosh_id,
+        db, common_name_cosh_id, trade_name_cosh_id, l2_type,
     )
     if tn_filter is None or not tn_filter:
         return []

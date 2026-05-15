@@ -3420,15 +3420,18 @@ async def cosh_units_for_l2(
 async def cosh_trade_names_for_common_name(
     common_name: str,
     manufacturer: Optional[str] = None,
+    l2: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Trade names for a common name. Optional `manufacturer` narrows
     the list to brands made by that manufacturer — used by the
-    bidirectional MFR ↔ TN filter on the Add Practice modal."""
+    bidirectional MFR ↔ TN filter on the Add Practice modal.
+
+    Optional `l2` opts into the Batch 39D completeness filter."""
     from app.services.cosh_options_view import list_trade_names_for_common_name
     return await list_trade_names_for_common_name(
-        db, common_name, manufacturer_cosh_id=manufacturer,
+        db, common_name, manufacturer_cosh_id=manufacturer, l2_type=l2,
     )
 
 
@@ -3436,16 +3439,19 @@ async def cosh_trade_names_for_common_name(
 async def cosh_manufacturers_for_common_name(
     common_name: str,
     trade_name: Optional[str] = None,
+    l2: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Manufacturers in scope for a common name. Optional `trade_name`
     narrows the list to the single manufacturer that makes that
     brand — used by the bidirectional MFR ↔ TN filter on the Add
-    Practice modal."""
+    Practice modal.
+
+    Optional `l2` opts into the Batch 39D completeness filter."""
     from app.services.cosh_options_view import list_manufacturers_for_common_name
     return await list_manufacturers_for_common_name(
-        db, common_name, trade_name_cosh_id=trade_name,
+        db, common_name, trade_name_cosh_id=trade_name, l2_type=l2,
     )
 
 
@@ -3453,15 +3459,19 @@ async def cosh_manufacturers_for_common_name(
 async def cosh_formulations(
     common_name: Optional[str] = None,
     trade_name: Optional[str] = None,
+    l2: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """When `trade_name` is supplied, narrows to formulations tied to
     that one trade name; otherwise spans all trade names sharing the
-    given `common_name`."""
+    given `common_name`.
+
+    Optional `l2` opts into the Batch 39D completeness filter."""
     from app.services.cosh_options_view import list_formulations
     return await list_formulations(
         db, common_name_cosh_id=common_name, trade_name_cosh_id=trade_name,
+        l2_type=l2,
     )
 
 
@@ -3469,12 +3479,15 @@ async def cosh_formulations(
 async def cosh_ai_concentrations(
     common_name: Optional[str] = None,
     trade_name: Optional[str] = None,
+    l2: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Optional `l2` opts into the Batch 39D completeness filter."""
     from app.services.cosh_options_view import list_ai_concentrations
     return await list_ai_concentrations(
         db, common_name_cosh_id=common_name, trade_name_cosh_id=trade_name,
+        l2_type=l2,
     )
 
 

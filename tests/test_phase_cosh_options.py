@@ -89,6 +89,18 @@ DOSAGE_UNIT_TYPE_UUID = UNIT_TYPE_SLUG_TO_COSH_UUIDS["dosage_unit"][0]
 TIME_UNIT_TYPE_UUID = UNIT_TYPE_SLUG_TO_COSH_UUIDS["time_unit"][0]
 
 
+# Batch 39D introduced a per-L2 completeness filter for the input
+# cascade. Legacy tests in this file pre-date it and don't seed the
+# required tradename_X rows. Clear the spec for every test in this
+# module so the legacy assertions still pass; the new completeness
+# tests at the bottom re-populate the dict locally and exercise the
+# filter directly.
+@pytest.fixture(autouse=True)
+def _no_completeness_filter(monkeypatch):
+    from app.services import cosh_options_view as _cov
+    monkeypatch.setattr(_cov, "L2_COMPLETENESS_REQUIREMENTS", {})
+
+
 # ── l2_uses_trade_names ───────────────────────────────────────────────────
 
 def test_l2_uses_trade_names_excludes_npk_dosage_l2s():
@@ -515,3 +527,190 @@ async def test_inactive_core_items_are_excluded(db):
 
     out = await list_common_names_for_l2(db, "CHEMICAL_PESTICIDES")
     assert [c["name"] for c in out] == ["Imidacloprid"]
+
+
+# ── Batch 39D — per-L2 completeness filter ─────────────────────────────────
+
+
+def _restore_completeness_spec(monkeypatch, spec: dict[str, frozenset[str]]):
+    """Re-populate the completeness spec for tests that exercise the
+    filter. The module-level autouse fixture cleared it; here we put
+    a narrowly-scoped spec back."""
+    from app.services import cosh_options_view as _cov
+    monkeypatch.setattr(_cov, "L2_COMPLETENESS_REQUIREMENTS", spec)
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_completeness_filter_chemical_pesticides_drops_incomplete_cns(db, monkeypatch):
+    """CHEMICAL_PESTICIDES requires M + F + AI per Cosh connect. CNs
+    whose only TN is missing any required connect must NOT surface."""
+    _restore_completeness_spec(monkeypatch, {
+        "CHEMICAL_PESTICIDES": frozenset({"manufacturer", "formulation", "ai"}),
+    })
+    # Cosh data:
+    # - "Imidacloprid" has TN "Confidor" with M + F + AI all linked → complete.
+    # - "Acephate" has TN "Acetox" with M only (no F, no AI)        → incomplete.
+    db.add(_core("cn:imid", COSH_COMMON_NAMES_CORE, "Imidacloprid"))
+    db.add(_core("cn:acephate", COSH_COMMON_NAMES_CORE, "Acephate"))
+    db.add(_core("tn:confidor", COSH_TRADE_NAMES_CORE, "Confidor"))
+    db.add(_core("tn:acetox", COSH_TRADE_NAMES_CORE, "Acetox"))
+    db.add(_core("mfr:bayer", COSH_INPUT_MANUFACTURERS_CORE, "Bayer"))
+    db.add(_core("mfr:upl", COSH_INPUT_MANUFACTURERS_CORE, "UPL"))
+    db.add(_core("f:wp", COSH_FORMULATIONS_CORE, "WP"))
+    db.add(_core("ai:17.8%", COSH_AI_CORE, "17.8%"))
+
+    # Both CNs are linked to the L2.
+    for cn in ("cn:imid", "cn:acephate"):
+        db.add(_connect2(
+            f"cncn-{cn}", COSH_COMMONNAMES_L2_CONNECT,
+            COSH_COMMON_NAMES_CORE, cn,
+            COSH_L2_DATA_CORE, CHEM_PEST_L2_UUID,
+        ))
+
+    # tradename_commonname links.
+    db.add(_connect2(
+        "tncn-1", COSH_TRADENAME_COMMONNAME_CONNECT,
+        COSH_TRADE_NAMES_CORE, "tn:confidor",
+        COSH_COMMON_NAMES_CORE, "cn:imid",
+    ))
+    db.add(_connect2(
+        "tncn-2", COSH_TRADENAME_COMMONNAME_CONNECT,
+        COSH_TRADE_NAMES_CORE, "tn:acetox",
+        COSH_COMMON_NAMES_CORE, "cn:acephate",
+    ))
+
+    # Confidor: complete (M + F + AI). Acetox: only M.
+    db.add(_connect2(
+        "tnmfr-1", COSH_TRADENAME_MANUFACTURER_CONNECT,
+        COSH_TRADE_NAMES_CORE, "tn:confidor",
+        COSH_INPUT_MANUFACTURERS_CORE, "mfr:bayer",
+    ))
+    db.add(_connect2(
+        "tnmfr-2", COSH_TRADENAME_MANUFACTURER_CONNECT,
+        COSH_TRADE_NAMES_CORE, "tn:acetox",
+        COSH_INPUT_MANUFACTURERS_CORE, "mfr:upl",
+    ))
+    db.add(_connect2(
+        "tnf-1", COSH_TRADENAME_FORMULATION_CONNECT,
+        COSH_TRADE_NAMES_CORE, "tn:confidor",
+        COSH_FORMULATIONS_CORE, "f:wp",
+    ))
+    db.add(_connect2(
+        "tnai-1", COSH_TRADENAME_AI_CONNECT,
+        COSH_TRADE_NAMES_CORE, "tn:confidor",
+        COSH_AI_CORE, "ai:17.8%",
+    ))
+    await db.commit()
+
+    out = await list_common_names_for_l2(db, "CHEMICAL_PESTICIDES")
+    assert [c["name"] for c in out] == ["Imidacloprid"]
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_completeness_filter_microbial_only_needs_manufacturer(db, monkeypatch):
+    """MICROBIAL_PESTICIDES requires only the manufacturer connect.
+    A CN with a TN linked to a MFR (no F, no AI) passes the filter."""
+    _restore_completeness_spec(monkeypatch, {
+        "MICROBIAL_PESTICIDES": frozenset({"manufacturer"}),
+    })
+    MICROBIAL_L2_UUID = PYTHON_L2_TO_COSH_UUID["MICROBIAL_PESTICIDES"]
+    db.add(_core("cn:beauv", COSH_COMMON_NAMES_CORE, "Beauveria bassiana"))
+    db.add(_core("tn:biosoft", COSH_TRADE_NAMES_CORE, "Biosoft"))
+    db.add(_core("mfr:multiplex", COSH_INPUT_MANUFACTURERS_CORE, "Multiplex"))
+    db.add(_connect2(
+        "cncn-1", COSH_COMMONNAMES_L2_CONNECT,
+        COSH_COMMON_NAMES_CORE, "cn:beauv",
+        COSH_L2_DATA_CORE, MICROBIAL_L2_UUID,
+    ))
+    db.add(_connect2(
+        "tncn-1", COSH_TRADENAME_COMMONNAME_CONNECT,
+        COSH_TRADE_NAMES_CORE, "tn:biosoft",
+        COSH_COMMON_NAMES_CORE, "cn:beauv",
+    ))
+    db.add(_connect2(
+        "tnmfr-1", COSH_TRADENAME_MANUFACTURER_CONNECT,
+        COSH_TRADE_NAMES_CORE, "tn:biosoft",
+        COSH_INPUT_MANUFACTURERS_CORE, "mfr:multiplex",
+    ))
+    await db.commit()
+
+    out = await list_common_names_for_l2(db, "MICROBIAL_PESTICIDES")
+    assert [c["name"] for c in out] == ["Beauveria bassiana"]
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_completeness_filter_cascades_to_trade_names(db, monkeypatch):
+    """When the SE picks a CN, the trade-name dropdown also hides
+    incomplete TNs. Sibling TN under the same CN that's missing
+    AI must not surface for CHEMICAL_PESTICIDES."""
+    _restore_completeness_spec(monkeypatch, {
+        "CHEMICAL_PESTICIDES": frozenset({"manufacturer", "formulation", "ai"}),
+    })
+    db.add(_core("cn:imid", COSH_COMMON_NAMES_CORE, "Imidacloprid"))
+    db.add(_core("tn:confidor", COSH_TRADE_NAMES_CORE, "Confidor"))
+    db.add(_core("tn:half", COSH_TRADE_NAMES_CORE, "HalfBrand"))
+    db.add(_core("mfr:bayer", COSH_INPUT_MANUFACTURERS_CORE, "Bayer"))
+    db.add(_core("mfr:upl", COSH_INPUT_MANUFACTURERS_CORE, "UPL"))
+    db.add(_core("f:wp", COSH_FORMULATIONS_CORE, "WP"))
+    db.add(_core("ai:17.8%", COSH_AI_CORE, "17.8%"))
+
+    db.add(_connect2(
+        "cncn-1", COSH_COMMONNAMES_L2_CONNECT,
+        COSH_COMMON_NAMES_CORE, "cn:imid",
+        COSH_L2_DATA_CORE, CHEM_PEST_L2_UUID,
+    ))
+    # Both TNs claim the CN.
+    for tn in ("tn:confidor", "tn:half"):
+        db.add(_connect2(
+            f"tncn-{tn}", COSH_TRADENAME_COMMONNAME_CONNECT,
+            COSH_TRADE_NAMES_CORE, tn,
+            COSH_COMMON_NAMES_CORE, "cn:imid",
+        ))
+    # Both have M + F. Only Confidor has AI.
+    for tn, mfr in (("tn:confidor", "mfr:bayer"), ("tn:half", "mfr:upl")):
+        db.add(_connect2(
+            f"tnmfr-{tn}", COSH_TRADENAME_MANUFACTURER_CONNECT,
+            COSH_TRADE_NAMES_CORE, tn,
+            COSH_INPUT_MANUFACTURERS_CORE, mfr,
+        ))
+        db.add(_connect2(
+            f"tnf-{tn}", COSH_TRADENAME_FORMULATION_CONNECT,
+            COSH_TRADE_NAMES_CORE, tn,
+            COSH_FORMULATIONS_CORE, "f:wp",
+        ))
+    db.add(_connect2(
+        "tnai-1", COSH_TRADENAME_AI_CONNECT,
+        COSH_TRADE_NAMES_CORE, "tn:confidor",
+        COSH_AI_CORE, "ai:17.8%",
+    ))
+    await db.commit()
+
+    out = await list_trade_names_for_common_name(
+        db, "cn:imid", l2_type="CHEMICAL_PESTICIDES",
+    )
+    assert [t["name"] for t in out] == ["Confidor"]
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_completeness_filter_omitted_l2_disables_filter(db, monkeypatch):
+    """If the caller doesn't supply l2_type, no filter applies — the
+    pre-39D behaviour is preserved for legacy callers."""
+    _restore_completeness_spec(monkeypatch, {
+        "CHEMICAL_PESTICIDES": frozenset({"manufacturer", "formulation", "ai"}),
+    })
+    db.add(_core("cn:imid", COSH_COMMON_NAMES_CORE, "Imidacloprid"))
+    db.add(_core("tn:half", COSH_TRADE_NAMES_CORE, "HalfBrand"))
+    db.add(_connect2(
+        "tncn-1", COSH_TRADENAME_COMMONNAME_CONNECT,
+        COSH_TRADE_NAMES_CORE, "tn:half",
+        COSH_COMMON_NAMES_CORE, "cn:imid",
+    ))
+    await db.commit()
+
+    # No l2_type → no filter. HalfBrand surfaces even without M/F/AI.
+    out = await list_trade_names_for_common_name(db, "cn:imid")
+    assert [t["name"] for t in out] == ["HalfBrand"]
