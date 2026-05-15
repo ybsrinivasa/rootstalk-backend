@@ -58,7 +58,7 @@ from app.services.publish_validation import (
 from app.services.timeline_validation import (
     TimelineValidationError, validate_timeline,
 )
-from app.services.relations import PracticeRef
+from app.services.relations import PracticeRef, decode_role
 from app.services.relation_validation import (
     RelationValidationFailed, validate_relation_save,
 )
@@ -1968,6 +1968,464 @@ async def link_relation_conditional(
     existing_rc = (await db.execute(
         select(RelationConditional).where(
             RelationConditional.relation_id == relation_id
+        )
+    )).scalar_one_or_none()
+    existing_q_id = existing_rc.question_id if existing_rc else None
+
+    try:
+        assert_relation_can_be_linked_to_conditional(
+            relation_id=relation_id,
+            target_question_id=request.question_id,
+            existing_question_id_for_relation=existing_q_id,
+        )
+    except ConditionalValidationError as e:
+        _raise_conditional_validation(e)
+
+    if existing_rc is not None and existing_rc.question_id == request.question_id:
+        existing_rc.answer = request.answer
+        await db.commit()
+        await db.refresh(existing_rc)
+        return existing_rc
+
+    rc = RelationConditional(
+        relation_id=relation_id,
+        question_id=request.question_id,
+        answer=request.answer,
+    )
+    db.add(rc)
+    await db.commit()
+    await db.refresh(rc)
+    return rc
+
+
+# ── Global Relations (Batch 39A, 2026-05-15) ──────────────────────────────────
+#
+# SA-portal authoring of Practice Relations on Global Packages. Mirrors the
+# four client-scoped endpoints above but binds to a Global Package (client_id
+# IS NULL) and verifies every URL segment composes the way the SE expects.
+# Reuses validate_relation_save / assert_*_can_be_linked_to_conditional from
+# the same services the client-side flow uses — single source of truth.
+
+
+async def _get_global_timeline(
+    db: AsyncSession, pkg_id: str, timeline_id: str,
+) -> tuple[Package, Timeline]:
+    """Resolve (Package, Timeline) for a Global authoring URL. 404 if either
+    is missing, mismatched, or the Package is client-scoped."""
+    pkg = (await db.execute(
+        select(Package).where(
+            Package.id == pkg_id, Package.client_id == None,  # noqa: E711
+        )
+    )).scalar_one_or_none()
+    if pkg is None:
+        raise HTTPException(status_code=404, detail="Global package not found")
+    tl = (await db.execute(
+        select(Timeline).where(
+            Timeline.id == timeline_id, Timeline.package_id == pkg_id,
+        )
+    )).scalar_one_or_none()
+    if tl is None:
+        raise HTTPException(status_code=404, detail="Timeline not found on this Global package")
+    return pkg, tl
+
+
+async def _get_global_practice(db: AsyncSession, practice_id: str) -> Practice:
+    """Resolve a Practice and confirm its Timeline's Package is Global."""
+    practice = (await db.execute(
+        select(Practice).where(Practice.id == practice_id)
+    )).scalar_one_or_none()
+    if practice is None:
+        raise HTTPException(status_code=404, detail="Practice not found")
+    pkg = (await db.execute(
+        select(Package)
+        .join(Timeline, Timeline.package_id == Package.id)
+        .where(Timeline.id == practice.timeline_id)
+    )).scalar_one_or_none()
+    if pkg is None or pkg.client_id is not None:
+        raise HTTPException(status_code=404, detail="Practice is not on a Global package")
+    return practice
+
+
+async def _get_global_relation(db: AsyncSession, relation_id: str) -> Relation:
+    """Resolve a Relation and confirm its Timeline's Package is Global."""
+    relation = (await db.execute(
+        select(Relation).where(Relation.id == relation_id)
+    )).scalar_one_or_none()
+    if relation is None:
+        raise HTTPException(status_code=404, detail="Relation not found")
+    pkg = (await db.execute(
+        select(Package)
+        .join(Timeline, Timeline.package_id == Package.id)
+        .where(Timeline.id == relation.timeline_id)
+    )).scalar_one_or_none()
+    if pkg is None or pkg.client_id is not None:
+        raise HTTPException(status_code=404, detail="Relation is not on a Global package")
+    return relation
+
+
+@router.post(
+    "/advisory/global/packages/{pkg_id}/timelines/{timeline_id}/relations",
+    status_code=201,
+)
+async def create_global_relation(
+    pkg_id: str, timeline_id: str,
+    request: RelationCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Authoring-time save of a Practice Relation on a Global Timeline.
+
+    Body mirrors `RelationCreate` from the client flow: `relation_type`
+    (AND/OR/IF), optional `expression` display string, and a 3-D `parts`
+    list of practice_ids (parts × options × positions). The same
+    `validate_relation_save` rules apply — Indian-agri-realistic mixed
+    AND-OR shapes (spec §10.1) and IF conditional bindings are
+    intentionally supported."""
+    await _get_global_timeline(db, pkg_id, timeline_id)
+
+    distinct_practice_ids: set[str] = set()
+    for opts in request.parts:
+        for positions in opts:
+            for pid in positions:
+                distinct_practice_ids.add(pid)
+    if not distinct_practice_ids:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "relation_empty",
+                "message": "A Relation must reference at least one Practice.",
+            },
+        )
+
+    practices = (await db.execute(
+        select(Practice).where(Practice.id.in_(distinct_practice_ids))
+    )).scalars().all()
+    by_id = {p.id: p for p in practices}
+    missing = sorted(distinct_practice_ids - set(by_id.keys()))
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "relation_practice_not_found",
+                "message": f"Practice(s) not found: {missing}.",
+                "missing_practice_ids": missing,
+            },
+        )
+
+    common_name_rows = (await db.execute(
+        select(Element.practice_id, Element.cosh_ref).where(
+            Element.practice_id.in_(distinct_practice_ids),
+            Element.element_type == "COMMON_NAME",
+        )
+    )).all()
+    cn_by_practice = {row[0]: row[1] for row in common_name_rows}
+
+    practice_refs_by_id = {
+        pid: PracticeRef(
+            practice_id=pid,
+            common_name_cosh_id=cn_by_practice.get(pid) or p.common_name_cosh_id,
+            is_special_input=p.is_special_input,
+            role="",
+            l2_type=p.l2_type,
+        )
+        for pid, p in by_id.items()
+    }
+    practice_meta = {
+        pid: {
+            "l0_type": p.l0_type.value if p.l0_type else None,
+            "l1_type": p.l1_type,
+            "timeline_id": p.timeline_id,
+            "relation_id": p.relation_id,
+        }
+        for pid, p in by_id.items()
+    }
+
+    # If any incoming practice carries an independent PracticeConditional,
+    # refuse — the conditional moves to the Relation (Path A) once the
+    # practice joins one. Same rule as the client-scoped endpoint.
+    existing_pcs = (await db.execute(
+        select(PracticeConditional).where(
+            PracticeConditional.practice_id.in_(distinct_practice_ids),
+        )
+    )).scalars().all()
+    if existing_pcs:
+        try:
+            assert_practices_have_no_independent_conditional(
+                practices_with_conditional=[
+                    {"practice_id": pc.practice_id, "question_id": pc.question_id}
+                    for pc in existing_pcs
+                ],
+            )
+        except ConditionalValidationError as e:
+            _raise_conditional_validation(e)
+
+    try:
+        structure = validate_relation_save(
+            relation_type=request.relation_type.value,
+            target_timeline_id=timeline_id,
+            parts=request.parts,
+            practice_refs_by_id=practice_refs_by_id,
+            practice_meta=practice_meta,
+        )
+    except RelationValidationFailed as e:
+        _raise_relation_validation(e)
+
+    relation = Relation(
+        timeline_id=timeline_id,
+        relation_type=request.relation_type,
+        expression=request.expression,
+    )
+    db.add(relation)
+    await db.flush()
+
+    for part in structure.parts:
+        for opt in part.options:
+            for pref in opt.practices:
+                pkg_practice = by_id[pref.practice_id]
+                pkg_practice.relation_id = relation.id
+                pkg_practice.relation_role = pref.role
+
+    await db.commit()
+    await db.refresh(relation)
+    return {
+        "id": relation.id,
+        "relation_type": relation.relation_type.value,
+        "expression": relation.expression,
+    }
+
+
+@router.get(
+    "/advisory/global/packages/{pkg_id}/timelines/{timeline_id}/relations",
+)
+async def list_global_relations_for_timeline(
+    pkg_id: str, timeline_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return every Relation on this Global Timeline with its 3-D parts
+    structure reconstructed from each Practice's encoded
+    `PART_n__OPT_m__POS_p` role string. Any RelationConditional bound to
+    a Relation is folded in under `conditional`. Frontend renders the
+    Relation block right inside the Timeline's expanded view."""
+    await _get_global_timeline(db, pkg_id, timeline_id)
+    relations = (await db.execute(
+        select(Relation).where(Relation.timeline_id == timeline_id)
+        .order_by(Relation.created_at)
+    )).scalars().all()
+    if not relations:
+        return []
+
+    relation_ids = [r.id for r in relations]
+    practices = (await db.execute(
+        select(Practice).where(Practice.relation_id.in_(relation_ids))
+    )).scalars().all()
+    practices_by_rel: dict[str, list[Practice]] = {}
+    for p in practices:
+        practices_by_rel.setdefault(p.relation_id, []).append(p)
+
+    rcs = (await db.execute(
+        select(RelationConditional).where(
+            RelationConditional.relation_id.in_(relation_ids),
+        )
+    )).scalars().all()
+    rc_by_rel = {rc.relation_id: rc for rc in rcs}
+
+    q_ids = {rc.question_id for rc in rcs}
+    questions_by_id: dict[str, ConditionalQuestion] = {}
+    if q_ids:
+        qs = (await db.execute(
+            select(ConditionalQuestion).where(ConditionalQuestion.id.in_(q_ids))
+        )).scalars().all()
+        questions_by_id = {q.id: q for q in qs}
+
+    out = []
+    for rel in relations:
+        # Reconstruct parts[part_idx][option_idx] = [practice_id, ...]
+        by_part: dict[int, dict[int, list[tuple[int, str]]]] = {}
+        for p in practices_by_rel.get(rel.id, []):
+            if not p.relation_role:
+                continue
+            coords = decode_role(p.relation_role)
+            by_part.setdefault(coords.part, {}).setdefault(coords.option, []).append(
+                (coords.position, p.id)
+            )
+        parts: list[list[list[str]]] = []
+        for part_idx in sorted(by_part.keys()):
+            options: list[list[str]] = []
+            for opt_idx in sorted(by_part[part_idx].keys()):
+                pos_list = sorted(by_part[part_idx][opt_idx], key=lambda x: x[0])
+                options.append([pid for (_, pid) in pos_list])
+            parts.append(options)
+
+        conditional = None
+        rc = rc_by_rel.get(rel.id)
+        if rc is not None:
+            q = questions_by_id.get(rc.question_id)
+            conditional = {
+                "question_id": rc.question_id,
+                "question_text": q.question_text if q else None,
+                "answer": rc.answer.value,
+            }
+
+        out.append({
+            "id": rel.id,
+            "relation_type": rel.relation_type.value,
+            "expression": rel.expression,
+            "parts": parts,
+            "conditional": conditional,
+        })
+    return out
+
+
+@router.delete(
+    "/advisory/global/relations/{relation_id}",
+    status_code=204,
+)
+async def delete_global_relation(
+    relation_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Remove a Relation. Clears `relation_id` and `relation_role` on every
+    Practice that was part of it (the practices stay in place — only the
+    Relation grouping is dropped) and deletes any RelationConditional
+    binding. Edit-saved-Relation is deferred to V1.1; the SE deletes and
+    rebuilds instead."""
+    await _get_global_relation(db, relation_id)
+
+    # Clear relation_id/role on practices in this relation.
+    practices = (await db.execute(
+        select(Practice).where(Practice.relation_id == relation_id)
+    )).scalars().all()
+    for p in practices:
+        p.relation_id = None
+        p.relation_role = None
+
+    # Drop any RelationConditional binding(s) for this relation.
+    rcs = (await db.execute(
+        select(RelationConditional).where(
+            RelationConditional.relation_id == relation_id,
+        )
+    )).scalars().all()
+    for rc in rcs:
+        await db.delete(rc)
+
+    # Finally, drop the Relation itself.
+    relation = (await db.execute(
+        select(Relation).where(Relation.id == relation_id)
+    )).scalar_one()
+    await db.delete(relation)
+    await db.commit()
+
+
+@router.post(
+    "/advisory/global/packages/{pkg_id}/timelines/{timeline_id}/conditional-questions",
+    status_code=201,
+)
+async def create_global_conditional_question(
+    pkg_id: str, timeline_id: str,
+    request: ConditionalQuestionCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Create a Conditional Question (CQ) on a Global Timeline. The CQ
+    is then bound to either a Relation (Path A) or an independent
+    Practice (Path B) via the link endpoints below."""
+    await _get_global_timeline(db, pkg_id, timeline_id)
+    q = ConditionalQuestion(timeline_id=timeline_id, **request.model_dump())
+    db.add(q)
+    await db.commit()
+    await db.refresh(q)
+    return q
+
+
+@router.get(
+    "/advisory/global/packages/{pkg_id}/timelines/{timeline_id}/conditional-questions",
+)
+async def list_global_conditional_questions(
+    pkg_id: str, timeline_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List CQs on a Global Timeline. The IF authoring modal calls this
+    to populate a "use existing question" dropdown so the SE doesn't
+    retype recurring questions ('Is the crop infested with X?')."""
+    await _get_global_timeline(db, pkg_id, timeline_id)
+    qs = (await db.execute(
+        select(ConditionalQuestion).where(
+            ConditionalQuestion.timeline_id == timeline_id,
+        ).order_by(ConditionalQuestion.display_order, ConditionalQuestion.created_at)
+    )).scalars().all()
+    return qs
+
+
+@router.post(
+    "/advisory/global/practices/{practice_id}/conditionals",
+    status_code=201,
+)
+async def link_global_practice_conditional(
+    practice_id: str,
+    request: PracticeConditionalCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Bind a CQ to an independent Practice on a Global Timeline (Path B —
+    the practice is not part of any saved Relation). Same idempotency
+    and conflict rules as the client-scoped endpoint."""
+    practice = await _get_global_practice(db, practice_id)
+
+    existing_pc = (await db.execute(
+        select(PracticeConditional).where(
+            PracticeConditional.practice_id == practice_id,
+        )
+    )).scalar_one_or_none()
+    existing_q_id = existing_pc.question_id if existing_pc else None
+
+    try:
+        assert_practice_can_be_linked_to_conditional(
+            practice_id=practice_id,
+            practice_relation_id=practice.relation_id,
+            target_question_id=request.question_id,
+            existing_question_id_for_practice=existing_q_id,
+        )
+    except ConditionalValidationError as e:
+        _raise_conditional_validation(e)
+
+    if existing_pc is not None and existing_pc.question_id == request.question_id:
+        existing_pc.answer = request.answer
+        await db.commit()
+        await db.refresh(existing_pc)
+        return existing_pc
+
+    pc = PracticeConditional(
+        practice_id=practice_id,
+        question_id=request.question_id,
+        answer=request.answer,
+    )
+    db.add(pc)
+    await db.commit()
+    await db.refresh(pc)
+    return pc
+
+
+@router.post(
+    "/advisory/global/relations/{relation_id}/conditionals",
+    status_code=201,
+)
+async def link_global_relation_conditional(
+    relation_id: str,
+    request: PracticeConditionalCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Bind a CQ to a saved Relation on a Global Timeline (Path A —
+    the whole Relation is conditional). `request.practice_id` is ignored;
+    the resource is the Relation in the URL."""
+    await _get_global_relation(db, relation_id)
+
+    existing_rc = (await db.execute(
+        select(RelationConditional).where(
+            RelationConditional.relation_id == relation_id,
         )
     )).scalar_one_or_none()
     existing_q_id = existing_rc.question_id if existing_rc else None
