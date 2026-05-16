@@ -299,25 +299,33 @@ async def assert_package_publish_ready(
         raise PublishBlockedError(missing)
 
 
-async def assert_global_package_publish_ready(
-    db: AsyncSession, *, package: Package,
+async def _assert_global_advisory_publish_ready(
+    db: AsyncSession, *,
+    parent_attr: str, parent_id: str, parent_label: str,
 ) -> None:
-    """Batch 39L-a (2026-05-16) — content gates for Global Package
-    publish on the SA portal. Lighter than the CA-side
-    `assert_package_publish_ready` (districts / PV-siblings / authors
-    / locations are CA-flavoured concerns). The CM-stated rules:
+    """Pipe-agnostic content-gate check for Global SA-portal publishes
+    (Batch 39P-d, 2026-05-16; extracted from `assert_global_package_
+    publish_ready`).
 
-      - At least one active Timeline on the package.
+    The CM-stated rules — common across pipes:
+      - At least one active Timeline on the parent.
       - Every active Timeline carries at least one Practice.
+      - Every Conditional Question on the parent has at least one
+        YES or NO binding (dangling-CQ rule from `find_dangling_
+        conditional_questions`).
 
-    Returns the complete list of failures so the publish modal shows
-    one consolidated checklist."""
+    `parent_attr` is the Timeline column to filter on
+    ('package_id' / 'pg_recommendation_id' / 'sp_recommendation_id' /
+    'standard_response_id'). `parent_label` is what to call the
+    parent in error messages ("Global Package" / "Global PG" / …).
+    """
     from app.modules.advisory.models import Practice, TimelineStatus
 
     missing: list[MissingPublishField] = []
+    src_col = getattr(Timeline, parent_attr)
     timelines = (await db.execute(
         select(Timeline).where(
-            Timeline.package_id == package.id,
+            src_col == parent_id,
             Timeline.status != TimelineStatus.INACTIVE,
         )
     )).scalars().all()
@@ -325,7 +333,7 @@ async def assert_global_package_publish_ready(
     if not timelines:
         missing.append(MissingPublishField(
             code="publish_no_timelines",
-            message="Add at least one Timeline before publishing.",
+            message=f"Add at least one Timeline on this {parent_label} before publishing.",
         ))
     else:
         for tl in timelines:
@@ -341,5 +349,64 @@ async def assert_global_package_publish_ready(
                     extra={"timeline_id": tl.id, "timeline_name": tl.name},
                 ))
 
+        # Dangling-CQ check — uses the existing pipe-agnostic helper
+        # which walks Timeline.id directly.
+        timeline_ids = [tl.id for tl in timelines]
+        practice_link_exists = (
+            select(PracticeConditional.id)
+            .where(PracticeConditional.question_id == ConditionalQuestion.id)
+            .exists()
+        )
+        relation_link_exists = (
+            select(RelationConditional.id)
+            .where(RelationConditional.question_id == ConditionalQuestion.id)
+            .exists()
+        )
+        dangling = (await db.execute(
+            select(ConditionalQuestion).where(
+                ConditionalQuestion.timeline_id.in_(timeline_ids),
+                ~practice_link_exists,
+                ~relation_link_exists,
+            )
+        )).scalars().all()
+        for q in dangling:
+            missing.append(MissingPublishField(
+                code="conditional_question_no_links",
+                message=(
+                    f"Conditional Question '{q.question_text}' has no YES or NO "
+                    "link to any Practice or Relation. Either link an answer or "
+                    "delete the question before publishing."
+                ),
+                extra={
+                    "question_id": q.id,
+                    "question_text": q.question_text,
+                    "timeline_id": q.timeline_id,
+                },
+            ))
+
     if missing:
         raise PublishBlockedError(missing)
+
+
+async def assert_global_package_publish_ready(
+    db: AsyncSession, *, package: Package,
+) -> None:
+    """Batch 39L-a (2026-05-16) — content gates for Global Package
+    publish on the SA portal. Now a thin wrapper over
+    `_assert_global_advisory_publish_ready` (Batch 39P-d)."""
+    await _assert_global_advisory_publish_ready(
+        db, parent_attr="package_id", parent_id=package.id,
+        parent_label="Global Package",
+    )
+
+
+async def assert_global_pg_publish_ready(
+    db: AsyncSession, *, pg_id: str,
+) -> None:
+    """Batch 39P-d (2026-05-16) — content gates for Global PG
+    publish. Same rules as the Package sibling (≥1 active Timeline,
+    every Timeline ≥1 Practice, no dangling CQs)."""
+    await _assert_global_advisory_publish_ready(
+        db, parent_attr="pg_recommendation_id", parent_id=pg_id,
+        parent_label="Global PG",
+    )

@@ -55,7 +55,7 @@ from app.services.pv_consistency import (
 )
 from app.services.publish_validation import (
     PublishBlockedError, assert_package_publish_ready,
-    assert_global_package_publish_ready,
+    assert_global_package_publish_ready, assert_global_pg_publish_ready,
 )
 from app.services.timeline_validation import (
     TimelineValidationError, validate_timeline,
@@ -4568,25 +4568,32 @@ async def delete_global_cca_element(
     )
 
 
-async def _deep_copy_package_content(
-    db: AsyncSession, src_id: str, dst_id: str,
+async def _deep_copy_advisory_content(
+    db: AsyncSession, *,
+    src_parent_attr: str, src_parent_id: str,
+    dst_parent_attr: str, dst_parent_id: str,
 ) -> None:
-    """Copy all timelines + practices + elements + relations + CQs
-    from `src_id` → `dst_id`. Used by push, pull, SE clone-to-draft,
-    and SE rollback-publish.
+    """Pipe-agnostic deep-copy of the UCAT Timeline → Practice →
+    Element → Relation → ConditionalQuestion sub-tree from one parent
+    advisory row to another.
 
-    Does NOT touch package-level fields (name, package_type,
-    duration_days, locations, authors, package_variables) — caller
-    is responsible for setting those on the destination row before
+    `*_parent_attr` is the name of the Timeline's parent FK column —
+    `'package_id'`, `'pg_recommendation_id'`, `'sp_recommendation_id'`,
+    or `'standard_response_id'`. Source and destination usually use
+    the same attr (same pipe) but the API supports cross-pipe copies
+    just in case.
+
+    Does NOT touch parent-level fields (Package name / duration /
+    locations / authors / PVs; PG-Recommendation problem_group_cosh_id
+    / area_or_plant) — caller sets those on the destination row before
     invoking. Commits are not issued here; the caller controls the
     transaction boundary.
 
-    Batch 39L-b (2026-05-16) — also carries is_brand_locked on the
-    Practice copy (column added in 39I-a), plus Relations + their
-    PracticeConditional / RelationConditional bindings + Conditional
-    Questions. Previously, cloning a package dropped every Relation
-    and CQ — making the CM's "edit this version" flow lose those
-    sub-structures.
+    Batch 39P-d (2026-05-16) — generalised from `_deep_copy_package_
+    content` so PG / SP / QA clone-to-draft flows can reuse the
+    same machinery the CCA clone uses (Brand Lock, frequency,
+    common_name, relations + bindings, CQs + bindings all flow
+    through).
     """
     practice_id_map: dict[str, str] = {}        # src_practice_id → new_practice_id
     timeline_id_map: dict[str, str] = {}        # src_timeline_id → new_timeline_id
@@ -4596,14 +4603,14 @@ async def _deep_copy_package_content(
     # practice rows to the new relation rows after both have flushed.
     practice_relation_links: dict[str, tuple[str, str]] = {}
 
+    src_attr_col = getattr(Timeline, src_parent_attr)
     tl_result = await db.execute(
-        select(Timeline).where(Timeline.package_id == src_id)
+        select(Timeline).where(src_attr_col == src_parent_id)
         .order_by(Timeline.display_order)
     )
     src_timelines = tl_result.scalars().all()
     for src_tl in src_timelines:
         new_tl = Timeline(
-            package_id=dst_id,
             name=src_tl.name,
             from_type=src_tl.from_type,
             from_value=src_tl.from_value,
@@ -4611,6 +4618,7 @@ async def _deep_copy_package_content(
             display_order=src_tl.display_order,
             status=src_tl.status,
         )
+        setattr(new_tl, dst_parent_attr, dst_parent_id)
         db.add(new_tl)
         await db.flush()
         timeline_id_map[src_tl.id] = new_tl.id
@@ -4725,6 +4733,19 @@ async def _deep_copy_package_content(
                 db.add(RelationConditional(
                     relation_id=new_r, question_id=new_cq, answer=rc.answer,
                 ))
+
+
+async def _deep_copy_package_content(
+    db: AsyncSession, src_id: str, dst_id: str,
+) -> None:
+    """Backward-compatible CCA shim over `_deep_copy_advisory_content`
+    (Batch 39P-d, 2026-05-16). Existing callers (push, pull, SE
+    clone-to-draft, SE rollback-publish) keep their two-arg shape."""
+    await _deep_copy_advisory_content(
+        db,
+        src_parent_attr="package_id", src_parent_id=src_id,
+        dst_parent_attr="package_id", dst_parent_id=dst_id,
+    )
 
 
 async def _assert_client_user_can_edit(
@@ -5641,6 +5662,12 @@ async def publish_global_pg(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Publish a Global PG Recommendation. Same content-gate rules as
+    Global Package (Batch 39P-d, 2026-05-16): ≥1 Timeline, every
+    Timeline ≥1 Practice, no dangling Conditional Questions.
+
+    Returns 422 `publish_blocked` with a structured `missing: [...]`
+    body so the SA portal can render one consolidated checklist."""
     pg = (await db.execute(
         select(PGRecommendation).where(PGRecommendation.id == pg_id)
     )).scalar_one_or_none()
@@ -5650,10 +5677,27 @@ async def publish_global_pg(
     if not res.allowed:
         _raise_publish_transition(res)
 
-    # Deactivate previous active version for same problem_group + client
+    try:
+        await assert_global_pg_publish_ready(db, pg_id=pg.id)
+    except PublishBlockedError as e:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "publish_blocked",
+                "message": "PG Recommendation is not ready for publish.",
+                "missing": [
+                    {"code": m.code, "message": m.message, "extra": m.extra}
+                    for m in e.missing
+                ],
+            },
+        )
+
+    # Deactivate previous active version for same problem_group +
+    # area_or_plant + client lineage (lineage-aware after Batch 39P-d).
     prev = (await db.execute(
         select(PGRecommendation).where(
             PGRecommendation.problem_group_cosh_id == pg.problem_group_cosh_id,
+            PGRecommendation.area_or_plant == pg.area_or_plant,
             PGRecommendation.client_id == pg.client_id,
             PGRecommendation.status == "ACTIVE",
             PGRecommendation.id != pg.id,
@@ -5673,6 +5717,121 @@ async def publish_global_pg(
     await db.commit()
     await db.refresh(pg)
     return pg
+
+
+# ── PG clone-to-draft + lineage (Batch 39P-d, 2026-05-16) ──────────────
+
+@router.post("/advisory/global/pg-recommendations/{pg_id}/clone-to-draft")
+async def clone_global_pg_to_draft(
+    pg_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CM clones an ACTIVE or INACTIVE Global PG Recommendation into
+    a new DRAFT. Same model as Global Package clone (Batch 39L-b):
+
+      • DRAFT sources rejected with `clone_source_is_draft`.
+      • Single-DRAFT invariant — any other DRAFT in the same lineage
+        flips to INACTIVE.
+      • Content deep-copied via `_deep_copy_advisory_content` so
+        Brand Lock / Relations / CQs / bindings all carry across.
+    """
+    src = (await db.execute(
+        select(PGRecommendation).where(
+            PGRecommendation.id == pg_id,
+            PGRecommendation.client_id == None,  # noqa: E711
+        )
+    )).scalar_one_or_none()
+    if not src:
+        raise HTTPException(status_code=404, detail="Global PG not found")
+    if src.status == "DRAFT":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "clone_source_is_draft",
+                "message": (
+                    "This row is already a DRAFT. Edit it in place rather "
+                    "than cloning."
+                ),
+            },
+        )
+
+    # Single-DRAFT invariant: flip any existing DRAFT in this lineage
+    # (same problem_group + area_or_plant, client_id NULL) to INACTIVE.
+    existing_draft = (await db.execute(
+        select(PGRecommendation).where(
+            PGRecommendation.client_id == None,  # noqa: E711
+            PGRecommendation.problem_group_cosh_id == src.problem_group_cosh_id,
+            PGRecommendation.area_or_plant == src.area_or_plant,
+            PGRecommendation.status == "DRAFT",
+        )
+    )).scalar_one_or_none()
+    if existing_draft is not None:
+        existing_draft.status = "INACTIVE"
+        await db.flush()
+
+    new_draft = PGRecommendation(
+        problem_group_cosh_id=src.problem_group_cosh_id,
+        area_or_plant=src.area_or_plant,
+        client_id=None,
+        parent_id=src.parent_id,  # preserve lineage anchor
+        status="DRAFT",
+        version=1,
+    )
+    db.add(new_draft)
+    await db.flush()
+
+    await _deep_copy_advisory_content(
+        db,
+        src_parent_attr="pg_recommendation_id", src_parent_id=src.id,
+        dst_parent_attr="pg_recommendation_id", dst_parent_id=new_draft.id,
+    )
+    await db.commit()
+    await db.refresh(new_draft)
+    return new_draft
+
+
+@router.get("/advisory/global/pg-recommendations/{pg_id}/lineage")
+async def get_global_pg_lineage(
+    pg_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Every row in this Global PG's lineage (same problem_group +
+    area_or_plant, client_id=NULL), DRAFT first then version desc.
+    `is_current` flags the row matching the path's `pg_id`. Mirror
+    of the Global Package lineage endpoint (Batch 39L-b)."""
+    src = (await db.execute(
+        select(PGRecommendation).where(
+            PGRecommendation.id == pg_id,
+            PGRecommendation.client_id == None,  # noqa: E711
+        )
+    )).scalar_one_or_none()
+    if not src:
+        raise HTTPException(status_code=404, detail="Global PG not found")
+    rows = (await db.execute(
+        select(PGRecommendation).where(
+            PGRecommendation.client_id == None,  # noqa: E711
+            PGRecommendation.problem_group_cosh_id == src.problem_group_cosh_id,
+            PGRecommendation.area_or_plant == src.area_or_plant,
+        )
+    )).scalars().all()
+
+    def sort_key(r: PGRecommendation) -> tuple:
+        # DRAFT first, then version desc.
+        is_draft = 0 if r.status == "DRAFT" else 1
+        return (is_draft, -r.version)
+
+    sorted_rows = sorted(rows, key=sort_key)
+    return [
+        {
+            "id": r.id,
+            "status": r.status,
+            "version": r.version,
+            "is_current": r.id == pg_id,
+        }
+        for r in sorted_rows
+    ]
 
 
 # ── Client PG Recommendations ──────────────────────────────────────────────────
