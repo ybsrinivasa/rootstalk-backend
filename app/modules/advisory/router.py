@@ -2081,42 +2081,52 @@ async def _get_global_practice(db: AsyncSession, practice_id: str) -> Practice:
 
 
 async def _get_global_relation(db: AsyncSession, relation_id: str) -> Relation:
-    """Resolve a Relation and confirm its Timeline's Package is Global."""
+    """Resolve a Relation and confirm its Timeline is rooted on a Global
+    parent (Package / PG / SP / QA, all with `client_id IS NULL`).
+
+    Batch 39P-b (2026-05-16) — extended from package-only to UCAT-wide
+    after Batch 39O merged the four pipes into a single `timelines`
+    table. The Relation table itself was always pipe-agnostic (FK to
+    `timelines.id` only); the Global-scoping check now walks via
+    Timeline → whichever parent FK is set."""
     relation = (await db.execute(
         select(Relation).where(Relation.id == relation_id)
     )).scalar_one_or_none()
     if relation is None:
         raise HTTPException(status_code=404, detail="Relation not found")
-    pkg = (await db.execute(
-        select(Package)
-        .join(Timeline, Timeline.package_id == Package.id)
-        .where(Timeline.id == relation.timeline_id)
+    tl = (await db.execute(
+        select(Timeline).where(Timeline.id == relation.timeline_id)
     )).scalar_one_or_none()
-    if pkg is None or pkg.client_id is not None:
-        raise HTTPException(status_code=404, detail="Relation is not on a Global package")
-    return relation
+    if tl is None:
+        raise HTTPException(status_code=404, detail="Relation has no parent timeline")
+    # CCA Global Package.
+    if tl.package_id is not None:
+        pkg = (await db.execute(
+            select(Package).where(Package.id == tl.package_id)
+        )).scalar_one_or_none()
+        if pkg and pkg.client_id is None:
+            return relation
+    # CHA Global PG.
+    if tl.pg_recommendation_id is not None:
+        pg = (await db.execute(
+            select(PGRecommendation).where(PGRecommendation.id == tl.pg_recommendation_id)
+        )).scalar_one_or_none()
+        if pg and pg.client_id is None:
+            return relation
+    raise HTTPException(
+        status_code=404, detail="Relation is not on a Global parent",
+    )
 
 
-@router.post(
-    "/advisory/global/packages/{pkg_id}/timelines/{timeline_id}/relations",
-    status_code=201,
-)
-async def create_global_relation(
-    pkg_id: str, timeline_id: str,
-    request: RelationCreate,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """Authoring-time save of a Practice Relation on a Global Timeline.
-
-    Body mirrors `RelationCreate` from the client flow: `relation_type`
-    (AND/OR/IF), optional `expression` display string, and a 3-D `parts`
-    list of practice_ids (parts × options × positions). The same
-    `validate_relation_save` rules apply — Indian-agri-realistic mixed
-    AND-OR shapes (spec §10.1) and IF conditional bindings are
-    intentionally supported."""
-    await _get_global_timeline(db, pkg_id, timeline_id)
-
+async def _create_relation_for_global_timeline(
+    db: AsyncSession, *, timeline_id: str, request: "RelationCreate",
+) -> dict:
+    """Pipe-agnostic Relation create. Caller is responsible for the
+    Global-scope auth check before calling. Body shared between
+    `create_global_relation` (CCA Package) and
+    `create_global_pg_relation` (CHA-PG) — extracted in Batch 39P-b
+    so both pipes go through the same validator + persistence path
+    after UCAT unification (Batch 39O)."""
     distinct_practice_ids: set[str] = set()
     for opts in request.parts:
         for positions in opts:
@@ -2228,20 +2238,32 @@ async def create_global_relation(
     }
 
 
-@router.get(
+@router.post(
     "/advisory/global/packages/{pkg_id}/timelines/{timeline_id}/relations",
+    status_code=201,
 )
-async def list_global_relations_for_timeline(
+async def create_global_relation(
     pkg_id: str, timeline_id: str,
+    request: RelationCreate,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Return every Relation on this Global Timeline with its 3-D parts
-    structure reconstructed from each Practice's encoded
-    `PART_n__OPT_m__POS_p` role string. Any RelationConditional bound to
-    a Relation is folded in under `conditional`. Frontend renders the
-    Relation block right inside the Timeline's expanded view."""
+    """Authoring-time save of a Practice Relation on a Global CCA
+    Timeline. Body shape, validation, and persistence shared with the
+    CHA-PG sibling via `_create_relation_for_global_timeline`."""
     await _get_global_timeline(db, pkg_id, timeline_id)
+    return await _create_relation_for_global_timeline(
+        db, timeline_id=timeline_id, request=request,
+    )
+
+
+async def _list_relations_for_global_timeline(
+    db: AsyncSession, *, timeline_id: str,
+) -> list[dict]:
+    """Pipe-agnostic Relation list. Caller pre-validates Global
+    scope. Returns each Relation with its 3-D `parts` shape
+    reconstructed from per-Practice `PART_n__OPT_m__POS_p` roles +
+    any bound RelationConditional folded in under `conditional`."""
     relations = (await db.execute(
         select(Relation).where(Relation.timeline_id == timeline_id)
         .order_by(Relation.created_at)
@@ -2309,6 +2331,89 @@ async def list_global_relations_for_timeline(
             "conditional": conditional,
         })
     return out
+
+
+@router.get(
+    "/advisory/global/packages/{pkg_id}/timelines/{timeline_id}/relations",
+)
+async def list_global_relations_for_timeline(
+    pkg_id: str, timeline_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List Relations on a Global CCA Timeline. Body shared with the
+    CHA-PG sibling via `_list_relations_for_global_timeline`."""
+    await _get_global_timeline(db, pkg_id, timeline_id)
+    return await _list_relations_for_global_timeline(
+        db, timeline_id=timeline_id,
+    )
+
+
+# ── PG-side Relation endpoints (Batch 39P-b, 2026-05-16) ───────────────
+# Same shape as CCA above — the create/list bodies are extracted into
+# pipe-agnostic helpers (`_create_relation_for_global_timeline`,
+# `_list_relations_for_global_timeline`) so adding more pipes is just
+# the auth-prefix wrapper.
+
+async def _get_global_pg_timeline(
+    db: AsyncSession, pg_id: str, timeline_id: str,
+) -> tuple["PGRecommendation", Timeline]:
+    """Resolve (PGRecommendation, Timeline) for a Global PG authoring
+    URL. 404 on any mismatch or if the PG is client-scoped."""
+    pg = (await db.execute(
+        select(PGRecommendation).where(
+            PGRecommendation.id == pg_id,
+            PGRecommendation.client_id == None,  # noqa: E711
+        )
+    )).scalar_one_or_none()
+    if pg is None:
+        raise HTTPException(status_code=404, detail="Global PG not found")
+    tl = (await db.execute(
+        select(Timeline).where(
+            Timeline.id == timeline_id,
+            Timeline.pg_recommendation_id == pg_id,
+        )
+    )).scalar_one_or_none()
+    if tl is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Timeline not found on this Global PG",
+        )
+    return pg, tl
+
+
+@router.post(
+    "/advisory/global/pg-recommendations/{pg_id}/timelines/{timeline_id}/relations",
+    status_code=201,
+)
+async def create_global_pg_relation(
+    pg_id: str, timeline_id: str,
+    request: RelationCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Authoring-time save of a Practice Relation on a Global CHA-PG
+    Timeline. Shares the body validator + persister with the CCA
+    sibling — see `_create_relation_for_global_timeline`."""
+    await _get_global_pg_timeline(db, pg_id, timeline_id)
+    return await _create_relation_for_global_timeline(
+        db, timeline_id=timeline_id, request=request,
+    )
+
+
+@router.get(
+    "/advisory/global/pg-recommendations/{pg_id}/timelines/{timeline_id}/relations",
+)
+async def list_global_pg_relations(
+    pg_id: str, timeline_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List Relations on a Global CHA-PG Timeline."""
+    await _get_global_pg_timeline(db, pg_id, timeline_id)
+    return await _list_relations_for_global_timeline(
+        db, timeline_id=timeline_id,
+    )
 
 
 @router.delete(
