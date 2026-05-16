@@ -5430,16 +5430,33 @@ async def list_global_problem_groups(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """SA-portal helper (Batch 39P-a, 2026-05-16) — list of
-    Problem-Groups a CM can author Global recommendations against.
+    """SA-portal helper — Problem Groups a CM can author Global
+    recommendations against. Reads from Cosh's `problem_groups` Core
+    (Batch 39Q-frontend, 2026-05-16) — the legacy hardcoded list in
+    `app/services/cha_problem_groups.py` still backs the CA-portal
+    helpers but the SA picker now ties into the same data that
+    drives `/diagnosis/pg-crops` so PGRecs created here can resolve
+    their applicable-crop chips against `sp_pg_crops` Connect.
 
-    Today this is the same hardcoded V1 list used by the CA portal
-    (`app/services/cha_problem_groups.py`); when Cosh's `problem_group`
-    Connect ships, that module switches its source and every caller
-    of this endpoint picks up the new list automatically.
-    """
-    from app.services.cha_problem_groups import list_problem_groups
-    return list_problem_groups()
+    Returns `[{cosh_id, name_en, status}]` sorted by `name_en`.
+    Only `active` Core items surface."""
+    from app.services.cosh_constants import COSH_PROBLEM_GROUPS_CORE
+    rows = (await db.execute(
+        select(CoshCoreItem).where(
+            CoshCoreItem.core_type == COSH_PROBLEM_GROUPS_CORE,
+            CoshCoreItem.status == "active",
+        )
+    )).scalars().all()
+    items = []
+    for r in rows:
+        t = r.translations or {}
+        items.append({
+            "cosh_id": r.cosh_id,
+            "name_en": t.get("en") or t.get("English") or r.cosh_id,
+            "status": "active",
+        })
+    items.sort(key=lambda x: x["name_en"].casefold())
+    return items
 
 
 @router.get("/advisory/global/pg-recommendations", response_model=list[PGRecommendationOut])
