@@ -3,7 +3,7 @@
 Tests the SP-side mirror of the PG hub:
 
   • cha_sp_eligible_crops returns ClientCrop ∩ CropHealthCrop (the
-    crops where SE may author SP recommendations).
+crops where SE may author SP recommendations).
   • cha_sp_specific_problems returns the V1 hardcoded list-per-crop
     with `existing` flag for problems the SE has already authored.
   • cha_sp_list_recommendations chip-filters on crop, status.
@@ -17,12 +17,12 @@ from datetime import datetime, timezone
 import pytest
 
 from app.modules.advisory.models import (
-    SPElement, SPPractice, SPRecommendation, SPTimeline,
+Element,Practice,SPRecommendation,Timeline,
 )
 from app.modules.advisory.router import (
-    cha_sp_eligible_crops, cha_sp_list_practices,
-    cha_sp_list_recommendations, cha_sp_list_timelines,
-    cha_sp_specific_problems,
+cha_sp_eligible_crops,cha_sp_list_practices,
+cha_sp_list_recommendations,cha_sp_list_timelines,
+cha_sp_specific_problems,
 )
 from app.modules.clients.models import ClientCrop
 from app.modules.sync.models import CoshCoreItem, CropHealthCrop
@@ -37,13 +37,13 @@ async def _seed_eligible_crops(db, *, client):
     """Three crops in CA's set; two of them ALSO in the CM-CHA set.
     Returns (eligible cosh_ids, name → cosh_id map)."""
     db.add_all([
-        # Three biological_names with friendly Cosh-side names.
-        CoshCoreItem(cosh_id="crop:tomato", core_type=COSH_BIOLOGICAL_NAMES_CORE,
-                     translations={"en": "Tomato"}, status="active"),
-        CoshCoreItem(cosh_id="crop:onion", core_type=COSH_BIOLOGICAL_NAMES_CORE,
-                     translations={"en": "Onion"}, status="active"),
-        CoshCoreItem(cosh_id="crop:papaya", core_type=COSH_BIOLOGICAL_NAMES_CORE,
-                     translations={"en": "Papaya"}, status="active"),
+# Three biological_names with friendly Cosh-side names.
+CoshCoreItem(cosh_id="crop:tomato",core_type=COSH_BIOLOGICAL_NAMES_CORE,
+translations={"en": "Tomato"},status="active"),
+        CoshCoreItem(cosh_id="crop:onion",core_type=COSH_BIOLOGICAL_NAMES_CORE,
+translations={"en": "Onion"},status="active"),
+        CoshCoreItem(cosh_id="crop:papaya",core_type=COSH_BIOLOGICAL_NAMES_CORE,
+translations={"en": "Papaya"},status="active"),
         # CA shortlist for this client — all three.
         ClientCrop(client_id=client.id, crop_cosh_id="crop:tomato"),
         ClientCrop(client_id=client.id, crop_cosh_id="crop:onion"),
@@ -85,10 +85,10 @@ async def test_eligible_crops_excludes_soft_removed_client_crop(db):
     await _seed_eligible_crops(db, client=client)
     from sqlalchemy import select as _sel
     tomato = (await db.execute(
-        _sel(ClientCrop).where(
-            ClientCrop.client_id == client.id,
-            ClientCrop.crop_cosh_id == "crop:tomato",
-        )
+_sel(ClientCrop).where(
+ClientCrop.client_id == client.id,
+ClientCrop.crop_cosh_id == "crop:tomato",
+)
     )).scalar_one()
     tomato.removed_at = datetime.now(timezone.utc)
     await db.commit()
@@ -108,7 +108,7 @@ async def test_eligible_crops_excludes_inactive_crop_health(db):
     await _seed_eligible_crops(db, client=client)
     from sqlalchemy import select as _sel
     onion = (await db.execute(
-        _sel(CropHealthCrop).where(CropHealthCrop.crop_cosh_id == "crop:onion")
+_sel(CropHealthCrop).where(CropHealthCrop.crop_cosh_id == "crop:onion")
     )).scalar_one()
     onion.status = "INACTIVE"
     await db.commit()
@@ -127,9 +127,9 @@ async def test_specific_problems_returns_v1_list_for_known_crop(db):
     user = await make_user(db, name="SE")
     await db.commit()
     out = await cha_sp_specific_problems(
-        client_id=client.id, crop_cosh_id="crop:tomato",
-        db=db, current_user=user,
-    )
+client_id=client.id,crop_cosh_id="crop:tomato",
+db=db,current_user=user,
+)
     cosh_ids = {p["cosh_id"] for p in out}
     assert "sp:tomato_late_blight" in cosh_ids
     assert "sp:tomato_fruit_borer" in cosh_ids
@@ -146,16 +146,16 @@ async def test_specific_problems_flags_existing_recommendation(db):
     client = await make_client(db)
     user = await make_user(db, name="SE")
     sp = SPRecommendation(
-        specific_problem_cosh_id="sp:tomato_late_blight",
-        client_id=client.id, crop_cosh_id="crop:tomato",
-        status="DRAFT",
-    )
+specific_problem_cosh_id="sp:tomato_late_blight",
+client_id=client.id,crop_cosh_id="crop:tomato",
+status="DRAFT",
+)
     db.add(sp); await db.commit()
 
     out = await cha_sp_specific_problems(
-        client_id=client.id, crop_cosh_id="crop:tomato",
-        db=db, current_user=user,
-    )
+client_id=client.id,crop_cosh_id="crop:tomato",
+db=db,current_user=user,
+)
     by_id = {p["cosh_id"]: p for p in out}
     assert by_id["sp:tomato_late_blight"]["existing"]["id"] == sp.id
     assert by_id["sp:tomato_late_blight"]["existing"]["status"] == "DRAFT"
@@ -170,9 +170,9 @@ async def test_specific_problems_unknown_crop_returns_empty(db):
     user = await make_user(db, name="SE")
     await db.commit()
     out = await cha_sp_specific_problems(
-        client_id=client.id, crop_cosh_id="crop:never_in_v1_list",
-        db=db, current_user=user,
-    )
+client_id=client.id,crop_cosh_id="crop:never_in_v1_list",
+db=db,current_user=user,
+)
     assert out == []
 
 
@@ -184,21 +184,21 @@ async def test_sp_recommendations_filter_by_crop(db):
     client = await make_client(db)
     user = await make_user(db, name="SE")
     db.add_all([
+SPRecommendation(
+specific_problem_cosh_id="sp:tomato_late_blight",
+client_id=client.id,crop_cosh_id="crop:tomato",status="DRAFT",
+),
         SPRecommendation(
-            specific_problem_cosh_id="sp:tomato_late_blight",
-            client_id=client.id, crop_cosh_id="crop:tomato", status="DRAFT",
-        ),
-        SPRecommendation(
-            specific_problem_cosh_id="sp:onion_thrips",
-            client_id=client.id, crop_cosh_id="crop:onion", status="ACTIVE",
-        ),
+specific_problem_cosh_id="sp:onion_thrips",
+client_id=client.id,crop_cosh_id="crop:onion",status="ACTIVE",
+),
     ])
     await db.commit()
 
     out = await cha_sp_list_recommendations(
-        client_id=client.id, crop_cosh_id="crop:tomato",
-        db=db, current_user=user,
-    )
+client_id=client.id,crop_cosh_id="crop:tomato",
+db=db,current_user=user,
+)
     assert len(out) == 1
     assert out[0]["specific_problem_name_en"] == "Tomato Late Blight"
 
@@ -210,22 +210,22 @@ async def test_sp_recommendations_filter_by_crop(db):
 async def test_sp_timelines_carry_crop_and_sp_context(db):
     client = await make_client(db)
     user = await make_user(db, name="SE")
-    db.add(CoshCoreItem(cosh_id="crop:tomato", core_type=COSH_BIOLOGICAL_NAMES_CORE,
-                        translations={"en": "Tomato"}, status="active"))
+    db.add(CoshCoreItem(cosh_id="crop:tomato",core_type=COSH_BIOLOGICAL_NAMES_CORE,
+translations={"en": "Tomato"},status="active"))
     sp = SPRecommendation(
-        specific_problem_cosh_id="sp:tomato_late_blight",
-        client_id=client.id, crop_cosh_id="crop:tomato", status="DRAFT",
-    )
+specific_problem_cosh_id="sp:tomato_late_blight",
+client_id=client.id,crop_cosh_id="crop:tomato",status="DRAFT",
+)
     db.add(sp); await db.flush()
-    tl = SPTimeline(
-        sp_recommendation_id=sp.id, name="Day 0–3",
-        from_value=0, to_value=3,
-    )
+    tl = Timeline(
+sp_recommendation_id=sp.id,name="Day 0–3",
+from_value=0,to_value=3,
+)
     db.add(tl); await db.flush()
-    db.add(SPPractice(
-        timeline_id=tl.id, l0_type="INPUT",
-        l1_type="PESTICIDE", l2_type="CHEMICAL_PESTICIDES",
-    ))
+    db.add(Practice(
+timeline_id=tl.id,l0_type="INPUT",
+l1_type="PESTICIDE",l2_type="CHEMICAL_PESTICIDES",
+))
     await db.commit()
 
     out = await cha_sp_list_timelines(client_id=client.id, db=db, current_user=user)
@@ -241,25 +241,25 @@ async def test_sp_timelines_carry_crop_and_sp_context(db):
 async def test_sp_practices_breadcrumb(db):
     client = await make_client(db)
     user = await make_user(db, name="SE")
-    db.add(CoshCoreItem(cosh_id="crop:tomato", core_type=COSH_BIOLOGICAL_NAMES_CORE,
-                        translations={"en": "Tomato"}, status="active"))
+    db.add(CoshCoreItem(cosh_id="crop:tomato",core_type=COSH_BIOLOGICAL_NAMES_CORE,
+translations={"en": "Tomato"},status="active"))
     sp = SPRecommendation(
-        specific_problem_cosh_id="sp:tomato_late_blight",
-        client_id=client.id, crop_cosh_id="crop:tomato", status="DRAFT",
-    )
+specific_problem_cosh_id="sp:tomato_late_blight",
+client_id=client.id,crop_cosh_id="crop:tomato",status="DRAFT",
+)
     db.add(sp); await db.flush()
-    tl = SPTimeline(sp_recommendation_id=sp.id, name="W1", from_value=0, to_value=7)
+    tl = Timeline(sp_recommendation_id=sp.id, name="W1", from_value=0, to_value=7)
     db.add(tl); await db.flush()
-    practice = SPPractice(
-        timeline_id=tl.id, l0_type="INPUT",
-        l1_type="PESTICIDE", l2_type="CHEMICAL_PESTICIDES",
-    )
+    practice = Practice(
+timeline_id=tl.id,l0_type="INPUT",
+l1_type="PESTICIDE",l2_type="CHEMICAL_PESTICIDES",
+)
     db.add(practice); await db.flush()
     db.add_all([
-        SPElement(practice_id=practice.id, element_type="BRAND_NAME",
-                  cosh_ref="brand:dithane-m45"),
-        SPElement(practice_id=practice.id, element_type="DOSAGE",
-                  value="2", unit_cosh_id="kg/ha"),
+Element(practice_id=practice.id,element_type="BRAND_NAME",
+cosh_ref="brand:dithane-m45"),
+        Element(practice_id=practice.id,element_type="DOSAGE",
+value="2",unit_cosh_id="kg/ha"),
     ])
     await db.commit()
 
@@ -281,9 +281,9 @@ async def test_get_client_sp_returns_single_row(db):
     client = await make_client(db)
     user = await make_user(db, name="SE")
     sp = SPRecommendation(
-        specific_problem_cosh_id="sp:tomato_late_blight",
-        client_id=client.id, crop_cosh_id="crop:tomato", status="DRAFT",
-    )
+specific_problem_cosh_id="sp:tomato_late_blight",
+client_id=client.id,crop_cosh_id="crop:tomato",status="DRAFT",
+)
     db.add(sp); await db.commit()
     out = await get_client_sp(client_id=client.id, sp_id=sp.id, db=db, current_user=user)
     assert out.id == sp.id
@@ -298,26 +298,26 @@ async def test_delete_sp_practice_cascades_elements(db):
     client = await make_client(db)
     user = await make_user(db, name="SE")
     sp = SPRecommendation(
-        specific_problem_cosh_id="sp:x", client_id=client.id,
-        crop_cosh_id="crop:tomato", status="DRAFT",
-    )
+specific_problem_cosh_id="sp:x",client_id=client.id,
+crop_cosh_id="crop:tomato",status="DRAFT",
+)
     db.add(sp); await db.flush()
-    tl = SPTimeline(sp_recommendation_id=sp.id, name="W1", from_value=0, to_value=7)
+    tl = Timeline(sp_recommendation_id=sp.id, name="W1", from_value=0, to_value=7)
     db.add(tl); await db.flush()
-    practice = SPPractice(
-        timeline_id=tl.id, l0_type="INPUT",
-        l1_type="PESTICIDE", l2_type="CHEMICAL_PESTICIDES",
-    )
+    practice = Practice(
+timeline_id=tl.id,l0_type="INPUT",
+l1_type="PESTICIDE",l2_type="CHEMICAL_PESTICIDES",
+)
     db.add(practice); await db.flush()
-    db.add(SPElement(practice_id=practice.id, element_type="DOSAGE", value="2"))
+    db.add(Element(practice_id=practice.id, element_type="DOSAGE", value="2"))
     await db.commit()
 
     await delete_client_sp_practice(
-        client_id=client.id, sp_id=sp.id, tl_id=tl.id, practice_id=practice.id,
-        db=db, current_user=user,
-    )
-    practices = (await db.execute(_sel(SPPractice))).scalars().all()
-    elements = (await db.execute(_sel(SPElement))).scalars().all()
+client_id=client.id,sp_id=sp.id,tl_id=tl.id,practice_id=practice.id,
+db=db,current_user=user,
+)
+    practices = (await db.execute(_sel(Practice))).scalars().all()
+    elements = (await db.execute(_sel(Element))).scalars().all()
     assert practices == []
     assert elements == []
 
@@ -329,16 +329,16 @@ async def test_sp_readiness_ready_when_timeline_present(db):
     client = await make_client(db)
     user = await make_user(db, name="SE")
     sp = SPRecommendation(
-        specific_problem_cosh_id="sp:x", client_id=client.id,
-        crop_cosh_id="crop:tomato", status="DRAFT",
-    )
+specific_problem_cosh_id="sp:x",client_id=client.id,
+crop_cosh_id="crop:tomato",status="DRAFT",
+)
     db.add(sp); await db.flush()
-    db.add(SPTimeline(sp_recommendation_id=sp.id, name="W1", from_value=0, to_value=7))
+    db.add(Timeline(sp_recommendation_id=sp.id, name="W1", from_value=0, to_value=7))
     await db.commit()
 
     out = await get_sp_publish_readiness(
-        client_id=client.id, sp_id=sp.id, db=db, current_user=user,
-    )
+client_id=client.id,sp_id=sp.id,db=db,current_user=user,
+)
     assert out["ready"] is True
 
 
@@ -349,14 +349,14 @@ async def test_sp_readiness_flags_no_timelines(db):
     client = await make_client(db)
     user = await make_user(db, name="SE")
     sp = SPRecommendation(
-        specific_problem_cosh_id="sp:x", client_id=client.id,
-        crop_cosh_id="crop:tomato", status="DRAFT",
-    )
+specific_problem_cosh_id="sp:x",client_id=client.id,
+crop_cosh_id="crop:tomato",status="DRAFT",
+)
     db.add(sp); await db.commit()
 
     out = await get_sp_publish_readiness(
-        client_id=client.id, sp_id=sp.id, db=db, current_user=user,
-    )
+client_id=client.id,sp_id=sp.id,db=db,current_user=user,
+)
     assert out["ready"] is False
     assert any(m["code"] == "no_timelines" for m in out["missing"])
 
@@ -369,9 +369,9 @@ async def test_sp_publish_422_on_empty(db):
     client = await make_client(db)
     user = await make_user(db, name="SE")
     sp = SPRecommendation(
-        specific_problem_cosh_id="sp:x", client_id=client.id,
-        crop_cosh_id="crop:tomato", status="DRAFT",
-    )
+specific_problem_cosh_id="sp:x",client_id=client.id,
+crop_cosh_id="crop:tomato",status="DRAFT",
+)
     db.add(sp); await db.commit()
     with pytest.raises(HTTPException) as exc:
         await publish_sp(client_id=client.id, sp_id=sp.id, db=db, current_user=user)
@@ -391,20 +391,20 @@ async def test_sp_publish_only_deactivates_same_crop_problem_siblings(db):
     client = await make_client(db)
     user = await make_user(db, name="SE")
     tomato_old = SPRecommendation(
-        specific_problem_cosh_id="sp:shared", client_id=client.id,
-        crop_cosh_id="crop:tomato", status="ACTIVE",
-    )
+specific_problem_cosh_id="sp:shared",client_id=client.id,
+crop_cosh_id="crop:tomato",status="ACTIVE",
+)
     tomato_new = SPRecommendation(
-        specific_problem_cosh_id="sp:shared", client_id=client.id,
-        crop_cosh_id="crop:tomato", status="DRAFT",
-    )
+specific_problem_cosh_id="sp:shared",client_id=client.id,
+crop_cosh_id="crop:tomato",status="DRAFT",
+)
     onion_active = SPRecommendation(
-        specific_problem_cosh_id="sp:shared", client_id=client.id,
-        crop_cosh_id="crop:onion", status="ACTIVE",
-    )
+specific_problem_cosh_id="sp:shared",client_id=client.id,
+crop_cosh_id="crop:onion",status="ACTIVE",
+)
     db.add_all([tomato_old, tomato_new, onion_active])
     await db.flush()
-    db.add(SPTimeline(sp_recommendation_id=tomato_new.id, name="W1", from_value=0, to_value=7))
+    db.add(Timeline(sp_recommendation_id=tomato_new.id, name="W1", from_value=0, to_value=7))
     await db.commit()
 
     await publish_sp(client_id=client.id, sp_id=tomato_new.id, db=db, current_user=user)

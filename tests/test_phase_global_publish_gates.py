@@ -20,17 +20,17 @@ from fastapi import HTTPException
 from sqlalchemy import select
 
 from app.modules.advisory.models import (
-    Package, PackageStatus, PackageType, PGRecommendation,
-    PGTimeline, Practice, PracticeL0, Timeline, TimelineFromType,
+Package,PackageStatus,PackageType,PGRecommendation,
+Timeline,Practice,PracticeL0,TimelineFromType,
 )
 from app.modules.advisory.router import (
-    import_global_pg, list_global_packages, list_global_pg,
-    push_global_package,
+import_global_pg,list_global_packages,list_global_pg,
+push_global_package,
 )
 from app.modules.advisory.schemas import PackagePushRequest
 from tests.conftest import requires_docker
 from tests.factories import (
-    make_client, make_cm_assignment, make_push_request_body, make_user,
+make_client,make_cm_assignment,make_push_request_body,make_user,
 )
 
 
@@ -41,8 +41,8 @@ async def _do_push(db, *, user, client, src, name="P"):
     body = await make_push_request_body(db, client=client, src=src, name=name)
     await db.commit()
     return await push_global_package(
-        client_id=client.id, pkg_id=src.id,
-        request=PackagePushRequest(**body),
+client_id=client.id,pkg_id=src.id,
+request=PackagePushRequest(**body),
         db=db, current_user=user,
     )
 
@@ -50,31 +50,31 @@ async def _do_push(db, *, user, client, src, name="P"):
 # ── Seed helpers ────────────────────────────────────────────────────────────
 
 async def _seed_global_pkg(
-    db, *, name, status: PackageStatus = PackageStatus.ACTIVE,
+db,*,name,status: PackageStatus = PackageStatus.ACTIVE,
 ) -> Package:
     pkg = Package(
-        client_id=None,
-        crop_cosh_id="crop:paddy",
-        name=name,
-        package_type=PackageType.ANNUAL,
-        duration_days=120,
-        start_date_label_cosh_id="label:sowing_date",
-        status=status,
-    )
+client_id=None,
+crop_cosh_id="crop:paddy",
+name=name,
+package_type=PackageType.ANNUAL,
+duration_days=120,
+start_date_label_cosh_id="label:sowing_date",
+status=status,
+)
     db.add(pkg)
     await db.flush()
     return pkg
 
 
 async def _seed_global_pg(
-    db, *, problem_group_cosh_id="pg:fungal", status: str = "ACTIVE",
+db,*,problem_group_cosh_id="pg:fungal",status: str = "ACTIVE",
 ) -> PGRecommendation:
     pg = PGRecommendation(
-        problem_group_cosh_id=problem_group_cosh_id,
-        client_id=None,
-        area_or_plant="AREA_WISE",
-        status=status,
-    )
+problem_group_cosh_id=problem_group_cosh_id,
+client_id=None,
+area_or_plant="AREA_WISE",
+status=status,
+)
     db.add(pg)
     await db.flush()
     return pg
@@ -106,8 +106,8 @@ async def test_list_global_packages_include_drafts_returns_all(db):
     await db.commit()
 
     out = await list_global_packages(
-        include_drafts=True, db=db, current_user=user,
-    )
+include_drafts=True,db=db,current_user=user,
+)
     names = {p.name for p in out}
     assert names == {"ActivePkg", "DraftPkg"}
 
@@ -152,9 +152,9 @@ async def test_import_draft_pg_rejected_422(db):
 
     with pytest.raises(HTTPException) as exc:
         await import_global_pg(
-            client_id=client.id, global_pg_id=pg.id,
-            db=db, current_user=user,
-        )
+client_id=client.id,global_pg_id=pg.id,
+db=db,current_user=user,
+)
     assert exc.value.status_code == 422
     assert exc.value.detail["code"] == "global_pg_not_published"
     assert exc.value.detail["current_status"] == "DRAFT"
@@ -171,9 +171,9 @@ async def test_import_inactive_pg_also_rejected(db):
 
     with pytest.raises(HTTPException) as exc:
         await import_global_pg(
-            client_id=client.id, global_pg_id=pg.id,
-            db=db, current_user=user,
-        )
+client_id=client.id,global_pg_id=pg.id,
+db=db,current_user=user,
+)
     assert exc.value.status_code == 422
     assert exc.value.detail["code"] == "global_pg_not_published"
 
@@ -202,16 +202,16 @@ async def test_fork_package_initial_succeeds(db):
     pkg = await _seed_global_pkg(db, name="GPaddy", status=PackageStatus.ACTIVE)
     # One Timeline + one Practice on the global so we can verify deep-copy.
     tl = Timeline(
-        package_id=pkg.id, name="GTL",
-        from_type=TimelineFromType.DAS, from_value=0, to_value=15,
-    )
+package_id=pkg.id,name="GTL",
+from_type=TimelineFromType.DAS,from_value=0,to_value=15,
+)
     db.add(tl)
     await db.flush()
     db.add(Practice(
-        timeline_id=tl.id, l0_type=PracticeL0.INPUT,
-        l1_type="PESTICIDE", l2_type="CHEMICAL_PESTICIDES",
-        display_order=1, is_special_input=False,
-    ))
+timeline_id=tl.id,l0_type=PracticeL0.INPUT,
+l1_type="PESTICIDE",l2_type="CHEMICAL_PESTICIDES",
+display_order=1,is_special_input=False,
+))
     await db.flush()
 
     client = await make_client(db, full_name="C1")
@@ -221,7 +221,7 @@ async def test_fork_package_initial_succeeds(db):
     out = await _do_push(db, user=user, client=client, src=pkg)
     assert out.parent_global_id == pkg.id
     tls = (await db.execute(
-        select(Timeline).where(Timeline.package_id == out.id)
+select(Timeline).where(Timeline.package_id == out.id)
     )).scalars().all()
     assert len(tls) == 1
 
@@ -233,13 +233,13 @@ async def test_refork_same_package_into_same_client_permanently_blocked(db):
     most ONCE in the client's lifetime. The second attempt is hard-
     blocked with a stable 409 — there is no force=true overwrite.
     SE/CM either edits the existing local copy or deletes it (a
-    separate operation) before any future re-import can be attempted."""
+separate operation) before any future re-import can be attempted."""
     user = await make_user(db, name="CM")
     pkg = await _seed_global_pkg(db, name="GPaddy", status=PackageStatus.ACTIVE)
     tl = Timeline(
-        package_id=pkg.id, name="GTL",
-        from_type=TimelineFromType.DAS, from_value=0, to_value=15,
-    )
+package_id=pkg.id,name="GTL",
+from_type=TimelineFromType.DAS,from_value=0,to_value=15,
+)
     db.add(tl)
     await db.flush()
     client = await make_client(db, full_name="C1")
@@ -301,9 +301,9 @@ async def test_import_global_pg_requires_cm_assignment(db):
 
     with pytest.raises(HTTPException) as exc:
         await import_global_pg(
-            client_id=client.id, global_pg_id=pg.id,
-            db=db, current_user=user,
-        )
+client_id=client.id,global_pg_id=pg.id,
+db=db,current_user=user,
+)
     assert exc.value.status_code == 403
     assert exc.value.detail["code"] == "cm_assignment_required"
 

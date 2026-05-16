@@ -18,11 +18,11 @@ from __future__ import annotations
 import pytest
 
 from app.modules.advisory.models import (
-    PGElement, PGPractice, PGRecommendation, PGTimeline,
+Element,Practice,PGRecommendation,Timeline,
 )
 from app.modules.advisory.router import (
-    cha_list_practices, cha_list_problems, cha_list_recommendations,
-    cha_list_timelines,
+cha_list_practices,cha_list_problems,cha_list_recommendations,
+cha_list_timelines,
 )
 from tests.conftest import requires_docker
 from tests.factories import make_client, make_user
@@ -41,49 +41,49 @@ async def _seed_two_pg_bundles(db):
     user = await make_user(db, name="SE")
 
     pg_fungal_aw = PGRecommendation(
-        problem_group_cosh_id="pg:fungal_diseases", client_id=client.id,
-        area_or_plant="AREA_WISE", status="DRAFT",
-    )
+problem_group_cosh_id="pg:fungal_diseases",client_id=client.id,
+area_or_plant="AREA_WISE",status="DRAFT",
+)
     pg_fungal_pw = PGRecommendation(
-        problem_group_cosh_id="pg:fungal_diseases", client_id=client.id,
-        area_or_plant="PLANT_WISE", status="ACTIVE",
-    )
+problem_group_cosh_id="pg:fungal_diseases",client_id=client.id,
+area_or_plant="PLANT_WISE",status="ACTIVE",
+)
     pg_sucking_aw = PGRecommendation(
-        problem_group_cosh_id="pg:sucking_pests", client_id=client.id,
-        area_or_plant="AREA_WISE", status="DRAFT",
-    )
+problem_group_cosh_id="pg:sucking_pests",client_id=client.id,
+area_or_plant="AREA_WISE",status="DRAFT",
+)
     pg_global = PGRecommendation(
-        problem_group_cosh_id="pg:fungal_diseases", client_id=None,
-        area_or_plant="AREA_WISE", status="ACTIVE",
-    )
+problem_group_cosh_id="pg:fungal_diseases",client_id=None,
+area_or_plant="AREA_WISE",status="ACTIVE",
+)
     db.add_all([pg_fungal_aw, pg_fungal_pw, pg_sucking_aw, pg_global])
     await db.flush()
 
-    tl_fa1 = PGTimeline(
-        pg_recommendation_id=pg_fungal_aw.id, name="W1",
-        from_value=0, to_value=7,
-    )
-    tl_fa2 = PGTimeline(
-        pg_recommendation_id=pg_fungal_aw.id, name="W2",
-        from_value=7, to_value=14,
-    )
-    tl_fp1 = PGTimeline(
-        pg_recommendation_id=pg_fungal_pw.id, name="P-W1",
-        from_value=0, to_value=10,
-    )
+    tl_fa1 = Timeline(
+pg_recommendation_id=pg_fungal_aw.id,name="W1",
+from_value=0,to_value=7,
+)
+    tl_fa2 = Timeline(
+pg_recommendation_id=pg_fungal_aw.id,name="W2",
+from_value=7,to_value=14,
+)
+    tl_fp1 = Timeline(
+pg_recommendation_id=pg_fungal_pw.id,name="P-W1",
+from_value=0,to_value=10,
+)
     db.add_all([tl_fa1, tl_fa2, tl_fp1])
     await db.flush()
 
     db.add_all([
-        PGPractice(timeline_id=tl_fa1.id, l0_type="INPUT",
-                   l1_type="PESTICIDE", l2_type="CHEMICAL_PESTICIDES",
-                   display_order=0),
-        PGPractice(timeline_id=tl_fa2.id, l0_type="INPUT",
-                   l1_type="FERTILIZER", l2_type="MANURES",
-                   display_order=0),
-        PGPractice(timeline_id=tl_fp1.id, l0_type="INPUT",
-                   l1_type="PESTICIDE", l2_type="CHEMICAL_PESTICIDES",
-                   display_order=0),
+Practice(timeline_id=tl_fa1.id,l0_type="INPUT",
+l1_type="PESTICIDE",l2_type="CHEMICAL_PESTICIDES",
+display_order=0),
+        Practice(timeline_id=tl_fa2.id,l0_type="INPUT",
+l1_type="FERTILIZER",l2_type="MANURES",
+display_order=0),
+        Practice(timeline_id=tl_fp1.id,l0_type="INPUT",
+l1_type="PESTICIDE",l2_type="CHEMICAL_PESTICIDES",
+display_order=0),
     ])
     await db.commit()
     return client, user, pg_fungal_aw, pg_fungal_pw, pg_sucking_aw, tl_fa1
@@ -103,7 +103,7 @@ async def test_cha_problems_returns_v1_hardcoded_list(db):
     assert "pg:nutrient_deficiency" in cosh_ids
     # All entries default to no bundle started yet.
     assert all(p["area_wise_status"] is None and p["plant_wise_status"] is None
-               for p in out)
+for p in out)
 
 
 @requires_docker
@@ -130,8 +130,8 @@ async def test_cha_recommendations_excludes_global(db):
     """Global PG rows (client_id=NULL) must not surface on a client's list."""
     client, user, *_ = await _seed_two_pg_bundles(db)
     out = await cha_list_recommendations(
-        client_id=client.id, db=db, current_user=user,
-    )
+client_id=client.id,db=db,current_user=user,
+)
     # 3 client-local rows; the global row dropped.
     assert len(out) == 3
     assert all(r["problem_group_cosh_id"] for r in out)
@@ -142,9 +142,9 @@ async def test_cha_recommendations_excludes_global(db):
 async def test_cha_recommendations_filters_by_pg(db):
     client, user, *_ = await _seed_two_pg_bundles(db)
     out = await cha_list_recommendations(
-        client_id=client.id, problem_group_cosh_id="pg:fungal_diseases",
-        db=db, current_user=user,
-    )
+client_id=client.id,problem_group_cosh_id="pg:fungal_diseases",
+db=db,current_user=user,
+)
     assert {r["area_or_plant"] for r in out} == {"AREA_WISE", "PLANT_WISE"}
     assert {r["status"] for r in out} == {"DRAFT", "ACTIVE"}
 
@@ -154,9 +154,9 @@ async def test_cha_recommendations_filters_by_pg(db):
 async def test_cha_recommendations_filters_by_area_or_plant(db):
     client, user, *_ = await _seed_two_pg_bundles(db)
     out = await cha_list_recommendations(
-        client_id=client.id, area_or_plant="PLANT_WISE",
-        db=db, current_user=user,
-    )
+client_id=client.id,area_or_plant="PLANT_WISE",
+db=db,current_user=user,
+)
     assert len(out) == 1
     assert out[0]["area_or_plant"] == "PLANT_WISE"
     assert out[0]["timeline_count"] == 1
@@ -167,8 +167,8 @@ async def test_cha_recommendations_filters_by_area_or_plant(db):
 async def test_cha_recommendations_friendly_name(db):
     client, user, *_ = await _seed_two_pg_bundles(db)
     out = await cha_list_recommendations(
-        client_id=client.id, db=db, current_user=user,
-    )
+client_id=client.id,db=db,current_user=user,
+)
     by_pg = {(r["problem_group_cosh_id"], r["area_or_plant"]): r for r in out}
     assert by_pg[("pg:fungal_diseases", "AREA_WISE")]["problem_group_name_en"] == "Fungal Diseases"
     assert by_pg[("pg:sucking_pests", "AREA_WISE")]["problem_group_name_en"] == "Sucking Pests"
@@ -195,9 +195,9 @@ async def test_cha_timelines_breadcrumb_and_practice_counts(db):
 async def test_cha_timelines_filters_by_recommendation(db):
     client, user, _, pg_fungal_pw, *_ = await _seed_two_pg_bundles(db)
     out = await cha_list_timelines(
-        client_id=client.id, recommendation_id=pg_fungal_pw.id,
-        db=db, current_user=user,
-    )
+client_id=client.id,recommendation_id=pg_fungal_pw.id,
+db=db,current_user=user,
+)
     assert len(out) == 1
     assert out[0]["area_or_plant"] == "PLANT_WISE"
 
@@ -224,9 +224,9 @@ async def test_cha_practices_l1_filter_cross_cutting(db):
     company's CHA recommendations regardless of PG / bundle."""
     client, user, *_ = await _seed_two_pg_bundles(db)
     out = await cha_list_practices(
-        client_id=client.id, l1="PESTICIDE",
-        db=db, current_user=user,
-    )
+client_id=client.id,l1="PESTICIDE",
+db=db,current_user=user,
+)
     assert out["total"] == 2
     assert all(p["l1_type"] == "PESTICIDE" for p in out["items"])
 
@@ -236,15 +236,15 @@ async def test_cha_practices_l1_filter_cross_cutting(db):
 async def test_cha_practices_brand_summary_when_present(db):
     client, user, *_, tl = await _seed_two_pg_bundles(db)
     practice = (await db.execute(
-        __import__("sqlalchemy").select(PGPractice).where(
-            PGPractice.timeline_id == tl.id,
-        )
+__import__("sqlalchemy").select(Practice).where(
+Practice.timeline_id == tl.id,
+)
     )).scalar_one()
     db.add_all([
-        PGElement(practice_id=practice.id, element_type="BRAND_NAME",
-                  cosh_ref="brand:dithane-m45"),
-        PGElement(practice_id=practice.id, element_type="DOSAGE",
-                  value="2", unit_cosh_id="kg/ha"),
+Element(practice_id=practice.id,element_type="BRAND_NAME",
+cosh_ref="brand:dithane-m45"),
+        Element(practice_id=practice.id,element_type="DOSAGE",
+value="2",unit_cosh_id="kg/ha"),
     ])
     await db.commit()
 
@@ -257,7 +257,7 @@ async def test_cha_practices_brand_summary_when_present(db):
 @requires_docker
 @pytest.mark.asyncio
 async def test_cha_practices_excludes_qa_rooted_timelines(db):
-    """A PGTimeline rooted at standard_response_id (Q&A pipe-3) sits
+    """A Timeline rooted at standard_response_id (Q&A pipe-3) sits
     in the same physical table but must NOT appear on the CHA
     practices list — it belongs to QA. Defensive filter."""
     from app.modules.farmpundit.router import create_standard_response
@@ -267,21 +267,21 @@ async def test_cha_practices_excludes_qa_rooted_timelines(db):
     # Make user a portal-member so QA endpoints accept them.
     await make_client_user(db, user=user, client=client)
     sr = await create_standard_response(
-        client_id=client.id,
-        data={"question_text": "Q?", "crop_cosh_id": None},
-        db=db, current_user=user,
-    )
-    qa_tl = PGTimeline(
-        standard_response_id=sr["id"], name="QA-W1",
-        from_value=0, to_value=7,
-    )
+client_id=client.id,
+data={"question_text": "Q?","crop_cosh_id": None},
+db=db,current_user=user,
+)
+    qa_tl = Timeline(
+standard_response_id=sr["id"],name="QA-W1",
+from_value=0,to_value=7,
+)
     db.add(qa_tl)
     await db.flush()
-    db.add(PGPractice(
-        timeline_id=qa_tl.id, l0_type="INPUT",
-        l1_type="PESTICIDE", l2_type="CHEMICAL_PESTICIDES",
-        display_order=0,
-    ))
+    db.add(Practice(
+timeline_id=qa_tl.id,l0_type="INPUT",
+l1_type="PESTICIDE",l2_type="CHEMICAL_PESTICIDES",
+display_order=0,
+))
     await db.commit()
 
     out = await cha_list_practices(client_id=client.id, db=db, current_user=user)
@@ -304,11 +304,11 @@ async def test_create_client_pg_happy_path(db):
     await db.commit()
 
     out = await create_client_pg(
-        client_id=client.id,
-        request=PGRecommendationCreate(
-            problem_group_cosh_id="pg:fungal_diseases",
-            area_or_plant="AREA_WISE",
-        ),
+client_id=client.id,
+request=PGRecommendationCreate(
+problem_group_cosh_id="pg:fungal_diseases",
+area_or_plant="AREA_WISE",
+),
         db=db, current_user=user,
     )
     assert out.problem_group_cosh_id == "pg:fungal_diseases"
@@ -329,11 +329,11 @@ async def test_create_client_pg_rejects_missing_bundle(db):
 
     with pytest.raises(HTTPException) as exc:
         await create_client_pg(
-            client_id=client.id,
-            request=PGRecommendationCreate(
-                problem_group_cosh_id="pg:fungal_diseases",
-                area_or_plant=None,
-            ),
+client_id=client.id,
+request=PGRecommendationCreate(
+problem_group_cosh_id="pg:fungal_diseases",
+area_or_plant=None,
+),
             db=db, current_user=user,
         )
     assert exc.value.status_code == 422
@@ -354,11 +354,11 @@ async def test_create_client_pg_rejects_unknown_pg(db):
 
     with pytest.raises(HTTPException) as exc:
         await create_client_pg(
-            client_id=client.id,
-            request=PGRecommendationCreate(
-                problem_group_cosh_id="pg:does_not_exist",
-                area_or_plant="AREA_WISE",
-            ),
+client_id=client.id,
+request=PGRecommendationCreate(
+problem_group_cosh_id="pg:does_not_exist",
+area_or_plant="AREA_WISE",
+),
             db=db, current_user=user,
         )
     assert exc.value.status_code == 422
@@ -380,20 +380,20 @@ async def test_create_client_pg_409_on_duplicate_bundle(db):
     await db.commit()
 
     await create_client_pg(
-        client_id=client.id,
-        request=PGRecommendationCreate(
-            problem_group_cosh_id="pg:fungal_diseases",
-            area_or_plant="AREA_WISE",
-        ),
+client_id=client.id,
+request=PGRecommendationCreate(
+problem_group_cosh_id="pg:fungal_diseases",
+area_or_plant="AREA_WISE",
+),
         db=db, current_user=user,
     )
     with pytest.raises(HTTPException) as exc:
         await create_client_pg(
-            client_id=client.id,
-            request=PGRecommendationCreate(
-                problem_group_cosh_id="pg:fungal_diseases",
-                area_or_plant="AREA_WISE",
-            ),
+client_id=client.id,
+request=PGRecommendationCreate(
+problem_group_cosh_id="pg:fungal_diseases",
+area_or_plant="AREA_WISE",
+),
             db=db, current_user=user,
         )
     assert exc.value.status_code == 409
@@ -414,19 +414,19 @@ async def test_create_client_pg_allows_both_bundles_for_same_pg(db):
     await db.commit()
 
     a = await create_client_pg(
-        client_id=client.id,
-        request=PGRecommendationCreate(
-            problem_group_cosh_id="pg:fungal_diseases",
-            area_or_plant="AREA_WISE",
-        ),
+client_id=client.id,
+request=PGRecommendationCreate(
+problem_group_cosh_id="pg:fungal_diseases",
+area_or_plant="AREA_WISE",
+),
         db=db, current_user=user,
     )
     b = await create_client_pg(
-        client_id=client.id,
-        request=PGRecommendationCreate(
-            problem_group_cosh_id="pg:fungal_diseases",
-            area_or_plant="PLANT_WISE",
-        ),
+client_id=client.id,
+request=PGRecommendationCreate(
+problem_group_cosh_id="pg:fungal_diseases",
+area_or_plant="PLANT_WISE",
+),
         db=db, current_user=user,
     )
     assert a.id != b.id
@@ -443,16 +443,16 @@ async def test_pg_readiness_ready_when_timeline_present(db):
     client = await make_client(db)
     user = await make_user(db, name="SE")
     pg = PGRecommendation(
-        problem_group_cosh_id="pg:fungal_diseases", client_id=client.id,
-        area_or_plant="AREA_WISE", status="DRAFT",
-    )
+problem_group_cosh_id="pg:fungal_diseases",client_id=client.id,
+area_or_plant="AREA_WISE",status="DRAFT",
+)
     db.add(pg); await db.flush()
     await make_pg_timeline(db, pg)
     await db.commit()
 
     out = await get_pg_publish_readiness(
-        client_id=client.id, pg_id=pg.id, db=db, current_user=user,
-    )
+client_id=client.id,pg_id=pg.id,db=db,current_user=user,
+)
     assert out["ready"] is True
     assert out["status"] == "DRAFT"
     assert out["version"] == pg.version
@@ -465,15 +465,15 @@ async def test_pg_readiness_flags_no_timelines(db):
     client = await make_client(db)
     user = await make_user(db, name="SE")
     pg = PGRecommendation(
-        problem_group_cosh_id="pg:fungal_diseases", client_id=client.id,
-        area_or_plant="AREA_WISE", status="DRAFT",
-    )
+problem_group_cosh_id="pg:fungal_diseases",client_id=client.id,
+area_or_plant="AREA_WISE",status="DRAFT",
+)
     db.add(pg)
     await db.commit()
 
     out = await get_pg_publish_readiness(
-        client_id=client.id, pg_id=pg.id, db=db, current_user=user,
-    )
+client_id=client.id,pg_id=pg.id,db=db,current_user=user,
+)
     assert out["ready"] is False
     assert out["blocker_code"] == "publish_blocked_missing_fields"
     assert any(m["code"] == "no_timelines" for m in out["missing"])
@@ -483,7 +483,7 @@ async def test_pg_readiness_flags_no_timelines(db):
 @pytest.mark.asyncio
 async def test_pg_readiness_flags_missing_bundle(db):
     """Defensive: if a PG row exists with area_or_plant=NULL (e.g. a
-    legacy global row that never got the bundle tag), readiness flags
+legacy global row that never got the bundle tag), readiness flags
     it. Won't happen for client-local rows post-Round-3 but matters
     for any pre-existing data and for SP later."""
     from app.modules.advisory.router import get_pg_publish_readiness
@@ -491,16 +491,16 @@ async def test_pg_readiness_flags_missing_bundle(db):
     client = await make_client(db)
     user = await make_user(db, name="SE")
     pg = PGRecommendation(
-        problem_group_cosh_id="pg:fungal_diseases", client_id=client.id,
-        area_or_plant=None, status="DRAFT",
-    )
+problem_group_cosh_id="pg:fungal_diseases",client_id=client.id,
+area_or_plant=None,status="DRAFT",
+)
     db.add(pg); await db.flush()
     await make_pg_timeline(db, pg)
     await db.commit()
 
     out = await get_pg_publish_readiness(
-        client_id=client.id, pg_id=pg.id, db=db, current_user=user,
-    )
+client_id=client.id,pg_id=pg.id,db=db,current_user=user,
+)
     assert out["ready"] is False
     assert any(m["code"] == "missing_area_or_plant" for m in out["missing"])
 
@@ -516,16 +516,16 @@ async def test_pg_publish_422_on_empty_recommendation(db):
     client = await make_client(db)
     user = await make_user(db, name="SE")
     pg = PGRecommendation(
-        problem_group_cosh_id="pg:fungal_diseases", client_id=client.id,
-        area_or_plant="AREA_WISE", status="DRAFT",
-    )
+problem_group_cosh_id="pg:fungal_diseases",client_id=client.id,
+area_or_plant="AREA_WISE",status="DRAFT",
+)
     db.add(pg)
     await db.commit()
 
     with pytest.raises(HTTPException) as exc:
         await publish_client_pg(
-            client_id=client.id, pg_id=pg.id, db=db, current_user=user,
-        )
+client_id=client.id,pg_id=pg.id,db=db,current_user=user,
+)
     assert exc.value.status_code == 422
     assert exc.value.detail["code"] == "publish_blocked_missing_fields"
 
@@ -543,25 +543,25 @@ async def test_pg_publish_only_deactivates_same_bundle_siblings(db):
     client = await make_client(db)
     user = await make_user(db, name="SE")
     aw_old = PGRecommendation(
-        problem_group_cosh_id="pg:fungal_diseases", client_id=client.id,
-        area_or_plant="AREA_WISE", status="ACTIVE",
-    )
+problem_group_cosh_id="pg:fungal_diseases",client_id=client.id,
+area_or_plant="AREA_WISE",status="ACTIVE",
+)
     aw_new = PGRecommendation(
-        problem_group_cosh_id="pg:fungal_diseases", client_id=client.id,
-        area_or_plant="AREA_WISE", status="DRAFT",
-    )
+problem_group_cosh_id="pg:fungal_diseases",client_id=client.id,
+area_or_plant="AREA_WISE",status="DRAFT",
+)
     pw_active = PGRecommendation(
-        problem_group_cosh_id="pg:fungal_diseases", client_id=client.id,
-        area_or_plant="PLANT_WISE", status="ACTIVE",
-    )
+problem_group_cosh_id="pg:fungal_diseases",client_id=client.id,
+area_or_plant="PLANT_WISE",status="ACTIVE",
+)
     db.add_all([aw_old, aw_new, pw_active])
     await db.flush()
     await make_pg_timeline(db, aw_new)
     await db.commit()
 
     await publish_client_pg(
-        client_id=client.id, pg_id=aw_new.id, db=db, current_user=user,
-    )
+client_id=client.id,pg_id=aw_new.id,db=db,current_user=user,
+)
     refreshed = (await db.execute(_sel(PGRecommendation))).scalars().all()
     by_id = {r.id: r for r in refreshed}
     assert by_id[aw_new.id].status == "ACTIVE"
@@ -582,29 +582,29 @@ async def test_delete_client_pg_practice_cascades_elements(db):
     client = await make_client(db)
     user = await make_user(db, name="SE")
     pg = PGRecommendation(
-        problem_group_cosh_id="pg:fungal_diseases", client_id=client.id,
-        area_or_plant="AREA_WISE", status="DRAFT",
-    )
+problem_group_cosh_id="pg:fungal_diseases",client_id=client.id,
+area_or_plant="AREA_WISE",status="DRAFT",
+)
     db.add(pg); await db.flush()
-    tl = PGTimeline(pg_recommendation_id=pg.id, name="W1", from_value=0, to_value=7)
+    tl = Timeline(pg_recommendation_id=pg.id, name="W1", from_value=0, to_value=7)
     db.add(tl); await db.flush()
-    practice = PGPractice(
-        timeline_id=tl.id, l0_type="INPUT",
-        l1_type="PESTICIDE", l2_type="CHEMICAL_PESTICIDES",
-        display_order=0,
-    )
+    practice = Practice(
+timeline_id=tl.id,l0_type="INPUT",
+l1_type="PESTICIDE",l2_type="CHEMICAL_PESTICIDES",
+display_order=0,
+)
     db.add(practice); await db.flush()
-    db.add(PGElement(
-        practice_id=practice.id, element_type="DOSAGE",
-        value="2", unit_cosh_id="kg/ha",
-    ))
+    db.add(Element(
+practice_id=practice.id,element_type="DOSAGE",
+value="2",unit_cosh_id="kg/ha",
+))
     await db.commit()
 
     await delete_client_pg_practice(
-        client_id=client.id, pg_id=pg.id, tl_id=tl.id, practice_id=practice.id,
-        db=db, current_user=user,
-    )
-    practices = (await db.execute(_sel(PGPractice))).scalars().all()
-    elements = (await db.execute(_sel(PGElement))).scalars().all()
+client_id=client.id,pg_id=pg.id,tl_id=tl.id,practice_id=practice.id,
+db=db,current_user=user,
+)
+    practices = (await db.execute(_sel(Practice))).scalars().all()
+    elements = (await db.execute(_sel(Element))).scalars().all()
     assert practices == []
     assert elements == []

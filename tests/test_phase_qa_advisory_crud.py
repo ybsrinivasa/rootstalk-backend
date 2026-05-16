@@ -13,13 +13,13 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
 
-from app.modules.advisory.models import PGElement, PGPractice, PGTimeline
+from app.modules.advisory.models import Element, Practice, Timeline
 from app.modules.advisory.router import (
-    add_qa_practice, add_qa_timeline, delete_qa_practice,
-    delete_qa_timeline, list_qa_timelines,
+add_qa_practice,add_qa_timeline,delete_qa_practice,
+delete_qa_timeline,list_qa_timelines,
 )
 from app.modules.advisory.schemas import (
-    ElementIn, QAPracticeCreate, QATimelineCreate,
+ElementIn,QAPracticeCreate,QATimelineCreate,
 )
 from app.modules.farmpundit.models import StandardResponse
 from app.modules.farmpundit.router import create_standard_response
@@ -35,10 +35,10 @@ async def _se_for(db, *, client):
 
 async def _seed_sr(db, *, client, se, question="Q?", crop=None):
     out = await create_standard_response(
-        client_id=client.id,
-        data={"question_text": question, "crop_cosh_id": crop},
-        db=db, current_user=se,
-    )
+client_id=client.id,
+data={"question_text": question,"crop_cosh_id": crop},
+db=db,current_user=se,
+)
     return out["id"]
 
 
@@ -56,8 +56,8 @@ async def test_add_timeline_writes_into_pg_timelines_with_qa_parent(db):
     await db.commit()
 
     out = await add_qa_timeline(
-        client_id=client.id, sr_id=sr_id,
-        request=QATimelineCreate(name="Recovery week 1", to_value=7),
+client_id=client.id,sr_id=sr_id,
+request=QATimelineCreate(name="Recovery week 1",to_value=7),
         db=db, current_user=se,
     )
     assert out["standard_response_id"] == sr_id
@@ -66,7 +66,7 @@ async def test_add_timeline_writes_into_pg_timelines_with_qa_parent(db):
 
     # Direct DB confirmation — row in pg_timelines with the QA parent.
     row = (await db.execute(
-        select(PGTimeline).where(PGTimeline.id == out["id"])
+select(Timeline).where(Timeline.id == out["id"])
     )).scalar_one()
     assert row.pg_recommendation_id is None
     assert row.standard_response_id == sr_id
@@ -87,8 +87,8 @@ async def test_add_timeline_rejects_cross_client_sr(db):
 
     with pytest.raises(HTTPException) as ei:
         await add_qa_timeline(
-            client_id=client_a.id, sr_id=sr_b,
-            request=QATimelineCreate(name="Hijacked", to_value=7),
+client_id=client_a.id,sr_id=sr_b,
+request=QATimelineCreate(name="Hijacked",to_value=7),
             db=db, current_user=se_a,
         )
     assert ei.value.status_code == 404
@@ -106,16 +106,16 @@ async def test_list_timelines_returns_full_tree(db):
     await db.commit()
 
     tl = await add_qa_timeline(
-        client_id=client.id, sr_id=sr_id,
-        request=QATimelineCreate(name="Week 1", to_value=7),
+client_id=client.id,sr_id=sr_id,
+request=QATimelineCreate(name="Week 1",to_value=7),
         db=db, current_user=se,
     )
     await add_qa_practice(
-        client_id=client.id, sr_id=sr_id, tl_id=tl["id"],
-        request=QAPracticeCreate(
-            l0_type="INPUT", display_order=0,
-            elements=[
-                ElementIn(element_type="PESTICIDE", value="Neem oil"),
+client_id=client.id,sr_id=sr_id,tl_id=tl["id"],
+request=QAPracticeCreate(
+l0_type="INPUT",display_order=0,
+elements=[
+ElementIn(element_type="PESTICIDE",value="Neem oil"),
                 ElementIn(element_type="DOSE", value="5", unit_cosh_id="ml/L"),
             ],
         ),
@@ -123,9 +123,9 @@ async def test_list_timelines_returns_full_tree(db):
     )
 
     tree = await list_qa_timelines(
-        client_id=client.id, sr_id=sr_id,
-        db=db, current_user=se,
-    )
+client_id=client.id,sr_id=sr_id,
+db=db,current_user=se,
+)
     assert len(tree) == 1
     assert tree[0]["name"] == "Week 1"
     assert tree[0]["parent_kind"] == "QA"
@@ -139,39 +139,39 @@ async def test_list_timelines_returns_full_tree(db):
 async def test_delete_timeline_cascades_practices_and_elements(db):
     """Deleting a Q&A timeline removes its practices + elements too.
     No orphan rows remain. The cascade is application-level (matches
-    PG/SP delete patterns)."""
+PG/SP delete patterns)."""
     client = await make_client(db)
     se = await _se_for(db, client=client)
     sr_id = await _seed_sr(db, client=client, se=se)
     await db.commit()
 
     tl = await add_qa_timeline(
-        client_id=client.id, sr_id=sr_id,
-        request=QATimelineCreate(name="Week 1", to_value=7),
+client_id=client.id,sr_id=sr_id,
+request=QATimelineCreate(name="Week 1",to_value=7),
         db=db, current_user=se,
     )
     p = await add_qa_practice(
-        client_id=client.id, sr_id=sr_id, tl_id=tl["id"],
-        request=QAPracticeCreate(
-            l0_type="INPUT",
-            elements=[ElementIn(element_type="PESTICIDE", value="X")],
+client_id=client.id,sr_id=sr_id,tl_id=tl["id"],
+request=QAPracticeCreate(
+l0_type="INPUT",
+elements=[ElementIn(element_type="PESTICIDE",value="X")],
         ),
         db=db, current_user=se,
     )
 
     await delete_qa_timeline(
-        client_id=client.id, sr_id=sr_id, tl_id=tl["id"],
-        db=db, current_user=se,
-    )
+client_id=client.id,sr_id=sr_id,tl_id=tl["id"],
+db=db,current_user=se,
+)
 
     assert (await db.execute(
-        select(PGTimeline).where(PGTimeline.id == tl["id"])
+select(Timeline).where(Timeline.id == tl["id"])
     )).scalar_one_or_none() is None
     assert (await db.execute(
-        select(PGPractice).where(PGPractice.id == p["id"])
+select(Practice).where(Practice.id == p["id"])
     )).scalar_one_or_none() is None
     assert (await db.execute(
-        select(PGElement).where(PGElement.practice_id == p["id"])
+select(Element).where(Element.practice_id == p["id"])
     )).scalars().all() == []
 
 
@@ -187,23 +187,23 @@ async def test_delete_timeline_rejects_pg_owned_timeline_via_qa_url(db):
     sr_id = await _seed_sr(db, client=client, se=se)
 
     pg = PGRecommendation(
-        problem_group_cosh_id="pg:test",
-        client_id=client.id, area_or_plant="AREA_WISE", status="DRAFT",
-    )
+problem_group_cosh_id="pg:test",
+client_id=client.id,area_or_plant="AREA_WISE",status="DRAFT",
+)
     db.add(pg)
     await db.flush()
-    pg_tl = PGTimeline(
-        pg_recommendation_id=pg.id,
-        name="Owned by PG", from_value=0, to_value=7,
-    )
+    pg_tl = Timeline(
+pg_recommendation_id=pg.id,
+name="Owned by PG",from_value=0,to_value=7,
+)
     db.add(pg_tl)
     await db.commit()
 
     with pytest.raises(HTTPException) as ei:
         await delete_qa_timeline(
-            client_id=client.id, sr_id=sr_id, tl_id=pg_tl.id,
-            db=db, current_user=se,
-        )
+client_id=client.id,sr_id=sr_id,tl_id=pg_tl.id,
+db=db,current_user=se,
+)
     assert ei.value.status_code == 404
 
 
@@ -218,17 +218,17 @@ async def test_add_practice_with_elements_inline(db):
     await db.commit()
 
     tl = await add_qa_timeline(
-        client_id=client.id, sr_id=sr_id,
-        request=QATimelineCreate(name="Week 1", to_value=7),
+client_id=client.id,sr_id=sr_id,
+request=QATimelineCreate(name="Week 1",to_value=7),
         db=db, current_user=se,
     )
 
     out = await add_qa_practice(
-        client_id=client.id, sr_id=sr_id, tl_id=tl["id"],
-        request=QAPracticeCreate(
-            l0_type="INPUT", l1_type="PESTICIDE", display_order=2,
-            elements=[
-                ElementIn(element_type="DOSE", value="5", unit_cosh_id="ml/L", display_order=0),
+client_id=client.id,sr_id=sr_id,tl_id=tl["id"],
+request=QAPracticeCreate(
+l0_type="INPUT",l1_type="PESTICIDE",display_order=2,
+elements=[
+ElementIn(element_type="DOSE",value="5",unit_cosh_id="ml/L",display_order=0),
                 ElementIn(element_type="FREQUENCY", value="weekly", display_order=1),
             ],
         ),
@@ -254,16 +254,16 @@ async def test_add_practice_rejects_timeline_under_different_sr(db):
     await db.commit()
 
     tl_a = await add_qa_timeline(
-        client_id=client.id, sr_id=sr_a,
-        request=QATimelineCreate(name="A's timeline", to_value=7),
+client_id=client.id,sr_id=sr_a,
+request=QATimelineCreate(name="A's timeline",to_value=7),
         db=db, current_user=se,
     )
 
     with pytest.raises(HTTPException) as ei:
         await add_qa_practice(
-            client_id=client.id, sr_id=sr_b,  # wrong parent
-            tl_id=tl_a["id"],
-            request=QAPracticeCreate(l0_type="INPUT"),
+client_id=client.id,sr_id=sr_b,# wrong parent
+tl_id=tl_a["id"],
+request=QAPracticeCreate(l0_type="INPUT"),
             db=db, current_user=se,
         )
     assert ei.value.status_code == 404
@@ -278,29 +278,29 @@ async def test_delete_practice_removes_elements_too(db):
     await db.commit()
 
     tl = await add_qa_timeline(
-        client_id=client.id, sr_id=sr_id,
-        request=QATimelineCreate(name="Week 1", to_value=7),
+client_id=client.id,sr_id=sr_id,
+request=QATimelineCreate(name="Week 1",to_value=7),
         db=db, current_user=se,
     )
     p = await add_qa_practice(
-        client_id=client.id, sr_id=sr_id, tl_id=tl["id"],
-        request=QAPracticeCreate(
-            l0_type="INPUT",
-            elements=[ElementIn(element_type="PESTICIDE", value="X")],
+client_id=client.id,sr_id=sr_id,tl_id=tl["id"],
+request=QAPracticeCreate(
+l0_type="INPUT",
+elements=[ElementIn(element_type="PESTICIDE",value="X")],
         ),
         db=db, current_user=se,
     )
 
     await delete_qa_practice(
-        client_id=client.id, sr_id=sr_id, tl_id=tl["id"], p_id=p["id"],
-        db=db, current_user=se,
-    )
+client_id=client.id,sr_id=sr_id,tl_id=tl["id"],p_id=p["id"],
+db=db,current_user=se,
+)
 
     assert (await db.execute(
-        select(PGPractice).where(PGPractice.id == p["id"])
+select(Practice).where(Practice.id == p["id"])
     )).scalar_one_or_none() is None
     assert (await db.execute(
-        select(PGElement).where(PGElement.practice_id == p["id"])
+select(Element).where(Element.practice_id == p["id"])
     )).scalars().all() == []
 
 
@@ -321,15 +321,15 @@ async def test_serialise_cha_timeline_accepts_qa_source(db):
     await db.commit()
 
     tl = await add_qa_timeline(
-        client_id=client.id, sr_id=sr_id,
-        request=QATimelineCreate(name="Recovery", to_value=14),
+client_id=client.id,sr_id=sr_id,
+request=QATimelineCreate(name="Recovery",to_value=14),
         db=db, current_user=se,
     )
     await add_qa_practice(
-        client_id=client.id, sr_id=sr_id, tl_id=tl["id"],
-        request=QAPracticeCreate(
-            l0_type="INPUT", l1_type="PESTICIDE",
-            elements=[ElementIn(element_type="DOSE", value="5", unit_cosh_id="ml/L")],
+client_id=client.id,sr_id=sr_id,tl_id=tl["id"],
+request=QAPracticeCreate(
+l0_type="INPUT",l1_type="PESTICIDE",
+elements=[ElementIn(element_type="DOSE",value="5",unit_cosh_id="ml/L")],
         ),
         db=db, current_user=se,
     )
@@ -356,7 +356,7 @@ async def test_endpoints_reject_non_member(db):
 
     with pytest.raises(HTTPException) as ei:
         await list_qa_timelines(
-            client_id=client.id, sr_id=sr_id,
-            db=db, current_user=outsider,
-        )
+client_id=client.id,sr_id=sr_id,
+db=db,current_user=outsider,
+)
     assert ei.value.status_code == 403

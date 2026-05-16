@@ -28,9 +28,7 @@ from sqlalchemy import select
 
 from app.celery_app import celery_app
 from app.database import AsyncSessionLocal
-from app.modules.advisory.models import (
-    PGTimeline, SPTimeline, Timeline,
-)
+from app.modules.advisory.models import Timeline
 from app.modules.subscriptions.models import (
     Subscription, SubscriptionStatus, TriggeredCHAEntry,
 )
@@ -113,10 +111,12 @@ async def _collect_active_keys(
             if hasattr(cha.triggered_at, "date")
             else cha.triggered_at
         )
+        # Batch 39O (2026-05-16): SP / PG / QA all live in the unified
+        # `timelines` table now, discriminated by which parent FK is set.
         if cha.recommendation_type == "SP":
             sp_tls = (await db.execute(
-                select(SPTimeline).where(
-                    SPTimeline.sp_recommendation_id == cha.recommendation_id
+                select(Timeline).where(
+                    Timeline.sp_recommendation_id == cha.recommendation_id
                 )
             )).scalars().all()
             for sp_tl in sp_tls:
@@ -126,8 +126,8 @@ async def _collect_active_keys(
                     keys.append((sp_tl.id, "SP"))
         elif cha.recommendation_type == "PG":
             pg_tls = (await db.execute(
-                select(PGTimeline).where(
-                    PGTimeline.pg_recommendation_id == cha.recommendation_id
+                select(Timeline).where(
+                    Timeline.pg_recommendation_id == cha.recommendation_id
                 )
             )).scalars().all()
             for pg_tl in pg_tls:

@@ -1,5 +1,5 @@
 """CCA Step 5 / Batch 5E — Global→Local field-preservation tests
-(renamed from fork-preservation in Batch 39N-a, 2026-05-16: fork
+(renamed from fork-preservation in Batch 39N-a,2026-05-16: fork
 became push-as-authoring).
 
 Three deep-copy paths exist for advisory content:
@@ -24,17 +24,17 @@ import pytest
 from sqlalchemy import select
 
 from app.modules.advisory.models import (
-    Element, PackageStatus, PackageType, PGPractice, PGRecommendation,
-    PGTimeline, Practice, PracticeL0, Timeline, TimelineFromType,
+Element,PackageStatus,PackageType,Practice,PGRecommendation,
+Timeline,PracticeL0,TimelineFromType,
 )
 from app.modules.advisory.router import (
-    import_global_pg, import_timeline, push_global_package,
+import_global_pg,import_timeline,push_global_package,
 )
 from app.modules.advisory.schemas import PackagePushRequest
 from tests.conftest import requires_docker
 from tests.factories import (
-    make_client, make_cm_assignment, make_crop_reference, make_package,
-    make_push_request_body, make_timeline, make_user,
+make_client,make_cm_assignment,make_crop_reference,make_package,
+make_push_request_body,make_timeline,make_user,
 )
 
 
@@ -50,7 +50,7 @@ async def test_push_package_preserves_practice_fields(db):
     # Global package: client_id=NULL.
     await make_crop_reference(db, "crop:paddy", measure="AREA_WISE")
     global_pkg = await make_package(
-        db, await make_client(db, full_name="placeholder for FK"),
+db,await make_client(db,full_name="placeholder for FK"),
         crop_cosh_id="crop:paddy",
     )
     global_pkg.client_id = None
@@ -58,15 +58,15 @@ async def test_push_package_preserves_practice_fields(db):
 
     tl = await make_timeline(db, global_pkg, name="GTL")
     src_practice = Practice(
-        timeline_id=tl.id,
-        l0_type=PracticeL0.INPUT,
-        l1_type="FERTILIZER",
-        l2_type="CHEMICAL_FERTILIZER_FERTIGATION_PRODUCTS",
-        display_order=1,
-        is_special_input=False,
-        common_name_cosh_id="cn:urea",
-        frequency_days=7,
-    )
+timeline_id=tl.id,
+l0_type=PracticeL0.INPUT,
+l1_type="FERTILIZER",
+l2_type="CHEMICAL_FERTILIZER_FERTIGATION_PRODUCTS",
+display_order=1,
+is_special_input=False,
+common_name_cosh_id="cn:urea",
+frequency_days=7,
+)
     db.add(src_practice)
     await db.flush()
     await db.commit()
@@ -79,17 +79,17 @@ async def test_push_package_preserves_practice_fields(db):
     body = await make_push_request_body(db, client=client, src=global_pkg)
     await db.commit()
     pushed = await push_global_package(
-        client_id=client.id, pkg_id=global_pkg.id,
-        request=PackagePushRequest(**body),
+client_id=client.id,pkg_id=global_pkg.id,
+request=PackagePushRequest(**body),
         db=db, current_user=user,
     )
 
     pushed_tls = (await db.execute(
-        select(Timeline).where(Timeline.package_id == pushed.id)
+select(Timeline).where(Timeline.package_id == pushed.id)
     )).scalars().all()
     assert len(pushed_tls) == 1
     pushed_practices = (await db.execute(
-        select(Practice).where(Practice.timeline_id == pushed_tls[0].id)
+select(Practice).where(Practice.timeline_id == pushed_tls[0].id)
     )).scalars().all()
     assert len(pushed_practices) == 1
     fp = pushed_practices[0]
@@ -115,30 +115,30 @@ async def test_import_timeline_preserves_practice_fields(db):
     src_tl = await make_timeline(db, src_pkg, name="SourceTL")
 
     src_practice = Practice(
-        timeline_id=src_tl.id,
-        l0_type=PracticeL0.INPUT,
-        l1_type="PESTICIDE",
-        l2_type="CHEMICAL_PESTICIDES",
-        display_order=1,
-        is_special_input=False,
-        common_name_cosh_id="cn:imida",
-        frequency_days=None,  # not all practices are frequency-based
-    )
+timeline_id=src_tl.id,
+l0_type=PracticeL0.INPUT,
+l1_type="PESTICIDE",
+l2_type="CHEMICAL_PESTICIDES",
+display_order=1,
+is_special_input=False,
+common_name_cosh_id="cn:imida",
+frequency_days=None,# not all practices are frequency-based
+)
     db.add(src_practice)
     await db.flush()
     await db.commit()
 
     new_tl = await import_timeline(
-        client_id=client.id, package_id=target_pkg.id,
-        data={
-            "source_timeline_id": src_tl.id,
-            "new_name": "ImportedTL",
-        },
-        db=db, current_user=user,
-    )
+client_id=client.id,package_id=target_pkg.id,
+data={
+"source_timeline_id": src_tl.id,
+"new_name": "ImportedTL",
+},
+db=db,current_user=user,
+)
 
     imported_practices = (await db.execute(
-        select(Practice).where(Practice.timeline_id == new_tl.id)
+select(Practice).where(Practice.timeline_id == new_tl.id)
     )).scalars().all()
     assert len(imported_practices) == 1
     ip = imported_practices[0]
@@ -161,26 +161,26 @@ async def test_import_timeline_preserves_frequency_when_set(db):
     src_tl = await make_timeline(db, src_pkg, name="SourceTL2")
 
     db.add(Practice(
-        timeline_id=src_tl.id,
-        l0_type=PracticeL0.INPUT,
-        l1_type="FERTILIZER",
-        l2_type="CHEMICAL_FERTILIZER_FERTIGATION_PRODUCTS",
-        display_order=1,
-        is_special_input=False,
-        common_name_cosh_id="cn:urea",
-        frequency_days=14,
-    ))
+timeline_id=src_tl.id,
+l0_type=PracticeL0.INPUT,
+l1_type="FERTILIZER",
+l2_type="CHEMICAL_FERTILIZER_FERTIGATION_PRODUCTS",
+display_order=1,
+is_special_input=False,
+common_name_cosh_id="cn:urea",
+frequency_days=14,
+))
     await db.flush()
     await db.commit()
 
     new_tl = await import_timeline(
-        client_id=client.id, package_id=target_pkg.id,
-        data={"source_timeline_id": src_tl.id, "new_name": "ImpFert"},
-        db=db, current_user=user,
-    )
+client_id=client.id,package_id=target_pkg.id,
+data={"source_timeline_id": src_tl.id,"new_name": "ImpFert"},
+db=db,current_user=user,
+)
 
     ip = (await db.execute(
-        select(Practice).where(Practice.timeline_id == new_tl.id)
+select(Practice).where(Practice.timeline_id == new_tl.id)
     )).scalars().one()
     assert ip.frequency_days == 14
     assert ip.common_name_cosh_id == "cn:urea"
@@ -192,36 +192,36 @@ async def test_import_timeline_preserves_frequency_when_set(db):
 @pytest.mark.asyncio
 async def test_import_global_pg_preserves_frequency_days(db):
     """Importing a global PG recommendation into a client must copy
-    frequency_days onto each PGPractice. PGPractice doesn't carry
+    frequency_days onto each Practice. Practice doesn't carry
     common_name_cosh_id, so only frequency_days is in scope here."""
     user = await make_user(db, name="GlobalSE")
 
     global_pg = PGRecommendation(
-        problem_group_cosh_id="pg:fungal",
-        client_id=None,
-        area_or_plant="AREA_WISE",
-        status="ACTIVE",  # publish gate
-    )
+problem_group_cosh_id="pg:fungal",
+client_id=None,
+area_or_plant="AREA_WISE",
+status="ACTIVE",# publish gate
+)
     db.add(global_pg)
     await db.flush()
 
-    pg_tl = PGTimeline(
-        pg_recommendation_id=global_pg.id, name="PGTL",
-        from_type="DAYS_AFTER_DETECTION",
-        from_value=0, to_value=14,
-    )
+    pg_tl = Timeline(
+pg_recommendation_id=global_pg.id,name="PGTL",
+from_type="DAYS_AFTER_DETECTION",
+from_value=0,to_value=14,
+)
     db.add(pg_tl)
     await db.flush()
 
-    db.add(PGPractice(
-        timeline_id=pg_tl.id,
-        l0_type="INPUT",
-        l1_type="FERTILIZER",
-        l2_type="CHEMICAL_FERTILIZER_FERTIGATION_PRODUCTS",
-        display_order=1,
-        is_special_input=False,
-        frequency_days=5,
-    ))
+    db.add(Practice(
+timeline_id=pg_tl.id,
+l0_type="INPUT",
+l1_type="FERTILIZER",
+l2_type="CHEMICAL_FERTILIZER_FERTIGATION_PRODUCTS",
+display_order=1,
+is_special_input=False,
+frequency_days=5,
+))
     await db.flush()
     await db.commit()
 
@@ -230,16 +230,16 @@ async def test_import_global_pg_preserves_frequency_days(db):
     await db.commit()
 
     imported = await import_global_pg(
-        client_id=client.id, global_pg_id=global_pg.id,
-        db=db, current_user=user,
-    )
+client_id=client.id,global_pg_id=global_pg.id,
+db=db,current_user=user,
+)
 
     imported_tls = (await db.execute(
-        select(PGTimeline).where(PGTimeline.pg_recommendation_id == imported.id)
+select(Timeline).where(Timeline.pg_recommendation_id == imported.id)
     )).scalars().all()
     assert len(imported_tls) == 1
     imported_practices = (await db.execute(
-        select(PGPractice).where(PGPractice.timeline_id == imported_tls[0].id)
+select(Practice).where(Practice.timeline_id == imported_tls[0].id)
     )).scalars().all()
     assert len(imported_practices) == 1
     assert imported_practices[0].frequency_days == 5
@@ -258,11 +258,11 @@ async def test_import_global_pg_idempotent_returns_409_on_duplicate(db):
 
     user = await make_user(db, name="GlobalSE")
     global_pg = PGRecommendation(
-        problem_group_cosh_id="pg:fungal",
-        client_id=None,
-        area_or_plant="AREA_WISE",
-        status="ACTIVE",  # publish gate
-    )
+problem_group_cosh_id="pg:fungal",
+client_id=None,
+area_or_plant="AREA_WISE",
+status="ACTIVE",# publish gate
+)
     db.add(global_pg)
     await db.flush()
     await db.commit()
@@ -273,15 +273,15 @@ async def test_import_global_pg_idempotent_returns_409_on_duplicate(db):
 
     # First import succeeds.
     await import_global_pg(
-        client_id=client.id, global_pg_id=global_pg.id,
-        db=db, current_user=user,
-    )
+client_id=client.id,global_pg_id=global_pg.id,
+db=db,current_user=user,
+)
 
     # Second one without force is rejected with the structured envelope.
     with pytest.raises(HTTPException) as exc:
         await import_global_pg(
-            client_id=client.id, global_pg_id=global_pg.id,
-            db=db, current_user=user,
-        )
+client_id=client.id,global_pg_id=global_pg.id,
+db=db,current_user=user,
+)
     assert exc.value.status_code == 409
     assert exc.value.detail["code"] == "import_would_overwrite"

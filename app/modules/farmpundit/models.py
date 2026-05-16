@@ -239,3 +239,10 @@ class StandardResponse(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow,
     )
+
+    # Timelines under this Q&A standard response live in the shared
+    # `timelines` table (Batch 39O UCAT unification, 2026-05-16).
+    timelines: Mapped[list["Timeline"]] = relationship(
+        "Timeline", back_populates="standard_response",
+        foreign_keys="Timeline.standard_response_id",
+    )

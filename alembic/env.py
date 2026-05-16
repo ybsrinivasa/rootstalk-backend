@@ -31,8 +31,7 @@ from app.modules.advisory.models import (
     Package, PackageLocation, PackageAuthor, Parameter, ParameterTranslation,
     Variable, VariableTranslation, PackageVariable, Timeline, Practice, Element,
     Relation, ConditionalQuestion, ConditionalQuestionTranslation, PracticeConditional,
-    PGRecommendation, PGTimeline, PGPractice, PGElement,
-    SPRecommendation, SPTimeline, SPPractice, SPElement,
+    PGRecommendation, SPRecommendation,
 )
 from app.modules.qr.models import ManufacturerBrandPortfolio, ProductQRCode, QRScan
 from app.modules.farmpundit.models import (

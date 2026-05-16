@@ -1,6 +1,6 @@
 """Round 2 — per-element CRUD across CCA/CHA/QA (2026-05-09).
 
-Adds POST/PUT/DELETE for individual Element / PGElement / SPElement
+Adds POST/PUT/DELETE for individual Element / Element / Element
 rows so an SE can fix a typo or swap one cosh_ref without re-saving
 the whole Practice. The shared helpers re-run the L2 rule book over
 the *resulting* element set, so the Practice can never drift out of
@@ -14,10 +14,10 @@ Coverage: one happy-path triple (add → edit → delete) per pipe plus
 a focused failure-mode test per operation. The pipes are:
 
   CCA           Element / Practice            /timelines/{tl_id}/...
-  CHA-PG global PGElement / PGPractice        /advisory/global/pg-recs/...
-  CHA-PG local  PGElement / PGPractice        /client/{cid}/pg-recs/...
-  CHA-SP        SPElement / SPPractice        /client/{cid}/sp-recs/...
-  Q&A           PGElement / PGPractice        /client/{cid}/std-resps/...
+  CHA-PG global Element / Practice        /advisory/global/pg-recs/...
+  CHA-PG local  Element / Practice        /client/{cid}/pg-recs/...
+  CHA-SP        Element / Practice        /client/{cid}/sp-recs/...
+  Q&A           Element / Practice        /client/{cid}/std-resps/...
 
 This file does NOT re-test the rule book itself (that's
 `tests/test_l2_element_validator.py`). It pins that the Round-2
@@ -30,29 +30,29 @@ from fastapi import HTTPException
 from sqlalchemy import select
 
 from app.modules.advisory.models import (
-    Element, PGElement, PGPractice, PGRecommendation, PGTimeline,
-    Practice, PracticeL0, SPElement, SPPractice, TimelineFromType,
+Element,Practice,PGRecommendation,Timeline,
+PracticeL0,TimelineFromType,
 )
 from app.modules.advisory.router import (
-    add_cca_element, add_client_pg_element, add_global_cca_element,
-    add_global_pg_element, add_qa_element, add_qa_practice,
-    add_qa_timeline, add_sp_element, create_practice,
-    delete_cca_element, delete_client_pg_element, delete_global_cca_element,
-    delete_global_pg_element, delete_qa_element, delete_sp_element,
-    update_cca_element, update_client_pg_element, update_global_cca_element,
-    update_global_pg_element, update_qa_element, update_sp_element,
+add_cca_element,add_client_pg_element,add_global_cca_element,
+add_global_pg_element,add_qa_element,add_qa_practice,
+add_qa_timeline,add_sp_element,create_practice,
+delete_cca_element,delete_client_pg_element,delete_global_cca_element,
+delete_global_pg_element,delete_qa_element,delete_sp_element,
+update_cca_element,update_client_pg_element,update_global_cca_element,
+update_global_pg_element,update_qa_element,update_sp_element,
 )
 from app.modules.advisory.schemas import (
-    ElementIn, PracticeCreate, QAPracticeCreate, QATimelineCreate,
+ElementIn,PracticeCreate,QAPracticeCreate,QATimelineCreate,
 )
 from app.modules.farmpundit.router import create_standard_response
 from app.modules.sync.models import CoshCoreItem
 from tests.conftest import requires_docker
 from tests.factories import (
-    make_client, make_client_user, make_crop_reference, make_package,
-    make_pg_practice, make_pg_recommendation, make_pg_timeline,
-    make_sp_practice, make_sp_recommendation, make_sp_timeline,
-    make_timeline, make_user,
+make_client,make_client_user,make_crop_reference,make_package,
+make_pg_practice,make_pg_recommendation,make_pg_timeline,
+make_sp_practice,make_sp_recommendation,make_sp_timeline,
+make_timeline,make_user,
 )
 
 
@@ -64,31 +64,31 @@ async def _seed_pesticide_cosh(db) -> None:
     # in test elements (cn:imida, am:foliar_spray, etc.) are valid
     # provided their core_type matches what the validator now queries.
     rows = [
-        CoshCoreItem(cosh_id="cn:imida", core_type="common_names_of_inputs",
-                     translations={"en": "Imidacloprid"}, status="active"),
-        CoshCoreItem(cosh_id="am:foliar_spray", core_type="application_methods",
-                     translations={"en": "Foliar spray"}, status="active"),
-        CoshCoreItem(cosh_id="am:soil_drench", core_type="application_methods",
-                     translations={"en": "Soil drench"}, status="active"),
-        CoshCoreItem(cosh_id="du:ml_per_l", core_type="units_data",
-                     translations={"en": "ml/L"}, status="active"),
+        CoshCoreItem(cosh_id="cn:imida",core_type="common_names_of_inputs",
+translations={"en": "Imidacloprid"},status="active"),
+        CoshCoreItem(cosh_id="am:foliar_spray",core_type="application_methods",
+translations={"en": "Foliar spray"},status="active"),
+        CoshCoreItem(cosh_id="am:soil_drench",core_type="application_methods",
+translations={"en": "Soil drench"},status="active"),
+        CoshCoreItem(cosh_id="du:ml_per_l",core_type="units_data",
+translations={"en": "ml/L"},status="active"),
         # The legacy `brand` Core path still exists in the validator
         # (it falls back to cosh_options_view when empty), so the
         # synthetic brand row is still useful for testing the
         # name-string contract in the legacy code-path.
         CoshCoreItem(
-            cosh_id="brand:confidor", core_type="brand",
-            parent_cosh_id="cn:imida",
-            translations={"en": "Confidor"},
-            metadata_={
-                "manufacturer_name": "Bayer",
-                "formulation_cosh_id": "form:SC",
-                "ai_concentration": "17.8% SL",
-            },
-            status="active",
-        ),
-        CoshCoreItem(cosh_id="form:SC", core_type="formulations",
-                     translations={"en": "SC"}, status="active"),
+cosh_id="brand:confidor",core_type="brand",
+parent_cosh_id="cn:imida",
+translations={"en": "Confidor"},
+metadata_={
+"manufacturer_name": "Bayer",
+"formulation_cosh_id": "form:SC",
+"ai_concentration": "17.8% SL",
+},
+status="active",
+),
+        CoshCoreItem(cosh_id="form:SC",core_type="formulations",
+translations={"en": "SC"},status="active"),
     ]
     for r in rows:
         db.add(r)
@@ -118,17 +118,17 @@ async def _seed_cca_practice(db):
     await make_crop_reference(db, "crop:test", name="Test Crop")
     pkg = await make_package(db, client, name="P", crop_cosh_id="crop:test")
     tl = await make_timeline(
-        db, pkg, name="TL", from_type=TimelineFromType.DAS,
-        from_value=0, to_value=15,
-    )
+db,pkg,name="TL",from_type=TimelineFromType.DAS,
+from_value=0,to_value=15,
+)
     await _seed_pesticide_cosh(db)
     await db.commit()
     practice = await create_practice(
-        client_id=client.id, timeline_id=tl.id,
-        request=PracticeCreate(
-            l0_type=PracticeL0.INPUT, l1_type="PESTICIDE",
-            l2_type="CHEMICAL_PESTICIDES",
-            elements=_full_pesticide_elements(),
+client_id=client.id,timeline_id=tl.id,
+request=PracticeCreate(
+l0_type=PracticeL0.INPUT,l1_type="PESTICIDE",
+l2_type="CHEMICAL_PESTICIDES",
+elements=_full_pesticide_elements(),
         ),
         db=db, current_user=se,
     )
@@ -148,15 +148,15 @@ async def _seed_cca_l2none_practice(db):
     tl = await make_timeline(db, pkg, name="TL-N")
     await db.commit()
     practice = Practice(
-        timeline_id=tl.id,
-        l0_type=PracticeL0.INPUT, l1_type=None, l2_type=None,
-        display_order=0, is_special_input=False,
-    )
+timeline_id=tl.id,
+l0_type=PracticeL0.INPUT,l1_type=None,l2_type=None,
+display_order=0,is_special_input=False,
+)
     db.add(practice)
     await db.flush()
     db.add(Element(
-        practice_id=practice.id, element_type="NOTE", value="seed",
-    ))
+practice_id=practice.id,element_type="NOTE",value="seed",
+))
     await db.commit()
     await db.refresh(practice)
     return client, se, tl, practice
@@ -171,27 +171,27 @@ async def test_cca_element_add_edit_delete_lifecycle(db):
     doesn't get in the way of testing the lifecycle plumbing."""
     client, se, tl, practice = await _seed_cca_l2none_practice(db)
     added = await add_cca_element(
-        client_id=client.id, timeline_id=tl.id, practice_id=practice.id,
-        body=ElementIn(element_type="EXTRA", value="Apply at dawn"),
+client_id=client.id,timeline_id=tl.id,practice_id=practice.id,
+body=ElementIn(element_type="EXTRA",value="Apply at dawn"),
         db=db, current_user=se,
     )
     assert added["element_type"] == "EXTRA"
 
     updated = await update_cca_element(
-        client_id=client.id, timeline_id=tl.id,
-        practice_id=practice.id, element_id=added["id"],
-        body=ElementIn(element_type="EXTRA", value="Apply at dusk"),
+client_id=client.id,timeline_id=tl.id,
+practice_id=practice.id,element_id=added["id"],
+body=ElementIn(element_type="EXTRA",value="Apply at dusk"),
         db=db, current_user=se,
     )
     assert updated["value"] == "Apply at dusk"
 
     await delete_cca_element(
-        client_id=client.id, timeline_id=tl.id,
-        practice_id=practice.id, element_id=added["id"],
-        db=db, current_user=se,
-    )
+client_id=client.id,timeline_id=tl.id,
+practice_id=practice.id,element_id=added["id"],
+db=db,current_user=se,
+)
     rows = (await db.execute(
-        select(Element).where(Element.id == added["id"])
+select(Element).where(Element.id == added["id"])
     )).scalars().all()
     assert rows == []
 
@@ -205,19 +205,19 @@ async def test_cca_element_add_unknown_field_returns_422(db):
     can't poison a practice with arbitrary keys."""
     client, se, tl, practice = await _seed_cca_practice(db)
     pre_count = len((await db.execute(
-        select(Element).where(Element.practice_id == practice.id)
+select(Element).where(Element.practice_id == practice.id)
     )).scalars().all())
 
     with pytest.raises(HTTPException) as exc:
         await add_cca_element(
-            client_id=client.id, timeline_id=tl.id, practice_id=practice.id,
-            body=ElementIn(element_type="RANDOM_KEY", value="x"),
+client_id=client.id,timeline_id=tl.id,practice_id=practice.id,
+body=ElementIn(element_type="RANDOM_KEY",value="x"),
             db=db, current_user=se,
         )
     assert exc.value.status_code == 422
 
     post_count = len((await db.execute(
-        select(Element).where(Element.practice_id == practice.id)
+select(Element).where(Element.practice_id == practice.id)
     )).scalars().all())
     assert pre_count == post_count  # no row added
 
@@ -230,20 +230,20 @@ async def test_cca_element_delete_mandatory_blocked_by_validator(db):
     pattern. To wipe everything, the SE deletes the whole Practice."""
     client, se, tl, practice = await _seed_cca_practice(db)
     rows = (await db.execute(
-        select(Element).where(Element.practice_id == practice.id)
+select(Element).where(Element.practice_id == practice.id)
     )).scalars().all()
     dosage = next(r for r in rows if r.element_type == "DOSAGE")
 
     with pytest.raises(HTTPException) as exc:
         await delete_cca_element(
-            client_id=client.id, timeline_id=tl.id,
-            practice_id=practice.id, element_id=dosage.id,
-            db=db, current_user=se,
-        )
+client_id=client.id,timeline_id=tl.id,
+practice_id=practice.id,element_id=dosage.id,
+db=db,current_user=se,
+)
     assert exc.value.status_code == 422
     # The DOSAGE row is still present.
     still_there = (await db.execute(
-        select(Element).where(Element.id == dosage.id)
+select(Element).where(Element.id == dosage.id)
     )).scalar_one_or_none()
     assert still_there is not None
 
@@ -256,20 +256,20 @@ async def test_cca_element_update_replaces_value(db):
     whole Practice. The L2 rule book still passes."""
     client, se, tl, practice = await _seed_cca_practice(db)
     rows = (await db.execute(
-        select(Element).where(Element.practice_id == practice.id)
+select(Element).where(Element.practice_id == practice.id)
     )).scalars().all()
     dosage = next(r for r in rows if r.element_type == "DOSAGE")
 
     out = await update_cca_element(
-        client_id=client.id, timeline_id=tl.id,
-        practice_id=practice.id, element_id=dosage.id,
-        body=ElementIn(element_type="DOSAGE", value="0.4"),
+client_id=client.id,timeline_id=tl.id,
+practice_id=practice.id,element_id=dosage.id,
+body=ElementIn(element_type="DOSAGE",value="0.4"),
         db=db, current_user=se,
     )
     assert out["value"] == "0.4"
 
     refreshed = (await db.execute(
-        select(Element).where(Element.id == dosage.id)
+select(Element).where(Element.id == dosage.id)
     )).scalar_one()
     assert refreshed.value == "0.4"
 
@@ -281,25 +281,25 @@ async def test_cca_element_update_404_on_wrong_practice(db):
     Defends against URL-tampering between two practices the SE can see."""
     client, se, tl, practice = await _seed_cca_practice(db)
     rows = (await db.execute(
-        select(Element).where(Element.practice_id == practice.id)
+select(Element).where(Element.practice_id == practice.id)
     )).scalars().all()
     elem = rows[0]
     # Make a second practice in the same timeline.
     other = await create_practice(
-        client_id=client.id, timeline_id=tl.id,
-        request=PracticeCreate(
-            l0_type=PracticeL0.INPUT, l1_type="PESTICIDE",
-            l2_type="CHEMICAL_PESTICIDES",
-            elements=_full_pesticide_elements(),
+client_id=client.id,timeline_id=tl.id,
+request=PracticeCreate(
+l0_type=PracticeL0.INPUT,l1_type="PESTICIDE",
+l2_type="CHEMICAL_PESTICIDES",
+elements=_full_pesticide_elements(),
         ),
         db=db, current_user=se,
     )
 
     with pytest.raises(HTTPException) as exc:
         await update_cca_element(
-            client_id=client.id, timeline_id=tl.id,
-            practice_id=other.id, element_id=elem.id,
-            body=ElementIn(element_type="DOSAGE", value="0.4"),
+client_id=client.id,timeline_id=tl.id,
+practice_id=other.id,element_id=elem.id,
+body=ElementIn(element_type="DOSAGE",value="0.4"),
             db=db, current_user=se,
         )
     assert exc.value.status_code == 404
@@ -309,19 +309,19 @@ async def test_cca_element_update_404_on_wrong_practice(db):
 
 async def _seed_global_pg_practice(db):
     """Seed a global PG with a CHEMICAL_PESTICIDES practice (full
-    element set seeded directly so the rule book passes). Used by the
+element set seeded directly so the rule book passes). Used by the
     validation-error test below."""
     pg = await make_pg_recommendation(db)
     tl = await make_pg_timeline(db, pg)
     await _seed_pesticide_cosh(db)
     practice = await make_pg_practice(
-        db, tl, l0_type="INPUT", l1_type="PESTICIDE",
-    )
+db,tl,l0_type="INPUT",l1_type="PESTICIDE",
+)
     practice.l2_type = "CHEMICAL_PESTICIDES"
     practice.is_special_input = False
     practice.frequency_days = None
     for el in _full_pesticide_elements():
-        db.add(PGElement(practice_id=practice.id, **el.model_dump()))
+        db.add(Element(practice_id=practice.id, **el.model_dump()))
     await db.commit()
     se = await make_user(db, name="SE-CHA")
     return se, pg, tl, practice
@@ -334,8 +334,8 @@ async def _seed_global_pg_l2none_practice(db):
     tl = await make_pg_timeline(db, pg)
     practice = await make_pg_practice(db, tl, l0_type="INPUT")
     practice.l2_type = None
-    db.add(PGElement(practice_id=practice.id, element_type="SEED",
-                     value="x"))
+    db.add(Element(practice_id=practice.id,element_type="SEED",
+value="x"))
     await db.commit()
     se = await make_user(db, name="SE-CHA-N")
     return se, pg, tl, practice
@@ -346,17 +346,17 @@ async def _seed_global_pg_l2none_practice(db):
 async def test_global_pg_element_add_and_delete(db):
     se, pg, tl, practice = await _seed_global_pg_l2none_practice(db)
     added = await add_global_pg_element(
-        pg_id=pg.id, tl_id=tl.id, practice_id=practice.id,
-        body=ElementIn(element_type="NOTES", value="Test"),
+pg_id=pg.id,tl_id=tl.id,practice_id=practice.id,
+body=ElementIn(element_type="NOTES",value="Test"),
         db=db, current_user=se,
     )
     await delete_global_pg_element(
-        pg_id=pg.id, tl_id=tl.id,
-        practice_id=practice.id, element_id=added["id"],
-        db=db, current_user=se,
-    )
+pg_id=pg.id,tl_id=tl.id,
+practice_id=practice.id,element_id=added["id"],
+db=db,current_user=se,
+)
     rows = (await db.execute(
-        select(PGElement).where(PGElement.id == added["id"])
+select(Element).where(Element.id == added["id"])
     )).scalars().all()
     assert rows == []
 
@@ -368,15 +368,15 @@ async def test_global_pg_element_update_validator_runs(db):
     (here a brand id) trips the L2 rule book — validator runs on PUT."""
     se, pg, tl, practice = await _seed_global_pg_practice(db)
     rows = (await db.execute(
-        select(PGElement).where(PGElement.practice_id == practice.id)
+select(Element).where(Element.practice_id == practice.id)
     )).scalars().all()
     dosage_unit = next(r for r in rows if r.element_type == "DOSAGE_UNIT")
 
     with pytest.raises(HTTPException) as exc:
         await update_global_pg_element(
-            pg_id=pg.id, tl_id=tl.id,
-            practice_id=practice.id, element_id=dosage_unit.id,
-            body=ElementIn(element_type="DOSAGE_UNIT", cosh_ref="brand:confidor"),
+pg_id=pg.id,tl_id=tl.id,
+practice_id=practice.id,element_id=dosage_unit.id,
+body=ElementIn(element_type="DOSAGE_UNIT",cosh_ref="brand:confidor"),
             db=db, current_user=se,
         )
     assert exc.value.status_code == 422
@@ -389,21 +389,21 @@ async def _seed_local_pg_l2none_practice(db):
     client = await make_client(db)
     se = await make_user(db, name="SE-PG-local")
     pg = PGRecommendation(
-        problem_group_cosh_id="pg:test", client_id=client.id,
-        area_or_plant="AREA_WISE",
-    )
+problem_group_cosh_id="pg:test",client_id=client.id,
+area_or_plant="AREA_WISE",
+)
     db.add(pg); await db.flush()
-    tl = PGTimeline(
-        pg_recommendation_id=pg.id, name="Local TL",
-        from_value=0, to_value=7,
-    )
+    tl = Timeline(
+pg_recommendation_id=pg.id,name="Local TL",
+from_value=0,to_value=7,
+)
     db.add(tl); await db.flush()
-    practice = PGPractice(
-        timeline_id=tl.id, l0_type="INPUT", l1_type=None, l2_type=None,
-    )
+    practice = Practice(
+timeline_id=tl.id,l0_type="INPUT",l1_type=None,l2_type=None,
+)
     db.add(practice); await db.flush()
-    db.add(PGElement(practice_id=practice.id, element_type="SEED",
-                     value="x"))
+    db.add(Element(practice_id=practice.id,element_type="SEED",
+value="x"))
     await db.commit()
     return client, se, pg, tl, practice
 
@@ -413,23 +413,23 @@ async def _seed_local_pg_l2none_practice(db):
 async def test_local_pg_element_lifecycle(db):
     client, se, pg, tl, practice = await _seed_local_pg_l2none_practice(db)
     added = await add_client_pg_element(
-        client_id=client.id, pg_id=pg.id, tl_id=tl.id,
-        practice_id=practice.id,
-        body=ElementIn(element_type="NOTES", value="Local note"),
+client_id=client.id,pg_id=pg.id,tl_id=tl.id,
+practice_id=practice.id,
+body=ElementIn(element_type="NOTES",value="Local note"),
         db=db, current_user=se,
     )
     out = await update_client_pg_element(
-        client_id=client.id, pg_id=pg.id, tl_id=tl.id,
-        practice_id=practice.id, element_id=added["id"],
-        body=ElementIn(element_type="NOTES", value="Updated"),
+client_id=client.id,pg_id=pg.id,tl_id=tl.id,
+practice_id=practice.id,element_id=added["id"],
+body=ElementIn(element_type="NOTES",value="Updated"),
         db=db, current_user=se,
     )
     assert out["value"] == "Updated"
     await delete_client_pg_element(
-        client_id=client.id, pg_id=pg.id, tl_id=tl.id,
-        practice_id=practice.id, element_id=added["id"],
-        db=db, current_user=se,
-    )
+client_id=client.id,pg_id=pg.id,tl_id=tl.id,
+practice_id=practice.id,element_id=added["id"],
+db=db,current_user=se,
+)
 
 
 # ── CHA-SP: smoke ──────────────────────────────────────────────────────────
@@ -443,11 +443,11 @@ async def _seed_sp_strict_practice(db):
     tl = await make_sp_timeline(db, sp)
     await _seed_pesticide_cosh(db)
     practice = await make_sp_practice(
-        db, tl, l0_type="INPUT", l1_type="PESTICIDE",
-    )
+db,tl,l0_type="INPUT",l1_type="PESTICIDE",
+)
     practice.l2_type = "CHEMICAL_PESTICIDES"
     for el in _full_pesticide_elements():
-        db.add(SPElement(practice_id=practice.id, **el.model_dump()))
+        db.add(Element(practice_id=practice.id, **el.model_dump()))
     await db.commit()
     return client, se, sp, tl, practice
 
@@ -459,7 +459,7 @@ async def _seed_sp_l2none_practice(db):
     tl = await make_sp_timeline(db, sp)
     practice = await make_sp_practice(db, tl, l0_type="INPUT")
     practice.l2_type = None
-    db.add(SPElement(practice_id=practice.id, element_type="SEED", value="x"))
+    db.add(Element(practice_id=practice.id, element_type="SEED", value="x"))
     await db.commit()
     return client, se, sp, tl, practice
 
@@ -469,20 +469,20 @@ async def _seed_sp_l2none_practice(db):
 async def test_sp_element_lifecycle(db):
     client, se, sp, tl, practice = await _seed_sp_l2none_practice(db)
     added = await add_sp_element(
-        client_id=client.id, sp_id=sp.id, tl_id=tl.id,
-        practice_id=practice.id,
-        body=ElementIn(element_type="NOTES", value="SP note"),
+client_id=client.id,sp_id=sp.id,tl_id=tl.id,
+practice_id=practice.id,
+body=ElementIn(element_type="NOTES",value="SP note"),
         db=db, current_user=se,
     )
     rows = (await db.execute(
-        select(SPElement).where(SPElement.id == added["id"])
+select(Element).where(Element.id == added["id"])
     )).scalars().all()
     assert len(rows) == 1
     await delete_sp_element(
-        client_id=client.id, sp_id=sp.id, tl_id=tl.id,
-        practice_id=practice.id, element_id=added["id"],
-        db=db, current_user=se,
-    )
+client_id=client.id,sp_id=sp.id,tl_id=tl.id,
+practice_id=practice.id,element_id=added["id"],
+db=db,current_user=se,
+)
 
 
 @requires_docker
@@ -492,18 +492,18 @@ async def test_sp_element_delete_mandatory_blocked(db):
     element from a strict-typed practice is blocked here too."""
     client, se, sp, tl, practice = await _seed_sp_strict_practice(db)
     dosage = (await db.execute(
-        select(SPElement).where(
-            SPElement.practice_id == practice.id,
-            SPElement.element_type == "DOSAGE",
-        )
+select(Element).where(
+Element.practice_id == practice.id,
+Element.element_type == "DOSAGE",
+)
     )).scalar_one()
 
     with pytest.raises(HTTPException) as exc:
         await delete_sp_element(
-            client_id=client.id, sp_id=sp.id, tl_id=tl.id,
-            practice_id=practice.id, element_id=dosage.id,
-            db=db, current_user=se,
-        )
+client_id=client.id,sp_id=sp.id,tl_id=tl.id,
+practice_id=practice.id,element_id=dosage.id,
+db=db,current_user=se,
+)
     assert exc.value.status_code == 422
 
 
@@ -516,20 +516,20 @@ async def _seed_qa_practice(db):
     se = await make_user(db, name="SE-QA")
     await make_client_user(db, user=se, client=client)
     sr = await create_standard_response(
-        client_id=client.id,
-        data={"question_text": "Q?", "crop_cosh_id": None},
-        db=db, current_user=se,
-    )
+client_id=client.id,
+data={"question_text": "Q?","crop_cosh_id": None},
+db=db,current_user=se,
+)
     tl = await add_qa_timeline(
-        client_id=client.id, sr_id=sr["id"],
-        request=QATimelineCreate(name="W1", to_value=7),
+client_id=client.id,sr_id=sr["id"],
+request=QATimelineCreate(name="W1",to_value=7),
         db=db, current_user=se,
     )
     practice = await add_qa_practice(
-        client_id=client.id, sr_id=sr["id"], tl_id=tl["id"],
-        request=QAPracticeCreate(
-            l0_type="INPUT", l1_type=None, l2_type=None,
-            elements=[ElementIn(element_type="SEED", value="x")],
+client_id=client.id,sr_id=sr["id"],tl_id=tl["id"],
+request=QAPracticeCreate(
+l0_type="INPUT",l1_type=None,l2_type=None,
+elements=[ElementIn(element_type="SEED",value="x")],
         ),
         db=db, current_user=se,
     )
@@ -541,23 +541,23 @@ async def _seed_qa_practice(db):
 async def test_qa_element_lifecycle(db):
     client, se, sr_id, tl_id, p_id = await _seed_qa_practice(db)
     added = await add_qa_element(
-        client_id=client.id, sr_id=sr_id, tl_id=tl_id,
-        practice_id=p_id,
-        body=ElementIn(element_type="NOTES", value="QA note"),
+client_id=client.id,sr_id=sr_id,tl_id=tl_id,
+practice_id=p_id,
+body=ElementIn(element_type="NOTES",value="QA note"),
         db=db, current_user=se,
     )
     out = await update_qa_element(
-        client_id=client.id, sr_id=sr_id, tl_id=tl_id,
-        practice_id=p_id, element_id=added["id"],
-        body=ElementIn(element_type="NOTES", value="Updated"),
+client_id=client.id,sr_id=sr_id,tl_id=tl_id,
+practice_id=p_id,element_id=added["id"],
+body=ElementIn(element_type="NOTES",value="Updated"),
         db=db, current_user=se,
     )
     assert out["value"] == "Updated"
     await delete_qa_element(
-        client_id=client.id, sr_id=sr_id, tl_id=tl_id,
-        practice_id=p_id, element_id=added["id"],
-        db=db, current_user=se,
-    )
+client_id=client.id,sr_id=sr_id,tl_id=tl_id,
+practice_id=p_id,element_id=added["id"],
+db=db,current_user=se,
+)
 
 
 @requires_docker
@@ -571,9 +571,9 @@ async def test_qa_element_rejects_non_member(db):
 
     with pytest.raises(HTTPException) as exc:
         await add_qa_element(
-            client_id=client.id, sr_id=sr_id, tl_id=tl_id,
-            practice_id=p_id,
-            body=ElementIn(element_type="NOTES", value="x"),
+client_id=client.id,sr_id=sr_id,tl_id=tl_id,
+practice_id=p_id,
+body=ElementIn(element_type="NOTES",value="x"),
             db=db, current_user=outsider,
         )
     assert exc.value.status_code in (401, 403)
@@ -597,26 +597,26 @@ async def test_delete_only_element_on_l2_none_practice_succeeds(db):
     # l2_type=None, but the test specifically needs a shell practice
     # to exercise the empty-element-set helper path.
     practice = Practice(
-        timeline_id=tl.id,
-        l0_type=PracticeL0.INPUT, l1_type=None, l2_type=None,
-        display_order=0, is_special_input=False,
-    )
+timeline_id=tl.id,
+l0_type=PracticeL0.INPUT,l1_type=None,l2_type=None,
+display_order=0,is_special_input=False,
+)
     db.add(practice)
     await db.flush()
     db.add(Element(
-        practice_id=practice.id, element_type="NOTES", value="x",
-    ))
+practice_id=practice.id,element_type="NOTES",value="x",
+))
     await db.commit()
     await db.refresh(practice)
     elem = (await db.execute(
-        select(Element).where(Element.practice_id == practice.id)
+select(Element).where(Element.practice_id == practice.id)
     )).scalar_one()
     await delete_cca_element(
-        client_id=client.id, timeline_id=tl.id,
-        practice_id=practice.id, element_id=elem.id,
-        db=db, current_user=se,
-    )
+client_id=client.id,timeline_id=tl.id,
+practice_id=practice.id,element_id=elem.id,
+db=db,current_user=se,
+)
     remaining = (await db.execute(
-        select(Element).where(Element.practice_id == practice.id)
+select(Element).where(Element.practice_id == practice.id)
     )).scalars().all()
     assert remaining == []

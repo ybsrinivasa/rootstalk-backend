@@ -23,23 +23,23 @@ from fastapi import HTTPException
 from sqlalchemy import select
 
 from app.modules.advisory.models import (
-    PGElement, PGPractice, PGRecommendation, PGTimeline,
-    SPElement, SPPractice, SPRecommendation, SPTimeline,
+Element,Practice,PGRecommendation,Timeline,
+SPRecommendation,
 )
 from app.modules.advisory.router import (
-    add_client_pg_practice, add_qa_practice, add_qa_timeline,
-    add_sp_practice,
+add_client_pg_practice,add_qa_practice,add_qa_timeline,
+add_sp_practice,
 )
 from app.modules.advisory.schemas import (
-    ElementIn, PGPracticeCreate, QAPracticeCreate, QATimelineCreate,
-    SPPracticeCreate,
+ElementIn,PGPracticeCreate,QAPracticeCreate,QATimelineCreate,
+SPPracticeCreate,
 )
 from app.modules.farmpundit.router import create_standard_response
 from app.modules.sync.models import CoshCoreItem
 from tests.conftest import requires_docker
 from tests.factories import (
-    make_client, make_client_user, make_sp_recommendation, make_sp_timeline,
-    make_user,
+make_client,make_client_user,make_sp_recommendation,make_sp_timeline,
+make_user,
 )
 
 
@@ -49,25 +49,25 @@ async def _seed_pesticide_cosh(db) -> None:
     """Same seed shape as the 4C-i.D wiring tests — Imidacloprid /
     Confidor / Foliar Spray. Lets the cascade service walk live data."""
     rows = [
-        CoshCoreItem(cosh_id="cn:imida", core_type="common_names_of_inputs",
-                     translations={"en": "Imidacloprid"}, status="active"),
-        CoshCoreItem(cosh_id="am:foliar_spray", core_type="application_methods",
-                     translations={"en": "Foliar spray"}, status="active"),
-        CoshCoreItem(cosh_id="du:ml_per_l", core_type="units_data",
-                     translations={"en": "ml/L"}, status="active"),
+        CoshCoreItem(cosh_id="cn:imida",core_type="common_names_of_inputs",
+translations={"en": "Imidacloprid"},status="active"),
+        CoshCoreItem(cosh_id="am:foliar_spray",core_type="application_methods",
+translations={"en": "Foliar spray"},status="active"),
+        CoshCoreItem(cosh_id="du:ml_per_l",core_type="units_data",
+translations={"en": "ml/L"},status="active"),
         CoshCoreItem(
-            cosh_id="brand:confidor", core_type="brand",
-            parent_cosh_id="cn:imida",
-            translations={"en": "Confidor"},
-            metadata_={
-                "manufacturer_name": "Bayer",
-                "formulation_cosh_id": "form:SC",
-                "ai_concentration": "17.8% SL",
-            },
-            status="active",
-        ),
-        CoshCoreItem(cosh_id="form:SC", core_type="formulations",
-                     translations={"en": "SC"}, status="active"),
+cosh_id="brand:confidor",core_type="brand",
+parent_cosh_id="cn:imida",
+translations={"en": "Confidor"},
+metadata_={
+"manufacturer_name": "Bayer",
+"formulation_cosh_id": "form:SC",
+"ai_concentration": "17.8% SL",
+},
+status="active",
+),
+        CoshCoreItem(cosh_id="form:SC",core_type="formulations",
+translations={"en": "SC"},status="active"),
     ]
     for r in rows:
         db.add(r)
@@ -95,13 +95,13 @@ async def _seed_qa_timeline(db):
     se = await make_user(db, name="SE")
     await make_client_user(db, user=se, client=client)
     sr = await create_standard_response(
-        client_id=client.id,
-        data={"question_text": "Q?", "crop_cosh_id": None},
-        db=db, current_user=se,
-    )
+client_id=client.id,
+data={"question_text": "Q?","crop_cosh_id": None},
+db=db,current_user=se,
+)
     tl = await add_qa_timeline(
-        client_id=client.id, sr_id=sr["id"],
-        request=QATimelineCreate(name="W1", to_value=7),
+client_id=client.id,sr_id=sr["id"],
+request=QATimelineCreate(name="W1",to_value=7),
         db=db, current_user=se,
     )
     return client, se, sr["id"], tl["id"]
@@ -115,11 +115,11 @@ async def test_qa_practice_happy_path_persists_elements(db):
     await db.commit()
 
     out = await add_qa_practice(
-        client_id=client.id, sr_id=sr_id, tl_id=tl_id,
-        request=QAPracticeCreate(
-            l0_type="INPUT", l1_type="PESTICIDE",
-            l2_type="CHEMICAL_PESTICIDES",
-            elements=_full_pesticide_elements(),
+client_id=client.id,sr_id=sr_id,tl_id=tl_id,
+request=QAPracticeCreate(
+l0_type="INPUT",l1_type="PESTICIDE",
+l2_type="CHEMICAL_PESTICIDES",
+elements=_full_pesticide_elements(),
         ),
         db=db, current_user=se,
     )
@@ -128,7 +128,7 @@ async def test_qa_practice_happy_path_persists_elements(db):
 
     # Defence-in-depth: rows actually landed in pg_elements.
     rows = (await db.execute(
-        select(PGElement).where(PGElement.practice_id == out["id"])
+select(Element).where(Element.practice_id == out["id"])
     )).scalars().all()
     assert len(rows) == 8
 
@@ -145,12 +145,12 @@ async def test_qa_practice_missing_mandatory_returns_422(db):
 
     with pytest.raises(HTTPException) as exc:
         await add_qa_practice(
-            client_id=client.id, sr_id=sr_id, tl_id=tl_id,
-            request=QAPracticeCreate(
-                l0_type="INPUT", l1_type="PESTICIDE",
-                l2_type="CHEMICAL_PESTICIDES",
-                elements=[],  # all mandatory missing
-            ),
+client_id=client.id,sr_id=sr_id,tl_id=tl_id,
+request=QAPracticeCreate(
+l0_type="INPUT",l1_type="PESTICIDE",
+l2_type="CHEMICAL_PESTICIDES",
+elements=[],# all mandatory missing
+),
             db=db, current_user=se,
         )
     assert exc.value.status_code == 422
@@ -167,15 +167,15 @@ async def _seed_local_pg_timeline(db):
     se = await make_user(db, name="SE-PG")
     await make_client_user(db, user=se, client=client)
     pg = PGRecommendation(
-        problem_group_cosh_id="pg:test", client_id=client.id,
-        area_or_plant="AREA_WISE",
-    )
+problem_group_cosh_id="pg:test",client_id=client.id,
+area_or_plant="AREA_WISE",
+)
     db.add(pg)
     await db.flush()
-    tl = PGTimeline(
-        pg_recommendation_id=pg.id, name="PG-W1",
-        from_value=0, to_value=7,
-    )
+    tl = Timeline(
+pg_recommendation_id=pg.id,name="PG-W1",
+from_value=0,to_value=7,
+)
     db.add(tl)
     await db.flush()
     return client, se, pg.id, tl.id
@@ -192,16 +192,16 @@ async def test_local_pg_practice_happy_path_persists_elements(db):
     await db.commit()
 
     out = await add_client_pg_practice(
-        client_id=client.id, pg_id=pg_id, tl_id=tl_id,
-        request=PGPracticeCreate(
-            l0_type="INPUT", l1_type="PESTICIDE",
-            l2_type="CHEMICAL_PESTICIDES",
-            elements=_full_pesticide_elements(),
+client_id=client.id,pg_id=pg_id,tl_id=tl_id,
+request=PGPracticeCreate(
+l0_type="INPUT",l1_type="PESTICIDE",
+l2_type="CHEMICAL_PESTICIDES",
+elements=_full_pesticide_elements(),
         ),
         db=db, current_user=se,
     )
     rows = (await db.execute(
-        select(PGElement).where(PGElement.practice_id == out.id)
+select(Element).where(Element.practice_id == out.id)
     )).scalars().all()
     assert len(rows) == 8
 
@@ -215,12 +215,12 @@ async def test_local_pg_practice_missing_mandatory_returns_422(db):
 
     with pytest.raises(HTTPException) as exc:
         await add_client_pg_practice(
-            client_id=client.id, pg_id=pg_id, tl_id=tl_id,
-            request=PGPracticeCreate(
-                l0_type="INPUT", l1_type="PESTICIDE",
-                l2_type="CHEMICAL_PESTICIDES",
-                elements=[],
-            ),
+client_id=client.id,pg_id=pg_id,tl_id=tl_id,
+request=PGPracticeCreate(
+l0_type="INPUT",l1_type="PESTICIDE",
+l2_type="CHEMICAL_PESTICIDES",
+elements=[],
+),
             db=db, current_user=se,
         )
     assert exc.value.status_code == 422
@@ -249,16 +249,16 @@ async def test_sp_practice_happy_path_persists_elements(db):
     await db.commit()
 
     out = await add_sp_practice(
-        client_id=client.id, sp_id=sp_id, tl_id=tl_id,
-        request=SPPracticeCreate(
-            l0_type="INPUT", l1_type="PESTICIDE",
-            l2_type="CHEMICAL_PESTICIDES",
-            elements=_full_pesticide_elements(),
+client_id=client.id,sp_id=sp_id,tl_id=tl_id,
+request=SPPracticeCreate(
+l0_type="INPUT",l1_type="PESTICIDE",
+l2_type="CHEMICAL_PESTICIDES",
+elements=_full_pesticide_elements(),
         ),
         db=db, current_user=se,
     )
     rows = (await db.execute(
-        select(SPElement).where(SPElement.practice_id == out.id)
+select(Element).where(Element.practice_id == out.id)
     )).scalars().all()
     assert len(rows) == 8
 
@@ -272,12 +272,12 @@ async def test_sp_practice_missing_mandatory_returns_422(db):
 
     with pytest.raises(HTTPException) as exc:
         await add_sp_practice(
-            client_id=client.id, sp_id=sp_id, tl_id=tl_id,
-            request=SPPracticeCreate(
-                l0_type="INPUT", l1_type="PESTICIDE",
-                l2_type="CHEMICAL_PESTICIDES",
-                elements=[],
-            ),
+client_id=client.id,sp_id=sp_id,tl_id=tl_id,
+request=SPPracticeCreate(
+l0_type="INPUT",l1_type="PESTICIDE",
+l2_type="CHEMICAL_PESTICIDES",
+elements=[],
+),
             db=db, current_user=se,
         )
     assert exc.value.status_code == 422
@@ -297,8 +297,8 @@ async def test_l2_none_bypass_qa(db):
     await db.commit()
 
     out = await add_qa_practice(
-        client_id=client.id, sr_id=sr_id, tl_id=tl_id,
-        request=QAPracticeCreate(l0_type="INPUT", elements=[]),
+client_id=client.id,sr_id=sr_id,tl_id=tl_id,
+request=QAPracticeCreate(l0_type="INPUT",elements=[]),
         db=db, current_user=se,
     )
     assert out["l0_type"] == "INPUT"
@@ -312,8 +312,8 @@ async def test_l2_none_bypass_local_pg(db):
     await db.commit()
 
     out = await add_client_pg_practice(
-        client_id=client.id, pg_id=pg_id, tl_id=tl_id,
-        request=PGPracticeCreate(l0_type="INPUT", elements=[]),
+client_id=client.id,pg_id=pg_id,tl_id=tl_id,
+request=PGPracticeCreate(l0_type="INPUT",elements=[]),
         db=db, current_user=se,
     )
     assert out.l0_type == "INPUT"
@@ -326,8 +326,8 @@ async def test_l2_none_bypass_sp(db):
     await db.commit()
 
     out = await add_sp_practice(
-        client_id=client.id, sp_id=sp_id, tl_id=tl_id,
-        request=SPPracticeCreate(l0_type="INPUT", elements=[]),
+client_id=client.id,sp_id=sp_id,tl_id=tl_id,
+request=SPPracticeCreate(l0_type="INPUT",elements=[]),
         db=db, current_user=se,
     )
     assert out.l0_type == "INPUT"

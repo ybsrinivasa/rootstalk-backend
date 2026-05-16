@@ -32,8 +32,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.modules.advisory.models import (
     Timeline, Practice, Element, Relation,
     ConditionalQuestion, PracticeConditional,
-    PGTimeline, PGPractice, PGElement,
-    SPTimeline, SPPractice, SPElement,
 )
 from app.modules.subscriptions.snapshot_models import LockedTimelineSnapshot
 
@@ -221,14 +219,14 @@ async def serialise_cha_timeline(
 
     Raises ValueError on bad source or missing timeline.
     """
-    if source == "PG" or source == "QA":
-        # QA timelines live in pg_timelines via the dual-FK
-        # polymorphism. Practices and elements are reused as-is.
-        TLModel, PracticeModel, ElementModel = PGTimeline, PGPractice, PGElement
-    elif source == "SP":
-        TLModel, PracticeModel, ElementModel = SPTimeline, SPPractice, SPElement
-    else:
+    # Batch 39O UCAT unification (2026-05-16): PG / SP / QA all live in
+    # the shared Timeline / Practice / Element tables. The `source`
+    # discriminator no longer dispatches to different models — it's
+    # kept on the `LockedTimelineSnapshot` row purely to label the
+    # snapshot origin for downstream renderers.
+    if source not in ("PG", "SP", "QA"):
         raise ValueError(f"source must be 'PG', 'SP', or 'QA', got {source!r}")
+    TLModel, PracticeModel, ElementModel = Timeline, Practice, Element
 
     tl = (
         await db.execute(select(TLModel).where(TLModel.id == timeline_id))

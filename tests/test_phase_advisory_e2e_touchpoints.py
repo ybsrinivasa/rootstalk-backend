@@ -27,26 +27,26 @@ import pytest
 from sqlalchemy import select
 
 from app.modules.advisory.models import (
-    PGElement, PGPractice, PGRecommendation, PGTimeline, PracticeL0,
-    TimelineFromType,
+Element,Practice,PGRecommendation,Timeline,PracticeL0,
+TimelineFromType,
 )
 from app.modules.farmpundit.models import (
-    ClientFarmPundit, FarmPunditProfile, PunditRole, Query, QueryStatus,
-    StandardResponse,
+ClientFarmPundit,FarmPunditProfile,PunditRole,Query,QueryStatus,
+StandardResponse,
 )
 from app.modules.farmpundit.router import (
-    create_standard_response, respond_to_query,
+create_standard_response,respond_to_query,
 )
 from app.modules.subscriptions.models import (
-    Subscription, SubscriptionStatus, TriggeredCHAEntry,
+Subscription,SubscriptionStatus,TriggeredCHAEntry,
 )
 from app.modules.subscriptions.router import get_today_advisory
 from app.modules.sync.models import CoshCoreItem
 from tests.conftest import requires_docker
 from tests.factories import (
-    make_client, make_client_user, make_crop_reference, make_element,
-    make_package, make_pg_element, make_pg_practice, make_practice,
-    make_subscription, make_timeline, make_user,
+make_client,make_client_user,make_crop_reference,make_element,
+make_package,make_pg_element,make_pg_practice,make_practice,
+make_subscription,make_timeline,make_user,
 )
 
 
@@ -72,14 +72,14 @@ async def _seed_pundit_with_query(db, *, client, farmer, sub, title="Pest issue"
     db.add(profile)
     await db.flush()
     db.add(ClientFarmPundit(
-        client_id=client.id, pundit_id=profile.id,
-        role=PunditRole.PRIMARY, status="ACTIVE", round_robin_sequence=1,
-    ))
+client_id=client.id,pundit_id=profile.id,
+role=PunditRole.PRIMARY,status="ACTIVE",round_robin_sequence=1,
+))
     query = Query(
-        farmer_user_id=farmer.id, subscription_id=sub.id, client_id=client.id,
-        title=title, severity="MODERATE", status=QueryStatus.NEW,
-        current_holder_id=profile.id,
-        expires_at=datetime.now(timezone.utc) + timedelta(days=7),
+farmer_user_id=farmer.id,subscription_id=sub.id,client_id=client.id,
+title=title,severity="MODERATE",status=QueryStatus.NEW,
+current_holder_id=profile.id,
+expires_at=datetime.now(timezone.utc) + timedelta(days=7),
     )
     db.add(query)
     await db.flush()
@@ -87,17 +87,17 @@ async def _seed_pundit_with_query(db, *, client, farmer, sub, title="Pest issue"
 
 
 async def _add_qa_timeline_to_sr(
-    db, *, sr_id: str, name: str = "QA-TL",
-    from_value: int = 0, to_value: int = 14,
-    l1_type: str = "PESTICIDE", l2_type: str = "NEEM_OIL",
-    common_name_cosh: str | None = None,
+db,*,sr_id: str,name: str = "QA-TL",
+from_value: int = 0,to_value: int = 14,
+l1_type: str = "PESTICIDE",l2_type: str = "NEEM_OIL",
+common_name_cosh: str | None = None,
 ):
     """Author a Timeline+Practice+Element rooted at a Standard Response.
     `make_pg_timeline` only supports pg_recommendation_id parents; QA
     timelines need standard_response_id + the polymorphic CHECK is
     enforced by the DB."""
-    tl = PGTimeline(
-        standard_response_id=sr_id, name=f"{name}-{uuid.uuid4().hex[:6]}",
+    tl = Timeline(
+standard_response_id=sr_id,name=f"{name}-{uuid.uuid4().hex[:6]}",
         from_type="DAYS_AFTER_DETECTION",
         from_value=from_value, to_value=to_value,
     )
@@ -107,9 +107,9 @@ async def _add_qa_timeline_to_sr(
     p.l2_type = l2_type
     if common_name_cosh:
         await make_pg_element(
-            db, p, element_type="common_name", value=None,
-            cosh_ref=common_name_cosh,
-        )
+db,p,element_type="common_name",value=None,
+cosh_ref=common_name_cosh,
+)
     else:
         await make_pg_element(db, p, element_type="DOSAGE", value="2.5")
     await db.flush()
@@ -117,12 +117,12 @@ async def _add_qa_timeline_to_sr(
 
 
 async def _add_pg_timeline(
-    db, *, pg_rec_id: str, name: str = "PG-TL",
-    from_value: int = 0, to_value: int = 14,
-    l2_type: str = "MANCOZEB",
+db,*,pg_rec_id: str,name: str = "PG-TL",
+from_value: int = 0,to_value: int = 14,
+l2_type: str = "MANCOZEB",
 ):
-    tl = PGTimeline(
-        pg_recommendation_id=pg_rec_id, name=f"{name}-{uuid.uuid4().hex[:6]}",
+    tl = Timeline(
+pg_recommendation_id=pg_rec_id,name=f"{name}-{uuid.uuid4().hex[:6]}",
         from_type="DAYS_AFTER_DETECTION",
         from_value=from_value, to_value=to_value,
     )
@@ -153,39 +153,39 @@ async def test_qa_timeline_reaches_farmer_today(db):
     await db.commit()
 
     sr = await create_standard_response(
-        client_id=client.id,
-        data={"question_text": "How to control aphids?"},
-        db=db, current_user=se,
-    )
+client_id=client.id,
+data={"question_text": "How to control aphids?"},
+db=db,current_user=se,
+)
     qa_tl, _ = await _add_qa_timeline_to_sr(
-        db, sr_id=sr["id"], name="QA-Aphids",
-    )
+db,sr_id=sr["id"],name="QA-Aphids",
+)
     pundit, _, query = await _seed_pundit_with_query(
-        db, client=client, farmer=farmer, sub=sub,
-    )
+db,client=client,farmer=farmer,sub=sub,
+)
     await db.commit()
 
     await respond_to_query(
-        query_id=query.id,
-        data={"standard_response_id": sr["id"]},
-        db=db, current_user=pundit,
-    )
+query_id=query.id,
+data={"standard_response_id": sr["id"]},
+db=db,current_user=pundit,
+)
 
     out = await get_today_advisory(db=db, current_user=farmer)
     assert len(out) == 1
     timelines_by_id = {t["id"]: t for t in out[0]["timelines"]}
     qa_id = f"cha-qa-{qa_tl.id}"
     assert qa_id in timelines_by_id, (
-        f"QA timeline {qa_id} must appear on /today after Pundit responds. "
-        f"Got: {list(timelines_by_id)}"
+f"QA timeline {qa_id} must appear on /today after Pundit responds. "
+f"Got: {list(timelines_by_id)}"
     )
     rt = timelines_by_id[qa_id]
     assert rt["source"] == "QA", "Pundit-origin marker for the PWA"
     # QA window is anchored at the triggered_at date; covers today.
     assert rt["from_date"] <= datetime.now(timezone.utc).date().isoformat()
     assert any(
-        p["l2_type"] == "NEEM_OIL" for p in rt["practices"]
-    ), "Authored QA practice must be present"
+p["l2_type"] == "NEEM_OIL" for p in rt["practices"]
+), "Authored QA practice must be present"
 
 
 # ── Test 2: QA window anchors to triggered_at, not crop_start ────────────────
@@ -196,7 +196,7 @@ async def test_qa_window_anchors_to_triggered_at_not_crop_start(db):
     """Like the existing CHA-window test but for QA: shifting
     crop_start_date AFTER the QA entry exists must not move the QA
     window. The QA window is anchored at triggered_at (Q&A is rooted
-    in a question, not the crop calendar)."""
+in a question,not the crop calendar)."""
     client = await make_client(db)
     se = await _se_for(db, client=client)
     farmer = await make_user(db, name="Farmer")
@@ -208,32 +208,32 @@ async def test_qa_window_anchors_to_triggered_at_not_crop_start(db):
     # Need an active CCA timeline so the today-route doesn't short-circuit
     # before reaching the CHA loop. Mirrors test_today_dbs_timeline_uses_*.
     cca_tl = await make_timeline(
-        db, pkg, name="CCA_FOR_QA_TEST",
-        from_type=TimelineFromType.DAS, from_value=0, to_value=120,
-    )
+db,pkg,name="CCA_FOR_QA_TEST",
+from_type=TimelineFromType.DAS,from_value=0,to_value=120,
+)
     await make_practice(db, cca_tl)
 
     sr = await create_standard_response(
-        client_id=client.id,
-        data={"question_text": "Bollworm control?"},
-        db=db, current_user=se,
-    )
+client_id=client.id,
+data={"question_text": "Bollworm control?"},
+db=db,current_user=se,
+)
     qa_tl, _ = await _add_qa_timeline_to_sr(
-        db, sr_id=sr["id"], name="QA-Bollworm", to_value=14,
-    )
+db,sr_id=sr["id"],name="QA-Bollworm",to_value=14,
+)
     triggered_at_dt = datetime.now(timezone.utc) - timedelta(days=3)
     db.add(TriggeredCHAEntry(
-        subscription_id=sub.id,
-        farmer_user_id=farmer.id,
-        client_id=client.id,
-        problem_cosh_id=None,
-        recommendation_type="QA",
-        recommendation_id=sr["id"],
-        triggered_by="QUERY",
-        triggered_at=triggered_at_dt,
-        status="ACTIVE",
-        problem_name="Bollworm control?",
-    ))
+subscription_id=sub.id,
+farmer_user_id=farmer.id,
+client_id=client.id,
+problem_cosh_id=None,
+recommendation_type="QA",
+recommendation_id=sr["id"],
+triggered_by="QUERY",
+triggered_at=triggered_at_dt,
+status="ACTIVE",
+problem_name="Bollworm control?",
+))
     await db.commit()
 
     qa_id = f"cha-qa-{qa_tl.id}"
@@ -254,9 +254,9 @@ async def test_qa_window_anchors_to_triggered_at_not_crop_start(db):
     rt2 = next((t for t in out2[0]["timelines"] if t["id"] == qa_id), None)
     assert rt2 is not None, "QA still in window after crop_start shift"
     assert rt2["from_date"] == qa_from_1, (
-        "QA from_date must NOT shift with crop_start_date — "
-        "it's anchored at triggered_at"
-    )
+"QA from_date must NOT shift with crop_start_date — "
+"it's anchored at triggered_at"
+)
     assert rt2["to_date"] == qa_to_1
 
 
@@ -272,41 +272,41 @@ async def test_pundit_pest_problem_via_pg_reaches_farmer_today(db):
     client = await make_client(db)
     farmer = await make_user(db, name="Farmer")
     await make_crop_reference(
-        db, "crop:tomato", name="Tomato", measure="AREA_WISE",
-    )
+db,"crop:tomato",name="Tomato",measure="AREA_WISE",
+)
     pkg = await make_package(db, client, crop_cosh_id="crop:tomato")
     sub = await make_subscription(db, farmer=farmer, client=client, package=pkg)
     sub.crop_start_date = datetime.now(timezone.utc) - timedelta(days=10)
     await db.commit()
 
     pg_rec = PGRecommendation(
-        problem_group_cosh_id="pg:fungal_diseases", client_id=client.id,
-        area_or_plant="AREA_WISE", status="ACTIVE",
-    )
+problem_group_cosh_id="pg:fungal_diseases",client_id=client.id,
+area_or_plant="AREA_WISE",status="ACTIVE",
+)
     db.add(pg_rec)
     await db.flush()
     pg_tl, _ = await _add_pg_timeline(
-        db, pg_rec_id=pg_rec.id, l2_type="MANCOZEB",
-    )
+db,pg_rec_id=pg_rec.id,l2_type="MANCOZEB",
+)
 
     pundit, _, query = await _seed_pundit_with_query(
-        db, client=client, farmer=farmer, sub=sub,
-    )
+db,client=client,farmer=farmer,sub=sub,
+)
     await db.commit()
 
     await respond_to_query(
-        query_id=query.id,
-        data={"problem_cosh_id": "pg:fungal_diseases"},
-        db=db, current_user=pundit,
-    )
+query_id=query.id,
+data={"problem_cosh_id": "pg:fungal_diseases"},
+db=db,current_user=pundit,
+)
 
     out = await get_today_advisory(db=db, current_user=farmer)
     timelines_by_id = {t["id"]: t for t in out[0]["timelines"]}
     cha_id = f"cha-pg-{pg_tl.id}"
     assert cha_id in timelines_by_id, (
-        f"PG timeline must reach /today via the resolver → "
-        f"TriggeredCHAEntry → today-route seam. "
-        f"Got: {list(timelines_by_id)}"
+f"PG timeline must reach /today via the resolver → "
+f"TriggeredCHAEntry → today-route seam. "
+f"Got: {list(timelines_by_id)}"
     )
     rt = timelines_by_id[cha_id]
     assert rt["source"] == "CHA"
@@ -324,33 +324,33 @@ async def test_pundit_pest_problem_via_sp_reaches_farmer_today(db):
     Resolver picks SP per spec §8.7 priority. /today shows
     `cha-sp-{tl.id}`."""
     from app.modules.advisory.models import (
-        SPRecommendation, SPTimeline,
-    )
+SPRecommendation,Timeline,
+)
     from tests.factories import make_sp_element, make_sp_practice
 
     client = await make_client(db)
     farmer = await make_user(db, name="Farmer")
     await make_crop_reference(
-        db, "crop:tomato", name="Tomato", measure="AREA_WISE",
-    )
+db,"crop:tomato",name="Tomato",measure="AREA_WISE",
+)
     pkg = await make_package(db, client, crop_cosh_id="crop:tomato")
     sub = await make_subscription(db, farmer=farmer, client=client, package=pkg)
     sub.crop_start_date = datetime.now(timezone.utc) - timedelta(days=10)
     await db.commit()
 
     db.add(CoshCoreItem(
-        cosh_id="sp:tomato_late_blight", core_type="specific_problem",
-        parent_cosh_id="pg:fungal_diseases",
-        translations={"en": "Tomato Late Blight"}, status="active",
-    ))
+cosh_id="sp:tomato_late_blight",core_type="specific_problem",
+parent_cosh_id="pg:fungal_diseases",
+translations={"en": "Tomato Late Blight"},status="active",
+))
     sp_rec = SPRecommendation(
-        specific_problem_cosh_id="sp:tomato_late_blight",
-        client_id=client.id, crop_cosh_id="crop:tomato", status="ACTIVE",
-    )
+specific_problem_cosh_id="sp:tomato_late_blight",
+client_id=client.id,crop_cosh_id="crop:tomato",status="ACTIVE",
+)
     db.add(sp_rec)
     await db.flush()
-    sp_tl = SPTimeline(
-        sp_recommendation_id=sp_rec.id, name=f"SP-{uuid.uuid4().hex[:6]}",
+    sp_tl = Timeline(
+sp_recommendation_id=sp_rec.id,name=f"SP-{uuid.uuid4().hex[:6]}",
         from_value=0, to_value=10,
     )
     db.add(sp_tl)
@@ -360,23 +360,23 @@ async def test_pundit_pest_problem_via_sp_reaches_farmer_today(db):
     await make_sp_element(db, sp_p, element_type="DOSAGE", value="3.0")
 
     pundit, _, query = await _seed_pundit_with_query(
-        db, client=client, farmer=farmer, sub=sub,
-    )
+db,client=client,farmer=farmer,sub=sub,
+)
     await db.commit()
 
     await respond_to_query(
-        query_id=query.id,
-        data={"problem_cosh_id": "sp:tomato_late_blight"},
-        db=db, current_user=pundit,
-    )
+query_id=query.id,
+data={"problem_cosh_id": "sp:tomato_late_blight"},
+db=db,current_user=pundit,
+)
 
     out = await get_today_advisory(db=db, current_user=farmer)
     timelines_by_id = {t["id"]: t for t in out[0]["timelines"]}
     cha_id = f"cha-sp-{sp_tl.id}"
     assert cha_id in timelines_by_id, (
-        "SP path must win over PG path when a Cosh-tagged "
-        "specific_problem has a client SP recommendation"
-    )
+"SP path must win over PG path when a Cosh-tagged "
+"specific_problem has a client SP recommendation"
+)
     rt = timelines_by_id[cha_id]
     assert rt["source"] == "CHA"
     assert any(p["l2_type"] == "COPPER_OXYCHLORIDE" for p in rt["practices"])
@@ -394,49 +394,49 @@ async def test_today_picks_area_wise_pg_bundle_for_area_wise_crop_e2e(db):
     client = await make_client(db)
     farmer = await make_user(db, name="Farmer")
     await make_crop_reference(
-        db, "crop:tomato", name="Tomato", measure="AREA_WISE",
-    )
+db,"crop:tomato",name="Tomato",measure="AREA_WISE",
+)
     pkg = await make_package(db, client, crop_cosh_id="crop:tomato")
     sub = await make_subscription(db, farmer=farmer, client=client, package=pkg)
     sub.crop_start_date = datetime.now(timezone.utc) - timedelta(days=10)
     await db.commit()
 
     pg_aw = PGRecommendation(
-        problem_group_cosh_id="pg:fungal_diseases", client_id=client.id,
-        area_or_plant="AREA_WISE", status="ACTIVE",
-    )
+problem_group_cosh_id="pg:fungal_diseases",client_id=client.id,
+area_or_plant="AREA_WISE",status="ACTIVE",
+)
     pg_pw = PGRecommendation(
-        problem_group_cosh_id="pg:fungal_diseases", client_id=client.id,
-        area_or_plant="PLANT_WISE", status="ACTIVE",
-    )
+problem_group_cosh_id="pg:fungal_diseases",client_id=client.id,
+area_or_plant="PLANT_WISE",status="ACTIVE",
+)
     db.add_all([pg_aw, pg_pw])
     await db.flush()
     aw_tl, _ = await _add_pg_timeline(
-        db, pg_rec_id=pg_aw.id, name="AW", l2_type="AW_FUNGICIDE",
-    )
+db,pg_rec_id=pg_aw.id,name="AW",l2_type="AW_FUNGICIDE",
+)
     pw_tl, _ = await _add_pg_timeline(
-        db, pg_rec_id=pg_pw.id, name="PW", l2_type="PW_FUNGICIDE",
-    )
+db,pg_rec_id=pg_pw.id,name="PW",l2_type="PW_FUNGICIDE",
+)
 
     pundit, _, query = await _seed_pundit_with_query(
-        db, client=client, farmer=farmer, sub=sub,
-    )
+db,client=client,farmer=farmer,sub=sub,
+)
     await db.commit()
 
     await respond_to_query(
-        query_id=query.id,
-        data={"problem_cosh_id": "pg:fungal_diseases"},
-        db=db, current_user=pundit,
-    )
+query_id=query.id,
+data={"problem_cosh_id": "pg:fungal_diseases"},
+db=db,current_user=pundit,
+)
 
     out = await get_today_advisory(db=db, current_user=farmer)
     timelines_by_id = {t["id"]: t for t in out[0]["timelines"]}
     assert f"cha-pg-{aw_tl.id}" in timelines_by_id, (
-        "Area-wise bundle must reach the area-wise crop's farmer"
-    )
+"Area-wise bundle must reach the area-wise crop's farmer"
+)
     assert f"cha-pg-{pw_tl.id}" not in timelines_by_id, (
-        "Plant-wise bundle must NOT reach an area-wise crop's farmer"
-    )
+"Plant-wise bundle must NOT reach an area-wise crop's farmer"
+)
 
 
 # ── Test 6: bundle correctness — plant-wise crop picks plant-wise bundle ────
@@ -448,40 +448,40 @@ async def test_today_picks_plant_wise_pg_bundle_for_plant_wise_crop_e2e(db):
     client = await make_client(db)
     farmer = await make_user(db, name="Farmer")
     await make_crop_reference(
-        db, "crop:apple", name="Apple", measure="PLANT_WISE",
-    )
+db,"crop:apple",name="Apple",measure="PLANT_WISE",
+)
     pkg = await make_package(db, client, crop_cosh_id="crop:apple")
     sub = await make_subscription(db, farmer=farmer, client=client, package=pkg)
     sub.crop_start_date = datetime.now(timezone.utc) - timedelta(days=10)
     await db.commit()
 
     pg_aw = PGRecommendation(
-        problem_group_cosh_id="pg:fungal_diseases", client_id=client.id,
-        area_or_plant="AREA_WISE", status="ACTIVE",
-    )
+problem_group_cosh_id="pg:fungal_diseases",client_id=client.id,
+area_or_plant="AREA_WISE",status="ACTIVE",
+)
     pg_pw = PGRecommendation(
-        problem_group_cosh_id="pg:fungal_diseases", client_id=client.id,
-        area_or_plant="PLANT_WISE", status="ACTIVE",
-    )
+problem_group_cosh_id="pg:fungal_diseases",client_id=client.id,
+area_or_plant="PLANT_WISE",status="ACTIVE",
+)
     db.add_all([pg_aw, pg_pw])
     await db.flush()
     aw_tl, _ = await _add_pg_timeline(
-        db, pg_rec_id=pg_aw.id, name="AW", l2_type="AW_FUNGICIDE",
-    )
+db,pg_rec_id=pg_aw.id,name="AW",l2_type="AW_FUNGICIDE",
+)
     pw_tl, _ = await _add_pg_timeline(
-        db, pg_rec_id=pg_pw.id, name="PW", l2_type="PW_FUNGICIDE",
-    )
+db,pg_rec_id=pg_pw.id,name="PW",l2_type="PW_FUNGICIDE",
+)
 
     pundit, _, query = await _seed_pundit_with_query(
-        db, client=client, farmer=farmer, sub=sub,
-    )
+db,client=client,farmer=farmer,sub=sub,
+)
     await db.commit()
 
     await respond_to_query(
-        query_id=query.id,
-        data={"problem_cosh_id": "pg:fungal_diseases"},
-        db=db, current_user=pundit,
-    )
+query_id=query.id,
+data={"problem_cosh_id": "pg:fungal_diseases"},
+db=db,current_user=pundit,
+)
 
     out = await get_today_advisory(db=db, current_user=farmer)
     timelines_by_id = {t["id"]: t for t in out[0]["timelines"]}
@@ -494,8 +494,8 @@ async def test_today_picks_plant_wise_pg_bundle_for_plant_wise_crop_e2e(db):
 @requires_docker
 @pytest.mark.asyncio
 async def test_cca_input_suppresses_overlapping_qa_input(db):
-    """BL-03 cross-pipe: a CCA timeline (earlier from_date, anchored at
-    crop_start) and a QA timeline (anchored at triggered_at) both
+    """BL-03 cross-pipe: a CCA timeline (earlier from_date,anchored at
+crop_start) and a QA timeline (anchored at triggered_at) both
     reference Urea via cosh:input:urea. CCA governs by from_date —
     QA's urea must be suppressed. Companion to existing
     `test_cca_governs_overlapping_cha_sp_input` but for the QA pipe."""
@@ -509,42 +509,42 @@ async def test_cca_input_suppresses_overlapping_qa_input(db):
 
     # CCA TL: DAS 0..30, from_date = today-20.
     cca_tl = await make_timeline(
-        db, pkg, name="CCA_TL",
-        from_type=TimelineFromType.DAS, from_value=0, to_value=30,
-    )
+db,pkg,name="CCA_TL",
+from_type=TimelineFromType.DAS,from_value=0,to_value=30,
+)
     cca_p = await make_practice(
-        db, cca_tl, l0=PracticeL0.INPUT, l1="FERTILIZER", l2="UREA",
-    )
+db,cca_tl,l0=PracticeL0.INPUT,l1="FERTILIZER",l2="UREA",
+)
     await make_element(
-        db, cca_p, element_type="common_name", value=None,
-        unit_cosh_id=None, cosh_ref=COMMON_NAME_UREA,
-    )
+db,cca_p,element_type="common_name",value=None,
+unit_cosh_id=None,cosh_ref=COMMON_NAME_UREA,
+)
 
     # QA TL: PG-table row with standard_response_id; triggered 2 days ago,
     # window 0..14 → from_date = today-2. Active and overlapping.
     sr = await create_standard_response(
-        client_id=client.id,
-        data={"question_text": "Should I apply nitrogen?"},
-        db=db, current_user=se,
-    )
+client_id=client.id,
+data={"question_text": "Should I apply nitrogen?"},
+db=db,current_user=se,
+)
     qa_tl, qa_p = await _add_qa_timeline_to_sr(
-        db, sr_id=sr["id"], name="QA-N",
-        l1_type="FERTILIZER", l2_type="UREA",
-        common_name_cosh=COMMON_NAME_UREA,
-    )
+db,sr_id=sr["id"],name="QA-N",
+l1_type="FERTILIZER",l2_type="UREA",
+common_name_cosh=COMMON_NAME_UREA,
+)
     triggered_at_dt = datetime.now(timezone.utc) - timedelta(days=2)
     db.add(TriggeredCHAEntry(
-        subscription_id=sub.id,
-        farmer_user_id=farmer.id,
-        client_id=client.id,
-        problem_cosh_id=None,
-        recommendation_type="QA",
-        recommendation_id=sr["id"],
-        triggered_by="QUERY",
-        triggered_at=triggered_at_dt,
-        status="ACTIVE",
-        problem_name="Should I apply nitrogen?",
-    ))
+subscription_id=sub.id,
+farmer_user_id=farmer.id,
+client_id=client.id,
+problem_cosh_id=None,
+recommendation_type="QA",
+recommendation_id=sr["id"],
+triggered_by="QUERY",
+triggered_at=triggered_at_dt,
+status="ACTIVE",
+problem_name="Should I apply nitrogen?",
+))
     await db.commit()
 
     out = await get_today_advisory(db=db, current_user=farmer)
@@ -557,10 +557,10 @@ async def test_cca_input_suppresses_overlapping_qa_input(db):
     rt_qa = timelines_by_id[qa_id]
 
     assert any(p["l2_type"] == "UREA" for p in rt_cca["practices"]), (
-        "CCA owns Urea (earlier from_date)"
+"CCA owns Urea (earlier from_date)"
     )
     assert not any(p["l2_type"] == "UREA" for p in rt_qa["practices"]), (
-        "QA's Urea must be suppressed by the earlier-from_date CCA — "
-        "BL-03 dedup is pipe-agnostic"
-    )
+"QA's Urea must be suppressed by the earlier-from_date CCA — "
+"BL-03 dedup is pipe-agnostic"
+)
     assert rt_qa["suppressed_count"] == 1

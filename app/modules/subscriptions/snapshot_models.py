@@ -31,8 +31,10 @@ class LockedTimelineSnapshot(Base):
         ForeignKey("subscriptions.id", ondelete="CASCADE"),
         nullable=False,
     )
-    # timeline_id is intentionally NOT a FK — it can reference timelines (CCA),
-    # pg_timelines, or sp_timelines. The `source` column disambiguates.
+    # timeline_id references the unified `timelines` table (Batch 39O
+    # UCAT unification, 2026-05-16); `source` records which pipe
+    # (CCA / PG / SP / QA) produced the snapshot for downstream
+    # renderers, even though all rows share the same physical table.
     timeline_id: Mapped[str] = mapped_column(String(36), nullable=False)
     source: Mapped[str] = mapped_column(String(10), nullable=False, default="CCA")
     content: Mapped[dict] = mapped_column(JSONB, nullable=False)

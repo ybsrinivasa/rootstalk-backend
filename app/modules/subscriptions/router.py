@@ -20,8 +20,7 @@ from app.modules.advisory.models import (
     ConditionalQuestion, PracticeConditional,
 )
 from app.modules.clients.models import Client
-from app.modules.advisory.models import PGRecommendation, PGTimeline, PGPractice, PGElement
-from app.modules.advisory.models import SPRecommendation, SPTimeline, SPPractice, SPElement
+from app.modules.advisory.models import PGRecommendation, SPRecommendation, Timeline
 from app.modules.platform.models import UserRole, RoleType
 from app.modules.orders.models import DealerProfile
 from app.modules.clients.models import Client, ClientLocation, ClientStatus
@@ -854,7 +853,7 @@ async def set_start_date(
         triggered_d = cha.triggered_at.date() if hasattr(cha.triggered_at, 'date') else cha.triggered_at
         if cha.recommendation_type == "SP":
             sp_timelines = (await db.execute(
-                select(SPTimeline).where(SPTimeline.sp_recommendation_id == cha.recommendation_id)
+                select(Timeline).where(Timeline.sp_recommendation_id == cha.recommendation_id)
             )).scalars().all()
             for sp_tl in sp_timelines:
                 from_d = triggered_d + timedelta(days=sp_tl.from_value)
@@ -864,7 +863,7 @@ async def set_start_date(
                 ))
         elif cha.recommendation_type == "PG":
             pg_timelines = (await db.execute(
-                select(PGTimeline).where(PGTimeline.pg_recommendation_id == cha.recommendation_id)
+                select(Timeline).where(Timeline.pg_recommendation_id == cha.recommendation_id)
             )).scalars().all()
             for pg_tl in pg_timelines:
                 from_d = triggered_d + timedelta(days=pg_tl.from_value)
@@ -878,7 +877,7 @@ async def set_start_date(
             # behaviour mirror PG/SP — they're CHA-flavoured for
             # date-shift purposes (don't move on crop_start change).
             qa_timelines = (await db.execute(
-                select(PGTimeline).where(PGTimeline.standard_response_id == cha.recommendation_id)
+                select(Timeline).where(Timeline.standard_response_id == cha.recommendation_id)
             )).scalars().all()
             for qa_tl in qa_timelines:
                 from_d = triggered_d + timedelta(days=qa_tl.from_value)
@@ -1934,7 +1933,7 @@ async def get_today_advisory(
         for cha in cha_entries:
             if cha.recommendation_type == "SP":
                 sp_timelines = (await db.execute(
-                    select(SPTimeline).where(SPTimeline.sp_recommendation_id == cha.recommendation_id)
+                    select(Timeline).where(Timeline.sp_recommendation_id == cha.recommendation_id)
                 )).scalars().all()
                 for sp_tl in sp_timelines:
                     # CHA window check uses snapshot's frozen offsets if a
@@ -1970,7 +1969,7 @@ async def get_today_advisory(
                     tl_date_map[cha_tl_id] = (from_d, to_d, 0)
             elif cha.recommendation_type == "PG":
                 pg_timelines = (await db.execute(
-                    select(PGTimeline).where(PGTimeline.pg_recommendation_id == cha.recommendation_id)
+                    select(Timeline).where(Timeline.pg_recommendation_id == cha.recommendation_id)
                 )).scalars().all()
                 for pg_tl in pg_timelines:
                     pg_snap = (await db.execute(
@@ -2010,7 +2009,7 @@ async def get_today_advisory(
                 # _trigger_qa_for_query). source="QA" so the PWA
                 # can render the Pundit-origin icon.
                 qa_timelines = (await db.execute(
-                    select(PGTimeline).where(PGTimeline.standard_response_id == cha.recommendation_id)
+                    select(Timeline).where(Timeline.standard_response_id == cha.recommendation_id)
                 )).scalars().all()
                 for qa_tl in qa_timelines:
                     qa_snap = (await db.execute(

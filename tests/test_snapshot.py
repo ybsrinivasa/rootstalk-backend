@@ -17,11 +17,11 @@ from __future__ import annotations
 import pytest
 
 from app.services.snapshot import (
-    VALID_LOCK_TRIGGERS,
-    VALID_SOURCES,
-    SCHEMA_VERSION,
-    deserialise_timeline,
-    take_snapshot,
+VALID_LOCK_TRIGGERS,
+VALID_SOURCES,
+SCHEMA_VERSION,
+deserialise_timeline,
+take_snapshot,
 )
 
 
@@ -202,8 +202,8 @@ async def test_take_snapshot_rejects_invalid_source():
     sess = _NullSession()
     with pytest.raises(ValueError, match="source"):
         await take_snapshot(
-            sess, "sub_1", "tl_1", "PURCHASE_ORDER", source="BOGUS"  # type: ignore[arg-type]
-        )
+sess,"sub_1","tl_1","PURCHASE_ORDER",source="BOGUS"  # type: ignore[arg-type]
+)
 
 
 def test_valid_lock_triggers_constant():
@@ -220,18 +220,18 @@ def test_valid_sources_constant():
 # Use the Postgres testcontainer fixture from tests/conftest.py.
 
 from app.services.snapshot import (
-    get_snapshot, has_snapshot, serialise_timeline, serialise_cha_timeline,
+get_snapshot,has_snapshot,serialise_timeline,serialise_cha_timeline,
 )
 from tests.conftest import requires_docker
 from tests.factories import (
-    make_client, make_conditional_question, make_element, make_package,
-    make_pg_element, make_pg_practice, make_pg_recommendation, make_pg_timeline,
-    make_practice, make_practice_conditional, make_relation, make_sp_element,
-    make_sp_practice, make_sp_recommendation, make_sp_timeline,
-    make_subscription, make_timeline, make_user,
+make_client,make_conditional_question,make_element,make_package,
+make_pg_element,make_pg_practice,make_pg_recommendation,make_pg_timeline,
+make_practice,make_practice_conditional,make_relation,make_sp_element,
+make_sp_practice,make_sp_recommendation,make_sp_timeline,
+make_subscription,make_timeline,make_user,
 )
 from app.modules.advisory.models import (
-    ConditionalAnswer, PracticeL0, RelationType, TimelineFromType,
+ConditionalAnswer,PracticeL0,RelationType,TimelineFromType,
 )
 
 
@@ -252,19 +252,19 @@ async def test_serialise_round_trip(db):
     """
     _sub, package = await _seed_subscription(db)
     tl = await make_timeline(
-        db, package, from_type=TimelineFromType.DAS, from_value=0, to_value=30,
-    )
+db,package,from_type=TimelineFromType.DAS,from_value=0,to_value=30,
+)
     relation = await make_relation(db, tl, relation_type=RelationType.AND)
     p1 = await make_practice(
-        db, tl, l0=PracticeL0.INPUT, l1="FERTILIZER", l2="UREA",
-        display_order=0, relation=relation, relation_role="PART_1__OPT_1__POS_1",
-    )
+db,tl,l0=PracticeL0.INPUT,l1="FERTILIZER",l2="UREA",
+display_order=0,relation=relation,relation_role="PART_1__OPT_1__POS_1",
+)
     p2 = await make_practice(
-        db, tl, l0=PracticeL0.NON_INPUT, l1="IRRIGATION", l2=None,
-        display_order=1, frequency_days=7,
-    )
-    await make_element(db, p1, element_type="DOSAGE", value="50",
-                       unit_cosh_id="kg_per_acre")
+db,tl,l0=PracticeL0.NON_INPUT,l1="IRRIGATION",l2=None,
+display_order=1,frequency_days=7,
+)
+    await make_element(db,p1,element_type="DOSAGE",value="50",
+unit_cosh_id="kg_per_acre")
     q = await make_conditional_question(db, tl, text="Rain expected?")
     await make_practice_conditional(db, p1, q, answer=ConditionalAnswer.NO)
 
@@ -316,8 +316,8 @@ async def test_take_snapshot_stores_content(db):
     assert await has_snapshot(db, sub.id, tl.id, "CCA") is False
 
     snap = await take_snapshot(
-        db, sub.id, tl.id, lock_trigger="PURCHASE_ORDER", source="CCA",
-    )
+db,sub.id,tl.id,lock_trigger="PURCHASE_ORDER",source="CCA",
+)
     assert snap.subscription_id == sub.id
     assert snap.timeline_id == tl.id
     assert snap.source == "CCA"
@@ -382,7 +382,7 @@ async def test_get_missing_snapshot_returns_none(db):
 @requires_docker
 @pytest.mark.asyncio
 async def test_cha_serialise_pg_timeline(db):
-    """serialise_cha_timeline for a PGTimeline returns source='PG' and includes
+    """serialise_cha_timeline for a Timeline returns source='PG' and includes
     its practices + elements."""
     pg_rec = await make_pg_recommendation(db)
     pg_tl = await make_pg_timeline(db, pg_rec, from_value=0, to_value=14)
@@ -406,7 +406,7 @@ async def test_cha_serialise_pg_timeline(db):
 @requires_docker
 @pytest.mark.asyncio
 async def test_cha_serialise_sp_timeline(db):
-    """serialise_cha_timeline for an SPTimeline returns source='SP'."""
+    """serialise_cha_timeline for an Timeline returns source='SP'."""
     client = await make_client(db)
     sp_rec = await make_sp_recommendation(db, client)
     sp_tl = await make_sp_timeline(db, sp_rec, from_value=2, to_value=10)

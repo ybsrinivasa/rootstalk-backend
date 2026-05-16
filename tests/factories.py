@@ -16,11 +16,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.advisory.models import (
-    ConditionalAnswer, ConditionalQuestion, Element, PGElement, PGPractice,
-    PGRecommendation, PGTimeline, Package, PackageAuthor, PackageLocation,
+    ConditionalAnswer, ConditionalQuestion, Element,
+    PGRecommendation, Package, PackageAuthor, PackageLocation,
     PackageStatus, PackageType, PackageVariable, Parameter, ParameterSource,
     Practice, PracticeConditional, PracticeL0, Relation, RelationType,
-    SPElement, SPPractice, SPRecommendation, SPTimeline, Timeline,
+    SPRecommendation, Timeline,
     TimelineFromType, Variable,
 )
 from app.modules.clients.models import (
@@ -527,21 +527,28 @@ async def make_pg_recommendation(db: AsyncSession, **kw) -> PGRecommendation:
     return pg
 
 
+# Batch 39O (2026-05-16): PG/SP timelines + practices + elements live
+# in the shared `Timeline` / `Practice` / `Element` tables, polymorphic
+# on which parent FK is set. The factories below set `pg_recommendation_id`
+# or `sp_recommendation_id` on Timeline and let Practice/Element flow
+# through the same builders CCA uses.
+
 async def make_pg_timeline(
     db: AsyncSession, pg_rec: PGRecommendation, *,
     name: str = "PG-TL", from_value: int = 0, to_value: int = 7,
-) -> PGTimeline:
-    t = PGTimeline(
+    from_type: str = "DAYS_AFTER_DETECTION",
+) -> Timeline:
+    t = Timeline(
         pg_recommendation_id=pg_rec.id, name=_short(name + "_"),
-        from_value=from_value, to_value=to_value,
+        from_type=from_type, from_value=from_value, to_value=to_value,
     )
     db.add(t)
     await db.flush()
     return t
 
 
-async def make_pg_practice(db: AsyncSession, tl: PGTimeline, **kw) -> PGPractice:
-    p = PGPractice(
+async def make_pg_practice(db: AsyncSession, tl: Timeline, **kw) -> Practice:
+    p = Practice(
         timeline_id=tl.id, l0_type=kw.get("l0_type", "INPUT"),
         l1_type=kw.get("l1_type", "PESTICIDE"),
         display_order=kw.get("display_order", 0),
@@ -551,8 +558,8 @@ async def make_pg_practice(db: AsyncSession, tl: PGTimeline, **kw) -> PGPractice
     return p
 
 
-async def make_pg_element(db: AsyncSession, prac: PGPractice, **kw) -> PGElement:
-    e = PGElement(
+async def make_pg_element(db: AsyncSession, prac: Practice, **kw) -> Element:
+    e = Element(
         practice_id=prac.id, element_type=kw.get("element_type", "DOSAGE"),
         value=kw.get("value", "1"),
         cosh_ref=kw.get("cosh_ref"),
@@ -578,18 +585,19 @@ async def make_sp_recommendation(
 async def make_sp_timeline(
     db: AsyncSession, sp_rec: SPRecommendation, *,
     name: str = "SP-TL", from_value: int = 0, to_value: int = 7,
-) -> SPTimeline:
-    t = SPTimeline(
+    from_type: str = "DAYS_AFTER_DETECTION",
+) -> Timeline:
+    t = Timeline(
         sp_recommendation_id=sp_rec.id, name=_short(name + "_"),
-        from_value=from_value, to_value=to_value,
+        from_type=from_type, from_value=from_value, to_value=to_value,
     )
     db.add(t)
     await db.flush()
     return t
 
 
-async def make_sp_practice(db: AsyncSession, tl: SPTimeline, **kw) -> SPPractice:
-    p = SPPractice(
+async def make_sp_practice(db: AsyncSession, tl: Timeline, **kw) -> Practice:
+    p = Practice(
         timeline_id=tl.id, l0_type=kw.get("l0_type", "INPUT"),
         l1_type=kw.get("l1_type", "PESTICIDE"),
         display_order=kw.get("display_order", 0),
@@ -599,8 +607,8 @@ async def make_sp_practice(db: AsyncSession, tl: SPTimeline, **kw) -> SPPractice
     return p
 
 
-async def make_sp_element(db: AsyncSession, prac: SPPractice, **kw) -> SPElement:
-    e = SPElement(
+async def make_sp_element(db: AsyncSession, prac: Practice, **kw) -> Element:
+    e = Element(
         practice_id=prac.id, element_type=kw.get("element_type", "DOSAGE"),
         value=kw.get("value", "1"),
         cosh_ref=kw.get("cosh_ref"),

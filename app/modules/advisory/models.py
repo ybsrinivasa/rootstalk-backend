@@ -63,6 +63,14 @@ class TimelineFromType(str, enum.Enum):
     DBS = "DBS"
     DAS = "DAS"
     CALENDAR = "CALENDAR"
+    # Batch 39O (UCAT unification, 2026-05-16): CHA / Q&A pipes plug
+    # into the same Timeline table and need their own anchor units.
+    # `DAYS_AFTER_DETECTION` is the CHA-PG / CHA-SP trigger; the
+    # farmer spots the problem and Day-1 starts then. `DAYS_AFTER_
+    # RESPONSE` is the Q&A trigger; Day-1 is when the FarmPundit
+    # delivered the standard response.
+    DAYS_AFTER_DETECTION = "DAYS_AFTER_DETECTION"
+    DAYS_AFTER_RESPONSE = "DAYS_AFTER_RESPONSE"
 
 
 class TimelineStatus(str, enum.Enum):
@@ -286,12 +294,55 @@ class PackageVariable(Base):
 # ── Timelines, Practices, Elements ────────────────────────────────────────────
 
 class Timeline(Base):
+    """UCAT-shared Timeline (Batch 39O, 2026-05-16).
+
+    Polymorphic across the four advisory pipes:
+      • CCA Package — `package_id` set, other 3 FKs NULL
+      • CHA Problem-Group — `pg_recommendation_id` set, other 3 NULL
+      • CHA Specific-Problem — `sp_recommendation_id` set, other 3 NULL
+      • Q&A Standard Response — `standard_response_id` set, other 3 NULL
+
+    The CHECK constraint `timelines_one_parent_chk` enforces exactly
+    one parent per row. Practices / Elements / Relations / Conditional
+    Questions hang off `timeline_id` and are pipe-agnostic — every
+    authoring feature (Brand Lock, frequency, common_name, relations,
+    CQs) lights up uniformly across pipes.
+
+    Before unification each pipe had its own timeline+practice+element
+    tables (CCA: `timelines`; PG+QA: `pg_timelines`; SP: `sp_timelines`).
+    The old tables were dropped in the same migration and their content
+    wiped per user 2026-05-16 (pre-launch testing data).
+    """
     __tablename__ = "timelines"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
-    package_id: Mapped[str] = mapped_column(String(36), ForeignKey("packages.id"), nullable=False)
+    # Exactly one of the four parent FKs is set per row.
+    package_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("packages.id"), nullable=True,
+    )
+    pg_recommendation_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("pg_recommendations.id"), nullable=True,
+    )
+    sp_recommendation_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("sp_recommendations.id"), nullable=True,
+    )
+    standard_response_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("standard_responses.id"), nullable=True,
+    )
     name: Mapped[str] = mapped_column(String(500), nullable=False)
-    from_type: Mapped[TimelineFromType] = mapped_column(SAEnum(TimelineFromType), nullable=False)
+    # `from_type` is stored as VARCHAR(30) (we dropped the postgres
+    # enum in the Batch 39O migration so CHA/QA anchor units coexist
+    # with CCA's DAS/DBS/CALENDAR), but Python-side it's still a
+    # `TimelineFromType` enum so the dozens of call sites doing
+    # `tl.from_type.value` / `tl.from_type == "DAS"` keep working.
+    # Default matches the legacy `pg_timelines / sp_timelines` shape
+    # so PG/SP/QA callers that omit `from_type` land with the right
+    # anchor; CCA callers always pass an explicit DAS / DBS / CALENDAR.
+    from_type: Mapped[TimelineFromType] = mapped_column(
+        SAEnum(TimelineFromType, native_enum=False, length=30,
+               values_callable=lambda e: [m.value for m in e]),
+        nullable=False, default=TimelineFromType.DAYS_AFTER_DETECTION,
+    )
     from_value: Mapped[int] = mapped_column(Integer, nullable=False)
     to_value: Mapped[int] = mapped_column(Integer, nullable=False)
     display_order: Mapped[int] = mapped_column(Integer, default=0)
@@ -304,11 +355,59 @@ class Timeline(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     package: Mapped["Package"] = relationship("Package", back_populates="timelines")
+    pg_recommendation: Mapped["PGRecommendation"] = relationship(
+        "PGRecommendation", back_populates="timelines",
+    )
+    sp_recommendation: Mapped["SPRecommendation"] = relationship(
+        "SPRecommendation", back_populates="timelines",
+    )
+    standard_response: Mapped["StandardResponse"] = relationship(
+        "StandardResponse", back_populates="timelines",
+    )
     practices: Mapped[list["Practice"]] = relationship("Practice", back_populates="timeline")
     relations: Mapped[list["Relation"]] = relationship("Relation", back_populates="timeline")
     conditional_questions: Mapped[list["ConditionalQuestion"]] = relationship("ConditionalQuestion", back_populates="timeline")
 
-    __table_args__ = (UniqueConstraint("package_id", "name"),)
+    __table_args__ = (
+        CheckConstraint(
+            "(CASE WHEN package_id IS NOT NULL THEN 1 ELSE 0 END) + "
+            "(CASE WHEN pg_recommendation_id IS NOT NULL THEN 1 ELSE 0 END) + "
+            "(CASE WHEN sp_recommendation_id IS NOT NULL THEN 1 ELSE 0 END) + "
+            "(CASE WHEN standard_response_id IS NOT NULL THEN 1 ELSE 0 END) = 1",
+            name="timelines_one_parent_chk",
+        ),
+        Index(
+            "uq_timelines_package_name", "package_id", "name",
+            unique=True, postgresql_where="package_id IS NOT NULL",
+        ),
+        Index(
+            "uq_timelines_pg_rec_name", "pg_recommendation_id", "name",
+            unique=True, postgresql_where="pg_recommendation_id IS NOT NULL",
+        ),
+        Index(
+            "uq_timelines_sp_rec_name", "sp_recommendation_id", "name",
+            unique=True, postgresql_where="sp_recommendation_id IS NOT NULL",
+        ),
+        Index(
+            "uq_timelines_sr_name", "standard_response_id", "name",
+            unique=True, postgresql_where="standard_response_id IS NOT NULL",
+        ),
+    )
+
+    @property
+    def parent_kind(self) -> str:
+        """'CCA' / 'PG' / 'SP' / 'QA' — derived from which parent FK is
+        set. Useful for the unified advisory-render service that walks
+        timelines across pipes."""
+        if self.package_id is not None:
+            return "CCA"
+        if self.pg_recommendation_id is not None:
+            return "PG"
+        if self.sp_recommendation_id is not None:
+            return "SP"
+        if self.standard_response_id is not None:
+            return "QA"
+        return "UNKNOWN"
 
 
 class Practice(Base):
@@ -453,91 +552,12 @@ class PGRecommendation(Base):
     version: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
-    timelines: Mapped[list["PGTimeline"]] = relationship("PGTimeline", back_populates="pg_recommendation")
-
-
-class PGTimeline(Base):
-    """Timeline rooted at a CHA Problem-Group recommendation OR a
-    Q&A standard response (UCAT pipe-3, spec §14.9). The table name
-    is historical — table hosts both PG-rooted and QA-rooted
-    timelines as of 2026-05-09. Cosmetic rename to `advisory_
-    timelines` deferred to V1.1.
-
-    Exactly one of `pg_recommendation_id` / `standard_response_id`
-    is set per row, enforced by the DB-level CHECK
-    `pg_timelines_one_parent_chk`. `parent_kind` is a Python-side
-    convenience for read code; no schema column.
-    """
-    __tablename__ = "pg_timelines"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
-    pg_recommendation_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("pg_recommendations.id"), nullable=True,
+    # Timelines under this PG live in the shared `timelines` table
+    # (Batch 39O UCAT unification, 2026-05-16).
+    timelines: Mapped[list["Timeline"]] = relationship(
+        "Timeline", back_populates="pg_recommendation",
+        foreign_keys="Timeline.pg_recommendation_id",
     )
-    standard_response_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("standard_responses.id"), nullable=True,
-    )
-    name: Mapped[str] = mapped_column(String(500), nullable=False)
-    from_type: Mapped[str] = mapped_column(String(30), default="DAYS_AFTER_DETECTION")
-    from_value: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    to_value: Mapped[int] = mapped_column(Integer, nullable=False)
-
-    pg_recommendation: Mapped["PGRecommendation"] = relationship(
-        "PGRecommendation", back_populates="timelines",
-    )
-    practices: Mapped[list["PGPractice"]] = relationship("PGPractice", back_populates="timeline")
-
-    __table_args__ = (
-        # Mirror the migration's CHECK so create_all-based test
-        # DBs enforce the same invariant. Postgres-only syntax
-        # (CASE-based count) — fine, the project is Postgres-only.
-        CheckConstraint(
-            "(CASE WHEN pg_recommendation_id IS NOT NULL THEN 1 ELSE 0 END) "
-            "+ (CASE WHEN standard_response_id IS NOT NULL THEN 1 ELSE 0 END) = 1",
-            name="pg_timelines_one_parent_chk",
-        ),
-    )
-
-    @property
-    def parent_kind(self) -> str:
-        """'PG' if rooted at a PG recommendation, 'QA' if rooted at a
-        Standard Response. Read-only derivation — no schema column.
-        Useful for the unified advisory-render service that walks
-        timelines across UCAT pipes."""
-        if self.standard_response_id is not None:
-            return "QA"
-        return "PG"
-
-
-class PGPractice(Base):
-    __tablename__ = "pg_practices"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
-    timeline_id: Mapped[str] = mapped_column(String(36), ForeignKey("pg_timelines.id"), nullable=False)
-    l0_type: Mapped[str] = mapped_column(String(20), nullable=False)
-    l1_type: Mapped[str] = mapped_column(String(100), nullable=True)
-    l2_type: Mapped[str] = mapped_column(String(100), nullable=True)
-    display_order: Mapped[int] = mapped_column(Integer, default=0)
-    is_special_input: Mapped[bool] = mapped_column(Boolean, default=False)
-    frequency_days: Mapped[int] = mapped_column(Integer, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-
-    timeline: Mapped["PGTimeline"] = relationship("PGTimeline", back_populates="practices")
-    elements: Mapped[list["PGElement"]] = relationship("PGElement", back_populates="practice")
-
-
-class PGElement(Base):
-    __tablename__ = "pg_elements"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
-    practice_id: Mapped[str] = mapped_column(String(36), ForeignKey("pg_practices.id"), nullable=False)
-    element_type: Mapped[str] = mapped_column(String(100), nullable=False)
-    cosh_ref: Mapped[str] = mapped_column(String(200), nullable=True)
-    value: Mapped[str] = mapped_column(Text, nullable=True)
-    unit_cosh_id: Mapped[str] = mapped_column(String(100), nullable=True)
-    display_order: Mapped[int] = mapped_column(Integer, default=0)
-
-    practice: Mapped["PGPractice"] = relationship("PGPractice", back_populates="elements")
 
 
 class SPRecommendation(Base):
@@ -559,49 +579,7 @@ class SPRecommendation(Base):
     version: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
-    timelines: Mapped[list["SPTimeline"]] = relationship("SPTimeline", back_populates="sp_recommendation")
-
-
-class SPTimeline(Base):
-    __tablename__ = "sp_timelines"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
-    sp_recommendation_id: Mapped[str] = mapped_column(String(36), ForeignKey("sp_recommendations.id"), nullable=False)
-    name: Mapped[str] = mapped_column(String(500), nullable=False)
-    from_type: Mapped[str] = mapped_column(String(30), default="DAYS_AFTER_DETECTION")
-    from_value: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    to_value: Mapped[int] = mapped_column(Integer, nullable=False)
-
-    sp_recommendation: Mapped["SPRecommendation"] = relationship("SPRecommendation", back_populates="timelines")
-    practices: Mapped[list["SPPractice"]] = relationship("SPPractice", back_populates="timeline")
-
-
-class SPPractice(Base):
-    __tablename__ = "sp_practices"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
-    timeline_id: Mapped[str] = mapped_column(String(36), ForeignKey("sp_timelines.id"), nullable=False)
-    l0_type: Mapped[str] = mapped_column(String(20), nullable=False)
-    l1_type: Mapped[str] = mapped_column(String(100), nullable=True)
-    l2_type: Mapped[str] = mapped_column(String(100), nullable=True)
-    display_order: Mapped[int] = mapped_column(Integer, default=0)
-    is_special_input: Mapped[bool] = mapped_column(Boolean, default=False)
-    frequency_days: Mapped[int] = mapped_column(Integer, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-
-    timeline: Mapped["SPTimeline"] = relationship("SPTimeline", back_populates="practices")
-    elements: Mapped[list["SPElement"]] = relationship("SPElement", back_populates="practice")
-
-
-class SPElement(Base):
-    __tablename__ = "sp_elements"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
-    practice_id: Mapped[str] = mapped_column(String(36), ForeignKey("sp_practices.id"), nullable=False)
-    element_type: Mapped[str] = mapped_column(String(100), nullable=False)
-    cosh_ref: Mapped[str] = mapped_column(String(200), nullable=True)
-    value: Mapped[str] = mapped_column(Text, nullable=True)
-    unit_cosh_id: Mapped[str] = mapped_column(String(100), nullable=True)
-    display_order: Mapped[int] = mapped_column(Integer, default=0)
-
-    practice: Mapped["SPPractice"] = relationship("SPPractice", back_populates="elements")
+    timelines: Mapped[list["Timeline"]] = relationship(
+        "Timeline", back_populates="sp_recommendation",
+        foreign_keys="Timeline.sp_recommendation_id",
+    )

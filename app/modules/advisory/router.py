@@ -31,8 +31,7 @@ from app.modules.advisory.schemas import (
     ElementIn,
 )
 from app.modules.advisory.models import (
-    PGRecommendation, PGTimeline, PGPractice, PGElement,
-    SPRecommendation, SPTimeline, SPPractice, SPElement,
+    PGRecommendation, SPRecommendation,
 )
 from app.modules.clients.models import ClientCrop, ClientLocation, ClientUser, ClientUserRole
 from app.modules.sync.models import CoshCoreItem
@@ -273,7 +272,7 @@ async def _assert_interval_fits_timeline(
 # ── Element-level CRUD helpers (Round 2 — element-level authoring) ─────────
 
 def _element_row_to_in(row) -> ElementIn:
-    """Coerce a persisted Element / PGElement / SPElement row back into
+    """Coerce a persisted Element / Element / Element row back into
     the ElementIn shape the L2 validator consumes. Used when we need to
     re-validate a Practice's full element set after a per-element edit."""
     return ElementIn(
@@ -5238,7 +5237,7 @@ async def add_global_pg_timeline(
     )).scalar_one_or_none()
     if not pg:
         raise HTTPException(status_code=404, detail="PG recommendation not found")
-    tl = PGTimeline(
+    tl = Timeline(
         pg_recommendation_id=pg_id,
         name=request.name,
         from_type=request.from_type,
@@ -5272,7 +5271,7 @@ async def add_global_pg_practice(
     except L2ElementValidationError as e:
         _raise_l2_element_validation(e)
 
-    practice = PGPractice(
+    practice = Practice(
         timeline_id=tl_id,
         l0_type=request.l0_type,
         l1_type=request.l1_type,
@@ -5284,7 +5283,7 @@ async def add_global_pg_practice(
     db.add(practice)
     await db.flush()
     for el in request.elements:
-        db.add(PGElement(
+        db.add(Element(
             practice_id=practice.id,
             element_type=el.element_type,
             cosh_ref=el.cosh_ref,
@@ -5301,9 +5300,9 @@ async def add_global_pg_practice(
 
 async def _load_pg_practice_by_timeline(db, *, timeline_id: str, practice_id: str):
     practice = (await db.execute(
-        select(PGPractice).where(
-            PGPractice.id == practice_id,
-            PGPractice.timeline_id == timeline_id,
+        select(Practice).where(
+            Practice.id == practice_id,
+            Practice.timeline_id == timeline_id,
         )
     )).scalar_one_or_none()
     if not practice:
@@ -5323,7 +5322,7 @@ async def add_global_pg_element(
 ):
     practice = await _load_pg_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
     new = await _add_practice_element(
-        db, practice=practice, element_model=PGElement, body=body,
+        db, practice=practice, element_model=Element, body=body,
     )
     return _element_row_to_out(new)
 
@@ -5339,7 +5338,7 @@ async def update_global_pg_element(
 ):
     practice = await _load_pg_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
     updated = await _update_practice_element(
-        db, practice=practice, element_model=PGElement,
+        db, practice=practice, element_model=Element,
         element_id=element_id, body=body,
     )
     return _element_row_to_out(updated)
@@ -5356,7 +5355,7 @@ async def delete_global_pg_element(
 ):
     practice = await _load_pg_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
     await _delete_practice_element(
-        db, practice=practice, element_model=PGElement, element_id=element_id,
+        db, practice=practice, element_model=Element, element_id=element_id,
     )
 
 
@@ -5368,7 +5367,7 @@ async def delete_global_pg_timeline(
     current_user: User = Depends(get_current_user),
 ):
     tl = (await db.execute(
-        select(PGTimeline).where(PGTimeline.id == tl_id, PGTimeline.pg_recommendation_id == pg_id)
+        select(Timeline).where(Timeline.id == tl_id, Timeline.pg_recommendation_id == pg_id)
     )).scalar_one_or_none()
     if tl:
         await db.delete(tl)
@@ -5537,10 +5536,10 @@ async def _copy_pg_content_into(
     content first if overwriting. Used by both Global → Local PG import
     and any future PG content moves."""
     tl_result = await db.execute(
-        select(PGTimeline).where(PGTimeline.pg_recommendation_id == src_pg.id)
+        select(Timeline).where(Timeline.pg_recommendation_id == src_pg.id)
     )
     for src_tl in tl_result.scalars().all():
-        new_tl = PGTimeline(
+        new_tl = Timeline(
             pg_recommendation_id=target_pg.id,
             name=src_tl.name,
             from_type=src_tl.from_type,
@@ -5551,10 +5550,10 @@ async def _copy_pg_content_into(
         await db.flush()
 
         p_result = await db.execute(
-            select(PGPractice).where(PGPractice.timeline_id == src_tl.id)
+            select(Practice).where(Practice.timeline_id == src_tl.id)
         )
         for src_p in p_result.scalars().all():
-            new_p = PGPractice(
+            new_p = Practice(
                 timeline_id=new_tl.id,
                 l0_type=src_p.l0_type,
                 l1_type=src_p.l1_type,
@@ -5567,10 +5566,10 @@ async def _copy_pg_content_into(
             await db.flush()
 
             el_result = await db.execute(
-                select(PGElement).where(PGElement.practice_id == src_p.id)
+                select(Element).where(Element.practice_id == src_p.id)
             )
             for src_el in el_result.scalars().all():
-                db.add(PGElement(
+                db.add(Element(
                     practice_id=new_p.id,
                     element_type=src_el.element_type,
                     cosh_ref=src_el.cosh_ref,
@@ -5581,22 +5580,22 @@ async def _copy_pg_content_into(
 
 
 async def _wipe_pg_content(db: AsyncSession, pg_id: str) -> dict:
-    """Delete every PGTimeline / PGPractice / PGElement under a PG.
+    """Delete every Timeline / Practice / Element under a PG.
     Returns counts so the caller can report what was overwritten."""
     timelines = (await db.execute(
-        select(PGTimeline).where(PGTimeline.pg_recommendation_id == pg_id)
+        select(Timeline).where(Timeline.pg_recommendation_id == pg_id)
     )).scalars().all()
     tl_count = len(timelines)
     practice_count = 0
     element_count = 0
     for tl in timelines:
         practices = (await db.execute(
-            select(PGPractice).where(PGPractice.timeline_id == tl.id)
+            select(Practice).where(Practice.timeline_id == tl.id)
         )).scalars().all()
         practice_count += len(practices)
         for p in practices:
             elements = (await db.execute(
-                select(PGElement).where(PGElement.practice_id == p.id)
+                select(Element).where(Element.practice_id == p.id)
             )).scalars().all()
             element_count += len(elements)
             for el in elements:
@@ -5673,8 +5672,8 @@ async def import_global_pg(
         # Tally what would be overwritten so the CA portal can show
         # a meaningful confirmation dialog.
         tl_count = (await db.execute(
-            select(func.count()).select_from(PGTimeline).where(
-                PGTimeline.pg_recommendation_id == existing.id,
+            select(func.count()).select_from(Timeline).where(
+                Timeline.pg_recommendation_id == existing.id,
             )
         )).scalar() or 0
         raise HTTPException(
@@ -5732,8 +5731,8 @@ async def _check_pg_publish_readiness(
         })
 
     tl_count = (await db.execute(
-        select(func.count()).select_from(PGTimeline).where(
-            PGTimeline.pg_recommendation_id == pg.id,
+        select(func.count()).select_from(Timeline).where(
+            Timeline.pg_recommendation_id == pg.id,
         )
     )).scalar() or 0
     if tl_count == 0:
@@ -5850,12 +5849,12 @@ async def list_client_pg_timelines(
     current_user: User = Depends(get_current_user),
 ):
     result = await db.execute(
-        select(PGTimeline).where(PGTimeline.pg_recommendation_id == pg_id)
+        select(Timeline).where(Timeline.pg_recommendation_id == pg_id)
     )
     timelines = result.scalars().all()
     out = []
     for tl in timelines:
-        p_res = await db.execute(select(PGPractice).where(PGPractice.timeline_id == tl.id).order_by(PGPractice.display_order))
+        p_res = await db.execute(select(Practice).where(Practice.timeline_id == tl.id).order_by(Practice.display_order))
         out.append({
             "id": tl.id, "pg_recommendation_id": tl.pg_recommendation_id,
             "name": tl.name, "from_type": tl.from_type, "from_value": tl.from_value, "to_value": tl.to_value,
@@ -5876,7 +5875,7 @@ async def add_client_pg_timeline(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    tl = PGTimeline(
+    tl = Timeline(
         pg_recommendation_id=pg_id,
         name=request.name,
         from_type=request.from_type,
@@ -5910,7 +5909,7 @@ async def add_client_pg_practice(
     except L2ElementValidationError as e:
         _raise_l2_element_validation(e)
 
-    practice = PGPractice(
+    practice = Practice(
         timeline_id=tl_id,
         l0_type=request.l0_type,
         l1_type=request.l1_type,
@@ -5922,7 +5921,7 @@ async def add_client_pg_practice(
     db.add(practice)
     await db.flush()
     for el in request.elements:
-        db.add(PGElement(
+        db.add(Element(
             practice_id=practice.id,
             element_type=el.element_type,
             cosh_ref=el.cosh_ref,
@@ -5949,7 +5948,7 @@ async def add_client_pg_element(
 ):
     practice = await _load_pg_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
     new = await _add_practice_element(
-        db, practice=practice, element_model=PGElement, body=body,
+        db, practice=practice, element_model=Element, body=body,
     )
     return _element_row_to_out(new)
 
@@ -5965,7 +5964,7 @@ async def update_client_pg_element(
 ):
     practice = await _load_pg_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
     updated = await _update_practice_element(
-        db, practice=practice, element_model=PGElement,
+        db, practice=practice, element_model=Element,
         element_id=element_id, body=body,
     )
     return _element_row_to_out(updated)
@@ -5982,7 +5981,7 @@ async def delete_client_pg_element(
 ):
     practice = await _load_pg_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
     await _delete_practice_element(
-        db, practice=practice, element_model=PGElement, element_id=element_id,
+        db, practice=practice, element_model=Element, element_id=element_id,
     )
 
 
@@ -5998,15 +5997,15 @@ async def delete_client_pg_practice(
     """Remove a practice from a client-local PG recommendation. Cascade
     drops its elements via ORM. Mirror of delete_practice on CCA."""
     practice = (await db.execute(
-        select(PGPractice).where(
-            PGPractice.id == practice_id,
-            PGPractice.timeline_id == tl_id,
+        select(Practice).where(
+            Practice.id == practice_id,
+            Practice.timeline_id == tl_id,
         )
     )).scalar_one_or_none()
     if not practice:
         raise HTTPException(status_code=404, detail="Practice not found")
     elems = (await db.execute(
-        select(PGElement).where(PGElement.practice_id == practice.id)
+        select(Element).where(Element.practice_id == practice.id)
     )).scalars().all()
     for e in elems:
         await db.delete(e)
@@ -6023,7 +6022,7 @@ async def delete_client_pg_timeline(
     current_user: User = Depends(get_current_user),
 ):
     tl = (await db.execute(
-        select(PGTimeline).where(PGTimeline.id == tl_id, PGTimeline.pg_recommendation_id == pg_id)
+        select(Timeline).where(Timeline.id == tl_id, Timeline.pg_recommendation_id == pg_id)
     )).scalar_one_or_none()
     if tl:
         await db.delete(tl)
@@ -6070,11 +6069,11 @@ async def list_sp_timelines(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    result = await db.execute(select(SPTimeline).where(SPTimeline.sp_recommendation_id == sp_id))
+    result = await db.execute(select(Timeline).where(Timeline.sp_recommendation_id == sp_id))
     timelines = result.scalars().all()
     out = []
     for tl in timelines:
-        p_res = await db.execute(select(SPPractice).where(SPPractice.timeline_id == tl.id).order_by(SPPractice.display_order))
+        p_res = await db.execute(select(Practice).where(Practice.timeline_id == tl.id).order_by(Practice.display_order))
         out.append({
             "id": tl.id, "sp_recommendation_id": tl.sp_recommendation_id,
             "name": tl.name, "from_type": tl.from_type, "from_value": tl.from_value, "to_value": tl.to_value,
@@ -6095,7 +6094,7 @@ async def add_sp_timeline(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    tl = SPTimeline(
+    tl = Timeline(
         sp_recommendation_id=sp_id,
         name=request.name,
         from_type=request.from_type,
@@ -6129,7 +6128,7 @@ async def add_sp_practice(
     except L2ElementValidationError as e:
         _raise_l2_element_validation(e)
 
-    practice = SPPractice(
+    practice = Practice(
         timeline_id=tl_id,
         l0_type=request.l0_type,
         l1_type=request.l1_type,
@@ -6141,7 +6140,7 @@ async def add_sp_practice(
     db.add(practice)
     await db.flush()
     for el in request.elements:
-        db.add(SPElement(
+        db.add(Element(
             practice_id=practice.id,
             element_type=el.element_type,
             cosh_ref=el.cosh_ref,
@@ -6158,9 +6157,9 @@ async def add_sp_practice(
 
 async def _load_sp_practice_by_timeline(db, *, timeline_id: str, practice_id: str):
     practice = (await db.execute(
-        select(SPPractice).where(
-            SPPractice.id == practice_id,
-            SPPractice.timeline_id == timeline_id,
+        select(Practice).where(
+            Practice.id == practice_id,
+            Practice.timeline_id == timeline_id,
         )
     )).scalar_one_or_none()
     if not practice:
@@ -6180,7 +6179,7 @@ async def add_sp_element(
 ):
     practice = await _load_sp_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
     new = await _add_practice_element(
-        db, practice=practice, element_model=SPElement, body=body,
+        db, practice=practice, element_model=Element, body=body,
     )
     return _element_row_to_out(new)
 
@@ -6196,7 +6195,7 @@ async def update_sp_element(
 ):
     practice = await _load_sp_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
     updated = await _update_practice_element(
-        db, practice=practice, element_model=SPElement,
+        db, practice=practice, element_model=Element,
         element_id=element_id, body=body,
     )
     return _element_row_to_out(updated)
@@ -6213,7 +6212,7 @@ async def delete_sp_element(
 ):
     practice = await _load_sp_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
     await _delete_practice_element(
-        db, practice=practice, element_model=SPElement, element_id=element_id,
+        db, practice=practice, element_model=Element, element_id=element_id,
     )
 
 
@@ -6226,7 +6225,7 @@ async def delete_sp_timeline(
     current_user: User = Depends(get_current_user),
 ):
     tl = (await db.execute(
-        select(SPTimeline).where(SPTimeline.id == tl_id, SPTimeline.sp_recommendation_id == sp_id)
+        select(Timeline).where(Timeline.id == tl_id, Timeline.sp_recommendation_id == sp_id)
     )).scalar_one_or_none()
     if tl:
         await db.delete(tl)
@@ -6279,22 +6278,22 @@ async def list_qa_timelines(
     await _assert_sr_belongs_to_client(db, sr_id, client_id)
 
     timelines = (await db.execute(
-        select(PGTimeline).where(
-            PGTimeline.standard_response_id == sr_id,
-        ).order_by(PGTimeline.from_value, PGTimeline.id)
+        select(Timeline).where(
+            Timeline.standard_response_id == sr_id,
+        ).order_by(Timeline.from_value, Timeline.id)
     )).scalars().all()
 
     out = []
     for tl in timelines:
         practices = (await db.execute(
-            select(PGPractice).where(PGPractice.timeline_id == tl.id)
-            .order_by(PGPractice.display_order)
+            select(Practice).where(Practice.timeline_id == tl.id)
+            .order_by(Practice.display_order)
         )).scalars().all()
         practice_dicts = []
         for p in practices:
             elements = (await db.execute(
-                select(PGElement).where(PGElement.practice_id == p.id)
-                .order_by(PGElement.display_order)
+                select(Element).where(Element.practice_id == p.id)
+                .order_by(Element.display_order)
             )).scalars().all()
             practice_dicts.append({
                 "id": p.id,
@@ -6342,7 +6341,7 @@ async def add_qa_timeline(
     await _assert_portal_member(db, current_user.id, client_id)
     await _assert_sr_belongs_to_client(db, sr_id, client_id)
 
-    tl = PGTimeline(
+    tl = Timeline(
         standard_response_id=sr_id,
         # pg_recommendation_id stays None — the DB CHECK enforces
         # exactly-one-parent so this row can never drift into a
@@ -6387,25 +6386,25 @@ async def delete_qa_timeline(
     await _assert_sr_belongs_to_client(db, sr_id, client_id)
 
     tl = (await db.execute(
-        select(PGTimeline).where(
-            PGTimeline.id == tl_id,
-            PGTimeline.standard_response_id == sr_id,
+        select(Timeline).where(
+            Timeline.id == tl_id,
+            Timeline.standard_response_id == sr_id,
         )
     )).scalar_one_or_none()
     if not tl:
         raise HTTPException(status_code=404, detail="Timeline not found")
 
     # Manually delete practices and elements first — SQLAlchemy
-    # relationships on PGTimeline don't carry cascade='delete' (it
+    # relationships on Timeline don't carry cascade='delete' (it
     # would require a back_populates change that ripples through
     # CHA tests). Mirrors the PG delete pattern though PG's delete
     # endpoint relies on the caller having no practices yet.
     practices = (await db.execute(
-        select(PGPractice).where(PGPractice.timeline_id == tl_id)
+        select(Practice).where(Practice.timeline_id == tl_id)
     )).scalars().all()
     for p in practices:
         elements = (await db.execute(
-            select(PGElement).where(PGElement.practice_id == p.id)
+            select(Element).where(Element.practice_id == p.id)
         )).scalars().all()
         for e in elements:
             await db.delete(e)
@@ -6434,9 +6433,9 @@ async def add_qa_practice(
     await _assert_sr_belongs_to_client(db, sr_id, client_id)
 
     tl = (await db.execute(
-        select(PGTimeline).where(
-            PGTimeline.id == tl_id,
-            PGTimeline.standard_response_id == sr_id,
+        select(Timeline).where(
+            Timeline.id == tl_id,
+            Timeline.standard_response_id == sr_id,
         )
     )).scalar_one_or_none()
     if not tl:
@@ -6453,7 +6452,7 @@ async def add_qa_practice(
     except L2ElementValidationError as e:
         _raise_l2_element_validation(e)
 
-    practice = PGPractice(
+    practice = Practice(
         timeline_id=tl_id,
         l0_type=request.l0_type,
         l1_type=request.l1_type,
@@ -6466,7 +6465,7 @@ async def add_qa_practice(
     await db.flush()
 
     for el in request.elements:
-        db.add(PGElement(
+        db.add(Element(
             practice_id=practice.id,
             element_type=el.element_type,
             cosh_ref=el.cosh_ref,
@@ -6478,8 +6477,8 @@ async def add_qa_practice(
     await db.refresh(practice)
 
     elements = (await db.execute(
-        select(PGElement).where(PGElement.practice_id == practice.id)
-        .order_by(PGElement.display_order)
+        select(Element).where(Element.practice_id == practice.id)
+        .order_by(Element.display_order)
     )).scalars().all()
     return {
         "id": practice.id,
@@ -6517,17 +6516,17 @@ async def _assert_qa_practice_path(
     await _assert_portal_member(db, current_user.id, client_id)
     await _assert_sr_belongs_to_client(db, sr_id, client_id)
     tl = (await db.execute(
-        select(PGTimeline).where(
-            PGTimeline.id == tl_id,
-            PGTimeline.standard_response_id == sr_id,
+        select(Timeline).where(
+            Timeline.id == tl_id,
+            Timeline.standard_response_id == sr_id,
         )
     )).scalar_one_or_none()
     if not tl:
         raise HTTPException(status_code=404, detail="Timeline not found")
     practice = (await db.execute(
-        select(PGPractice).where(
-            PGPractice.id == practice_id,
-            PGPractice.timeline_id == tl_id,
+        select(Practice).where(
+            Practice.id == practice_id,
+            Practice.timeline_id == tl_id,
         )
     )).scalar_one_or_none()
     if not practice:
@@ -6550,7 +6549,7 @@ async def add_qa_element(
         sr_id=sr_id, tl_id=tl_id, practice_id=practice_id,
     )
     new = await _add_practice_element(
-        db, practice=practice, element_model=PGElement, body=body,
+        db, practice=practice, element_model=Element, body=body,
     )
     return _element_row_to_out(new)
 
@@ -6569,7 +6568,7 @@ async def update_qa_element(
         sr_id=sr_id, tl_id=tl_id, practice_id=practice_id,
     )
     updated = await _update_practice_element(
-        db, practice=practice, element_model=PGElement,
+        db, practice=practice, element_model=Element,
         element_id=element_id, body=body,
     )
     return _element_row_to_out(updated)
@@ -6589,7 +6588,7 @@ async def delete_qa_element(
         sr_id=sr_id, tl_id=tl_id, practice_id=practice_id,
     )
     await _delete_practice_element(
-        db, practice=practice, element_model=PGElement, element_id=element_id,
+        db, practice=practice, element_model=Element, element_id=element_id,
     )
 
 
@@ -6610,9 +6609,9 @@ async def delete_qa_practice(
     await _assert_sr_belongs_to_client(db, sr_id, client_id)
 
     practice = (await db.execute(
-        select(PGPractice).where(
-            PGPractice.id == p_id,
-            PGPractice.timeline_id == tl_id,
+        select(Practice).where(
+            Practice.id == p_id,
+            Practice.timeline_id == tl_id,
         )
     )).scalar_one_or_none()
     if not practice:
@@ -6622,16 +6621,16 @@ async def delete_qa_practice(
     # sure the timeline really belongs to this Standard Response
     # before deleting under it.
     tl = (await db.execute(
-        select(PGTimeline).where(
-            PGTimeline.id == tl_id,
-            PGTimeline.standard_response_id == sr_id,
+        select(Timeline).where(
+            Timeline.id == tl_id,
+            Timeline.standard_response_id == sr_id,
         )
     )).scalar_one_or_none()
     if not tl:
         raise HTTPException(status_code=404, detail="Timeline not found")
 
     elements = (await db.execute(
-        select(PGElement).where(PGElement.practice_id == p_id)
+        select(Element).where(Element.practice_id == p_id)
     )).scalars().all()
     for e in elements:
         await db.delete(e)
@@ -6640,22 +6639,22 @@ async def delete_qa_practice(
 
 
 async def _wipe_sp_content(db: AsyncSession, sp_id: str) -> dict:
-    """Delete every SPTimeline / SPPractice / SPElement under an SP.
+    """Delete every Timeline / Practice / Element under an SP.
     Mirrors `_wipe_pg_content` for the SP-side import overwrite path."""
     timelines = (await db.execute(
-        select(SPTimeline).where(SPTimeline.sp_recommendation_id == sp_id)
+        select(Timeline).where(Timeline.sp_recommendation_id == sp_id)
     )).scalars().all()
     tl_count = len(timelines)
     practice_count = 0
     element_count = 0
     for tl in timelines:
         practices = (await db.execute(
-            select(SPPractice).where(SPPractice.timeline_id == tl.id)
+            select(Practice).where(Practice.timeline_id == tl.id)
         )).scalars().all()
         practice_count += len(practices)
         for p in practices:
             elements = (await db.execute(
-                select(SPElement).where(SPElement.practice_id == p.id)
+                select(Element).where(Element.practice_id == p.id)
             )).scalars().all()
             element_count += len(elements)
             for el in elements:
@@ -6726,8 +6725,8 @@ async def import_pg_into_sp(
         raise HTTPException(status_code=404, detail="Local PG recommendation not found")
 
     existing_tl_count = (await db.execute(
-        select(func.count()).select_from(SPTimeline).where(
-            SPTimeline.sp_recommendation_id == sp_id,
+        select(func.count()).select_from(Timeline).where(
+            Timeline.sp_recommendation_id == sp_id,
         )
     )).scalar() or 0
 
@@ -6751,13 +6750,13 @@ async def import_pg_into_sp(
     if existing_tl_count > 0:
         await _wipe_sp_content(db, sp_id)
 
-    # Deep-copy: PGTimeline → SPTimeline, PGPractice → SPPractice,
-    # PGElement → SPElement. Same field shapes; just different tables.
+    # Deep-copy: Timeline → Timeline, Practice → Practice,
+    # Element → Element. Same field shapes; just different tables.
     pg_timelines = (await db.execute(
-        select(PGTimeline).where(PGTimeline.pg_recommendation_id == src_pg.id)
+        select(Timeline).where(Timeline.pg_recommendation_id == src_pg.id)
     )).scalars().all()
     for src_tl in pg_timelines:
-        new_tl = SPTimeline(
+        new_tl = Timeline(
             sp_recommendation_id=sp_id,
             name=src_tl.name,
             from_type=src_tl.from_type,
@@ -6768,10 +6767,10 @@ async def import_pg_into_sp(
         await db.flush()
 
         src_practices = (await db.execute(
-            select(PGPractice).where(PGPractice.timeline_id == src_tl.id)
+            select(Practice).where(Practice.timeline_id == src_tl.id)
         )).scalars().all()
         for src_p in src_practices:
-            new_p = SPPractice(
+            new_p = Practice(
                 timeline_id=new_tl.id,
                 l0_type=src_p.l0_type,
                 l1_type=src_p.l1_type,
@@ -6784,10 +6783,10 @@ async def import_pg_into_sp(
             await db.flush()
 
             src_elements = (await db.execute(
-                select(PGElement).where(PGElement.practice_id == src_p.id)
+                select(Element).where(Element.practice_id == src_p.id)
             )).scalars().all()
             for src_el in src_elements:
-                db.add(SPElement(
+                db.add(Element(
                     practice_id=new_p.id,
                     element_type=src_el.element_type,
                     cosh_ref=src_el.cosh_ref,
@@ -6828,16 +6827,16 @@ async def delete_client_sp_practice(
 ):
     """Mirror of delete_client_pg_practice. Cascades the practice's
     elements via ORM."""
-    from app.modules.advisory.models import SPElement, SPPractice
+    from app.modules.advisory.models import Element, Practice
     practice = (await db.execute(
-        select(SPPractice).where(
-            SPPractice.id == practice_id, SPPractice.timeline_id == tl_id,
+        select(Practice).where(
+            Practice.id == practice_id, Practice.timeline_id == tl_id,
         )
     )).scalar_one_or_none()
     if not practice:
         raise HTTPException(status_code=404, detail="Practice not found")
     elems = (await db.execute(
-        select(SPElement).where(SPElement.practice_id == practice.id)
+        select(Element).where(Element.practice_id == practice.id)
     )).scalars().all()
     for e in elems:
         await db.delete(e)
@@ -6860,8 +6859,8 @@ async def _check_sp_publish_readiness(
             ),
         })
     tl_count = (await db.execute(
-        select(func.count()).select_from(SPTimeline).where(
-            SPTimeline.sp_recommendation_id == sp.id,
+        select(func.count()).select_from(Timeline).where(
+            Timeline.sp_recommendation_id == sp.id,
         )
     )).scalar() or 0
     if tl_count == 0:
@@ -7359,9 +7358,9 @@ async def cha_list_recommendations(
 
     rec_ids = [r.id for r in recs]
     tl_counts = dict((await db.execute(
-        select(PGTimeline.pg_recommendation_id, func.count())
-        .where(PGTimeline.pg_recommendation_id.in_(rec_ids))
-        .group_by(PGTimeline.pg_recommendation_id)
+        select(Timeline.pg_recommendation_id, func.count())
+        .where(Timeline.pg_recommendation_id.in_(rec_ids))
+        .group_by(Timeline.pg_recommendation_id)
     )).all())
 
     pg_names = {p["cosh_id"]: p["name_en"] for p in list_problem_groups()}
@@ -7400,20 +7399,20 @@ async def cha_list_timelines(
     from app.services.cha_problem_groups import list_problem_groups
 
     q = (
-        select(PGTimeline, PGRecommendation)
-        .join(PGRecommendation, PGTimeline.pg_recommendation_id == PGRecommendation.id)
+        select(Timeline, PGRecommendation)
+        .join(PGRecommendation, Timeline.pg_recommendation_id == PGRecommendation.id)
         .where(
             PGRecommendation.client_id == client_id,
-            PGTimeline.pg_recommendation_id.isnot(None),
+            Timeline.pg_recommendation_id.isnot(None),
         )
     )
     if problem_group_cosh_id:
         q = q.where(PGRecommendation.problem_group_cosh_id == problem_group_cosh_id)
     if recommendation_id:
-        q = q.where(PGTimeline.pg_recommendation_id == recommendation_id)
+        q = q.where(Timeline.pg_recommendation_id == recommendation_id)
     if area_or_plant:
         q = q.where(PGRecommendation.area_or_plant == area_or_plant)
-    q = q.order_by(PGRecommendation.problem_group_cosh_id, PGTimeline.from_value)
+    q = q.order_by(PGRecommendation.problem_group_cosh_id, Timeline.from_value)
 
     rows = (await db.execute(q)).all()
     if not rows:
@@ -7421,9 +7420,9 @@ async def cha_list_timelines(
 
     tl_ids = [tl.id for tl, _ in rows]
     practice_counts = dict((await db.execute(
-        select(PGPractice.timeline_id, func.count())
-        .where(PGPractice.timeline_id.in_(tl_ids))
-        .group_by(PGPractice.timeline_id)
+        select(Practice.timeline_id, func.count())
+        .where(Practice.timeline_id.in_(tl_ids))
+        .group_by(Practice.timeline_id)
     )).all())
 
     pg_names = {p["cosh_id"]: p["name_en"] for p in list_problem_groups()}
@@ -7480,34 +7479,34 @@ async def cha_list_practices(
         )
 
     q = (
-        select(PGPractice, PGTimeline, PGRecommendation)
-        .join(PGTimeline, PGPractice.timeline_id == PGTimeline.id)
-        .join(PGRecommendation, PGTimeline.pg_recommendation_id == PGRecommendation.id)
+        select(Practice, Timeline, PGRecommendation)
+        .join(Timeline, Practice.timeline_id == Timeline.id)
+        .join(PGRecommendation, Timeline.pg_recommendation_id == PGRecommendation.id)
         .where(
             PGRecommendation.client_id == client_id,
-            PGTimeline.pg_recommendation_id.isnot(None),
+            Timeline.pg_recommendation_id.isnot(None),
         )
     )
     if problem_group_cosh_id:
         q = q.where(PGRecommendation.problem_group_cosh_id == problem_group_cosh_id)
     if recommendation_id:
-        q = q.where(PGTimeline.pg_recommendation_id == recommendation_id)
+        q = q.where(Timeline.pg_recommendation_id == recommendation_id)
     if timeline_id:
-        q = q.where(PGPractice.timeline_id == timeline_id)
+        q = q.where(Practice.timeline_id == timeline_id)
     if area_or_plant:
         q = q.where(PGRecommendation.area_or_plant == area_or_plant)
     if l1:
-        q = q.where(PGPractice.l1_type == l1)
+        q = q.where(Practice.l1_type == l1)
     if l2:
-        q = q.where(PGPractice.l2_type == l2)
+        q = q.where(Practice.l2_type == l2)
 
     total = (await db.execute(
         select(func.count()).select_from(q.subquery())
     )).scalar() or 0
 
     q = q.order_by(
-        PGRecommendation.problem_group_cosh_id, PGTimeline.from_value,
-        PGPractice.display_order,
+        PGRecommendation.problem_group_cosh_id, Timeline.from_value,
+        Practice.display_order,
     ).offset(offset).limit(limit)
 
     rows = (await db.execute(q)).all()
@@ -7515,12 +7514,12 @@ async def cha_list_practices(
         return {"items": [], "total": total, "limit": limit, "offset": offset}
 
     practice_ids = [pr.id for pr, _, _ in rows]
-    elements_by_practice: dict[str, list[PGElement]] = {}
+    elements_by_practice: dict[str, list[Element]] = {}
     if practice_ids:
         elem_rows = (await db.execute(
-            select(PGElement)
-            .where(PGElement.practice_id.in_(practice_ids))
-            .order_by(PGElement.display_order)
+            select(Element)
+            .where(Element.practice_id.in_(practice_ids))
+            .order_by(Element.display_order)
         )).scalars().all()
         for e in elem_rows:
             elements_by_practice.setdefault(e.practice_id, []).append(e)
@@ -7682,9 +7681,9 @@ async def cha_sp_list_recommendations(
 
     sp_ids = [s.id for s in sps]
     tl_counts = dict((await db.execute(
-        select(SPTimeline.sp_recommendation_id, func.count())
-        .where(SPTimeline.sp_recommendation_id.in_(sp_ids))
-        .group_by(SPTimeline.sp_recommendation_id)
+        select(Timeline.sp_recommendation_id, func.count())
+        .where(Timeline.sp_recommendation_id.in_(sp_ids))
+        .group_by(Timeline.sp_recommendation_id)
     )).all())
 
     crop_ids = {s.crop_cosh_id for s in sps if s.crop_cosh_id}
@@ -7728,18 +7727,18 @@ async def cha_sp_list_timelines(
     """Cross-recommendation SP timeline list with denormalised crop +
     SP context + practice count. Chips: ?crop_cosh_id=,
     ?recommendation_id=."""
-    from app.modules.advisory.models import SPPractice
+    from app.modules.advisory.models import Practice
 
     q = (
-        select(SPTimeline, SPRecommendation)
-        .join(SPRecommendation, SPTimeline.sp_recommendation_id == SPRecommendation.id)
+        select(Timeline, SPRecommendation)
+        .join(SPRecommendation, Timeline.sp_recommendation_id == SPRecommendation.id)
         .where(SPRecommendation.client_id == client_id)
     )
     if crop_cosh_id:
         q = q.where(SPRecommendation.crop_cosh_id == crop_cosh_id)
     if recommendation_id:
-        q = q.where(SPTimeline.sp_recommendation_id == recommendation_id)
-    q = q.order_by(SPTimeline.from_value)
+        q = q.where(Timeline.sp_recommendation_id == recommendation_id)
+    q = q.order_by(Timeline.from_value)
 
     rows = (await db.execute(q)).all()
     if not rows:
@@ -7747,9 +7746,9 @@ async def cha_sp_list_timelines(
 
     tl_ids = [tl.id for tl, _ in rows]
     practice_counts = dict((await db.execute(
-        select(SPPractice.timeline_id, func.count())
-        .where(SPPractice.timeline_id.in_(tl_ids))
-        .group_by(SPPractice.timeline_id)
+        select(Practice.timeline_id, func.count())
+        .where(Practice.timeline_id.in_(tl_ids))
+        .group_by(Practice.timeline_id)
     )).all())
 
     crop_ids = {sp.crop_cosh_id for _, sp in rows if sp.crop_cosh_id}
@@ -7798,7 +7797,7 @@ async def cha_sp_list_practices(
     """Cross-timeline SP practice list with brand + dosage summary +
     full breadcrumb. Paginated. Same cross-cutting power as the
     CHA-PG / CCA practice lists."""
-    from app.modules.advisory.models import SPElement, SPPractice
+    from app.modules.advisory.models import Element, Practice
 
     if limit < 1 or limit > 500:
         raise HTTPException(status_code=422, detail={"code": "invalid_limit", "message": "limit must be 1..500"})
@@ -7806,36 +7805,36 @@ async def cha_sp_list_practices(
         raise HTTPException(status_code=422, detail={"code": "invalid_offset", "message": "offset must be >= 0"})
 
     q = (
-        select(SPPractice, SPTimeline, SPRecommendation)
-        .join(SPTimeline, SPPractice.timeline_id == SPTimeline.id)
-        .join(SPRecommendation, SPTimeline.sp_recommendation_id == SPRecommendation.id)
+        select(Practice, Timeline, SPRecommendation)
+        .join(Timeline, Practice.timeline_id == Timeline.id)
+        .join(SPRecommendation, Timeline.sp_recommendation_id == SPRecommendation.id)
         .where(SPRecommendation.client_id == client_id)
     )
     if crop_cosh_id:
         q = q.where(SPRecommendation.crop_cosh_id == crop_cosh_id)
     if recommendation_id:
-        q = q.where(SPTimeline.sp_recommendation_id == recommendation_id)
+        q = q.where(Timeline.sp_recommendation_id == recommendation_id)
     if timeline_id:
-        q = q.where(SPPractice.timeline_id == timeline_id)
+        q = q.where(Practice.timeline_id == timeline_id)
     if l1:
-        q = q.where(SPPractice.l1_type == l1)
+        q = q.where(Practice.l1_type == l1)
     if l2:
-        q = q.where(SPPractice.l2_type == l2)
+        q = q.where(Practice.l2_type == l2)
 
     total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar() or 0
 
-    q = q.order_by(SPRecommendation.specific_problem_cosh_id, SPTimeline.from_value, SPPractice.display_order)
+    q = q.order_by(SPRecommendation.specific_problem_cosh_id, Timeline.from_value, Practice.display_order)
     q = q.offset(offset).limit(limit)
     rows = (await db.execute(q)).all()
     if not rows:
         return {"items": [], "total": total, "limit": limit, "offset": offset}
 
     practice_ids = [pr.id for pr, _, _ in rows]
-    elements_by_practice: dict[str, list[SPElement]] = {}
+    elements_by_practice: dict[str, list[Element]] = {}
     if practice_ids:
         elem_rows = (await db.execute(
-            select(SPElement).where(SPElement.practice_id.in_(practice_ids))
-            .order_by(SPElement.display_order)
+            select(Element).where(Element.practice_id.in_(practice_ids))
+            .order_by(Element.display_order)
         )).scalars().all()
         for e in elem_rows:
             elements_by_practice.setdefault(e.practice_id, []).append(e)
@@ -7955,9 +7954,9 @@ async def qa_list_standard_responses(
 
     sr_ids = [s.id for s in srs]
     tl_counts = dict((await db.execute(
-        select(PGTimeline.standard_response_id, func.count())
-        .where(PGTimeline.standard_response_id.in_(sr_ids))
-        .group_by(PGTimeline.standard_response_id)
+        select(Timeline.standard_response_id, func.count())
+        .where(Timeline.standard_response_id.in_(sr_ids))
+        .group_by(Timeline.standard_response_id)
     )).all())
 
     crop_ids = {s.crop_cosh_id for s in srs if s.crop_cosh_id}
@@ -7994,17 +7993,17 @@ async def qa_list_timelines(
     from app.modules.farmpundit.models import StandardResponse
 
     q = (
-        select(PGTimeline, StandardResponse)
-        .join(StandardResponse, PGTimeline.standard_response_id == StandardResponse.id)
+        select(Timeline, StandardResponse)
+        .join(StandardResponse, Timeline.standard_response_id == StandardResponse.id)
         .where(StandardResponse.client_id == client_id)
     )
     if standard_response_id:
-        q = q.where(PGTimeline.standard_response_id == standard_response_id)
+        q = q.where(Timeline.standard_response_id == standard_response_id)
     if crop_cosh_id == "__AGNOSTIC__":
         q = q.where(StandardResponse.crop_cosh_id.is_(None))
     elif crop_cosh_id:
         q = q.where(StandardResponse.crop_cosh_id == crop_cosh_id)
-    q = q.order_by(PGTimeline.from_value)
+    q = q.order_by(Timeline.from_value)
 
     rows = (await db.execute(q)).all()
     if not rows:
@@ -8012,9 +8011,9 @@ async def qa_list_timelines(
 
     tl_ids = [tl.id for tl, _ in rows]
     practice_counts = dict((await db.execute(
-        select(PGPractice.timeline_id, func.count())
-        .where(PGPractice.timeline_id.in_(tl_ids))
-        .group_by(PGPractice.timeline_id)
+        select(Practice.timeline_id, func.count())
+        .where(Practice.timeline_id.in_(tl_ids))
+        .group_by(Practice.timeline_id)
     )).all())
 
     crop_ids = {sr.crop_cosh_id for _, sr in rows if sr.crop_cosh_id}
@@ -8064,27 +8063,27 @@ async def qa_list_practices(
         raise HTTPException(status_code=422, detail={"code": "invalid_offset", "message": "offset must be >= 0"})
 
     q = (
-        select(PGPractice, PGTimeline, StandardResponse)
-        .join(PGTimeline, PGPractice.timeline_id == PGTimeline.id)
-        .join(StandardResponse, PGTimeline.standard_response_id == StandardResponse.id)
+        select(Practice, Timeline, StandardResponse)
+        .join(Timeline, Practice.timeline_id == Timeline.id)
+        .join(StandardResponse, Timeline.standard_response_id == StandardResponse.id)
         .where(StandardResponse.client_id == client_id)
     )
     if standard_response_id:
-        q = q.where(PGTimeline.standard_response_id == standard_response_id)
+        q = q.where(Timeline.standard_response_id == standard_response_id)
     if crop_cosh_id == "__AGNOSTIC__":
         q = q.where(StandardResponse.crop_cosh_id.is_(None))
     elif crop_cosh_id:
         q = q.where(StandardResponse.crop_cosh_id == crop_cosh_id)
     if timeline_id:
-        q = q.where(PGPractice.timeline_id == timeline_id)
+        q = q.where(Practice.timeline_id == timeline_id)
     if l1:
-        q = q.where(PGPractice.l1_type == l1)
+        q = q.where(Practice.l1_type == l1)
     if l2:
-        q = q.where(PGPractice.l2_type == l2)
+        q = q.where(Practice.l2_type == l2)
 
     total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar() or 0
 
-    q = q.order_by(StandardResponse.created_at.desc(), PGTimeline.from_value, PGPractice.display_order)
+    q = q.order_by(StandardResponse.created_at.desc(), Timeline.from_value, Practice.display_order)
     q = q.offset(offset).limit(limit)
 
     rows = (await db.execute(q)).all()
@@ -8092,11 +8091,11 @@ async def qa_list_practices(
         return {"items": [], "total": total, "limit": limit, "offset": offset}
 
     practice_ids = [pr.id for pr, _, _ in rows]
-    elements_by_practice: dict[str, list[PGElement]] = {}
+    elements_by_practice: dict[str, list[Element]] = {}
     if practice_ids:
         elem_rows = (await db.execute(
-            select(PGElement).where(PGElement.practice_id.in_(practice_ids))
-            .order_by(PGElement.display_order)
+            select(Element).where(Element.practice_id.in_(practice_ids))
+            .order_by(Element.display_order)
         )).scalars().all()
         for e in elem_rows:
             elements_by_practice.setdefault(e.practice_id, []).append(e)

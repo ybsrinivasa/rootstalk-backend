@@ -8,7 +8,7 @@ Pre-L4-real (commit 40f4238 earlier today) the model carried
 `answer_text` + `answer_media` as the advisory body. That was the
 "notepad" cut and got dropped in migration `4b8e2c1a93f5` once we
 adopted UCAT — Q&A advisories carry full Timelines (in
-`pg_timelines`, polymorphic by Sub-batch 1) the same way PG and SP
+`pg_timelines`,polymorphic by Sub-batch 1) the same way PG and SP
 do.
 
 This test file covers entry-level CRUD only. Timeline / Practice /
@@ -22,9 +22,9 @@ from sqlalchemy import select
 
 from app.modules.farmpundit.models import StandardResponse
 from app.modules.farmpundit.router import (
-    create_standard_response, delete_standard_response,
-    list_standard_responses, search_standard_responses,
-    update_standard_response,
+create_standard_response,delete_standard_response,
+list_standard_responses,search_standard_responses,
+update_standard_response,
 )
 from tests.conftest import requires_docker
 from tests.factories import make_client, make_client_user, make_user
@@ -46,13 +46,13 @@ async def test_create_returns_metadata(db):
     await db.commit()
 
     out = await create_standard_response(
-        client_id=client.id,
-        data={
-            "question_text": "Why are leaves yellowing in young paddy?",
-            "crop_cosh_id": "crop:paddy",
-        },
-        db=db, current_user=se,
-    )
+client_id=client.id,
+data={
+"question_text": "Why are leaves yellowing in young paddy?",
+"crop_cosh_id": "crop:paddy",
+},
+db=db,current_user=se,
+)
     assert out["question_text"].startswith("Why are leaves")
     assert out["crop_cosh_id"] == "crop:paddy"
     assert out["created_by"] == se.id
@@ -70,10 +70,10 @@ async def test_create_strips_whitespace(db):
     await db.commit()
 
     out = await create_standard_response(
-        client_id=client.id,
-        data={"question_text": "  Q?  "},
-        db=db, current_user=se,
-    )
+client_id=client.id,
+data={"question_text": "  Q?  "},
+db=db,current_user=se,
+)
     assert out["question_text"] == "Q?"
 
 
@@ -87,10 +87,10 @@ async def test_create_requires_question_text(db):
     for bad in (None, "", "   "):
         with pytest.raises(HTTPException) as ei:
             await create_standard_response(
-                client_id=client.id,
-                data={"question_text": bad},
-                db=db, current_user=se,
-            )
+client_id=client.id,
+data={"question_text": bad},
+db=db,current_user=se,
+)
         assert ei.value.status_code == 422
         assert "question_text" in ei.value.detail
 
@@ -107,19 +107,19 @@ async def test_list_returns_client_scoped_only(db):
     await db.commit()
 
     await create_standard_response(
-        client_id=client_a.id,
-        data={"question_text": "A's question"},
-        db=db, current_user=se_a,
-    )
+client_id=client_a.id,
+data={"question_text": "A's question"},
+db=db,current_user=se_a,
+)
     await create_standard_response(
-        client_id=client_b.id,
-        data={"question_text": "B's question"},
-        db=db, current_user=se_b,
-    )
+client_id=client_b.id,
+data={"question_text": "B's question"},
+db=db,current_user=se_b,
+)
 
     out = await list_standard_responses(
-        client_id=client_a.id, db=db, current_user=se_a,
-    )
+client_id=client_a.id,db=db,current_user=se_a,
+)
     assert {r["question_text"] for r in out} == {"A's question"}
 
 
@@ -131,36 +131,36 @@ async def test_list_filters_by_crop_or_agnostic(db):
     await db.commit()
 
     await create_standard_response(
-        client_id=client.id,
-        data={"question_text": "Paddy Q", "crop_cosh_id": "crop:paddy"},
-        db=db, current_user=se,
-    )
+client_id=client.id,
+data={"question_text": "Paddy Q","crop_cosh_id": "crop:paddy"},
+db=db,current_user=se,
+)
     await create_standard_response(
-        client_id=client.id,
-        data={"question_text": "Tomato Q", "crop_cosh_id": "crop:tomato"},
-        db=db, current_user=se,
-    )
+client_id=client.id,
+data={"question_text": "Tomato Q","crop_cosh_id": "crop:tomato"},
+db=db,current_user=se,
+)
     await create_standard_response(
-        client_id=client.id,
-        data={"question_text": "Generic Q"},  # no crop
-        db=db, current_user=se,
-    )
+client_id=client.id,
+data={"question_text": "Generic Q"},# no crop
+db=db,current_user=se,
+)
 
     paddy = await list_standard_responses(
-        client_id=client.id, crop_cosh_id="crop:paddy",
-        db=db, current_user=se,
-    )
+client_id=client.id,crop_cosh_id="crop:paddy",
+db=db,current_user=se,
+)
     assert {r["question_text"] for r in paddy} == {"Paddy Q"}
 
     agnostic = await list_standard_responses(
-        client_id=client.id, crop_cosh_id="AGNOSTIC",
-        db=db, current_user=se,
-    )
+client_id=client.id,crop_cosh_id="AGNOSTIC",
+db=db,current_user=se,
+)
     assert {r["question_text"] for r in agnostic} == {"Generic Q"}
 
     everything = await list_standard_responses(
-        client_id=client.id, db=db, current_user=se,
-    )
+client_id=client.id,db=db,current_user=se,
+)
     assert {r["question_text"] for r in everything} == {"Paddy Q", "Tomato Q", "Generic Q"}
 
 
@@ -172,20 +172,20 @@ async def test_list_filters_by_search(db):
     await db.commit()
 
     await create_standard_response(
-        client_id=client.id,
-        data={"question_text": "Yellow leaves on paddy"},
-        db=db, current_user=se,
-    )
+client_id=client.id,
+data={"question_text": "Yellow leaves on paddy"},
+db=db,current_user=se,
+)
     await create_standard_response(
-        client_id=client.id,
-        data={"question_text": "Brown spots on tomato"},
-        db=db, current_user=se,
-    )
+client_id=client.id,
+data={"question_text": "Brown spots on tomato"},
+db=db,current_user=se,
+)
 
     out = await list_standard_responses(
-        client_id=client.id, search="yellow",
-        db=db, current_user=se,
-    )
+client_id=client.id,search="yellow",
+db=db,current_user=se,
+)
     assert {r["question_text"] for r in out} == {"Yellow leaves on paddy"}
 
 
@@ -199,19 +199,19 @@ async def test_update_persists_new_values(db):
     await db.commit()
 
     created = await create_standard_response(
-        client_id=client.id,
-        data={"question_text": "Old Q"},
-        db=db, current_user=se,
-    )
+client_id=client.id,
+data={"question_text": "Old Q"},
+db=db,current_user=se,
+)
 
     updated = await update_standard_response(
-        client_id=client.id, sr_id=created["id"],
-        data={
-            "question_text": "New Q",
-            "crop_cosh_id": "crop:wheat",
-        },
-        db=db, current_user=se,
-    )
+client_id=client.id,sr_id=created["id"],
+data={
+"question_text": "New Q",
+"crop_cosh_id": "crop:wheat",
+},
+db=db,current_user=se,
+)
     assert updated["question_text"] == "New Q"
     assert updated["crop_cosh_id"] == "crop:wheat"
 
@@ -226,17 +226,17 @@ async def test_update_404_for_other_clients_response(db):
     await db.commit()
 
     sr_b = await create_standard_response(
-        client_id=client_b.id,
-        data={"question_text": "B's question"},
-        db=db, current_user=se_b,
-    )
+client_id=client_b.id,
+data={"question_text": "B's question"},
+db=db,current_user=se_b,
+)
 
     with pytest.raises(HTTPException) as ei:
         await update_standard_response(
-            client_id=client_a.id, sr_id=sr_b["id"],
-            data={"question_text": "Hijacked"},
-            db=db, current_user=se_a,
-        )
+client_id=client_a.id,sr_id=sr_b["id"],
+data={"question_text": "Hijacked"},
+db=db,current_user=se_a,
+)
     assert ei.value.status_code == 404
 
 
@@ -248,18 +248,18 @@ async def test_delete_removes_row(db):
     await db.commit()
 
     sr = await create_standard_response(
-        client_id=client.id,
-        data={"question_text": "Q?"},
-        db=db, current_user=se,
-    )
+client_id=client.id,
+data={"question_text": "Q?"},
+db=db,current_user=se,
+)
 
     await delete_standard_response(
-        client_id=client.id, sr_id=sr["id"],
-        db=db, current_user=se,
-    )
+client_id=client.id,sr_id=sr["id"],
+db=db,current_user=se,
+)
 
     leftover = (await db.execute(
-        select(StandardResponse).where(StandardResponse.id == sr["id"])
+select(StandardResponse).where(StandardResponse.id == sr["id"])
     )).scalar_one_or_none()
     assert leftover is None
 
@@ -274,16 +274,16 @@ async def test_delete_404_for_other_clients_response(db):
     await db.commit()
 
     sr_b = await create_standard_response(
-        client_id=client_b.id,
-        data={"question_text": "B's"},
-        db=db, current_user=se_b,
-    )
+client_id=client_b.id,
+data={"question_text": "B's"},
+db=db,current_user=se_b,
+)
 
     with pytest.raises(HTTPException) as ei:
         await delete_standard_response(
-            client_id=client_a.id, sr_id=sr_b["id"],
-            db=db, current_user=se_a,
-        )
+client_id=client_a.id,sr_id=sr_b["id"],
+db=db,current_user=se_a,
+)
     assert ei.value.status_code == 404
 
 
@@ -298,8 +298,8 @@ async def test_list_rejects_non_member(db):
 
     with pytest.raises(HTTPException) as ei:
         await list_standard_responses(
-            client_id=client.id, db=db, current_user=outsider,
-        )
+client_id=client.id,db=db,current_user=outsider,
+)
     assert ei.value.status_code == 403
 
 
@@ -317,15 +317,15 @@ async def test_pundit_search_returns_metadata(db):
     await db.commit()
 
     await create_standard_response(
-        client_id=client.id,
-        data={"question_text": "How to control aphids?"},
-        db=db, current_user=se,
-    )
+client_id=client.id,
+data={"question_text": "How to control aphids?"},
+db=db,current_user=se,
+)
 
     out = await search_standard_responses(
-        client_id=client.id, search="aphids",
-        db=db, current_user=pundit,
-    )
+client_id=client.id,search="aphids",
+db=db,current_user=pundit,
+)
     assert len(out) == 1
     assert out[0]["question_text"] == "How to control aphids?"
 
@@ -339,34 +339,34 @@ async def test_pg_timelines_check_constraint_rejects_dual_parent(db):
     set must fail the DB CHECK. This is the invariant that makes
     `parent_kind` a sound derivation — exactly one parent, ever."""
     from app.modules.advisory.models import (
-        PGRecommendation, PGTimeline,
-    )
+PGRecommendation,Timeline,
+)
     from sqlalchemy.exc import IntegrityError
 
     client = await make_client(db)
     await db.commit()
 
     pg = PGRecommendation(
-        problem_group_cosh_id="pg:test",
-        client_id=client.id,
-        area_or_plant="AREA_WISE",
-        status="DRAFT",
-    )
+problem_group_cosh_id="pg:test",
+client_id=client.id,
+area_or_plant="AREA_WISE",
+status="DRAFT",
+)
     db.add(pg)
     await db.flush()
 
     sr = StandardResponse(
-        client_id=client.id, question_text="Q?",
-    )
+client_id=client.id,question_text="Q?",
+)
     db.add(sr)
     await db.flush()
 
-    db.add(PGTimeline(
-        pg_recommendation_id=pg.id,
-        standard_response_id=sr.id,  # both set — violates CHECK
-        name="Bad timeline",
-        from_value=0, to_value=7,
-    ))
+    db.add(Timeline(
+pg_recommendation_id=pg.id,
+standard_response_id=sr.id,# both set — violates CHECK
+name="Bad timeline",
+from_value=0,to_value=7,
+))
     with pytest.raises(IntegrityError):
         await db.flush()
     await db.rollback()
@@ -376,18 +376,18 @@ async def test_pg_timelines_check_constraint_rejects_dual_parent(db):
 @pytest.mark.asyncio
 async def test_pg_timelines_check_constraint_rejects_zero_parents(db):
     """Symmetric: NEITHER parent set is also a violation."""
-    from app.modules.advisory.models import PGTimeline
+    from app.modules.advisory.models import Timeline
     from sqlalchemy.exc import IntegrityError
 
     client = await make_client(db)
     await db.commit()
 
-    db.add(PGTimeline(
-        pg_recommendation_id=None,
-        standard_response_id=None,  # zero parents — violates CHECK
-        name="Orphan timeline",
-        from_value=0, to_value=7,
-    ))
+    db.add(Timeline(
+pg_recommendation_id=None,
+standard_response_id=None,# zero parents — violates CHECK
+name="Orphan timeline",
+from_value=0,to_value=7,
+))
     with pytest.raises(IntegrityError):
         await db.flush()
     await db.rollback()
@@ -400,31 +400,31 @@ async def test_pg_timeline_parent_kind_property(db):
     based on which FK is set. No schema column; pure read-side
     convenience for the unified advisory-render service."""
     from app.modules.advisory.models import (
-        PGRecommendation, PGTimeline,
-    )
+PGRecommendation,Timeline,
+)
 
     client = await make_client(db)
     await db.commit()
 
     pg = PGRecommendation(
-        problem_group_cosh_id="pg:test",
-        client_id=client.id,
-        area_or_plant="AREA_WISE",
-        status="DRAFT",
-    )
+problem_group_cosh_id="pg:test",
+client_id=client.id,
+area_or_plant="AREA_WISE",
+status="DRAFT",
+)
     db.add(pg)
     sr = StandardResponse(client_id=client.id, question_text="Q?")
     db.add(sr)
     await db.flush()
 
-    pg_tl = PGTimeline(
-        pg_recommendation_id=pg.id, name="PG-rooted",
-        from_value=0, to_value=7,
-    )
-    qa_tl = PGTimeline(
-        standard_response_id=sr.id, name="QA-rooted",
-        from_value=0, to_value=7, from_type="DAYS_AFTER_RESPONSE",
-    )
+    pg_tl = Timeline(
+pg_recommendation_id=pg.id,name="PG-rooted",
+from_value=0,to_value=7,
+)
+    qa_tl = Timeline(
+standard_response_id=sr.id,name="QA-rooted",
+from_value=0,to_value=7,from_type="DAYS_AFTER_RESPONSE",
+)
     db.add_all([pg_tl, qa_tl])
     await db.flush()
 
