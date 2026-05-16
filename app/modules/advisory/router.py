@@ -2064,20 +2064,35 @@ async def _get_global_timeline(
 
 
 async def _get_global_practice(db: AsyncSession, practice_id: str) -> Practice:
-    """Resolve a Practice and confirm its Timeline's Package is Global."""
+    """Resolve a Practice and confirm its Timeline is rooted on a Global
+    parent (Package / PG, both with `client_id IS NULL`). Extended in
+    Batch 39P-c (2026-05-16) from package-only to UCAT-wide so the
+    practice→CQ binding endpoint works for any pipe."""
     practice = (await db.execute(
         select(Practice).where(Practice.id == practice_id)
     )).scalar_one_or_none()
     if practice is None:
         raise HTTPException(status_code=404, detail="Practice not found")
-    pkg = (await db.execute(
-        select(Package)
-        .join(Timeline, Timeline.package_id == Package.id)
-        .where(Timeline.id == practice.timeline_id)
+    tl = (await db.execute(
+        select(Timeline).where(Timeline.id == practice.timeline_id)
     )).scalar_one_or_none()
-    if pkg is None or pkg.client_id is not None:
-        raise HTTPException(status_code=404, detail="Practice is not on a Global package")
-    return practice
+    if tl is None:
+        raise HTTPException(status_code=404, detail="Practice has no parent timeline")
+    if tl.package_id is not None:
+        pkg = (await db.execute(
+            select(Package).where(Package.id == tl.package_id)
+        )).scalar_one_or_none()
+        if pkg and pkg.client_id is None:
+            return practice
+    if tl.pg_recommendation_id is not None:
+        pg = (await db.execute(
+            select(PGRecommendation).where(PGRecommendation.id == tl.pg_recommendation_id)
+        )).scalar_one_or_none()
+        if pg and pg.client_id is None:
+            return practice
+    raise HTTPException(
+        status_code=404, detail="Practice is not on a Global parent",
+    )
 
 
 async def _get_global_relation(db: AsyncSession, relation_id: str) -> Relation:
@@ -2457,20 +2472,13 @@ async def delete_global_relation(
     await db.commit()
 
 
-@router.post(
-    "/advisory/global/packages/{pkg_id}/timelines/{timeline_id}/conditional-questions",
-    status_code=201,
-)
-async def create_global_conditional_question(
-    pkg_id: str, timeline_id: str,
-    request: ConditionalQuestionCreate,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """Create a Conditional Question (CQ) on a Global Timeline. The CQ
-    is then bound to either a Relation (Path A) or an independent
-    Practice (Path B) via the link endpoints below."""
-    await _get_global_timeline(db, pkg_id, timeline_id)
+async def _create_cq_for_global_timeline(
+    db: AsyncSession, *,
+    timeline_id: str, request: "ConditionalQuestionCreate",
+) -> ConditionalQuestion:
+    """Pipe-agnostic CQ create. Caller pre-validates Global scope.
+    Extracted Batch 39P-c (2026-05-16); body shared between CCA
+    Package + CHA-PG endpoints."""
     q = ConditionalQuestion(timeline_id=timeline_id, **request.model_dump())
     db.add(q)
     await db.commit()
@@ -2478,19 +2486,12 @@ async def create_global_conditional_question(
     return q
 
 
-@router.get(
-    "/advisory/global/packages/{pkg_id}/timelines/{timeline_id}/conditional-questions",
-)
-async def list_global_conditional_questions(
-    pkg_id: str, timeline_id: str,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """List CQs on a Global Timeline, each bundled with its YES- and
-    NO-side attachments (Batch 39E, 2026-05-15). Either side may carry
-    a practice_id OR a relation_id (Path A or Path B) — or be null.
-    The SA portal CQ panel renders directly from this shape."""
-    await _get_global_timeline(db, pkg_id, timeline_id)
+async def _list_cqs_for_global_timeline(
+    db: AsyncSession, *, timeline_id: str,
+) -> list[dict]:
+    """Pipe-agnostic CQ list. Returns each CQ with its YES- and NO-side
+    attachments bundled (Path A relation or Path B practice). Caller
+    pre-validates Global scope."""
     qs = (await db.execute(
         select(ConditionalQuestion).where(
             ConditionalQuestion.timeline_id == timeline_id,
@@ -2539,6 +2540,110 @@ async def list_global_conditional_questions(
     return out
 
 
+@router.post(
+    "/advisory/global/packages/{pkg_id}/timelines/{timeline_id}/conditional-questions",
+    status_code=201,
+)
+async def create_global_conditional_question(
+    pkg_id: str, timeline_id: str,
+    request: ConditionalQuestionCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Create a CQ on a Global CCA Timeline. Body shared with the
+    CHA-PG sibling via `_create_cq_for_global_timeline`."""
+    await _get_global_timeline(db, pkg_id, timeline_id)
+    return await _create_cq_for_global_timeline(
+        db, timeline_id=timeline_id, request=request,
+    )
+
+
+@router.get(
+    "/advisory/global/packages/{pkg_id}/timelines/{timeline_id}/conditional-questions",
+)
+async def list_global_conditional_questions(
+    pkg_id: str, timeline_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List CQs on a Global CCA Timeline with YES/NO attachments
+    bundled. Shared with CHA-PG via `_list_cqs_for_global_timeline`."""
+    await _get_global_timeline(db, pkg_id, timeline_id)
+    return await _list_cqs_for_global_timeline(
+        db, timeline_id=timeline_id,
+    )
+
+
+# ── PG-side CQ endpoints (Batch 39P-c, 2026-05-16) ─────────────────────
+
+@router.post(
+    "/advisory/global/pg-recommendations/{pg_id}/timelines/{timeline_id}/conditional-questions",
+    status_code=201,
+)
+async def create_global_pg_conditional_question(
+    pg_id: str, timeline_id: str,
+    request: ConditionalQuestionCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Create a CQ on a Global CHA-PG Timeline. Same body validator +
+    persister as CCA, plumbed via the shared helper."""
+    await _get_global_pg_timeline(db, pg_id, timeline_id)
+    return await _create_cq_for_global_timeline(
+        db, timeline_id=timeline_id, request=request,
+    )
+
+
+@router.get(
+    "/advisory/global/pg-recommendations/{pg_id}/timelines/{timeline_id}/conditional-questions",
+)
+async def list_global_pg_conditional_questions(
+    pg_id: str, timeline_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List CQs on a Global CHA-PG Timeline. PUT + DELETE on these CQs
+    use the existing pipe-agnostic `/advisory/global/conditional-
+    questions/{id}` URLs."""
+    await _get_global_pg_timeline(db, pg_id, timeline_id)
+    return await _list_cqs_for_global_timeline(
+        db, timeline_id=timeline_id,
+    )
+
+
+async def _assert_cq_is_on_global_timeline(
+    db: AsyncSession, cq: ConditionalQuestion,
+) -> None:
+    """Confirm the CQ's parent Timeline is rooted on a Global parent
+    (CCA Package or CHA-PG, both with `client_id IS NULL`). Used by
+    every CQ mutating endpoint (PUT / DELETE) so PG-rooted CQs work
+    through the same shared URLs as CCA. Batch 39P-c, 2026-05-16."""
+    tl = (await db.execute(
+        select(Timeline).where(Timeline.id == cq.timeline_id)
+    )).scalar_one_or_none()
+    if tl is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Conditional Question has no parent timeline",
+        )
+    if tl.package_id is not None:
+        pkg = (await db.execute(
+            select(Package).where(Package.id == tl.package_id)
+        )).scalar_one_or_none()
+        if pkg and pkg.client_id is None:
+            return
+    if tl.pg_recommendation_id is not None:
+        pg = (await db.execute(
+            select(PGRecommendation).where(PGRecommendation.id == tl.pg_recommendation_id)
+        )).scalar_one_or_none()
+        if pg and pg.client_id is None:
+            return
+    raise HTTPException(
+        status_code=404,
+        detail="Conditional Question is not on a Global parent",
+    )
+
+
 @router.put(
     "/advisory/global/conditional-questions/{question_id}",
 )
@@ -2561,13 +2666,7 @@ async def update_global_conditional_question(
     )).scalar_one_or_none()
     if cq is None:
         raise HTTPException(status_code=404, detail="Conditional Question not found")
-    pkg = (await db.execute(
-        select(Package)
-        .join(Timeline, Timeline.package_id == Package.id)
-        .where(Timeline.id == cq.timeline_id)
-    )).scalar_one_or_none()
-    if pkg is None or pkg.client_id is not None:
-        raise HTTPException(status_code=404, detail="Conditional Question is not on a Global package")
+    await _assert_cq_is_on_global_timeline(db, cq)
 
     if not request.question_text.strip():
         raise HTTPException(status_code=422, detail={
@@ -2677,19 +2776,13 @@ async def delete_global_conditional_question(
     deleting every PracticeConditional / RelationConditional row that
     bound to this CQ (the practices / relations themselves stay in
     place — only the gating goes). Path-Global mirror of the existing
-    client-scoped deletes."""
+    client-scoped deletes. Pipe-agnostic after Batch 39P-c."""
     cq = (await db.execute(
         select(ConditionalQuestion).where(ConditionalQuestion.id == question_id)
     )).scalar_one_or_none()
     if cq is None:
         raise HTTPException(status_code=404, detail="Conditional Question not found")
-    pkg = (await db.execute(
-        select(Package)
-        .join(Timeline, Timeline.package_id == Package.id)
-        .where(Timeline.id == cq.timeline_id)
-    )).scalar_one_or_none()
-    if pkg is None or pkg.client_id is not None:
-        raise HTTPException(status_code=404, detail="Conditional Question is not on a Global package")
+    await _assert_cq_is_on_global_timeline(db, cq)
     # Drop attachments first to satisfy any FK ordering.
     await db.execute(
         PracticeConditional.__table__.delete().where(
