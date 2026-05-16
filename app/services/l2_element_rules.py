@@ -127,9 +127,10 @@ PLANT_WISE_EXTRAS_APPLY_TO: frozenset[str] = frozenset({
 # the UX layer via /cosh/options/units, but for validation purposes
 # "is this a real units_data cosh_id?" is the right check.
 #
-# `planting_material`, `itk_name`, `maturity_index` are not yet
-# shipped by Cosh — keep them mapped to their literal slugs so
-# validation returns INVALID_COSH_REF until those Cores arrive.
+# Non-input cores `planting_material`, `itk_data`, `maturity_index`
+# shipped by Cosh 2026-05-16. The rule-book slug `itk_name` (used by
+# ITKS L2's element) maps to the real Cosh `core_type` `itk_data`; the
+# other two land under their literal slugs.
 COSH_CORE_SLUG_MAP: Mapping[str, str] = {
     "common_name":        "common_names_of_inputs",
     "application_method": "application_methods",
@@ -142,7 +143,7 @@ COSH_CORE_SLUG_MAP: Mapping[str, str] = {
     "irrigation_unit":    "units_data",
     "number_unit":        "units_data",
     "planting_material":  "planting_material",
-    "itk_name":           "itk_name",
+    "itk_name":           "itk_data",
     "maturity_index":     "maturity_index",
 }
 

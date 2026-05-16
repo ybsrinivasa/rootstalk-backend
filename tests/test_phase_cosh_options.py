@@ -39,7 +39,10 @@ from app.services.cosh_options_view import (
     list_common_names_for_l2,
     list_formulations,
     list_incomplete_cosh_data_for_l2,
+    list_itks,
     list_manufacturers_for_common_name,
+    list_maturity_indices,
+    list_planting_materials,
     list_trade_names_for_common_name,
     list_units_for_l2,
 )
@@ -808,3 +811,42 @@ async def test_incomplete_report_l2_not_in_spec_returns_applicable_false(db):
     assert report["applicable"] is False
     assert report["required"] == []
     assert report["common_names"] == []
+
+
+# ── Non-input Cores (2026-05-16) ──────────────────────────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_list_planting_materials_returns_all_active(db):
+    """Flat lookup, no L2 filter — returns every active row sorted by
+    English name. Inactive rows are excluded."""
+    db.add(_core("pm-1", "planting_material", "Seedlings"))
+    db.add(_core("pm-2", "planting_material", "Cuttings"))
+    db.add(_core("pm-3", "planting_material", "Old", status="inactive"))
+    db.add(_core("other", "common_names_of_inputs", "Imidacloprid"))
+    await db.commit()
+    out = await list_planting_materials(db)
+    assert [o["name"] for o in out] == ["Cuttings", "Seedlings"]
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_list_itks_reads_itk_data_core(db):
+    """Rule-book slug `itk_name` maps to the real Cosh core_type
+    `itk_data`. The endpoint serves rows of `itk_data`."""
+    db.add(_core("itk-1", "itk_data", "Neem leaf extract"))
+    db.add(_core("itk-2", "itk_data", "Ash dusting"))
+    db.add(_core("itk-stale", "itk_data", "Removed", status="inactive"))
+    await db.commit()
+    out = await list_itks(db)
+    assert [o["name"] for o in out] == ["Ash dusting", "Neem leaf extract"]
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_list_maturity_indices_returns_all_active(db):
+    db.add(_core("mi-1", "maturity_index", "Colour change"))
+    db.add(_core("mi-2", "maturity_index", "Brix value"))
+    await db.commit()
+    out = await list_maturity_indices(db)
+    assert [o["name"] for o in out] == ["Brix value", "Colour change"]

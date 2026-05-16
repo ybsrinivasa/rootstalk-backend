@@ -3913,6 +3913,44 @@ async def cosh_ai_concentrations(
     )
 
 
+# ── Non-input flat lookups (2026-05-16) ──────────────────────────────
+# Three Cosh cores wired to Non-input L0 element forms. Flat reads —
+# no L2 filter, no cascade.
+
+@router.get("/cosh/options/planting-materials")
+async def cosh_planting_materials(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Options for the PLANTING_MATERIAL element under L2
+    PLANTING_MATERIAL_QUANTITY (Non-input L0)."""
+    from app.services.cosh_options_view import list_planting_materials
+    return await list_planting_materials(db)
+
+
+@router.get("/cosh/options/itks")
+async def cosh_itks(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Options for the ITK_NAME element under L2 ITKS (Non-input L0).
+    Cosh ships these under core_type `itk_data`."""
+    from app.services.cosh_options_view import list_itks
+    return await list_itks(db)
+
+
+@router.get("/cosh/options/maturity-indices")
+async def cosh_maturity_indices(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Options for the MATURITY_INDEX element under L2 HARVESTING_MANUAL
+    (Non-input L0). The L2 is labelled 'Manual Harvesting' in the UX
+    but stored as HARVESTING_MANUAL in the taxonomy."""
+    from app.services.cosh_options_view import list_maturity_indices
+    return await list_maturity_indices(db)
+
+
 # Diagnosis lookups moved to `app/modules/diagnosis/router.py` in
 # Batch 23 (2026-05-14). See that module for `/diagnosis/*` endpoints.
 

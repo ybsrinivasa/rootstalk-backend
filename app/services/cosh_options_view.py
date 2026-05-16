@@ -646,3 +646,41 @@ async def list_ai_concentrations(
     return await _resolve_names(
         db, core_type=COSH_AI_CORE, cosh_ids=ai_ids,
     )
+
+
+# ── Non-input Cores (2026-05-16) ──────────────────────────────────────
+# Three flat lookups for Non-input L0 element forms. No L2 filter, no
+# cascade — every active Cosh row of the named core_type surfaces.
+#
+#   PLANTING_MATERIAL_QUANTITY.PLANTING_MATERIAL  → planting_material
+#   ITKS.ITK_NAME                                 → itk_data
+#   HARVESTING_MANUAL.MATURITY_INDEX              → maturity_index
+
+async def _list_all_of_core_type(
+    db: AsyncSession, *, core_type: str,
+) -> list[dict]:
+    """All active CoshCoreItem rows of the given core_type, sorted by
+    English translation. Used by the three flat Non-input lookups."""
+    cores = (await db.execute(
+        select(CoshCoreItem).where(
+            CoshCoreItem.core_type == core_type,
+            CoshCoreItem.status == "active",
+        )
+    )).scalars().all()
+    items = [
+        {"cosh_id": c.cosh_id, "name": _translation_en(c, c.cosh_id)}
+        for c in cores
+    ]
+    return sorted(items, key=lambda x: x["name"].casefold())
+
+
+async def list_planting_materials(db: AsyncSession) -> list[dict]:
+    return await _list_all_of_core_type(db, core_type="planting_material")
+
+
+async def list_itks(db: AsyncSession) -> list[dict]:
+    return await _list_all_of_core_type(db, core_type="itk_data")
+
+
+async def list_maturity_indices(db: AsyncSession) -> list[dict]:
+    return await _list_all_of_core_type(db, core_type="maturity_index")
