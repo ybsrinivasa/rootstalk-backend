@@ -1157,12 +1157,13 @@ async def get_dealer_order(
         return elements_by_practice.get(it.practice_id, [])
 
     def has_locked_brand_item(it: OrderItem) -> bool:
-        for e in _elements_for_item(it):
-            et = e.get("element_type") if isinstance(e, dict) else getattr(e, "element_type", None)
-            cr = e.get("cosh_ref") if isinstance(e, dict) else getattr(e, "cosh_ref", None)
-            if et == "brand" and cr:
-                return True
-        return False
+        # Batch 39I-b (2026-05-16) — read the authoritative
+        # Practice.is_brand_locked flag. The SE opts in to Brand Lock
+        # at authoring time; element presence on its own no longer
+        # implies a lock. Practices not loaded (defensive) are treated
+        # as unlocked.
+        practice = practice_map.get(it.practice_id) if it.practice_id else None
+        return bool(practice and practice.is_brand_locked)
 
     relations_payload: list[dict] = []
     for rel_id, rel_items in by_relation.items():
@@ -1993,9 +1994,11 @@ async def nearby_dealers(
       - Dealer pool always restricted to onboarded dealers (any
         active ClientPromoter row of type DEALER somewhere).
       - If `order_id` supplied: derive `client_id` from the order
-        and detect locked-brand items (any item whose Practice has
-        an Element with element_type='brand' AND a non-null
-        cosh_ref).
+        and detect locked-brand items.
+        Batch 39I-b (2026-05-16) — detection now reads
+        Practice.is_brand_locked instead of inferring from
+        element_type='brand'. The SE opts in to Brand Lock
+        explicitly at authoring time.
       - **Locked**: pool further restricted to dealers onboarded by
         the order's client. Tier = LOCKED_MATCH.
       - **Unlocked but client_id known**: client-onboarded dealers
@@ -2032,15 +2035,15 @@ async def nearby_dealers(
             )).scalars().all()
             practice_ids = [it.practice_id for it in order_items if it.practice_id]
             if practice_ids:
-                from app.modules.advisory.models import Element
-                els = (await db.execute(
-                    select(Element).where(
-                        Element.practice_id.in_(practice_ids),
-                        Element.element_type == "brand",
-                        Element.cosh_ref.isnot(None),
+                # Batch 39I-b: Practice.is_brand_locked is the
+                # authoritative flag.
+                locked_practices = (await db.execute(
+                    select(Practice.id).where(
+                        Practice.id.in_(practice_ids),
+                        Practice.is_brand_locked.is_(True),
                     )
-                )).scalars().all()
-                has_locked = bool(els)
+                )).all()
+                has_locked = bool(locked_practices)
 
     # Build the onboarded-dealer pool.
     onboarded_q = select(ClientPromoter).where(
