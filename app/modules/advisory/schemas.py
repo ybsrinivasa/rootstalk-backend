@@ -354,6 +354,9 @@ class PGPracticeCreate(BaseModel):
     l2_type: Optional[str] = None
     display_order: int = 0
     is_special_input: bool = False
+    # Batch 39P-e (2026-05-16) — UCAT means Practice shape is identical
+    # across pipes; Brand Lock applies to PG just as it applies to CCA.
+    is_brand_locked: bool = False
     frequency_days: Optional[int] = None
     elements: List["ElementIn"] = []
 

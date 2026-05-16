@@ -4374,16 +4374,17 @@ async def list_global_practices(
     return await _attach_elements_with_labels(db, practices)
 
 
-@router.post("/advisory/global/packages/{pkg_id}/timelines/{tl_id}/practices", response_model=PracticeOut, status_code=201)
-async def create_global_practice(
-    pkg_id: str, tl_id: str,
-    request: PracticeCreate,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """CCA Step 4 / Batch 4C-i.D: same L2 element rule book validation
-    as the client-side create_practice route. Batch 30 (2026-05-14):
-    l2_type required — no more "No sub-type" shells."""
+async def _create_practice_at_global_timeline(
+    db: AsyncSession, *,
+    timeline_id: str, request,
+) -> Practice:
+    """Pipe-agnostic atomic Practice create. Caller pre-validates the
+    Timeline belongs to a Global parent. Body shape accepted: any
+    Pydantic model exposing the Practice fields + `elements`. Used
+    by CCA Package + CHA-PG Global endpoints (Batch 39P-e,
+    2026-05-16). Validators (`assert_l2_elements_valid`,
+    `_assert_interval_fits_timeline`, `_validate_brand_lock`) are
+    identical across pipes per UCAT."""
     if not request.l2_type:
         raise HTTPException(status_code=422, detail={
             "code": "l2_type_required",
@@ -4399,32 +4400,24 @@ async def create_global_practice(
         )
     except L2ElementValidationError as e:
         _raise_l2_element_validation(e)
-    # Batch 34: frequency_too_long gate.
     await _assert_interval_fits_timeline(
         db, l2_type=request.l2_type,
-        elements=request.elements, timeline_id=tl_id,
+        elements=request.elements, timeline_id=timeline_id,
     )
     _validate_brand_lock(request)
 
     practice = Practice(
-        timeline_id=tl_id,
+        timeline_id=timeline_id,
         l0_type=request.l0_type,
         l1_type=request.l1_type,
         l2_type=request.l2_type,
         display_order=request.display_order,
         is_special_input=request.is_special_input,
-        is_brand_locked=request.is_brand_locked,
+        is_brand_locked=getattr(request, 'is_brand_locked', False),
         frequency_days=request.frequency_days,
     )
     db.add(practice)
-    # Batch 31-followup: flush so practice.id (default=new_uuid) is
-    # materialised before we reference it on the Element rows. Mirrors
-    # the client-scoped handler. Without this, Element.practice_id was
-    # NULL → NotNullViolation at commit. The bug never surfaced before
-    # because the L2 validator rejected every prod request earlier in
-    # the chain (Batches 27/29/31 fixed that path).
     await db.flush()
-    # Batch 39C-bugfix2: stamp display_order from the request position.
     for idx, elem in enumerate(request.elements):
         data = elem.model_dump()
         data["display_order"] = idx
@@ -4434,19 +4427,14 @@ async def create_global_practice(
     return practice
 
 
-@router.put("/advisory/global/packages/{pkg_id}/timelines/{tl_id}/practices/{practice_id}", response_model=PracticeOut)
-async def update_global_practice(
-    pkg_id: str, tl_id: str, practice_id: str,
-    request: PracticeCreate,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """Replace a Global Practice atomically (Batch 33). Accepts the
-    full PracticeCreate shape — l0/l1/l2 + elements list +
-    is_special_input + frequency_days. Runs the same L2 element
-    validator as create, then deletes the existing element rows and
-    inserts the new ones in a single transaction. Practice id stays
-    stable so any downstream references (relation_id, etc.) survive."""
+async def _update_practice_at_global_timeline(
+    db: AsyncSession, *,
+    timeline_id: str, practice_id: str, request,
+) -> Practice:
+    """Pipe-agnostic atomic Practice update. Caller pre-validates the
+    Timeline belongs to a Global parent. Same validators as create.
+    Replaces the Element set in one transaction; Practice.id stays
+    stable so downstream refs (relation_id) survive."""
     if not request.l2_type:
         raise HTTPException(status_code=422, detail={
             "code": "l2_type_required",
@@ -4454,7 +4442,7 @@ async def update_global_practice(
         })
     practice = (await db.execute(
         select(Practice).where(
-            Practice.id == practice_id, Practice.timeline_id == tl_id,
+            Practice.id == practice_id, Practice.timeline_id == timeline_id,
         )
     )).scalar_one_or_none()
     if practice is None:
@@ -4470,30 +4458,24 @@ async def update_global_practice(
         )
     except L2ElementValidationError as e:
         _raise_l2_element_validation(e)
-    # Batch 34: frequency_too_long gate.
     await _assert_interval_fits_timeline(
         db, l2_type=request.l2_type,
-        elements=request.elements, timeline_id=tl_id,
+        elements=request.elements, timeline_id=timeline_id,
     )
     _validate_brand_lock(request)
 
-    # Update the Practice scalar fields.
     practice.l0_type = request.l0_type
     practice.l1_type = request.l1_type
     practice.l2_type = request.l2_type
     practice.display_order = request.display_order
     practice.is_special_input = request.is_special_input
-    practice.is_brand_locked = request.is_brand_locked
+    practice.is_brand_locked = getattr(request, 'is_brand_locked', False)
     practice.frequency_days = request.frequency_days
 
-    # Atomically replace the element set. Delete-then-insert in one
-    # transaction; clearing first means we don't have to diff the old
-    # vs new element_type sets.
     await db.execute(
         Element.__table__.delete().where(Element.practice_id == practice_id)
     )
     await db.flush()
-    # Batch 39C-bugfix2: stamp display_order from the request position.
     for idx, elem in enumerate(request.elements):
         data = elem.model_dump()
         data["display_order"] = idx
@@ -4503,18 +4485,66 @@ async def update_global_practice(
     return practice
 
 
+@router.post("/advisory/global/packages/{pkg_id}/timelines/{tl_id}/practices", response_model=PracticeOut, status_code=201)
+async def create_global_practice(
+    pkg_id: str, tl_id: str,
+    request: PracticeCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Create a Practice on a Global CCA Timeline. Body shared with
+    CHA-PG sibling via `_create_practice_at_global_timeline`."""
+    return await _create_practice_at_global_timeline(
+        db, timeline_id=tl_id, request=request,
+    )
+
+
+@router.put("/advisory/global/packages/{pkg_id}/timelines/{tl_id}/practices/{practice_id}", response_model=PracticeOut)
+async def update_global_practice(
+    pkg_id: str, tl_id: str, practice_id: str,
+    request: PracticeCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Atomic Practice update on a Global CCA Timeline. Body shared
+    with CHA-PG sibling via `_update_practice_at_global_timeline`."""
+    return await _update_practice_at_global_timeline(
+        db, timeline_id=tl_id, practice_id=practice_id, request=request,
+    )
+
+
+async def _delete_practice_at_global_timeline(
+    db: AsyncSession, *, timeline_id: str, practice_id: str,
+) -> None:
+    """Pipe-agnostic Practice delete. Explicitly removes child Elements
+    first (the FK isn't `ON DELETE CASCADE`; `db.delete(practice)`
+    alone would orphan the Elements and trip the NOT NULL on
+    `element.practice_id`)."""
+    practice = (await db.execute(
+        select(Practice).where(
+            Practice.id == practice_id, Practice.timeline_id == timeline_id,
+        )
+    )).scalar_one_or_none()
+    if not practice:
+        raise HTTPException(status_code=404, detail="Practice not found")
+    await db.execute(
+        Element.__table__.delete().where(Element.practice_id == practice_id)
+    )
+    await db.delete(practice)
+    await db.commit()
+
+
 @router.delete("/advisory/global/packages/{pkg_id}/timelines/{tl_id}/practices/{practice_id}", status_code=204)
 async def delete_global_practice(
     pkg_id: str, tl_id: str, practice_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    result = await db.execute(select(Practice).where(Practice.id == practice_id, Practice.timeline_id == tl_id))
-    practice = result.scalar_one_or_none()
-    if not practice:
-        raise HTTPException(status_code=404, detail="Practice not found")
-    await db.delete(practice)
-    await db.commit()
+    """Delete a Practice on a Global CCA Timeline. Pipe-agnostic body
+    via `_delete_practice_at_global_timeline`."""
+    await _delete_practice_at_global_timeline(
+        db, timeline_id=tl_id, practice_id=practice_id,
+    )
 
 
 # ── CHA global-Practice per-element CRUD (Round 2) ─────────────────────────
@@ -5540,42 +5570,49 @@ async def add_global_pg_practice(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """CCA Step 4 / Batch 4C-i.D: L2 element rule book validation also
-    applies to PG-recommendation practices — same shape as PoP."""
-    try:
-        await assert_l2_elements_valid(
-            db,
-            l2_type=request.l2_type,
-            elements=request.elements,
-            is_special_input=request.is_special_input,
-            frequency_days=request.frequency_days,
-        )
-    except L2ElementValidationError as e:
-        _raise_l2_element_validation(e)
-
-    practice = Practice(
-        timeline_id=tl_id,
-        l0_type=request.l0_type,
-        l1_type=request.l1_type,
-        l2_type=request.l2_type,
-        display_order=request.display_order,
-        is_special_input=request.is_special_input,
-        frequency_days=request.frequency_days,
+    """Create a Practice on a Global CHA-PG Timeline. Body validator,
+    Brand Lock + frequency rules, and persistence shared with the CCA
+    sibling via `_create_practice_at_global_timeline` (Batch 39P-e,
+    2026-05-16)."""
+    await _get_global_pg_timeline(db, pg_id, tl_id)
+    return await _create_practice_at_global_timeline(
+        db, timeline_id=tl_id, request=request,
     )
-    db.add(practice)
-    await db.flush()
-    for el in request.elements:
-        db.add(Element(
-            practice_id=practice.id,
-            element_type=el.element_type,
-            cosh_ref=el.cosh_ref,
-            value=el.value,
-            unit_cosh_id=el.unit_cosh_id,
-            display_order=el.display_order,
-        ))
-    await db.commit()
-    await db.refresh(practice)
-    return practice
+
+
+@router.put(
+    "/advisory/global/pg-recommendations/{pg_id}/timelines/{tl_id}/practices/{practice_id}",
+    response_model=PracticeOut,
+)
+async def update_global_pg_practice(
+    pg_id: str, tl_id: str, practice_id: str,
+    request: PGPracticeCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Atomic Practice update on a Global CHA-PG Timeline. Mirror of
+    the CCA sibling (Batch 39P-e, 2026-05-16)."""
+    await _get_global_pg_timeline(db, pg_id, tl_id)
+    return await _update_practice_at_global_timeline(
+        db, timeline_id=tl_id, practice_id=practice_id, request=request,
+    )
+
+
+@router.delete(
+    "/advisory/global/pg-recommendations/{pg_id}/timelines/{tl_id}/practices/{practice_id}",
+    status_code=204,
+)
+async def delete_global_pg_practice(
+    pg_id: str, tl_id: str, practice_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete a Practice on a Global CHA-PG Timeline. Pipe-agnostic
+    body via `_delete_practice_at_global_timeline`."""
+    await _get_global_pg_timeline(db, pg_id, tl_id)
+    await _delete_practice_at_global_timeline(
+        db, timeline_id=tl_id, practice_id=practice_id,
+    )
 
 
 # ── CHA global-PG per-element CRUD (Round 2) ───────────────────────────────
