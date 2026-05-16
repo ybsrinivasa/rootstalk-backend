@@ -41,7 +41,7 @@ from app.services.cosh_options_view import (
     list_incomplete_cosh_data_for_l2,
     list_itks,
     list_manufacturers_for_common_name,
-    list_maturity_indices,
+    list_maturity_indices_for_crop,
     list_planting_materials,
     list_trade_names_for_common_name,
     list_units_for_l2,
@@ -844,9 +844,45 @@ async def test_list_itks_reads_itk_data_core(db):
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_list_maturity_indices_returns_all_active(db):
+async def test_list_maturity_indices_filters_by_crop(db):
+    """Filters via the `maturity_index_crops` Connect — only indices
+    linked to the given biological_names cosh_id surface."""
     db.add(_core("mi-1", "maturity_index", "Colour change"))
     db.add(_core("mi-2", "maturity_index", "Brix value"))
+    db.add(_core("mi-3", "maturity_index", "Firmness"))
+    db.add(_core("crop-tomato", "biological_names", "Tomato"))
+    db.add(_core("crop-mango", "biological_names", "Mango"))
+    # Tomato gets mi-1 + mi-2; Mango gets mi-2 + mi-3.
+    db.add(_connect2("mic-1", "maturity_index_crops",
+                     "maturity_index", "mi-1",
+                     "biological_names", "crop-tomato"))
+    db.add(_connect2("mic-2", "maturity_index_crops",
+                     "maturity_index", "mi-2",
+                     "biological_names", "crop-tomato"))
+    db.add(_connect2("mic-3", "maturity_index_crops",
+                     "maturity_index", "mi-2",
+                     "biological_names", "crop-mango"))
+    db.add(_connect2("mic-4", "maturity_index_crops",
+                     "maturity_index", "mi-3",
+                     "biological_names", "crop-mango"))
     await db.commit()
-    out = await list_maturity_indices(db)
+    out = await list_maturity_indices_for_crop(db, crop_cosh_id="crop-tomato")
     assert [o["name"] for o in out] == ["Brix value", "Colour change"]
+    out = await list_maturity_indices_for_crop(db, crop_cosh_id="crop-mango")
+    assert [o["name"] for o in out] == ["Brix value", "Firmness"]
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_list_maturity_indices_unknown_crop_returns_empty(db):
+    """A crop with no Connect coverage returns an empty list — the SE
+    sees an empty dropdown and either picks a different crop or asks
+    the data team to extend the mapping."""
+    db.add(_core("mi-1", "maturity_index", "Colour change"))
+    db.add(_core("crop-tomato", "biological_names", "Tomato"))
+    db.add(_connect2("mic-1", "maturity_index_crops",
+                     "maturity_index", "mi-1",
+                     "biological_names", "crop-tomato"))
+    await db.commit()
+    out = await list_maturity_indices_for_crop(db, crop_cosh_id="crop-unknown")
+    assert out == []

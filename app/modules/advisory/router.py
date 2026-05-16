@@ -3941,14 +3941,17 @@ async def cosh_itks(
 
 @router.get("/cosh/options/maturity-indices")
 async def cosh_maturity_indices(
+    crop: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Options for the MATURITY_INDEX element under L2 HARVESTING_MANUAL
     (Non-input L0). The L2 is labelled 'Manual Harvesting' in the UX
-    but stored as HARVESTING_MANUAL in the taxonomy."""
-    from app.services.cosh_options_view import list_maturity_indices
-    return await list_maturity_indices(db)
+    but stored as HARVESTING_MANUAL in the taxonomy. `crop` is the
+    package's biological_names cosh_id — only maturity indices linked
+    to that crop via Cosh's `maturity_index_crops` Connect surface."""
+    from app.services.cosh_options_view import list_maturity_indices_for_crop
+    return await list_maturity_indices_for_crop(db, crop_cosh_id=crop)
 
 
 # Diagnosis lookups moved to `app/modules/diagnosis/router.py` in

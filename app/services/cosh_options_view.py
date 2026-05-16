@@ -649,18 +649,21 @@ async def list_ai_concentrations(
 
 
 # ── Non-input Cores (2026-05-16) ──────────────────────────────────────
-# Three flat lookups for Non-input L0 element forms. No L2 filter, no
-# cascade — every active Cosh row of the named core_type surfaces.
+# Three lookups for Non-input L0 element forms:
 #
-#   PLANTING_MATERIAL_QUANTITY.PLANTING_MATERIAL  → planting_material
-#   ITKS.ITK_NAME                                 → itk_data
-#   HARVESTING_MANUAL.MATURITY_INDEX              → maturity_index
+#   PLANTING_MATERIAL_QUANTITY.PLANTING_MATERIAL  → planting_material  (flat)
+#   ITKS.ITK_NAME                                 → itk_data           (flat)
+#   HARVESTING_MANUAL.MATURITY_INDEX              → maturity_index     (crop-filtered)
+#
+# Planting Material and ITKs are flat — every active row surfaces.
+# Maturity Index narrows to the rows linked to the package's crop via
+# the `maturity_index_crops` Connect (maturity_index × biological_names).
 
 async def _list_all_of_core_type(
     db: AsyncSession, *, core_type: str,
 ) -> list[dict]:
     """All active CoshCoreItem rows of the given core_type, sorted by
-    English translation. Used by the three flat Non-input lookups."""
+    English translation. Used by the flat Non-input lookups."""
     cores = (await db.execute(
         select(CoshCoreItem).where(
             CoshCoreItem.core_type == core_type,
@@ -682,5 +685,25 @@ async def list_itks(db: AsyncSession) -> list[dict]:
     return await _list_all_of_core_type(db, core_type="itk_data")
 
 
-async def list_maturity_indices(db: AsyncSession) -> list[dict]:
-    return await _list_all_of_core_type(db, core_type="maturity_index")
+async def list_maturity_indices_for_crop(
+    db: AsyncSession, *, crop_cosh_id: str,
+) -> list[dict]:
+    """Maturity indices linked to the given biological_names cosh_id via
+    the `maturity_index_crops` Connect. Crops outside the Connect's
+    coverage return an empty list — the SE then either picks a different
+    crop or asks the data team to extend the Cosh-side mapping."""
+    from app.services.cosh_constants import COSH_MATURITY_INDEX_CROPS_CONNECT
+    rows = await _walk_connect(
+        db, connect_type=COSH_MATURITY_INDEX_CROPS_CONNECT,
+    )
+    mi_ids: set[str] = set()
+    for r in rows:
+        ep = {e.get("role"): e.get("cosh_id") for e in (r.endpoints or [])}
+        if ep.get("biological_names") != crop_cosh_id:
+            continue
+        mi = ep.get("maturity_index")
+        if mi:
+            mi_ids.add(mi)
+    return await _resolve_names(
+        db, core_type="maturity_index", cosh_ids=mi_ids,
+    )

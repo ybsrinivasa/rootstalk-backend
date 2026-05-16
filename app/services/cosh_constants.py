@@ -96,6 +96,15 @@ COSH_TRADENAME_MANUFACTURER_CONNECT = "tradename_manufacturer"
 COSH_TRADENAME_FORMULATION_CONNECT = "tradename_formulation"
 COSH_TRADENAME_AI_CONNECT = "tradename_ai"
 
+# Non-input Cores (synced 2026-05-16). Flat Cosh Cores driving the three
+# Non-input element dropdowns: PLANTING_MATERIAL_QUANTITY → planting_material,
+# ITKS → itk_data, HARVESTING_MANUAL → maturity_index. Maturity indices are
+# additionally crop-filtered via the `maturity_index_crops` Connect.
+COSH_PLANTING_MATERIAL_CORE = "planting_material"
+COSH_ITK_DATA_CORE = "itk_data"
+COSH_MATURITY_INDEX_CORE = "maturity_index"
+COSH_MATURITY_INDEX_CROPS_CONNECT = "maturity_index_crops"
+
 # ── Pest Diagnosis (synced 2026-05-14) ────────────────────────────────────
 #
 # Cosh ships one Connect — `pest_diagnosis` — that's 9 endpoints wide
