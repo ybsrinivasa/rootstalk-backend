@@ -50,6 +50,9 @@ async def _seed_brand_locked_order(db):
     )
     p = await make_practice(
         db, tl, l0=PracticeL0.INPUT, l1="PESTICIDE", l2="MANCOZEB",
+        # Batch 39I-a — Brand Lock is now driven by the explicit
+        # is_brand_locked flag, not by element-presence inference.
+        is_brand_locked=True,
     )
     # Brand-lock element: element_type='brand' + cosh_ref set.
     await make_element(
@@ -124,7 +127,10 @@ async def test_brand_options_falls_back_to_master_when_snapshot_id_null(db):
         db, package, name="LEGACY_TL",
         from_type=TimelineFromType.DAS, from_value=0, to_value=30,
     )
-    p = await make_practice(db, tl, l0=PracticeL0.INPUT, l1="PESTICIDE")
+    p = await make_practice(
+        db, tl, l0=PracticeL0.INPUT, l1="PESTICIDE",
+        is_brand_locked=True,
+    )
     await make_element(
         db, p, element_type="brand", value=None,
         unit_cosh_id=None, cosh_ref="brand:legacy-locked",
@@ -182,6 +188,7 @@ async def test_dealer_order_detail_locked_brand_uses_snapshot(db):
     p_locked = await make_practice(
         db, tl, l0=PracticeL0.INPUT, l1="PESTICIDE", l2="MANCOZEB",
         relation=relation, relation_role="PART_1__OPT_1__POS_1",
+        is_brand_locked=True,
     )
     await make_element(
         db, p_locked, element_type="brand", value=None,

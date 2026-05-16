@@ -74,9 +74,14 @@ async def _seed_order_with_locked_brand(
     await db.flush()
 
     tl = await make_timeline(db, package, name="TL")
-    practice = await make_practice(db, tl, l1="PESTICIDE", l2="MANCOZEB")
+    practice = await make_practice(
+        db, tl, l1="PESTICIDE", l2="MANCOZEB",
+        is_brand_locked=has_locked,
+    )
     if has_locked:
-        # Brand-lock signature: element_type='brand', cosh_ref non-null.
+        # Brand-lock signature (Batch 39I-a): is_brand_locked=True on
+        # the Practice, plus the BRAND_NAME / legacy 'brand' element
+        # carrying the locked Trade Name cosh_ref.
         db.add(Element(
             practice_id=practice.id,
             element_type="brand",

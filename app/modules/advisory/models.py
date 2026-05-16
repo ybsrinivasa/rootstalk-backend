@@ -325,6 +325,14 @@ class Practice(Base):
     is_special_input: Mapped[bool] = mapped_column(Boolean, default=False)
     common_name_cosh_id: Mapped[str] = mapped_column(String(100), nullable=True)
     frequency_days: Mapped[int] = mapped_column(Integer, nullable=True)
+    # Batch 39I-a (2026-05-16) — explicit per-Practice Brand Lock flag.
+    # Only meaningful when a BRAND_NAME element is set. Drives the
+    # downstream order-routing rule ("locked-brand items can only be
+    # fulfilled by the company's onboarded dealers") and the dealer
+    # brand picker ("disabled for locked-brand items"). The legacy
+    # BL-07 "lock by element presence" inference is superseded by this
+    # explicit flag.
+    is_brand_locked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     timeline: Mapped["Timeline"] = relationship("Timeline", back_populates="practices")

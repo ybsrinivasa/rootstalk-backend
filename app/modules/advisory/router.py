@@ -104,6 +104,24 @@ def _raise_timeline_validation(e: TimelineValidationError):
     )
 
 
+def _validate_brand_lock(request: "PracticeCreate") -> None:
+    """Batch 39I-a (2026-05-16) — `is_brand_locked=True` is only valid
+    when the Practice carries a BRAND_NAME element with a non-empty
+    cosh_ref. The SE opts in to brand-lock per Practice; the flag is
+    meaningless without a Trade Name."""
+    if not request.is_brand_locked:
+        return
+    has_brand = any(
+        e.element_type == "BRAND_NAME" and (e.cosh_ref or "").strip()
+        for e in request.elements
+    )
+    if not has_brand:
+        raise HTTPException(status_code=422, detail={
+            "code": "brand_lock_requires_brand_name",
+            "message": "Lock Brand requires a Trade Name (BRAND_NAME) to be set on the Practice.",
+        })
+
+
 async def _assert_cm_can_edit_client(
     db: AsyncSession, user_id: str, client_id: str,
 ) -> None:
@@ -1568,6 +1586,7 @@ async def create_practice(
         db, l2_type=request.l2_type,
         elements=request.elements, timeline_id=timeline_id,
     )
+    _validate_brand_lock(request)
 
     practice = Practice(
         timeline_id=timeline_id,
@@ -1576,6 +1595,7 @@ async def create_practice(
         l2_type=request.l2_type,
         display_order=request.display_order,
         is_special_input=request.is_special_input,
+        is_brand_locked=request.is_brand_locked,
         frequency_days=request.frequency_days,
     )
     db.add(practice)
@@ -1633,12 +1653,14 @@ async def update_practice(
         db, l2_type=request.l2_type,
         elements=request.elements, timeline_id=timeline_id,
     )
+    _validate_brand_lock(request)
 
     practice.l0_type = request.l0_type
     practice.l1_type = request.l1_type
     practice.l2_type = request.l2_type
     practice.display_order = request.display_order
     practice.is_special_input = request.is_special_input
+    practice.is_brand_locked = request.is_brand_locked
     practice.frequency_days = request.frequency_days
 
     await db.execute(
@@ -3899,6 +3921,7 @@ async def _attach_elements_with_labels(
             "l0_type": p.l0_type, "l1_type": p.l1_type, "l2_type": p.l2_type,
             "display_order": p.display_order,
             "is_special_input": p.is_special_input,
+            "is_brand_locked": p.is_brand_locked,
             "relation_id": p.relation_id,
             "created_at": p.created_at,
             "elements": by_practice.get(p.id, []),
@@ -3951,6 +3974,7 @@ async def create_global_practice(
         db, l2_type=request.l2_type,
         elements=request.elements, timeline_id=tl_id,
     )
+    _validate_brand_lock(request)
 
     practice = Practice(
         timeline_id=tl_id,
@@ -3959,6 +3983,7 @@ async def create_global_practice(
         l2_type=request.l2_type,
         display_order=request.display_order,
         is_special_input=request.is_special_input,
+        is_brand_locked=request.is_brand_locked,
         frequency_days=request.frequency_days,
     )
     db.add(practice)
@@ -4020,6 +4045,7 @@ async def update_global_practice(
         db, l2_type=request.l2_type,
         elements=request.elements, timeline_id=tl_id,
     )
+    _validate_brand_lock(request)
 
     # Update the Practice scalar fields.
     practice.l0_type = request.l0_type
@@ -4027,6 +4053,7 @@ async def update_global_practice(
     practice.l2_type = request.l2_type
     practice.display_order = request.display_order
     practice.is_special_input = request.is_special_input
+    practice.is_brand_locked = request.is_brand_locked
     practice.frequency_days = request.frequency_days
 
     # Atomically replace the element set. Delete-then-insert in one

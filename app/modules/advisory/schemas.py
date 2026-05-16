@@ -184,6 +184,11 @@ class PracticeCreate(BaseModel):
     l2_type: Optional[str] = None
     display_order: int = 0
     is_special_input: bool = False
+    # Batch 39I-a (2026-05-16) — SE opts in per Practice. Server
+    # validates the flag is only True when a BRAND_NAME element is
+    # supplied; otherwise the request is rejected with
+    # `brand_lock_requires_brand_name`.
+    is_brand_locked: bool = False
     frequency_days: Optional[int] = None
     elements: List[ElementIn] = []
 
@@ -196,6 +201,7 @@ class PracticeOut(BaseModel):
     l2_type: Optional[str] = None
     display_order: int
     is_special_input: bool
+    is_brand_locked: bool = False
     relation_id: Optional[str] = None
     created_at: datetime
 
@@ -232,6 +238,7 @@ class PracticeWithElementsOut(BaseModel):
     l2_type: Optional[str] = None
     display_order: int
     is_special_input: bool
+    is_brand_locked: bool = False
     relation_id: Optional[str] = None
     created_at: datetime
     elements: list[ElementWithLabelOut] = []

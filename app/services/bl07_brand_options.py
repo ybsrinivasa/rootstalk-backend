@@ -122,45 +122,60 @@ async def get_brand_options(
     from app.modules.orders.models import DealerRelationship
     from app.modules.sync.models import CoshCoreItem
 
+    # Batch 39I-a (2026-05-16) — Practice.is_brand_locked is now the
+    # authoritative lock flag. We always load the Practice (even when a
+    # snapshot is present) to read the flag; snapshot content is used
+    # only for element values, which is what Rule 5 protects.
+    practice = (await db.execute(
+        select(Practice).where(Practice.id == practice_id)
+    )).scalar_one_or_none()
+    if practice is None:
+        return BrandOptionsResult(is_locked=False)
+
     elements = _practice_elements_from_snapshot(snapshot, practice_id)
     if elements is None:
         # No snapshot or practice not found inside snapshot — fall back to master.
-        practice = (await db.execute(
-            select(Practice).where(Practice.id == practice_id)
-        )).scalar_one_or_none()
-        if not practice:
-            return BrandOptionsResult(is_locked=False)
         elements = (await db.execute(
             select(Element).where(Element.practice_id == practice_id)
         )).scalars().all()
 
-    # Check for locked brand: element_type == 'brand' with a specific cosh_ref
-    locked_el = next(
-        (e for e in elements
-         if _el_field(e, "element_type") == "brand" and _el_field(e, "cosh_ref")),
-        None,
-    )
-    if locked_el:
-        locked_cosh_ref = _el_field(locked_el, "cosh_ref")
-        brand_entry = (await db.execute(
-            select(CoshCoreItem).where(
-                CoshCoreItem.cosh_id == locked_cosh_ref,
-                CoshCoreItem.core_type == "brand",
-            )
-        )).scalar_one_or_none()
-        brand_name = None
-        if brand_entry and brand_entry.translations:
-            brand_name = brand_entry.translations.get("en") or locked_cosh_ref
-        return BrandOptionsResult(
-            is_locked=True,
-            locked_brand_cosh_id=locked_cosh_ref,
-            locked_brand_name=brand_name or locked_cosh_ref,
+    # Locked: the SE checked Lock Brand on this Practice. The locked
+    # Trade Name comes from the BRAND_NAME element (legacy lowercase
+    # 'brand' element_type also supported for any pre-39I-a rows that
+    # may have been authored against the older schema).
+    if practice.is_brand_locked:
+        locked_el = next(
+            (e for e in elements
+             if _el_field(e, "element_type") in ("BRAND_NAME", "brand")
+             and _el_field(e, "cosh_ref")),
+            None,
         )
+        if locked_el:
+            locked_cosh_ref = _el_field(locked_el, "cosh_ref")
+            brand_entry = (await db.execute(
+                select(CoshCoreItem).where(
+                    CoshCoreItem.cosh_id == locked_cosh_ref,
+                )
+            )).scalar_one_or_none()
+            brand_name = None
+            if brand_entry and brand_entry.translations:
+                brand_name = brand_entry.translations.get("en") or locked_cosh_ref
+            return BrandOptionsResult(
+                is_locked=True,
+                locked_brand_cosh_id=locked_cosh_ref,
+                locked_brand_name=brand_name or locked_cosh_ref,
+            )
+        # is_brand_locked was True but BRAND_NAME was wiped from the
+        # snapshot — defensive: fall through to the unlocked branch
+        # rather than emit half-locked state. The Practice should be
+        # repaired by re-saving via the SA portal (the validation
+        # catches the same gap on write).
 
-    # Unlocked brand — find available brands from cosh_core_items
+    # Unlocked brand — find available brands from cosh_core_items.
     common_name_el = next(
         (e for e in elements
-         if _el_field(e, "element_type") == "common_name" and _el_field(e, "cosh_ref")),
+         if _el_field(e, "element_type") in ("COMMON_NAME", "common_name")
+         and _el_field(e, "cosh_ref")),
         None,
     )
     common_name_cosh_id = _el_field(common_name_el, "cosh_ref") if common_name_el else None

@@ -458,6 +458,7 @@ async def make_practice(
     l2: str | None = "UREA", display_order: int = 0,
     relation: Relation | None = None, relation_role: str | None = None,
     is_special_input: bool = False, frequency_days: int | None = None,
+    is_brand_locked: bool = False,
 ) -> Practice:
     p = Practice(
         timeline_id=timeline.id, l0_type=l0, l1_type=l1, l2_type=l2,
@@ -465,6 +466,7 @@ async def make_practice(
         relation_id=relation.id if relation else None,
         relation_role=relation_role, is_special_input=is_special_input,
         frequency_days=frequency_days,
+        is_brand_locked=is_brand_locked,
     )
     db.add(p)
     await db.flush()
