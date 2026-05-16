@@ -55,6 +55,7 @@ from app.services.pv_consistency import (
 )
 from app.services.publish_validation import (
     PublishBlockedError, assert_package_publish_ready,
+    assert_global_package_publish_ready,
 )
 from app.services.timeline_validation import (
     TimelineValidationError, validate_timeline,
@@ -3533,6 +3534,23 @@ async def publish_global_package(
     res = validate_publish_transition(current_status)
     if not res.allowed:
         _raise_publish_transition(res)
+    # Batch 39L-a (2026-05-16) — content gate: ≥1 active Timeline,
+    # every active Timeline ≥1 Practice. Raises PublishBlockedError
+    # mapped to a 422 with the full failure list.
+    try:
+        await assert_global_package_publish_ready(db, package=pkg)
+    except PublishBlockedError as e:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "publish_blocked",
+                "message": "Package is not ready for publish.",
+                "missing": [
+                    {"code": m.code, "message": m.message, "extra": m.extra}
+                    for m in e.missing
+                ],
+            },
+        )
     pkg.version = compute_publish_version(
         current_version=pkg.version, was_published=pkg.published_at is not None,
     )

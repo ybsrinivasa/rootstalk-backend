@@ -297,3 +297,49 @@ async def assert_package_publish_ready(
 
     if missing:
         raise PublishBlockedError(missing)
+
+
+async def assert_global_package_publish_ready(
+    db: AsyncSession, *, package: Package,
+) -> None:
+    """Batch 39L-a (2026-05-16) — content gates for Global Package
+    publish on the SA portal. Lighter than the CA-side
+    `assert_package_publish_ready` (districts / PV-siblings / authors
+    / locations are CA-flavoured concerns). The CM-stated rules:
+
+      - At least one active Timeline on the package.
+      - Every active Timeline carries at least one Practice.
+
+    Returns the complete list of failures so the publish modal shows
+    one consolidated checklist."""
+    from app.modules.advisory.models import Practice, TimelineStatus
+
+    missing: list[MissingPublishField] = []
+    timelines = (await db.execute(
+        select(Timeline).where(
+            Timeline.package_id == package.id,
+            Timeline.status != TimelineStatus.INACTIVE,
+        )
+    )).scalars().all()
+
+    if not timelines:
+        missing.append(MissingPublishField(
+            code="publish_no_timelines",
+            message="Add at least one Timeline before publishing.",
+        ))
+    else:
+        for tl in timelines:
+            count = (await db.execute(
+                select(func.count()).select_from(Practice).where(
+                    Practice.timeline_id == tl.id,
+                )
+            )).scalar() or 0
+            if count == 0:
+                missing.append(MissingPublishField(
+                    code="publish_timeline_empty",
+                    message=f"Timeline '{tl.name}' has no Practices.",
+                    extra={"timeline_id": tl.id, "timeline_name": tl.name},
+                ))
+
+    if missing:
+        raise PublishBlockedError(missing)
