@@ -105,6 +105,33 @@ COSH_ITK_DATA_CORE = "itk_data"
 COSH_MATURITY_INDEX_CORE = "maturity_index"
 COSH_MATURITY_INDEX_CROPS_CONNECT = "maturity_index_crops"
 
+# ── SP × PG × Crop applicability (Cosh shipped 2026-05-14) ───────────────
+#
+# Cosh's `sp_pg_crops` Connect ties each Specific Problem (SP) to one
+# Problem Group (PG) and one crop. 3-endpoint shape per row:
+#
+#   pos 1: biological_names   ← the **SP** (the specific organism /
+#                                 pest / pathogen). Same Core as crop,
+#                                 disambiguated by position.
+#   pos 2: problem_groups     ← the PG (e.g. Fungal Diseases).
+#   pos 3: biological_names   ← the **crop**.
+#
+# 1,633 rows in the first prod sync. Bridge between Cosh's pest-side
+# taxonomy and RootsTalk's PG / SP authoring surfaces: a SP is only
+# applicable to a given crop if a row exists in this Connect. Drives:
+#
+#   • "applicable crops" chips on each PG card (SA portal CHA list).
+#   • crop-filter on SE's Add Specific-Problem picker.
+#   • PG-filter on SE's Add Crop picker (reverse direction).
+
+COSH_PROBLEM_GROUPS_CORE = "problem_groups"
+COSH_SP_PG_CROPS_CONNECT = "sp_pg_crops"
+
+SPPC_POS_SP = 1
+SPPC_POS_PG = 2
+SPPC_POS_CROP = 3
+
+
 # ── Pest Diagnosis (synced 2026-05-14) ────────────────────────────────────
 #
 # Cosh ships one Connect — `pest_diagnosis` — that's 9 endpoints wide

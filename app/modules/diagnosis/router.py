@@ -842,3 +842,59 @@ async def diagnosis_google_search_query(
         symptom_name=sym_name,
     )
     return {"query": query}
+
+
+# ── SP × PG × Crop applicability (Batch 39Q, 2026-05-16) ──────────────────
+#
+# Reads through Cosh's `sp_pg_crops` Connect (1,633 rows). Three lookup
+# directions: crops-for-PG, PGs-for-crop, SPs-for-(PG,crop). Used by the
+# CHA-Global authoring UI (crop chips on each PG card) and the SE's
+# Add Specific-Problem picker (crop-scoped SP list).
+
+
+@router.get("/diagnosis/pg-crops")
+async def diagnosis_pg_crops(
+    pg: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Crops applicable to a Problem Group.
+
+    Args (querystring):
+      pg — `problem_groups` Core cosh_id.
+
+    Returns:
+      `{"items": [{"cosh_id", "name_en"}, ...]}` sorted by name.
+      Empty `items` when the PG has no rows or is unknown."""
+    from app.services.sp_pg_crops_view import list_crops_for_pg
+    items = await list_crops_for_pg(db, pg_cosh_id=pg)
+    return {"items": items}
+
+
+@router.get("/diagnosis/pg-by-crop")
+async def diagnosis_pg_by_crop(
+    crop: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Problem Groups applicable to a crop. Reverse of /pg-crops."""
+    from app.services.sp_pg_crops_view import list_pgs_for_crop
+    items = await list_pgs_for_crop(db, crop_cosh_id=crop)
+    return {"items": items}
+
+
+@router.get("/diagnosis/sps-by-pg-crop")
+async def diagnosis_sps_by_pg_crop(
+    pg: str,
+    crop: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Specific Problems at the (PG, crop) intersection. Drives the
+    SE's Add Specific-Problem picker when authoring SP-level
+    recommendations under a PG that's scoped to a crop bundle."""
+    from app.services.sp_pg_crops_view import list_sps_for_pg_crop
+    items = await list_sps_for_pg_crop(
+        db, pg_cosh_id=pg, crop_cosh_id=crop,
+    )
+    return {"items": items}
