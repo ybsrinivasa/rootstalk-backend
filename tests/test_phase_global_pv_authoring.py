@@ -1,17 +1,18 @@
-"""Global PV authoring (Batch 9, 2026-05-11).
+"""Global PV authoring (Batch 9, 2026-05-11; updated Batch 39N-a
+2026-05-16 — push no longer carries Global PVs to Local).
 
 The CM needs to set a parameter-variable signature on Global
 Packages so multiple Globals for the same crop are distinguishable
-(e.g. Tomato-Drip vs Tomato-Flood). On push, the signature
-deep-copies to the Local Package; the client-side §4.2 sibling
-check picks it up.
+(e.g. Tomato-Drip vs Tomato-Flood). Per Batch 39N-a, the Global's
+PV signature is an SA-side identifier ONLY — at push time Ram
+re-picks PVs in the form (catalogue-only); Global PVs are NOT
+carried across.
 
 Coverage:
   - Global Parameter CRUD with client_id IS NULL.
   - Global Variable add under Global Parameter.
   - Set/get Global PackageVariable fingerprint.
-  - push deep-copies PVs from Global to Local.
-  - pull deep-copies PVs likewise.
+  - push does NOT carry Global PVs — Local takes the form's PVs.
   - CA-side `list_parameters` returns both client-scoped AND
     Global Parameters so the SE sees the inherited ones.
 """
@@ -31,11 +32,11 @@ from app.modules.advisory.router import (
     create_global_parameter, create_global_variable,
     list_global_package_variables, list_global_parameters,
     list_global_variables, list_parameters,
-    pull_global_package, push_global_package,
-    set_global_package_variables,
+    push_global_package, set_global_package_variables,
 )
 from app.modules.advisory.schemas import (
-    ParameterCreate, PackageVariableSet, VariableCreate, VariableNameIn,
+    PackagePushRequest, ParameterCreate, PackageVariableSet,
+    VariableCreate, VariableNameIn,
 )
 
 
@@ -50,7 +51,8 @@ from app.modules.clients.models import ClientCrop, ClientUserRole
 from app.modules.platform.models import StatusEnum
 from tests.conftest import requires_docker
 from tests.factories import (
-    make_client, make_client_user, make_cm_assignment, make_user,
+    make_client, make_client_user, make_cm_assignment,
+    make_push_request_body, make_user,
 )
 
 
@@ -240,91 +242,64 @@ async def test_set_global_package_variables_replaces_existing(db):
     assert out[0]["variable_id"] == v2.id
 
 
-# ── push + pull deep-copy ─────────────────────────────────────────────────
+# ── push isolates Global PVs from Local (Batch 39N-a) ─────────────────────
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_push_deep_copies_global_pv_signature_to_local(db):
-    """When CM pushes a Global with PVs set, the new Local DRAFT
-    inherits the PackageVariable rows pointing at the same
-    Parameter and Variable ids (no row cloning)."""
+async def test_push_does_not_carry_global_pvs_to_local(db):
+    """Global has PVs (Drip irrigation). At push time, Ram re-picks
+    PVs in the form (Flood) — the resulting Local takes the form's
+    PVs, NOT Global's. Per Batch 39N-a, Global PVs are an SA-side
+    identifier only."""
     cm = await make_user(db, name="CM")
     client = await make_client(db)
     await make_cm_assignment(db, user=cm, client=client)
 
-    param = await create_global_parameter(
+    # Global PV (Drip).
+    global_param = await create_global_parameter(
         request=ParameterCreate(crop_cosh_id="crop:tomato", name="Irrigation", variables=_SEED_VARS),
         db=db, current_user=cm,
     )
     drip = await create_global_variable(
-        parameter_id=param.id, request=VariableCreate(parameter_id=param.id, name="Drip"),
+        parameter_id=global_param.id,
+        request=VariableCreate(parameter_id=global_param.id, name="Drip"),
+        db=db, current_user=cm,
+    )
+    flood = await create_global_variable(
+        parameter_id=global_param.id,
+        request=VariableCreate(parameter_id=global_param.id, name="Flood"),
         db=db, current_user=cm,
     )
     pkg = await _seed_global_pkg(db, crop="crop:tomato")
     db.add(ClientCrop(client_id=client.id, crop_cosh_id="crop:tomato"))
     await set_global_package_variables(
         pkg_id=pkg.id,
-        request=PackageVariableSet(assignments=[{"parameter_id": param.id, "variable_id": drip.id}]),
+        request=PackageVariableSet(assignments=[
+            {"parameter_id": global_param.id, "variable_id": drip.id},
+        ]),
         db=db, current_user=cm,
     )
     await db.commit()
 
+    # Push-form body: Ram picks Flood, not Drip.
+    body = await make_push_request_body(db, client=client, src=pkg)
+    body["pv_assignments"] = [
+        {"parameter_id": global_param.id, "variable_id": flood.id},
+    ]
+    await db.commit()
+
     local = await push_global_package(
-        client_id=client.id, pkg_id=pkg.id, db=db, current_user=cm,
+        client_id=client.id, pkg_id=pkg.id,
+        request=PackagePushRequest(**body),
+        db=db, current_user=cm,
     )
     pvs = (await db.execute(
         select(PackageVariable).where(PackageVariable.package_id == local.id)
     )).scalars().all()
     assert len(pvs) == 1
-    assert pvs[0].parameter_id == param.id  # same Global Parameter row
-    assert pvs[0].variable_id == drip.id    # same Global Variable row
-
-
-@requires_docker
-@pytest.mark.asyncio
-async def test_pull_deep_copies_pv_signature_too(db):
-    """SE pulling a refresh gets the same PV inheritance — keeps
-    the lineage's discriminator stable across pulls."""
-    cm = await make_user(db, name="CM")
-    se = await make_user(db, name="SE")
-    client = await make_client(db)
-    await make_cm_assignment(db, user=cm, client=client)
-    cu = await make_client_user(db, user=se, client=client)
-    cu.role = ClientUserRole.SUBJECT_EXPERT
-    cu.status = StatusEnum.ACTIVE
-
-    param = await create_global_parameter(
-        request=ParameterCreate(crop_cosh_id="crop:tomato", name="Irrigation", variables=_SEED_VARS),
-        db=db, current_user=cm,
-    )
-    drip = await create_global_variable(
-        parameter_id=param.id, request=VariableCreate(parameter_id=param.id, name="Drip"),
-        db=db, current_user=cm,
-    )
-    pkg = await _seed_global_pkg(db, crop="crop:tomato")
-    db.add(ClientCrop(client_id=client.id, crop_cosh_id="crop:tomato"))
-    await set_global_package_variables(
-        pkg_id=pkg.id,
-        request=PackageVariableSet(assignments=[{"parameter_id": param.id, "variable_id": drip.id}]),
-        db=db, current_user=cm,
-    )
-    await db.commit()
-
-    pushed = await push_global_package(
-        client_id=client.id, pkg_id=pkg.id, db=db, current_user=cm,
-    )
-    pushed.status = PackageStatus.ACTIVE  # simulate SE publish
-    await db.commit()
-
-    pulled = await pull_global_package(
-        client_id=client.id, pkg_id=pkg.id, db=db, current_user=se,
-    )
-    pvs = (await db.execute(
-        select(PackageVariable).where(PackageVariable.package_id == pulled.id)
-    )).scalars().all()
-    assert len(pvs) == 1
-    assert pvs[0].parameter_id == param.id
-    assert pvs[0].variable_id == drip.id
+    # Local has the form-supplied PV (Flood), NOT Global's (Drip).
+    assert pvs[0].variable_id == flood.id
+    assert pvs[0].variable_id != drip.id
 
 
 # ── CA list_parameters now returns Globals + client-scoped ──────────────────

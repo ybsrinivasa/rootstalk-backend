@@ -134,6 +134,28 @@ class PackageVariableSet(BaseModel):
     assignments: List[dict]  # [{"parameter_id": ..., "variable_id": ...}]
 
 
+# ── Push from Global → Local (Batch 39N-a, 2026-05-16) ────────────────
+# Push is now authoring: Ram picks the client-specific framing at push
+# time. The Global Package contributes only its content (timelines,
+# practices, elements, relations, CQs); Name, Description, Locations,
+# Authors, PVs, and Start Date Label are entered fresh per push.
+
+class PVAssignmentIn(BaseModel):
+    parameter_id: str
+    variable_id: str
+
+
+class PackagePushRequest(BaseModel):
+    name: str
+    description: Optional[str] = None
+    start_date_label_cosh_id: str
+    # All three lists carry the publish-gate's minimum at push time so
+    # the SE inherits a Local DRAFT that's already publish-ready.
+    locations: List[PackageLocationIn] = Field(..., min_length=1)
+    pv_assignments: List[PVAssignmentIn] = Field(..., min_length=1)
+    author_ids: List[str] = Field(..., min_length=1)
+
+
 # ── Timeline ───────────────────────────────────────────────────────────────────
 
 class TimelineCreate(BaseModel):

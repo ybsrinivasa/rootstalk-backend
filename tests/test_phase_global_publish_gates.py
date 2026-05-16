@@ -24,11 +24,27 @@ from app.modules.advisory.models import (
     PGTimeline, Practice, PracticeL0, Timeline, TimelineFromType,
 )
 from app.modules.advisory.router import (
-    fork_global_package, import_global_pg, list_global_packages,
-    list_global_pg,
+    import_global_pg, list_global_packages, list_global_pg,
+    push_global_package,
 )
+from app.modules.advisory.schemas import PackagePushRequest
 from tests.conftest import requires_docker
-from tests.factories import make_client, make_cm_assignment, make_user
+from tests.factories import (
+    make_client, make_cm_assignment, make_push_request_body, make_user,
+)
+
+
+async def _do_push(db, *, user, client, src, name="P"):
+    """Test helper: builds the form body via factory scaffolding and
+    runs push_global_package. Use this in place of the old
+    `fork_global_package(client_id, pkg_id, db, current_user)` shape."""
+    body = await make_push_request_body(db, client=client, src=src, name=name)
+    await db.commit()
+    return await push_global_package(
+        client_id=client.id, pkg_id=src.id,
+        request=PackagePushRequest(**body),
+        db=db, current_user=user,
+    )
 
 
 # ── Seed helpers ────────────────────────────────────────────────────────────
@@ -172,10 +188,7 @@ async def test_fork_draft_package_rejected_422(db):
     await db.commit()
 
     with pytest.raises(HTTPException) as exc:
-        await fork_global_package(
-            client_id=client.id, pkg_id=pkg.id,
-            db=db, current_user=user,
-        )
+        await _do_push(db, user=user, client=client, src=pkg)
     assert exc.value.status_code == 422
     assert exc.value.detail["code"] == "global_package_not_published"
 
@@ -205,10 +218,7 @@ async def test_fork_package_initial_succeeds(db):
     await make_cm_assignment(db, user=user, client=client)
     await db.commit()
 
-    out = await fork_global_package(
-        client_id=client.id, pkg_id=pkg.id,
-        db=db, current_user=user,
-    )
+    out = await _do_push(db, user=user, client=client, src=pkg)
     assert out.parent_global_id == pkg.id
     tls = (await db.execute(
         select(Timeline).where(Timeline.package_id == out.id)
@@ -236,18 +246,12 @@ async def test_refork_same_package_into_same_client_permanently_blocked(db):
     await make_cm_assignment(db, user=user, client=client)
     await db.commit()
 
-    # Initial fork.
-    await fork_global_package(
-        client_id=client.id, pkg_id=pkg.id,
-        db=db, current_user=user,
-    )
+    # Initial push.
+    await _do_push(db, user=user, client=client, src=pkg, name="A")
 
-    # Re-fork is permanently blocked.
+    # Re-push is permanently blocked.
     with pytest.raises(HTTPException) as exc:
-        await fork_global_package(
-            client_id=client.id, pkg_id=pkg.id,
-            db=db, current_user=user,
-        )
+        await _do_push(db, user=user, client=client, src=pkg, name="B")
     assert exc.value.status_code == 409
     assert exc.value.detail["code"] == "package_already_pushed"
     assert exc.value.detail["existing"]["timeline_count"] == 1
@@ -266,10 +270,7 @@ async def test_fork_rejected_when_user_has_no_cm_assignment(db):
     await db.commit()
 
     with pytest.raises(HTTPException) as exc:
-        await fork_global_package(
-            client_id=client.id, pkg_id=pkg.id,
-            db=db, current_user=user,
-        )
+        await _do_push(db, user=user, client=client, src=pkg)
     assert exc.value.status_code == 403
     assert exc.value.detail["code"] == "cm_assignment_required"
 
@@ -286,10 +287,7 @@ async def test_fork_rejected_when_cm_assigned_to_different_client(db):
     await db.commit()
 
     with pytest.raises(HTTPException) as exc:
-        await fork_global_package(
-            client_id=client_a.id, pkg_id=pkg.id,
-            db=db, current_user=user,
-        )
+        await _do_push(db, user=user, client=client_a, src=pkg)
     assert exc.value.status_code == 403
 
 

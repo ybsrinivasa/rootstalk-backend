@@ -1,7 +1,9 @@
-"""CCA Step 5 / Batch 5E — Global→Local fork field-preservation tests.
+"""CCA Step 5 / Batch 5E — Global→Local field-preservation tests
+(renamed from fork-preservation in Batch 39N-a, 2026-05-16: fork
+became push-as-authoring).
 
 Three deep-copy paths exist for advisory content:
-  • POST /client/{id}/packages/{pkg_id}/fork           — fork_global_package
+  • POST /client/{id}/packages/{pkg_id}/push            — push_global_package
   • POST /client/{id}/packages/{pkg_id}/timelines/import — import_timeline
   • POST /client/{id}/pg-recommendations/import/{global_pg_id} — import_global_pg
 
@@ -14,7 +16,7 @@ source. In particular:
     on the imported copy.
 
 These tests pin the preservation contract so future Practice-level
-fields aren't silently dropped on fork/import.
+fields aren't silently dropped on push/import.
 """
 from __future__ import annotations
 
@@ -26,28 +28,29 @@ from app.modules.advisory.models import (
     PGTimeline, Practice, PracticeL0, Timeline, TimelineFromType,
 )
 from app.modules.advisory.router import (
-    fork_global_package, import_global_pg, import_timeline,
+    import_global_pg, import_timeline, push_global_package,
 )
+from app.modules.advisory.schemas import PackagePushRequest
 from tests.conftest import requires_docker
 from tests.factories import (
     make_client, make_cm_assignment, make_crop_reference, make_package,
-    make_timeline, make_user,
+    make_push_request_body, make_timeline, make_user,
 )
 
 
-# ── fork_global_package ─────────────────────────────────────────────────────
+# ── push_global_package ─────────────────────────────────────────────────────
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_fork_package_preserves_practice_fields(db):
-    """Forking a global Package into a client must copy
+async def test_push_package_preserves_practice_fields(db):
+    """Pushing a global Package into a client must copy
     common_name_cosh_id and frequency_days onto each Practice."""
     user = await make_user(db, name="GlobalSE")
 
     # Global package: client_id=NULL.
     await make_crop_reference(db, "crop:paddy", measure="AREA_WISE")
     global_pkg = await make_package(
-        db, await make_client(db, name="placeholder for FK"),
+        db, await make_client(db, full_name="placeholder for FK"),
         crop_cosh_id="crop:paddy",
     )
     global_pkg.client_id = None
@@ -68,25 +71,28 @@ async def test_fork_package_preserves_practice_fields(db):
     await db.flush()
     await db.commit()
 
-    # Client forks it.
-    client = await make_client(db, name="ForkingClient")
+    # Client pushes it.
+    client = await make_client(db, full_name="PushingClient")
     await make_cm_assignment(db, user=user, client=client)
     await db.commit()
 
-    forked = await fork_global_package(
+    body = await make_push_request_body(db, client=client, src=global_pkg)
+    await db.commit()
+    pushed = await push_global_package(
         client_id=client.id, pkg_id=global_pkg.id,
+        request=PackagePushRequest(**body),
         db=db, current_user=user,
     )
 
-    forked_tls = (await db.execute(
-        select(Timeline).where(Timeline.package_id == forked.id)
+    pushed_tls = (await db.execute(
+        select(Timeline).where(Timeline.package_id == pushed.id)
     )).scalars().all()
-    assert len(forked_tls) == 1
-    forked_practices = (await db.execute(
-        select(Practice).where(Practice.timeline_id == forked_tls[0].id)
+    assert len(pushed_tls) == 1
+    pushed_practices = (await db.execute(
+        select(Practice).where(Practice.timeline_id == pushed_tls[0].id)
     )).scalars().all()
-    assert len(forked_practices) == 1
-    fp = forked_practices[0]
+    assert len(pushed_practices) == 1
+    fp = pushed_practices[0]
     assert fp.common_name_cosh_id == "cn:urea"
     assert fp.frequency_days == 7
     assert fp.l2_type == "CHEMICAL_FERTILIZER_FERTIGATION_PRODUCTS"

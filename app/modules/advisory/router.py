@@ -19,6 +19,7 @@ from app.modules.advisory.models import (
 from app.modules.advisory.schemas import (
     PackageCreate, PackageUpdate, PackageOut,
     PackageLocationIn, PackageAuthorIn, PackageAuthorOut,
+    PackagePushRequest, PVAssignmentIn,
     ParameterCreate, ParameterUpdate, VariableCreate, VariableUpdate, VariableOut,
     PackageVariableSet,
     TimelineCreate, TimelineUpdate, TimelineOut,
@@ -33,7 +34,7 @@ from app.modules.advisory.models import (
     PGRecommendation, PGTimeline, PGPractice, PGElement,
     SPRecommendation, SPTimeline, SPPractice, SPElement,
 )
-from app.modules.clients.models import ClientCrop, ClientUser, ClientUserRole
+from app.modules.clients.models import ClientCrop, ClientLocation, ClientUser, ClientUserRole
 from app.modules.sync.models import CoshCoreItem
 from app.services.cosh_constants import COSH_BIOLOGICAL_NAMES_CORE
 from app.services.bl13_versioning import (
@@ -3120,9 +3121,23 @@ async def get_global_package_push_status(
         )).scalars().all()
     }
 
+    # Lineage-aware lookup (Batch 39N-a, 2026-05-16). The "already
+    # pushed" flag must reflect the whole Global lineage — a Local
+    # row whose `parent_global_id` points at any historical Global
+    # row in the same (client_id=NULL, crop, name) lineage still
+    # counts as pushed. Without this, a new Global v_{N+1} would
+    # incorrectly report all clients as "not yet pushed."
+    lineage_ids = list((await db.execute(
+        select(Package.id).where(
+            Package.client_id == None,  # noqa: E711
+            Package.crop_cosh_id == src.crop_cosh_id,
+            Package.name == src.name,
+        )
+    )).scalars().all())
+
     local_rows = (await db.execute(
         select(Package).where(
-            Package.parent_global_id == pkg_id,
+            Package.parent_global_id.in_(lineage_ids),
             Package.client_id.in_(client_ids),
         )
     )).scalars().all()
@@ -4587,32 +4602,68 @@ async def _load_global_active_or_422(
 async def push_global_package(
     client_id: str,
     pkg_id: str,
+    request: PackagePushRequest,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """**CM push — first contact only**. A CM with active EDIT
-    rights on `client_id` deep-copies the Global Package into the
-    client's scope as a DRAFT (Local v1). The SE then publishes
-    when they're ready (legal-review gate).
+    """**CM push — once per Global lineage, per client (Batch 39N-a,
+    2026-05-16).** Ram (the CM) picks the client-specific framing at
+    push time — Name, Description, Start Date Label, Locations,
+    P-V signature, Authors — and deep-copies the Global's content
+    (timelines, practices, elements, relations, CQs) into the
+    client's scope as a DRAFT.
 
-    Locked 2026-05-11 in
-    `project_rootstalk_global_to_local_pipe.md`: a Global Package
-    can be pushed to a Client exactly **once** (regardless of any
-    history rows from later SE pulls / republishes). Re-pushing is
-    permanently 409 `package_already_pushed` — subsequent versions
-    are pulled by the SE, not pushed by the CM.
+    Auth:
+      - 403 `cm_assignment_required` — caller has no active EDIT
+        CMClientAssignment for `client_id`.
 
-    Auth: 403 `cm_assignment_required` if not a CM with active
-    EDIT rights for this client. Publish gate: 422
-    `global_package_not_published` if the Global isn't ACTIVE.
+    Source gates:
+      - 404 — Global package not found.
+      - 422 `global_package_not_published` — Global is DRAFT/INACTIVE.
+
+    Once-per-package gate (lineage-aware):
+      - 409 `package_already_pushed` — any row in the Global lineage
+        (same client_id=NULL, crop_cosh_id, name) has already been
+        pushed to this client. Subsequent updates are made by the CM
+        directly within the client's scope (V1 model — Pull is
+        deferred to V1.x).
+
+    Field validations (each surfaces a structured 422):
+      - `duplicate_package_name` — name already in use within
+        (client, crop) on a DRAFT or ACTIVE row.
+      - `location_not_onboarded` — at least one (state, district)
+        is not on the client's ACTIVE ClientLocation list.
+      - `custom_pv_not_allowed_on_push` — at least one parameter is
+        not a catalogue row (client_id IS NULL).
+      - `invalid_pv_assignment` — variable doesn't belong to its
+        parameter, or row doesn't exist.
+      - `pv_crop_mismatch` — parameter belongs to a different crop
+        than the Global.
+      - `invalid_author` — at least one user_id is not an ACTIVE
+        SUBJECT_EXPERT ClientUser on this client.
+      - `duplicate_author` — same user_id appears twice in
+        `author_ids`.
+      - PV uniqueness §4.2 — `pv_signature_conflict` (mapped via
+        `_raise_pv_conflict`) names the sibling Package + shared
+        districts so Ram can fix and retry.
     """
     await _assert_cm_can_edit_client(db, current_user.id, client_id)
     src = await _load_global_active_or_422(db, pkg_id)
 
+    # Lineage-aware once-per-package gate. The Global lineage is the
+    # set of rows sharing (client_id=NULL, crop_cosh_id, name) — same
+    # lineage key the SA portal uses for Global versioning (Batch 39L-b).
+    lineage_ids = list((await db.execute(
+        select(Package.id).where(
+            Package.client_id == None,  # noqa: E711
+            Package.crop_cosh_id == src.crop_cosh_id,
+            Package.name == src.name,
+        )
+    )).scalars().all())
     existing = (await db.execute(
         select(Package).where(
             Package.client_id == client_id,
-            Package.parent_global_id == pkg_id,
+            Package.parent_global_id.in_(lineage_ids),
         ).limit(1)
     )).scalar_one_or_none()
     if existing:
@@ -4628,8 +4679,8 @@ async def push_global_package(
                 "message": (
                     "This Global Package has already been pushed to this "
                     "client. First contact happens once per client; "
-                    "subsequent versions are pulled by the SE from the "
-                    "CA portal, not pushed again from the SA portal."
+                    "subsequent updates are made by the CM directly on "
+                    "the client's local Package."
                 ),
                 "existing": {
                     "package_id": existing.id,
@@ -4638,58 +4689,217 @@ async def push_global_package(
             },
         )
 
+    # Name uniqueness within (client, crop) on DRAFT/ACTIVE rows.
+    dupe_name = (await db.execute(
+        select(Package).where(
+            Package.client_id == client_id,
+            Package.crop_cosh_id == src.crop_cosh_id,
+            Package.name == request.name,
+            Package.status.in_([PackageStatus.DRAFT, PackageStatus.ACTIVE]),
+        ).limit(1)
+    )).scalar_one_or_none()
+    if dupe_name:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "duplicate_package_name",
+                "message": (
+                    f"A {dupe_name.status.value if hasattr(dupe_name.status, 'value') else dupe_name.status} "
+                    f"package named '{request.name}' already exists for "
+                    "this crop on this client. Pick a different name."
+                ),
+                "existing_package_id": dupe_name.id,
+            },
+        )
+
+    # Locations must be ACTIVE onboarded locations on this client.
+    requested_locs = [
+        (loc.state_cosh_id, loc.district_cosh_id) for loc in request.locations
+    ]
+    onboarded = set(
+        (loc.state_cosh_id, loc.district_cosh_id)
+        for loc in (await db.execute(
+            select(ClientLocation).where(
+                ClientLocation.client_id == client_id,
+                ClientLocation.status == StatusEnum.ACTIVE,
+            )
+        )).scalars().all()
+    )
+    bad_locs = sorted(set(requested_locs) - onboarded)
+    if bad_locs:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "location_not_onboarded",
+                "message": (
+                    "One or more locations are not on this client's "
+                    "onboarded list. Ask the client admin to add the "
+                    "location(s) before pushing this package."
+                ),
+                "invalid_locations": [
+                    {"state_cosh_id": s, "district_cosh_id": d}
+                    for s, d in bad_locs
+                ],
+            },
+        )
+
+    # PV assignments: catalogue-only (client_id IS NULL); variable
+    # belongs to its parameter; parameter belongs to this crop.
+    parameter_ids = [pv.parameter_id for pv in request.pv_assignments]
+    variable_ids = [pv.variable_id for pv in request.pv_assignments]
+    catalogue_params = {
+        p.id: p for p in (await db.execute(
+            select(Parameter).where(
+                Parameter.id.in_(parameter_ids),
+                Parameter.client_id == None,  # noqa: E711
+            )
+        )).scalars().all()
+    }
+    custom_params = sorted(set(parameter_ids) - catalogue_params.keys())
+    if custom_params:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "custom_pv_not_allowed_on_push",
+                "message": (
+                    "Custom parameters cannot be used at push time. Pick "
+                    "Parameters from the global catalogue; the client SE "
+                    "can add custom P-V later from their own scope."
+                ),
+                "invalid_parameter_ids": custom_params,
+            },
+        )
+    cross_crop = sorted(
+        pid for pid, p in catalogue_params.items()
+        if p.crop_cosh_id != src.crop_cosh_id
+    )
+    if cross_crop:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "pv_crop_mismatch",
+                "message": (
+                    "One or more Parameters belong to a different crop "
+                    "than this Global Package."
+                ),
+                "invalid_parameter_ids": cross_crop,
+            },
+        )
+    catalogue_variables = {
+        (v.parameter_id, v.id)
+        for v in (await db.execute(
+            select(Variable).where(Variable.id.in_(variable_ids))
+        )).scalars().all()
+    }
+    bad_pvs = sorted(
+        {(pv.parameter_id, pv.variable_id) for pv in request.pv_assignments}
+        - catalogue_variables
+    )
+    if bad_pvs:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_pv_assignment",
+                "message": (
+                    "One or more variable→parameter pairings are invalid "
+                    "(variable doesn't belong to its parameter, or row "
+                    "doesn't exist)."
+                ),
+                "invalid_pairs": [
+                    {"parameter_id": p, "variable_id": v} for p, v in bad_pvs
+                ],
+            },
+        )
+
+    # Authors: ACTIVE SUBJECT_EXPERT ClientUsers on this client; no
+    # duplicates in the request.
+    if len(set(request.author_ids)) != len(request.author_ids):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "duplicate_author",
+                "message": (
+                    "An expert cannot be listed twice as an author of "
+                    "the same Package."
+                ),
+            },
+        )
+    valid_se_ids = set((await db.execute(
+        select(ClientUser.user_id).where(
+            ClientUser.client_id == client_id,
+            ClientUser.user_id.in_(request.author_ids),
+            ClientUser.role == ClientUserRole.SUBJECT_EXPERT,
+            ClientUser.status == StatusEnum.ACTIVE,
+        )
+    )).scalars().all())
+    invalid_authors = sorted(set(request.author_ids) - valid_se_ids)
+    if invalid_authors:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_author",
+                "message": (
+                    "One or more authors are not ACTIVE Subject Experts "
+                    "of this client."
+                ),
+                "invalid_user_ids": invalid_authors,
+            },
+        )
+
+    # All input-side validations passed. Build the Local DRAFT.
     copy = Package(
         client_id=client_id,
         parent_global_id=src.id,
         crop_cosh_id=src.crop_cosh_id,
-        name=src.name,
+        name=request.name,
         package_type=src.package_type,
         duration_days=src.duration_days,
-        start_date_label_cosh_id=src.start_date_label_cosh_id,
-        description=src.description,
+        start_date_label_cosh_id=request.start_date_label_cosh_id,
+        description=request.description,
         created_by=current_user.id,
         status=PackageStatus.DRAFT,
         created_via=PackageCreatedVia.CM_PUSH,
     )
     db.add(copy)
     await db.flush()
-    await _deep_copy_package_content(db, src.id, copy.id)
-    # PVs (Batch 9, 2026-05-11): copy the Global's parameter-variable
-    # signature so the Local inherits the discriminator. Parameter +
-    # Variable rows are NOT cloned — Global Parameters (client_id IS
-    # NULL) are usable as FK from any Local PackageVariable. Saves
-    # the SE from manually re-assigning the same signature post-pull.
-    src_pvs = (await db.execute(
-        select(PackageVariable).where(PackageVariable.package_id == src.id)
-    )).scalars().all()
-    for pv in src_pvs:
+
+    for loc in request.locations:
+        db.add(PackageLocation(
+            package_id=copy.id,
+            state_cosh_id=loc.state_cosh_id,
+            district_cosh_id=loc.district_cosh_id,
+        ))
+    for pv in request.pv_assignments:
         db.add(PackageVariable(
             package_id=copy.id,
             parameter_id=pv.parameter_id,
             variable_id=pv.variable_id,
         ))
+    for i, uid in enumerate(request.author_ids):
+        db.add(PackageAuthor(
+            package_id=copy.id,
+            user_id=uid,
+            display_order=i,
+        ))
+    await db.flush()
+
+    # §4.2 district-overlap PV uniqueness check against existing
+    # client-side siblings. Naming the sibling + shared districts in
+    # the response gives Ram a precise fix path: change PVs, change
+    # locations, or both.
+    try:
+        await assert_pv_unique_for_package(db, package=copy)
+    except PVConflictError as e:
+        await db.rollback()
+        _raise_pv_conflict(e)
+
+    # Deep-copy content (timelines, practices, elements, relations,
+    # CQs, brand-lock — extended in Batch 39L-b).
+    await _deep_copy_package_content(db, src.id, copy.id)
+
     await db.commit()
     await db.refresh(copy)
     return copy
-
-
-# Backward-compat alias for the renamed endpoint. The CA-portal
-# Import button still calls /fork while we migrate the UI to the
-# SA-portal Push surface (Batch 5). Drop this route + the alias
-# once the frontend is cut over.
-@router.post("/client/{client_id}/packages/{pkg_id}/fork", response_model=PackageOut, status_code=201)
-async def fork_global_package(
-    client_id: str,
-    pkg_id: str,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """DEPRECATED. Routes to `push_global_package`. Tests and the
-    transitional CA-portal Import button call this name."""
-    return await push_global_package(
-        client_id=client_id, pkg_id=pkg_id,
-        db=db, current_user=current_user,
-    )
 
 
 @router.post("/client/{client_id}/packages/{pkg_id}/pull", response_model=PackageOut, status_code=201)
@@ -4699,80 +4909,26 @@ async def pull_global_package(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """**SE pull — refresh from Global**. Requires that the CM has
-    already pushed this Global to this client at least once. Deep-
-    copies Global's current content into a new Local Package row,
-    status=DRAFT, alongside any existing PUBLISHED Local. The SE
-    reviews v_n DRAFT against the live PUBLISHED in the editor;
-    only publishing the DRAFT actually swaps farmers over.
+    """**Deferred to V1.x (Batch 39N-a, 2026-05-16).** Per the user's
+    V1 decision, pull is not shipping: Ram (the CM) has direct EDIT
+    rights on the client's Local Package and updates content there
+    directly, rather than the SE pulling a fresh DRAFT from Global.
 
-    **Single-DRAFT invariant**: at most one DRAFT row per
-    (client_id, parent_global_id) at any time. If a prior DRAFT
-    exists (e.g. abandoned earlier pull), it's auto-flipped to
-    INACTIVE before the new DRAFT is created.
-
-    Auth: any ACTIVE ClientUser for this client. 403
-    `client_user_required` otherwise. Refusal codes: 422
-    `global_package_not_published`, 422 `package_not_pushed_yet`.
+    The endpoint stays registered so existing clients see a clear 501
+    code (`pull_deferred`) rather than a 404. Re-enable when real-world
+    feedback shapes the refresh model.
     """
-    await _assert_client_user_can_edit(db, current_user.id, client_id)
-    src = await _load_global_active_or_422(db, pkg_id)
-
-    siblings = (await db.execute(
-        select(Package).where(
-            Package.client_id == client_id,
-            Package.parent_global_id == pkg_id,
-        )
-    )).scalars().all()
-    if not siblings:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "code": "package_not_pushed_yet",
-                "message": (
-                    "This Global Package has not been pushed to this "
-                    "client yet. The CM must push it from the SA portal "
-                    "before the SE can pull subsequent versions."
-                ),
-            },
-        )
-
-    # Single-DRAFT invariant — flip prior DRAFTs to INACTIVE.
-    for sib in siblings:
-        if sib.status == PackageStatus.DRAFT:
-            sib.status = PackageStatus.INACTIVE
-
-    copy = Package(
-        client_id=client_id,
-        parent_global_id=src.id,
-        crop_cosh_id=src.crop_cosh_id,
-        name=src.name,
-        package_type=src.package_type,
-        duration_days=src.duration_days,
-        start_date_label_cosh_id=src.start_date_label_cosh_id,
-        description=src.description,
-        created_by=current_user.id,
-        status=PackageStatus.DRAFT,
-        created_via=PackageCreatedVia.SE_PULL_DRAFT,
+    raise HTTPException(
+        status_code=501,
+        detail={
+            "code": "pull_deferred",
+            "message": (
+                "Pull from Global is deferred in V1. Ask the CM to make "
+                "any content updates directly on the client's local "
+                "Package — they have EDIT rights on the client's scope."
+            ),
+        },
     )
-    db.add(copy)
-    await db.flush()
-    await _deep_copy_package_content(db, src.id, copy.id)
-    # PVs (Batch 9): same rationale as push — pulled Locals inherit
-    # the Global's parameter-variable signature so the SE doesn't
-    # re-assign it on every refresh.
-    src_pvs = (await db.execute(
-        select(PackageVariable).where(PackageVariable.package_id == src.id)
-    )).scalars().all()
-    for pv in src_pvs:
-        db.add(PackageVariable(
-            package_id=copy.id,
-            parameter_id=pv.parameter_id,
-            variable_id=pv.variable_id,
-        ))
-    await db.commit()
-    await db.refresh(copy)
-    return copy
 
 
 async def _deep_copy_package_metadata(

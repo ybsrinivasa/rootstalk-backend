@@ -24,7 +24,7 @@ from app.modules.advisory.models import (
     TimelineFromType, Variable,
 )
 from app.modules.clients.models import (
-    Client, ClientCrop, ClientUser, ClientUserRole,
+    Client, ClientCrop, ClientLocation, ClientUser, ClientUserRole,
     CMClientAssignment, CMRights, PaymentModel,
 )
 from app.modules.platform.models import StatusEnum, User
@@ -608,3 +608,55 @@ async def make_sp_element(db: AsyncSession, prac: SPPractice, **kw) -> SPElement
     db.add(e)
     await db.flush()
     return e
+
+
+# ── Push scaffolding (Batch 39N-a, 2026-05-16) ────────────────────────
+# The form-driven push gate validates name uniqueness, onboarded
+# locations, catalogue PVs, and ACTIVE SE authors at request time, so
+# every push test needs a populated client. This helper seeds the
+# minimum scaffolding and returns the matching `PackagePushRequest`
+# kwargs ready to pass into `push_global_package`.
+
+async def make_push_request_body(
+    db: AsyncSession, *,
+    client: Client, src: Package,
+    name: str = "Pushed PoP",
+    description: str | None = None,
+    start_date_label_cosh_id: str | None = None,
+) -> dict:
+    """Seed an ACTIVE ClientLocation, an ACTIVE SE ClientUser, and a
+    catalogue Parameter+Variable for the src's crop, then return a
+    dict shaped for `PackagePushRequest`. Each call returns fresh ids
+    so tests can stack multiple pushes without scaffolding collision.
+    """
+    state = "state:test"
+    district = _short("district:test:")
+    db.add(ClientLocation(
+        client_id=client.id, state_cosh_id=state, district_cosh_id=district,
+        status=StatusEnum.ACTIVE,
+    ))
+    se_user = await make_user(db, name="Push SE")
+    db.add(ClientUser(
+        client_id=client.id, user_id=se_user.id,
+        role=ClientUserRole.SUBJECT_EXPERT, status=StatusEnum.ACTIVE,
+    ))
+    param = await make_parameter(
+        db, crop_cosh_id=src.crop_cosh_id, name=_short("Param "),
+    )
+    variable = await make_variable(db, param, name=_short("Var "))
+    await db.flush()
+    return {
+        "name": name,
+        "description": description,
+        "start_date_label_cosh_id": (
+            start_date_label_cosh_id or src.start_date_label_cosh_id
+            or "label:sowing_date"
+        ),
+        "locations": [
+            {"state_cosh_id": state, "district_cosh_id": district},
+        ],
+        "pv_assignments": [
+            {"parameter_id": param.id, "variable_id": variable.id},
+        ],
+        "author_ids": [se_user.id],
+    }

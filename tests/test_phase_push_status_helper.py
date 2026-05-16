@@ -1,12 +1,14 @@
 """SA-portal push-status helper endpoint (Batch 4 of the multi-row
-versioning work locked 2026-05-11).
+versioning work locked 2026-05-11; extended Batch 39N-a 2026-05-16
+for lineage-aware lookup + form-driven push).
 
 Verifies `GET /advisory/global/packages/{pkg_id}/push-status`:
   • Lists every client the calling CM can edit, with per-client
     push/publish state.
-  • already_pushed reflects any Local row in the lineage,
-    regardless of status (CM_PUSH never repeats, so its presence
-    is a stable "first contact happened" signal).
+  • already_pushed = True when **any** row in the Global lineage
+    (same client_id=NULL, crop_cosh_id, name) has already been
+    pushed to this client. A new Global v_{N+1} in the same
+    lineage doesn't reset the flag.
   • pushed_at = earliest Local row's created_at.
   • latest_local_published_at = max(published_at) across PUBLISHED
     history rows in the lineage; None when nothing has been
@@ -29,14 +31,15 @@ from app.modules.advisory.models import (
     Timeline, TimelineFromType,
 )
 from app.modules.advisory.router import (
-    clone_to_draft, get_global_package_push_status, publish_package,
-    pull_global_package, push_global_package,
+    get_global_package_push_status, publish_package, push_global_package,
 )
+from app.modules.advisory.schemas import PackagePushRequest
 from app.modules.clients.models import ClientCrop, ClientUserRole
 from app.modules.platform.models import StatusEnum
 from tests.conftest import requires_docker
 from tests.factories import (
-    make_client, make_client_user, make_cm_assignment, make_user,
+    make_client, make_client_user, make_cm_assignment,
+    make_push_request_body, make_user,
 )
 
 
@@ -65,6 +68,16 @@ async def _seed_global(db, *, name: str | None = None):
     return pkg
 
 
+async def _push(db, *, cm, client, gpkg, name="P"):
+    body = await make_push_request_body(db, client=client, src=gpkg, name=name)
+    await db.commit()
+    return await push_global_package(
+        client_id=client.id, pkg_id=gpkg.id,
+        request=PackagePushRequest(**body),
+        db=db, current_user=cm,
+    )
+
+
 # ── Happy path: CM sees both assigned clients with correct state ────────────
 
 @requires_docker
@@ -82,10 +95,7 @@ async def test_push_status_lists_all_assigned_clients(db):
     db.add(ClientCrop(client_id=client_b.id, crop_cosh_id=gpkg.crop_cosh_id))
     await db.commit()
 
-    # Push to A only.
-    await push_global_package(
-        client_id=client_a.id, pkg_id=gpkg.id, db=db, current_user=cm,
-    )
+    await _push(db, cm=cm, client=client_a, gpkg=gpkg)
 
     out = await get_global_package_push_status(
         pkg_id=gpkg.id, db=db, current_user=cm,
@@ -95,7 +105,7 @@ async def test_push_status_lists_all_assigned_clients(db):
     assert by_id[client_a.id]["already_pushed"] is True
     assert by_id[client_a.id]["pushed_at"] is not None
     assert by_id[client_a.id]["has_pending_draft"] is True  # DRAFT from push
-    assert by_id[client_a.id]["latest_local_published_at"] is None  # SE hasn't published
+    assert by_id[client_a.id]["latest_local_published_at"] is None
     assert by_id[client_b.id]["already_pushed"] is False
     assert by_id[client_b.id]["pushed_at"] is None
     assert by_id[client_b.id]["has_pending_draft"] is False
@@ -107,32 +117,30 @@ async def test_push_status_after_se_publishes(db):
     """Once the SE publishes the pushed DRAFT, has_pending_draft
     flips to False and latest_local_published_at is set."""
     cm = await make_user(db, name=f"CM-{uuid.uuid4().hex[:4]}")
-    se = await make_user(db, name=f"SE-{uuid.uuid4().hex[:4]}")
     client = await make_client(db, full_name="Pubco")
     await make_cm_assignment(db, user=cm, client=client)
-    cu = await make_client_user(db, user=se, client=client)
-    cu.role = ClientUserRole.SUBJECT_EXPERT
-    cu.status = StatusEnum.ACTIVE
     gpkg = await _seed_global(db)
     db.add(ClientCrop(client_id=client.id, crop_cosh_id=gpkg.crop_cosh_id))
     await db.commit()
 
-    pushed = await push_global_package(
-        client_id=client.id, pkg_id=gpkg.id, db=db, current_user=cm,
-    )
-    # Author needs at least 1 PackageLocation + PackageAuthor for
-    # publish-readiness. Add them inline.
-    from app.modules.advisory.models import PackageLocation, PackageAuthor
-    db.add(PackageLocation(
-        package_id=pushed.id, state_cosh_id="state:test",
-        district_cosh_id=f"district:test:{uuid.uuid4().hex[:4]}",
-    ))
-    db.add(PackageAuthor(package_id=pushed.id, user_id=se.id))
-    await db.commit()
+    pushed = await _push(db, cm=cm, client=client, gpkg=gpkg)
+    # The push scaffolding already seeded one ACTIVE SE on the client;
+    # fetch the matching User row to act as the publisher.
+    from app.modules.clients.models import ClientUser
+    from app.modules.platform.models import User
+    se_user = (await db.execute(
+        select(User).join(
+            ClientUser, ClientUser.user_id == User.id,
+        ).where(
+            ClientUser.client_id == client.id,
+            ClientUser.role == ClientUserRole.SUBJECT_EXPERT,
+            ClientUser.status == StatusEnum.ACTIVE,
+        ).limit(1)
+    )).scalar_one()
 
     await publish_package(
         client_id=client.id, package_id=pushed.id,
-        db=db, current_user=se,
+        db=db, current_user=se_user,
     )
 
     out = await get_global_package_push_status(
@@ -142,50 +150,6 @@ async def test_push_status_after_se_publishes(db):
     assert entry["already_pushed"] is True
     assert entry["has_pending_draft"] is False
     assert entry["latest_local_published_at"] is not None
-
-
-@requires_docker
-@pytest.mark.asyncio
-async def test_push_status_with_pending_pull_draft(db):
-    """SE has pulled a refresh but hasn't published it yet:
-    has_pending_draft=True; latest_local_published_at still
-    reflects the prior published version."""
-    cm = await make_user(db, name=f"CM-{uuid.uuid4().hex[:4]}")
-    se = await make_user(db, name=f"SE-{uuid.uuid4().hex[:4]}")
-    client = await make_client(db, full_name="Pullco")
-    await make_cm_assignment(db, user=cm, client=client)
-    cu = await make_client_user(db, user=se, client=client)
-    cu.role = ClientUserRole.SUBJECT_EXPERT
-    cu.status = StatusEnum.ACTIVE
-    gpkg = await _seed_global(db)
-    db.add(ClientCrop(client_id=client.id, crop_cosh_id=gpkg.crop_cosh_id))
-    await db.commit()
-
-    pushed = await push_global_package(
-        client_id=client.id, pkg_id=gpkg.id, db=db, current_user=cm,
-    )
-    from app.modules.advisory.models import PackageLocation, PackageAuthor
-    db.add(PackageLocation(
-        package_id=pushed.id, state_cosh_id="state:test",
-        district_cosh_id=f"district:test:{uuid.uuid4().hex[:4]}",
-    ))
-    db.add(PackageAuthor(package_id=pushed.id, user_id=se.id))
-    await db.commit()
-    await publish_package(
-        client_id=client.id, package_id=pushed.id,
-        db=db, current_user=se,
-    )
-    # SE pulls a refresh.
-    await pull_global_package(
-        client_id=client.id, pkg_id=gpkg.id, db=db, current_user=se,
-    )
-
-    out = await get_global_package_push_status(
-        pkg_id=gpkg.id, db=db, current_user=cm,
-    )
-    entry = next(e for e in out if e["client_id"] == client.id)
-    assert entry["has_pending_draft"] is True
-    assert entry["latest_local_published_at"] is not None  # prior publish
 
 
 # ── Auth + isolation ────────────────────────────────────────────────────────
@@ -244,7 +208,36 @@ async def test_push_status_404_for_missing_global(db):
     assert exc.value.status_code == 404
 
 
-# ── Ordering + multi-row lineage tracking ───────────────────────────────────
+# ── Lineage-aware push detection (Batch 39N-a) ──────────────────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_push_status_already_pushed_holds_across_global_lineage(db):
+    """After Ram pushes from Global v1, a new Global v2 in the same
+    lineage (same crop+name, different row id) must STILL report the
+    client as already_pushed. Without the lineage-aware lookup the
+    flag would reset on each new Global version, letting Ram re-push."""
+    cm = await make_user(db, name=f"CM-{uuid.uuid4().hex[:4]}")
+    client = await make_client(db)
+    await make_cm_assignment(db, user=cm, client=client)
+    name = f"GP-{uuid.uuid4().hex[:6]}"
+    g_v1 = await _seed_global(db, name=name)
+    db.add(ClientCrop(client_id=client.id, crop_cosh_id=g_v1.crop_cosh_id))
+    await db.commit()
+
+    await _push(db, cm=cm, client=client, gpkg=g_v1)
+
+    g_v2 = await _seed_global(db, name=name)
+    await db.commit()
+
+    out = await get_global_package_push_status(
+        pkg_id=g_v2.id, db=db, current_user=cm,
+    )
+    entry = next(e for e in out if e["client_id"] == client.id)
+    assert entry["already_pushed"] is True
+
+
+# ── Ordering ────────────────────────────────────────────────────────────────
 
 @requires_docker
 @pytest.mark.asyncio
@@ -261,9 +254,7 @@ async def test_push_status_not_pushed_clients_sort_first(db):
     gpkg = await _seed_global(db)
     db.add(ClientCrop(client_id=client_a.id, crop_cosh_id=gpkg.crop_cosh_id))
     await db.commit()
-    await push_global_package(
-        client_id=client_a.id, pkg_id=gpkg.id, db=db, current_user=cm,
-    )
+    await _push(db, cm=cm, client=client_a, gpkg=gpkg)
 
     out = await get_global_package_push_status(
         pkg_id=gpkg.id, db=db, current_user=cm,

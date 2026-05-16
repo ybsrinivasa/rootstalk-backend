@@ -37,13 +37,14 @@ from app.modules.advisory.router import (
     clone_to_draft, publish_package, push_global_package,
     rollback_publish,
 )
+from app.modules.advisory.schemas import PackagePushRequest
 from app.modules.clients.models import ClientCrop, ClientUserRole
 from app.modules.platform.models import StatusEnum
 from app.modules.subscriptions.models import Subscription
 from tests.conftest import requires_docker
 from tests.factories import (
     make_client, make_client_user, make_cm_assignment,
-    make_subscription, make_user,
+    make_push_request_body, make_subscription, make_user,
 )
 
 
@@ -73,40 +74,40 @@ async def _seed_global_with_one_timeline(db, *, name: str | None = None):
 
 
 async def _se_and_client(db):
-    """A client with one SE (ClientUser) and one CM. Pushed once so
-    a Local PUBLISHED exists. Returns (cm, se, client, local_active)."""
+    """A client with one SE (seeded by `make_push_request_body`) and
+    one CM. Pushed once so a Local PUBLISHED exists. Returns
+    (cm, se, client, local_active)."""
     cm = await make_user(db, name=f"CM-{uuid.uuid4().hex[:4]}")
-    se = await make_user(db, name=f"SE-{uuid.uuid4().hex[:4]}")
     client = await make_client(db)
     await make_cm_assignment(db, user=cm, client=client)
-    await make_client_user(db, user=se, client=client)
     gpkg = await _seed_global_with_one_timeline(db)
     # Crop on the belt — publish_package's assert_crop_on_belt gate
-    # requires this. push_global_package itself doesn't seed it
-    # today (separate decision); CA portal flow would have added it.
+    # requires this. The push gate doesn't seed it.
     db.add(ClientCrop(client_id=client.id, crop_cosh_id=gpkg.crop_cosh_id))
     await db.commit()
+
+    body = await make_push_request_body(db, client=client, src=gpkg)
+    await db.commit()
     pushed = await push_global_package(
-        client_id=client.id, pkg_id=gpkg.id, db=db, current_user=cm,
+        client_id=client.id, pkg_id=gpkg.id,
+        request=PackagePushRequest(**body),
+        db=db, current_user=cm,
     )
-    # Add the metadata that clone-to-draft / rollback-publish
-    # deep-copy + that publish-readiness needs.
-    db.add(PackageLocation(
-        package_id=pushed.id, state_cosh_id="state:test",
-        district_cosh_id=f"district:test:{uuid.uuid4().hex[:4]}",
-    ))
-    db.add(PackageAuthor(package_id=pushed.id, user_id=se.id))
-    # Make `se` a SUBJECT_EXPERT on the client so they pass the
-    # publish-readiness "at least one ACTIVE SE author" check.
-    from sqlalchemy import select as _sel
+    # The push scaffolding already seeded one ACTIVE SE on the client
+    # and wired it as an author + as a ClientUser row. Fetch the
+    # matching User row to act as the publisher.
     from app.modules.clients.models import ClientUser
-    cu = (await db.execute(
-        _sel(ClientUser).where(
-            ClientUser.user_id == se.id, ClientUser.client_id == client.id,
-        )
+    from app.modules.platform.models import User
+    se = (await db.execute(
+        select(User).join(
+            ClientUser, ClientUser.user_id == User.id,
+        ).where(
+            ClientUser.client_id == client.id,
+            ClientUser.role == ClientUserRole.SUBJECT_EXPERT,
+            ClientUser.status == StatusEnum.ACTIVE,
+        ).limit(1)
     )).scalar_one()
-    cu.role = ClientUserRole.SUBJECT_EXPERT
-    cu.status = StatusEnum.ACTIVE
+
     # Flip to ACTIVE + mark as published. Bypassing the real
     # publish endpoint so the fixture stays small; tests that
     # exercise the publish path do so explicitly.
