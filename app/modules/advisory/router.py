@@ -3562,6 +3562,165 @@ async def publish_global_package(
     return pkg
 
 
+@router.post(
+    "/advisory/global/packages/{pkg_id}/clone-to-draft",
+    response_model=PackageOut, status_code=201,
+)
+async def clone_global_to_draft(
+    pkg_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Batch 39L-b (2026-05-16) — CM starts a new edit cycle from
+    a Global Package. Takes any row in the lineage (ACTIVE or
+    INACTIVE) as the source and deep-copies its content into a
+    new DRAFT row. Publishing that DRAFT becomes v_{max + 1} per
+    the existing compute_publish_version logic.
+
+    Single-DRAFT invariant: any existing DRAFT in the same Global
+    lineage (client_id IS NULL + crop + name) is auto-flipped to
+    INACTIVE so the CM only sees one editable row at a time.
+
+    Source may be ACTIVE (the typical "edit the current version"
+    flow) or INACTIVE (the "go back and edit a previous version"
+    flow per CM 2026-05-16) — DRAFT rows are rejected to keep
+    the path obvious.
+    """
+    src = (await db.execute(
+        select(Package).where(
+            Package.id == pkg_id, Package.client_id == None,  # noqa: E711
+        )
+    )).scalar_one_or_none()
+    if src is None:
+        raise HTTPException(status_code=404, detail="Global package not found")
+    if src.status == PackageStatus.DRAFT:
+        raise HTTPException(status_code=422, detail={
+            "code": "clone_source_is_draft",
+            "message": (
+                "clone-to-draft requires an ACTIVE or INACTIVE row of "
+                "the lineage as the source. The current row is already "
+                "a DRAFT — edit it in place."
+            ),
+        })
+
+    existing_draft = (await db.execute(
+        select(Package).where(
+            Package.client_id == None,  # noqa: E711
+            Package.crop_cosh_id == src.crop_cosh_id,
+            Package.name == src.name,
+            Package.status == PackageStatus.DRAFT,
+        )
+    )).scalar_one_or_none()
+    if existing_draft:
+        existing_draft.status = PackageStatus.INACTIVE
+
+    new_draft = Package(
+        client_id=None,
+        parent_global_id=src.parent_global_id,
+        crop_cosh_id=src.crop_cosh_id,
+        name=src.name,
+        package_type=src.package_type,
+        duration_days=src.duration_days,
+        start_date_label_cosh_id=src.start_date_label_cosh_id,
+        description=src.description,
+        created_by=current_user.id,
+        status=PackageStatus.DRAFT,
+        # The new DRAFT carries version=1 until published, at which
+        # point compute_publish_version stamps max(lineage) + 1.
+        version=1,
+        source_version_id=src.id,
+        created_via=PackageCreatedVia.SE_EDIT_DRAFT,
+    )
+    db.add(new_draft)
+    await db.flush()
+    await _deep_copy_package_content(db, src.id, new_draft.id)
+
+    # Carry Locations / Authors / PackageVariables / Parameters
+    # too — they're CA-side concepts but Global packages also use
+    # them (SE assigns Authors, sets PVs, etc.). Mirror the client
+    # clone-to-draft semantics.
+    locations = (await db.execute(
+        select(PackageLocation).where(PackageLocation.package_id == src.id)
+    )).scalars().all()
+    for loc in locations:
+        db.add(PackageLocation(
+            package_id=new_draft.id,
+            state_cosh_id=loc.state_cosh_id,
+            district_cosh_id=loc.district_cosh_id,
+        ))
+    authors = (await db.execute(
+        select(PackageAuthor).where(PackageAuthor.package_id == src.id)
+    )).scalars().all()
+    for a in authors:
+        db.add(PackageAuthor(
+            package_id=new_draft.id,
+            user_id=a.user_id,
+            display_order=a.display_order,
+        ))
+    pvs = (await db.execute(
+        select(PackageVariable).where(PackageVariable.package_id == src.id)
+    )).scalars().all()
+    for pv in pvs:
+        db.add(PackageVariable(
+            package_id=new_draft.id,
+            parameter_id=pv.parameter_id,
+            variable_id=pv.variable_id,
+        ))
+
+    await db.commit()
+    await db.refresh(new_draft)
+    return new_draft
+
+
+@router.get(
+    "/advisory/global/packages/{pkg_id}/lineage",
+)
+async def get_global_package_lineage(
+    pkg_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Every row in this Global Package's lineage — rows sharing
+    (client_id IS NULL, crop_cosh_id, name). Feeds the SA portal's
+    version-history navigator (Batch 39L-c) and the "Continue
+    v_{N+1} draft" detection on the detail page (Batch 39L-b)."""
+    pkg = (await db.execute(
+        select(Package).where(
+            Package.id == pkg_id, Package.client_id == None,  # noqa: E711
+        )
+    )).scalar_one_or_none()
+    if pkg is None:
+        raise HTTPException(status_code=404, detail="Global package not found")
+    rows = (await db.execute(
+        select(Package).where(
+            Package.client_id == None,  # noqa: E711
+            Package.crop_cosh_id == pkg.crop_cosh_id,
+            Package.name == pkg.name,
+        ).order_by(Package.version.desc(), Package.created_at.desc())
+    )).scalars().all()
+
+    def sort_key(p: Package):
+        is_draft = 0 if p.status == PackageStatus.DRAFT else 1
+        return (is_draft, -p.version, -p.created_at.timestamp())
+
+    return [
+        {
+            "id": r.id,
+            "status": r.status.value if hasattr(r.status, "value") else r.status,
+            "version": r.version,
+            "published_at": r.published_at.isoformat() if r.published_at else None,
+            "created_at": r.created_at.isoformat(),
+            "created_via": (
+                r.created_via.value if r.created_via and hasattr(r.created_via, "value")
+                else r.created_via
+            ),
+            "source_version_id": r.source_version_id,
+            "is_current": r.id == pkg_id,
+        }
+        for r in sorted(rows, key=sort_key)
+    ]
+
+
 # ── Practice taxonomy + element specs (2026-05-11) ─────────────────────────
 # L0 → L1 → L2 hierarchy + per-L2 element rules. Pure-data
 # endpoints used by both the SA and CA portals to render
@@ -4159,20 +4318,37 @@ async def delete_global_cca_element(
 async def _deep_copy_package_content(
     db: AsyncSession, src_id: str, dst_id: str,
 ) -> None:
-    """Copy all timelines + practices + elements from `src_id` →
-    `dst_id`. Used by push, pull, and SE clone-to-draft (Batch 3).
+    """Copy all timelines + practices + elements + relations + CQs
+    from `src_id` → `dst_id`. Used by push, pull, SE clone-to-draft,
+    and SE rollback-publish.
 
     Does NOT touch package-level fields (name, package_type,
     duration_days, locations, authors, package_variables) — caller
     is responsible for setting those on the destination row before
     invoking. Commits are not issued here; the caller controls the
     transaction boundary.
+
+    Batch 39L-b (2026-05-16) — also carries is_brand_locked on the
+    Practice copy (column added in 39I-a), plus Relations + their
+    PracticeConditional / RelationConditional bindings + Conditional
+    Questions. Previously, cloning a package dropped every Relation
+    and CQ — making the CM's "edit this version" flow lose those
+    sub-structures.
     """
+    practice_id_map: dict[str, str] = {}        # src_practice_id → new_practice_id
+    timeline_id_map: dict[str, str] = {}        # src_timeline_id → new_timeline_id
+    relation_id_map: dict[str, str] = {}        # src_relation_id → new_relation_id
+    cq_id_map: dict[str, str] = {}              # src_cq_id → new_cq_id
+    # src_practice → (src_relation_id, role) so we can wire the new
+    # practice rows to the new relation rows after both have flushed.
+    practice_relation_links: dict[str, tuple[str, str]] = {}
+
     tl_result = await db.execute(
         select(Timeline).where(Timeline.package_id == src_id)
         .order_by(Timeline.display_order)
     )
-    for src_tl in tl_result.scalars().all():
+    src_timelines = tl_result.scalars().all()
+    for src_tl in src_timelines:
         new_tl = Timeline(
             package_id=dst_id,
             name=src_tl.name,
@@ -4180,9 +4356,11 @@ async def _deep_copy_package_content(
             from_value=src_tl.from_value,
             to_value=src_tl.to_value,
             display_order=src_tl.display_order,
+            status=src_tl.status,
         )
         db.add(new_tl)
         await db.flush()
+        timeline_id_map[src_tl.id] = new_tl.id
 
         p_result = await db.execute(
             select(Practice).where(Practice.timeline_id == src_tl.id)
@@ -4196,11 +4374,17 @@ async def _deep_copy_package_content(
                 l2_type=src_p.l2_type,
                 display_order=src_p.display_order,
                 is_special_input=src_p.is_special_input,
+                is_brand_locked=src_p.is_brand_locked,
                 common_name_cosh_id=src_p.common_name_cosh_id,
                 frequency_days=src_p.frequency_days,
+                # relation_id + relation_role wired in a second pass
+                # once Relations have been cloned.
             )
             db.add(new_p)
             await db.flush()
+            practice_id_map[src_p.id] = new_p.id
+            if src_p.relation_id and src_p.relation_role:
+                practice_relation_links[src_p.id] = (src_p.relation_id, src_p.relation_role)
 
             el_result = await db.execute(
                 select(Element).where(Element.practice_id == src_p.id)
@@ -4214,6 +4398,79 @@ async def _deep_copy_package_content(
                     value=src_el.value,
                     unit_cosh_id=src_el.unit_cosh_id,
                     display_order=src_el.display_order,
+                ))
+
+    # Relations — clone, then wire the practice rows to their new
+    # Relation via relation_id + relation_role.
+    for src_tl in src_timelines:
+        rels = (await db.execute(
+            select(Relation).where(Relation.timeline_id == src_tl.id)
+        )).scalars().all()
+        for src_rel in rels:
+            new_rel = Relation(
+                timeline_id=timeline_id_map[src_tl.id],
+                relation_type=src_rel.relation_type,
+                expression=src_rel.expression,
+            )
+            db.add(new_rel)
+            await db.flush()
+            relation_id_map[src_rel.id] = new_rel.id
+    if practice_relation_links:
+        # Second-pass: now that Relations exist on the destination,
+        # walk the new Practice rows and set their relation_id / role.
+        for src_pid, (src_rel_id, role) in practice_relation_links.items():
+            new_pid = practice_id_map.get(src_pid)
+            new_rel_id = relation_id_map.get(src_rel_id)
+            if not (new_pid and new_rel_id):
+                continue
+            new_p = (await db.execute(
+                select(Practice).where(Practice.id == new_pid)
+            )).scalar_one()
+            new_p.relation_id = new_rel_id
+            new_p.relation_role = role
+
+    # Conditional Questions — clone per timeline.
+    for src_tl in src_timelines:
+        cqs = (await db.execute(
+            select(ConditionalQuestion).where(
+                ConditionalQuestion.timeline_id == src_tl.id
+            ).order_by(ConditionalQuestion.display_order)
+        )).scalars().all()
+        for src_cq in cqs:
+            new_cq = ConditionalQuestion(
+                timeline_id=timeline_id_map[src_tl.id],
+                question_text=src_cq.question_text,
+                display_order=src_cq.display_order,
+            )
+            db.add(new_cq)
+            await db.flush()
+            cq_id_map[src_cq.id] = new_cq.id
+
+    # PracticeConditional + RelationConditional bindings.
+    if cq_id_map:
+        pcs = (await db.execute(
+            select(PracticeConditional).where(
+                PracticeConditional.question_id.in_(list(cq_id_map.keys()))
+            )
+        )).scalars().all()
+        for pc in pcs:
+            new_p = practice_id_map.get(pc.practice_id)
+            new_cq = cq_id_map.get(pc.question_id)
+            if new_p and new_cq:
+                db.add(PracticeConditional(
+                    practice_id=new_p, question_id=new_cq, answer=pc.answer,
+                ))
+        rcs = (await db.execute(
+            select(RelationConditional).where(
+                RelationConditional.question_id.in_(list(cq_id_map.keys()))
+            )
+        )).scalars().all()
+        for rc in rcs:
+            new_r = relation_id_map.get(rc.relation_id)
+            new_cq = cq_id_map.get(rc.question_id)
+            if new_r and new_cq:
+                db.add(RelationConditional(
+                    relation_id=new_r, question_id=new_cq, answer=rc.answer,
                 ))
 
 
