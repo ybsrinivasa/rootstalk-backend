@@ -5176,6 +5176,23 @@ async def rollback_publish(
 
 # ── Global PG Recommendations ──────────────────────────────────────────────────
 
+@router.get("/advisory/global/problem-groups")
+async def list_global_problem_groups(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SA-portal helper (Batch 39P-a, 2026-05-16) — list of
+    Problem-Groups a CM can author Global recommendations against.
+
+    Today this is the same hardcoded V1 list used by the CA portal
+    (`app/services/cha_problem_groups.py`); when Cosh's `problem_group`
+    Connect ships, that module switches its source and every caller
+    of this endpoint picks up the new list automatically.
+    """
+    from app.services.cha_problem_groups import list_problem_groups
+    return list_problem_groups()
+
+
 @router.get("/advisory/global/pg-recommendations", response_model=list[PGRecommendationOut])
 async def list_global_pg(
     include_drafts: bool = False,
@@ -5223,6 +5240,52 @@ async def get_global_pg(
     if not pg:
         raise HTTPException(status_code=404, detail="Global PG recommendation not found")
     return pg
+
+
+@router.get("/advisory/global/pg-recommendations/{pg_id}/timelines")
+async def list_global_pg_timelines(
+    pg_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SA-portal helper (Batch 39P-a, 2026-05-16) — list Timelines on
+    a Global PG recommendation with their practices nested. Mirrors
+    the CA-side `/client/{cid}/pg-recommendations/{pg_id}/timelines`
+    shape so the same front-end renderer can drive both surfaces."""
+    result = await db.execute(
+        select(Timeline).where(Timeline.pg_recommendation_id == pg_id)
+        .order_by(Timeline.display_order, Timeline.from_value)
+    )
+    timelines = result.scalars().all()
+    out = []
+    for tl in timelines:
+        p_res = await db.execute(
+            select(Practice).where(Practice.timeline_id == tl.id)
+            .order_by(Practice.display_order)
+        )
+        from_type_value = (
+            tl.from_type.value if hasattr(tl.from_type, "value") else tl.from_type
+        )
+        out.append({
+            "id": tl.id,
+            "pg_recommendation_id": tl.pg_recommendation_id,
+            "name": tl.name,
+            "from_type": from_type_value,
+            "from_value": tl.from_value,
+            "to_value": tl.to_value,
+            "practices": [
+                {
+                    "id": p.id,
+                    "l0_type": p.l0_type.value if hasattr(p.l0_type, "value") else p.l0_type,
+                    "l1_type": p.l1_type,
+                    "l2_type": p.l2_type,
+                    "display_order": p.display_order,
+                    "is_special_input": p.is_special_input,
+                }
+                for p in p_res.scalars().all()
+            ],
+        })
+    return out
 
 
 @router.post("/advisory/global/pg-recommendations/{pg_id}/timelines", status_code=201)
