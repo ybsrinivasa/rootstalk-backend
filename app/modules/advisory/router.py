@@ -6887,6 +6887,44 @@ async def add_sp_timeline(
     return tl
 
 
+@router.put("/client/{client_id}/sp-recommendations/{sp_id}/timelines/{tl_id}")
+async def update_sp_timeline(
+    client_id: str,
+    sp_id: str,
+    tl_id: str,
+    request: PGTimelineUpdate,  # name/from/to/status — same shape as PG/QA
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CA-SP Edit Timeline (Phase 4 of CA-portal parity, 2026-05-17).
+    Mirror of update_client_pg_timeline. `from_type` stays immutable;
+    `status` toggle excludes the Timeline from the farmer's daily
+    advisory without deleting it."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    tl = (await db.execute(
+        select(Timeline).where(
+            Timeline.id == tl_id,
+            Timeline.sp_recommendation_id == sp_id,
+        )
+    )).scalar_one_or_none()
+    if not tl:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    update_data = request.model_dump(exclude_unset=True)
+    if "status" in update_data:
+        if update_data["status"] not in ("ACTIVE", "INACTIVE"):
+            raise HTTPException(status_code=422, detail={
+                "code": "invalid_status",
+                "message": "Timeline status must be ACTIVE or INACTIVE.",
+            })
+
+    for field, value in update_data.items():
+        setattr(tl, field, value)
+    await db.commit()
+    await db.refresh(tl)
+    return tl
+
+
 @router.post("/client/{client_id}/sp-recommendations/{sp_id}/timelines/{tl_id}/practices", status_code=201)
 async def add_sp_practice(
     client_id: str,
@@ -6920,6 +6958,71 @@ async def add_sp_practice(
     )
     db.add(practice)
     await db.flush()
+    for el in request.elements:
+        db.add(Element(
+            practice_id=practice.id,
+            element_type=el.element_type,
+            cosh_ref=el.cosh_ref,
+            value=el.value,
+            unit_cosh_id=el.unit_cosh_id,
+            display_order=el.display_order,
+        ))
+    await db.commit()
+    await db.refresh(practice)
+    return practice
+
+
+@router.put(
+    "/client/{client_id}/sp-recommendations/{sp_id}/timelines/{tl_id}/practices/{practice_id}",
+    response_model=PracticeOut,
+)
+async def update_sp_practice(
+    client_id: str,
+    sp_id: str,
+    tl_id: str,
+    practice_id: str,
+    request: SPPracticeCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CA-SP atomic Practice replace (Phase 4 of CA-portal parity,
+    2026-05-17). Mirror of update_client_pg_practice — same shape
+    so the shared <PracticeFormModal> uses one body for Create and
+    Edit. Elements wiped + reinserted to match what the form
+    submits."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    try:
+        await assert_l2_elements_valid(
+            db,
+            l2_type=request.l2_type,
+            elements=request.elements,
+            is_special_input=request.is_special_input,
+            frequency_days=request.frequency_days,
+        )
+    except L2ElementValidationError as e:
+        _raise_l2_element_validation(e)
+
+    practice = (await db.execute(
+        select(Practice).where(
+            Practice.id == practice_id,
+            Practice.timeline_id == tl_id,
+        )
+    )).scalar_one_or_none()
+    if not practice:
+        raise HTTPException(status_code=404, detail="Practice not found")
+
+    practice.l0_type = request.l0_type
+    practice.l1_type = request.l1_type
+    practice.l2_type = request.l2_type
+    practice.display_order = request.display_order
+    practice.is_special_input = request.is_special_input
+    practice.frequency_days = request.frequency_days
+
+    existing_els = (await db.execute(
+        select(Element).where(Element.practice_id == practice.id)
+    )).scalars().all()
+    for e in existing_els:
+        await db.delete(e)
     for el in request.elements:
         db.add(Element(
             practice_id=practice.id,
@@ -7148,6 +7251,55 @@ async def add_qa_timeline(
     }
 
 
+@router.put("/client/{client_id}/standard-responses/{sr_id}/timelines/{tl_id}")
+async def update_qa_timeline(
+    client_id: str,
+    sr_id: str,
+    tl_id: str,
+    request: PGTimelineUpdate,  # name/from/to/status — same shape as PG/SP
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CA-QA Edit Timeline (Phase 4 of CA-portal parity, 2026-05-17).
+    Mirror of update_client_pg_timeline. `from_type` (default
+    DAYS_AFTER_RESPONSE) stays immutable. Note QA has no publish
+    lifecycle — these edits are immediately live for FarmPundits."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    await _assert_sr_belongs_to_client(db, sr_id, client_id)
+
+    tl = (await db.execute(
+        select(Timeline).where(
+            Timeline.id == tl_id,
+            Timeline.standard_response_id == sr_id,
+        )
+    )).scalar_one_or_none()
+    if not tl:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    update_data = request.model_dump(exclude_unset=True)
+    if "status" in update_data:
+        if update_data["status"] not in ("ACTIVE", "INACTIVE"):
+            raise HTTPException(status_code=422, detail={
+                "code": "invalid_status",
+                "message": "Timeline status must be ACTIVE or INACTIVE.",
+            })
+
+    for field, value in update_data.items():
+        setattr(tl, field, value)
+    await db.commit()
+    await db.refresh(tl)
+    return {
+        "id": tl.id,
+        "standard_response_id": tl.standard_response_id,
+        "parent_kind": tl.parent_kind,
+        "name": tl.name,
+        "from_type": tl.from_type,
+        "from_value": tl.from_value,
+        "to_value": tl.to_value,
+        "status": tl.status,
+    }
+
+
 @router.delete(
     "/client/{client_id}/standard-responses/{sr_id}/timelines/{tl_id}",
     status_code=204,
@@ -7245,6 +7397,96 @@ async def add_qa_practice(
     db.add(practice)
     await db.flush()
 
+    for el in request.elements:
+        db.add(Element(
+            practice_id=practice.id,
+            element_type=el.element_type,
+            cosh_ref=el.cosh_ref,
+            value=el.value,
+            unit_cosh_id=el.unit_cosh_id,
+            display_order=el.display_order,
+        ))
+    await db.commit()
+    await db.refresh(practice)
+
+    elements = (await db.execute(
+        select(Element).where(Element.practice_id == practice.id)
+        .order_by(Element.display_order)
+    )).scalars().all()
+    return {
+        "id": practice.id,
+        "timeline_id": practice.timeline_id,
+        "l0_type": practice.l0_type,
+        "l1_type": practice.l1_type,
+        "l2_type": practice.l2_type,
+        "display_order": practice.display_order,
+        "is_special_input": practice.is_special_input,
+        "frequency_days": practice.frequency_days,
+        "elements": [
+            {
+                "id": e.id,
+                "element_type": e.element_type,
+                "cosh_ref": e.cosh_ref,
+                "value": e.value,
+                "unit_cosh_id": e.unit_cosh_id,
+                "display_order": e.display_order,
+            }
+            for e in elements
+        ],
+    }
+
+
+@router.put(
+    "/client/{client_id}/standard-responses/{sr_id}/timelines/{tl_id}/practices/{practice_id}",
+)
+async def update_qa_practice(
+    client_id: str,
+    sr_id: str,
+    tl_id: str,
+    practice_id: str,
+    request: QAPracticeCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CA-QA atomic Practice replace (Phase 4 of CA-portal parity,
+    2026-05-17). Mirror of update_client_pg_practice / update_sp_practice.
+    Elements wiped + reinserted to match what the shared modal
+    submits."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    await _assert_sr_belongs_to_client(db, sr_id, client_id)
+
+    try:
+        await assert_l2_elements_valid(
+            db,
+            l2_type=request.l2_type,
+            elements=request.elements,
+            is_special_input=request.is_special_input,
+            frequency_days=request.frequency_days,
+        )
+    except L2ElementValidationError as e:
+        _raise_l2_element_validation(e)
+
+    practice = (await db.execute(
+        select(Practice).where(
+            Practice.id == practice_id,
+            Practice.timeline_id == tl_id,
+        )
+    )).scalar_one_or_none()
+    if not practice:
+        raise HTTPException(status_code=404, detail="Practice not found")
+
+    practice.l0_type = request.l0_type
+    practice.l1_type = request.l1_type
+    practice.l2_type = request.l2_type
+    practice.display_order = request.display_order
+    practice.is_special_input = request.is_special_input
+    practice.frequency_days = request.frequency_days
+
+    existing_els = (await db.execute(
+        select(Element).where(Element.practice_id == practice.id)
+    )).scalars().all()
+    for e in existing_els:
+        await db.delete(e)
     for el in request.elements:
         db.add(Element(
             practice_id=practice.id,
