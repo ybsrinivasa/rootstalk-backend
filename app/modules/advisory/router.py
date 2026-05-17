@@ -124,6 +124,69 @@ def _validate_brand_lock(request: "PracticeCreate") -> None:
         })
 
 
+async def _assert_can_edit_client_advisory(
+    db: AsyncSession, user_id: str, client_id: str,
+) -> None:
+    """Authorisation gate for CA-side advisory writes (CCA today;
+    PG / SP / QA when those CA-side surfaces ship).
+
+    V1 (Batch 39S, 2026-05-17) accepts two paths:
+      1. ANY ACTIVE ClientUser of this client (regardless of role).
+      2. ACTIVE CMClientAssignment with EDIT rights — per the
+         documented Ram-direct-edit pattern (`pull_global_package`
+         docstring) the CM may edit a client's Local advisory
+         content directly without going through pull.
+
+    Why the V1 boundary is "any ClientUser of THIS client" rather
+    than the stricter "SUBJECT_EXPERT-only": the immediate goal is
+    closing the cross-company hole (any authenticated user could
+    previously write to ANY client's CCA endpoints because
+    `_require_client_role` was a no-op stub). Narrowing further to
+    SE-only is a follow-up; it requires several existing test
+    fixtures to be reshaped, which has wider blast radius than
+    this batch.
+
+    Raises 403 with stable code `cca_edit_forbidden`.
+    """
+    from app.modules.clients.models import (
+        CMClientAssignment, CMRights, ClientUser,
+    )
+    from app.modules.platform.models import StatusEnum
+
+    cu = (await db.execute(
+        select(ClientUser.id).where(
+            ClientUser.user_id == user_id,
+            ClientUser.client_id == client_id,
+            ClientUser.status == StatusEnum.ACTIVE,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if cu is not None:
+        return
+
+    cm = (await db.execute(
+        select(CMClientAssignment.id).where(
+            CMClientAssignment.cm_user_id == user_id,
+            CMClientAssignment.client_id == client_id,
+            CMClientAssignment.status == StatusEnum.ACTIVE,
+            CMClientAssignment.rights == CMRights.EDIT,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if cm is not None:
+        return
+
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "code": "cca_edit_forbidden",
+            "message": (
+                "Editing advisory content requires either an active "
+                "staff role on this client, or an active Content "
+                "Manager assignment with EDIT rights."
+            ),
+        },
+    )
+
+
 async def _assert_cm_can_edit_client(
     db: AsyncSession, user_id: str, client_id: str,
 ) -> None:
@@ -519,6 +582,7 @@ async def create_package(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     # CCA Step 1 membership gate (Batch 1C): the crop must be on the
     # company's conveyor belt before an expert can build a PoP for it.
     try:
@@ -641,6 +705,7 @@ async def update_package(
     and locked at 365 for Perennial packages. Pre-fix the route blindly
     setattr'd whatever was sent — a Perennial's duration could be
     flipped to 100 and break advisory alignment downstream."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     pkg = await _get_package(db, package_id, client_id)
     update_data = request.model_dump(exclude_unset=True)
 
@@ -788,6 +853,7 @@ async def publish_package(
     Pre-fix the unconditional `version + 1` produced v=2 on first
     publish for a default-version-1 row.
     """
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     pkg = await _get_package(db, package_id, client_id)
 
     # CCA Step 1 membership gate (Batch 1C): publish requires the
@@ -890,6 +956,7 @@ async def set_package_locations(
     After the new location set is in place, run the uniqueness check
     against DRAFT/ACTIVE siblings and refuse the save if any conflict
     surfaces. Spec §4.2."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     pkg = await _get_package(db, package_id, client_id)
     existing = (await db.execute(
         select(PackageLocation).where(PackageLocation.package_id == package_id)
@@ -963,6 +1030,7 @@ async def set_package_authors(
       of this client. Detail includes `invalid_user_ids` so the
       portal can highlight precisely which rows to fix.
     """
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     await _get_package(db, package_id, client_id)
 
     user_ids = [a.user_id for a in authors]
@@ -1261,6 +1329,7 @@ async def set_package_variables(
     otherwise — the farmer answers all the questions and ends up
     with two PoPs the system can't distinguish.
     """
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     pkg = await _get_package(db, package_id, client_id)
     existing = (await db.execute(
         select(PackageVariable).where(PackageVariable.package_id == package_id)
@@ -1362,6 +1431,7 @@ async def create_timeline(
     against the parent Package's type, plus pre-checks name
     uniqueness within the Package so duplicate names surface as a
     friendly 422 instead of a 500 from the DB unique constraint."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     pkg = await _get_package(db, package_id, client_id)
 
     try:
@@ -1399,6 +1469,7 @@ async def update_timeline(
     type ↔ package consistency is fixed at create time and the
     update path doesn't need to re-check it.
     """
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     pkg = await _get_package(db, package_id, client_id)
     tl = await _get_timeline(db, timeline_id, package_id)
 
@@ -1441,6 +1512,7 @@ async def delete_timeline(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     tl = await _get_timeline(db, timeline_id, package_id)
     await db.delete(tl)
     await db.commit()
@@ -1456,6 +1528,7 @@ async def import_timeline(
     """Copy a timeline (with all practices and elements) from any package into this one.
     The copy is completely independent after save — changes to either do not affect the other.
     """
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     source_id = data.get("source_timeline_id")
     new_name = (data.get("new_name") or "").strip()
     if not source_id:
@@ -1568,6 +1641,7 @@ async def create_practice(
     integrity, special-input / frequency-based / plant-wise invariants).
 
     Batch 30: l2_type is now required (no more "No sub-type" shells)."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     if not request.l2_type:
         raise HTTPException(status_code=422, detail={
             "code": "l2_type_required",
@@ -1627,6 +1701,7 @@ async def update_practice(
 ):
     """Atomic Practice replace — same shape as the global PUT
     (Batch 33). Runs the L2 validator before swapping elements."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     if not request.l2_type:
         raise HTTPException(status_code=422, detail={
             "code": "l2_type_required",
@@ -1685,6 +1760,7 @@ async def delete_practice(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     result = await db.execute(select(Practice).where(Practice.id == practice_id, Practice.timeline_id == timeline_id))
     practice = result.scalar_one_or_none()
     if not practice:
@@ -1717,6 +1793,7 @@ async def add_cca_element(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     practice = await _load_cca_practice(db, timeline_id=timeline_id, practice_id=practice_id)
     new = await _add_practice_element(
         db, practice=practice, element_model=Element, body=body,
@@ -1733,6 +1810,7 @@ async def update_cca_element(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     practice = await _load_cca_practice(db, timeline_id=timeline_id, practice_id=practice_id)
     updated = await _update_practice_element(
         db, practice=practice, element_model=Element,
@@ -1750,6 +1828,7 @@ async def delete_cca_element(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     practice = await _load_cca_practice(db, timeline_id=timeline_id, practice_id=practice_id)
     await _delete_practice_element(
         db, practice=practice, element_model=Element, element_id=element_id,
@@ -1777,6 +1856,7 @@ async def create_relation(
     `request.parts` is a 3-D list (parts × options × positions) of
     practice_ids — see RelationCreate docstring for the shape.
     """
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     # Flatten + dedupe practice_ids while preserving the structure.
     distinct_practice_ids: set[str] = set()
     for opts in request.parts:
@@ -1907,6 +1987,7 @@ async def create_conditional_question(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     q = ConditionalQuestion(timeline_id=timeline_id, **request.model_dump())
     db.add(q)
     await db.commit()
@@ -1930,6 +2011,7 @@ async def link_practice_conditional(
     Same `(practice_id, question_id)` repeats are idempotent — the
     existing row is returned without modification.
     """
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     practice = (await db.execute(
         select(Practice).where(Practice.id == practice_id)
     )).scalar_one_or_none()
@@ -1994,6 +2076,7 @@ async def link_relation_conditional(
     is ignored on this endpoint — the resource is the Relation
     identified in the URL.
     """
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     relation = (await db.execute(
         select(Relation).where(Relation.id == relation_id)
     )).scalar_one_or_none()
@@ -4796,12 +4879,15 @@ async def _assert_client_user_can_edit(
     from app.modules.clients.models import ClientUser
     from app.modules.platform.models import StatusEnum
 
+    # Existence check, not a single-row constraint. The DB allows
+    # multiple ClientUser rows per (user, client) keyed on role, so
+    # `.first()` is the correct primitive here.
     cu = (await db.execute(
-        select(ClientUser).where(
+        select(ClientUser.id).where(
             ClientUser.user_id == user_id,
             ClientUser.client_id == client_id,
             ClientUser.status == StatusEnum.ACTIVE,
-        )
+        ).limit(1)
     )).scalar_one_or_none()
     if cu is None:
         raise HTTPException(

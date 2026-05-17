@@ -567,7 +567,7 @@ async def test_qa_element_rejects_non_member(db):
     QA practice endpoints do — outsiders get 403, NOT 404, so URL
     enumeration doesn't leak which client has a Q&A library."""
     client, se, sr_id, tl_id, p_id = await _seed_qa_practice(db)
-    outsider = await make_user(db, name="Outsider")
+    outsider = await make_user(db, name="Outsider", skip_auto_link=True)
 
     with pytest.raises(HTTPException) as exc:
         await add_qa_element(

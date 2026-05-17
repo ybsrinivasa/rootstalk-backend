@@ -1045,7 +1045,7 @@ async def test_set_authors_422_when_user_not_in_client(db):
     user = await make_user(db, name="CA")
     await _seed_paddy_on_belt(db, client, user)
     pkg = await _create_test_package(db, client=client, user=user)
-    stranger = await make_user(db, name="Stranger")  # exists, no ClientUser row
+    stranger = await make_user(db, name="Stranger", skip_auto_link=True)  # exists, no ClientUser row
     await db.commit()
 
     with pytest.raises(HTTPException) as ei:
@@ -1121,8 +1121,14 @@ async def test_set_authors_422_when_se_is_inactive(db):
     pkg = await _create_test_package(db, client=client, user=user)
     from sqlalchemy import select as sql_select
     se = await _make_subject_expert(db, client=client, name="Dr Inactive")
+    # Filter on role: the SE was also auto-linked as REPORT_USER by
+    # the factory (Batch 39S test-compat). Test wants the SUBJECT_EXPERT
+    # row specifically.
     cu_row = (await db.execute(
-        sql_select(ClientUser).where(ClientUser.user_id == se.id)
+        sql_select(ClientUser).where(
+            ClientUser.user_id == se.id,
+            ClientUser.role == ClientUserRole.SUBJECT_EXPERT,
+        )
     )).scalar_one()
     cu_row.status = StatusEnum.INACTIVE
     await db.commit()

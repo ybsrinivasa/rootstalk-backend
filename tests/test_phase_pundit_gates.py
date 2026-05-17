@@ -55,7 +55,10 @@ async def _enrol_pundit(db, *, client, profile, status="ACTIVE",
 
 
 async def _portal_member(db, *, client, role=ClientUserRole.CA):
-    user = await make_user(db, name=f"Member-{client.short_name}")
+    # skip_auto_link so the user is a member of ONLY the requested client
+    # (matters when the test creates multiple clients to verify cross-
+    # client isolation).
+    user = await make_user(db, name=f"Member-{client.short_name}", skip_auto_link=True)
     await make_client_user(db, user=user, client=client, role=role)
     return user
 
@@ -69,7 +72,7 @@ async def test_search_pundits_rejects_non_member(db):
     JWT auth being valid in the test (we pass a User who simply has
     no ClientUser row at the target client)."""
     client = await make_client(db)
-    outsider = await make_user(db, name="Outsider")
+    outsider = await make_user(db, name="Outsider", skip_auto_link=True)
     await db.commit()
 
     with pytest.raises(HTTPException) as ei:
@@ -317,7 +320,7 @@ async def test_invite_pundit_rejects_non_member(db):
     """The invite endpoint sits behind the same gate. Without it, an
     outsider could spam any client's pundit pool with invitations."""
     client = await make_client(db)
-    outsider = await make_user(db, name="Outsider")
+    outsider = await make_user(db, name="Outsider", skip_auto_link=True)
     target_user, _target_profile = await _seed_pundit(db)
     await db.commit()
 

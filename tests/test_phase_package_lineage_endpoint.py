@@ -168,8 +168,10 @@ async def test_lineage_excludes_other_clients_rows(db):
 async def test_lineage_403_when_caller_not_client_user(db):
     """Caller without an active ClientUser at this client → 403
     `client_user_required`."""
-    rando = await make_user(db, name="Rando")
+    # skip_auto_link so the user is a member of NO client (the test's
+    # whole point is the missing ClientUser → 403).
     client = await make_client(db)
+    rando = await make_user(db, name="Rando", skip_auto_link=True)
     now = datetime.now(timezone.utc)
     pkg = await _local_pkg(db, client=client, name="P",
                            status=PackageStatus.ACTIVE, version=1,

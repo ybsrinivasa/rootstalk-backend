@@ -293,7 +293,7 @@ db=db,current_user=se_a,
 @pytest.mark.asyncio
 async def test_list_rejects_non_member(db):
     client = await make_client(db)
-    outsider = await make_user(db, name="Outsider")
+    outsider = await make_user(db, name="Outsider", skip_auto_link=True)
     await db.commit()
 
     with pytest.raises(HTTPException) as ei:

@@ -84,12 +84,15 @@ async def _assert_portal_member(
     from app.modules.clients.models import ClientUser
     from app.modules.platform.models import StatusEnum
 
+    # Existence check; DB allows multiple roles per (user, client) so
+    # use `.limit(1)` to avoid MultipleResultsFound on legitimate
+    # multi-role users.
     enrolled = (await db.execute(
-        select(ClientUser).where(
+        select(ClientUser.id).where(
             ClientUser.user_id == user_id,
             ClientUser.client_id == client_id,
             ClientUser.status == StatusEnum.ACTIVE,
-        )
+        ).limit(1)
     )).scalar_one_or_none()
     if enrolled is None:
         raise HTTPException(

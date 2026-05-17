@@ -351,7 +351,7 @@ async def test_endpoints_reject_non_member(db):
     client = await make_client(db)
     se = await _se_for(db, client=client)
     sr_id = await _seed_sr(db, client=client, se=se)
-    outsider = await make_user(db, name="Outsider")
+    outsider = await make_user(db, name="Outsider", skip_auto_link=True)
     await db.commit()
 
     with pytest.raises(HTTPException) as ei:

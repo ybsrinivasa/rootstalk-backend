@@ -42,7 +42,66 @@ async def make_user(db: AsyncSession, **kw) -> User:
     u = User(phone=_short("+91"), name=kw.get("name", "Test Farmer"))
     db.add(u)
     await db.flush()
+    if not kw.get("skip_auto_link"):
+        await _auto_link_user_to_existing_clients(db, u)
     return u
+
+
+async def _auto_link_user_to_existing_clients(db: AsyncSession, user: User) -> None:
+    """Batch 39S (2026-05-17) test compat: auto-link new test Users to
+    every existing test Client as REPORT_USER so the new CCA-write
+    guard (`_assert_can_edit_client_advisory`) passes by default.
+
+    REPORT_USER is chosen as a "lowest-meaningful-role" placeholder so
+    the auto-link doesn't collide with tests that explicitly create
+    SUBJECT_EXPERT / CA / FIELD_MANAGER rows (the only roles real
+    tests construct today; see `grep ClientUserRole\\. tests/`). The
+    DB unique constraint is `(client_id, user_id, role)` so the
+    auto-linked REPORT_USER coexists peacefully with any test-added
+    explicit role on the same (user, client) pair.
+
+    Real production never auto-links; this only fires in the test
+    factories."""
+    from app.modules.clients.models import (
+        Client, ClientUser, ClientUserRole,
+    )
+    from app.modules.platform.models import StatusEnum
+
+    clients = (await db.execute(select(Client))).scalars().all()
+    if not clients:
+        return
+    added = False
+    for c in clients:
+        db.add(ClientUser(
+            user_id=user.id, client_id=c.id,
+            role=ClientUserRole.REPORT_USER,
+            status=StatusEnum.ACTIVE,
+        ))
+        added = True
+    if added:
+        await db.flush()
+
+
+async def _auto_link_client_to_existing_users(db: AsyncSession, client: Client) -> None:
+    """Mirror of `_auto_link_user_to_existing_clients` for the
+    make_client → make_user ordering. Uses REPORT_USER for the
+    same collision-avoidance reason."""
+    from app.modules.clients.models import ClientUser, ClientUserRole
+    from app.modules.platform.models import StatusEnum
+
+    users = (await db.execute(select(User))).scalars().all()
+    if not users:
+        return
+    added = False
+    for u in users:
+        db.add(ClientUser(
+            user_id=u.id, client_id=client.id,
+            role=ClientUserRole.REPORT_USER,
+            status=StatusEnum.ACTIVE,
+        ))
+        added = True
+    if added:
+        await db.flush()
 
 
 async def make_crop_reference(
@@ -188,6 +247,8 @@ async def make_client(db: AsyncSession, **kw) -> Client:
     )
     db.add(c)
     await db.flush()
+    if not kw.get("skip_auto_link"):
+        await _auto_link_client_to_existing_users(db, c)
     return c
 
 
@@ -267,7 +328,20 @@ async def make_client_user(
 
     Default role is CA — change via `role=` for tests that need a
     specific role (e.g. SUBJECT_EXPERT for standard-response
-    tests, FIELD_MANAGER for Promoter-Pundit tests)."""
+    tests, FIELD_MANAGER for Promoter-Pundit tests).
+
+    Batch 39S (2026-05-17): drop any auto-linked REPORT_USER row
+    for this (user, client) pair so callers that need a SINGLE
+    ClientUser row for the user (e.g. tests asserting on
+    `scalar_one_or_none()` semantics in the FarmPundit module) get
+    exactly one row, not the auto-linked REPORT_USER plus the
+    explicit role they're adding."""
+    await db.execute(
+        ClientUser.__table__.delete().where(
+            ClientUser.client_id == client.id,
+            ClientUser.user_id == user.id,
+        )
+    )
     cu = ClientUser(
         client_id=client.id, user_id=user.id, role=role, status=status,
     )
