@@ -1239,6 +1239,139 @@ async def create_variable(
 
 # ── Custom Parameters: extended CRUD (status, edit, translation) ─────────────
 
+@router.put("/client/{client_id}/parameters/{parameter_id}")
+async def update_client_parameter(
+    client_id: str, parameter_id: str,
+    request: ParameterUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Rename a CUSTOM client parameter. Mirror of
+    update_global_parameter (SA, line ~3614). Refuses on Cosh-mirrored
+    parameters — those track upstream Cosh translations and shouldn't
+    be edited locally."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    param = (await db.execute(
+        select(Parameter).where(
+            Parameter.id == parameter_id, Parameter.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if param is None:
+        raise HTTPException(status_code=404, detail="Parameter not found")
+    if param.source != ParameterSource.CUSTOM:
+        raise HTTPException(status_code=422, detail={
+            "code": "cosh_mirrored_parameter_readonly",
+            "message": "Cosh-mirrored parameters can't be edited; Cosh is the source of truth.",
+        })
+    update_data = request.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(param, field, value)
+    await db.commit()
+    await db.refresh(param)
+    return param
+
+
+@router.delete("/client/{client_id}/parameters/{parameter_id}", status_code=204)
+async def delete_client_parameter(
+    client_id: str, parameter_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Hard-delete a CUSTOM client parameter and its variables. Mirror
+    of delete_global_parameter (SA, line ~3645). Refuses if any
+    PackageVariable still references it — SE must clear the
+    Package signatures first. Refuses on Cosh-mirrored parameters."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    param = (await db.execute(
+        select(Parameter).where(
+            Parameter.id == parameter_id, Parameter.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if param is None:
+        raise HTTPException(status_code=404, detail="Parameter not found")
+    if param.source != ParameterSource.CUSTOM:
+        raise HTTPException(status_code=422, detail={
+            "code": "cosh_mirrored_parameter_readonly",
+            "message": "Cosh-mirrored parameters can't be deleted; Cosh is the source of truth.",
+        })
+    in_use = (await db.execute(
+        select(PackageVariable).where(
+            PackageVariable.parameter_id == parameter_id,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if in_use is not None:
+        raise HTTPException(status_code=422, detail={
+            "code": "parameter_in_use",
+            "message": "Parameter is in use by one or more Package signatures. Clear those signatures first.",
+        })
+    await db.execute(
+        Variable.__table__.delete().where(Variable.parameter_id == parameter_id)
+    )
+    await db.delete(param)
+    await db.commit()
+
+
+@router.delete(
+    "/client/{client_id}/parameters/{parameter_id}/variables/{variable_id}",
+    status_code=204,
+)
+async def delete_client_variable(
+    client_id: str, parameter_id: str, variable_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Hard-delete a Variable from a client parameter. Mirror of
+    delete_global_variable (SA, line ~3728). Gates on
+    `variable.cosh_id` (SE-added variables on Cosh-mirrored parents
+    are deletable; Cosh-mirrored variables themselves are not).
+    A CUSTOM parameter must keep ≥ 2 variables (Batch 28 invariant).
+    Refuses if the variable is in use by any PackageVariable."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    param = (await db.execute(
+        select(Parameter).where(
+            Parameter.id == parameter_id, Parameter.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if param is None:
+        raise HTTPException(status_code=404, detail="Parameter not found")
+    var = (await db.execute(
+        select(Variable).where(
+            Variable.id == variable_id,
+            Variable.parameter_id == parameter_id,
+        )
+    )).scalar_one_or_none()
+    if var is None:
+        raise HTTPException(status_code=404, detail="Variable not found")
+    if var.cosh_id is not None:
+        raise HTTPException(status_code=422, detail={
+            "code": "cosh_mirrored_variable_readonly",
+            "message": "Cosh-mirrored variables can't be deleted; Cosh is the source of truth.",
+        })
+    if param.source == ParameterSource.CUSTOM:
+        sibling_count = (await db.execute(
+            select(func.count()).select_from(Variable).where(
+                Variable.parameter_id == parameter_id,
+            )
+        )).scalar()
+        if sibling_count <= 2:
+            raise HTTPException(status_code=422, detail={
+                "code": "min_two_variables",
+                "message": "A CUSTOM Parameter must have at least 2 variables.",
+            })
+    in_use = (await db.execute(
+        select(PackageVariable).where(
+            PackageVariable.variable_id == variable_id,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if in_use is not None:
+        raise HTTPException(status_code=422, detail={
+            "code": "variable_in_use",
+            "message": "Variable is in use by one or more Package signatures. Clear those signatures first.",
+        })
+    await db.delete(var)
+    await db.commit()
+
+
 @router.put("/client/{client_id}/parameters/{parameter_id}/status")
 async def toggle_parameter_status(
     client_id: str, parameter_id: str,
@@ -1388,6 +1521,28 @@ async def approve_variable_translation(
         db.add(existing)
     await db.commit()
     return {"language_code": lang_code, "status": "EXPERT_VALIDATED"}
+
+
+@router.get("/client/{client_id}/packages/{package_id}/variables")
+async def list_package_variables(
+    client_id: str, package_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List the parameter→variable fingerprint set on a client Package.
+    Mirror of list_global_package_variables (SA, line ~3843).
+    Defaults to empty when none assigned yet."""
+    await _get_package(db, package_id, client_id)
+    rows = (await db.execute(
+        select(PackageVariable).where(PackageVariable.package_id == package_id)
+    )).scalars().all()
+    return [
+        {
+            "parameter_id": pv.parameter_id,
+            "variable_id": pv.variable_id,
+        }
+        for pv in rows
+    ]
 
 
 @router.put("/client/{client_id}/packages/{package_id}/variables")
