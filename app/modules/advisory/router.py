@@ -127,8 +127,8 @@ def _validate_brand_lock(request: "PracticeCreate") -> None:
 async def _assert_can_edit_client_advisory(
     db: AsyncSession, user_id: str, client_id: str,
 ) -> None:
-    """Authorisation gate for CA-side advisory writes (CCA today;
-    PG / SP / QA when those CA-side surfaces ship).
+    """Authorisation gate for CA-side advisory writes (CCA in Batch
+    39S; CHA-PG added in Batch 39T; SP / QA still pending).
 
     V1 (Batch 39S, 2026-05-17) accepts two paths:
       1. ANY ACTIVE ClientUser of this client (regardless of role).
@@ -6085,6 +6085,7 @@ async def create_client_pg(
     - `problem_group_cosh_id` is validated against the V1 hardcoded
       PG list — checked against Cosh's `problem_groups` Core
       (Batch 39R-bridge, 2026-05-17)."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     from app.services.cha_problem_groups import is_known_problem_group
 
     if request.area_or_plant not in ("AREA_WISE", "PLANT_WISE"):
@@ -6429,6 +6430,7 @@ async def publish_client_pg(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     pg = (await db.execute(
         select(PGRecommendation).where(PGRecommendation.id == pg_id, PGRecommendation.client_id == client_id)
     )).scalar_one_or_none()
@@ -6509,6 +6511,7 @@ async def add_client_pg_timeline(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     tl = Timeline(
         pg_recommendation_id=pg_id,
         name=request.name,
@@ -6532,6 +6535,7 @@ async def add_client_pg_practice(
     current_user: User = Depends(get_current_user),
 ):
     """Local-PG practice — same UCAT shape as global-PG and Q&A."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     try:
         await assert_l2_elements_valid(
             db,
@@ -6580,6 +6584,7 @@ async def add_client_pg_element(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     practice = await _load_pg_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
     new = await _add_practice_element(
         db, practice=practice, element_model=Element, body=body,
@@ -6596,6 +6601,7 @@ async def update_client_pg_element(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     practice = await _load_pg_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
     updated = await _update_practice_element(
         db, practice=practice, element_model=Element,
@@ -6613,6 +6619,7 @@ async def delete_client_pg_element(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     practice = await _load_pg_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
     await _delete_practice_element(
         db, practice=practice, element_model=Element, element_id=element_id,
@@ -6630,6 +6637,7 @@ async def delete_client_pg_practice(
 ):
     """Remove a practice from a client-local PG recommendation. Cascade
     drops its elements via ORM. Mirror of delete_practice on CCA."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     practice = (await db.execute(
         select(Practice).where(
             Practice.id == practice_id,
@@ -6655,6 +6663,7 @@ async def delete_client_pg_timeline(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     tl = (await db.execute(
         select(Timeline).where(Timeline.id == tl_id, Timeline.pg_recommendation_id == pg_id)
     )).scalar_one_or_none()
