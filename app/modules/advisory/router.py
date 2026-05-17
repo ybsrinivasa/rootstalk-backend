@@ -998,6 +998,29 @@ async def publish_package(
     return pkg
 
 
+@router.get("/client/{client_id}/packages/{package_id}/locations")
+async def list_package_locations(
+    client_id: str, package_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List the state/district pairs this Package is configured to
+    serve. Read-only; mutations go through PUT below."""
+    await _get_package(db, package_id, client_id)
+    rows = (await db.execute(
+        select(PackageLocation).where(PackageLocation.package_id == package_id)
+        .order_by(PackageLocation.state_cosh_id, PackageLocation.district_cosh_id)
+    )).scalars().all()
+    return [
+        {
+            "id": r.id,
+            "state_cosh_id": r.state_cosh_id,
+            "district_cosh_id": r.district_cosh_id,
+        }
+        for r in rows
+    ]
+
+
 @router.put("/client/{client_id}/packages/{package_id}/locations")
 async def set_package_locations(
     client_id: str, package_id: str,
