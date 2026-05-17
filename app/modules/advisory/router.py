@@ -6552,6 +6552,47 @@ async def add_client_pg_timeline(
     return tl
 
 
+@router.put(
+    "/client/{client_id}/pg-recommendations/{pg_id}/timelines/{tl_id}",
+    response_model=PGTimelineOut,
+)
+async def update_client_pg_timeline(
+    client_id: str,
+    pg_id: str,
+    tl_id: str,
+    request: PGTimelineUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CA-side mirror of update_global_pg_timeline (line ~5866).
+    Edit Timeline modal on the CA-PG editor posts here. `from_type`
+    stays immutable; `status` toggle gates the Timeline out of the
+    farmer's daily advisory without deleting it."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    tl = (await db.execute(
+        select(Timeline).where(
+            Timeline.id == tl_id,
+            Timeline.pg_recommendation_id == pg_id,
+        )
+    )).scalar_one_or_none()
+    if not tl:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    update_data = request.model_dump(exclude_unset=True)
+    if "status" in update_data:
+        if update_data["status"] not in ("ACTIVE", "INACTIVE"):
+            raise HTTPException(status_code=422, detail={
+                "code": "invalid_status",
+                "message": "Timeline status must be ACTIVE or INACTIVE.",
+            })
+
+    for field, value in update_data.items():
+        setattr(tl, field, value)
+    await db.commit()
+    await db.refresh(tl)
+    return tl
+
+
 @router.post("/client/{client_id}/pg-recommendations/{pg_id}/timelines/{tl_id}/practices", status_code=201)
 async def add_client_pg_practice(
     client_id: str,
@@ -6585,6 +6626,73 @@ async def add_client_pg_practice(
     )
     db.add(practice)
     await db.flush()
+    for el in request.elements:
+        db.add(Element(
+            practice_id=practice.id,
+            element_type=el.element_type,
+            cosh_ref=el.cosh_ref,
+            value=el.value,
+            unit_cosh_id=el.unit_cosh_id,
+            display_order=el.display_order,
+        ))
+    await db.commit()
+    await db.refresh(practice)
+    return practice
+
+
+@router.put(
+    "/client/{client_id}/pg-recommendations/{pg_id}/timelines/{tl_id}/practices/{practice_id}",
+    response_model=PracticeOut,
+)
+async def update_client_pg_practice(
+    client_id: str,
+    pg_id: str,
+    tl_id: str,
+    practice_id: str,
+    request: PGPracticeCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CA-side mirror of update_global_pg_practice (line ~5715).
+    Atomic Practice replace — same shape as add_client_pg_practice
+    so the shared <PracticeFormModal> can call this for Edit. The
+    Practice row's elements list is replaced wholesale to match
+    what the form submits."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    try:
+        await assert_l2_elements_valid(
+            db,
+            l2_type=request.l2_type,
+            elements=request.elements,
+            is_special_input=request.is_special_input,
+            frequency_days=request.frequency_days,
+        )
+    except L2ElementValidationError as e:
+        _raise_l2_element_validation(e)
+
+    practice = (await db.execute(
+        select(Practice).where(
+            Practice.id == practice_id,
+            Practice.timeline_id == tl_id,
+        )
+    )).scalar_one_or_none()
+    if not practice:
+        raise HTTPException(status_code=404, detail="Practice not found")
+
+    practice.l0_type = request.l0_type
+    practice.l1_type = request.l1_type
+    practice.l2_type = request.l2_type
+    practice.display_order = request.display_order
+    practice.is_special_input = request.is_special_input
+    practice.frequency_days = request.frequency_days
+
+    # Wipe + re-insert elements (atomic replace mirrors what the
+    # PracticeFormModal posts on Edit).
+    existing_els = (await db.execute(
+        select(Element).where(Element.practice_id == practice.id)
+    )).scalars().all()
+    for e in existing_els:
+        await db.delete(e)
     for el in request.elements:
         db.add(Element(
             practice_id=practice.id,
