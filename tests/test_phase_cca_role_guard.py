@@ -9,7 +9,7 @@ Eligible (V1 boundary):
   • Any ACTIVE ClientUser of THIS client (regardless of role).
   • ACTIVE CMClientAssignment with EDIT rights to THIS client.
 
-Rejected with 403 `cca_edit_forbidden`:
+Rejected with 403 `ca_edit_forbidden`:
   • Authenticated user with no ClientUser AND no CM assignment.
   • Authenticated user with a ClientUser at a DIFFERENT client only.
   • CMClientAssignment with rights != EDIT.
@@ -103,7 +103,7 @@ async def test_user_with_no_clientuser_and_no_assignment_rejected(db):
     with pytest.raises(HTTPException) as ei:
         await _assert_can_edit_client_advisory(db, user.id, client.id)
     assert ei.value.status_code == 403
-    assert ei.value.detail["code"] == "cca_edit_forbidden"
+    assert ei.value.detail["code"] == "ca_edit_forbidden"
 
 
 @requires_docker
@@ -120,7 +120,7 @@ async def test_clientuser_at_different_client_rejected(db):
     with pytest.raises(HTTPException) as ei:
         await _assert_can_edit_client_advisory(db, user.id, client_b.id)
     assert ei.value.status_code == 403
-    assert ei.value.detail["code"] == "cca_edit_forbidden"
+    assert ei.value.detail["code"] == "ca_edit_forbidden"
 
 
 @requires_docker
@@ -193,4 +193,4 @@ async def test_create_package_rejects_stranger_before_crop_check(db):
             db=db, current_user=stranger,
         )
     assert ei.value.status_code == 403
-    assert ei.value.detail["code"] == "cca_edit_forbidden"
+    assert ei.value.detail["code"] == "ca_edit_forbidden"

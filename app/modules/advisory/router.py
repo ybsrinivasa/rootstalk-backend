@@ -147,7 +147,7 @@ async def _assert_can_edit_client_advisory(
     fixtures to be reshaped, which has wider blast radius than
     this batch.
 
-    Raises 403 with stable code `cca_edit_forbidden`.
+    Raises 403 with stable code `ca_edit_forbidden`.
     """
     from app.modules.clients.models import (
         CMClientAssignment, CMRights, ClientUser,
@@ -178,7 +178,7 @@ async def _assert_can_edit_client_advisory(
     raise HTTPException(
         status_code=403,
         detail={
-            "code": "cca_edit_forbidden",
+            "code": "ca_edit_forbidden",
             "message": (
                 "Editing advisory content requires either an active "
                 "staff role on this client, or an active Content "

@@ -41,7 +41,7 @@ async def test_create_client_pg_rejects_stranger_before_pg_check(db):
             db=db, current_user=stranger,
         )
     assert ei.value.status_code == 403
-    assert ei.value.detail["code"] == "cca_edit_forbidden"
+    assert ei.value.detail["code"] == "ca_edit_forbidden"
 
 
 @requires_docker
@@ -63,4 +63,4 @@ async def test_create_client_pg_rejects_stranger_before_bundle_check(db):
             db=db, current_user=stranger,
         )
     assert ei.value.status_code == 403
-    assert ei.value.detail["code"] == "cca_edit_forbidden"
+    assert ei.value.detail["code"] == "ca_edit_forbidden"

@@ -53,7 +53,7 @@ async def test_create_client_sp_rejects_stranger(db):
             db=db, current_user=stranger,
         )
     assert ei.value.status_code == 403
-    assert ei.value.detail["code"] == "cca_edit_forbidden"
+    assert ei.value.detail["code"] == "ca_edit_forbidden"
 
 
 @requires_docker
@@ -145,4 +145,4 @@ async def test_import_pg_into_sp_still_rejects_stranger(db):
             db=db, current_user=stranger,
         )
     assert ei.value.status_code == 403
-    assert ei.value.detail["code"] == "cca_edit_forbidden"
+    assert ei.value.detail["code"] == "ca_edit_forbidden"
