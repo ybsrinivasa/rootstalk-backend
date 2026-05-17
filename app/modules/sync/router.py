@@ -234,6 +234,91 @@ async def list_crop_measures(
     return await list_crops_with_measure(db)
 
 
+# ── Cosh Locations (state + district picker source) ────────────────────────────
+
+@router.get("/cosh/locations/india")
+async def list_cosh_india_locations(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Full Cosh India locations list, shaped for state-grouped pickers.
+
+    Pulls distinct `(state, district)` pairs from `cosh_connect_rows`
+    where `connect_type='india_locations'` (each row is a country/
+    state/district/subdistrict tuple — we dedupe on the first three
+    and ignore the sub-district since packages don't target below
+    district level). Joins `cosh_core_items` for English names.
+
+    Used by:
+      - Setup → Locations tab (CA picks the company's footprint here).
+      - The package detail Edit Locations modal indirectly, via
+        /client/{cid}/location-options-for-package which filters this
+        list to the company's footprint.
+
+    Defensive on partial Cosh data: pairs whose state/district isn't
+    in `cosh_core_items` (still-pending sync) surface as `null` name
+    so the picker can render them as "(unnamed)" without breaking.
+    """
+    from app.modules.sync.models import CoshConnectRow, CoshCoreItem
+
+    rows = (await db.execute(
+        select(CoshConnectRow.endpoints).where(
+            CoshConnectRow.connect_type == "india_locations",
+            CoshConnectRow.status == "active",
+        )
+    )).scalars().all()
+
+    pairs: set[tuple[str, str]] = set()
+    for endpoints in rows:
+        state_id, district_id = None, None
+        for ep in endpoints or []:
+            role = ep.get("role")
+            if role == "state_list":
+                state_id = ep.get("cosh_id")
+            elif role == "district_list":
+                district_id = ep.get("cosh_id")
+        if state_id and district_id:
+            pairs.add((state_id, district_id))
+
+    needed_ids = {sid for sid, _ in pairs} | {did for _, did in pairs}
+    if not needed_ids:
+        return {"states": []}
+
+    cores = (await db.execute(
+        select(CoshCoreItem.cosh_id, CoshCoreItem.core_type, CoshCoreItem.translations)
+        .where(
+            CoshCoreItem.cosh_id.in_(needed_ids),
+            CoshCoreItem.core_type.in_(["state_list", "district_list"]),
+        )
+    )).all()
+    state_names: dict[str, str] = {}
+    district_names: dict[str, str] = {}
+    for cosh_id, core_type, translations in cores:
+        name = (translations or {}).get("en") if isinstance(translations, dict) else None
+        if core_type == "state_list":
+            state_names[cosh_id] = name
+        elif core_type == "district_list":
+            district_names[cosh_id] = name
+
+    by_state: dict[str, list[dict]] = {}
+    for sid, did in pairs:
+        by_state.setdefault(sid, []).append({
+            "cosh_id": did,
+            "name": district_names.get(did),
+        })
+
+    states = []
+    for sid, districts in by_state.items():
+        districts.sort(key=lambda d: (d["name"] or "").lower())
+        states.append({
+            "cosh_id": sid,
+            "name": state_names.get(sid),
+            "districts": districts,
+        })
+    states.sort(key=lambda s: (s["name"] or "").lower())
+    return {"states": states}
+
+
 # ── Cosh Reference Lookup (used internally by all other modules) ───────────────
 
 @router.get("/internal/cosh-entity/{entity_type}/{cosh_id}")

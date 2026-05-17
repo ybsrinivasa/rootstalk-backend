@@ -631,6 +631,71 @@ async def list_locations(
     return result.scalars().all()
 
 
+@router.get("/client/{client_id}/location-options-for-package")
+async def list_package_location_options(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """The universe for the Package detail Edit Locations picker —
+    bounded to this company's ACTIVE ClientLocation footprint.
+
+    Same shape as /cosh/locations/india (`{states: [{cosh_id, name,
+    districts: [{cosh_id, name}]}]}`) but only states/districts the
+    CA has enabled in Setup. Pairs whose state/district isn't in
+    cosh_core_items (pending sync) surface with `name: null`.
+
+    Empty `states` means the CA hasn't set up the footprint yet —
+    the package modal should display a clear nudge to Setup."""
+    from app.modules.sync.models import CoshCoreItem
+
+    rows = (await db.execute(
+        select(ClientLocation.state_cosh_id, ClientLocation.district_cosh_id)
+        .where(
+            ClientLocation.client_id == client_id,
+            ClientLocation.status == StatusEnum.ACTIVE,
+        )
+    )).all()
+    pairs = {(sid, did) for sid, did in rows}
+    if not pairs:
+        return {"states": []}
+
+    needed_ids = {sid for sid, _ in pairs} | {did for _, did in pairs}
+    cores = (await db.execute(
+        select(CoshCoreItem.cosh_id, CoshCoreItem.core_type, CoshCoreItem.translations)
+        .where(
+            CoshCoreItem.cosh_id.in_(needed_ids),
+            CoshCoreItem.core_type.in_(["state_list", "district_list"]),
+        )
+    )).all()
+    state_names: dict[str, str] = {}
+    district_names: dict[str, str] = {}
+    for cosh_id, core_type, translations in cores:
+        name = (translations or {}).get("en") if isinstance(translations, dict) else None
+        if core_type == "state_list":
+            state_names[cosh_id] = name
+        elif core_type == "district_list":
+            district_names[cosh_id] = name
+
+    by_state: dict[str, list[dict]] = {}
+    for sid, did in pairs:
+        by_state.setdefault(sid, []).append({
+            "cosh_id": did,
+            "name": district_names.get(did),
+        })
+
+    states = []
+    for sid, districts in by_state.items():
+        districts.sort(key=lambda d: (d["name"] or "").lower())
+        states.append({
+            "cosh_id": sid,
+            "name": state_names.get(sid),
+            "districts": districts,
+        })
+    states.sort(key=lambda s: (s["name"] or "").lower())
+    return {"states": states}
+
+
 @router.post("/client/{client_id}/locations", response_model=LocationOut, status_code=201)
 async def add_location(
     client_id: str,
@@ -647,6 +712,48 @@ async def add_location(
     await db.commit()
     await db.refresh(loc)
     return loc
+
+
+@router.put("/client/{client_id}/locations")
+async def set_client_locations(
+    client_id: str,
+    pairs: list[LocationCreate],
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Atomic replace of the company's location footprint. Wipes
+    existing ACTIVE rows and inserts the supplied set. The legacy
+    row-by-row POST/DELETE endpoints stay live for backward compat;
+    the new state-grouped picker on Setup uses this PUT for a single
+    submit. Duplicates in the input are de-duped silently.
+
+    Dropping ACTIVE rows here does not cascade — PackageLocation
+    rows that referenced a removed district stay intact. The package
+    detail's Locations panel may then show districts that fell out
+    of the footprint; surfacing that drift is a follow-up (Setup
+    should warn the CA before they remove a district that an active
+    package targets)."""
+    existing = (await db.execute(
+        select(ClientLocation).where(ClientLocation.client_id == client_id)
+    )).scalars().all()
+    for row in existing:
+        await db.delete(row)
+    await db.flush()
+
+    seen: set[tuple[str, str]] = set()
+    for p in pairs:
+        key = (p.state_cosh_id, p.district_cosh_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        db.add(ClientLocation(
+            client_id=client_id,
+            state_cosh_id=p.state_cosh_id,
+            district_cosh_id=p.district_cosh_id,
+            status=StatusEnum.ACTIVE,
+        ))
+    await db.commit()
+    return {"saved": len(seen)}
 
 
 @router.delete("/client/{client_id}/locations/{location_id}", status_code=204)
