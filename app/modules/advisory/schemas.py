@@ -341,11 +341,27 @@ class PGRecommendationCreate(BaseModel):
     area_or_plant: Optional[str] = None
 
 
+class PGRecommendationUpdate(BaseModel):
+    # Batch 39R (2026-05-17) — Global PG status toggle. DRAFT → ACTIVE
+    # must still go through /publish (lineage migration); this endpoint
+    # only handles ACTIVE ↔ INACTIVE.
+    status: Optional[str] = None
+
+
 class PGTimelineCreate(BaseModel):
     name: str
     from_type: str = "DAYS_AFTER_DETECTION"
     from_value: int = 0
     to_value: int
+
+
+class PGTimelineUpdate(BaseModel):
+    # Batch 39R (2026-05-17) — Global PG Timeline status toggle.
+    # from_type stays immutable (mirrors CCA TimelineUpdate).
+    name: Optional[str] = None
+    from_value: Optional[int] = None
+    to_value: Optional[int] = None
+    status: Optional[str] = None
 
 
 class PGPracticeCreate(BaseModel):

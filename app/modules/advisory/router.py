@@ -25,7 +25,8 @@ from app.modules.advisory.schemas import (
     TimelineCreate, TimelineUpdate, TimelineOut,
     PracticeCreate, PracticeOut, PracticeWithElementsOut,
     RelationCreate, ConditionalQuestionCreate, PracticeConditionalCreate, CQReplace,
-    PGRecommendationCreate, PGRecommendationOut, PGTimelineCreate, PGTimelineOut, PGPracticeCreate,
+    PGRecommendationCreate, PGRecommendationOut, PGRecommendationUpdate,
+    PGTimelineCreate, PGTimelineOut, PGTimelineUpdate, PGPracticeCreate,
     SPRecommendationCreate, SPRecommendationOut, SPTimelineCreate, SPTimelineOut, SPPracticeCreate,
     QATimelineCreate, QAPracticeCreate,
     ElementIn,
@@ -5539,6 +5540,7 @@ async def list_global_pg_timelines(
             "from_type": from_type_value,
             "from_value": tl.from_value,
             "to_value": tl.to_value,
+            "status": tl.status,
             "practices": [
                 {
                     "id": p.id,
@@ -5708,6 +5710,78 @@ async def delete_global_pg_timeline(
     if tl:
         await db.delete(tl)
         await db.commit()
+
+
+@router.put("/advisory/global/pg-recommendations/{pg_id}", response_model=PGRecommendationOut)
+async def update_global_pg(
+    pg_id: str,
+    request: PGRecommendationUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Batch 39R — Global PG status toggle. ACTIVE ↔ INACTIVE flips
+    freely; DRAFT → INACTIVE is allowed (discards a draft); DRAFT →
+    ACTIVE must go through the publish endpoint (lineage migration)."""
+    pg = (await db.execute(
+        select(PGRecommendation).where(
+            PGRecommendation.id == pg_id,
+            PGRecommendation.client_id == None,  # noqa: E711
+        )
+    )).scalar_one_or_none()
+    if not pg:
+        raise HTTPException(status_code=404, detail="Global PG recommendation not found")
+
+    if request.status is not None:
+        new_status = request.status
+        if new_status not in ("ACTIVE", "INACTIVE"):
+            raise HTTPException(status_code=422, detail={
+                "code": "invalid_status",
+                "message": "status must be ACTIVE or INACTIVE.",
+            })
+        if pg.status == "DRAFT" and new_status == "ACTIVE":
+            raise HTTPException(status_code=422, detail={
+                "code": "publish_required",
+                "message": "DRAFT → ACTIVE must go through the publish endpoint, not the status toggle.",
+            })
+        pg.status = new_status
+
+    await db.commit()
+    await db.refresh(pg)
+    return pg
+
+
+@router.put("/advisory/global/pg-recommendations/{pg_id}/timelines/{tl_id}", response_model=PGTimelineOut)
+async def update_global_pg_timeline(
+    pg_id: str,
+    tl_id: str,
+    request: PGTimelineUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Batch 39R — Global PG Timeline status toggle + minor field
+    edits (name, from/to). `from_type` stays immutable."""
+    tl = (await db.execute(
+        select(Timeline).where(
+            Timeline.id == tl_id,
+            Timeline.pg_recommendation_id == pg_id,
+        )
+    )).scalar_one_or_none()
+    if not tl:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    update_data = request.model_dump(exclude_unset=True)
+    if "status" in update_data:
+        if update_data["status"] not in ("ACTIVE", "INACTIVE"):
+            raise HTTPException(status_code=422, detail={
+                "code": "invalid_status",
+                "message": "Timeline status must be ACTIVE or INACTIVE.",
+            })
+
+    for field, value in update_data.items():
+        setattr(tl, field, value)
+    await db.commit()
+    await db.refresh(tl)
+    return tl
 
 
 @router.post("/advisory/global/pg-recommendations/{pg_id}/publish")
