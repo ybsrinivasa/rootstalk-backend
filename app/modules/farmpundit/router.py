@@ -22,6 +22,7 @@ from app.services.bl12_query_state import (
     validate_transition as validate_query_transition,
 )
 from app.modules.subscriptions.models import Subscription, SubscriptionStatus
+from app.modules.advisory.router import _assert_can_edit_client_advisory
 
 router = APIRouter(tags=["FarmPundit"])
 
@@ -671,7 +672,7 @@ async def create_standard_response(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    await _assert_portal_member(db, current_user.id, client_id)
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     _validate_standard_response_payload(data)
     sr = StandardResponse(
         client_id=client_id,
@@ -697,7 +698,7 @@ async def update_standard_response(
     modify standard answers — that's a Pundit-side rule on the
     response flow, not an SE-side rule on the library itself. The
     library curator (SE) can refine entries freely."""
-    await _assert_portal_member(db, current_user.id, client_id)
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     _validate_standard_response_payload(data)
 
     sr = (await db.execute(
@@ -728,7 +729,7 @@ async def delete_standard_response(
     referenced — the FK is nullable on the response side so this
     won't break, but the breadcrumb is broken. Acceptable for V1
     (deletion is a curator action, not a frequent flow)."""
-    await _assert_portal_member(db, current_user.id, client_id)
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     sr = (await db.execute(
         select(StandardResponse).where(
             StandardResponse.id == sr_id,

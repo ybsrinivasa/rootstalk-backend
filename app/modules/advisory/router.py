@@ -127,9 +127,9 @@ def _validate_brand_lock(request: "PracticeCreate") -> None:
 async def _assert_can_edit_client_advisory(
     db: AsyncSession, user_id: str, client_id: str,
 ) -> None:
-    """Authorisation gate for CA-side advisory writes (CCA in Batch
-    39S; CHA-PG added in Batch 39T; CHA-SP added in Batch 39U; QA
-    still pending).
+    """Authorisation gate for CA-side advisory writes — covers all
+    four pipes: CCA (Batch 39S), CHA-PG (39T), CHA-SP (39U), QA
+    (39V).
 
     V1 (Batch 39S, 2026-05-17) accepts two paths:
       1. ANY ACTIVE ClientUser of this client (regardless of role).
@@ -6924,8 +6924,7 @@ async def list_qa_timelines(
     nested Practices and Elements. The CA-portal editor renders the
     whole tree at once; the Pundit picker only needs the metadata
     so it goes through the simpler farmpundit search endpoint."""
-    from app.modules.farmpundit.router import _assert_portal_member
-    await _assert_portal_member(db, current_user.id, client_id)
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     await _assert_sr_belongs_to_client(db, sr_id, client_id)
 
     timelines = (await db.execute(
@@ -6988,8 +6987,7 @@ async def add_qa_timeline(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    from app.modules.farmpundit.router import _assert_portal_member
-    await _assert_portal_member(db, current_user.id, client_id)
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     await _assert_sr_belongs_to_client(db, sr_id, client_id)
 
     tl = Timeline(
@@ -7032,8 +7030,7 @@ async def delete_qa_timeline(
     and Element FKs to timeline_id / practice_id remain intact in
     the schema — the cascade is application-level via SQLAlchemy
     relationships, matching the existing PG/SP delete patterns."""
-    from app.modules.farmpundit.router import _assert_portal_member
-    await _assert_portal_member(db, current_user.id, client_id)
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     await _assert_sr_belongs_to_client(db, sr_id, client_id)
 
     tl = (await db.execute(
@@ -7079,8 +7076,7 @@ async def add_qa_practice(
     """Create a Practice on a Q&A timeline with its Elements inline.
     Mirrors PGPracticeCreate exactly — UCAT means Practice + Element
     shapes are pipe-agnostic."""
-    from app.modules.farmpundit.router import _assert_portal_member
-    await _assert_portal_member(db, current_user.id, client_id)
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     await _assert_sr_belongs_to_client(db, sr_id, client_id)
 
     tl = (await db.execute(
@@ -7163,8 +7159,7 @@ async def _assert_qa_practice_path(
     """Q&A authoring is gated on portal-member auth + sr-belongs-to-client.
     The practice itself must live under the named QA timeline (which in
     turn lives under the named standard_response_id)."""
-    from app.modules.farmpundit.router import _assert_portal_member
-    await _assert_portal_member(db, current_user.id, client_id)
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     await _assert_sr_belongs_to_client(db, sr_id, client_id)
     tl = (await db.execute(
         select(Timeline).where(
@@ -7255,8 +7250,7 @@ async def delete_qa_practice(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    from app.modules.farmpundit.router import _assert_portal_member
-    await _assert_portal_member(db, current_user.id, client_id)
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     await _assert_sr_belongs_to_client(db, sr_id, client_id)
 
     practice = (await db.execute(
