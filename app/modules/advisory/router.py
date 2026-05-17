@@ -128,7 +128,8 @@ async def _assert_can_edit_client_advisory(
     db: AsyncSession, user_id: str, client_id: str,
 ) -> None:
     """Authorisation gate for CA-side advisory writes (CCA in Batch
-    39S; CHA-PG added in Batch 39T; SP / QA still pending).
+    39S; CHA-PG added in Batch 39T; CHA-SP added in Batch 39U; QA
+    still pending).
 
     V1 (Batch 39S, 2026-05-17) accepts two paths:
       1. ANY ACTIVE ClientUser of this client (regardless of role).
@@ -6694,6 +6695,7 @@ async def create_client_sp(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     sp = SPRecommendation(
         specific_problem_cosh_id=request.specific_problem_cosh_id,
         client_id=client_id,
@@ -6737,6 +6739,7 @@ async def add_sp_timeline(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     tl = Timeline(
         sp_recommendation_id=sp_id,
         name=request.name,
@@ -6760,6 +6763,7 @@ async def add_sp_practice(
     current_user: User = Depends(get_current_user),
 ):
     """SP practice — same UCAT shape as PG and Q&A."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     try:
         await assert_l2_elements_valid(
             db,
@@ -6820,6 +6824,7 @@ async def add_sp_element(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     practice = await _load_sp_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
     new = await _add_practice_element(
         db, practice=practice, element_model=Element, body=body,
@@ -6836,6 +6841,7 @@ async def update_sp_element(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     practice = await _load_sp_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
     updated = await _update_practice_element(
         db, practice=practice, element_model=Element,
@@ -6853,6 +6859,7 @@ async def delete_sp_element(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     practice = await _load_sp_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
     await _delete_practice_element(
         db, practice=practice, element_model=Element, element_id=element_id,
@@ -6867,6 +6874,7 @@ async def delete_sp_timeline(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     tl = (await db.execute(
         select(Timeline).where(Timeline.id == tl_id, Timeline.sp_recommendation_id == sp_id)
     )).scalar_one_or_none()
@@ -7344,8 +7352,15 @@ async def import_pg_into_sp(
 
     The SP must already exist (created via
     POST /client/{id}/sp-recommendations). This endpoint adds
-    content; it doesn't create the SP itself."""
-    await _assert_cm_can_edit_client(db, current_user.id, client_id)
+    content; it doesn't create the SP itself.
+
+    Auth (Batch 39U, widened from CM-EDIT-only on 2026-05-17): any
+    ACTIVE ClientUser of this client OR an ACTIVE CMClientAssignment
+    with EDIT rights may import. Earlier CM-only gate was a mismatch
+    — this is a within-client copy operation (cross-client is 404'd
+    below); the SE who authored the source PG should be able to
+    seed their own SP from it without round-tripping through the CM."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
 
     sp = (await db.execute(
         select(SPRecommendation).where(
@@ -7470,6 +7485,7 @@ async def delete_client_sp_practice(
 ):
     """Mirror of delete_client_pg_practice. Cascades the practice's
     elements via ORM."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     from app.modules.advisory.models import Element, Practice
     practice = (await db.execute(
         select(Practice).where(
@@ -7556,6 +7572,7 @@ async def publish_sp(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     sp = (await db.execute(
         select(SPRecommendation).where(SPRecommendation.id == sp_id, SPRecommendation.client_id == client_id)
     )).scalar_one_or_none()
