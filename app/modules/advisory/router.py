@@ -5643,6 +5643,32 @@ async def list_global_pg_timelines(
     return out
 
 
+@router.get(
+    "/advisory/global/pg-recommendations/{pg_id}/timelines/{tl_id}/practices",
+    response_model=list[PracticeWithElementsOut],
+)
+async def list_global_pg_practices(
+    pg_id: str, tl_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Practice index for a Global CHA-PG Timeline — same shape as the
+    CCA sibling at /advisory/global/packages/{pkg}/timelines/{tl}/practices.
+    Returns practices with elements + server-resolved English labels so
+    the SA-portal PG editor can expand a Practice row inline to show
+    element values, and the Edit modal can pre-fill correctly.
+
+    The earlier nested-in-timelines GET (line ~5599) ships practices
+    WITHOUT elements; that was a bug surfaced by the user 2026-05-17.
+    Frontend should call this endpoint on timeline expand + after each
+    Add/Edit, mirroring the CCA pattern."""
+    practices = (await db.execute(
+        select(Practice).where(Practice.timeline_id == tl_id)
+        .order_by(Practice.display_order)
+    )).scalars().all()
+    return await _attach_elements_with_labels(db, practices)
+
+
 @router.post("/advisory/global/pg-recommendations/{pg_id}/timelines", status_code=201)
 async def add_global_pg_timeline(
     pg_id: str,
