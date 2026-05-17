@@ -162,7 +162,7 @@ async def test_pg_timeline_active_to_inactive_flips(db):
         request=PGTimelineUpdate(status="INACTIVE"),
         db=db, current_user=user,
     )
-    assert out.status == "INACTIVE"
+    assert out["status"] == "INACTIVE"
 
 
 @requires_docker
@@ -182,7 +182,7 @@ async def test_pg_timeline_inactive_to_active_flips(db):
         request=PGTimelineUpdate(status="ACTIVE"),
         db=db, current_user=user,
     )
-    assert out.status == "ACTIVE"
+    assert out["status"] == "ACTIVE"
 
 
 @requires_docker
@@ -224,9 +224,9 @@ async def test_pg_timeline_can_edit_name_and_range(db):
         request=PGTimelineUpdate(name="Week 1", from_value=1, to_value=10),
         db=db, current_user=user,
     )
-    assert out.name == "Week 1"
-    assert out.from_value == 1
-    assert out.to_value == 10
+    assert out["name"] == "Week 1"
+    assert out["from_value"] == 1
+    assert out["to_value"] == 10
 
 
 @requires_docker

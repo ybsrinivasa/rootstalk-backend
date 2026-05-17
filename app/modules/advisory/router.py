@@ -5955,7 +5955,7 @@ async def update_global_pg(
     return pg
 
 
-@router.put("/advisory/global/pg-recommendations/{pg_id}/timelines/{tl_id}", response_model=PGTimelineOut)
+@router.put("/advisory/global/pg-recommendations/{pg_id}/timelines/{tl_id}")
 async def update_global_pg_timeline(
     pg_id: str,
     tl_id: str,
@@ -5964,7 +5964,13 @@ async def update_global_pg_timeline(
     current_user: User = Depends(get_current_user),
 ):
     """Batch 39R — Global PG Timeline status toggle + minor field
-    edits (name, from/to). `from_type` stays immutable."""
+    edits (name, from/to). `from_type` stays immutable.
+
+    Returns a plain dict (NOT response_model=PGTimelineOut) — the
+    Timeline ORM has a `practices` lazy relationship that triggers
+    async lazy-load on Pydantic serialization, surfacing as a 500
+    after the DB commit had already succeeded. Same shape as
+    add_global_pg_timeline."""
     await _assert_sa_or_cm(db, current_user)
     tl = (await db.execute(
         select(Timeline).where(
@@ -5987,7 +5993,15 @@ async def update_global_pg_timeline(
         setattr(tl, field, value)
     await db.commit()
     await db.refresh(tl)
-    return tl
+    return {
+        "id": tl.id,
+        "pg_recommendation_id": tl.pg_recommendation_id,
+        "name": tl.name,
+        "from_type": tl.from_type,
+        "from_value": tl.from_value,
+        "to_value": tl.to_value,
+        "status": tl.status,
+    }
 
 
 @router.post("/advisory/global/pg-recommendations/{pg_id}/publish")
@@ -6649,7 +6663,6 @@ async def add_client_pg_timeline(
 
 @router.put(
     "/client/{client_id}/pg-recommendations/{pg_id}/timelines/{tl_id}",
-    response_model=PGTimelineOut,
 )
 async def update_client_pg_timeline(
     client_id: str,
@@ -6662,7 +6675,11 @@ async def update_client_pg_timeline(
     """CA-side mirror of update_global_pg_timeline (line ~5866).
     Edit Timeline modal on the CA-PG editor posts here. `from_type`
     stays immutable; `status` toggle gates the Timeline out of the
-    farmer's daily advisory without deleting it."""
+    farmer's daily advisory without deleting it.
+
+    Returns a plain dict (NOT response_model=PGTimelineOut) — same
+    lazy-load-on-serialize bug as update_global_pg_timeline (see
+    docstring there)."""
     await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     tl = (await db.execute(
         select(Timeline).where(
@@ -6685,7 +6702,15 @@ async def update_client_pg_timeline(
         setattr(tl, field, value)
     await db.commit()
     await db.refresh(tl)
-    return tl
+    return {
+        "id": tl.id,
+        "pg_recommendation_id": tl.pg_recommendation_id,
+        "name": tl.name,
+        "from_type": tl.from_type,
+        "from_value": tl.from_value,
+        "to_value": tl.to_value,
+        "status": tl.status,
+    }
 
 
 @router.post("/client/{client_id}/pg-recommendations/{pg_id}/timelines/{tl_id}/practices", status_code=201)
