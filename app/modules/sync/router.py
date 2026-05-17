@@ -8,6 +8,7 @@ from app.dependencies import get_current_user
 from app.modules.platform.models import User
 from app.modules.sync.models import CoshSyncLog, VolumeFormula, CropHealthCrop
 from app.modules.sync.service import process_payload, get_cosh_translation
+from app.modules.advisory.router import _assert_sa_or_cm
 
 router = APIRouter(tags=["Cosh Sync"])
 
@@ -128,6 +129,7 @@ async def create_volume_formula(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_sa_or_cm(db, current_user)
     formula = VolumeFormula(**{k: v for k, v in data.items() if k != "id"})
     db.add(formula)
     await db.commit()
@@ -142,6 +144,7 @@ async def update_volume_formula(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_sa_or_cm(db, current_user)
     result = await db.execute(select(VolumeFormula).where(VolumeFormula.id == formula_id))
     formula = result.scalar_one_or_none()
     if not formula:
@@ -171,6 +174,7 @@ async def enable_crop_health(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_sa_or_cm(db, current_user)
     result = await db.execute(
         select(CropHealthCrop).where(CropHealthCrop.crop_cosh_id == crop_cosh_id)
     )
@@ -199,6 +203,7 @@ async def disable_crop_health(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_sa_or_cm(db, current_user)
     result = await db.execute(
         select(CropHealthCrop).where(CropHealthCrop.crop_cosh_id == crop_cosh_id)
     )

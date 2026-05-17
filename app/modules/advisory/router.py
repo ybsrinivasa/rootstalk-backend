@@ -188,6 +188,59 @@ async def _assert_can_edit_client_advisory(
     )
 
 
+async def _assert_sa_or_cm(
+    db: AsyncSession, current_user: "User",
+) -> None:
+    """Authorisation gate for SA-Portal-scope writes — Global advisory
+    content (/advisory/global/*) and platform admin endpoints
+    (/admin/crop-health-crops/*, etc.). The SA Portal exposes only
+    CCA + PG at the Global level; SP and QA are CA-Portal-only.
+
+    Accepts:
+      1. The SA identity — `current_user.email == settings.sa_email`
+         (single SA, env-configured; mirror of the frontend `is_sa`
+         flag at /portal/auth/me).
+      2. An ACTIVE UserRole(role_type=CONTENT_MANAGER).
+
+    Rejects:
+      - RM / BM / FARMER / DEALER / FACILITATOR / FARM_PUNDIT roles
+        (they don't author Global content).
+      - CA-Portal-only ClientUsers (SUBJECT_EXPERT / CA /
+        FIELD_MANAGER / REPORT_USER) with no SA-Portal role — closes
+        the cross-portal hole flagged by user 2026-05-17.
+
+    Raises 403 with stable code `global_edit_forbidden`. Mirrors
+    Batch 39S's `_assert_can_edit_client_advisory` in the opposite
+    direction (that one gates CA-side writes; this one gates SA-side).
+    """
+    from app.config import settings
+    from app.modules.platform.models import RoleType, StatusEnum, UserRole
+
+    if current_user.email and current_user.email == settings.sa_email:
+        return
+
+    cm = (await db.execute(
+        select(UserRole.id).where(
+            UserRole.user_id == current_user.id,
+            UserRole.role_type == RoleType.CONTENT_MANAGER,
+            UserRole.status == StatusEnum.ACTIVE,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if cm is not None:
+        return
+
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "code": "global_edit_forbidden",
+            "message": (
+                "Editing Global / platform content requires either the "
+                "Super Admin identity or an active Content Manager role."
+            ),
+        },
+    )
+
+
 async def _assert_cm_can_edit_client(
     db: AsyncSession, user_id: str, client_id: str,
 ) -> None:
@@ -2351,6 +2404,7 @@ async def create_global_relation(
     """Authoring-time save of a Practice Relation on a Global CCA
     Timeline. Body shape, validation, and persistence shared with the
     CHA-PG sibling via `_create_relation_for_global_timeline`."""
+    await _assert_sa_or_cm(db, current_user)
     await _get_global_timeline(db, pkg_id, timeline_id)
     return await _create_relation_for_global_timeline(
         db, timeline_id=timeline_id, request=request,
@@ -2495,6 +2549,7 @@ async def create_global_pg_relation(
     """Authoring-time save of a Practice Relation on a Global CHA-PG
     Timeline. Shares the body validator + persister with the CCA
     sibling — see `_create_relation_for_global_timeline`."""
+    await _assert_sa_or_cm(db, current_user)
     await _get_global_pg_timeline(db, pg_id, timeline_id)
     return await _create_relation_for_global_timeline(
         db, timeline_id=timeline_id, request=request,
@@ -2530,6 +2585,7 @@ async def delete_global_relation(
     Relation grouping is dropped) and deletes any RelationConditional
     binding. Edit-saved-Relation is deferred to V1.1; the SE deletes and
     rebuilds instead."""
+    await _assert_sa_or_cm(db, current_user)
     await _get_global_relation(db, relation_id)
 
     # Clear relation_id/role on practices in this relation.
@@ -2637,6 +2693,7 @@ async def create_global_conditional_question(
 ):
     """Create a CQ on a Global CCA Timeline. Body shared with the
     CHA-PG sibling via `_create_cq_for_global_timeline`."""
+    await _assert_sa_or_cm(db, current_user)
     await _get_global_timeline(db, pkg_id, timeline_id)
     return await _create_cq_for_global_timeline(
         db, timeline_id=timeline_id, request=request,
@@ -2673,6 +2730,7 @@ async def create_global_pg_conditional_question(
 ):
     """Create a CQ on a Global CHA-PG Timeline. Same body validator +
     persister as CCA, plumbed via the shared helper."""
+    await _assert_sa_or_cm(db, current_user)
     await _get_global_pg_timeline(db, pg_id, timeline_id)
     return await _create_cq_for_global_timeline(
         db, timeline_id=timeline_id, request=request,
@@ -2746,6 +2804,7 @@ async def update_global_conditional_question(
     so the same conflict rules apply (an entity bound to a different
     CQ is rejected; same-CQ rebinds are allowed because we clear all
     of THIS CQ's existing rows first)."""
+    await _assert_sa_or_cm(db, current_user)
     cq = (await db.execute(
         select(ConditionalQuestion).where(ConditionalQuestion.id == question_id)
     )).scalar_one_or_none()
@@ -2862,6 +2921,7 @@ async def delete_global_conditional_question(
     bound to this CQ (the practices / relations themselves stay in
     place — only the gating goes). Path-Global mirror of the existing
     client-scoped deletes. Pipe-agnostic after Batch 39P-c."""
+    await _assert_sa_or_cm(db, current_user)
     cq = (await db.execute(
         select(ConditionalQuestion).where(ConditionalQuestion.id == question_id)
     )).scalar_one_or_none()
@@ -2896,6 +2956,7 @@ async def link_global_practice_conditional(
     """Bind a CQ to an independent Practice on a Global Timeline (Path B —
     the practice is not part of any saved Relation). Same idempotency
     and conflict rules as the client-scoped endpoint."""
+    await _assert_sa_or_cm(db, current_user)
     practice = await _get_global_practice(db, practice_id)
 
     existing_pc = (await db.execute(
@@ -2945,6 +3006,7 @@ async def link_global_relation_conditional(
     """Bind a CQ to a saved Relation on a Global Timeline (Path A —
     the whole Relation is conditional). `request.practice_id` is ignored;
     the resource is the Relation in the URL."""
+    await _assert_sa_or_cm(db, current_user)
     await _get_global_relation(db, relation_id)
 
     existing_rc = (await db.execute(
@@ -3245,6 +3307,7 @@ async def create_global_package(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_sa_or_cm(db, current_user)
     pkg = Package(
         client_id=None,
         crop_cosh_id=request.crop_cosh_id,
@@ -3291,6 +3354,7 @@ async def update_global_package(
     Mirrors the client-scoped `update_package` validator: duration
     range-checked for ANNUAL, locked at 365 for PERENNIAL.
     """
+    await _assert_sa_or_cm(db, current_user)
     pkg = (await db.execute(
         select(Package).where(
             Package.id == pkg_id, Package.client_id == None,  # noqa: E711
@@ -3507,6 +3571,7 @@ async def create_global_parameter(
 
     Visible to every Local Package via FK from PackageVariable; the
     SA-portal authors them, Local Packages reference them after push."""
+    await _assert_sa_or_cm(db, current_user)
     param = Parameter(
         crop_cosh_id=request.crop_cosh_id,
         client_id=None,
@@ -3533,6 +3598,7 @@ async def update_global_parameter(
     """Rename or re-order a CUSTOM Global Parameter (Batch 28).
     Refuses on Cosh-mirrored parameters — those track upstream Cosh
     translations and shouldn't be edited locally."""
+    await _assert_sa_or_cm(db, current_user)
     param = (await db.execute(
         select(Parameter).where(
             Parameter.id == parameter_id, Parameter.client_id == None,  # noqa: E711
@@ -3562,6 +3628,7 @@ async def delete_global_parameter(
     """Delete a CUSTOM Global Parameter and its variables. Refuses if
     any PackageVariable still references it — SE must clear the
     Package signature first. Refuses on Cosh-mirrored parameters."""
+    await _assert_sa_or_cm(db, current_user)
     from app.modules.advisory.models import PackageVariable
     param = (await db.execute(
         select(Parameter).where(
@@ -3606,6 +3673,7 @@ async def update_global_variable(
     NULL) are editable on either CUSTOM or COSH-mirrored parents —
     only the Cosh-mirrored variables themselves (cosh_id non-NULL)
     are read-only."""
+    await _assert_sa_or_cm(db, current_user)
     param = (await db.execute(
         select(Parameter).where(
             Parameter.id == parameter_id, Parameter.client_id == None,  # noqa: E711
@@ -3653,6 +3721,7 @@ async def delete_global_variable(
     locally-added variables don't trip min-2.
 
     Refuses if the variable is in use by any PackageVariable."""
+    await _assert_sa_or_cm(db, current_user)
     from app.modules.advisory.models import PackageVariable
     param = (await db.execute(
         select(Parameter).where(
@@ -3733,6 +3802,7 @@ async def create_global_variable(
     current_user: User = Depends(get_current_user),
 ):
     """Add a Variable to a Global Parameter."""
+    await _assert_sa_or_cm(db, current_user)
     param = (await db.execute(
         select(Parameter).where(
             Parameter.id == parameter_id, Parameter.client_id == None,  # noqa: E711
@@ -3788,6 +3858,7 @@ async def set_global_package_variables(
     two Tomato PoPs co-existing is the *intent*: different farmer
     profiles. The CM uses PVs to make them distinguishable on push.
     """
+    await _assert_sa_or_cm(db, current_user)
     pkg = (await db.execute(
         select(Package).where(
             Package.id == pkg_id, Package.client_id == None,  # noqa: E711
@@ -3821,6 +3892,7 @@ async def publish_global_package(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_sa_or_cm(db, current_user)
     result = await db.execute(
         select(Package).where(Package.id == pkg_id, Package.client_id == None)  # noqa: E711
     )
@@ -3883,6 +3955,7 @@ async def clone_global_to_draft(
     flow per CM 2026-05-16) — DRAFT rows are rejected to keep
     the path obvious.
     """
+    await _assert_sa_or_cm(db, current_user)
     src = (await db.execute(
         select(Package).where(
             Package.id == pkg_id, Package.client_id == None,  # noqa: E711
@@ -4280,6 +4353,7 @@ async def create_global_timeline(
     surface as a friendly 422 instead of a 500 from the DB unique
     constraint.
     """
+    await _assert_sa_or_cm(db, current_user)
     pkg = (await db.execute(
         select(Package).where(Package.id == pkg_id, Package.client_id == None)  # noqa: E711
     )).scalar_one_or_none()
@@ -4322,6 +4396,7 @@ async def update_global_timeline(
     type ↔ package consistency is fixed at create time. Mirrors the
     client-scoped handler at /client/{client_id}/packages/.../timelines/{tl_id}
     including name-uniqueness and direction validation."""
+    await _assert_sa_or_cm(db, current_user)
     pkg = (await db.execute(
         select(Package).where(
             Package.id == pkg_id, Package.client_id == None,  # noqa: E711
@@ -4369,6 +4444,7 @@ async def delete_global_timeline(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_sa_or_cm(db, current_user)
     tl = await _get_timeline(db, tl_id, pkg_id)
     await db.delete(tl)
     await db.commit()
@@ -4579,6 +4655,7 @@ async def create_global_practice(
 ):
     """Create a Practice on a Global CCA Timeline. Body shared with
     CHA-PG sibling via `_create_practice_at_global_timeline`."""
+    await _assert_sa_or_cm(db, current_user)
     return await _create_practice_at_global_timeline(
         db, timeline_id=tl_id, request=request,
     )
@@ -4593,6 +4670,7 @@ async def update_global_practice(
 ):
     """Atomic Practice update on a Global CCA Timeline. Body shared
     with CHA-PG sibling via `_update_practice_at_global_timeline`."""
+    await _assert_sa_or_cm(db, current_user)
     return await _update_practice_at_global_timeline(
         db, timeline_id=tl_id, practice_id=practice_id, request=request,
     )
@@ -4627,6 +4705,7 @@ async def delete_global_practice(
 ):
     """Delete a Practice on a Global CCA Timeline. Pipe-agnostic body
     via `_delete_practice_at_global_timeline`."""
+    await _assert_sa_or_cm(db, current_user)
     await _delete_practice_at_global_timeline(
         db, timeline_id=tl_id, practice_id=practice_id,
     )
@@ -4644,6 +4723,7 @@ async def add_global_cca_element(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_sa_or_cm(db, current_user)
     practice = await _load_cca_practice(db, timeline_id=tl_id, practice_id=practice_id)
     new = await _add_practice_element(
         db, practice=practice, element_model=Element, body=body,
@@ -4660,6 +4740,7 @@ async def update_global_cca_element(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_sa_or_cm(db, current_user)
     practice = await _load_cca_practice(db, timeline_id=tl_id, practice_id=practice_id)
     updated = await _update_practice_element(
         db, practice=practice, element_model=Element,
@@ -4677,6 +4758,7 @@ async def delete_global_cca_element(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_sa_or_cm(db, current_user)
     practice = await _load_cca_practice(db, timeline_id=tl_id, practice_id=practice_id)
     await _delete_practice_element(
         db, practice=practice, element_model=Element, element_id=element_id,
@@ -5571,6 +5653,7 @@ async def create_global_pg(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_sa_or_cm(db, current_user)
     pg = PGRecommendation(
         problem_group_cosh_id=request.problem_group_cosh_id,
         client_id=None,
@@ -5676,6 +5759,7 @@ async def add_global_pg_timeline(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_sa_or_cm(db, current_user)
     pg = (await db.execute(
         select(PGRecommendation).where(PGRecommendation.id == pg_id)
     )).scalar_one_or_none()
@@ -5706,6 +5790,7 @@ async def add_global_pg_practice(
     Brand Lock + frequency rules, and persistence shared with the CCA
     sibling via `_create_practice_at_global_timeline` (Batch 39P-e,
     2026-05-16)."""
+    await _assert_sa_or_cm(db, current_user)
     await _get_global_pg_timeline(db, pg_id, tl_id)
     return await _create_practice_at_global_timeline(
         db, timeline_id=tl_id, request=request,
@@ -5724,6 +5809,7 @@ async def update_global_pg_practice(
 ):
     """Atomic Practice update on a Global CHA-PG Timeline. Mirror of
     the CCA sibling (Batch 39P-e, 2026-05-16)."""
+    await _assert_sa_or_cm(db, current_user)
     await _get_global_pg_timeline(db, pg_id, tl_id)
     return await _update_practice_at_global_timeline(
         db, timeline_id=tl_id, practice_id=practice_id, request=request,
@@ -5741,6 +5827,7 @@ async def delete_global_pg_practice(
 ):
     """Delete a Practice on a Global CHA-PG Timeline. Pipe-agnostic
     body via `_delete_practice_at_global_timeline`."""
+    await _assert_sa_or_cm(db, current_user)
     await _get_global_pg_timeline(db, pg_id, tl_id)
     await _delete_practice_at_global_timeline(
         db, timeline_id=tl_id, practice_id=practice_id,
@@ -5771,6 +5858,7 @@ async def add_global_pg_element(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_sa_or_cm(db, current_user)
     practice = await _load_pg_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
     new = await _add_practice_element(
         db, practice=practice, element_model=Element, body=body,
@@ -5787,6 +5875,7 @@ async def update_global_pg_element(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_sa_or_cm(db, current_user)
     practice = await _load_pg_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
     updated = await _update_practice_element(
         db, practice=practice, element_model=Element,
@@ -5804,6 +5893,7 @@ async def delete_global_pg_element(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_sa_or_cm(db, current_user)
     practice = await _load_pg_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
     await _delete_practice_element(
         db, practice=practice, element_model=Element, element_id=element_id,
@@ -5817,6 +5907,7 @@ async def delete_global_pg_timeline(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_sa_or_cm(db, current_user)
     tl = (await db.execute(
         select(Timeline).where(Timeline.id == tl_id, Timeline.pg_recommendation_id == pg_id)
     )).scalar_one_or_none()
@@ -5835,6 +5926,7 @@ async def update_global_pg(
     """Batch 39R — Global PG status toggle. ACTIVE ↔ INACTIVE flips
     freely; DRAFT → INACTIVE is allowed (discards a draft); DRAFT →
     ACTIVE must go through the publish endpoint (lineage migration)."""
+    await _assert_sa_or_cm(db, current_user)
     pg = (await db.execute(
         select(PGRecommendation).where(
             PGRecommendation.id == pg_id,
@@ -5873,6 +5965,7 @@ async def update_global_pg_timeline(
 ):
     """Batch 39R — Global PG Timeline status toggle + minor field
     edits (name, from/to). `from_type` stays immutable."""
+    await _assert_sa_or_cm(db, current_user)
     tl = (await db.execute(
         select(Timeline).where(
             Timeline.id == tl_id,
@@ -5909,6 +6002,7 @@ async def publish_global_pg(
 
     Returns 422 `publish_blocked` with a structured `missing: [...]`
     body so the SA portal can render one consolidated checklist."""
+    await _assert_sa_or_cm(db, current_user)
     pg = (await db.execute(
         select(PGRecommendation).where(PGRecommendation.id == pg_id)
     )).scalar_one_or_none()
@@ -5977,6 +6071,7 @@ async def clone_global_pg_to_draft(
       • Content deep-copied via `_deep_copy_advisory_content` so
         Brand Lock / Relations / CQs / bindings all carry across.
     """
+    await _assert_sa_or_cm(db, current_user)
     src = (await db.execute(
         select(PGRecommendation).where(
             PGRecommendation.id == pg_id,

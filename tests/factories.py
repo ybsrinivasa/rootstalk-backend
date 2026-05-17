@@ -44,7 +44,32 @@ async def make_user(db: AsyncSession, **kw) -> User:
     await db.flush()
     if not kw.get("skip_auto_link"):
         await _auto_link_user_to_existing_clients(db, u)
+    if not kw.get("skip_auto_cm"):
+        await _auto_grant_cm_role(db, u)
     return u
+
+
+async def _auto_grant_cm_role(db: AsyncSession, user: User) -> None:
+    """2026-05-17 test compat: auto-grant CONTENT_MANAGER UserRole so
+    the new SA-Portal-side guard (`_assert_sa_or_cm`) passes by
+    default on Global write endpoints. Mirrors
+    `_auto_link_user_to_existing_clients` (Batch 39S) in pattern.
+
+    Tests that want to exercise rejection (e.g. test_phase_global_
+    role_guard) pass `skip_auto_cm=True` to make_user. Tests that
+    want a non-CM Portal role (RM, BM) should also use skip_auto_cm
+    and add the UserRole explicitly.
+
+    Real production never auto-grants; this only fires in the test
+    factories."""
+    from app.modules.platform.models import RoleType, StatusEnum, UserRole
+
+    db.add(UserRole(
+        user_id=user.id,
+        role_type=RoleType.CONTENT_MANAGER,
+        status=StatusEnum.ACTIVE,
+    ))
+    await db.flush()
 
 
 async def _auto_link_user_to_existing_clients(db: AsyncSession, user: User) -> None:
