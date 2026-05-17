@@ -5997,8 +5997,8 @@ async def create_client_pg(
       one bundle per (PG, side) per client. Re-creating returns 409
       with a pointer to the existing bundle.
     - `problem_group_cosh_id` is validated against the V1 hardcoded
-      PG list (will become a Cosh-Connect membership check once the
-      `problem_group` Connect ships)."""
+      PG list — checked against Cosh's `problem_groups` Core
+      (Batch 39R-bridge, 2026-05-17)."""
     from app.services.cha_problem_groups import is_known_problem_group
 
     if request.area_or_plant not in ("AREA_WISE", "PLANT_WISE"):
@@ -6014,7 +6014,7 @@ async def create_client_pg(
             },
         )
 
-    if not is_known_problem_group(request.problem_group_cosh_id):
+    if not await is_known_problem_group(db, request.problem_group_cosh_id):
         raise HTTPException(
             status_code=422,
             detail={
@@ -7844,12 +7844,12 @@ async def cha_list_problems(
     SE can see at a glance which PGs are complete, in progress, or
     untouched.
 
-    PG list source is `app/services/cha_problem_groups.py` (a
-    hardcoded V1 stopgap). When Cosh ships the `problem_group`
-    Connect, swap the source there; this endpoint stays the same."""
+    PG list source: Cosh's `problem_groups` Core via
+    `app/services/cha_problem_groups.list_problem_groups`
+    (Batch 39R-bridge, 2026-05-17)."""
     from app.services.cha_problem_groups import list_problem_groups
 
-    pgs = list_problem_groups()
+    pgs = await list_problem_groups(db)
 
     # Aggregate the company's existing recommendations by (PG, bundle).
     rec_q = (await db.execute(
@@ -7911,7 +7911,7 @@ async def cha_list_recommendations(
         .group_by(Timeline.pg_recommendation_id)
     )).all())
 
-    pg_names = {p["cosh_id"]: p["name_en"] for p in list_problem_groups()}
+    pg_names = {p["cosh_id"]: p["name_en"] for p in await list_problem_groups(db)}
 
     return [
         {
@@ -7973,7 +7973,7 @@ async def cha_list_timelines(
         .group_by(Practice.timeline_id)
     )).all())
 
-    pg_names = {p["cosh_id"]: p["name_en"] for p in list_problem_groups()}
+    pg_names = {p["cosh_id"]: p["name_en"] for p in await list_problem_groups(db)}
 
     return [
         {
@@ -8072,7 +8072,7 @@ async def cha_list_practices(
         for e in elem_rows:
             elements_by_practice.setdefault(e.practice_id, []).append(e)
 
-    pg_names = {p["cosh_id"]: p["name_en"] for p in list_problem_groups()}
+    pg_names = {p["cosh_id"]: p["name_en"] for p in await list_problem_groups(db)}
 
     items = []
     for practice, timeline, rec in rows:

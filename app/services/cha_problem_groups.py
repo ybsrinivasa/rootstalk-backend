@@ -1,24 +1,43 @@
-"""Hardcoded Problem-Group list — V1 stopgap until Cosh ships the
-`problem_group` Connect (CHA hub Round 1, 2026-05-10).
+"""Problem Group catalogue — async lookups against Cosh's
+`problem_groups` Core (Batch 39R-bridge, 2026-05-17).
 
-The user expects ~70 PGs to land via Cosh later. Until then, the SE
-needs *something* to pick from when authoring a CHA recommendation.
-This module provides a curated subset that covers the common CHA
-authoring scenarios in pilot data — the SE can still author
-content, and when Cosh's PG sync arrives the list source swaps to
-`cosh_core_items.core_type='problem_group'` without touching any
-caller (just rewire `list_problem_groups`).
+History: through Batches 1-28 this module was a hardcoded V1 stopgap
+because Cosh hadn't yet shipped a `problem_groups` Connect. Batch
+39Q-frontend (2026-05-16) shipped real Cosh problem_groups data and
+swapped the SA-portal `/advisory/global/problem-groups` endpoint to
+read from it. This batch finishes the job: the CA-portal helpers
+(`cha_list_problems`, `cha_list_recommendations`,
+`cha_list_timelines`, `cha_list_practices`, plus the
+`is_known_problem_group` create-PG validator) now read the same
+Cosh source as the SA portal.
 
-Each entry mirrors the shape Cosh will eventually emit:
-  cosh_id (stable UUID-like slug) + name_en (display) + status.
+Why bridge in two batches: SA-side is just a picker; CA-side has
+~10 tests that insert `PGRecommendation` rows directly with the
+legacy `pg:fungal_diseases`-style slugs. The conftest fixture is
+extended (same commit as this swap) to seed those legacy slugs as
+Cosh `problem_groups` items so existing tests keep passing; new
+work should use real Cosh UUIDs.
 
-Status of `active` for all entries — at this surface there's no need
-for inactive distinction yet.
+Shape returned by `list_problem_groups` is preserved:
+  [{cosh_id, name_en, status}]
+sorted alphabetically by `name_en`. Only `active` Cosh items surface.
 """
 from __future__ import annotations
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-_PROBLEM_GROUPS_V1: list[dict] = [
+from app.modules.sync.models import CoshCoreItem
+from app.services.cosh_constants import COSH_PROBLEM_GROUPS_CORE
+
+
+# Legacy slugs the CA portal carried through V1. Kept here as a
+# module-level constant ONLY so tests/conftest.py can pre-seed them
+# as Cosh `problem_groups` items, keeping the ~10 legacy tests green
+# while production code reads exclusively from Cosh. Do NOT consume
+# this list from production code — it stays in lock-step with what
+# the test fixtures auto-seed.
+LEGACY_V1_PROBLEM_GROUPS: list[dict] = [
     {"cosh_id": "pg:fungal_diseases",       "name_en": "Fungal Diseases"},
     {"cosh_id": "pg:bacterial_diseases",    "name_en": "Bacterial Diseases"},
     {"cosh_id": "pg:viral_diseases",        "name_en": "Viral Diseases"},
@@ -34,18 +53,37 @@ _PROBLEM_GROUPS_V1: list[dict] = [
 ]
 
 
-def list_problem_groups() -> list[dict]:
-    """Return the V1 PG list, sorted alphabetically by display name.
-    Identical shape to what `cosh_crop_view.list_crops` returns for
-    crops — keeps the four-screen-hub frontend code symmetrical."""
-    return [
-        {**pg, "status": "active"}
-        for pg in sorted(_PROBLEM_GROUPS_V1, key=lambda p: p["name_en"].lower())
-    ]
+async def list_problem_groups(db: AsyncSession) -> list[dict]:
+    """Return [{cosh_id, name_en, status}] sorted by name_en. Only
+    `active` Cosh problem_groups items surface. Empty list when
+    Cosh has no rows."""
+    rows = (await db.execute(
+        select(CoshCoreItem).where(
+            CoshCoreItem.core_type == COSH_PROBLEM_GROUPS_CORE,
+            CoshCoreItem.status == "active",
+        )
+    )).scalars().all()
+    items = []
+    for r in rows:
+        t = r.translations or {}
+        items.append({
+            "cosh_id": r.cosh_id,
+            "name_en": t.get("en") or t.get("English") or r.cosh_id,
+            "status": "active",
+        })
+    items.sort(key=lambda x: x["name_en"].casefold())
+    return items
 
 
-def is_known_problem_group(cosh_id: str) -> bool:
-    """Membership check used by validation paths that need to refuse
-    a PG cosh_id the V1 list doesn't carry. Once Cosh ships the
-    Connect, this becomes a DB lookup against `cosh_core_items`."""
-    return any(pg["cosh_id"] == cosh_id for pg in _PROBLEM_GROUPS_V1)
+async def is_known_problem_group(db: AsyncSession, cosh_id: str) -> bool:
+    """Membership check used by the CA-side create-PG validator.
+    True iff Cosh has an `active` `problem_groups` row for the given
+    cosh_id."""
+    row = (await db.execute(
+        select(CoshCoreItem.cosh_id).where(
+            CoshCoreItem.cosh_id == cosh_id,
+            CoshCoreItem.core_type == COSH_PROBLEM_GROUPS_CORE,
+            CoshCoreItem.status == "active",
+        )
+    )).scalar_one_or_none()
+    return row is not None

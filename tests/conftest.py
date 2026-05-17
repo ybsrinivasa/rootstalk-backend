@@ -130,14 +130,32 @@ async def db(_engine):
     """Yield an AsyncSession bound to the session-scoped test DB. Production
     code is free to call `await db.commit()`; at teardown we TRUNCATE every
     table so the next test sees an empty DB.
+
+    Batch 39R-bridge (2026-05-17): seed the legacy CHA Problem-Group slugs
+    as Cosh `problem_groups` Core items so the ~10 tests that insert
+    `PGRecommendation` rows with hardcoded `pg:fungal_diseases`-style IDs
+    keep passing after the CA-portal stopgap → Cosh swap. Production code
+    reads exclusively from `cosh_core_items`; this seed is test-only.
     """
     from sqlalchemy import text
     from sqlalchemy.ext.asyncio import async_sessionmaker
     from app.database import Base
+    from app.modules.sync.models import CoshCoreItem
+    from app.services.cha_problem_groups import LEGACY_V1_PROBLEM_GROUPS
+    from app.services.cosh_constants import COSH_PROBLEM_GROUPS_CORE
 
     Session = async_sessionmaker(_engine, expire_on_commit=False)
     session = Session()
     try:
+        # Pre-seed legacy PG slugs as Cosh problem_groups items.
+        for pg in LEGACY_V1_PROBLEM_GROUPS:
+            session.add(CoshCoreItem(
+                cosh_id=pg["cosh_id"],
+                core_type=COSH_PROBLEM_GROUPS_CORE,
+                translations={"en": pg["name_en"]},
+                status="active",
+            ))
+        await session.commit()
         yield session
     finally:
         await session.close()
