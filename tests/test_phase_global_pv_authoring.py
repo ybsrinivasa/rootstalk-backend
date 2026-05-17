@@ -302,32 +302,41 @@ async def test_push_does_not_carry_global_pvs_to_local(db):
     assert pvs[0].variable_id != drip.id
 
 
-# ── CA list_parameters now returns Globals + client-scoped ──────────────────
+# ── CA list_parameters: Cosh-globals + own customs only ────────────────────
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_ca_list_parameters_includes_globals(db):
-    """SE-side list_parameters returns both the client's CUSTOM
-    parameters AND the Globals — so the SE sees the inherited PV
-    after a pulled refresh."""
+async def test_ca_list_parameters_cosh_global_and_own_customs(db):
+    """CA-side list_parameters returns ONLY:
+      - Cosh-mirrored Globals (source=COSH, client_id IS NULL).
+      - This client's own Customs.
+    Excludes Global-Customs (SA-only authoring artefact) and other
+    clients' Customs (per-client isolation).
+    """
     se = await make_user(db, name="SE")
     client = await make_client(db)
     await make_client_user(db, user=se, client=client)
-    # Global parameter (visible).
+    # Cosh-mirrored Global (visible — read-only catalogue).
     db.add(Parameter(
         crop_cosh_id="crop:tomato", client_id=None,
-        name="GlobalIrrigation", source=ParameterSource.CUSTOM,
+        name="CoshSoilType", source=ParameterSource.COSH,
+        cosh_id="cosh:soil_type",
     ))
-    # Client-scoped parameter (also visible to this client).
+    # Global-Custom (SA-only — must NOT appear on CA).
+    db.add(Parameter(
+        crop_cosh_id="crop:tomato", client_id=None,
+        name="GlobalCustomIrrigation", source=ParameterSource.CUSTOM,
+    ))
+    # This client's own Custom (visible).
     db.add(Parameter(
         crop_cosh_id="crop:tomato", client_id=client.id,
         name="ClientCustom", source=ParameterSource.CUSTOM,
     ))
-    # Other-client parameter (must NOT appear).
+    # Other-client Custom (must NOT appear).
     other = await make_client(db)
     db.add(Parameter(
         crop_cosh_id="crop:tomato", client_id=other.id,
-        name="OtherClient", source=ParameterSource.CUSTOM,
+        name="OtherClientCustom", source=ParameterSource.CUSTOM,
     ))
     await db.commit()
 
@@ -336,9 +345,10 @@ async def test_ca_list_parameters_includes_globals(db):
         db=db, current_user=se,
     )
     names = {p.name for p in out}
-    assert "GlobalIrrigation" in names
+    assert "CoshSoilType" in names
     assert "ClientCustom" in names
-    assert "OtherClient" not in names
+    assert "GlobalCustomIrrigation" not in names
+    assert "OtherClientCustom" not in names
 
 
 # ── Batch 28: atomic create min-2 + Custom CRUD ────────────────────────────

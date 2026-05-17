@@ -1169,15 +1169,27 @@ async def list_parameters(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Returns the client's own CUSTOM parameters AND the Global
-    parameters (client_id IS NULL) for this crop. Globals are
-    visible after push so the SE can see + assign the inherited
-    fingerprint. Locked 2026-05-11 in the Global PV work (Batch 9)."""
-    from sqlalchemy import or_
+    """Returns the parameters visible to this client for the crop:
+      (a) Cosh-mirrored Globals (source=COSH, client_id IS NULL) —
+          read-only catalogue, available to every client.
+      (b) This client's own Custom parameters (client_id = this).
+
+    Deliberately EXCLUDES Global-Custom (client_id IS NULL AND
+    source = CUSTOM) — those are an SA-Portal-only authoring artefact
+    that should never bleed into CA. Also excludes other clients'
+    Customs — per-client isolation."""
+    from sqlalchemy import and_, or_
+    from app.modules.advisory.models import ParameterSource
     result = await db.execute(
         select(Parameter).where(
             Parameter.crop_cosh_id == crop_cosh_id,
-            or_(Parameter.client_id == client_id, Parameter.client_id == None),  # noqa: E711
+            or_(
+                Parameter.client_id == client_id,
+                and_(
+                    Parameter.client_id == None,  # noqa: E711
+                    Parameter.source == ParameterSource.COSH,
+                ),
+            ),
         ).order_by(Parameter.display_order)
     )
     return result.scalars().all()
@@ -1210,15 +1222,56 @@ async def create_parameter(
     return param
 
 
+async def _assert_ca_param_writable(
+    db: AsyncSession, client_id: str, parameter_id: str,
+) -> Parameter:
+    """Gate for any CA write against a Parameter or its Variables.
+    Refuses Cosh-mirrored parents (read-only catalogue) and
+    cross-client parents (per-client isolation). Returns the
+    parameter when the write is allowed."""
+    from app.modules.advisory.models import ParameterSource
+    param = (await db.execute(
+        select(Parameter).where(Parameter.id == parameter_id)
+    )).scalar_one_or_none()
+    if param is None:
+        raise HTTPException(status_code=404, detail="Parameter not found")
+    if param.source == ParameterSource.COSH or param.client_id is None:
+        raise HTTPException(status_code=422, detail={
+            "code": "cosh_parameter_readonly",
+            "message": "Cosh parameters are read-only. Create your own Custom parameter to extend.",
+        })
+    if param.client_id != client_id:
+        raise HTTPException(status_code=403, detail={
+            "code": "parameter_not_owned",
+            "message": "This parameter belongs to a different client.",
+        })
+    return param
+
+
 @router.get("/client/{client_id}/parameters/{parameter_id}/variables")
 async def list_variables(
     client_id: str, parameter_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    result = await db.execute(
-        select(Variable).where(Variable.parameter_id == parameter_id).order_by(Variable.created_at)
-    )
+    """Returns variables visible to this client for the parameter:
+      - Cosh-mirrored parent: only Cosh-sourced variables
+        (cosh_id IS NOT NULL). Any SA-added siblings stay hidden.
+      - This client's own Custom parent: all variables.
+      - Other clients' Custom parents: empty (defensive — shouldn't
+        be reachable via list_parameters' filter)."""
+    from app.modules.advisory.models import ParameterSource
+    param = (await db.execute(
+        select(Parameter).where(Parameter.id == parameter_id)
+    )).scalar_one_or_none()
+    if param is None:
+        return []
+    stmt = select(Variable).where(Variable.parameter_id == parameter_id)
+    if param.source == ParameterSource.COSH or param.client_id is None:
+        stmt = stmt.where(Variable.cosh_id.isnot(None))
+    elif param.client_id != client_id:
+        return []
+    result = await db.execute(stmt.order_by(Variable.created_at))
     return result.scalars().all()
 
 
@@ -1229,7 +1282,9 @@ async def create_variable(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    # Validate min 2 variables enforced at list level
+    """Add a variable under one of this client's Custom parameters.
+    Refuses Cosh parents (read-only) and cross-client parents."""
+    await _assert_ca_param_writable(db, client_id, parameter_id)
     var = Variable(parameter_id=parameter_id, name=request.name)
     db.add(var)
     await db.commit()
@@ -1397,7 +1452,10 @@ async def update_variable(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Edit variable text. Resets all its translations to PENDING_REVIEW per spec A1.4."""
+    """Edit variable text. Refuses Cosh parents (read-only) and
+    cross-client parents. Resets all its translations to
+    PENDING_REVIEW per spec A1.4."""
+    await _assert_ca_param_writable(db, client_id, parameter_id)
     var = (await db.execute(
         select(Variable).where(Variable.id == variable_id, Variable.parameter_id == parameter_id)
     )).scalar_one_or_none()
@@ -1563,6 +1621,48 @@ async def set_package_variables(
     """
     await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     pkg = await _get_package(db, package_id, client_id)
+    # Visibility check — every assignment must reference a parameter
+    # that's visible to this client (Cosh-global OR own Custom) and a
+    # variable that's visible under it (Cosh-sourced on a Cosh parent,
+    # or any sibling on an own Custom parent). Prevents the SE from
+    # binding their package to an SA-only Global-Custom or another
+    # client's Custom by guessing IDs.
+    from app.modules.advisory.models import ParameterSource
+    for a in request.assignments:
+        param = (await db.execute(
+            select(Parameter).where(Parameter.id == a["parameter_id"])
+        )).scalar_one_or_none()
+        if param is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "parameter_not_found",
+                "message": f"Parameter {a['parameter_id']} not found.",
+            })
+        param_visible = (
+            param.client_id == client_id
+            or (param.client_id is None and param.source == ParameterSource.COSH)
+        )
+        if not param_visible:
+            raise HTTPException(status_code=403, detail={
+                "code": "parameter_not_visible",
+                "message": "Parameter not visible to this client.",
+            })
+        var = (await db.execute(
+            select(Variable).where(
+                Variable.id == a["variable_id"],
+                Variable.parameter_id == a["parameter_id"],
+            )
+        )).scalar_one_or_none()
+        if var is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "variable_not_found",
+                "message": f"Variable {a['variable_id']} not found under parameter.",
+            })
+        if param.client_id is None and var.cosh_id is None:
+            # SA-added variable on a Cosh parent — invisible to CA.
+            raise HTTPException(status_code=403, detail={
+                "code": "variable_not_visible",
+                "message": "Variable not visible to this client.",
+            })
     existing = (await db.execute(
         select(PackageVariable).where(PackageVariable.package_id == package_id)
     )).scalars().all()

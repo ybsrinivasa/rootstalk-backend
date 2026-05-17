@@ -25,8 +25,8 @@ from app.modules.advisory.models import (
 )
 from app.modules.advisory.router import (
     create_parameter, create_variable, delete_client_parameter,
-    delete_client_variable, list_package_variables,
-    set_package_variables, update_client_parameter,
+    delete_client_variable, list_package_variables, list_variables,
+    set_package_variables, update_client_parameter, update_variable,
 )
 from app.modules.advisory.schemas import (
     PackageVariableSet, ParameterCreate, ParameterUpdate, VariableCreate,
@@ -294,6 +294,184 @@ async def test_delete_client_variable_refuses_cosh_mirrored(db):
         )
     assert exc.value.status_code == 422
     assert exc.value.detail["code"] == "cosh_mirrored_variable_readonly"
+
+
+# ── Per-client filter & Cosh-parent read-only enforcement ───────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_list_variables_on_cosh_parent_hides_sa_added(db):
+    """On a Cosh-mirrored parent, CA must only see Cosh-sourced
+    variables (cosh_id IS NOT NULL). Any SA-added siblings stay
+    hidden on the CA side."""
+    client = await make_client(db)
+    user = await _seed_se(db, client)
+    cosh_param = Parameter(
+        crop_cosh_id="crop:tomato", client_id=None,
+        name="Soil Type", source=ParameterSource.COSH,
+        cosh_id="cosh:soil_type",
+    )
+    db.add(cosh_param)
+    await db.flush()
+    cosh_var = Variable(
+        parameter_id=cosh_param.id, name="Loamy",
+        cosh_id="cosh:soil_type:loamy",
+    )
+    sa_added = Variable(
+        parameter_id=cosh_param.id, name="SAExtension",
+        cosh_id=None,
+    )
+    db.add(cosh_var)
+    db.add(sa_added)
+    await db.commit()
+    out = await list_variables(
+        client_id=client.id, parameter_id=cosh_param.id,
+        db=db, current_user=user,
+    )
+    names = {v.name for v in out}
+    assert "Loamy" in names
+    assert "SAExtension" not in names
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_create_variable_refuses_cosh_parent(db):
+    """CA cannot add a variable under a Cosh-mirrored parent — Cosh
+    is read-only catalogue. 422 cosh_parameter_readonly."""
+    client = await make_client(db)
+    user = await _seed_se(db, client)
+    cosh_param = Parameter(
+        crop_cosh_id="crop:tomato", client_id=None,
+        name="Soil Type", source=ParameterSource.COSH,
+        cosh_id="cosh:soil_type",
+    )
+    db.add(cosh_param)
+    await db.commit()
+    with pytest.raises(HTTPException) as exc:
+        await create_variable(
+            client_id=client.id, parameter_id=cosh_param.id,
+            request=VariableCreate(parameter_id=cosh_param.id, name="X"),
+            db=db, current_user=user,
+        )
+    assert exc.value.status_code == 422
+    assert exc.value.detail["code"] == "cosh_parameter_readonly"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_create_variable_refuses_other_client_parent(db):
+    """CA cannot add a variable under another client's Custom
+    parameter — per-client isolation. 403 parameter_not_owned."""
+    client_a = await make_client(db)
+    client_b = await make_client(db)
+    user_a = await _seed_se(db, client_a)
+    b_param = Parameter(
+        crop_cosh_id="crop:tomato", client_id=client_b.id,
+        name="OtherClientCustom", source=ParameterSource.CUSTOM,
+    )
+    db.add(b_param)
+    await db.commit()
+    with pytest.raises(HTTPException) as exc:
+        await create_variable(
+            client_id=client_a.id, parameter_id=b_param.id,
+            request=VariableCreate(parameter_id=b_param.id, name="X"),
+            db=db, current_user=user_a,
+        )
+    assert exc.value.status_code == 403
+    assert exc.value.detail["code"] == "parameter_not_owned"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_update_variable_refuses_cosh_parent(db):
+    """Rename refuses on a Cosh-mirrored parent — even the SA-added
+    sibling (which CA can't see anyway) can't be edited from CA."""
+    client = await make_client(db)
+    user = await _seed_se(db, client)
+    cosh_param = Parameter(
+        crop_cosh_id="crop:tomato", client_id=None,
+        name="Soil Type", source=ParameterSource.COSH,
+        cosh_id="cosh:soil_type",
+    )
+    db.add(cosh_param)
+    await db.flush()
+    cosh_var = Variable(
+        parameter_id=cosh_param.id, name="Loamy",
+        cosh_id="cosh:soil_type:loamy",
+    )
+    db.add(cosh_var)
+    await db.commit()
+    with pytest.raises(HTTPException) as exc:
+        await update_variable(
+            client_id=client.id, parameter_id=cosh_param.id,
+            variable_id=cosh_var.id, data={"name": "renamed"},
+            db=db, current_user=user,
+        )
+    assert exc.value.status_code == 422
+    assert exc.value.detail["code"] == "cosh_parameter_readonly"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_set_package_variables_refuses_global_custom_assignment(db):
+    """CA cannot pin its Package signature to a Global-Custom
+    parameter (SA-only artefact). 403 parameter_not_visible."""
+    client = await make_client(db)
+    user = await _seed_se(db, client)
+    pkg = await _seed_client_pkg(db, client=client)
+    global_custom = Parameter(
+        crop_cosh_id="crop:tomato", client_id=None,
+        name="GlobalCustom", source=ParameterSource.CUSTOM,
+    )
+    db.add(global_custom)
+    await db.flush()
+    v = Variable(parameter_id=global_custom.id, name="x", cosh_id=None)
+    db.add(v)
+    await db.commit()
+    with pytest.raises(HTTPException) as exc:
+        await set_package_variables(
+            client_id=client.id, package_id=pkg.id,
+            request=PackageVariableSet(
+                assignments=[{"parameter_id": global_custom.id, "variable_id": v.id}],
+            ),
+            db=db, current_user=user,
+        )
+    assert exc.value.status_code == 403
+    assert exc.value.detail["code"] == "parameter_not_visible"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_set_package_variables_refuses_sa_added_variable_on_cosh_parent(db):
+    """Even if CA can see the Cosh parent, an SA-added sibling
+    variable under it is invisible to CA — refuse the assignment.
+    403 variable_not_visible."""
+    client = await make_client(db)
+    user = await _seed_se(db, client)
+    pkg = await _seed_client_pkg(db, client=client)
+    cosh_param = Parameter(
+        crop_cosh_id="crop:tomato", client_id=None,
+        name="Soil Type", source=ParameterSource.COSH,
+        cosh_id="cosh:soil_type",
+    )
+    db.add(cosh_param)
+    await db.flush()
+    sa_added = Variable(
+        parameter_id=cosh_param.id, name="SAExtension",
+        cosh_id=None,
+    )
+    db.add(sa_added)
+    await db.commit()
+    with pytest.raises(HTTPException) as exc:
+        await set_package_variables(
+            client_id=client.id, package_id=pkg.id,
+            request=PackageVariableSet(
+                assignments=[{"parameter_id": cosh_param.id, "variable_id": sa_added.id}],
+            ),
+            db=db, current_user=user,
+        )
+    assert exc.value.status_code == 403
+    assert exc.value.detail["code"] == "variable_not_visible"
 
 
 @requires_docker
