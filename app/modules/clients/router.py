@@ -1957,6 +1957,11 @@ async def cm_my_clients(
                 "status": client.status.value,
                 "rights": a.rights.value,
                 "assigned_at": a.assigned_at,
-                "portal_url": f"https://rootstalk.in/{client.short_name}",
+                # Env-driven base URL — same _base_url() helper used by
+                # login URLs + onboarding links. Hardcoding rootstalk.in
+                # (the prior value) 404s on testing because the CA portal
+                # lives on rstalk-ca.eywa.farm there. Mirror of the fix
+                # in commit 556113b for the welcome-email login URL.
+                "portal_url": f"{_base_url()}/login/{client.short_name}",
             })
     return out
