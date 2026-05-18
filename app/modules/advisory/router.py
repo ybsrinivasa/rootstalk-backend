@@ -2543,6 +2543,286 @@ async def link_relation_conditional(
     return rc
 
 
+# ── CA-side GET / PUT / DELETE for Relations + CQs (Batch N1, 2026-05-18) ────
+#
+# Until this batch, CA-side only had the four POST endpoints above.
+# The SA-frontend's RelationsSection.tsx and CQsSection.tsx (Batches
+# 39P-b / 39P-c) shipped a full GET / PUT / DELETE surface against
+# `/advisory/global/...` URLs. Adding the CA mirrors here lets the
+# same shared components mount on CA-CCA (and later CA-PG / CA-SP /
+# CA-QA in batch N2) by passing a different endpoints object.
+#
+# Implementation: the SA-side pipe-agnostic helpers
+# (`_list_relations_for_global_timeline`, `_list_cqs_for_global_timeline`)
+# don't actually scope by Global — the calling endpoint does. We
+# reuse them here directly after verifying the timeline belongs to
+# the path's client.
+
+
+async def _assert_timeline_belongs_to_client(
+    db: AsyncSession, timeline_id: str, client_id: str,
+) -> Timeline:
+    """Resolve a Timeline and confirm one of its parent FKs
+    (package_id / pg_recommendation_id / sp_recommendation_id /
+    standard_response_id) points to a parent owned by `client_id`.
+    Refuses 404 otherwise — same response shape whether the timeline
+    is unknown or cross-tenant (no info leak)."""
+    from app.modules.farmpundit.models import StandardResponse
+
+    tl = (await db.execute(
+        select(Timeline).where(Timeline.id == timeline_id)
+    )).scalar_one_or_none()
+    if tl is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+    if tl.package_id is not None:
+        pkg = (await db.execute(
+            select(Package).where(Package.id == tl.package_id)
+        )).scalar_one_or_none()
+        if pkg and pkg.client_id == client_id:
+            return tl
+    if tl.pg_recommendation_id is not None:
+        pg = (await db.execute(
+            select(PGRecommendation).where(PGRecommendation.id == tl.pg_recommendation_id)
+        )).scalar_one_or_none()
+        if pg and pg.client_id == client_id:
+            return tl
+    if tl.sp_recommendation_id is not None:
+        sp = (await db.execute(
+            select(SPRecommendation).where(SPRecommendation.id == tl.sp_recommendation_id)
+        )).scalar_one_or_none()
+        if sp and sp.client_id == client_id:
+            return tl
+    if tl.standard_response_id is not None:
+        sr = (await db.execute(
+            select(StandardResponse).where(StandardResponse.id == tl.standard_response_id)
+        )).scalar_one_or_none()
+        if sr and sr.client_id == client_id:
+            return tl
+    raise HTTPException(status_code=404, detail="Timeline not found")
+
+
+async def _get_relation_for_client(
+    db: AsyncSession, relation_id: str, client_id: str,
+) -> Relation:
+    """Resolve a Relation and confirm its Timeline belongs to
+    `client_id`. 404 on any mismatch."""
+    rel = (await db.execute(
+        select(Relation).where(Relation.id == relation_id)
+    )).scalar_one_or_none()
+    if rel is None:
+        raise HTTPException(status_code=404, detail="Relation not found")
+    await _assert_timeline_belongs_to_client(db, rel.timeline_id, client_id)
+    return rel
+
+
+async def _get_cq_for_client(
+    db: AsyncSession, question_id: str, client_id: str,
+) -> ConditionalQuestion:
+    """Resolve a ConditionalQuestion and confirm its Timeline belongs
+    to `client_id`. 404 on any mismatch."""
+    cq = (await db.execute(
+        select(ConditionalQuestion).where(ConditionalQuestion.id == question_id)
+    )).scalar_one_or_none()
+    if cq is None:
+        raise HTTPException(status_code=404, detail="Conditional Question not found")
+    await _assert_timeline_belongs_to_client(db, cq.timeline_id, client_id)
+    return cq
+
+
+@router.get("/client/{client_id}/timelines/{timeline_id}/relations")
+async def list_client_relations(
+    client_id: str, timeline_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List Relations on a client-side Timeline. Pipe-agnostic
+    (works for CCA / PG / SP / QA timelines). View-guard applies
+    so non-SE / non-CA roles get a 403."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
+    await _assert_timeline_belongs_to_client(db, timeline_id, client_id)
+    return await _list_relations_for_global_timeline(
+        db, timeline_id=timeline_id,
+    )
+
+
+@router.delete("/client/{client_id}/relations/{relation_id}", status_code=204)
+async def delete_client_relation(
+    client_id: str, relation_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Drop a Relation on a client-side Timeline. Clears
+    relation_id / relation_role on every Practice in this Relation
+    and removes any RelationConditional binding. Mirror of
+    delete_global_relation."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    await _get_relation_for_client(db, relation_id, client_id)
+
+    practices = (await db.execute(
+        select(Practice).where(Practice.relation_id == relation_id)
+    )).scalars().all()
+    for p in practices:
+        p.relation_id = None
+        p.relation_role = None
+
+    rcs = (await db.execute(
+        select(RelationConditional).where(
+            RelationConditional.relation_id == relation_id,
+        )
+    )).scalars().all()
+    for rc in rcs:
+        await db.delete(rc)
+
+    rel = (await db.execute(
+        select(Relation).where(Relation.id == relation_id)
+    )).scalar_one()
+    await db.delete(rel)
+    await db.commit()
+
+
+@router.get("/client/{client_id}/timelines/{timeline_id}/conditional-questions")
+async def list_client_conditional_questions(
+    client_id: str, timeline_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List CQs on a client-side Timeline with YES/NO attachments
+    bundled. Pipe-agnostic. View-guard applies."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
+    await _assert_timeline_belongs_to_client(db, timeline_id, client_id)
+    return await _list_cqs_for_global_timeline(
+        db, timeline_id=timeline_id,
+    )
+
+
+@router.put("/client/{client_id}/conditional-questions/{question_id}")
+async def update_client_conditional_question(
+    client_id: str, question_id: str,
+    request: CQReplace,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Atomic replace: update the CQ text + rebind YES / NO sides
+    in one transaction. Mirror of update_global_conditional_question.
+    Reuses the same assert_*_can_be_linked_to_conditional checks."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    cq = await _get_cq_for_client(db, question_id, client_id)
+
+    if not request.question_text.strip():
+        raise HTTPException(status_code=422, detail={
+            "code": "cq_question_text_required",
+            "message": "Question text is required.",
+        })
+
+    # Clear existing attachments for THIS CQ first.
+    await db.execute(
+        PracticeConditional.__table__.delete().where(
+            PracticeConditional.question_id == question_id
+        )
+    )
+    await db.execute(
+        RelationConditional.__table__.delete().where(
+            RelationConditional.question_id == question_id
+        )
+    )
+    await db.flush()
+
+    async def _bind(att, answer_value: str):
+        if att is None:
+            return
+        ans = ConditionalAnswer(answer_value)
+        if att.kind == "practice":
+            practice = (await db.execute(
+                select(Practice).where(Practice.id == att.id)
+            )).scalar_one_or_none()
+            if practice is None:
+                raise HTTPException(status_code=404, detail=f"Practice {att.id} not found")
+            existing_pc = (await db.execute(
+                select(PracticeConditional).where(
+                    PracticeConditional.practice_id == att.id,
+                )
+            )).scalar_one_or_none()
+            existing_q_id = existing_pc.question_id if existing_pc else None
+            try:
+                assert_practice_can_be_linked_to_conditional(
+                    practice_id=att.id,
+                    practice_relation_id=practice.relation_id,
+                    target_question_id=question_id,
+                    existing_question_id_for_practice=existing_q_id,
+                )
+            except ConditionalValidationError as e:
+                _raise_conditional_validation(e)
+            db.add(PracticeConditional(
+                practice_id=att.id, question_id=question_id, answer=ans,
+            ))
+        elif att.kind == "relation":
+            relation = (await db.execute(
+                select(Relation).where(Relation.id == att.id)
+            )).scalar_one_or_none()
+            if relation is None:
+                raise HTTPException(status_code=404, detail=f"Relation {att.id} not found")
+            existing_rc = (await db.execute(
+                select(RelationConditional).where(
+                    RelationConditional.relation_id == att.id,
+                )
+            )).scalar_one_or_none()
+            existing_q_id = existing_rc.question_id if existing_rc else None
+            try:
+                assert_relation_can_be_linked_to_conditional(
+                    relation_id=att.id,
+                    target_question_id=question_id,
+                    existing_question_id_for_relation=existing_q_id,
+                )
+            except ConditionalValidationError as e:
+                _raise_conditional_validation(e)
+            db.add(RelationConditional(
+                relation_id=att.id, question_id=question_id, answer=ans,
+            ))
+        else:
+            raise HTTPException(status_code=422, detail={
+                "code": "cq_attachment_unknown_kind",
+                "message": f"Unknown attachment kind: {att.kind!r}",
+            })
+
+    await _bind(request.yes, "YES")
+    await _bind(request.no, "NO")
+
+    cq.question_text = request.question_text.strip()
+    await db.commit()
+    await db.refresh(cq)
+    return {
+        "id": cq.id,
+        "timeline_id": cq.timeline_id,
+        "question_text": cq.question_text,
+        "display_order": cq.display_order,
+    }
+
+
+@router.delete("/client/{client_id}/conditional-questions/{question_id}", status_code=204)
+async def delete_client_conditional_question(
+    client_id: str, question_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Drop a CQ on a client-side Timeline. Cascades through any
+    PracticeConditional / RelationConditional rows that bound to
+    this CQ. Mirror of delete_global_conditional_question."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    cq = await _get_cq_for_client(db, question_id, client_id)
+    await db.execute(
+        PracticeConditional.__table__.delete().where(
+            PracticeConditional.question_id == question_id
+        )
+    )
+    await db.execute(
+        RelationConditional.__table__.delete().where(
+            RelationConditional.question_id == question_id
+        )
+    )
+    await db.delete(cq)
+    await db.commit()
+
+
 # ── Global Relations (Batch 39A, 2026-05-15) ──────────────────────────────────
 #
 # SA-portal authoring of Practice Relations on Global Packages. Mirrors the
