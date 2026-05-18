@@ -7382,12 +7382,16 @@ async def publish_client_pg(
             },
         )
 
+    # Demote BOTH prior ACTIVE and any sibling DRAFT to INACTIVE.
+    # Sibling DRAFT covers the "imported draft I never used" case
+    # (Batch T, 2026-05-18) — after a publish there is exactly one
+    # live row in the lineage, nothing stale lurking.
     prev = (await db.execute(
         select(PGRecommendation).where(
             PGRecommendation.problem_group_cosh_id == pg.problem_group_cosh_id,
             PGRecommendation.client_id == client_id,
             PGRecommendation.area_or_plant == pg.area_or_plant,
-            PGRecommendation.status == "ACTIVE",
+            PGRecommendation.status.in_(("ACTIVE", "DRAFT")),
             PGRecommendation.id != pg.id,
         )
     )).scalars().all()
