@@ -1057,6 +1057,47 @@ async def add_portal_user(
     if conflict:
         raise HTTPException(status_code=409, detail="This user already has this role for this client")
 
+    # CA-exclusivity (Batch K, 2026-05-18). Per user rule: every
+    # ClientUser except CA can hold multiple roles; CA is mutually
+    # exclusive. So:
+    #   - Adding CA to a user who has any non-CA role → refuse.
+    #   - Adding any non-CA role to a user who is already CA → refuse.
+    other_roles = (await db.execute(
+        select(ClientUser).where(
+            ClientUser.client_id == client_id,
+            ClientUser.user_id == user.id,
+            ClientUser.status == StatusEnum.ACTIVE,
+        )
+    )).scalars().all()
+    if request.role == ClientUserRole.CA and any(
+        r.role != ClientUserRole.CA for r in other_roles
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ca_role_exclusive",
+                "message": (
+                    "This user already holds non-CA roles. CA is a single "
+                    "exclusive role per user — remove the other roles first "
+                    "or assign CA to a different user."
+                ),
+            },
+        )
+    if request.role != ClientUserRole.CA and any(
+        r.role == ClientUserRole.CA for r in other_roles
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ca_role_exclusive",
+                "message": (
+                    "This user is the CA. CA is a single exclusive role — "
+                    "they cannot also hold other roles. Remove the CA "
+                    "assignment first or pick a different user."
+                ),
+            },
+        )
+
     cu = ClientUser(
         client_id=client_id,
         user_id=user.id,

@@ -184,7 +184,13 @@ async def test_lineage_403_when_caller_not_client_user(db):
             db=db, current_user=rando,
         )
     assert exc.value.status_code == 403
-    assert exc.value.detail["code"] == "client_user_required"
+    # Batch K (2026-05-18): the view-guard fires first now, with
+    # `advisory_view_forbidden`. Previously the test asserted the
+    # downstream `client_user_required` code from
+    # `_assert_client_user_required`. The new guard is a superset
+    # (refuses non-members AND non-SE/non-CA members) — refusing
+    # earlier is by design.
+    assert exc.value.detail["code"] == "advisory_view_forbidden"
 
 
 @requires_docker

@@ -410,12 +410,24 @@ async def get_me(request: Request, current_user: User = Depends(get_current_user
     from app.modules.clients.models import ClientPromoter
     from app.modules.farmpundit.models import FarmPunditProfile
 
-    cu = (await db.execute(
-        select(ClientUser).where(
-            ClientUser.user_id == current_user.id,
-            ClientUser.status == StatusEnum.ACTIVE,
-        )
-    )).scalar_one_or_none()
+    # Tenant binding pre-fetch (Batch K, 2026-05-18). With the
+    # client_id claim now on the JWT, we can scope the ClientUser
+    # query to the bound client AND surface ALL active roles
+    # (previously the code did scalar_one_or_none, which crashed
+    # on users with multiple roles — a latent bug exposed by the
+    # multi-role rule).
+    token_client_id_pre = getattr(request.state, "token_client_id", None)
+    cu_query = select(ClientUser).where(
+        ClientUser.user_id == current_user.id,
+        ClientUser.status == StatusEnum.ACTIVE,
+    )
+    if token_client_id_pre:
+        cu_query = cu_query.where(ClientUser.client_id == token_client_id_pre)
+    cus = (await db.execute(cu_query)).scalars().all()
+    # Preserve the legacy single `portal_role` field for backward
+    # compat — caller can migrate to `portal_roles` (the new list).
+    cu = cus[0] if cus else None
+    portal_roles = sorted({c.role.value for c in cus})
 
     # Determine PWA roles from ClientPromoter and FarmPunditProfile
     pwa_roles: list[str] = []
@@ -459,7 +471,7 @@ async def get_me(request: Request, current_user: User = Depends(get_current_user
     # claims — surface them here as the authoritative source for the
     # frontend's `setClient` call. Pre-login branding fetches can
     # drift; the token can't.
-    token_client_id = getattr(request.state, "token_client_id", None)
+    token_client_id = token_client_id_pre
     token_client_short_name = getattr(request.state, "token_client_short_name", None)
 
     return {
@@ -470,6 +482,7 @@ async def get_me(request: Request, current_user: User = Depends(get_current_user
         "language_code": current_user.language_code,
         "roles": current_user.roles,
         "portal_role": cu.role.value if cu else None,
+        "portal_roles": portal_roles,
         "pwa_roles": pwa_roles,
         "is_sa": bool(current_user.email and current_user.email == settings.sa_email),
         "client_id": token_client_id,

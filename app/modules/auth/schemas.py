@@ -44,7 +44,8 @@ class UserOut(BaseModel):
     name: Optional[str] = None
     language_code: str
     roles: List[RoleOut] = []
-    portal_role: Optional[str] = None
+    portal_role: Optional[str] = None  # deprecated; use portal_roles
+    portal_roles: List[str] = []  # all ACTIVE ClientUser roles at the bound client
     pwa_roles: List[str] = []
     is_sa: bool = False  # True iff email matches settings.sa_email
     # Tenant binding (2026-05-18). Surfaced from the JWT claim set at

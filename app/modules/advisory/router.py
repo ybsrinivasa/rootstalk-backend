@@ -206,6 +206,68 @@ async def _assert_can_edit_client_advisory(
     )
 
 
+async def _assert_can_view_client_advisory(
+    db: AsyncSession, user_id: str, client_id: str,
+) -> None:
+    """Authorisation gate for CA-side advisory READS.
+
+    Batch K (2026-05-18): non-SE / non-CA roles cannot see CCA / PG /
+    SP / QA content at all — not even via direct URL. The sidebar
+    hides the items but the backend is the audit-grade guarantee.
+
+    Accepts:
+      1. ACTIVE ClientUser of this client with role SUBJECT_EXPERT or CA.
+      2. ACTIVE CMClientAssignment with EDIT rights (Ram-direct-view
+         path — CMs administer the client's content and need read
+         access too).
+
+    Refused (403 `advisory_view_forbidden`):
+      - Any other ACTIVE ClientUser role (FIELD_MANAGER /
+        SEED_DATA_MANAGER / REPORT_USER / CLIENT_RM / PRODUCT_MANAGER).
+      - Not a member of this client AND not a CM-EDIT assignee.
+    """
+    from app.modules.clients.models import (
+        CMClientAssignment, CMRights, ClientUser, ClientUserRole,
+    )
+    from app.modules.platform.models import StatusEnum
+
+    cu_rows = (await db.execute(
+        select(ClientUser).where(
+            ClientUser.user_id == user_id,
+            ClientUser.client_id == client_id,
+            ClientUser.status == StatusEnum.ACTIVE,
+        )
+    )).scalars().all()
+    if any(
+        cu.role in (ClientUserRole.SUBJECT_EXPERT, ClientUserRole.CA)
+        for cu in cu_rows
+    ):
+        return
+
+    cm = (await db.execute(
+        select(CMClientAssignment.id).where(
+            CMClientAssignment.cm_user_id == user_id,
+            CMClientAssignment.client_id == client_id,
+            CMClientAssignment.status == StatusEnum.ACTIVE,
+            CMClientAssignment.rights == CMRights.EDIT,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if cm is not None:
+        return
+
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "code": "advisory_view_forbidden",
+            "message": (
+                "Viewing advisory content requires the Subject Expert "
+                "or CA role on this company. Ask your CA to grant "
+                "the appropriate role."
+            ),
+        },
+    )
+
+
 async def _assert_sa_or_cm(
     db: AsyncSession, current_user: "User",
 ) -> None:
@@ -641,6 +703,7 @@ async def list_packages(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     result = await db.execute(
         select(Package).where(Package.client_id == client_id).order_by(Package.created_at)
     )
@@ -705,6 +768,7 @@ async def get_package(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     pkg = await _get_package(db, package_id, client_id)
     return pkg
 
@@ -730,6 +794,7 @@ async def get_package_lineage(
         source_version_id, is_current}, ...]
       where `is_current` flags the row the caller is viewing.
     """
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     await _assert_client_user_can_edit(db, current_user.id, client_id)
     pkg = await _get_package(db, package_id, client_id)
 
@@ -819,6 +884,7 @@ async def get_publish_readiness(
     would surface in its 422 — the missing list mirrors that 422's
     `missing` array shape so the frontend can render either response
     with the same component."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     from app.services.crop_lifecycle import (
         CropNotOnBeltError, assert_crop_on_belt,
     )
@@ -1024,6 +1090,7 @@ async def list_package_locations(
 ):
     """List the state/district pairs this Package is configured to
     serve. Read-only; mutations go through PUT below."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     await _get_package(db, package_id, client_id)
     rows = (await db.execute(
         select(PackageLocation).where(PackageLocation.package_id == package_id)
@@ -1196,6 +1263,7 @@ async def list_parameters(
     source = CUSTOM) — those are an SA-Portal-only authoring artefact
     that should never bleed into CA. Also excludes other clients'
     Customs — per-client isolation."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     from sqlalchemy import and_, or_
     from app.modules.advisory.models import ParameterSource
     result = await db.execute(
@@ -1278,6 +1346,7 @@ async def list_variables(
       - This client's own Custom parent: all variables.
       - Other clients' Custom parents: empty (defensive — shouldn't
         be reachable via list_parameters' filter)."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     from app.modules.advisory.models import ParameterSource
     param = (await db.execute(
         select(Parameter).where(Parameter.id == parameter_id)
@@ -1516,6 +1585,7 @@ async def list_parameter_translations(
     current_user: User = Depends(get_current_user),
 ):
     """List all language translations for a parameter."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     translations = (await db.execute(
         select(ParameterTranslation).where(ParameterTranslation.parameter_id == parameter_id)
     )).scalars().all()
@@ -1563,6 +1633,7 @@ async def list_variable_translations(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     translations = (await db.execute(
         select(VariableTranslation).where(VariableTranslation.variable_id == variable_id)
     )).scalars().all()
@@ -1608,6 +1679,7 @@ async def list_package_variables(
     """List the parameter→variable fingerprint set on a client Package.
     Mirror of list_global_package_variables (SA, line ~3843).
     Defaults to empty when none assigned yet."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     await _get_package(db, package_id, client_id)
     rows = (await db.execute(
         select(PackageVariable).where(PackageVariable.package_id == package_id)
@@ -1715,6 +1787,7 @@ async def list_timelines(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     await _get_package(db, package_id, client_id)
     result = await db.execute(
         select(Timeline).where(Timeline.package_id == package_id).order_by(Timeline.display_order, Timeline.from_value)
@@ -1741,6 +1814,7 @@ async def list_timeline_conflicts(
     day-offset anchor relative to crop_start, so they can't gap or
     overlap with DAS/DBS timelines on the same number line.
     """
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     await _get_package(db, package_id, client_id)
     rows = (await db.execute(
         select(Timeline).where(Timeline.package_id == package_id)
@@ -1972,6 +2046,7 @@ async def list_practices(
 ):
     """Same shape as the global list (Batch 32) — practices bundled
     with their elements + server-resolved English labels."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     practices = (await db.execute(
         select(Practice).where(Practice.timeline_id == timeline_id).order_by(Practice.display_order)
     )).scalars().all()
@@ -6488,6 +6563,7 @@ async def list_client_pg(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     result = await db.execute(
         select(PGRecommendation).where(PGRecommendation.client_id == client_id)
         .order_by(PGRecommendation.created_at.desc())
@@ -6587,6 +6663,7 @@ async def get_client_pg(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     pg = (await db.execute(
         select(PGRecommendation).where(PGRecommendation.id == pg_id, PGRecommendation.client_id == client_id)
     )).scalar_one_or_none()
@@ -6824,6 +6901,7 @@ async def get_pg_publish_readiness(
     """Read-only check of every gate `publish_client_pg` runs. Same
     response shape as the package /publish-readiness — frontend can
     render either with the same gate-panel component."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     pg = (await db.execute(
         select(PGRecommendation).where(
             PGRecommendation.id == pg_id, PGRecommendation.client_id == client_id,
@@ -6916,6 +6994,7 @@ async def list_client_pg_timelines(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     result = await db.execute(
         select(Timeline).where(Timeline.pg_recommendation_id == pg_id)
     )
@@ -7231,6 +7310,7 @@ async def list_client_sp(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     from app.services.crop_measure import get_measure
     result = await db.execute(
         select(SPRecommendation).where(SPRecommendation.client_id == client_id)
@@ -7284,6 +7364,7 @@ async def list_sp_timelines(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     result = await db.execute(select(Timeline).where(Timeline.sp_recommendation_id == sp_id))
     timelines = result.scalars().all()
     out = []
@@ -7597,6 +7678,7 @@ async def list_qa_timelines(
     nested Practices and Elements. The CA-portal editor renders the
     whole tree at once; the Pundit picker only needs the metadata
     so it goes through the simpler farmpundit search endpoint."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     await _assert_sr_belongs_to_client(db, sr_id, client_id)
 
@@ -8270,6 +8352,7 @@ async def get_client_sp(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     from app.services.crop_measure import get_measure
     sp = (await db.execute(
         select(SPRecommendation).where(
@@ -8359,6 +8442,7 @@ async def get_sp_publish_readiness(
     """Read-only check of every gate `publish_sp` runs. Same envelope
     shape as the package + PG readiness endpoints — frontend renders
     all three with the same gate-panel component."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     sp = (await db.execute(
         select(SPRecommendation).where(
             SPRecommendation.id == sp_id, SPRecommendation.client_id == client_id,
@@ -8473,6 +8557,7 @@ async def cca_list_crops(
     """Crop-level list for the four-screen CCA hub. Each row carries a
     package-status breakdown ({DRAFT, ACTIVE, INACTIVE}) so the SE can
     see at a glance which crops have advisory work in flight."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     crops = (await db.execute(
         select(ClientCrop)
         .where(ClientCrop.client_id == client_id, ClientCrop.removed_at.is_(None))
@@ -8530,6 +8615,7 @@ async def cca_list_packages(
     """Package-level list with denormalised crop name + counts of
     timelines and locations + last-edited. Filter chips:
     ?crop_cosh_id= and ?status= (DRAFT/ACTIVE/INACTIVE)."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     q = select(Package).where(Package.client_id == client_id)
     if crop_cosh_id:
         q = q.where(Package.crop_cosh_id == crop_cosh_id)
@@ -8594,6 +8680,7 @@ async def cca_list_timelines(
     """Cross-package timeline list with denormalised package + crop
     info and a practice count per timeline. Filter chips:
     ?crop_cosh_id= and ?package_id=."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     q = (
         select(Timeline, Package)
         .join(Package, Timeline.package_id == Package.id)
@@ -8658,6 +8745,7 @@ async def cca_list_practices(
     queries like 'all practices in any package using brand X' work by
     scoping with ?crop_cosh_id=...&l1=PESTICIDE — the brand-level filter
     falls out of the L2-bound element list."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     if limit < 1 or limit > 500:
         raise HTTPException(
             status_code=422,
@@ -8776,6 +8864,7 @@ async def cha_list_problems(
     PG list source: Cosh's `problem_groups` Core via
     `app/services/cha_problem_groups.list_problem_groups`
     (Batch 39R-bridge, 2026-05-17)."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     from app.services.cha_problem_groups import list_problem_groups
 
     pgs = await list_problem_groups(db)
@@ -8818,6 +8907,7 @@ async def cha_list_recommendations(
     ?problem_group_cosh_id=, ?area_or_plant=, ?status=. Each row
     denormalises the friendly PG name + a timeline_count so the
     table is rendered without N+1."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     from app.services.cha_problem_groups import list_problem_groups
 
     q = select(PGRecommendation).where(PGRecommendation.client_id == client_id)
@@ -8873,6 +8963,7 @@ async def cha_list_timelines(
     bundle context + practice count. Chips: ?problem_group_cosh_id=,
     ?recommendation_id=, ?area_or_plant=. Filters out QA-rooted
     timelines (those live under standard_response_id)."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     from app.services.cha_problem_groups import list_problem_groups
 
     q = (
@@ -8942,6 +9033,7 @@ async def cha_list_practices(
     """Cross-timeline CHA practice list. Same cross-cutting power as
     /cca/practices — "every PESTICIDE practice in any of our PG
     recommendations" type queries. Paginated."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     from app.services.cha_problem_groups import list_problem_groups
 
     if limit < 1 or limit > 500:
@@ -9064,6 +9156,7 @@ async def cha_sp_eligible_crops(
     Surfaced on the SE-side picker AND on the CA-side Setup → Crops
     page (informational: "of your N crops, M have CHA-SP authoring
     enabled by RootsTalk")."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     from app.modules.sync.models import CropHealthCrop
 
     client_crops = (await db.execute(
@@ -9109,6 +9202,7 @@ async def cha_sp_specific_problems(
     bundle for (this client, crop, SP) already exists, so the SE
     sees at a glance which problems have been authored against and
     can navigate straight into the existing bundle."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     from app.services.cha_specific_problems import list_specific_problems_for_crop
 
     problems = list_specific_problems_for_crop(crop_cosh_id)
@@ -9145,6 +9239,7 @@ async def cha_sp_list_recommendations(
 ):
     """SP recommendation list with denormalised crop name + SP name +
     timeline_count. Filter chips: ?crop_cosh_id= and ?status=."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     q = select(SPRecommendation).where(SPRecommendation.client_id == client_id)
     if crop_cosh_id:
         q = q.where(SPRecommendation.crop_cosh_id == crop_cosh_id)
@@ -9204,6 +9299,7 @@ async def cha_sp_list_timelines(
     """Cross-recommendation SP timeline list with denormalised crop +
     SP context + practice count. Chips: ?crop_cosh_id=,
     ?recommendation_id=."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     from app.modules.advisory.models import Practice
 
     q = (
@@ -9274,6 +9370,7 @@ async def cha_sp_list_practices(
     """Cross-timeline SP practice list with brand + dosage summary +
     full breadcrumb. Paginated. Same cross-cutting power as the
     CHA-PG / CCA practice lists."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     from app.modules.advisory.models import Element, Practice
 
     if limit < 1 or limit > 500:
@@ -9385,6 +9482,7 @@ async def qa_eligible_crops(
     crop-agnostic, but the picker only surfaces the CA's belt
     crops). Plus a synthetic 'Crop-agnostic' entry for questions
     that don't belong to any crop."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     rows = (await db.execute(
         select(ClientCrop).where(
             ClientCrop.client_id == client_id,
@@ -9416,6 +9514,7 @@ async def qa_list_standard_responses(
     screen renders without N+1. Filter chip: ?crop_cosh_id=. The
     special value `__AGNOSTIC__` filters to crop-agnostic SRs
     (question_text without a crop attached)."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     from app.modules.farmpundit.models import StandardResponse
 
     q = select(StandardResponse).where(StandardResponse.client_id == client_id)
@@ -9467,6 +9566,7 @@ async def qa_list_timelines(
     """Cross-SR timeline list. Walks the polymorphic `pg_timelines`
     table for rows with `standard_response_id IS NOT NULL` (excluding
     PG-rooted rows). Chips: ?standard_response_id=, ?crop_cosh_id=."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     from app.modules.farmpundit.models import StandardResponse
 
     q = (
@@ -9532,6 +9632,7 @@ async def qa_list_practices(
 ):
     """Cross-timeline QA practice list. Same shape as /cha/practices
     and /cha-sp/practices. Paginated."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
     from app.modules.farmpundit.models import StandardResponse
 
     if limit < 1 or limit > 500:
