@@ -44,9 +44,40 @@ def decode_token(token: str) -> Optional[dict]:
         return None
 
 
-def _build_token(user: User) -> str:
+def _build_token(
+    user: User,
+    *,
+    client_id: Optional[str] = None,
+    client_short_name: Optional[str] = None,
+) -> str:
+    """Build a JWT for the user.
+
+    When the user logs in via a client portal (i.e. with a
+    `client_short_name`), the token carries `client_id` +
+    `client_short_name` claims and the access scope is bound to
+    that single client for the session. Calls to `/client/{cid}/...`
+    with cid != token.client_id are refused 403 cross_client_forbidden
+    in `get_current_user`.
+
+    SA / CM / PWA logins (no client_short_name) get tokens without
+    the claim — those identities are not tenant-bound by design
+    (CMs reach `/client/{cid}/...` for clients they're assigned to,
+    via the per-endpoint CMClientAssignment gate).
+    """
     active_roles = [r.role_type.value for r in user.roles if r.status == StatusEnum.ACTIVE]
-    return create_access_token({"sub": user.id, "roles": active_roles, "jti": user.current_session_id})
+    payload: dict = {
+        "sub": user.id,
+        "roles": active_roles,
+    }
+    # JWT spec requires jti to be a string; jose refuses to decode
+    # tokens carrying jti=null. Omit when the user has no session id.
+    if user.current_session_id:
+        payload["jti"] = user.current_session_id
+    if client_id:
+        payload["client_id"] = client_id
+    if client_short_name:
+        payload["client_short_name"] = client_short_name
+    return create_access_token(payload)
 
 
 async def start_new_session(db: AsyncSession, user: User) -> str:

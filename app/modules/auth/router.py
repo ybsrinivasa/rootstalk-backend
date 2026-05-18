@@ -1,7 +1,7 @@
 import logging
 import secrets
 from datetime import datetime, timezone, timedelta
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.database import get_db
@@ -27,8 +27,11 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 
-async def _check_client_user(db: AsyncSession, user: User, short_name: str) -> None:
-    """When logging in via client portal: verify client is ACTIVE and user belongs to it."""
+async def _check_client_user(db: AsyncSession, user: User, short_name: str) -> Client:
+    """When logging in via client portal: verify client is ACTIVE and
+    user belongs to it. Returns the Client row so callers can bind
+    the issued JWT to this client_id (tenant isolation — see
+    `_build_token` and `get_current_user`)."""
     client = (await db.execute(
         select(Client).where(Client.short_name == short_name.lower(), Client.status == ClientStatus.ACTIVE)
     )).scalar_one_or_none()
@@ -43,6 +46,7 @@ async def _check_client_user(db: AsyncSession, user: User, short_name: str) -> N
     )).scalar_one_or_none()
     if not cu:
         raise HTTPException(status_code=401, detail="This email is not registered with this company")
+    return client
 
 
 # ── PWA: Phone OTP ─────────────────────────────────────────────────────────────
@@ -98,10 +102,15 @@ async def admin_login(request: AdminLoginRequest, db: AsyncSession = Depends(get
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     if not verify_password(request.password, user.password_hash):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    client: Client | None = None
     if request.client_short_name:
-        await _check_client_user(db, user, request.client_short_name)
+        client = await _check_client_user(db, user, request.client_short_name)
     await start_new_session(db, user)
-    return TokenResponse(access_token=_build_token(user))
+    return TokenResponse(access_token=_build_token(
+        user,
+        client_id=client.id if client else None,
+        client_short_name=client.short_name if client else None,
+    ))
 
 
 # ── Portal: Email OTP login ────────────────────────────────────────────────────
@@ -176,11 +185,16 @@ async def verify_email_otp(data: dict, db: AsyncSession = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     client_short_name = data.get("client_short_name")
+    client: Client | None = None
     if client_short_name and otp.purpose == "LOGIN":
-        await _check_client_user(db, user, client_short_name)
+        client = await _check_client_user(db, user, client_short_name)
     await db.commit()
     await start_new_session(db, user)
-    return TokenResponse(access_token=_build_token(user))
+    return TokenResponse(access_token=_build_token(
+        user,
+        client_id=client.id if client else None,
+        client_short_name=client.short_name if client else None,
+    ))
 
 
 # ── Forgot & Change Password ────────────────────────────────────────────────────
@@ -392,7 +406,7 @@ async def claim_role(
 # ── Shared ─────────────────────────────────────────────────────────────────────
 
 @router.get("/me", response_model=UserOut)
-async def get_me(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+async def get_me(request: Request, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     from app.modules.clients.models import ClientPromoter
     from app.modules.farmpundit.models import FarmPunditProfile
 
@@ -440,6 +454,14 @@ async def get_me(current_user: User = Depends(get_current_user), db: AsyncSessio
     if pundit:
         pwa_roles.append("FARM_PUNDIT")
 
+    # Tenant binding (2026-05-18). When the user logged in via a
+    # client portal the JWT carries client_id + client_short_name
+    # claims — surface them here as the authoritative source for the
+    # frontend's `setClient` call. Pre-login branding fetches can
+    # drift; the token can't.
+    token_client_id = getattr(request.state, "token_client_id", None)
+    token_client_short_name = getattr(request.state, "token_client_short_name", None)
+
     return {
         "id": current_user.id,
         "email": current_user.email,
@@ -450,6 +472,8 @@ async def get_me(current_user: User = Depends(get_current_user), db: AsyncSessio
         "portal_role": cu.role.value if cu else None,
         "pwa_roles": pwa_roles,
         "is_sa": bool(current_user.email and current_user.email == settings.sa_email),
+        "client_id": token_client_id,
+        "client_short_name": token_client_short_name,
     }
 
 

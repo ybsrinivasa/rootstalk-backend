@@ -47,6 +47,11 @@ class UserOut(BaseModel):
     portal_role: Optional[str] = None
     pwa_roles: List[str] = []
     is_sa: bool = False  # True iff email matches settings.sa_email
+    # Tenant binding (2026-05-18). Surfaced from the JWT claim set at
+    # portal-login time. Frontend MUST seed its local rt_cp_client
+    # from these — pre-login branding fetches drift; the token can't.
+    client_id: Optional[str] = None
+    client_short_name: Optional[str] = None
 
     class Config:
         from_attributes = True

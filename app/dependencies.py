@@ -1,4 +1,4 @@
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
@@ -9,6 +9,7 @@ bearer = HTTPBearer()
 
 
 async def get_current_user(
+    request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(bearer),
     db: AsyncSession = Depends(get_db),
 ) -> User:
@@ -27,6 +28,32 @@ async def get_current_user(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Session ended — signed in on another device",
         )
+
+    # Tenant isolation (2026-05-18): a portal-issued token carries a
+    # `client_id` claim. Refuse if the path's {client_id} doesn't
+    # match — this is the architectural gate that makes
+    # `/client/{cid}/...` endpoints tenant-safe regardless of any
+    # missing per-endpoint role checks. Tokens issued WITHOUT a
+    # client_id claim (SA / CM / PWA logins) are allowed through here;
+    # per-endpoint guards (_assert_cm_can_edit_client, etc.) still
+    # apply downstream.
+    token_client_id = payload.get("client_id")
+    path_client_id = request.path_params.get("client_id")
+    if token_client_id and path_client_id and token_client_id != path_client_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "cross_client_forbidden",
+                "message": (
+                    "This session is bound to a different company. "
+                    "Sign out and sign back in to the company you need to access."
+                ),
+            },
+        )
+    # Stash for downstream introspection (e.g. /auth/me needs to
+    # surface the bound client to the frontend).
+    request.state.token_client_id = token_client_id
+    request.state.token_client_short_name = payload.get("client_short_name")
     return user
 
 
