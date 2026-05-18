@@ -31,7 +31,7 @@ from app.modules.advisory.router import (
 import_global_pg,import_pg_into_sp,
 )
 from tests.conftest import requires_docker
-from tests.factories import make_client, make_cm_assignment, make_user
+from tests.factories import make_client, make_client_user, make_cm_assignment, make_user
 
 
 # ── Seed helpers ────────────────────────────────────────────────────────────
@@ -103,6 +103,30 @@ select(Element).where(Element.practice_id == practices[0].id)
     )).scalars().all()
     assert len(elements) == 1
     assert elements[0].cosh_ref == "cn:imida"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_global_pg_import_permitted_for_se(db):
+    """Auth widened 2026-05-18: an ACTIVE SUBJECT_EXPERT of the
+    client can import a Global PG without needing a CM assignment.
+    Previously CM-only — that blocked SEs inside their own
+    company from pulling Global library content."""
+    from app.modules.clients.models import ClientUserRole
+    se = await make_user(db, name="SE", skip_auto_link=True)
+    client = await make_client(db)
+    await make_client_user(
+        db, user=se, client=client, role=ClientUserRole.SUBJECT_EXPERT,
+    )
+    src = await _seed_global_pg_with_content(db)
+    await db.commit()
+
+    out = await import_global_pg(
+        client_id=client.id, global_pg_id=src.id,
+        db=db, current_user=se,
+    )
+    assert out.client_id == client.id
+    assert out.parent_id == src.id
 
 
 @requires_docker

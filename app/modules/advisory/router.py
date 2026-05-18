@@ -7056,8 +7056,15 @@ async def import_global_pg(
         re-imports fresh from the global. Local copy keeps its same
         primary key (so triggered references stay intact); only its
         timelines / practices / elements are replaced.
+
+    Auth (widened 2026-05-18 per user feedback): any ACTIVE
+    ClientUser with SUBJECT_EXPERT role on this client OR an ACTIVE
+    CM-EDIT assignee may import. Previously CM-only; that blocked
+    SEs from pulling Global PGs into their own account, which
+    contradicts the principle that an SE shouldn't be blocked inside
+    their own client. Same shape as the import-pg-into-sp widening.
     """
-    await _assert_cm_can_edit_client(db, current_user.id, client_id)
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
 
     src = (await db.execute(
         select(PGRecommendation).where(
