@@ -2,7 +2,7 @@ import uuid
 import enum
 from datetime import datetime, timezone
 from sqlalchemy import (
-    String, Text, Boolean, DateTime, ForeignKey,
+    String, Text, Boolean, DateTime, ForeignKey, Index,
     Enum as SAEnum, JSON, UniqueConstraint
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -205,7 +205,14 @@ class CMPrivilegeModel(Base):
     privilege: Mapped[CMPrivilege] = mapped_column(SAEnum(CMPrivilege), nullable=False)
     granted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
-    __table_args__ = (UniqueConstraint("cm_user_id", "privilege"),)
+    __table_args__ = (
+        UniqueConstraint("cm_user_id", "privilege"),
+        # Batch U (2026-05-18): single-holder invariant — at most one
+        # CM holds each privilege at any time. Belt-and-braces with
+        # the application-level demote-before-grant logic in
+        # PUT /admin/cm-privileges/{privilege}.
+        Index("uq_cm_privilege_single_holder", "privilege", unique=True),
+    )
 
 
 class ClientPromoter(Base):

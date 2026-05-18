@@ -358,6 +358,50 @@ async def _assert_sa_or_cm(
     )
 
 
+async def _assert_sa_or_privileged_cm(
+    db: AsyncSession, current_user: "User", privilege: str,
+) -> None:
+    """Batch U (2026-05-18) — feature-specific privilege gate. Wraps
+    `_assert_sa_or_cm` (SA always passes; a CM must hold the named
+    privilege to write). Used by the three single-holder feature
+    endpoints: Volume Calculations, Brand Handling, Crop Health Crops.
+
+    Raises 403 `cm_privilege_required` if the caller is a CM without
+    the privilege. SA still passes through.
+    """
+    from app.config import settings
+    from app.modules.clients.models import CMPrivilege, CMPrivilegeModel
+
+    if current_user.email and current_user.email == settings.sa_email:
+        return
+
+    # Reuse the CM-role gate first — this 403s with global_edit_forbidden
+    # for non-CM callers, which is the right error code for them.
+    await _assert_sa_or_cm(db, current_user)
+
+    # The caller is a CM. Confirm they hold the specific privilege.
+    holds = (await db.execute(
+        select(CMPrivilegeModel.id).where(
+            CMPrivilegeModel.cm_user_id == current_user.id,
+            CMPrivilegeModel.privilege == CMPrivilege(privilege),
+        ).limit(1)
+    )).scalar_one_or_none()
+    if holds is not None:
+        return
+
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "code": "cm_privilege_required",
+            "message": (
+                f"This action is reserved for the Content Manager who "
+                f"holds the {privilege} privilege. Ask the SA to assign it."
+            ),
+            "privilege": privilege,
+        },
+    )
+
+
 async def _assert_cm_can_edit_client(
     db: AsyncSession, user_id: str, client_id: str,
 ) -> None:

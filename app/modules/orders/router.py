@@ -1300,7 +1300,12 @@ async def update_brand_report(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """CM with BRAND_HANDLING privilege: review and approve/reject a missing brand report."""
+    """SA or the CM with BRAND_HANDLING privilege: review and
+    approve/reject a missing brand report. Batch U (2026-05-18) —
+    privilege actually enforced now (previously the docstring
+    claimed it but the function body didn't check)."""
+    from app.modules.advisory.router import _assert_sa_or_privileged_cm
+    await _assert_sa_or_privileged_cm(db, current_user, "BRAND_HANDLING")
     report = (await db.execute(
         select(MissingBrandReport).where(MissingBrandReport.id == report_id)
     )).scalar_one_or_none()

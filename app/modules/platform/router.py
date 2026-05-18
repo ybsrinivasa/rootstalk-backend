@@ -208,7 +208,13 @@ async def set_cm_privileges(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """SA: set or clear CM privileges (3 toggles). Only applies to Content Manager role."""
+    """SA: set or clear CM privileges (3 toggles). Only applies to Content Manager role.
+
+    Batch U (2026-05-18) — privileges are single-holder. Granting a
+    privilege to user X atomically revokes the same privilege from
+    any other CM who held it. The DB also enforces this with a
+    partial unique index, so concurrent grants race-safe.
+    """
     await _get_neytiri_user(db, user_id)
 
     privileges = data.get("privileges", [])
@@ -217,11 +223,84 @@ async def set_cm_privileges(
         if p not in valid:
             raise HTTPException(status_code=422, detail=f"Unknown privilege: {p}")
 
+    # Demote anyone else holding the privileges we're about to grant.
+    if privileges:
+        await db.execute(
+            delete(CMPrivilegeModel).where(
+                CMPrivilegeModel.privilege.in_([CMPrivilege(p) for p in privileges]),
+                CMPrivilegeModel.cm_user_id != user_id,
+            )
+        )
+    # Clear this user's existing privileges + insert the new set.
     await db.execute(delete(CMPrivilegeModel).where(CMPrivilegeModel.cm_user_id == user_id))
     for p in privileges:
         db.add(CMPrivilegeModel(cm_user_id=user_id, privilege=CMPrivilege(p)))
     await db.commit()
     return {"user_id": user_id, "privileges": privileges}
+
+
+@router.get("/admin/cm-privileges")
+async def list_cm_privilege_owners(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SA: returns the current owner (or null) for each CM privilege.
+    One row per privilege — exactly three rows.
+    Batch U (2026-05-18)."""
+    rows = (await db.execute(
+        select(CMPrivilegeModel, User)
+        .join(User, User.id == CMPrivilegeModel.cm_user_id, isouter=False)
+    )).all()
+    holders: dict[str, dict] = {
+        p.value: {"privilege": p.value, "cm_user_id": None, "name": None, "email": None}
+        for p in CMPrivilege
+    }
+    for priv, user in rows:
+        holders[priv.privilege.value] = {
+            "privilege": priv.privilege.value,
+            "cm_user_id": user.id,
+            "name": user.name,
+            "email": user.email,
+        }
+    # Stable order matching the UI's display order.
+    order = [
+        CMPrivilege.CROP_HEALTH_CROPS.value,
+        CMPrivilege.BRAND_HANDLING.value,
+        CMPrivilege.VOLUME_CALCULATIONS.value,
+    ]
+    return [holders[p] for p in order]
+
+
+@router.put("/admin/cm-privileges/{privilege}")
+async def set_cm_privilege_holder(
+    privilege: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SA: assigns a single CM as the holder of a privilege (or
+    unassigns by passing `cm_user_id: null`). Atomically demotes
+    any other CM who currently holds the privilege.
+    Batch U (2026-05-18) — supports the SA Portal owner dropdowns.
+    """
+    valid = {p.value for p in CMPrivilege}
+    if privilege not in valid:
+        raise HTTPException(status_code=422, detail=f"Unknown privilege: {privilege}")
+    priv = CMPrivilege(privilege)
+
+    cm_user_id = data.get("cm_user_id")
+    # Demote any current holder.
+    await db.execute(
+        delete(CMPrivilegeModel).where(CMPrivilegeModel.privilege == priv)
+    )
+
+    if cm_user_id is not None:
+        # Confirm target is a Neytiri portal user (404s if not).
+        await _get_neytiri_user(db, cm_user_id)
+        db.add(CMPrivilegeModel(cm_user_id=cm_user_id, privilege=priv))
+
+    await db.commit()
+    return {"privilege": privilege, "cm_user_id": cm_user_id}
 
 
 @router.put("/admin/users/{user_id}/password-override")
