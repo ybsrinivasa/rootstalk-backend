@@ -175,6 +175,24 @@ async def enable_crop_health(
     current_user: User = Depends(get_current_user),
 ):
     await _assert_sa_or_privileged_cm(db, current_user, "CROP_HEALTH_CROPS")
+    # 2026-05-18 — refuse free-text IDs. The CM was typing names
+    # like "Tomato" / "tomato" into the page's old text box; they
+    # got accepted and showed up as bogus disabled rows. Reject
+    # anything that isn't a real Cosh crop ID.
+    from app.services.cosh_crop_view import is_crop_in_cosh
+    if not await is_crop_in_cosh(db, crop_cosh_id):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "unknown_cosh_crop",
+                "message": (
+                    f"'{crop_cosh_id}' is not a Cosh crop. Pick a crop "
+                    f"from the Cosh crops list — that's the source of "
+                    f"truth for what crops exist."
+                ),
+                "crop_cosh_id": crop_cosh_id,
+            },
+        )
     result = await db.execute(
         select(CropHealthCrop).where(CropHealthCrop.crop_cosh_id == crop_cosh_id)
     )
