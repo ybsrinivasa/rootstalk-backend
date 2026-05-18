@@ -169,13 +169,15 @@ class PackageLocation(Base):
 
 
 class PackageAuthor(Base):
+    """Author credits on a Package (CCA). Batch D+E (2026-05-18)
+    dropped per-row `designation` + `professional_profile` — those
+    fields now live on `User` and are joined in at read time so the
+    same SE always shows the same bio across every package."""
     __tablename__ = "package_authors"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     package_id: Mapped[str] = mapped_column(String(36), ForeignKey("packages.id"), nullable=False)
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
-    designation: Mapped[str] = mapped_column(String(255), nullable=True)
-    professional_profile: Mapped[str] = mapped_column(Text, nullable=True)
     display_order: Mapped[int] = mapped_column(Integer, default=0)
 
     package: Mapped["Package"] = relationship("Package", back_populates="authors")

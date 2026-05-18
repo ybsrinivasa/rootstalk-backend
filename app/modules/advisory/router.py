@@ -1166,8 +1166,12 @@ async def list_package_authors(
     return [
         PackageAuthorOut(
             id=pa.id, user_id=pa.user_id, user_name=u.name,
-            designation=pa.designation,
-            professional_profile=pa.professional_profile,
+            # Batch D+E (2026-05-18): designation + professional_profile
+            # are now per-User (set in User Management). Joined in at
+            # read time so the farmer PWA gets one consistent bio per
+            # author regardless of which package surfaced them.
+            designation=u.designation,
+            professional_profile=u.professional_profile,
             display_order=pa.display_order,
         )
         for pa, u in rows
@@ -1238,8 +1242,6 @@ async def set_package_authors(
         db.add(PackageAuthor(
             package_id=package_id,
             user_id=a.user_id,
-            designation=a.designation,
-            professional_profile=a.professional_profile,
             display_order=a.display_order,
         ))
     await db.commit()
@@ -5742,8 +5744,6 @@ async def _deep_copy_package_metadata(
     )).scalars().all():
         db.add(PackageAuthor(
             package_id=dst_id, user_id=a.user_id,
-            designation=a.designation,
-            professional_profile=a.professional_profile,
             display_order=a.display_order,
         ))
     for pv in (await db.execute(

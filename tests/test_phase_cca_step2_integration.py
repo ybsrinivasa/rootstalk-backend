@@ -943,7 +943,11 @@ async def test_consistency_inactive_sibling_does_not_block(db):
 
 # ── Batch 2B: package authors management ─────────────────────────────────────
 
-async def _make_subject_expert(db, *, client, name="SE One") -> UserModel:
+async def _make_subject_expert(
+    db, *, client, name="SE One",
+    designation: str | None = None,
+    professional_profile: str | None = None,
+) -> UserModel:
     """Create a User + an ACTIVE SUBJECT_EXPERT ClientUser row for
     the given client. Returns the User.
 
@@ -952,8 +956,16 @@ async def _make_subject_expert(db, *, client, name="SE One") -> UserModel:
     that exercise cross-tenant isolation (e.g.
     `test_set_authors_422_when_user_is_se_of_different_client`)
     rely on this SE being bound to ONLY the requested client.
+
+    `designation` + `professional_profile` may be set here (Batch D,
+    2026-05-18) — they live on User and the Authors panel joins
+    them in at read time.
     """
     se = await make_user(db, name=name, skip_auto_link=True)
+    if designation is not None:
+        se.designation = designation
+    if professional_profile is not None:
+        se.professional_profile = professional_profile
     await make_client_user(
         db, user=se, client=client, role=ClientUserRole.SUBJECT_EXPERT,
     )
@@ -970,15 +982,19 @@ async def test_set_authors_with_two_active_ses(db):
     user = await make_user(db, name="CA")
     await _seed_paddy_on_belt(db, client, user)
     pkg = await _create_test_package(db, client=client, user=user)
-    se1 = await _make_subject_expert(db, client=client, name="Dr A")
-    se2 = await _make_subject_expert(db, client=client, name="Dr B")
+    se1 = await _make_subject_expert(
+        db, client=client, name="Dr A", designation="Lead",
+    )
+    se2 = await _make_subject_expert(
+        db, client=client, name="Dr B", designation="Reviewer",
+    )
     await db.commit()
 
     out = await set_package_authors(
         client_id=client.id, package_id=pkg.id,
         authors=[
-            PackageAuthorIn(user_id=se1.id, designation="Lead", display_order=0),
-            PackageAuthorIn(user_id=se2.id, designation="Reviewer", display_order=1),
+            PackageAuthorIn(user_id=se1.id, display_order=0),
+            PackageAuthorIn(user_id=se2.id, display_order=1),
         ],
         db=db, current_user=user,
     )
@@ -989,6 +1005,7 @@ async def test_set_authors_with_two_active_ses(db):
     )
     assert [a.user_id for a in listed] == [se1.id, se2.id]
     assert [a.user_name for a in listed] == ["Dr A", "Dr B"]
+    # Batch D+E (2026-05-18): designation joined from User.designation.
     assert [a.designation for a in listed] == ["Lead", "Reviewer"]
 
 
@@ -1161,8 +1178,8 @@ async def test_set_authors_422_when_duplicate_user_ids(db):
         await set_package_authors(
             client_id=client.id, package_id=pkg.id,
             authors=[
-                PackageAuthorIn(user_id=se.id, designation="A"),
-                PackageAuthorIn(user_id=se.id, designation="B"),
+                PackageAuthorIn(user_id=se.id),
+                PackageAuthorIn(user_id=se.id),
             ],
             db=db, current_user=user,
         )

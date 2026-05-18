@@ -191,15 +191,39 @@ class PortalUserCreate(BaseModel):
     name: Optional[str] = None
     role: ClientUserRole
     password: str
+    # Author bio (Batch D, 2026-05-18). Persists to User.designation /
+    # User.professional_profile. The PWA renders these next to the
+    # author's name on advisory practice cards. Both optional at
+    # create time; the CA can fill them in later via the update
+    # endpoint.
+    designation: Optional[str] = None
+    professional_profile: Optional[str] = None
+
+
+class PortalUserUpdate(BaseModel):
+    """PATCH-style update for portal user details (CA-managed).
+
+    Only name + designation + professional_profile are editable here.
+    Role changes go through a separate flow (CA-exclusivity gate).
+    Status changes use the existing /status endpoint.
+    """
+    name: Optional[str] = None
+    designation: Optional[str] = None
+    professional_profile: Optional[str] = None
 
 
 class PortalUserOut(BaseModel):
     id: str
-    email: str
+    # User.email is nullable in the model (some test fixtures and
+    # phone-only users have None). Optional here so the response
+    # serialiser doesn't 500 on those rows.
+    email: Optional[str] = None
     name: Optional[str] = None
     role: str
     status: str
     created_at: datetime
+    designation: Optional[str] = None
+    professional_profile: Optional[str] = None
 
     class Config:
         from_attributes = True

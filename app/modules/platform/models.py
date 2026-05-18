@@ -46,6 +46,13 @@ class User(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=True)
     password_hash: Mapped[str] = mapped_column(Text, nullable=True)
     photo_url: Mapped[str] = mapped_column(Text, nullable=True)
+    # Author bio (Batch D, 2026-05-18). Captured at User-Management
+    # time for Subject Experts; surfaced on the farmer PWA alongside
+    # the author's name on advisory practice cards. Was previously
+    # per-PackageAuthor; moved here because the same SE on multiple
+    # packages always has the same designation + profile.
+    designation: Mapped[str] = mapped_column(String(255), nullable=True)
+    professional_profile: Mapped[str] = mapped_column(Text, nullable=True)
     language_code: Mapped[str] = mapped_column(String(10), default="en")
     gps_lat: Mapped[Decimal] = mapped_column(DECIMAL(10, 7), nullable=True)
     gps_lng: Mapped[Decimal] = mapped_column(DECIMAL(10, 7), nullable=True)

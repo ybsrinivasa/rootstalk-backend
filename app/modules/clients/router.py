@@ -17,7 +17,7 @@ from app.modules.clients.schemas import (
     ClientInitiate, ClientCASubmit, ClientReject, ClientEdit,
     ClientStatusUpdate, ClientOut, OnboardingLinkOut, CMAssignment, CMPrivilegeGrant,
     LocationCreate, LocationOut, CropCreate, CropOut, ClientBrandingOut,
-    PortalUserCreate, PortalUserOut,
+    PortalUserCreate, PortalUserOut, PortalUserUpdate,
 )
 from app.modules.clients.service import (
     generate_token, send_onboarding_email, send_ca_credentials_email,
@@ -996,6 +996,8 @@ async def list_portal_users(
             role=cu.role.value,
             status=cu.status.value,
             created_at=cu.created_at,
+            designation=user.designation,
+            professional_profile=user.professional_profile,
         ))
     return out
 
@@ -1037,12 +1039,23 @@ async def add_portal_user(
 
     if existing_user:
         user = existing_user
+        # Batch D (2026-05-18) — when the CA fills in designation /
+        # professional_profile while assigning a new role to a user
+        # who already exists, save them. Skip values that are None
+        # (CA might be re-using an existing SE who already has a bio
+        # — don't blow it away with empty fields).
+        if request.designation is not None:
+            user.designation = request.designation
+        if request.professional_profile is not None:
+            user.professional_profile = request.professional_profile
     else:
         user = User(
             email=request.email,
             name=request.name,
             password_hash=hash_password(request.password),
             language_code="en",
+            designation=request.designation,
+            professional_profile=request.professional_profile,
         )
         db.add(user)
         await db.flush()
@@ -1126,6 +1139,64 @@ async def add_portal_user(
         role=cu.role.value,
         status=cu.status.value,
         created_at=cu.created_at,
+        designation=user.designation,
+        professional_profile=user.professional_profile,
+    )
+
+
+@router.put("/client/{client_id}/users/{user_id}")
+async def update_portal_user(
+    client_id: str,
+    user_id: str,
+    request: PortalUserUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CA-side edit of a portal user's name / designation /
+    professional_profile (Batch D, 2026-05-18).
+
+    Gated to ClientUsers of this client — caller must be a CA (or
+    any ClientUser; this endpoint is benign, but the cross-client
+    guard in get_current_user is the architectural protection).
+
+    Returns the updated user with role pulled from the FIRST
+    ClientUser row found for the target (any one will do — the
+    user's tenant binding is what matters for display)."""
+    target = (await db.execute(
+        select(User).where(User.id == user_id)
+    )).scalar_one_or_none()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    # Ensure target is a member of this client (defence-in-depth).
+    membership = (await db.execute(
+        select(ClientUser).where(
+            ClientUser.client_id == client_id,
+            ClientUser.user_id == user_id,
+            ClientUser.status == StatusEnum.ACTIVE,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if not membership:
+        raise HTTPException(
+            status_code=404,
+            detail="User is not an active member of this client",
+        )
+    if request.name is not None:
+        target.name = request.name
+    if request.designation is not None:
+        target.designation = request.designation
+    if request.professional_profile is not None:
+        target.professional_profile = request.professional_profile
+    await db.commit()
+    await db.refresh(target)
+    return PortalUserOut(
+        id=target.id,
+        email=target.email,
+        name=target.name,
+        role=membership.role.value,
+        status=membership.status.value,
+        created_at=membership.created_at,
+        designation=target.designation,
+        professional_profile=target.professional_profile,
     )
 
 

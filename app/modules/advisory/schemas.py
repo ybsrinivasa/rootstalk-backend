@@ -39,19 +39,27 @@ class PackageAuthorIn(BaseModel):
     """Input row for PUT /packages/{id}/authors — one per Subject
     Expert credited on the Package. `user_id` must reference an
     ACTIVE ClientUser of the same client with role SUBJECT_EXPERT
-    (validated server-side; spec §4.1)."""
+    (validated server-side; spec §4.1).
+
+    Batch D+E (2026-05-18): designation + professional_profile
+    moved to the User row (managed via Users page). Per-package
+    overrides removed."""
     user_id: str
-    designation: Optional[str] = None
-    professional_profile: Optional[str] = None
     display_order: int = 0
 
 
 class PackageAuthorOut(BaseModel):
+    """Read shape for the Authors panel + farmer PWA.
+
+    Batch D+E (2026-05-18): designation + professional_profile are
+    JOINED from User.designation / User.professional_profile, not
+    stored per-row. Same SE → same bio on every package they author.
+    """
     id: str
     user_id: str
-    user_name: Optional[str] = None  # joined from User.name for portal rendering
-    designation: Optional[str] = None
-    professional_profile: Optional[str] = None
+    user_name: Optional[str] = None  # joined from User.name
+    designation: Optional[str] = None  # joined from User.designation
+    professional_profile: Optional[str] = None  # joined from User.professional_profile
     display_order: int
 
     class Config:
