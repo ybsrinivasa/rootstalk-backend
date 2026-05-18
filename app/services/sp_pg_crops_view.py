@@ -150,3 +150,24 @@ async def list_sps_for_pg_crop(
         db, core_type=COSH_BIOLOGICAL_NAMES_CORE, cosh_ids=sp_ids,
     )
     return _name_items(sp_ids, names)
+
+
+async def list_sps_for_crop(
+    db: AsyncSession, *, crop_cosh_id: str,
+) -> list[dict]:
+    """All Specific Problems applicable to a crop, across every PG.
+
+    Used by the CA-SP authoring page (SE picks the crop, sees every
+    SP that could be authored against it). 2026-05-18 — replaces the
+    hardcoded `_SPECIFIC_PROBLEMS_V1` stopgap with the real
+    Cosh-sourced list.
+    """
+    rows = [
+        r for r in await _walk_active_rows(db)
+        if _endpoint_at_position(r, SPPC_POS_CROP) == crop_cosh_id
+    ]
+    sp_ids = _collect_at_position(rows, SPPC_POS_SP)
+    names = await _resolve_core_names(
+        db, core_type=COSH_BIOLOGICAL_NAMES_CORE, cosh_ids=sp_ids,
+    )
+    return _name_items(sp_ids, names)

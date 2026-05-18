@@ -120,20 +120,59 @@ _sel(CropHealthCrop).where(CropHealthCrop.crop_cosh_id == "crop:onion")
 
 # ── specific-problems ──────────────────────────────────────────────────────
 
+async def _seed_sp_pg_crops_tomato(db):
+    """Seed the minimum Cosh data for two SPs on a Tomato crop:
+    biological_names Core entries + an sp_pg_crops Connect row each.
+    Returns the crop_cosh_id used in the seed."""
+    from app.modules.sync.models import CoshConnectRow
+    from app.services.cosh_constants import (
+        COSH_BIOLOGICAL_NAMES_CORE, COSH_PROBLEM_GROUPS_CORE,
+        COSH_SP_PG_CROPS_CONNECT, SPPC_POS_CROP, SPPC_POS_PG, SPPC_POS_SP,
+    )
+    crop_id = "biological_name:solanum_lycopersicum"
+    pg_id = "problem_group:fungal_diseases"
+    sps = [
+        ("biological_name:phytophthora_infestans", "Late Blight"),
+        ("biological_name:helicoverpa_armigera",   "Fruit Borer"),
+    ]
+    db.add(CoshCoreItem(
+        cosh_id=crop_id, core_type=COSH_BIOLOGICAL_NAMES_CORE,
+        status="active", translations={"en": "Tomato"},
+    ))
+    db.add(CoshCoreItem(
+        cosh_id=pg_id, core_type=COSH_PROBLEM_GROUPS_CORE,
+        status="active", translations={"en": "Fungal Diseases"},
+    ))
+    for sp_id, en in sps:
+        db.add(CoshCoreItem(
+            cosh_id=sp_id, core_type=COSH_BIOLOGICAL_NAMES_CORE,
+            status="active", translations={"en": en},
+        ))
+        db.add(CoshConnectRow(
+            connect_id=f"sp_pg_crops:{sp_id}",
+            connect_type=COSH_SP_PG_CROPS_CONNECT, status="active",
+            endpoints=[
+                {"role": COSH_BIOLOGICAL_NAMES_CORE, "cosh_id": sp_id,   "position": SPPC_POS_SP},
+                {"role": COSH_PROBLEM_GROUPS_CORE,   "cosh_id": pg_id,   "position": SPPC_POS_PG},
+                {"role": COSH_BIOLOGICAL_NAMES_CORE, "cosh_id": crop_id, "position": SPPC_POS_CROP},
+            ],
+        ))
+    return crop_id, [s[0] for s in sps]
+
+
 @requires_docker
 @pytest.mark.asyncio
-async def test_specific_problems_returns_v1_list_for_known_crop(db):
+async def test_specific_problems_returns_cosh_list_for_crop(db):
     client = await make_client(db)
     user = await make_user(db, name="SE")
+    crop_id, sp_ids = await _seed_sp_pg_crops_tomato(db)
     await db.commit()
     out = await cha_sp_specific_problems(
-client_id=client.id,crop_cosh_id="crop:tomato",
-db=db,current_user=user,
-)
+        client_id=client.id, crop_cosh_id=crop_id,
+        db=db, current_user=user,
+    )
     cosh_ids = {p["cosh_id"] for p in out}
-    assert "sp:tomato_late_blight" in cosh_ids
-    assert "sp:tomato_fruit_borer" in cosh_ids
-    # Existing field is None on a fresh client (no SP rows yet).
+    assert set(sp_ids) <= cosh_ids
     assert all(p["existing"] is None for p in out)
 
 
@@ -145,22 +184,24 @@ async def test_specific_problems_flags_existing_recommendation(db):
     straight into the existing bundle."""
     client = await make_client(db)
     user = await make_user(db, name="SE")
+    crop_id, sp_ids = await _seed_sp_pg_crops_tomato(db)
+    target_sp = sp_ids[0]
+    other_sp = sp_ids[1]
     sp = SPRecommendation(
-specific_problem_cosh_id="sp:tomato_late_blight",
-client_id=client.id,crop_cosh_id="crop:tomato",
-status="DRAFT",
-)
+        specific_problem_cosh_id=target_sp,
+        client_id=client.id, crop_cosh_id=crop_id,
+        status="DRAFT",
+    )
     db.add(sp); await db.commit()
 
     out = await cha_sp_specific_problems(
-client_id=client.id,crop_cosh_id="crop:tomato",
-db=db,current_user=user,
-)
+        client_id=client.id, crop_cosh_id=crop_id,
+        db=db, current_user=user,
+    )
     by_id = {p["cosh_id"]: p for p in out}
-    assert by_id["sp:tomato_late_blight"]["existing"]["id"] == sp.id
-    assert by_id["sp:tomato_late_blight"]["existing"]["status"] == "DRAFT"
-    # Other problems unflagged.
-    assert by_id["sp:tomato_fusarium_wilt"]["existing"] is None
+    assert by_id[target_sp]["existing"]["id"] == sp.id
+    assert by_id[target_sp]["existing"]["status"] == "DRAFT"
+    assert by_id[other_sp]["existing"] is None
 
 
 @requires_docker

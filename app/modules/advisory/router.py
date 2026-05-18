@@ -9701,19 +9701,23 @@ async def cha_sp_specific_problems(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """V1 stopgap — list of specific problems for the given crop,
-    drawn from `cha_specific_problems._SPECIFIC_PROBLEMS_V1`. When
-    Cosh ships the `specific_problem` Connect, swap the source in
-    `list_specific_problems_for_crop()`; this endpoint stays.
+    """SE picks a crop; this returns every Specific Problem Cosh has
+    associated with that crop via the `sp_pg_crops` Connect (any PG).
 
-    Each row carries a `taken_by_recommendation_id` when an SP
-    bundle for (this client, crop, SP) already exists, so the SE
-    sees at a glance which problems have been authored against and
-    can navigate straight into the existing bundle."""
+    2026-05-18 — switched from the hardcoded V1 stopgap to the live
+    Cosh data via `list_sps_for_crop`. The V1 stopgap was keyed on
+    "crop:tomato" / "crop:paddy" etc.; real Cosh crop IDs look like
+    `biological_name:solanum_lycopersicum`, so the stopgap returned
+    an empty list for every real crop and the SE saw nothing.
+
+    Each row carries an `existing` field when an SP bundle for
+    (this client, crop, SP) already exists, so the SE sees at a
+    glance which problems are already authored and can navigate
+    straight into the existing bundle."""
     await _assert_can_view_client_advisory(db, current_user.id, client_id)
-    from app.services.cha_specific_problems import list_specific_problems_for_crop
+    from app.services.sp_pg_crops_view import list_sps_for_crop
 
-    problems = list_specific_problems_for_crop(crop_cosh_id)
+    problems = await list_sps_for_crop(db, crop_cosh_id=crop_cosh_id)
     if not problems:
         return []
 
@@ -9732,7 +9736,7 @@ async def cha_sp_specific_problems(
     }
 
     return [
-        {**p, "existing": taken.get(p["cosh_id"])}
+        {**p, "status": "active", "existing": taken.get(p["cosh_id"])}
         for p in problems
     ]
 
@@ -9769,14 +9773,21 @@ async def cha_sp_list_recommendations(
     crop_ids = {s.crop_cosh_id for s in sps if s.crop_cosh_id}
     crop_names = await _crop_names_by_cosh_id(db, crop_ids)
 
-    # SP friendly names from the V1 hardcoded list — for any
-    # `specific_problem_cosh_id` we don't recognise, fall back to the
-    # raw cosh_id.
-    from app.services.cha_specific_problems import _SPECIFIC_PROBLEMS_V1
-    sp_names: dict[str, str] = {}
-    for crop_id, items in _SPECIFIC_PROBLEMS_V1.items():
-        for it in items:
-            sp_names[it["cosh_id"]] = it["name_en"]
+    # SP friendly names — resolve from Cosh's biological_names Core
+    # (the source the `sp_pg_crops` Connect points into). Legacy rows
+    # authored against the old V1 stopgap (sp:tomato_late_blight etc.)
+    # fall back to the V1 dict, then to the raw cosh_id. 2026-05-18.
+    sp_ids = {s.specific_problem_cosh_id for s in sps if s.specific_problem_cosh_id}
+    from app.services.sp_pg_crops_view import _resolve_core_names
+    from app.services.cosh_constants import COSH_BIOLOGICAL_NAMES_CORE
+    sp_names = await _resolve_core_names(
+        db, core_type=COSH_BIOLOGICAL_NAMES_CORE, cosh_ids=sp_ids,
+    )
+    if any(sp_id not in sp_names for sp_id in sp_ids):
+        from app.services.cha_specific_problems import _SPECIFIC_PROBLEMS_V1
+        for _crop_id, items in _SPECIFIC_PROBLEMS_V1.items():
+            for it in items:
+                sp_names.setdefault(it["cosh_id"], it["name_en"])
 
     return [
         {
