@@ -42,6 +42,35 @@ def _require_sa(current_user: User):
         raise HTTPException(status_code=403, detail="Super Admin access required")
 
 
+async def _require_sa_or_cm_assigned(
+    db: AsyncSession, current_user: User, client_id: str,
+) -> None:
+    """Read-only access widening: lets a Content Manager who has an
+    ACTIVE CMClientAssignment for `client_id` reach SA-side detail
+    endpoints (GET client, GET cm-assignment). Per user 2026-05-18:
+    the My Clients flow on SA Portal navigates a CM to /clients/{cid}
+    and that page must work for the CM, not just the SA.
+
+    PUT / DELETE on these resources still require SA — CMs can't
+    reassign themselves or edit client metadata. Add the same gate
+    to other read endpoints as the My Clients UI grows.
+    """
+    if current_user.email == settings.sa_email:
+        return
+    assignment = (await db.execute(
+        select(CMClientAssignment).where(
+            CMClientAssignment.cm_user_id == current_user.id,
+            CMClientAssignment.client_id == client_id,
+            CMClientAssignment.status == StatusEnum.ACTIVE,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if assignment is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Super Admin access or active CM assignment required for this client",
+        )
+
+
 async def _assert_unique_legal_ids(
     db: AsyncSession,
     *,
@@ -217,7 +246,7 @@ async def get_client(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _require_sa(current_user)
+    await _require_sa_or_cm_assigned(db, current_user, client_id)
     result = await db.execute(select(Client).where(Client.id == client_id))
     client = result.scalar_one_or_none()
     if not client:
@@ -1809,8 +1838,10 @@ async def get_cm_assignment(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Get the current CM assignment for a client."""
-    _require_sa(current_user)
+    """Get the current CM assignment for a client. Visible to the SA
+    and to the CM who is currently assigned (so they can see their
+    own role + rights on the client detail page)."""
+    await _require_sa_or_cm_assigned(db, current_user, client_id)
     assignment = (await db.execute(
         select(CMClientAssignment).where(
             CMClientAssignment.client_id == client_id,
