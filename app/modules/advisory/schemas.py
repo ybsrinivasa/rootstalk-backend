@@ -505,6 +505,11 @@ class SPRecommendationOut(BaseModel):
     specific_problem_cosh_id: str
     client_id: str
     crop_cosh_id: Optional[str] = None
+    # Resolved on read from Cosh's `crop_area_plant_wise` Connect via
+    # app.services.crop_measure.get_measure(). None when Cosh hasn't
+    # classified the crop yet. The CA-SP Import-from-PG flow filters
+    # the picker to CA-PGs whose area_or_plant matches this value.
+    crop_measure: Optional[str] = None
     status: str
     version: int
     created_at: datetime

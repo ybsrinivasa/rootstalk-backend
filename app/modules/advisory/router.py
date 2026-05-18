@@ -7213,11 +7213,31 @@ async def list_client_sp(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    from app.services.crop_measure import get_measure
     result = await db.execute(
         select(SPRecommendation).where(SPRecommendation.client_id == client_id)
         .order_by(SPRecommendation.created_at.desc())
     )
-    return result.scalars().all()
+    sps = result.scalars().all()
+    measure_by_crop: dict[str, str | None] = {}
+    out: list[SPRecommendationOut] = []
+    for sp in sps:
+        measure: str | None = None
+        if sp.crop_cosh_id:
+            if sp.crop_cosh_id not in measure_by_crop:
+                measure_by_crop[sp.crop_cosh_id] = await get_measure(db, sp.crop_cosh_id)
+            measure = measure_by_crop[sp.crop_cosh_id]
+        out.append(SPRecommendationOut(
+            id=sp.id,
+            specific_problem_cosh_id=sp.specific_problem_cosh_id,
+            client_id=sp.client_id,
+            crop_cosh_id=sp.crop_cosh_id,
+            crop_measure=measure,
+            status=sp.status,
+            version=sp.version,
+            created_at=sp.created_at,
+        ))
+    return out
 
 
 @router.post("/client/{client_id}/sp-recommendations", response_model=SPRecommendationOut, status_code=201)
@@ -8232,6 +8252,7 @@ async def get_client_sp(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    from app.services.crop_measure import get_measure
     sp = (await db.execute(
         select(SPRecommendation).where(
             SPRecommendation.id == sp_id, SPRecommendation.client_id == client_id,
@@ -8239,7 +8260,17 @@ async def get_client_sp(
     )).scalar_one_or_none()
     if not sp:
         raise HTTPException(status_code=404, detail="SP recommendation not found")
-    return sp
+    measure = await get_measure(db, sp.crop_cosh_id) if sp.crop_cosh_id else None
+    return SPRecommendationOut(
+        id=sp.id,
+        specific_problem_cosh_id=sp.specific_problem_cosh_id,
+        client_id=sp.client_id,
+        crop_cosh_id=sp.crop_cosh_id,
+        crop_measure=measure,
+        status=sp.status,
+        version=sp.version,
+        created_at=sp.created_at,
+    )
 
 
 @router.delete(
