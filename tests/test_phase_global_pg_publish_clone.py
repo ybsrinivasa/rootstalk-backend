@@ -241,7 +241,11 @@ async def test_clone_pg_carries_relation_and_cq_with_bindings(db):
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_clone_pg_flips_existing_draft_to_inactive(db):
+async def test_clone_pg_reuses_existing_draft(db):
+    """Batch V (2026-05-18): clone-to-draft is find-or-create. A
+    second clone while a DRAFT already exists in the lineage returns
+    the existing DRAFT unchanged — no new row, no demotion. Only
+    Publish creates new rows now."""
     user = await make_user(db, name="CM")
     pg = await _seed_pg(db)
     tl = await _add_timeline(db, pg)
@@ -254,11 +258,12 @@ async def test_clone_pg_flips_existing_draft_to_inactive(db):
     draft2 = await clone_global_pg_to_draft(
         pg_id=pg.id, db=db, current_user=user,
     )
+    # Same row returned both times. draft1 is still DRAFT.
+    assert draft2.id == draft1.id
     refreshed = (await db.execute(
         select(PGRecommendation).where(PGRecommendation.id == draft1.id)
     )).scalar_one()
-    assert refreshed.status == "INACTIVE"
-    assert draft2.status == "DRAFT"
+    assert refreshed.status == "DRAFT"
 
 
 @requires_docker

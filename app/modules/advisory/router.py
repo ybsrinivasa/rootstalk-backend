@@ -6773,14 +6773,15 @@ async def publish_global_pg(
             },
         )
 
-    # Deactivate previous active version for same problem_group +
-    # area_or_plant + client lineage (lineage-aware after Batch 39P-d).
+    # Deactivate previous ACTIVE + any sibling DRAFT in the same
+    # lineage (Batch V mirror of Batch T 2026-05-18 — only Publish
+    # creates new rows; nothing stale lurks after publish).
     prev = (await db.execute(
         select(PGRecommendation).where(
             PGRecommendation.problem_group_cosh_id == pg.problem_group_cosh_id,
             PGRecommendation.area_or_plant == pg.area_or_plant,
             PGRecommendation.client_id == pg.client_id,
-            PGRecommendation.status == "ACTIVE",
+            PGRecommendation.status.in_(("ACTIVE", "DRAFT")),
             PGRecommendation.id != pg.id,
         )
     )).scalars().all()
@@ -6808,14 +6809,17 @@ async def clone_global_pg_to_draft(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """CM clones an ACTIVE or INACTIVE Global PG Recommendation into
-    a new DRAFT. Same model as Global Package clone (Batch 39L-b):
+    """CM picks an ACTIVE or INACTIVE Global PG Recommendation to start
+    editing.
 
-      • DRAFT sources rejected with `clone_source_is_draft`.
-      • Single-DRAFT invariant — any other DRAFT in the same lineage
-        flips to INACTIVE.
-      • Content deep-copied via `_deep_copy_advisory_content` so
-        Brand Lock / Relations / CQs / bindings all carry across.
+    Batch V (2026-05-18) — DRAFT is a single reusable slot per lineage,
+    mirroring CA-PG Batch T:
+      • A DRAFT already exists in the lineage → return it. No new
+        row, no demotion.
+      • No DRAFT exists → deep-copy this row's content into a new
+        DRAFT row.
+
+    Refuses if the source is itself a DRAFT (`clone_source_is_draft`).
     """
     await _assert_sa_or_cm(db, current_user)
     src = (await db.execute(
@@ -6838,8 +6842,9 @@ async def clone_global_pg_to_draft(
             },
         )
 
-    # Single-DRAFT invariant: flip any existing DRAFT in this lineage
-    # (same problem_group + area_or_plant, client_id NULL) to INACTIVE.
+    # Find-or-create. If a DRAFT exists in the lineage, return it
+    # unchanged — the CM was probably mid-edit and the existing DRAFT
+    # IS their edit-in-progress. Only Publish creates new rows.
     existing_draft = (await db.execute(
         select(PGRecommendation).where(
             PGRecommendation.client_id == None,  # noqa: E711
@@ -6849,8 +6854,7 @@ async def clone_global_pg_to_draft(
         )
     )).scalar_one_or_none()
     if existing_draft is not None:
-        existing_draft.status = "INACTIVE"
-        await db.flush()
+        return existing_draft
 
     new_draft = PGRecommendation(
         problem_group_cosh_id=src.problem_group_cosh_id,
