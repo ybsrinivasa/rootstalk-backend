@@ -128,41 +128,59 @@ async def _assert_can_edit_client_advisory(
     db: AsyncSession, user_id: str, client_id: str,
 ) -> None:
     """Authorisation gate for CA-side advisory writes — covers all
-    four pipes: CCA (Batch 39S), CHA-PG (39T), CHA-SP (39U), QA
-    (39V).
+    four pipes: CCA, CHA-PG, CHA-SP, QA.
 
-    V1 (Batch 39S, 2026-05-17) accepts two paths:
-      1. ANY ACTIVE ClientUser of this client (regardless of role).
+    Batch J (2026-05-18) tightens from "any ACTIVE ClientUser" to
+    "ACTIVE SUBJECT_EXPERT only". Per user 2026-05-17: "Only the
+    Subject Experts have the right to manage CCA, PG, SP, and QA.
+    No other role can do this, not even the CA."
+
+    Accepts:
+      1. ACTIVE ClientUser of this client with role SUBJECT_EXPERT.
       2. ACTIVE CMClientAssignment with EDIT rights — per the
-         documented Ram-direct-edit pattern (`pull_global_package`
-         docstring) the CM may edit a client's Local advisory
-         content directly without going through pull.
+         documented Ram-direct-edit pattern the CM may edit a
+         client's Local advisory content directly without going
+         through pull.
 
-    Why the V1 boundary is "any ClientUser of THIS client" rather
-    than the stricter "SUBJECT_EXPERT-only": the immediate goal is
-    closing the cross-company hole (any authenticated user could
-    previously write to ANY client's CCA endpoints because
-    `_require_client_role` was a no-op stub). Narrowing further to
-    SE-only is a follow-up; it requires several existing test
-    fixtures to be reshaped, which has wider blast radius than
-    this batch.
+    Refused (with distinct codes for clearer UX):
+      - Non-SE ClientUser (CA / FIELD_MANAGER / REPORT_USER) →
+        403 `subject_expert_only`. They retain View access via
+        unchanged GET endpoints.
+      - Not a member + not a CM-EDIT assignee → 403 `ca_edit_forbidden`.
 
-    Raises 403 with stable code `ca_edit_forbidden`.
+    Cross-tenant access is already refused at the request boundary
+    by `get_current_user` (cross_client_forbidden); this gate runs
+    after that and only sees same-client attempts.
     """
     from app.modules.clients.models import (
-        CMClientAssignment, CMRights, ClientUser,
+        CMClientAssignment, CMRights, ClientUser, ClientUserRole,
     )
     from app.modules.platform.models import StatusEnum
 
     cu = (await db.execute(
-        select(ClientUser.id).where(
+        select(ClientUser).where(
             ClientUser.user_id == user_id,
             ClientUser.client_id == client_id,
             ClientUser.status == StatusEnum.ACTIVE,
         ).limit(1)
     )).scalar_one_or_none()
     if cu is not None:
-        return
+        if cu.role == ClientUserRole.SUBJECT_EXPERT:
+            return
+        # Member but wrong role — surface a specific error so the UI
+        # can render a helpful "ask your Subject Expert to do this"
+        # message instead of a generic 403.
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "subject_expert_only",
+                "message": (
+                    "Only Subject Experts can edit advisory content. "
+                    "Your role can view but not modify CCA / PG / SP / QA."
+                ),
+                "your_role": cu.role.value,
+            },
+        )
 
     cm = (await db.execute(
         select(CMClientAssignment.id).where(
@@ -181,7 +199,7 @@ async def _assert_can_edit_client_advisory(
             "code": "ca_edit_forbidden",
             "message": (
                 "Editing advisory content requires either an active "
-                "staff role on this client, or an active Content "
+                "Subject Expert role on this client, or an active Content "
                 "Manager assignment with EDIT rights."
             ),
         },

@@ -29,7 +29,7 @@ from app.modules.subscriptions.models import (
 )
 from app.modules.sync.models import CoshCoreItem, CropMeasure
 from tests.conftest import requires_docker
-from tests.factories import make_client, make_crop_reference, make_user
+from tests.factories import make_client, make_client_user, make_crop_reference, make_user
 
 
 async def _seed_paddy(db):
@@ -660,11 +660,9 @@ async def test_publish_package_succeeds_after_re_add(db):
         package_id=pkg.id, state_cosh_id="S1", district_cosh_id="D-revive",
     ))
     se = await make_user(db, name="Reviving Author")
-    db.add(ClientUser(
-        client_id=client.id, user_id=se.id,
-        role=ClientUserRole.SUBJECT_EXPERT,
-        status=StatusEnum.ACTIVE,
-    ))
+    await make_client_user(
+        db, user=se, client=client, role=ClientUserRole.SUBJECT_EXPERT,
+    )
     db.add(PackageAuthor(package_id=pkg.id, user_id=se.id))
     await db.commit()
     await remove_crop(client_id=client.id, crop_id=crop.id, db=db, current_user=user)

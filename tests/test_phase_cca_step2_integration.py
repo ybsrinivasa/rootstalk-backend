@@ -33,7 +33,7 @@ from app.modules.clients.router import add_crop
 from app.modules.clients.schemas import CropCreate
 from app.modules.platform.models import StatusEnum, User as UserModel
 from tests.conftest import requires_docker
-from tests.factories import make_client, make_crop_reference, make_user
+from tests.factories import make_client, make_client_user, make_crop_reference, make_user
 
 
 async def _seed_paddy_on_belt(db, client, user) -> None:
@@ -945,14 +945,18 @@ async def test_consistency_inactive_sibling_does_not_block(db):
 
 async def _make_subject_expert(db, *, client, name="SE One") -> UserModel:
     """Create a User + an ACTIVE SUBJECT_EXPERT ClientUser row for
-    the given client. Returns the User."""
-    se = await make_user(db, name=name)
-    db.add(ClientUser(
-        client_id=client.id, user_id=se.id,
-        role=ClientUserRole.SUBJECT_EXPERT,
-        status=StatusEnum.ACTIVE,
-    ))
-    await db.flush()
+    the given client. Returns the User.
+
+    Passes `skip_auto_link=True` to make_user so the auto-link
+    helper doesn't spread this SE across every test client — tests
+    that exercise cross-tenant isolation (e.g.
+    `test_set_authors_422_when_user_is_se_of_different_client`)
+    rely on this SE being bound to ONLY the requested client.
+    """
+    se = await make_user(db, name=name, skip_auto_link=True)
+    await make_client_user(
+        db, user=se, client=client, role=ClientUserRole.SUBJECT_EXPERT,
+    )
     return se
 
 
@@ -1069,11 +1073,9 @@ async def test_set_authors_422_when_user_is_wrong_role(db):
     await _seed_paddy_on_belt(db, client, user)
     pkg = await _create_test_package(db, client=client, user=user)
     other_ca = await make_user(db, name="Other CA")
-    db.add(ClientUser(
-        client_id=client.id, user_id=other_ca.id,
-        role=ClientUserRole.CA,
-        status=StatusEnum.ACTIVE,
-    ))
+    await make_client_user(
+        db, user=other_ca, client=client, role=ClientUserRole.CA,
+    )
     await db.commit()
 
     with pytest.raises(HTTPException) as ei:

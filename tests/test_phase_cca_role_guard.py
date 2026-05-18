@@ -56,26 +56,36 @@ async def test_se_clientuser_passes(db):
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_ca_clientuser_passes(db):
-    """V1 boundary: any role on this client passes. SE-only tightening
-    is a future refinement."""
+async def test_ca_clientuser_refused_subject_expert_only(db):
+    """Batch J (2026-05-18) tightening: CA role can no longer edit
+    advisory content. Refused with code `subject_expert_only` and
+    a `your_role` hint for the UI."""
     client = await make_client(db)
     user = await make_user(db, name="CA", skip_auto_link=True)
     await make_client_user(
         db, user=user, client=client, role=ClientUserRole.CA,
     )
-    await _assert_can_edit_client_advisory(db, user.id, client.id)
+    with pytest.raises(HTTPException) as exc:
+        await _assert_can_edit_client_advisory(db, user.id, client.id)
+    assert exc.value.status_code == 403
+    assert exc.value.detail["code"] == "subject_expert_only"
+    assert exc.value.detail["your_role"] == "CA"
 
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_field_manager_clientuser_passes(db):
+async def test_field_manager_clientuser_refused_subject_expert_only(db):
+    """Same as CA — FIELD_MANAGER lost edit rights in Batch J."""
     client = await make_client(db)
     user = await make_user(db, name="FM", skip_auto_link=True)
     await make_client_user(
         db, user=user, client=client, role=ClientUserRole.FIELD_MANAGER,
     )
-    await _assert_can_edit_client_advisory(db, user.id, client.id)
+    with pytest.raises(HTTPException) as exc:
+        await _assert_can_edit_client_advisory(db, user.id, client.id)
+    assert exc.value.status_code == 403
+    assert exc.value.detail["code"] == "subject_expert_only"
+    assert exc.value.detail["your_role"] == "FIELD_MANAGER"
 
 
 @requires_docker

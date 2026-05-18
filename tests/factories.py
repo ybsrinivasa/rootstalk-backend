@@ -74,16 +74,13 @@ async def _auto_grant_cm_role(db: AsyncSession, user: User) -> None:
 
 async def _auto_link_user_to_existing_clients(db: AsyncSession, user: User) -> None:
     """Batch 39S (2026-05-17) test compat: auto-link new test Users to
-    every existing test Client as REPORT_USER so the new CCA-write
-    guard (`_assert_can_edit_client_advisory`) passes by default.
+    every existing test Client so the CCA-write guard
+    (`_assert_can_edit_client_advisory`) passes by default.
 
-    REPORT_USER is chosen as a "lowest-meaningful-role" placeholder so
-    the auto-link doesn't collide with tests that explicitly create
-    SUBJECT_EXPERT / CA / FIELD_MANAGER rows (the only roles real
-    tests construct today; see `grep ClientUserRole\\. tests/`). The
-    DB unique constraint is `(client_id, user_id, role)` so the
-    auto-linked REPORT_USER coexists peacefully with any test-added
-    explicit role on the same (user, client) pair.
+    Role updated 2026-05-18 (Batch J): SUBJECT_EXPERT. Previously
+    REPORT_USER, but the guard now refuses non-SE roles. Make_client_user
+    DELETEs any prior (client, user) row before inserting an explicit
+    role, so tests that override the role still work.
 
     Real production never auto-links; this only fires in the test
     factories."""
@@ -97,9 +94,21 @@ async def _auto_link_user_to_existing_clients(db: AsyncSession, user: User) -> N
         return
     added = False
     for c in clients:
+        # Tolerate tests that already wired a ClientUser row for
+        # (user, client) via direct db.add or make_client_user — the
+        # auto-link is a fallback, not authoritative. Skip when any
+        # row exists for the pair (regardless of role).
+        existing = (await db.execute(
+            select(ClientUser.id).where(
+                ClientUser.user_id == user.id,
+                ClientUser.client_id == c.id,
+            ).limit(1)
+        )).scalar_one_or_none()
+        if existing is not None:
+            continue
         db.add(ClientUser(
             user_id=user.id, client_id=c.id,
-            role=ClientUserRole.REPORT_USER,
+            role=ClientUserRole.SUBJECT_EXPERT,
             status=StatusEnum.ACTIVE,
         ))
         added = True
@@ -109,8 +118,8 @@ async def _auto_link_user_to_existing_clients(db: AsyncSession, user: User) -> N
 
 async def _auto_link_client_to_existing_users(db: AsyncSession, client: Client) -> None:
     """Mirror of `_auto_link_user_to_existing_clients` for the
-    make_client → make_user ordering. Uses REPORT_USER for the
-    same collision-avoidance reason."""
+    make_client → make_user ordering. Uses SUBJECT_EXPERT
+    (Batch J, 2026-05-18) for the same guard-compat reason."""
     from app.modules.clients.models import ClientUser, ClientUserRole
     from app.modules.platform.models import StatusEnum
 
@@ -119,9 +128,17 @@ async def _auto_link_client_to_existing_users(db: AsyncSession, client: Client) 
         return
     added = False
     for u in users:
+        existing = (await db.execute(
+            select(ClientUser.id).where(
+                ClientUser.user_id == u.id,
+                ClientUser.client_id == client.id,
+            ).limit(1)
+        )).scalar_one_or_none()
+        if existing is not None:
+            continue
         db.add(ClientUser(
             user_id=u.id, client_id=client.id,
-            role=ClientUserRole.REPORT_USER,
+            role=ClientUserRole.SUBJECT_EXPERT,
             status=StatusEnum.ACTIVE,
         ))
         added = True
@@ -344,15 +361,17 @@ async def make_self_registered_user(
 
 async def make_client_user(
     db: AsyncSession, *, user: User, client: Client,
-    role: ClientUserRole = ClientUserRole.CA,
+    role: ClientUserRole = ClientUserRole.SUBJECT_EXPERT,
     status: StatusEnum = StatusEnum.ACTIVE,
 ) -> ClientUser:
     """Seed a ClientUser row so the user passes the FarmPundit
     module's membership gate (`_assert_portal_member`). Used by
     tests that exercise the FarmPundit-management endpoints.
 
-    Default role is CA — change via `role=` for tests that need a
-    specific role (e.g. SUBJECT_EXPERT for standard-response
+    Default role is SUBJECT_EXPERT (Batch J, 2026-05-18) — most
+    advisory-authoring tests need an SE to pass
+    `_assert_can_edit_client_advisory`. Tests that explicitly need
+    a non-SE role (CA / FIELD_MANAGER / REPORT_USER) pass `role=`
     tests, FIELD_MANAGER for Promoter-Pundit tests).
 
     Batch 39S (2026-05-17): drop any auto-linked REPORT_USER row
@@ -742,7 +761,7 @@ async def make_push_request_body(
         client_id=client.id, state_cosh_id=state, district_cosh_id=district,
         status=StatusEnum.ACTIVE,
     ))
-    se_user = await make_user(db, name="Push SE")
+    se_user = await make_user(db, name="Push SE", skip_auto_link=True)
     db.add(ClientUser(
         client_id=client.id, user_id=se_user.id,
         role=ClientUserRole.SUBJECT_EXPERT, status=StatusEnum.ACTIVE,
