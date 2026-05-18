@@ -11,6 +11,79 @@ from app.modules.subscriptions.models import Subscription
 router = APIRouter(tags=["Seed Management"])
 
 
+# ── Authorisation gate (Batch O, 2026-05-18) ────────────────────────────────
+#
+# Per user 2026-05-18: Seed Varieties is restricted three ways.
+#   (1) Feature available only to clients onboarded as Seed Companies
+#       (Client.org_type_cosh_ids contains 'org_type_seed_companies').
+#   (2) Within such a client, only CA and SEED_DATA_MANAGER can manage
+#       the catalogue. FIELD_MANAGER / REPORT_USER / etc. are refused
+#       even when they're members of the seed company.
+# These checks ride on top of the tenant-isolation guard in
+# get_current_user (Batch I) — so cross-tenant access is already
+# refused at the request boundary; this helper only fires on
+# same-client access.
+
+SEED_COMPANY_COSH_ID = "org_type_seed_companies"
+
+
+async def _assert_can_manage_seed_varieties(
+    db: AsyncSession, user_id: str, client_id: str,
+) -> None:
+    """Both org-type AND role gate. Raises 403 with stable codes:
+      - `not_a_seed_company` — client.org_type_cosh_ids doesn't
+        include the Seed Company tag.
+      - `sdm_or_ca_only` — user's ACTIVE ClientUser role isn't CA
+        or SEED_DATA_MANAGER (after the org-type check passes)."""
+    from app.modules.clients.models import (
+        Client, ClientOrganisationType, ClientUser, ClientUserRole,
+    )
+    from app.modules.platform.models import StatusEnum
+
+    client = (await db.execute(
+        select(Client).where(Client.id == client_id)
+    )).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    org_types = (await db.execute(
+        select(ClientOrganisationType).where(
+            ClientOrganisationType.client_id == client_id,
+        )
+    )).scalars().all()
+    if not any(
+        ot.org_type_cosh_id == SEED_COMPANY_COSH_ID for ot in org_types
+    ):
+        raise HTTPException(status_code=403, detail={
+            "code": "not_a_seed_company",
+            "message": (
+                "Seed Varieties is available only to clients onboarded "
+                "as a Seed Company. Contact RootsTalk support to add "
+                "the Seed Company organisation type."
+            ),
+        })
+
+    cus = (await db.execute(
+        select(ClientUser).where(
+            ClientUser.user_id == user_id,
+            ClientUser.client_id == client_id,
+            ClientUser.status == StatusEnum.ACTIVE,
+        )
+    )).scalars().all()
+    if any(
+        cu.role in (ClientUserRole.CA, ClientUserRole.SEED_DATA_MANAGER)
+        for cu in cus
+    ):
+        return
+    raise HTTPException(status_code=403, detail={
+        "code": "sdm_or_ca_only",
+        "message": (
+            "Only the CA or a Seed Data Manager can manage Seed "
+            "Varieties for this company."
+        ),
+    })
+
+
 # ── SDM / Client Portal: Variety Catalog ─────────────────────────────────────
 
 @router.get("/client/{client_id}/varieties")
@@ -20,6 +93,7 @@ async def list_varieties(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_manage_seed_varieties(db, current_user.id, client_id)
     q = select(SeedVariety).where(
         SeedVariety.client_id == client_id,
         SeedVariety.status == "ACTIVE",
@@ -38,6 +112,7 @@ async def create_variety(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_manage_seed_varieties(db, current_user.id, client_id)
     variety = SeedVariety(
         client_id=client_id,
         crop_cosh_id=data["crop_cosh_id"],
@@ -61,6 +136,7 @@ async def update_variety(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_manage_seed_varieties(db, current_user.id, client_id)
     variety = await _get_variety(db, variety_id, client_id)
     for field in ["name", "variety_type", "description_points", "dus_characters", "photos", "status"]:
         if field in data:
@@ -75,6 +151,7 @@ async def deactivate_variety(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_manage_seed_varieties(db, current_user.id, client_id)
     variety = await _get_variety(db, variety_id, client_id)
     variety.status = "INACTIVE"
     await db.commit()
@@ -90,6 +167,7 @@ async def assign_to_pop(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_manage_seed_varieties(db, current_user.id, client_id)
     await _get_variety(db, variety_id, client_id)
     existing = (await db.execute(
         select(VarietyPoP).where(
@@ -114,6 +192,7 @@ async def remove_from_pop(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_can_manage_seed_varieties(db, current_user.id, client_id)
     assignment = (await db.execute(
         select(VarietyPoP).where(
             VarietyPoP.variety_id == variety_id,
