@@ -429,6 +429,30 @@ async def get_me(request: Request, current_user: User = Depends(get_current_user
     cu = cus[0] if cus else None
     portal_roles = sorted({c.role.value for c in cus})
 
+    # CM impersonation (2026-05-18). When a CM SSOs into the CA
+    # Portal via /admin/cm/clients/{cid}/login-as, the JWT carries
+    # `client_id` but the CM has no ClientUser row for that client —
+    # they're SA-side staff. Surface their ACTIVE CM-EDIT assignment
+    # as the synthetic role `CONTENT_MANAGER` in portal_roles so the
+    # CA Portal sidebar renders full CA-equivalent access. Per user:
+    # "The CM will have all the privileges inside the Client — that
+    # of the CA, Subject Experts, and all other roles."
+    is_cm_for_this_client = False
+    if token_client_id_pre:
+        from app.modules.clients.models import CMClientAssignment, CMRights
+        cm_assignment = (await db.execute(
+            select(CMClientAssignment.id).where(
+                CMClientAssignment.cm_user_id == current_user.id,
+                CMClientAssignment.client_id == token_client_id_pre,
+                CMClientAssignment.status == StatusEnum.ACTIVE,
+                CMClientAssignment.rights == CMRights.EDIT,
+            ).limit(1)
+        )).scalar_one_or_none()
+        if cm_assignment is not None:
+            is_cm_for_this_client = True
+            if "CONTENT_MANAGER" not in portal_roles:
+                portal_roles = sorted([*portal_roles, "CONTENT_MANAGER"])
+
     # Determine PWA roles from ClientPromoter and FarmPunditProfile
     pwa_roles: list[str] = []
 
@@ -487,6 +511,7 @@ async def get_me(request: Request, current_user: User = Depends(get_current_user
         "is_sa": bool(current_user.email and current_user.email == settings.sa_email),
         "client_id": token_client_id,
         "client_short_name": token_client_short_name,
+        "is_cm_for_this_client": is_cm_for_this_client,
     }
 
 

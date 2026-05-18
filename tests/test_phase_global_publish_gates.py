@@ -293,10 +293,20 @@ async def test_fork_rejected_when_cm_assigned_to_different_client(db):
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_import_global_pg_requires_cm_assignment(db):
-    user = await make_user(db, name="RandomUser")
+async def test_import_global_pg_requires_membership_or_cm(db):
+    """Updated 2026-05-18: import_global_pg auth widened from
+    CM-EDIT-only to SE-or-CM-EDIT (per the
+    SE-not-blocked-in-own-account rule). A user with NO ClientUser
+    on this client AND no CM assignment is still refused — just
+    with the broader `ca_edit_forbidden` code from
+    _assert_can_edit_client_advisory."""
+    # skip_auto_link on BOTH sides — make_client also runs an auto-
+    # link helper that would otherwise create an SE ClientUser for
+    # the existing user. The test's whole point is "no membership,
+    # no CM assignment" so we need a clean slate.
+    user = await make_user(db, name="RandomUser", skip_auto_link=True)
     pg = await _seed_global_pg(db, status="ACTIVE")
-    client = await make_client(db)
+    client = await make_client(db, skip_auto_link=True)
     await db.commit()
 
     with pytest.raises(HTTPException) as exc:
@@ -305,6 +315,6 @@ client_id=client.id,global_pg_id=pg.id,
 db=db,current_user=user,
 )
     assert exc.value.status_code == 403
-    assert exc.value.detail["code"] == "cm_assignment_required"
+    assert exc.value.detail["code"] == "ca_edit_forbidden"
 
 

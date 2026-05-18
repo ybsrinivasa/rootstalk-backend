@@ -53,6 +53,10 @@ class UserOut(BaseModel):
     # from these — pre-login branding fetches drift; the token can't.
     client_id: Optional[str] = None
     client_short_name: Optional[str] = None
+    # CM impersonation flag (2026-05-18). True when the bound user
+    # has an ACTIVE CM-EDIT assignment for the bound client. Frontend
+    # uses this to grant full CA-equivalent sidebar visibility.
+    is_cm_for_this_client: bool = False
 
     class Config:
         from_attributes = True

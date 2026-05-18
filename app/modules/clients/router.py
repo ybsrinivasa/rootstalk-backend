@@ -1965,3 +1965,80 @@ async def cm_my_clients(
                 "portal_url": f"{_base_url()}/login/{client.short_name}",
             })
     return out
+
+
+@router.post("/admin/cm/clients/{client_id}/login-as")
+async def cm_login_as(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SSO from SA Portal → CA Portal for a CM with an ACTIVE EDIT
+    assignment on the target client. Issues a fresh JWT bound to
+    `client_id` (same shape as a normal portal login — includes the
+    `client_id` and `client_short_name` claims that drive the
+    tenant-isolation gate in get_current_user).
+
+    The frontend then opens https://<ca-portal>/cm-login#token=<jwt>
+    in a new tab; the CA Portal's /cm-login route persists the token
+    and lands on /dashboard with full CA-equivalent access (CM-EDIT
+    bypasses every role guard inside the client portal).
+
+    Per user 2026-05-18: "The CM will have all the privileges inside
+    the Client — that of the CA, Subject Experts, and all other
+    roles. The CM will be the person who bails them out of any
+    trouble, or handles any support request."
+
+    Auth: the CM must have an ACTIVE CMClientAssignment for this
+    client with EDIT rights. VIEW assignments don't grant login-as
+    (a read-only CM can browse via the SA Portal's /clients/{cid}
+    page; they don't need to BE the client). The SA itself can also
+    call this endpoint for any client — useful for support
+    walkthrough sessions.
+    """
+    from app.modules.auth.service import _build_token, start_new_session
+
+    client = (await db.execute(
+        select(Client).where(Client.id == client_id)
+    )).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    # SA can login-as anyone; CM needs an ACTIVE EDIT assignment.
+    if current_user.email != settings.sa_email:
+        assignment = (await db.execute(
+            select(CMClientAssignment).where(
+                CMClientAssignment.cm_user_id == current_user.id,
+                CMClientAssignment.client_id == client_id,
+                CMClientAssignment.status == StatusEnum.ACTIVE,
+                CMClientAssignment.rights == CMRights.EDIT,
+            ).limit(1)
+        )).scalar_one_or_none()
+        if assignment is None:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "cm_login_as_forbidden",
+                    "message": (
+                        "Login-as requires an active CM assignment "
+                        "with EDIT rights on this client."
+                    ),
+                },
+            )
+
+    # Rotate the session so the new token is the only valid one for
+    # this user — the previous SA-portal token gets invalidated.
+    # That's the right semantics: the CM is "switching" into the
+    # client; their SA-portal tab will need to re-login when they
+    # come back. Matches the single-device model the JWT jti enforces.
+    await start_new_session(db, current_user)
+    token = _build_token(
+        current_user,
+        client_id=client.id,
+        client_short_name=client.short_name,
+    )
+    return {
+        "access_token": token,
+        "client_short_name": client.short_name,
+        "ca_portal_url": _base_url().rstrip("/"),
+    }

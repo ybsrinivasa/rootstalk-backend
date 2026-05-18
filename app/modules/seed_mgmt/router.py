@@ -34,9 +34,14 @@ async def _assert_can_manage_seed_varieties(
       - `not_a_seed_company` — client.org_type_cosh_ids doesn't
         include the Seed Company tag.
       - `sdm_or_ca_only` — user's ACTIVE ClientUser role isn't CA
-        or SEED_DATA_MANAGER (after the org-type check passes)."""
+        or SEED_DATA_MANAGER (after the org-type check passes).
+
+    CM-EDIT assignees also pass — per user 2026-05-18 the CM has
+    every privilege inside the client they're assigned to, so they
+    can manage Seed Varieties as well."""
     from app.modules.clients.models import (
-        Client, ClientOrganisationType, ClientUser, ClientUserRole,
+        CMClientAssignment, CMRights, Client, ClientOrganisationType,
+        ClientUser, ClientUserRole,
     )
     from app.modules.platform.models import StatusEnum
 
@@ -75,6 +80,20 @@ async def _assert_can_manage_seed_varieties(
         for cu in cus
     ):
         return
+
+    # CM-EDIT path (2026-05-18). CMs have full CA-equivalent access
+    # when impersonating via the SA-Portal login-as flow.
+    cm_assignment = (await db.execute(
+        select(CMClientAssignment.id).where(
+            CMClientAssignment.cm_user_id == user_id,
+            CMClientAssignment.client_id == client_id,
+            CMClientAssignment.status == StatusEnum.ACTIVE,
+            CMClientAssignment.rights == CMRights.EDIT,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if cm_assignment is not None:
+        return
+
     raise HTTPException(status_code=403, detail={
         "code": "sdm_or_ca_only",
         "message": (
