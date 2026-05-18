@@ -248,11 +248,12 @@ select(Practice).where(Practice.timeline_id == imported_tls[0].id)
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_import_global_pg_creates_new_draft_each_time(db):
-    """Re-importing the same global PG creates a new DRAFT version
-    every time and demotes any prior DRAFT in the lineage to INACTIVE
-    (Batch R, 2026-05-18 — multi-version semantic). Replaces the
-    old "409 import_would_overwrite" gate."""
+async def test_import_global_pg_with_existing_draft_requires_overwrite(db):
+    """Batch T (2026-05-18) — re-import 409s when a DRAFT is already
+    in the lineage. Passing overwrite=true wipes the existing DRAFT's
+    content and copies the import in (same row, no demotion). Only
+    Publish creates new rows now."""
+    from fastapi import HTTPException
     from sqlalchemy import select
 
     user = await make_user(db, name="GlobalSE")
@@ -270,22 +271,32 @@ async def test_import_global_pg_creates_new_draft_each_time(db):
     await make_cm_assignment(db, user=user, client=client)
     await db.commit()
 
-    # First import → DRAFT v1.
     d1 = await import_global_pg(
         client_id=client.id, global_pg_id=global_pg.id,
         db=db, current_user=user,
     )
     assert d1.status == "DRAFT"
 
-    # Second import → new DRAFT row; the first DRAFT becomes INACTIVE.
-    d2 = await import_global_pg(
-        client_id=client.id, global_pg_id=global_pg.id,
+    with pytest.raises(HTTPException) as exc:
+        await import_global_pg(
+            client_id=client.id, global_pg_id=global_pg.id,
+            db=db, current_user=user,
+        )
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "draft_exists_confirm_overwrite"
+
+    # overwrite=true → same row, content replaced.
+    d1_again = await import_global_pg(
+        client_id=client.id, global_pg_id=global_pg.id, overwrite=True,
         db=db, current_user=user,
     )
-    assert d2.id != d1.id
-    assert d2.status == "DRAFT"
-
-    d1_after = (await db.execute(
-        select(PGRecommendation).where(PGRecommendation.id == d1.id)
-    )).scalar_one()
-    assert d1_after.status == "INACTIVE"
+    assert d1_again.id == d1.id
+    assert d1_again.status == "DRAFT"
+    # Only one row in the lineage.
+    rows = (await db.execute(
+        select(PGRecommendation).where(
+            PGRecommendation.client_id == client.id,
+            PGRecommendation.problem_group_cosh_id == "pg:fungal",
+        )
+    )).scalars().all()
+    assert len(rows) == 1

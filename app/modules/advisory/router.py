@@ -7075,28 +7075,23 @@ async def _wipe_pg_content(db: AsyncSession, pg_id: str) -> dict:
 async def import_global_pg(
     client_id: str,
     global_pg_id: str,
+    overwrite: bool = False,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Import a Global PG into a client — creates a new DRAFT row in
-    the local lineage. Always.
+    """Import a Global PG into a client.
 
-    Multi-version semantics (Batch R, 2026-05-18, per user):
-      • PG is "subscribe to upstream with a review gate." Each import
-        creates a new DRAFT under `(client_id, problem_group_cosh_id,
-        area_or_plant)`. The current ACTIVE keeps serving farmers
-        untouched.
-      • Single-DRAFT invariant: if a DRAFT already exists in the
-        lineage, it's auto-flipped to INACTIVE before the new DRAFT
-        is created. The SE almost always wants the latest import;
-        the prior unreviewed DRAFT was abandoned by virtue of
-        re-importing.
-      • DRAFT is editable — the SE can tweak timelines / practices
-        / elements before publishing.
-      • Publishing the DRAFT supersedes the current ACTIVE (the
-        existing publish_client_pg flow already does this).
-      • Revert is via clone-to-draft from an INACTIVE row ("Make
-        editable" pattern).
+    Batch T (2026-05-18) — DRAFT is a single reusable slot per
+    lineage; only Publish creates new rows. Behaviour:
+      • No DRAFT exists yet → create a new DRAFT row with the
+        imported content.
+      • DRAFT exists, `overwrite=false` → 409 `draft_exists_confirm_overwrite`.
+        Frontend asks the SE whether to replace.
+      • DRAFT exists, `overwrite=true` → wipe the existing DRAFT's
+        content and copy the import in. No new row, no demotion.
+
+    The ACTIVE row keeps serving farmers untouched; nothing changes
+    for them until the SE reviews + publishes.
 
     Auth: SUBJECT_EXPERT of this client OR CM-EDIT assignee.
     """
@@ -7127,8 +7122,6 @@ async def import_global_pg(
             },
         )
 
-    # Single-DRAFT invariant — demote any existing DRAFT in this
-    # lineage to INACTIVE so only one row is editable at a time.
     existing_draft = (await db.execute(
         select(PGRecommendation).where(
             PGRecommendation.client_id == client_id,
@@ -7137,10 +7130,35 @@ async def import_global_pg(
             PGRecommendation.status == "DRAFT",
         )
     )).scalar_one_or_none()
-    if existing_draft is not None:
-        existing_draft.status = "INACTIVE"
 
     from datetime import datetime, timezone
+
+    if existing_draft is not None:
+        if not overwrite:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "draft_exists_confirm_overwrite",
+                    "message": (
+                        "A draft already exists for this PG and bundle. "
+                        "Importing again will replace the draft's contents. "
+                        "Confirm to proceed."
+                    ),
+                    "existing_draft_id": existing_draft.id,
+                },
+            )
+        # Overwrite in place — wipe existing DRAFT content, copy import in.
+        await _wipe_pg_content(db, existing_draft.id)
+        await _copy_pg_content_into(db, src_pg=src, target_pg=existing_draft)
+        existing_draft.parent_id = global_pg_id
+        existing_draft.source_version_id = None
+        existing_draft.created_via = "SE_PULL_DRAFT"
+        existing_draft.imported_from_global_at = datetime.now(timezone.utc)
+        await db.commit()
+        await db.refresh(existing_draft)
+        return existing_draft
+
+    # No DRAFT yet — create one from the import.
     target = PGRecommendation(
         problem_group_cosh_id=src.problem_group_cosh_id,
         client_id=client_id,
@@ -7171,15 +7189,18 @@ async def clone_client_pg_to_draft(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """SE picks an ACTIVE or INACTIVE row in the lineage and makes
-    it editable. Deep-copies its content into a new DRAFT row;
-    single-DRAFT invariant (any existing DRAFT in the lineage gets
-    flipped to INACTIVE). Mirror of CCA's clone_global_to_draft.
+    """SE picks an ACTIVE or INACTIVE row in the lineage to start
+    editing.
 
-    The "Make editable" pattern is also the revert path: pick any
-    historical row → start a DRAFT from it → review + publish to
-    revert. Avoids surprise live changes (per user 2026-05-18,
-    Q3 → option (a)).
+    Batch T (2026-05-18) — DRAFT is a single reusable slot per
+    lineage. Behaviour:
+      • A DRAFT already exists in the lineage → return it. No new
+        row, no demotion. The SE was probably mid-edit and the
+        existing DRAFT IS their edit-in-progress.
+      • No DRAFT exists → deep-copy this row's content into a new
+        DRAFT row.
+
+    Refuses if the source is itself a DRAFT (`clone_source_is_draft`).
     """
     await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     src = (await db.execute(
@@ -7209,7 +7230,8 @@ async def clone_client_pg_to_draft(
         )
     )).scalar_one_or_none()
     if existing_draft is not None:
-        existing_draft.status = "INACTIVE"
+        # Reuse — Batch T's only-publish-creates-rows contract.
+        return existing_draft
 
     new_draft = PGRecommendation(
         problem_group_cosh_id=src.problem_group_cosh_id,

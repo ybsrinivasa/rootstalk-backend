@@ -112,46 +112,45 @@ async def test_clone_to_draft_refuses_draft_source(db):
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_clone_to_draft_demotes_existing_draft(db):
-    """Single-DRAFT invariant — cloning while a DRAFT already
-    exists in the lineage flips it to INACTIVE before creating
-    the new DRAFT."""
+async def test_clone_to_draft_reuses_existing_draft(db):
+    """Batch T (2026-05-18): DRAFT is a single reusable slot. If a
+    DRAFT already exists in the lineage, clone-to-draft returns it
+    without creating a new row. The previous "demote and replace"
+    behaviour is gone — only Publish creates new rows now."""
     client = await make_client(db)
     se = await _seed_se(db, client)
     src_global = await _seed_global_pg(db)
     await db.commit()
 
-    # First DRAFT (from import).
+    # Seed: ACTIVE v1 + an existing DRAFT in the lineage.
     draft1 = await import_global_pg(
         client_id=client.id, global_pg_id=src_global.id,
         db=db, current_user=se,
     )
-    # Promote draft1 to INACTIVE to act as a historical row we'll
-    # clone from. (We can't clone a DRAFT, so we INACTIVE it first.)
     d1_row = (await db.execute(
         select(PGRecommendation).where(PGRecommendation.id == draft1.id)
     )).scalar_one()
     d1_row.status = "INACTIVE"
     await db.commit()
-
-    # Second import creates a new DRAFT (draft2).
+    # Now no DRAFT exists, so a second import creates a fresh one.
     draft2 = await import_global_pg(
         client_id=client.id, global_pg_id=src_global.id,
         db=db, current_user=se,
     )
     assert draft2.status == "DRAFT"
 
-    # Now clone draft1 (INACTIVE) — the new draft2 (DRAFT) should
-    # get demoted to INACTIVE.
-    cloned = await clone_client_pg_to_draft(
+    # Clone draft1 (INACTIVE) → since draft2 (DRAFT) exists, the
+    # endpoint returns draft2 unchanged. No new row, no demotion.
+    reused = await clone_client_pg_to_draft(
         client_id=client.id, pg_id=draft1.id,
         db=db, current_user=se,
     )
-    assert cloned.status == "DRAFT"
+    assert reused.id == draft2.id
+    assert reused.status == "DRAFT"
     draft2_after = (await db.execute(
         select(PGRecommendation).where(PGRecommendation.id == draft2.id)
     )).scalar_one()
-    assert draft2_after.status == "INACTIVE"
+    assert draft2_after.status == "DRAFT"  # NOT demoted
 
 
 # ── lineage endpoint ─────────────────────────────────────────────────────
@@ -159,6 +158,9 @@ async def test_clone_to_draft_demotes_existing_draft(db):
 @requires_docker
 @pytest.mark.asyncio
 async def test_lineage_endpoint_returns_all_versions(db):
+    """Batch T: build a 2-row lineage the realistic way (import →
+    flip to INACTIVE → import again creates fresh DRAFT) since
+    re-import with existing DRAFT now 409s instead of demoting."""
     client = await make_client(db)
     se = await _seed_se(db, client)
     src_global = await _seed_global_pg(db)
@@ -168,7 +170,13 @@ async def test_lineage_endpoint_returns_all_versions(db):
         client_id=client.id, global_pg_id=src_global.id,
         db=db, current_user=se,
     )
-    # Import again → v2 DRAFT, v1 demoted.
+    # Move v1 out of DRAFT slot so a second import can land cleanly.
+    v1_row = (await db.execute(
+        select(PGRecommendation).where(PGRecommendation.id == v1.id)
+    )).scalar_one()
+    v1_row.status = "INACTIVE"
+    await db.commit()
+
     v2 = await import_global_pg(
         client_id=client.id, global_pg_id=src_global.id,
         db=db, current_user=se,

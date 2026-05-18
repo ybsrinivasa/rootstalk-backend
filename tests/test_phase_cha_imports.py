@@ -131,47 +131,79 @@ async def test_global_pg_import_permitted_for_se(db):
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_global_pg_reimport_creates_new_draft_and_demotes_old(db):
-    """Batch R (2026-05-18): re-import always creates a new DRAFT
-    in the same lineage. The previous DRAFT (if any) is auto-
-    flipped to INACTIVE — single-DRAFT invariant. The current
-    ACTIVE row (if any) is untouched until the new DRAFT is
-    published. Replaces the prior 409 / force=true branch."""
+async def test_global_pg_reimport_with_existing_draft_returns_409(db):
+    """Batch T (2026-05-18): re-importing when a DRAFT already exists
+    in the lineage returns 409 `draft_exists_confirm_overwrite`. The
+    SE confirms in the UI; the frontend retries with overwrite=true.
+    No new row, no demotion."""
+    from fastapi import HTTPException
+
     user = await make_user(db, name="SE")
     src = await _seed_global_pg_with_content(db)
     client = await make_client(db)
     await make_cm_assignment(db, user=user, client=client)
     await db.commit()
 
-    # First import → DRAFT v1.
+    # First import → DRAFT (single slot).
     local_v1 = await import_global_pg(
-client_id=client.id,global_pg_id=src.id,
-db=db,current_user=user,
-)
+        client_id=client.id, global_pg_id=src.id,
+        db=db, current_user=user,
+    )
     assert local_v1.status == "DRAFT"
     assert local_v1.created_via == "SE_PULL_DRAFT"
 
-    # Second import → new DRAFT, the first is demoted to INACTIVE.
+    # Second import without overwrite → 409.
+    with pytest.raises(HTTPException) as exc:
+        await import_global_pg(
+            client_id=client.id, global_pg_id=src.id,
+            db=db, current_user=user,
+        )
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "draft_exists_confirm_overwrite"
+    assert exc.value.detail["existing_draft_id"] == local_v1.id
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_global_pg_reimport_with_overwrite_replaces_in_place(db):
+    """With overwrite=true, second import wipes the existing DRAFT's
+    contents and copies the import in. Same row id, no demotion."""
+    user = await make_user(db, name="SE")
+    src = await _seed_global_pg_with_content(db)
+    client = await make_client(db)
+    await make_cm_assignment(db, user=user, client=client)
+    await db.commit()
+
+    local_v1 = await import_global_pg(
+        client_id=client.id, global_pg_id=src.id,
+        db=db, current_user=user,
+    )
+    original_id = local_v1.id
+
+    # Same DRAFT row, overwritten.
     local_v2 = await import_global_pg(
-client_id=client.id,global_pg_id=src.id,
-db=db,current_user=user,
-)
-    assert local_v2.id != local_v1.id
+        client_id=client.id, global_pg_id=src.id, overwrite=True,
+        db=db, current_user=user,
+    )
+    assert local_v2.id == original_id
     assert local_v2.status == "DRAFT"
-    assert local_v2.created_via == "SE_PULL_DRAFT"
-    # Re-fetch v1 — should now be INACTIVE.
-    v1_after = (await db.execute(
-        select(PGRecommendation).where(PGRecommendation.id == local_v1.id)
-    )).scalar_one()
-    assert v1_after.status == "INACTIVE"
+    # Only one row in the lineage — nothing was demoted.
+    rows = (await db.execute(
+        select(PGRecommendation).where(
+            PGRecommendation.client_id == client.id,
+            PGRecommendation.problem_group_cosh_id == src.problem_group_cosh_id,
+        )
+    )).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].status == "DRAFT"
 
 
 @requires_docker
 @pytest.mark.asyncio
 async def test_global_pg_reimport_does_not_touch_active(db):
     """The current ACTIVE row keeps serving farmers untouched while a
-    new DRAFT sits for SE review. Only the publish step supersedes
-    the prior ACTIVE."""
+    re-import (with overwrite) refreshes the DRAFT slot. Only the
+    publish step supersedes the prior ACTIVE."""
     user = await make_user(db, name="SE")
     src = await _seed_global_pg_with_content(db)
     client = await make_client(db)
@@ -181,9 +213,9 @@ async def test_global_pg_reimport_does_not_touch_active(db):
     # Import → DRAFT, then force it to ACTIVE inline (skip publish
     # gate; this test isn't about the gate, just the import effect).
     v1 = await import_global_pg(
-client_id=client.id,global_pg_id=src.id,
-db=db,current_user=user,
-)
+        client_id=client.id, global_pg_id=src.id,
+        db=db, current_user=user,
+    )
     v1_row = (await db.execute(
         select(PGRecommendation).where(PGRecommendation.id == v1.id)
     )).scalar_one()
@@ -191,11 +223,12 @@ db=db,current_user=user,
     v1_row.version = 1
     await db.commit()
 
-    # Re-import — creates a new DRAFT; the ACTIVE v1 is untouched.
+    # Re-import — no DRAFT in lineage now (v1 is ACTIVE), so a fresh
+    # DRAFT row is created. ACTIVE v1 stays untouched.
     v2 = await import_global_pg(
-client_id=client.id,global_pg_id=src.id,
-db=db,current_user=user,
-)
+        client_id=client.id, global_pg_id=src.id,
+        db=db, current_user=user,
+    )
     assert v2.status == "DRAFT"
     v1_after = (await db.execute(
         select(PGRecommendation).where(PGRecommendation.id == v1.id)
