@@ -206,6 +206,43 @@ async def _assert_can_edit_client_advisory(
     )
 
 
+async def _assert_pg_recommendation_draft(
+    db: AsyncSession, pg_id: str, *, client_id: str,
+) -> "PGRecommendation":
+    """Batch S (2026-05-18). Refuse mutations on ACTIVE / INACTIVE
+    PGRecommendation rows — they leak straight to farmers (ACTIVE)
+    or rewrite historical record (INACTIVE).
+
+    The right edit path is clone-to-draft → edit DRAFT → publish.
+    Returns the row so callers don't double-fetch.
+    """
+    from app.modules.advisory.models import PGRecommendation
+    pg = (await db.execute(
+        select(PGRecommendation).where(
+            PGRecommendation.id == pg_id,
+            PGRecommendation.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if pg is None:
+        raise HTTPException(
+            status_code=404, detail="PG recommendation not found",
+        )
+    if pg.status != "DRAFT":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "pg_not_draft",
+                "message": (
+                    f"This PG recommendation is {pg.status.lower()}. "
+                    "To make changes, start a new draft from the "
+                    "version-history panel."
+                ),
+                "current_status": pg.status,
+            },
+        )
+    return pg
+
+
 async def _assert_can_view_client_advisory(
     db: AsyncSession, user_id: str, client_id: str,
 ) -> None:
@@ -7418,6 +7455,7 @@ async def add_client_pg_timeline(
     current_user: User = Depends(get_current_user),
 ):
     await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    await _assert_pg_recommendation_draft(db, pg_id, client_id=client_id)
     tl = Timeline(
         pg_recommendation_id=pg_id,
         name=request.name,
@@ -7451,6 +7489,7 @@ async def update_client_pg_timeline(
     lazy-load-on-serialize bug as update_global_pg_timeline (see
     docstring there)."""
     await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    await _assert_pg_recommendation_draft(db, pg_id, client_id=client_id)
     tl = (await db.execute(
         select(Timeline).where(
             Timeline.id == tl_id,
@@ -7494,6 +7533,7 @@ async def add_client_pg_practice(
 ):
     """Local-PG practice — same UCAT shape as global-PG and Q&A."""
     await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    await _assert_pg_recommendation_draft(db, pg_id, client_id=client_id)
     try:
         await assert_l2_elements_valid(
             db,
@@ -7549,6 +7589,7 @@ async def update_client_pg_practice(
     Practice row's elements list is replaced wholesale to match
     what the form submits."""
     await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    await _assert_pg_recommendation_draft(db, pg_id, client_id=client_id)
     try:
         await assert_l2_elements_valid(
             db,
@@ -7663,6 +7704,7 @@ async def delete_client_pg_practice(
     """Remove a practice from a client-local PG recommendation. Cascade
     drops its elements via ORM. Mirror of delete_practice on CCA."""
     await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    await _assert_pg_recommendation_draft(db, pg_id, client_id=client_id)
     practice = (await db.execute(
         select(Practice).where(
             Practice.id == practice_id,
@@ -7689,6 +7731,7 @@ async def delete_client_pg_timeline(
     current_user: User = Depends(get_current_user),
 ):
     await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    await _assert_pg_recommendation_draft(db, pg_id, client_id=client_id)
     tl = (await db.execute(
         select(Timeline).where(Timeline.id == tl_id, Timeline.pg_recommendation_id == pg_id)
     )).scalar_one_or_none()
