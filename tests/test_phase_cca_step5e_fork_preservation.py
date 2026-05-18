@@ -248,21 +248,20 @@ select(Practice).where(Practice.timeline_id == imported_tls[0].id)
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_import_global_pg_idempotent_returns_409_on_duplicate(db):
-    """Re-importing the same global PG without ?force=true returns a
-    structured 409 — the CA portal renders this as the "this will
-    overwrite your local edits" warning. The structured shape was
-    introduced in the 2026-05-08 CHA imports work; before that this
-    test asserted the legacy free-text "already imported" message."""
-    from fastapi import HTTPException
+async def test_import_global_pg_creates_new_draft_each_time(db):
+    """Re-importing the same global PG creates a new DRAFT version
+    every time and demotes any prior DRAFT in the lineage to INACTIVE
+    (Batch R, 2026-05-18 — multi-version semantic). Replaces the
+    old "409 import_would_overwrite" gate."""
+    from sqlalchemy import select
 
     user = await make_user(db, name="GlobalSE")
     global_pg = PGRecommendation(
-problem_group_cosh_id="pg:fungal",
-client_id=None,
-area_or_plant="AREA_WISE",
-status="ACTIVE",# publish gate
-)
+        problem_group_cosh_id="pg:fungal",
+        client_id=None,
+        area_or_plant="AREA_WISE",
+        status="ACTIVE",  # publish gate
+    )
     db.add(global_pg)
     await db.flush()
     await db.commit()
@@ -271,17 +270,22 @@ status="ACTIVE",# publish gate
     await make_cm_assignment(db, user=user, client=client)
     await db.commit()
 
-    # First import succeeds.
-    await import_global_pg(
-client_id=client.id,global_pg_id=global_pg.id,
-db=db,current_user=user,
-)
+    # First import → DRAFT v1.
+    d1 = await import_global_pg(
+        client_id=client.id, global_pg_id=global_pg.id,
+        db=db, current_user=user,
+    )
+    assert d1.status == "DRAFT"
 
-    # Second one without force is rejected with the structured envelope.
-    with pytest.raises(HTTPException) as exc:
-        await import_global_pg(
-client_id=client.id,global_pg_id=global_pg.id,
-db=db,current_user=user,
-)
-    assert exc.value.status_code == 409
-    assert exc.value.detail["code"] == "import_would_overwrite"
+    # Second import → new DRAFT row; the first DRAFT becomes INACTIVE.
+    d2 = await import_global_pg(
+        client_id=client.id, global_pg_id=global_pg.id,
+        db=db, current_user=user,
+    )
+    assert d2.id != d1.id
+    assert d2.status == "DRAFT"
+
+    d1_after = (await db.execute(
+        select(PGRecommendation).where(PGRecommendation.id == d1.id)
+    )).scalar_one()
+    assert d1_after.status == "INACTIVE"

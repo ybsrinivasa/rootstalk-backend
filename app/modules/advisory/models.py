@@ -552,6 +552,22 @@ class PGRecommendation(Base):
     imported_from_global_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="DRAFT")
     version: Mapped[int] = mapped_column(Integer, default=1)
+    # Lineage columns (2026-05-18, Batch R). Mirror of Package's lineage
+    # fields so the same `<LineageSection>` component drives version
+    # history + "Make editable" on PG. source_version_id is set on
+    # clone-to-draft and import (points at the previous row this DRAFT
+    # was seeded from); created_via is the audit marker; published_at
+    # /published_by are set on publish.
+    source_version_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("pg_recommendations.id"), nullable=True,
+    )
+    created_via: Mapped[str] = mapped_column(String(30), nullable=True)
+    published_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    published_by: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     # Timelines under this PG live in the shared `timelines` table

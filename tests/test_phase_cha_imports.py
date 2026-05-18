@@ -131,78 +131,77 @@ async def test_global_pg_import_permitted_for_se(db):
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_global_pg_reimport_without_force_returns_409_with_summary(db):
-    """Spec: re-import warns the SE that local edits will be overwritten,
-    and surfaces what's there. The CA portal renders this as a
-    confirmation dialog before re-calling with force=true."""
+async def test_global_pg_reimport_creates_new_draft_and_demotes_old(db):
+    """Batch R (2026-05-18): re-import always creates a new DRAFT
+    in the same lineage. The previous DRAFT (if any) is auto-
+    flipped to INACTIVE — single-DRAFT invariant. The current
+    ACTIVE row (if any) is untouched until the new DRAFT is
+    published. Replaces the prior 409 / force=true branch."""
     user = await make_user(db, name="SE")
     src = await _seed_global_pg_with_content(db)
     client = await make_client(db)
     await make_cm_assignment(db, user=user, client=client)
     await db.commit()
 
-    # First import succeeds.
-    await import_global_pg(
+    # First import → DRAFT v1.
+    local_v1 = await import_global_pg(
 client_id=client.id,global_pg_id=src.id,
 db=db,current_user=user,
 )
+    assert local_v1.status == "DRAFT"
+    assert local_v1.created_via == "SE_PULL_DRAFT"
 
-    # Re-import without force fails with structured 409.
-    with pytest.raises(HTTPException) as exc:
-        await import_global_pg(
+    # Second import → new DRAFT, the first is demoted to INACTIVE.
+    local_v2 = await import_global_pg(
 client_id=client.id,global_pg_id=src.id,
-force=False,db=db,current_user=user,
+db=db,current_user=user,
 )
-    assert exc.value.status_code == 409
-    body = exc.value.detail
-    assert body["code"] == "import_would_overwrite"
-    assert body["existing"]["timeline_count"] == 1
-    assert "force=true" in body["message"]
+    assert local_v2.id != local_v1.id
+    assert local_v2.status == "DRAFT"
+    assert local_v2.created_via == "SE_PULL_DRAFT"
+    # Re-fetch v1 — should now be INACTIVE.
+    v1_after = (await db.execute(
+        select(PGRecommendation).where(PGRecommendation.id == local_v1.id)
+    )).scalar_one()
+    assert v1_after.status == "INACTIVE"
 
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_global_pg_reimport_with_force_overwrites(db):
-    """Force re-import wipes the local copy's content and re-imports
-    fresh from the global. Local recommendation row keeps the same id
-    so any references survive."""
+async def test_global_pg_reimport_does_not_touch_active(db):
+    """The current ACTIVE row keeps serving farmers untouched while a
+    new DRAFT sits for SE review. Only the publish step supersedes
+    the prior ACTIVE."""
     user = await make_user(db, name="SE")
     src = await _seed_global_pg_with_content(db)
     client = await make_client(db)
     await make_cm_assignment(db, user=user, client=client)
     await db.commit()
 
-    # First import.
-    local = await import_global_pg(
+    # Import → DRAFT, then force it to ACTIVE inline (skip publish
+    # gate; this test isn't about the gate, just the import effect).
+    v1 = await import_global_pg(
 client_id=client.id,global_pg_id=src.id,
 db=db,current_user=user,
 )
-    local_id_before = local.id
-
-    # SE adds a custom timeline to their local copy.
-    db.add(Timeline(
-pg_recommendation_id=local.id,name="SE custom timeline",
-from_type="DAYS_AFTER_DETECTION",from_value=20,to_value=30,
-))
+    v1_row = (await db.execute(
+        select(PGRecommendation).where(PGRecommendation.id == v1.id)
+    )).scalar_one()
+    v1_row.status = "ACTIVE"
+    v1_row.version = 1
     await db.commit()
-    tl_count_before = (await db.execute(
-select(Timeline).where(Timeline.pg_recommendation_id == local.id)
-    )).scalars().all()
-    assert len(tl_count_before) == 2  # 1 from import + 1 SE-added
 
-    # Now force re-import. The custom timeline gets wiped; only the
-    # global's 1 timeline remains.
-    out = await import_global_pg(
+    # Re-import — creates a new DRAFT; the ACTIVE v1 is untouched.
+    v2 = await import_global_pg(
 client_id=client.id,global_pg_id=src.id,
-force=True,db=db,current_user=user,
+db=db,current_user=user,
 )
-    assert out.id == local_id_before  # row preserved, content replaced
-
-    after_tls = (await db.execute(
-select(Timeline).where(Timeline.pg_recommendation_id == out.id)
-    )).scalars().all()
-    assert len(after_tls) == 1
-    assert after_tls[0].name == "GTL-1"  # the global's name
+    assert v2.status == "DRAFT"
+    v1_after = (await db.execute(
+        select(PGRecommendation).where(PGRecommendation.id == v1.id)
+    )).scalar_one()
+    assert v1_after.status == "ACTIVE"
+    assert v1_after.version == 1
 
 
 @requires_docker

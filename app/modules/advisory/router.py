@@ -7038,31 +7038,30 @@ async def _wipe_pg_content(db: AsyncSession, pg_id: str) -> dict:
 async def import_global_pg(
     client_id: str,
     global_pg_id: str,
-    force: bool = False,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Deep-copy a global PG recommendation into a client.
+    """Import a Global PG into a client — creates a new DRAFT row in
+    the local lineage. Always.
 
-    First import: creates a fresh local PGRecommendation linked to the
-    global via parent_id, with all timelines / practices / elements
-    deep-copied.
+    Multi-version semantics (Batch R, 2026-05-18, per user):
+      • PG is "subscribe to upstream with a review gate." Each import
+        creates a new DRAFT under `(client_id, problem_group_cosh_id,
+        area_or_plant)`. The current ACTIVE keeps serving farmers
+        untouched.
+      • Single-DRAFT invariant: if a DRAFT already exists in the
+        lineage, it's auto-flipped to INACTIVE before the new DRAFT
+        is created. The SE almost always wants the latest import;
+        the prior unreviewed DRAFT was abandoned by virtue of
+        re-importing.
+      • DRAFT is editable — the SE can tweak timelines / practices
+        / elements before publishing.
+      • Publishing the DRAFT supersedes the current ACTIVE (the
+        existing publish_client_pg flow already does this).
+      • Revert is via clone-to-draft from an INACTIVE row ("Make
+        editable" pattern).
 
-    Re-import (existing local copy detected):
-      • Default — refuses with 409 + structured `existing` summary so
-        the CA portal can show the SE a "this will overwrite your
-        local edits" warning.
-      • `?force=true` — wipes the existing local copy's content and
-        re-imports fresh from the global. Local copy keeps its same
-        primary key (so triggered references stay intact); only its
-        timelines / practices / elements are replaced.
-
-    Auth (widened 2026-05-18 per user feedback): any ACTIVE
-    ClientUser with SUBJECT_EXPERT role on this client OR an ACTIVE
-    CM-EDIT assignee may import. Previously CM-only; that blocked
-    SEs from pulling Global PGs into their own account, which
-    contradicts the principle that an SE shouldn't be blocked inside
-    their own client. Same shape as the import-pg-into-sp widening.
+    Auth: SUBJECT_EXPERT of this client OR CM-EDIT assignee.
     """
     await _assert_can_edit_client_advisory(db, current_user.id, client_id)
 
@@ -7077,7 +7076,6 @@ async def import_global_pg(
 
     # Publish gate: only ACTIVE global PGs may be imported. DRAFTs are
     # CM-curated work-in-progress; INACTIVE rows are superseded versions.
-    # Either signals the source isn't fit for client consumption.
     if src.status != "ACTIVE":
         raise HTTPException(
             status_code=422,
@@ -7092,56 +7090,152 @@ async def import_global_pg(
             },
         )
 
-    existing = (await db.execute(
+    # Single-DRAFT invariant — demote any existing DRAFT in this
+    # lineage to INACTIVE so only one row is editable at a time.
+    existing_draft = (await db.execute(
         select(PGRecommendation).where(
             PGRecommendation.client_id == client_id,
-            PGRecommendation.parent_id == global_pg_id,
+            PGRecommendation.problem_group_cosh_id == src.problem_group_cosh_id,
+            PGRecommendation.area_or_plant == src.area_or_plant,
+            PGRecommendation.status == "DRAFT",
         )
     )).scalar_one_or_none()
+    if existing_draft is not None:
+        existing_draft.status = "INACTIVE"
 
-    if existing and not force:
-        # Tally what would be overwritten so the CA portal can show
-        # a meaningful confirmation dialog.
-        tl_count = (await db.execute(
-            select(func.count()).select_from(Timeline).where(
-                Timeline.pg_recommendation_id == existing.id,
-            )
-        )).scalar() or 0
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "import_would_overwrite",
-                "message": (
-                    "This PG recommendation is already imported. Re-importing "
-                    "will overwrite the existing local copy's timelines and "
-                    "practices. Send force=true to confirm."
-                ),
-                "existing": {
-                    "pg_recommendation_id": existing.id,
-                    "timeline_count": tl_count,
-                },
-            },
-        )
-
-    if existing:
-        # Force-overwrite path: wipe existing content + reuse the row.
-        await _wipe_pg_content(db, existing.id)
-        target = existing
-    else:
-        target = PGRecommendation(
-            problem_group_cosh_id=src.problem_group_cosh_id,
-            client_id=client_id,
-            parent_id=global_pg_id,
-            area_or_plant=src.area_or_plant,
-        )
-        db.add(target)
-        await db.flush()
+    from datetime import datetime, timezone
+    target = PGRecommendation(
+        problem_group_cosh_id=src.problem_group_cosh_id,
+        client_id=client_id,
+        parent_id=global_pg_id,
+        area_or_plant=src.area_or_plant,
+        status="DRAFT",
+        version=1,
+        source_version_id=None,  # source is Global, not a same-lineage row
+        created_via="SE_PULL_DRAFT",
+        imported_from_global_at=datetime.now(timezone.utc),
+    )
+    db.add(target)
+    await db.flush()
 
     await _copy_pg_content_into(db, src_pg=src, target_pg=target)
 
     await db.commit()
     await db.refresh(target)
     return target
+
+
+@router.post(
+    "/client/{client_id}/pg-recommendations/{pg_id}/clone-to-draft",
+    response_model=PGRecommendationOut, status_code=201,
+)
+async def clone_client_pg_to_draft(
+    client_id: str, pg_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SE picks an ACTIVE or INACTIVE row in the lineage and makes
+    it editable. Deep-copies its content into a new DRAFT row;
+    single-DRAFT invariant (any existing DRAFT in the lineage gets
+    flipped to INACTIVE). Mirror of CCA's clone_global_to_draft.
+
+    The "Make editable" pattern is also the revert path: pick any
+    historical row → start a DRAFT from it → review + publish to
+    revert. Avoids surprise live changes (per user 2026-05-18,
+    Q3 → option (a)).
+    """
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    src = (await db.execute(
+        select(PGRecommendation).where(
+            PGRecommendation.id == pg_id,
+            PGRecommendation.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if src is None:
+        raise HTTPException(status_code=404, detail="PG recommendation not found")
+    if src.status == "DRAFT":
+        raise HTTPException(status_code=422, detail={
+            "code": "clone_source_is_draft",
+            "message": (
+                "clone-to-draft requires an ACTIVE or INACTIVE row of "
+                "the lineage as the source. The current row is already "
+                "a DRAFT — edit it in place."
+            ),
+        })
+
+    existing_draft = (await db.execute(
+        select(PGRecommendation).where(
+            PGRecommendation.client_id == client_id,
+            PGRecommendation.problem_group_cosh_id == src.problem_group_cosh_id,
+            PGRecommendation.area_or_plant == src.area_or_plant,
+            PGRecommendation.status == "DRAFT",
+        )
+    )).scalar_one_or_none()
+    if existing_draft is not None:
+        existing_draft.status = "INACTIVE"
+
+    new_draft = PGRecommendation(
+        problem_group_cosh_id=src.problem_group_cosh_id,
+        client_id=client_id,
+        parent_id=src.parent_id,
+        area_or_plant=src.area_or_plant,
+        status="DRAFT",
+        version=1,
+        source_version_id=src.id,
+        created_via="SE_EDIT_DRAFT",
+    )
+    db.add(new_draft)
+    await db.flush()
+    await _copy_pg_content_into(db, src_pg=src, target_pg=new_draft)
+    await db.commit()
+    await db.refresh(new_draft)
+    return new_draft
+
+
+@router.get("/client/{client_id}/pg-recommendations/{pg_id}/lineage")
+async def get_client_pg_lineage(
+    client_id: str, pg_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Every row in this PG's lineage — rows sharing (client_id,
+    problem_group_cosh_id, area_or_plant). Feeds the version-history
+    panel + ReadOnlyBanner on the CA-PG detail page. Mirror of
+    get_package_lineage."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
+    pg = (await db.execute(
+        select(PGRecommendation).where(
+            PGRecommendation.id == pg_id,
+            PGRecommendation.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if pg is None:
+        raise HTTPException(status_code=404, detail="PG recommendation not found")
+    rows = (await db.execute(
+        select(PGRecommendation).where(
+            PGRecommendation.client_id == client_id,
+            PGRecommendation.problem_group_cosh_id == pg.problem_group_cosh_id,
+            PGRecommendation.area_or_plant == pg.area_or_plant,
+        ).order_by(PGRecommendation.version.desc(), PGRecommendation.created_at.desc())
+    )).scalars().all()
+
+    def sort_key(p: PGRecommendation):
+        is_draft = 0 if p.status == "DRAFT" else 1
+        return (is_draft, -p.version, -p.created_at.timestamp())
+
+    return [
+        {
+            "id": r.id,
+            "status": r.status,
+            "version": r.version,
+            "published_at": r.published_at.isoformat() if r.published_at else None,
+            "created_at": r.created_at.isoformat(),
+            "created_via": r.created_via,
+            "source_version_id": r.source_version_id,
+            "is_current": r.id == pg_id,
+        }
+        for r in sorted(rows, key=sort_key)
+    ]
 
 
 async def _check_pg_publish_readiness(
@@ -7263,10 +7357,24 @@ async def publish_client_pg(
     for p in prev:
         p.status = "INACTIVE"
 
-    pg.version = compute_publish_version(
-        current_version=pg.version, was_published=pg.status != "DRAFT",
-    )
+    # Bump to max(other rows in lineage) + 1 — multi-row versioning
+    # semantic (Batch R, 2026-05-18). Excluding the row being
+    # published keeps first-publish at v1 (lineage had only this
+    # DRAFT) while still bumping past any prior ACTIVE/INACTIVE
+    # siblings.
+    max_version = (await db.execute(
+        select(func.max(PGRecommendation.version)).where(
+            PGRecommendation.client_id == client_id,
+            PGRecommendation.problem_group_cosh_id == pg.problem_group_cosh_id,
+            PGRecommendation.area_or_plant == pg.area_or_plant,
+            PGRecommendation.id != pg.id,
+        )
+    )).scalar()
+    pg.version = (max_version or 0) + 1
     pg.status = "ACTIVE"
+    from datetime import datetime, timezone
+    pg.published_at = datetime.now(timezone.utc)
+    pg.published_by = current_user.id
     await db.commit()
     await db.refresh(pg)
     return pg
