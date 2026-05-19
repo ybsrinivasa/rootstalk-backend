@@ -289,17 +289,40 @@ async def list_varieties(
     # the moment a client had at least one variety; tests didn't
     # catch it because they hit the function directly within the
     # greenlet context.
+    # Batch Z (2026-05-19) — INACTIVE varieties stay on the list so
+    # the SE can see what they've retired and reactivate if needed.
+    # Frontend dims the card and offers Reactivate instead of
+    # Deactivate.
     q = select(SeedVariety).options(
         selectinload(SeedVariety.pop_assignments),
     ).where(
         SeedVariety.client_id == client_id,
-        SeedVariety.status == "ACTIVE",
     ).order_by(SeedVariety.name)
     if crop_cosh_id:
         q = q.where(SeedVariety.crop_cosh_id == crop_cosh_id)
     result = await db.execute(q)
     rows = result.scalars().all()
     return [_variety_out(v) for v in rows]
+
+
+# Batch Z (2026-05-19) — cap photos per variety. User-set
+# 2026-05-19: "limit the number of images per variety to four."
+MAX_PHOTOS_PER_VARIETY = 4
+
+
+def _validate_photos(photos):
+    if not isinstance(photos, list):
+        return
+    if len(photos) > MAX_PHOTOS_PER_VARIETY:
+        raise HTTPException(status_code=422, detail={
+            "code": "too_many_photos",
+            "message": (
+                f"A variety can have at most {MAX_PHOTOS_PER_VARIETY} "
+                f"photos. Remove some before saving."
+            ),
+            "max": MAX_PHOTOS_PER_VARIETY,
+            "submitted": len(photos),
+        })
 
 
 @router.post("/client/{client_id}/varieties", status_code=201)
@@ -310,6 +333,7 @@ async def create_variety(
     current_user: User = Depends(get_current_user),
 ):
     await _assert_can_manage_seed_varieties(db, current_user.id, client_id)
+    _validate_photos(data.get("photos"))
     variety = SeedVariety(
         client_id=client_id,
         crop_cosh_id=data["crop_cosh_id"],
@@ -337,6 +361,8 @@ async def update_variety(
     current_user: User = Depends(get_current_user),
 ):
     await _assert_can_manage_seed_varieties(db, current_user.id, client_id)
+    if "photos" in data:
+        _validate_photos(data["photos"])
     variety = await _get_variety(db, variety_id, client_id)
     for field in ["name", "variety_type", "description_points", "dus_characters", "photos", "status"]:
         if field in data:
@@ -356,6 +382,21 @@ async def deactivate_variety(
     variety.status = "INACTIVE"
     await db.commit()
     return {"detail": "Variety deactivated"}
+
+
+@router.put("/client/{client_id}/varieties/{variety_id}/reactivate")
+async def reactivate_variety(
+    client_id: str, variety_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Batch Z (2026-05-19) — flip an INACTIVE variety back to
+    ACTIVE. Idempotent on already-ACTIVE rows."""
+    await _assert_can_manage_seed_varieties(db, current_user.id, client_id)
+    variety = await _get_variety(db, variety_id, client_id)
+    variety.status = "ACTIVE"
+    await db.commit()
+    return {"detail": "Variety reactivated", "id": variety_id}
 
 
 # ── PoP assignments ────────────────────────────────────────────────────────────
