@@ -358,6 +358,33 @@ async def _assert_sa_or_cm(
     )
 
 
+def _refuse_global_custom_write() -> None:
+    """Batch EE (2026-05-19) — Globals are pure Cosh.
+
+    User-locked rule: any universal Parameter/Variable need is a
+    push-back-to-Cosh ask, not a Global-Custom workaround. CA-CCA
+    keeps per-client Customs (Batch CC); SA-CCA cannot author
+    Customs. Batch DD hid the UI; this helper closes the backend
+    surface so direct API calls also fail.
+
+    Raises 422 with stable code `global_custom_writes_disabled`.
+    Historical Global-Custom rows continue to render read-only on
+    SA and remain usable on CA; only new writes and edits are
+    refused here.
+    """
+    raise HTTPException(
+        status_code=422,
+        detail={
+            "code": "global_custom_writes_disabled",
+            "message": (
+                "Global-Custom Parameter/Variable writes are disabled "
+                "at SA scope. Universal additions go through Cosh; "
+                "per-client extensions live on CA-CCA."
+            ),
+        },
+    )
+
+
 async def _assert_sa_or_privileged_cm(
     db: AsyncSession, current_user: "User", privilege: str,
 ) -> None:
@@ -4343,8 +4370,15 @@ async def create_global_parameter(
     enforces this, returning 422 with field details when violated.
 
     Visible to every Local Package via FK from PackageVariable; the
-    SA-portal authors them, Local Packages reference them after push."""
+    SA-portal authors them, Local Packages reference them after push.
+
+    Batch EE: refuses unconditionally — every new Global Parameter
+    here would be source=CUSTOM, which the pure-Cosh rule disallows.
+    Universal additions go through Cosh; per-client additions go
+    through CA-CCA.
+    """
     await _assert_sa_or_cm(db, current_user)
+    _refuse_global_custom_write()
     param = Parameter(
         crop_cosh_id=request.crop_cosh_id,
         client_id=None,
@@ -4384,6 +4418,10 @@ async def update_global_parameter(
             "code": "cosh_mirrored_parameter_readonly",
             "message": "Cosh-mirrored parameters can't be edited; Cosh is the source of truth.",
         })
+    # Batch EE: pure-Cosh rule — historical Global-Custom parameters
+    # are read-only too. The only legal Parameter edit at SA scope
+    # is Cosh-driven, which already 422s above.
+    _refuse_global_custom_write()
     update_data = request.model_dump(exclude_unset=True)
     for field, value in update_data.items():
         setattr(param, field, value)
@@ -4415,6 +4453,10 @@ async def delete_global_parameter(
             "code": "cosh_mirrored_parameter_readonly",
             "message": "Cosh-mirrored parameters can't be deleted; Cosh is the source of truth.",
         })
+    # Batch EE: SA cannot delete Global-Custom parameters either.
+    # Historical rows are read-only at SA scope; CM-driven cleanup
+    # of orphans is a separate data-migration batch.
+    _refuse_global_custom_write()
     in_use = (await db.execute(
         select(PackageVariable).where(
             PackageVariable.parameter_id == parameter_id,
@@ -4467,6 +4509,9 @@ async def update_global_variable(
             "code": "cosh_mirrored_variable_readonly",
             "message": "Cosh-mirrored variables can't be edited; Cosh is the source of truth.",
         })
+    # Batch EE: any non-Cosh variable at Global scope is a legacy
+    # SE-added Custom — pure-Cosh rule says read-only.
+    _refuse_global_custom_write()
     update_data = request.model_dump(exclude_unset=True)
     for field, value in update_data.items():
         setattr(var, field, value)
@@ -4516,6 +4561,9 @@ async def delete_global_variable(
             "code": "cosh_mirrored_variable_readonly",
             "message": "Cosh-mirrored variables can't be deleted; Cosh is the source of truth.",
         })
+    # Batch EE: any non-Cosh variable at Global scope is a legacy
+    # SE-added Custom — pure-Cosh rule says read-only (no delete).
+    _refuse_global_custom_write()
 
     if param.source == ParameterSource.CUSTOM:
         sibling_count = (await db.execute(
@@ -4574,8 +4622,15 @@ async def create_global_variable(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Add a Variable to a Global Parameter."""
+    """Add a Variable to a Global Parameter.
+
+    Batch EE: refuses unconditionally. A new variable here would be
+    non-Cosh (no cosh_id; no client_id since Global), which the
+    pure-Cosh rule disallows. Universal additions go through Cosh;
+    per-client extras go through CA-CCA's "+ Variable" affordance.
+    """
     await _assert_sa_or_cm(db, current_user)
+    _refuse_global_custom_write()
     param = (await db.execute(
         select(Parameter).where(
             Parameter.id == parameter_id, Parameter.client_id == None,  # noqa: E711
@@ -4639,6 +4694,31 @@ async def set_global_package_variables(
     )).scalar_one_or_none()
     if pkg is None:
         raise HTTPException(status_code=404, detail="Global package not found")
+    # Batch EE: every assigned (parameter, variable) must be
+    # Cosh-sourced. Reject when the request still references a
+    # legacy Global-Custom Parameter or a non-Cosh Variable. The
+    # frontend already hides those affordances (Batch DD); this
+    # closes the direct-API surface too.
+    param_ids = list({a["parameter_id"] for a in request.assignments})
+    var_ids = list({a["variable_id"] for a in request.assignments})
+    if param_ids:
+        params = (await db.execute(
+            select(Parameter.id, Parameter.source).where(
+                Parameter.id.in_(param_ids),
+            )
+        )).all()
+        non_cosh = [pid for pid, src in params if src != ParameterSource.COSH]
+        if non_cosh:
+            _refuse_global_custom_write()
+    if var_ids:
+        vars_meta = (await db.execute(
+            select(Variable.id, Variable.cosh_id).where(
+                Variable.id.in_(var_ids),
+            )
+        )).all()
+        non_cosh_var = [vid for vid, cid in vars_meta if cid is None]
+        if non_cosh_var:
+            _refuse_global_custom_write()
     existing = (await db.execute(
         select(PackageVariable).where(PackageVariable.package_id == pkg_id)
     )).scalars().all()
