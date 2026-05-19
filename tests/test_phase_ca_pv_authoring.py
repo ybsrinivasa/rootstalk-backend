@@ -335,9 +335,10 @@ async def test_list_variables_on_cosh_parent_hides_sa_added(db):
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_create_variable_refuses_cosh_parent(db):
-    """CA cannot add a variable under a Cosh-mirrored parent — Cosh
-    is read-only catalogue. 422 cosh_parameter_readonly."""
+async def test_create_variable_under_cosh_parent_stamps_client_id(db):
+    """Batch CC (2026-05-19) — CA can add a custom variable under a
+    Cosh-mirrored parent. The new row carries client_id so other
+    clients don't see it; the Cosh parameter stays unchanged."""
     client = await make_client(db)
     user = await _seed_se(db, client)
     cosh_param = Parameter(
@@ -347,14 +348,14 @@ async def test_create_variable_refuses_cosh_parent(db):
     )
     db.add(cosh_param)
     await db.commit()
-    with pytest.raises(HTTPException) as exc:
-        await create_variable(
-            client_id=client.id, parameter_id=cosh_param.id,
-            request=VariableCreate(parameter_id=cosh_param.id, name="X"),
-            db=db, current_user=user,
-        )
-    assert exc.value.status_code == 422
-    assert exc.value.detail["code"] == "cosh_parameter_readonly"
+    out = await create_variable(
+        client_id=client.id, parameter_id=cosh_param.id,
+        request=VariableCreate(parameter_id=cosh_param.id, name="Black Cotton"),
+        db=db, current_user=user,
+    )
+    assert out.client_id == client.id
+    assert out.cosh_id is None
+    assert out.name == "Black Cotton"
 
 
 @requires_docker
@@ -408,7 +409,7 @@ async def test_update_variable_refuses_cosh_parent(db):
             db=db, current_user=user,
         )
     assert exc.value.status_code == 422
-    assert exc.value.detail["code"] == "cosh_parameter_readonly"
+    assert exc.value.detail["code"] == "cosh_mirrored_variable_readonly"
 
 
 @requires_docker

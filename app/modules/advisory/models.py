@@ -242,6 +242,15 @@ class Variable(Base):
     # Mirror of a Cosh `package_variables` entity. NULL on CUSTOM
     # rows.
     cosh_id: Mapped[str] = mapped_column(String(36), nullable=True)
+    # Batch CC (2026-05-19) — per-client custom variable under a Cosh
+    # parameter. NULL when global (Cosh-shipped or SA-added). Set to
+    # the CA's client_id when the CA portal adds a custom variable
+    # under a Cosh parameter (the parameter stays Cosh; the variable
+    # is per-client). Filters in `list_variables` ensure clients see
+    # only globals + their own customs.
+    client_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("clients.id"), nullable=True,
+    )
     name: Mapped[str] = mapped_column(String(500), nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -252,7 +261,23 @@ class Variable(Base):
     package_variables: Mapped[list["PackageVariable"]] = relationship("PackageVariable", back_populates="variable")
 
     __table_args__ = (
-        UniqueConstraint("parameter_id", "name"),
+        # Uniqueness split into two partial indexes because Postgres
+        # treats NULLs as distinct in a normal unique constraint.
+        # Globals (client_id IS NULL) must be unique on (parameter, name);
+        # per-client customs unique on (parameter, client_id, name) —
+        # two different clients are allowed to use the same name.
+        Index(
+            "uq_variables_parameter_name_global",
+            "parameter_id", "name",
+            unique=True,
+            postgresql_where="client_id IS NULL",
+        ),
+        Index(
+            "uq_variables_parameter_client_name_custom",
+            "parameter_id", "client_id", "name",
+            unique=True,
+            postgresql_where="client_id IS NOT NULL",
+        ),
         Index(
             "uq_variables_parameter_cosh_id",
             "parameter_id", "cosh_id",

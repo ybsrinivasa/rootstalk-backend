@@ -1395,20 +1395,23 @@ async def _assert_ca_param_writable(
     db: AsyncSession, client_id: str, parameter_id: str,
 ) -> Parameter:
     """Gate for any CA write against a Parameter or its Variables.
-    Refuses Cosh-mirrored parents (read-only catalogue) and
-    cross-client parents (per-client isolation). Returns the
-    parameter when the write is allowed."""
+    Returns the parameter when the write is allowed.
+
+    Batch CC (2026-05-19) — Cosh parents now permitted for variable
+    writes: the CA can add a per-client custom variable under a
+    Cosh parameter (`variables.client_id` carries the scope). Cosh
+    parameters themselves remain immutable — name/description edits
+    still 422 via separate handlers. Cross-client custom parents
+    refused as before."""
     from app.modules.advisory.models import ParameterSource
     param = (await db.execute(
         select(Parameter).where(Parameter.id == parameter_id)
     )).scalar_one_or_none()
     if param is None:
         raise HTTPException(status_code=404, detail="Parameter not found")
+    # Cosh parents are now writable in the variable-add direction.
     if param.source == ParameterSource.COSH or param.client_id is None:
-        raise HTTPException(status_code=422, detail={
-            "code": "cosh_parameter_readonly",
-            "message": "Cosh parameters are read-only. Create your own Custom parameter to extend.",
-        })
+        return param
     if param.client_id != client_id:
         raise HTTPException(status_code=403, detail={
             "code": "parameter_not_owned",
@@ -1424,11 +1427,14 @@ async def list_variables(
     current_user: User = Depends(get_current_user),
 ):
     """Returns variables visible to this client for the parameter:
-      - Cosh-mirrored parent: only Cosh-sourced variables
-        (cosh_id IS NOT NULL). Any SA-added siblings stay hidden.
+      - Cosh-mirrored parent: Cosh-sourced variables (cosh_id IS NOT
+        NULL) PLUS this-client's own custom variables under the same
+        Cosh parameter (client_id = this client). SA-added globals
+        (cosh_id IS NULL AND client_id IS NULL) and other clients'
+        customs stay hidden.
       - This client's own Custom parent: all variables.
-      - Other clients' Custom parents: empty (defensive — shouldn't
-        be reachable via list_parameters' filter)."""
+      - Other clients' Custom parents: empty (defensive)."""
+    from sqlalchemy import or_, and_
     await _assert_can_view_client_advisory(db, current_user.id, client_id)
     from app.modules.advisory.models import ParameterSource
     param = (await db.execute(
@@ -1438,7 +1444,12 @@ async def list_variables(
         return []
     stmt = select(Variable).where(Variable.parameter_id == parameter_id)
     if param.source == ParameterSource.COSH or param.client_id is None:
-        stmt = stmt.where(Variable.cosh_id.isnot(None))
+        # Batch CC (2026-05-19) — surface this-client's customs
+        # alongside Cosh-shipped variables under Cosh parameters.
+        stmt = stmt.where(or_(
+            Variable.cosh_id.isnot(None),
+            Variable.client_id == client_id,
+        ))
     elif param.client_id != client_id:
         return []
     result = await db.execute(stmt.order_by(Variable.created_at))
@@ -1452,10 +1463,16 @@ async def create_variable(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Add a variable under one of this client's Custom parameters.
-    Refuses Cosh parents (read-only) and cross-client parents."""
-    await _assert_ca_param_writable(db, client_id, parameter_id)
-    var = Variable(parameter_id=parameter_id, name=request.name)
+    """Add a variable under a parameter.
+    Batch CC (2026-05-19) — Cosh parents now permitted. The new
+    variable is stamped with `client_id` so only this client sees
+    it. Custom parents work as before — but the new variable still
+    gets client_id stamped for consistency."""
+    param = await _assert_ca_param_writable(db, client_id, parameter_id)
+    var = Variable(
+        parameter_id=parameter_id, name=request.name,
+        client_id=client_id,
+    )
     db.add(var)
     await db.commit()
     await db.refresh(var)
@@ -1545,19 +1562,29 @@ async def delete_client_variable(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Hard-delete a Variable from a client parameter. Mirror of
-    delete_global_variable (SA, line ~3728). Gates on
-    `variable.cosh_id` (SE-added variables on Cosh-mirrored parents
-    are deletable; Cosh-mirrored variables themselves are not).
-    A CUSTOM parameter must keep ≥ 2 variables (Batch 28 invariant).
-    Refuses if the variable is in use by any PackageVariable."""
+    """Hard-delete a Variable from a parameter visible to this client.
+    Gates:
+      • Parameter must be a Cosh parent or this client's own custom.
+      • Variable must be deletable: cosh_id IS NULL (Cosh-shipped
+        are read-only) AND client_id == this client (other clients'
+        customs are invisible / not ours to delete).
+      • A CUSTOM parameter must keep ≥ 2 variables (Batch 28
+        invariant). Cosh parents don't enforce the min count
+        because the Cosh-shipped variables already satisfy it.
+      • Refuses if the variable is in use by any PackageVariable.
+
+    Batch CC (2026-05-19) — extended to allow deleting per-client
+    customs added under Cosh parameters."""
     await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     param = (await db.execute(
-        select(Parameter).where(
-            Parameter.id == parameter_id, Parameter.client_id == client_id,
-        )
+        select(Parameter).where(Parameter.id == parameter_id)
     )).scalar_one_or_none()
     if param is None:
+        raise HTTPException(status_code=404, detail="Parameter not found")
+    # Either Cosh-mirrored (client_id is NULL) or owned by this
+    # client. Other-client custom parents are 404 (defensive — the
+    # CA portal wouldn't even surface them).
+    if param.client_id is not None and param.client_id != client_id:
         raise HTTPException(status_code=404, detail="Parameter not found")
     var = (await db.execute(
         select(Variable).where(
@@ -1572,6 +1599,9 @@ async def delete_client_variable(
             "code": "cosh_mirrored_variable_readonly",
             "message": "Cosh-mirrored variables can't be deleted; Cosh is the source of truth.",
         })
+    # Refuse cross-client customs (another CA's add).
+    if var.client_id is not None and var.client_id != client_id:
+        raise HTTPException(status_code=404, detail="Variable not found")
     if param.source == ParameterSource.CUSTOM:
         sibling_count = (await db.execute(
             select(func.count()).select_from(Variable).where(
@@ -1622,14 +1652,23 @@ async def update_variable(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Edit variable text. Refuses Cosh parents (read-only) and
-    cross-client parents. Resets all its translations to
-    PENDING_REVIEW per spec A1.4."""
+    """Edit variable text. Allowed for the client's own custom
+    variables under either a Custom parent or a Cosh parent
+    (Batch CC, 2026-05-19). Refuses Cosh-shipped variables
+    (cosh_id IS NOT NULL) and other clients' customs. Resets all
+    translations to PENDING_REVIEW per spec A1.4."""
     await _assert_ca_param_writable(db, client_id, parameter_id)
     var = (await db.execute(
         select(Variable).where(Variable.id == variable_id, Variable.parameter_id == parameter_id)
     )).scalar_one_or_none()
     if not var:
+        raise HTTPException(status_code=404, detail="Variable not found")
+    if var.cosh_id is not None:
+        raise HTTPException(status_code=422, detail={
+            "code": "cosh_mirrored_variable_readonly",
+            "message": "Cosh-mirrored variables can't be edited; Cosh is the source of truth.",
+        })
+    if var.client_id is not None and var.client_id != client_id:
         raise HTTPException(status_code=404, detail="Variable not found")
     if "name" in data and data["name"] != var.name:
         var.name = data["name"]
