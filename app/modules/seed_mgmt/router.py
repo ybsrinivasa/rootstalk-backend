@@ -2,6 +2,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.modules.platform.models import User
@@ -138,7 +139,15 @@ async def list_varieties(
     current_user: User = Depends(get_current_user),
 ):
     await _assert_can_manage_seed_varieties(db, current_user.id, client_id)
-    q = select(SeedVariety).where(
+    # Batch W-3 (2026-05-19) — eager-load pop_assignments so the
+    # serializer doesn't trigger a lazy-load (async SQLAlchemy raises
+    # MissingGreenlet during JSON encoding otherwise). The list 500'd
+    # the moment a client had at least one variety; tests didn't
+    # catch it because they hit the function directly within the
+    # greenlet context.
+    q = select(SeedVariety).options(
+        selectinload(SeedVariety.pop_assignments),
+    ).where(
         SeedVariety.client_id == client_id,
         SeedVariety.status == "ACTIVE",
     ).order_by(SeedVariety.name)
@@ -169,7 +178,10 @@ async def create_variety(
     )
     db.add(variety)
     await db.commit()
-    await db.refresh(variety)
+    # Batch W-3 (2026-05-19) — re-fetch with pop_assignments eagerly
+    # loaded so _variety_out doesn't trigger a lazy-load during
+    # serialization. refresh() alone doesn't populate relationships.
+    await db.refresh(variety, attribute_names=["pop_assignments"])
     return _variety_out(variety)
 
 
@@ -269,6 +281,7 @@ async def browse_seed_varieties(
 
     result = await db.execute(
         select(SeedVariety)
+        .options(selectinload(SeedVariety.pop_assignments))
         .join(VarietyPoP, VarietyPoP.variety_id == SeedVariety.id)
         .where(
             VarietyPoP.package_id == sub.package_id,
@@ -484,8 +497,13 @@ def _variety_out(v: SeedVariety) -> dict:
 
 
 async def _get_variety(db: AsyncSession, variety_id: str, client_id: str) -> SeedVariety:
+    # Batch W-3 (2026-05-19) — eager-load pop_assignments to avoid
+    # MissingGreenlet during _variety_out serialization. Every caller
+    # of this helper passes the result through _variety_out.
     v = (await db.execute(
-        select(SeedVariety).where(SeedVariety.id == variety_id, SeedVariety.client_id == client_id)
+        select(SeedVariety).options(
+            selectinload(SeedVariety.pop_assignments),
+        ).where(SeedVariety.id == variety_id, SeedVariety.client_id == client_id)
     )).scalar_one_or_none()
     if not v:
         raise HTTPException(status_code=404, detail="Variety not found")
