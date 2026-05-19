@@ -177,7 +177,7 @@ async def test_role_display_friendly_for_each_role(db, monkeypatch):
     from app.modules.clients.service import humanize_client_user_role
     assert humanize_client_user_role("SUBJECT_EXPERT") == "Subject Expert"
     assert humanize_client_user_role("FIELD_MANAGER") == "Field Manager"
-    assert humanize_client_user_role("SEED_DATA_MANAGER") == "Seed Data Manager"
+    assert humanize_client_user_role("SEED_DATA_MANAGER") == "Seed Data"
     assert humanize_client_user_role("REPORT_USER") == "Report User"
     assert humanize_client_user_role("CLIENT_RM") == "Client RM"
     assert humanize_client_user_role("PRODUCT_MANAGER") == "Product Manager"

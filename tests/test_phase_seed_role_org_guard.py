@@ -72,22 +72,30 @@ async def test_permits_ca_on_seed_company(db):
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_permits_sdm_on_seed_company(db):
+async def test_permits_se_with_seed_data_privilege(db):
+    """Batch X (2026-05-19): SE who holds the SEED_DATA privilege
+    passes (replaces the legacy SDM role test)."""
+    from app.modules.clients.models import (
+        ClientUserPrivilege, ClientUserPrivilegeModel,
+    )
     client = await make_client(db)
     await _mark_as_seed_company(db, client)
-    user = await make_user(db, name="SDM", skip_auto_link=True)
+    user = await make_user(db, name="SE+SeedData", skip_auto_link=True)
     await make_client_user(
-        db, user=user, client=client, role=ClientUserRole.SEED_DATA_MANAGER,
+        db, user=user, client=client, role=ClientUserRole.SUBJECT_EXPERT,
     )
+    db.add(ClientUserPrivilegeModel(
+        client_id=client.id, user_id=user.id,
+        privilege=ClientUserPrivilege.SEED_DATA,
+    ))
     await db.commit()
     await _assert_can_manage_seed_varieties(db, user.id, client.id)
 
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_refuses_subject_expert_on_seed_company(db):
-    """Even on a Seed Company, SE can't manage varieties — only CA
-    and SDM are eligible."""
+async def test_refuses_subject_expert_without_privilege(db):
+    """SE without the SEED_DATA privilege can't manage varieties."""
     client = await make_client(db)
     await _mark_as_seed_company(db, client)
     user = await make_user(db, name="SE", skip_auto_link=True)
@@ -98,7 +106,7 @@ async def test_refuses_subject_expert_on_seed_company(db):
     with pytest.raises(HTTPException) as exc:
         await _assert_can_manage_seed_varieties(db, user.id, client.id)
     assert exc.value.status_code == 403
-    assert exc.value.detail["code"] == "sdm_or_ca_only"
+    assert exc.value.detail["code"] == "seed_data_or_ca_only"
 
 
 @requires_docker
@@ -114,23 +122,26 @@ async def test_refuses_field_manager_on_seed_company(db):
     with pytest.raises(HTTPException) as exc:
         await _assert_can_manage_seed_varieties(db, user.id, client.id)
     assert exc.value.status_code == 403
-    assert exc.value.detail["code"] == "sdm_or_ca_only"
+    assert exc.value.detail["code"] == "seed_data_or_ca_only"
 
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_multi_role_user_with_sdm_passes(db):
-    """A user with FM + SDM on the same seed company passes — any
-    eligible role qualifies them."""
+async def test_se_with_other_privilege_only_still_refused(db):
+    """An SE without the SEED_DATA privilege is still refused even
+    if they have other ClientUser rows on the client."""
     client = await make_client(db)
     await _mark_as_seed_company(db, client)
-    user = await make_user(db, name="FM+SDM", skip_auto_link=True)
+    user = await make_user(db, name="FM+SE", skip_auto_link=True)
     await make_client_user(
         db, user=user, client=client, role=ClientUserRole.FIELD_MANAGER,
     )
     db.add(ClientUser(
         client_id=client.id, user_id=user.id,
-        role=ClientUserRole.SEED_DATA_MANAGER, status=StatusEnum.ACTIVE,
+        role=ClientUserRole.SUBJECT_EXPERT, status=StatusEnum.ACTIVE,
     ))
     await db.commit()
-    await _assert_can_manage_seed_varieties(db, user.id, client.id)
+    with pytest.raises(HTTPException) as exc:
+        await _assert_can_manage_seed_varieties(db, user.id, client.id)
+    assert exc.value.status_code == 403
+    assert exc.value.detail["code"] == "seed_data_or_ca_only"

@@ -34,15 +34,24 @@ async def _assert_can_manage_seed_varieties(
     """Both org-type AND role gate. Raises 403 with stable codes:
       - `not_a_seed_company` — client.org_type_cosh_ids doesn't
         include the Seed Company tag.
-      - `sdm_or_ca_only` — user's ACTIVE ClientUser role isn't CA
-        or SEED_DATA_MANAGER (after the org-type check passes).
+      - `seed_data_or_ca_only` — user doesn't have CA role, nor
+        the Seed Data privilege (after the org-type check passes).
 
-    CM-EDIT assignees also pass — per user 2026-05-18 the CM has
-    every privilege inside the client they're assigned to, so they
-    can manage Seed Varieties as well."""
+    Accepted callers (after Batch X, 2026-05-19):
+      • ACTIVE ClientUser with role CA, OR
+      • ACTIVE SUBJECT_EXPERT holding the SEED_DATA privilege via
+        ClientUserPrivilege, OR
+      • CM-EDIT assignee (CMs retain full CA-equivalent access when
+        impersonating via the SA-Portal login-as flow).
+
+    The legacy SEED_DATA_MANAGER role is gone — the Batch X
+    migration backfilled existing rows into SE + SEED_DATA
+    privilege. The role enum value is kept for SAEnum compat but
+    no longer surfaces in the role picker or auth path."""
     from app.modules.clients.models import (
         CMClientAssignment, CMRights, Client, ClientOrganisationType,
-        ClientUser, ClientUserRole,
+        ClientUser, ClientUserPrivilege, ClientUserPrivilegeModel,
+        ClientUserRole,
     )
     from app.modules.platform.models import StatusEnum
 
@@ -76,11 +85,21 @@ async def _assert_can_manage_seed_varieties(
             ClientUser.status == StatusEnum.ACTIVE,
         )
     )).scalars().all()
-    if any(
-        cu.role in (ClientUserRole.CA, ClientUserRole.SEED_DATA_MANAGER)
-        for cu in cus
-    ):
+    # CA always passes.
+    if any(cu.role == ClientUserRole.CA for cu in cus):
         return
+    # SE who holds the SEED_DATA privilege passes.
+    is_se = any(cu.role == ClientUserRole.SUBJECT_EXPERT for cu in cus)
+    if is_se:
+        holds = (await db.execute(
+            select(ClientUserPrivilegeModel.id).where(
+                ClientUserPrivilegeModel.client_id == client_id,
+                ClientUserPrivilegeModel.user_id == user_id,
+                ClientUserPrivilegeModel.privilege == ClientUserPrivilege.SEED_DATA,
+            ).limit(1)
+        )).scalar_one_or_none()
+        if holds is not None:
+            return
 
     # CM-EDIT path (2026-05-18). CMs have full CA-equivalent access
     # when impersonating via the SA-Portal login-as flow.
@@ -96,10 +115,10 @@ async def _assert_can_manage_seed_varieties(
         return
 
     raise HTTPException(status_code=403, detail={
-        "code": "sdm_or_ca_only",
+        "code": "seed_data_or_ca_only",
         "message": (
-            "Only the CA or a Seed Data Manager can manage Seed "
-            "Varieties for this company."
+            "Only the CA, or the Subject Expert holding the Seed Data "
+            "privilege, can manage Seed Varieties for this company."
         ),
     })
 

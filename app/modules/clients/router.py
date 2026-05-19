@@ -1249,6 +1249,169 @@ async def toggle_portal_user_status(
     return {"detail": f"User status set to {new_status}"}
 
 
+# ── CA: Per-client single-holder privileges (Batch X, 2026-05-19) ───────────
+
+async def _assert_caller_can_assign_client_privileges(
+    db: AsyncSession, user_id: str, client_id: str,
+) -> None:
+    """Only the CA of the client (or a CM-EDIT impersonator) may
+    assign client-scoped privileges. Other roles 403 with
+    `ca_privilege_assign_only`."""
+    from app.modules.clients.models import (
+        CMClientAssignment, CMRights, ClientUser, ClientUserRole,
+    )
+    from app.modules.platform.models import StatusEnum
+    cus = (await db.execute(
+        select(ClientUser).where(
+            ClientUser.user_id == user_id,
+            ClientUser.client_id == client_id,
+            ClientUser.status == StatusEnum.ACTIVE,
+        )
+    )).scalars().all()
+    if any(cu.role == ClientUserRole.CA for cu in cus):
+        return
+    cm = (await db.execute(
+        select(CMClientAssignment.id).where(
+            CMClientAssignment.cm_user_id == user_id,
+            CMClientAssignment.client_id == client_id,
+            CMClientAssignment.status == StatusEnum.ACTIVE,
+            CMClientAssignment.rights == CMRights.EDIT,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if cm is not None:
+        return
+    raise HTTPException(status_code=403, detail={
+        "code": "ca_privilege_assign_only",
+        "message": (
+            "Only the CA of this company can assign client-level "
+            "responsibilities."
+        ),
+    })
+
+
+@router.get("/client/{client_id}/privileges")
+async def list_client_privileges(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return one row per ClientUserPrivilege with its current holder
+    (or None). Feeds the CA Users page "Client Responsibilities"
+    panel. Visible to any active member of the client; the assign
+    endpoint is CA-only."""
+    from app.modules.clients.models import (
+        ClientUser, ClientUserPrivilege, ClientUserPrivilegeModel,
+    )
+    from app.modules.platform.models import StatusEnum, User as UserModel
+    # Any active ClientUser of this client can view.
+    member = (await db.execute(
+        select(ClientUser.id).where(
+            ClientUser.user_id == current_user.id,
+            ClientUser.client_id == client_id,
+            ClientUser.status == StatusEnum.ACTIVE,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if member is None:
+        # CMs also allowed.
+        from app.modules.clients.models import CMClientAssignment
+        cm = (await db.execute(
+            select(CMClientAssignment.id).where(
+                CMClientAssignment.cm_user_id == current_user.id,
+                CMClientAssignment.client_id == client_id,
+                CMClientAssignment.status == StatusEnum.ACTIVE,
+            ).limit(1)
+        )).scalar_one_or_none()
+        if cm is None:
+            raise HTTPException(status_code=403, detail="Forbidden")
+
+    rows = (await db.execute(
+        select(ClientUserPrivilegeModel, UserModel)
+        .join(UserModel, UserModel.id == ClientUserPrivilegeModel.user_id)
+        .where(ClientUserPrivilegeModel.client_id == client_id)
+    )).all()
+    holders: dict[str, dict] = {
+        p.value: {"privilege": p.value, "user_id": None, "name": None, "email": None}
+        for p in ClientUserPrivilege
+    }
+    for priv, user in rows:
+        holders[priv.privilege.value] = {
+            "privilege": priv.privilege.value,
+            "user_id": user.id,
+            "name": user.name,
+            "email": user.email,
+        }
+    order = [ClientUserPrivilege.SEED_DATA.value]
+    return [holders[p] for p in order]
+
+
+@router.put("/client/{client_id}/privileges/{privilege}")
+async def set_client_privilege_holder(
+    client_id: str, privilege: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CA assigns one SE as the holder of a client-scoped privilege
+    (or unassigns by passing user_id=null). Atomically demotes any
+    other holder of the same privilege in this client.
+
+    Refuses if:
+      • Caller isn't the CA / CM-EDIT (403 `ca_privilege_assign_only`).
+      • Target user isn't an ACTIVE SUBJECT_EXPERT of this client
+        (422 `target_must_be_active_se`).
+      • Unknown privilege (422 `unknown_privilege`).
+    """
+    from app.modules.clients.models import (
+        ClientUser, ClientUserPrivilege, ClientUserPrivilegeModel,
+        ClientUserRole,
+    )
+    from app.modules.platform.models import StatusEnum
+    await _assert_caller_can_assign_client_privileges(
+        db, current_user.id, client_id,
+    )
+    valid = {p.value for p in ClientUserPrivilege}
+    if privilege not in valid:
+        raise HTTPException(status_code=422, detail={
+            "code": "unknown_privilege",
+            "message": f"Unknown privilege: {privilege}",
+        })
+    priv = ClientUserPrivilege(privilege)
+    target_user_id = data.get("user_id")
+
+    # Demote current holder (if any). Always do this so we end up
+    # with at most one row.
+    from sqlalchemy import delete as sa_delete
+    await db.execute(
+        sa_delete(ClientUserPrivilegeModel).where(
+            ClientUserPrivilegeModel.client_id == client_id,
+            ClientUserPrivilegeModel.privilege == priv,
+        )
+    )
+
+    if target_user_id is not None:
+        cu = (await db.execute(
+            select(ClientUser).where(
+                ClientUser.user_id == target_user_id,
+                ClientUser.client_id == client_id,
+                ClientUser.status == StatusEnum.ACTIVE,
+                ClientUser.role == ClientUserRole.SUBJECT_EXPERT,
+            ).limit(1)
+        )).scalar_one_or_none()
+        if cu is None:
+            raise HTTPException(status_code=422, detail={
+                "code": "target_must_be_active_se",
+                "message": (
+                    "The target user must be an active Subject Expert of "
+                    "this client to hold a client-scoped privilege."
+                ),
+            })
+        db.add(ClientUserPrivilegeModel(
+            client_id=client_id, user_id=target_user_id, privilege=priv,
+        ))
+    await db.commit()
+    return {"privilege": privilege, "user_id": target_user_id}
+
+
 # ── CA: Self-serve company profile ─────────────────────────────────────────────
 
 @router.get("/client/{client_id}/profile")

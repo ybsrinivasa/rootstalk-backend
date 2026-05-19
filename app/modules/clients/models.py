@@ -31,6 +31,12 @@ class ClientUserRole(str, enum.Enum):
     CA = "CA"
     SUBJECT_EXPERT = "SUBJECT_EXPERT"
     FIELD_MANAGER = "FIELD_MANAGER"
+    # Legacy role kept for the SAEnum value list compatibility while
+    # the Batch X migration backfills existing rows. New users can
+    # no longer be created with this role; the equivalent permission
+    # is now granted via ClientUserPrivilege(SEED_DATA) layered on
+    # top of SUBJECT_EXPERT. Remove the value in a future batch once
+    # we confirm zero usage across all environments.
     SEED_DATA_MANAGER = "SEED_DATA_MANAGER"
     REPORT_USER = "REPORT_USER"
     CLIENT_RM = "CLIENT_RM"
@@ -46,6 +52,19 @@ class CMPrivilege(str, enum.Enum):
     CROP_HEALTH_CROPS = "CROP_HEALTH_CROPS"
     BRAND_HANDLING = "BRAND_HANDLING"
     VOLUME_CALCULATIONS = "VOLUME_CALCULATIONS"
+
+
+class ClientUserPrivilege(str, enum.Enum):
+    """Batch X (2026-05-19) — per-client single-holder privilege
+    held by a Subject Expert. Mirrors the CM-side `CMPrivilege` shape
+    but scoped to a single client (so each Seed Company can have its
+    own SE holding the Seed Data privilege).
+
+    Initial enum has just `SEED_DATA` — the SE who can manage Seed
+    Varieties + CCA Packages for the company. Layered on top of the
+    SUBJECT_EXPERT role: the privilege holder is always an SE first.
+    """
+    SEED_DATA = "SEED_DATA"
 
 
 class PaymentModel(str, enum.Enum):
@@ -212,6 +231,41 @@ class CMPrivilegeModel(Base):
         # the application-level demote-before-grant logic in
         # PUT /admin/cm-privileges/{privilege}.
         Index("uq_cm_privilege_single_holder", "privilege", unique=True),
+    )
+
+
+class ClientUserPrivilegeModel(Base):
+    """Batch X (2026-05-19) — per-client single-holder privilege held
+    by a Subject Expert. Mirrors CMPrivilegeModel but scoped to a
+    single client (each Seed Company can have its own SE holding the
+    Seed Data privilege).
+    """
+    __tablename__ = "client_user_privileges"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    client_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("clients.id"), nullable=False,
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=False,
+    )
+    privilege: Mapped[ClientUserPrivilege] = mapped_column(
+        SAEnum(ClientUserPrivilege), nullable=False,
+    )
+    granted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("client_id", "user_id", "privilege"),
+        # Single-holder invariant per (client, privilege): at most one
+        # user inside a client holds each privilege at any time.
+        # Belt-and-braces with the demote-before-grant logic in the
+        # PUT /client/{cid}/privileges/{privilege} endpoint.
+        Index(
+            "uq_client_user_privilege_single_holder",
+            "client_id", "privilege", unique=True,
+        ),
     )
 
 

@@ -78,7 +78,11 @@ RootsTalk — Neytiri Eywafarm Agritech"""
 CLIENT_USER_ROLE_DISPLAY = {
     "SUBJECT_EXPERT": "Subject Expert",
     "FIELD_MANAGER": "Field Manager",
-    "SEED_DATA_MANAGER": "Seed Data Manager",
+    # Legacy enum value kept for emails to anyone still on the
+    # historical role (pre Batch X 2026-05-19 migration). New users
+    # get SE + SEED_DATA privilege instead and never surface as this
+    # role.
+    "SEED_DATA_MANAGER": "Seed Data",
     "REPORT_USER": "Report User",
     "CLIENT_RM": "Client RM",
     "PRODUCT_MANAGER": "Product Manager",
