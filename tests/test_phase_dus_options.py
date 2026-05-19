@@ -12,6 +12,7 @@ import pytest
 from app.modules.sync.models import CoshConnectRow, CoshCoreItem
 from app.services.cosh_constants import (
     COSH_BIOLOGICAL_NAMES_CORE,
+    COSH_BLANK_BOX_BY_CORE,
     COSH_DUS_CHARACTERS_CORE,
     COSH_DUS_CHARACTERS_DESCRIPTORS_CONNECT,
     COSH_DUS_DESCRIPTORS_CORE,
@@ -88,6 +89,85 @@ async def test_nests_part_subpart_character_descriptors(db):
     assert char_names == ["Color", "Shape"]
     color = next(c for c in pericarp["characters"] if c["character_cosh_id"] == "ch:color")
     assert [d["descriptor_name_en"] for d in color["descriptors"]] == ["Red"]
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_blank_box_subpart_collapses_to_null(db):
+    """Batch W-1 (2026-05-19): when the Connect row's subpart
+    endpoint is the BLANK BOX sentinel, the tree emits
+    subpart_cosh_id=None / subpart_name_en=None so the frontend can
+    skip the subpart dropdown for that branch."""
+    crop = "bn:tomato"
+    bb_subpart = COSH_BLANK_BOX_BY_CORE[COSH_PLANT_SUBPARTS_CORE]
+    await _seed_core(db, cosh_id=crop,        core_type=COSH_BIOLOGICAL_NAMES_CORE, name="Tomato")
+    await _seed_core(db, cosh_id="part:leaf", core_type=COSH_PLANT_PARTS_CORE,    name="Leaf")
+    await _seed_core(db, cosh_id=bb_subpart,  core_type=COSH_PLANT_SUBPARTS_CORE, name="BLANK BOX")
+    await _seed_core(db, cosh_id="ch:color",  core_type=COSH_DUS_CHARACTERS_CORE, name="Color")
+    await _seed_core(db, cosh_id="desc:green", core_type=COSH_DUS_DESCRIPTORS_CORE, name="Green")
+    await _seed_row(db, connect_id="dus:bb", crop=crop, part="part:leaf",
+                    subpart=bb_subpart, character="ch:color", descriptor="desc:green")
+    await db.commit()
+
+    out = await list_dus_options_for_crop(db, crop_cosh_id=crop)
+    leaf = next(p for p in out if p["part_cosh_id"] == "part:leaf")
+    assert len(leaf["subparts"]) == 1
+    only = leaf["subparts"][0]
+    assert only["subpart_cosh_id"] is None
+    assert only["subpart_name_en"] is None
+    # The character + descriptor still surface under the null subpart.
+    assert only["characters"][0]["character_name_en"] == "Color"
+    assert only["characters"][0]["descriptors"][0]["descriptor_name_en"] == "Green"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_blank_box_part_drops_row(db):
+    """BLANK BOX at the part level removes the row entirely — no
+    meaningful part means nothing for the SE to score."""
+    crop = "bn:tomato"
+    bb_part = COSH_BLANK_BOX_BY_CORE[COSH_PLANT_PARTS_CORE]
+    await _seed_core(db, cosh_id=crop,         core_type=COSH_BIOLOGICAL_NAMES_CORE, name="Tomato")
+    await _seed_core(db, cosh_id=bb_part,      core_type=COSH_PLANT_PARTS_CORE,    name="BLANK BOX")
+    await _seed_core(db, cosh_id="sub:lamina", core_type=COSH_PLANT_SUBPARTS_CORE, name="Lamina")
+    await _seed_core(db, cosh_id="ch:color",   core_type=COSH_DUS_CHARACTERS_CORE, name="Color")
+    await _seed_core(db, cosh_id="desc:green", core_type=COSH_DUS_DESCRIPTORS_CORE, name="Green")
+    await _seed_row(db, connect_id="dus:bb_part", crop=crop, part=bb_part,
+                    subpart="sub:lamina", character="ch:color", descriptor="desc:green")
+    await db.commit()
+
+    out = await list_dus_options_for_crop(db, crop_cosh_id=crop)
+    assert out == []
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_blank_box_subpart_coexists_with_real(db):
+    """A part can have a mix: some rows with real subparts, some with
+    BLANK BOX. The tree carries both — null subpart sorted first,
+    then real subparts alphabetised. The frontend renders an
+    additional "— not applicable —" option in that case."""
+    crop = "bn:tomato"
+    bb_subpart = COSH_BLANK_BOX_BY_CORE[COSH_PLANT_SUBPARTS_CORE]
+    await _seed_core(db, cosh_id=crop,        core_type=COSH_BIOLOGICAL_NAMES_CORE, name="Tomato")
+    await _seed_core(db, cosh_id="part:leaf", core_type=COSH_PLANT_PARTS_CORE,    name="Leaf")
+    await _seed_core(db, cosh_id="sub:lamina", core_type=COSH_PLANT_SUBPARTS_CORE, name="Lamina")
+    await _seed_core(db, cosh_id=bb_subpart,  core_type=COSH_PLANT_SUBPARTS_CORE, name="BLANK BOX")
+    await _seed_core(db, cosh_id="ch:overall", core_type=COSH_DUS_CHARACTERS_CORE, name="Overall")
+    await _seed_core(db, cosh_id="ch:color",   core_type=COSH_DUS_CHARACTERS_CORE, name="Color")
+    await _seed_core(db, cosh_id="desc:green", core_type=COSH_DUS_DESCRIPTORS_CORE, name="Green")
+    await _seed_row(db, connect_id="dus:bb1", crop=crop, part="part:leaf",
+                    subpart=bb_subpart, character="ch:overall", descriptor="desc:green")
+    await _seed_row(db, connect_id="dus:real1", crop=crop, part="part:leaf",
+                    subpart="sub:lamina", character="ch:color", descriptor="desc:green")
+    await db.commit()
+
+    out = await list_dus_options_for_crop(db, crop_cosh_id=crop)
+    leaf = next(p for p in out if p["part_cosh_id"] == "part:leaf")
+    assert len(leaf["subparts"]) == 2
+    # Null subpart sorts first.
+    assert leaf["subparts"][0]["subpart_cosh_id"] is None
+    assert leaf["subparts"][1]["subpart_cosh_id"] == "sub:lamina"
 
 
 @requires_docker

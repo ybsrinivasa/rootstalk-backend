@@ -39,6 +39,7 @@ from app.services.cosh_constants import (
     DCD_POS_DESCRIPTOR,
     DCD_POS_PART,
     DCD_POS_SUBPART,
+    is_blank_box,
 )
 
 
@@ -120,6 +121,19 @@ async def list_dus_options_for_crop(
     it yet). Sorted alphabetically at every level by English name;
     inactive Core items are silently dropped — a stale part /
     character / descriptor never surfaces in the dropdown.
+
+    **BLANK BOX handling** (Batch W-1, 2026-05-19):
+
+    * Rows where the **part** is BLANK BOX are dropped entirely —
+      no part = no DUS row the SE can meaningfully pick.
+    * Rows where the **subpart** is BLANK BOX collapse the subpart
+      level to a "not applicable" entry: `subpart_cosh_id=None,
+      subpart_name_en=None`. The frontend skips the subpart
+      dropdown for parts whose only subpart is None, otherwise
+      surfaces it as "— not applicable —".
+
+    BLANK BOX UUIDs come from `COSH_BLANK_BOX_BY_CORE` — extend
+    that dict if Cosh adds the sentinel to a new Core.
     """
     rows = await _walk_rows_for_crop(db, crop_cosh_id=crop_cosh_id)
     if not rows:
@@ -148,21 +162,30 @@ async def list_dus_options_for_crop(
         db, core_type=COSH_DUS_DESCRIPTORS_CORE, cosh_ids=descriptor_ids,
     )
 
-    # tree[part_id][subpart_id][character_id] = set[descriptor_id]
-    tree: dict[str, dict[str, dict[str, set[str]]]] = {}
+    # tree[part_id][subpart_id_or_None][character_id] = set[descriptor_id]
+    # Subpart key is None when the row's subpart endpoint is BLANK BOX.
+    tree: dict[str, dict[str | None, dict[str, set[str]]]] = {}
     for r in rows:
         part = _endpoint_at_position(r, DCD_POS_PART)
         subpart = _endpoint_at_position(r, DCD_POS_SUBPART)
         character = _endpoint_at_position(r, DCD_POS_CHARACTER)
         descriptor = _endpoint_at_position(r, DCD_POS_DESCRIPTOR)
-        # Drop if any referenced Core item is inactive / missing —
-        # those have no entry in the name maps.
-        if (
-            part not in part_names
-            or subpart not in subpart_names
-            or character not in character_names
-            or descriptor not in descriptor_names
-        ):
+        # BLANK BOX at the part level → drop row (no meaningful part
+        # for the SE to pick).
+        if is_blank_box(COSH_PLANT_PARTS_CORE, part):
+            continue
+        # BLANK BOX at the subpart level → collapse to None.
+        if is_blank_box(COSH_PLANT_SUBPARTS_CORE, subpart):
+            subpart = None
+        # Drop if any referenced (non-BLANK-BOX) Core item is
+        # inactive / missing — those have no entry in the name maps.
+        if part not in part_names:
+            continue
+        if subpart is not None and subpart not in subpart_names:
+            continue
+        if character not in character_names:
+            continue
+        if descriptor not in descriptor_names:
             continue
         tree.setdefault(part, {}) \
             .setdefault(subpart, {}) \
@@ -196,10 +219,17 @@ async def list_dus_options_for_crop(
             character_list.sort(key=lambda x: x["character_name_en"].casefold())
             subpart_list.append({
                 "subpart_cosh_id": subpart_id,
-                "subpart_name_en": _name(subpart_names, subpart_id),
+                "subpart_name_en": (
+                    None if subpart_id is None else _name(subpart_names, subpart_id)
+                ),
                 "characters": character_list,
             })
-        subpart_list.sort(key=lambda x: x["subpart_name_en"].casefold())
+        # None (BLANK BOX) subpart sorts first; named subparts after,
+        # alphabetised. The frontend keys on this order.
+        subpart_list.sort(key=lambda x: (
+            0 if x["subpart_cosh_id"] is None else 1,
+            (x["subpart_name_en"] or "").casefold(),
+        ))
         out.append({
             "part_cosh_id": part_id,
             "part_name_en": _name(part_names, part_id),

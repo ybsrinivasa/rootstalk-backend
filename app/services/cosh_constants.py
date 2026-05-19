@@ -164,6 +164,36 @@ DCD_POS_CHARACTER = 4
 DCD_POS_DESCRIPTOR = 5
 
 
+# ── BLANK BOX sentinel UUIDs (canonical) ──────────────────────────────────
+#
+# Cosh's `BLANK BOX` Core item is a sentinel meaning "no relevant
+# data for this field." User-confirmed 2026-05-14 and re-stated
+# 2026-05-19. Treat as null / wildcard at filter time; never
+# surface to users as a pickable option. See
+# `feedback_cosh_blank_box_sentinel.md` for the rule.
+#
+# This is the canonical dict — services walking Cosh Connects
+# should normalise matching endpoints to None before building any
+# picker tree or filter index. Mirror of the older
+# `PD_BLANK_BOX_BY_CORE` in pest_diagnosis_view (which predates
+# this file; the dict there is the authoritative seed and is kept
+# in sync manually).
+COSH_BLANK_BOX_BY_CORE: dict[str, str] = {
+    "plant_parts":        "15d12e37-9309-4899-ad7b-801bc8bb0a65",
+    "plant_subparts":     "9cba3894-6022-4f9d-9aa7-b8685f567b74",
+    "damage_subsymptoms": "818bb871-ff52-4fb0-a95d-3d80ff40bb43",
+    "crop_stages":        "c15d78e4-7f46-421b-9a9f-10ce080c45e3",
+}
+
+
+def is_blank_box(core_type: str, cosh_id: str | None) -> bool:
+    """True iff `cosh_id` is the BLANK BOX sentinel for `core_type`.
+    Returns False for unknown Cores, missing sentinels, or None ids."""
+    if not cosh_id:
+        return False
+    return COSH_BLANK_BOX_BY_CORE.get(core_type) == cosh_id
+
+
 # ── Pest Diagnosis (synced 2026-05-14) ────────────────────────────────────
 #
 # Cosh ships one Connect — `pest_diagnosis` — that's 9 endpoints wide
