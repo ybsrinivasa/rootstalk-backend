@@ -80,6 +80,15 @@ class PackageOut(BaseModel):
     version: int
     published_at: Optional[datetime] = None
     created_at: datetime
+    # Batch FF (2026-05-19) — footprint/crop cascade audit fields.
+    # `cascade_inactivated_reason` is set ONLY when status went
+    # INACTIVE because of a cascade; cleared on republish.
+    # `last_cascade_at` fires on every cascade event (including a
+    # SHRINK that didn't flip status), so the package detail can
+    # render a "footprint changed; review" banner regardless of
+    # whether status changed.
+    cascade_inactivated_reason: Optional[str] = None
+    last_cascade_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

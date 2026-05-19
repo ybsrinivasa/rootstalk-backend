@@ -122,6 +122,14 @@ class Package(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
     cascade_inactivated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Batch FF (2026-05-19) — distinguishes crop-cascade from
+    # locations-cascade since both stamp `cascade_inactivated_at`.
+    # Values: "crop_removed_from_belt" | "locations_cleared_by_cascade".
+    cascade_inactivated_reason: Mapped[str] = mapped_column(String(64), nullable=True)
+    # Fires on EVERY footprint cascade event, including a SHRINK that
+    # left other locations standing. Drives the package detail banner
+    # so the SE knows their footprint changed even when status didn't.
+    last_cascade_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Multi-row versioning (2026-05-11). NULL on pre-migration rows;
     # populated on every newly created row from this point on.

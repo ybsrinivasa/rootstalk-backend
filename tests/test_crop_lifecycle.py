@@ -19,10 +19,21 @@ from app.services.crop_lifecycle import (
 )
 
 
-def _pkg(status: PackageStatus, cascade_at=None, crop_cosh_id="crop:test") -> SimpleNamespace:
-    """Stand-in for an ORM Package — only the fields the service touches."""
+def _pkg(
+    status: PackageStatus, cascade_at=None,
+    cascade_reason=None, last_cascade_at=None,
+    crop_cosh_id="crop:test",
+) -> SimpleNamespace:
+    """Stand-in for an ORM Package — only the fields the service touches.
+    Batch FF (2026-05-19) added cascade_inactivated_reason +
+    last_cascade_at; the stub now mirrors those so the asymmetric
+    revive rule (don't auto-revive locations-cascaded INACTIVE) can
+    be exercised."""
     return SimpleNamespace(
-        status=status, cascade_inactivated_at=cascade_at,
+        status=status,
+        cascade_inactivated_at=cascade_at,
+        cascade_inactivated_reason=cascade_reason,
+        last_cascade_at=last_cascade_at,
         crop_cosh_id=crop_cosh_id,
     )
 
@@ -36,6 +47,10 @@ def test_cascade_flips_active_to_inactive_with_timestamp():
     assert changed == [p]
     assert p.status == PackageStatus.INACTIVE
     assert p.cascade_inactivated_at == now
+    # Batch FF: crop cascade stamps the reason + last_cascade_at so
+    # the package detail can distinguish it from a locations cascade.
+    assert p.cascade_inactivated_reason == "crop_removed_from_belt"
+    assert p.last_cascade_at == now
 
 
 def test_cascade_skips_already_inactive():
@@ -106,6 +121,32 @@ def test_restore_clears_timestamp():
     )
     restore_cascade_inactivated_packages([p])
     assert p.cascade_inactivated_at is None
+
+
+def test_restore_skips_locations_cascade_inactivations():
+    """Batch FF (2026-05-19): a package that went INACTIVE because
+    its locations were cleared by a footprint cascade is NOT auto-
+    revived when the CA later re-adds a related crop. Locations
+    don't auto-restore — the SE must add new locations + Publish.
+    Only crop-cascade inactivations revive on crop re-add."""
+    locations_cascaded = _pkg(
+        PackageStatus.INACTIVE,
+        cascade_at=datetime(2026, 5, 19, 12, 0, tzinfo=timezone.utc),
+        cascade_reason="locations_cleared_by_cascade",
+    )
+    crop_cascaded = _pkg(
+        PackageStatus.INACTIVE,
+        cascade_at=datetime(2026, 5, 6, 12, 0, tzinfo=timezone.utc),
+        cascade_reason="crop_removed_from_belt",
+    )
+    changed = restore_cascade_inactivated_packages(
+        [locations_cascaded, crop_cascaded],
+    )
+    assert changed == [crop_cascaded]
+    assert locations_cascaded.status == PackageStatus.INACTIVE
+    assert locations_cascaded.cascade_inactivated_at is not None
+    assert crop_cascaded.status == PackageStatus.ACTIVE
+    assert crop_cascaded.cascade_inactivated_reason is None
 
 
 def test_restore_leaves_drafts_alone():

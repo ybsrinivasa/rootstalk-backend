@@ -1185,6 +1185,14 @@ async def publish_package(
     pkg.status = PackageStatus.ACTIVE
     pkg.published_at = datetime.now(timezone.utc)
     pkg.published_by = current_user.id
+    # Batch FF (2026-05-19): clear cascade-inactivation stamps when
+    # an SE successfully republishes a package that had been
+    # auto-INACTIVATED by a footprint or crop cascade. The package is
+    # now a normal ACTIVE row. `last_cascade_at` stays set so the
+    # package-detail banner can keep nudging the SE until they
+    # dismiss it client-side.
+    pkg.cascade_inactivated_at = None
+    pkg.cascade_inactivated_reason = None
     await db.commit()
     await db.refresh(pkg)
     return pkg

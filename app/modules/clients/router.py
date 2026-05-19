@@ -747,21 +747,50 @@ async def add_location(
 async def set_client_locations(
     client_id: str,
     pairs: list[LocationCreate],
+    force: bool = False,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Atomic replace of the company's location footprint. Wipes
-    existing ACTIVE rows and inserts the supplied set. The legacy
-    row-by-row POST/DELETE endpoints stay live for backward compat;
-    the new state-grouped picker on Setup uses this PUT for a single
-    submit. Duplicates in the input are de-duped silently.
+    existing ACTIVE rows and inserts the supplied set.
 
-    Dropping ACTIVE rows here does not cascade — PackageLocation
-    rows that referenced a removed district stay intact. The package
-    detail's Locations panel may then show districts that fell out
-    of the footprint; surfacing that drift is a follow-up (Setup
-    should warn the CA before they remove a district that an active
-    package targets)."""
+    Batch FF (2026-05-19): the package-footprint boundary is now
+    strict. Districts removed by this PUT cascade into matching
+    `package_locations` rows — they are hard-deleted. A package left
+    with zero locations is auto-INACTIVATED with a stamped reason.
+
+    Without `?force=true`, an impact-causing diff first returns 422
+    `footprint_cascade_confirmation_required` so the CA portal can
+    show "N packages will shrink, M will inactivate. Continue?"
+    Re-sending with `force=true` executes the cascade.
+
+    Add-only diffs (no removals) skip the confirmation gate."""
+    from app.services.footprint_cascade import (
+        diff_footprint_and_cascade,
+        FootprintCascadeConfirmationRequired,
+    )
+
+    new_pairs: set[tuple[str, str]] = set()
+    for p in pairs:
+        new_pairs.add((p.state_cosh_id, p.district_cosh_id))
+
+    try:
+        await diff_footprint_and_cascade(
+            db, client_id=client_id, new_pairs=new_pairs, force=force,
+        )
+    except FootprintCascadeConfirmationRequired as e:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "footprint_cascade_confirmation_required",
+                "message": (
+                    "Removing these districts will affect existing packages. "
+                    "Resend with ?force=true to confirm the cascade."
+                ),
+                "impact": e.impact.to_dict(),
+            },
+        )
+
     existing = (await db.execute(
         select(ClientLocation).where(ClientLocation.client_id == client_id)
     )).scalars().all()
@@ -769,33 +798,67 @@ async def set_client_locations(
         await db.delete(row)
     await db.flush()
 
-    seen: set[tuple[str, str]] = set()
-    for p in pairs:
-        key = (p.state_cosh_id, p.district_cosh_id)
-        if key in seen:
-            continue
-        seen.add(key)
+    for state_id, district_id in sorted(new_pairs):
         db.add(ClientLocation(
             client_id=client_id,
-            state_cosh_id=p.state_cosh_id,
-            district_cosh_id=p.district_cosh_id,
+            state_cosh_id=state_id,
+            district_cosh_id=district_id,
             status=StatusEnum.ACTIVE,
         ))
     await db.commit()
-    return {"saved": len(seen)}
+    return {"saved": len(new_pairs)}
 
 
 @router.delete("/client/{client_id}/locations/{location_id}", status_code=204)
 async def remove_location(
     client_id: str, location_id: str,
+    force: bool = False,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Batch FF (2026-05-19): single-row delete now cascades the same
+    way the bulk PUT does. Without `?force=true`, an impact-causing
+    delete returns 422 with the affected-package list; resend with
+    force=true to execute."""
+    from app.services.footprint_cascade import (
+        diff_footprint_and_cascade,
+        FootprintCascadeConfirmationRequired,
+    )
+
     loc = (await db.execute(
         select(ClientLocation).where(ClientLocation.id == location_id, ClientLocation.client_id == client_id)
     )).scalar_one_or_none()
     if not loc:
         raise HTTPException(status_code=404, detail="Location not found")
+
+    current_pairs = {
+        (s, d) for s, d in (await db.execute(
+            select(ClientLocation.state_cosh_id, ClientLocation.district_cosh_id)
+            .where(
+                ClientLocation.client_id == client_id,
+                ClientLocation.status == StatusEnum.ACTIVE,
+            )
+        )).all()
+    }
+    new_pairs = current_pairs - {(loc.state_cosh_id, loc.district_cosh_id)}
+
+    try:
+        await diff_footprint_and_cascade(
+            db, client_id=client_id, new_pairs=new_pairs, force=force,
+        )
+    except FootprintCascadeConfirmationRequired as e:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "footprint_cascade_confirmation_required",
+                "message": (
+                    "Removing this district will affect existing packages. "
+                    "Resend with ?force=true to confirm the cascade."
+                ),
+                "impact": e.impact.to_dict(),
+            },
+        )
+
     await db.delete(loc)
     await db.commit()
 

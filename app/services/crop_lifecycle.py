@@ -101,6 +101,8 @@ def cascade_inactivate_packages_for_crop(
         if pkg.status == PackageStatus.ACTIVE:
             pkg.status = PackageStatus.INACTIVE
             pkg.cascade_inactivated_at = now
+            pkg.cascade_inactivated_reason = "crop_removed_from_belt"
+            pkg.last_cascade_at = now
             changed.append(pkg)
     return changed
 
@@ -117,8 +119,16 @@ def restore_cascade_inactivated_packages(
     """
     changed: list[Package] = []
     for pkg in packages:
-        if pkg.cascade_inactivated_at is not None:
+        # Only revive crop-cascade inactivations. A package that went
+        # INACTIVE because its locations were cleared by cascade
+        # stays INACTIVE — the SE must add new locations and Publish
+        # explicitly (locations don't auto-restore on footprint re-add).
+        if (
+            pkg.cascade_inactivated_at is not None
+            and pkg.cascade_inactivated_reason != "locations_cleared_by_cascade"
+        ):
             pkg.status = PackageStatus.ACTIVE
             pkg.cascade_inactivated_at = None
+            pkg.cascade_inactivated_reason = None
             changed.append(pkg)
     return changed
