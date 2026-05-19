@@ -250,7 +250,12 @@ class ClientUserPrivilegeModel(Base):
         String(36), ForeignKey("users.id"), nullable=False,
     )
     privilege: Mapped[ClientUserPrivilege] = mapped_column(
-        SAEnum(ClientUserPrivilege), nullable=False,
+        SAEnum(
+            ClientUserPrivilege,
+            native_enum=False, length=30,
+            values_callable=lambda e: [m.value for m in e],
+        ),
+        nullable=False,
     )
     granted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow,
