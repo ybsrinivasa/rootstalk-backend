@@ -323,9 +323,13 @@ async def test_delete_cosh_mirrored_variable_refused(db):
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_set_global_package_variables_refuses_custom_parent(db):
-    """Batch EE: set_global_package_variables refuses if any
-    assignment references a Global-Custom Parameter."""
+async def test_set_global_package_variables_allows_legacy_custom_parent(db):
+    """Batch EE-fix (2026-05-19): set_global_package_variables does
+    NOT validate Parameter source or Variable cosh_id. Per-row
+    create/update/delete already refuse new non-Cosh authoring, so
+    the only path for a legacy non-Cosh row to land in the payload
+    is the SA preserving an inherited assignment while editing a
+    Cosh sibling. Refusing that whole save was the wrong tradeoff."""
     user = await make_user(db, name="CM")
     legacy_param = Parameter(
         crop_cosh_id="crop:tomato", client_id=None,
@@ -337,24 +341,22 @@ async def test_set_global_package_variables_refuses_custom_parent(db):
     db.add(v)
     pkg = await _seed_global_pkg(db, crop="crop:tomato")
     await db.commit()
-    with pytest.raises(HTTPException) as exc:
-        await set_global_package_variables(
-            pkg_id=pkg.id,
-            request=PackageVariableSet(assignments=[
-                {"parameter_id": legacy_param.id, "variable_id": v.id},
-            ]),
-            db=db, current_user=user,
-        )
-    assert exc.value.status_code == 422
-    assert exc.value.detail["code"] == "global_custom_writes_disabled"
+    out = await set_global_package_variables(
+        pkg_id=pkg.id,
+        request=PackageVariableSet(assignments=[
+            {"parameter_id": legacy_param.id, "variable_id": v.id},
+        ]),
+        db=db, current_user=user,
+    )
+    assert "1 parameter-variable assignments saved" in out["detail"]
 
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_set_global_package_variables_refuses_non_cosh_variable(db):
-    """Batch EE: set_global_package_variables refuses if any
-    assigned Variable has no cosh_id (SE-added legacy custom even
-    when sitting on a Cosh parent)."""
+async def test_set_global_package_variables_allows_legacy_se_added_variable(db):
+    """Batch EE-fix: legacy SE-added variables (cosh_id IS NULL) on
+    Cosh parents stay assignable through set_global_package_variables.
+    New non-Cosh variable creation is blocked at the per-row endpoint."""
     user = await make_user(db, name="CM")
     cosh_param = Parameter(
         crop_cosh_id="crop:tomato", client_id=None,
@@ -367,16 +369,14 @@ async def test_set_global_package_variables_refuses_non_cosh_variable(db):
     db.add(legacy_var)
     pkg = await _seed_global_pkg(db, crop="crop:tomato")
     await db.commit()
-    with pytest.raises(HTTPException) as exc:
-        await set_global_package_variables(
-            pkg_id=pkg.id,
-            request=PackageVariableSet(assignments=[
-                {"parameter_id": cosh_param.id, "variable_id": legacy_var.id},
-            ]),
-            db=db, current_user=user,
-        )
-    assert exc.value.status_code == 422
-    assert exc.value.detail["code"] == "global_custom_writes_disabled"
+    out = await set_global_package_variables(
+        pkg_id=pkg.id,
+        request=PackageVariableSet(assignments=[
+            {"parameter_id": cosh_param.id, "variable_id": legacy_var.id},
+        ]),
+        db=db, current_user=user,
+    )
+    assert "1 parameter-variable assignments saved" in out["detail"]
 
 
 # ── Pure-Cosh read + assignment path still works ─────────────────────────

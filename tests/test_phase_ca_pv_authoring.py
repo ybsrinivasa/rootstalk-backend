@@ -477,6 +477,75 @@ async def test_set_package_variables_refuses_sa_added_variable_on_cosh_parent(db
 
 @requires_docker
 @pytest.mark.asyncio
+async def test_set_package_variables_allows_own_cc_custom_under_cosh_parent(db):
+    """Batch CC-fix (2026-05-19): a per-client custom variable
+    (var.client_id stamped to this client) under a Cosh parent is
+    assignable to a Package. The previous visibility check refused
+    every var.cosh_id-NULL row on a Cosh parent, which blocked the
+    Batch CC affordance from completing the save."""
+    client = await make_client(db)
+    user = await _seed_se(db, client)
+    pkg = await _seed_client_pkg(db, client=client)
+    cosh_param = Parameter(
+        crop_cosh_id="crop:tomato", client_id=None,
+        name="Mulch Type", source=ParameterSource.COSH,
+        cosh_id="cosh:mulch_type",
+    )
+    db.add(cosh_param)
+    await db.flush()
+    cc_custom = Variable(
+        parameter_id=cosh_param.id, name="BioMulch",
+        cosh_id=None, client_id=client.id,
+    )
+    db.add(cc_custom)
+    await db.commit()
+    out = await set_package_variables(
+        client_id=client.id, package_id=pkg.id,
+        request=PackageVariableSet(
+            assignments=[{"parameter_id": cosh_param.id, "variable_id": cc_custom.id}],
+        ),
+        db=db, current_user=user,
+    )
+    assert "1 parameter-variable assignments saved" in out["detail"]
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_set_package_variables_refuses_other_client_cc_custom(db):
+    """Cross-client isolation still holds: a CC custom variable
+    stamped to a different client (var.client_id != this client_id)
+    stays invisible and unassignable here."""
+    me = await make_client(db)
+    other = await make_client(db)
+    user = await _seed_se(db, me)
+    pkg = await _seed_client_pkg(db, client=me)
+    cosh_param = Parameter(
+        crop_cosh_id="crop:tomato", client_id=None,
+        name="Mulch Type", source=ParameterSource.COSH,
+        cosh_id="cosh:mulch_type",
+    )
+    db.add(cosh_param)
+    await db.flush()
+    other_cc = Variable(
+        parameter_id=cosh_param.id, name="OtherClientBioMulch",
+        cosh_id=None, client_id=other.id,
+    )
+    db.add(other_cc)
+    await db.commit()
+    with pytest.raises(HTTPException) as exc:
+        await set_package_variables(
+            client_id=me.id, package_id=pkg.id,
+            request=PackageVariableSet(
+                assignments=[{"parameter_id": cosh_param.id, "variable_id": other_cc.id}],
+            ),
+            db=db, current_user=user,
+        )
+    assert exc.value.status_code == 403
+    assert exc.value.detail["code"] == "variable_not_visible"
+
+
+@requires_docker
+@pytest.mark.asyncio
 async def test_delete_client_variable_blocked_when_in_use(db):
     client = await make_client(db)
     user = await _seed_se(db, client)

@@ -1896,8 +1896,16 @@ async def set_package_variables(
                 "code": "variable_not_found",
                 "message": f"Variable {a['variable_id']} not found under parameter.",
             })
-        if param.client_id is None and var.cosh_id is None:
-            # SA-added variable on a Cosh parent — invisible to CA.
+        if (
+            param.client_id is None
+            and var.cosh_id is None
+            and var.client_id != client_id
+        ):
+            # SA-added or other-client custom variable on a Cosh parent.
+            # Batch CC (2026-05-19): this client's OWN customs under
+            # Cosh parents are visible and assignable; only SA-added
+            # legacy (var.client_id IS NULL) and cross-client rows
+            # stay hidden here.
             raise HTTPException(status_code=403, detail={
                 "code": "variable_not_visible",
                 "message": "Variable not visible to this client.",
@@ -4694,31 +4702,12 @@ async def set_global_package_variables(
     )).scalar_one_or_none()
     if pkg is None:
         raise HTTPException(status_code=404, detail="Global package not found")
-    # Batch EE: every assigned (parameter, variable) must be
-    # Cosh-sourced. Reject when the request still references a
-    # legacy Global-Custom Parameter or a non-Cosh Variable. The
-    # frontend already hides those affordances (Batch DD); this
-    # closes the direct-API surface too.
-    param_ids = list({a["parameter_id"] for a in request.assignments})
-    var_ids = list({a["variable_id"] for a in request.assignments})
-    if param_ids:
-        params = (await db.execute(
-            select(Parameter.id, Parameter.source).where(
-                Parameter.id.in_(param_ids),
-            )
-        )).all()
-        non_cosh = [pid for pid, src in params if src != ParameterSource.COSH]
-        if non_cosh:
-            _refuse_global_custom_write()
-    if var_ids:
-        vars_meta = (await db.execute(
-            select(Variable.id, Variable.cosh_id).where(
-                Variable.id.in_(var_ids),
-            )
-        )).all()
-        non_cosh_var = [vid for vid, cid in vars_meta if cid is None]
-        if non_cosh_var:
-            _refuse_global_custom_write()
+    # Batch EE: per-row create/update/delete already refuse new
+    # non-Cosh Parameters/Variables at SA scope, so there is no
+    # path to introduce a new non-Cosh row. The assignment payload
+    # may still reference legacy Global-Custom rows the SA inherited;
+    # let those re-assignments through so the user can save other
+    # edits without first manually clearing every legacy chip.
     existing = (await db.execute(
         select(PackageVariable).where(PackageVariable.package_id == pkg_id)
     )).scalars().all()
