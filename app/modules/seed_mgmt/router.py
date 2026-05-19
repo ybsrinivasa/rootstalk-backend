@@ -123,6 +123,131 @@ async def _assert_can_manage_seed_varieties(
     })
 
 
+# ── Assignable packages for a variety (Batch Y, 2026-05-19) ─────────────────
+
+@router.get("/client/{client_id}/seed/assignable-packages")
+async def list_assignable_packages(
+    client_id: str,
+    crop_cosh_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Packages on this crop the SE can assign a variety to, with
+    everything the variety form's "Sold via Packages" picker needs
+    inline:
+
+      * id, name, status (DRAFT or ACTIVE only; INACTIVE skipped),
+        package_type, duration_days
+      * locations: list of {state_cosh_id, state_name_en,
+        district_cosh_id, district_name_en} — friendly names
+        resolved from Cosh `state_list` / `district_list` Cores.
+      * parameters: list of {parameter_id, parameter_name_en,
+        variables: [{variable_id, variable_name_en}]} grouped by
+        parameter — feeds the P-V details disclosure.
+
+    One round-trip so the picker can render cards + filter by
+    district without chatty per-package fetches.
+    """
+    await _assert_can_manage_seed_varieties(db, current_user.id, client_id)
+
+    from app.modules.advisory.models import (
+        Package, PackageLocation, PackageVariable, Parameter, Variable,
+    )
+    from app.modules.sync.models import CoshCoreItem
+
+    pkgs = (await db.execute(
+        select(Package).where(
+            Package.client_id == client_id,
+            Package.crop_cosh_id == crop_cosh_id,
+            Package.status.in_(("DRAFT", "ACTIVE")),
+        ).order_by(Package.name)
+    )).scalars().all()
+    if not pkgs:
+        return []
+
+    pkg_ids = [p.id for p in pkgs]
+
+    # Locations (joined to grab raw state/district cosh_ids).
+    loc_rows = (await db.execute(
+        select(PackageLocation).where(
+            PackageLocation.package_id.in_(pkg_ids),
+        )
+    )).scalars().all()
+    locs_by_pkg: dict[str, list] = {p.id: [] for p in pkgs}
+    cosh_ids_needed: set[str] = set()
+    for l in loc_rows:
+        locs_by_pkg.setdefault(l.package_id, []).append(l)
+        if l.state_cosh_id:
+            cosh_ids_needed.add(l.state_cosh_id)
+        if l.district_cosh_id:
+            cosh_ids_needed.add(l.district_cosh_id)
+
+    # Resolve state/district friendly names from Cosh Core in one shot.
+    cosh_names: dict[str, str] = {}
+    if cosh_ids_needed:
+        cores = (await db.execute(
+            select(CoshCoreItem).where(
+                CoshCoreItem.cosh_id.in_(cosh_ids_needed),
+                CoshCoreItem.core_type.in_(("state_list", "district_list")),
+                CoshCoreItem.status == "active",
+            )
+        )).scalars().all()
+        for c in cores:
+            t = c.translations or {}
+            cosh_names[c.cosh_id] = t.get("en") or t.get("English") or c.cosh_id
+
+    # P-V wiring: PackageVariable links a package to a (parameter, variable).
+    pv_rows = (await db.execute(
+        select(PackageVariable, Parameter, Variable)
+        .join(Parameter, Parameter.id == PackageVariable.parameter_id)
+        .join(Variable, Variable.id == PackageVariable.variable_id)
+        .where(PackageVariable.package_id.in_(pkg_ids))
+    )).all()
+    # pvs_by_pkg[pkg_id] = {parameter_id: {"name": ..., "variables": [(vid,name)]}}
+    pvs_by_pkg: dict[str, dict] = {p.id: {} for p in pkgs}
+    for pv, param, var in pv_rows:
+        bucket = pvs_by_pkg.setdefault(pv.package_id, {})
+        slot = bucket.setdefault(param.id, {
+            "parameter_id": param.id,
+            "parameter_name_en": param.name,
+            "variables": [],
+        })
+        slot["variables"].append({
+            "variable_id": var.id,
+            "variable_name_en": var.name,
+        })
+
+    out = []
+    for p in pkgs:
+        out.append({
+            "id": p.id,
+            "name": p.name,
+            "status": p.status,
+            "package_type": p.package_type,
+            "duration_days": p.duration_days,
+            "locations": [
+                {
+                    "state_cosh_id": l.state_cosh_id,
+                    "state_name_en": cosh_names.get(l.state_cosh_id, l.state_cosh_id),
+                    "district_cosh_id": l.district_cosh_id,
+                    "district_name_en": cosh_names.get(l.district_cosh_id, l.district_cosh_id),
+                }
+                for l in sorted(
+                    locs_by_pkg.get(p.id, []),
+                    key=lambda x: (
+                        (cosh_names.get(x.state_cosh_id, "") or "").casefold(),
+                        (cosh_names.get(x.district_cosh_id, "") or "").casefold(),
+                    ),
+                )
+            ],
+            "parameters": sorted(
+                list(pvs_by_pkg.get(p.id, {}).values()),
+                key=lambda x: (x["parameter_name_en"] or "").casefold(),
+            ),
+        })
+    return out
+
+
 # ── DUS options lookup (Batch W, 2026-05-19) ────────────────────────────────
 
 @router.get("/client/{client_id}/seed/dus-options")
