@@ -316,6 +316,87 @@ PYTHON_L2_TO_COSH_UUID: dict[str, str] = {
     "SOIL_AMENDMENTS":                          "bed6a3e5-3844-48ad-b25e-f56792966fd7",
     "CHEMICAL_FERTILIZERS_NPK_DOSAGES":         "249c5760-341f-406e-9105-a570b166506c",
     "FERTIGATION_NPK_DOSAGES":                  "b7f34666-9bcd-4e9d-bfa7-99ea6446d8f2",
+
+    # ── §2.6 NON-INPUT / Spacing + Seed Treatment Physical (Batch AA, 2026-05-19)
+    # User-flagged 2026-05-19: Units-related info wasn't populated for
+    # non-input practices. Root cause was this map missing the non-input
+    # L2 → Cosh UUID rows — `list_units_for_l2` returned [] for any L2
+    # not in the dict. The `l2_units_unittypes` Connect has rows for all
+    # of these; resolving the slug → UUID lookup unblocks the dropdown.
+    "SPACING_PLANT_TO_PLANT":     "86a1f009-3838-4dc1-a61e-be3a9fb1f68d",
+    "SPACING_ROW_TO_ROW":         "f7db24aa-3a81-4f80-acb8-4265be6489b1",
+    "SEED_TREATMENT_HOT_WATER":   "b78525ea-6561-4e79-a4f7-0422484a377b",
+    "SEED_TREATMENT_HOT_AIR":     "44e6852a-1b6c-4f5a-ba45-75342c7b9358",
+    "SEED_TREATMENT_COLD":        "5e5dba09-5b51-450a-b8a2-b980c59c9d58",
+    "SEED_TREATMENT_BOILING":     "1b217746-2022-4119-aefe-5f5efe733175",
+    "SEED_TREATMENT_SOAKING":     "740df3a5-2a5d-4d64-bc42-6039dd773a37",
+    "SEED_TREATMENT_SUN_DRYING":  "f22f39df-8b35-49b4-84a5-106fb10d76f9",
+    "SEED_TREATMENT_SHADE_DRYING":"e4eb2248-fb61-4329-873c-94a440fd73e6",
+
+    # ── §2.6 NON-INPUT / Sowing/Planting Methods
+    "SOWING_LINE":          "c424dd0f-0c15-4d23-8d6e-76682cb7bfd4",
+    "SOWING_BROADCASTING":  "690a0c51-4343-419c-8dc3-fb692e40a245",
+    "SOWING_DIBBLING":      "1a92deaa-056f-4f48-a9e4-482d9defeed6",
+    "SOWING_DRILLING":      "301e5854-bd44-45da-9f18-e496d36fa96a",
+    "SOWING_TRANSPLANTING": "bc897c1d-f47b-422f-bd4f-2829c79cf874",
+    "SOWING_HILL_DROPPING": "341ead61-0da1-483f-8069-f513631c82bc",
+    "SOWING_CHECK_ROW":     "059aaa20-448f-4e61-96d5-98267ce029b3",
+    "SOWING_PRO_TRAY":      "c6bb8707-590f-4794-9a2a-71f4c01968ce",
+    "SOWING_RAISED_BEDS":   "86d46efc-2b86-4648-b414-95737320ebb0",
+    "SOWING_PIT_METHOD":    "e4683395-b941-4e00-b243-7c5d373fc2f7",
+
+    # ── §2.6 NON-INPUT / Other Non-Inputs
+    "PLANTING_MATERIAL_QUANTITY": "41658881-30bf-4baf-9cf0-c410f5d01d98",
+    "PLANTING_SQUARE":            "4c2b3b2b-459b-4acd-85da-9d46d95abf08",
+    "PLANTING_RECTANGULAR":       "e525ec7f-3ca7-4359-8ffa-f864717d4ffb",
+    "PLANTING_TRIANGULAR":        "5c035605-6e2f-4982-81aa-155ff3a72e83",
+    "PLANTING_HEXAGONAL":         "5f0351e6-fe5a-4c98-99c1-10683e4f31bd",
+    "PLANTING_QUINCUNX":          "37c44217-7167-40f6-abd8-52f9925ea0ac",
+    "CONTOUR_SYSTEM":             "cddaf342-583a-41e2-92e0-acf350698bcf",
+    "ITKS":                       "22a3a5e1-cab9-4e36-8a26-715d90c8e086",
+
+    # Irrigation L2s (frequency-based). Furrow / Flood / Basin don't
+    # currently appear in the l2_units_unittypes Connect — their rule
+    # book entries don't have unit-typed fields. Mapped anyway so future
+    # Cosh additions surface without another code change.
+    "WATER_DRIP":      "192eb9fb-ada5-4773-b2c9-c2b413ba1174",
+    "WATER_SPRINKLER": "53decf29-04e3-4640-8cb2-bd87d9ffbad6",
+    "WATER_FURROW":    "c6a7f6ba-8352-4fdd-8600-0187ee13a247",
+    "WATER_FLOOD":     "295f1ba9-06ed-404d-ba0e-1cac4de0321e",
+    "WATER_BASIN":     "8f4ee59e-5970-487b-bf57-fd9f3bd6a6a0",
+
+    "WEED_MANUAL":     "dc23865d-fb2d-482e-94fb-084752b1945b",
+
+    "CULTURAL_THINNING":              "c83733b3-b8a4-40c1-9a5b-8ddb935d9436",
+    "CULTURAL_GAP_FILLING":           "6ec45032-106b-4339-bf38-848e68cbc069",
+    # CULTURAL_EARTHING_UP — not yet in Cosh sync; will resolve to None
+    # in _l2_uuid and the units dropdown will stay empty for it.
+    "CULTURAL_TOP_DRESSING":          "daccb959-d2e8-4b30-a29a-cf5ee36bad8d",
+    "CULTURAL_STAKING":               "a65e02df-26e6-43f2-b144-df0f53256427",
+    "CULTURAL_ARTIFICIAL_POLLINATION":"c176010d-d357-43e4-b9f7-60394fcc2711",
+    "CULTURAL_TRAINING":              "51d9cf66-ad1e-445a-92d9-c074f2ee0f63",
+    "CULTURAL_PRUNING":               "f628bc11-7c4c-4165-9c82-720c92375fec",
+    "CULTURAL_SHADE_MANAGEMENT":      "95fc1732-f067-448e-a986-1eb5b9aa2546",
+    "CULTURAL_WIND_BREAKS":           "ea709d94-a81c-4976-a8d4-4e224225684c",
+    "CULTURAL_DEFLOWERING":           "cfb80c0e-d38a-46fe-ae32-ad146c61d8e3",
+    "CULTURAL_NIPPING_PINCHING":      "594b7703-ce76-403e-a16a-1b7e21cae50e",
+    "CULTURAL_DESHOOTING":            "932b6cfa-409b-44cb-8ac5-5bca33281eab",
+    "CULTURAL_DESUCKERING":           "169091fe-14c3-4b90-86c7-775ed536ef76",
+
+    "HARVESTING_MANUAL":          "3b519992-52fb-4406-9182-f53dc3061ca0",
+
+    "POST_HARVEST_DEHULLING":     "53b06365-400e-4c92-892f-ff32b284141c",
+    "POST_HARVEST_DEHUSKING":     "543ce5dc-034a-45bc-9107-4fa9597c7cbd",
+    "POST_HARVEST_SHELLING":      "dae94293-e82e-45ac-807f-dc162a8333ad",
+    "POST_HARVEST_DRYING":        "7c4e05e2-0e33-4a25-8864-2b27968b2cbf",
+    "POST_HARVEST_CURING":        "dc6b4ff7-7b97-4bd6-b2b6-950ab9e7a71e",
+    "POST_HARVEST_WINNOWING":     "5321d916-2c94-4d4f-86ff-814b1c9a023b",
+    "POST_HARVEST_CLEANING":      "a7d55c82-4475-4ce6-8a92-85e08c3cb28c",
+    "POST_HARVEST_TRIMMING":      "2b82460c-9d0c-4a4f-aca2-e9cf9282adc7",
+    "POST_HARVEST_SORTING":       "b863efb3-237e-4d8f-a463-45f49e866d74",
+    "POST_HARVEST_GRADING":       "a2d69622-9b74-4064-9bda-4810a03893c7",
+    "POST_HARVEST_PACKING":       "21adf2f2-e409-42c1-8a06-961c2bff8b31",
+    "POST_HARVEST_COLD_STORAGE":  "96222fd5-d8e1-40c9-8cb6-95cd49c7c601",
 }
 
 
