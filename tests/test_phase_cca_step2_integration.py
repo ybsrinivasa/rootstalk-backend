@@ -21,6 +21,7 @@ from app.modules.advisory.router import (
     create_package, update_package, set_package_locations,
     set_package_variables, publish_package,
     list_package_authors, set_package_authors,
+    list_package_locations,
 )
 from app.modules.advisory.schemas import (
     PackageCreate, PackageUpdate,
@@ -1486,3 +1487,72 @@ async def test_publish_inactive_sibling_not_considered(db):
         db=db, current_user=user,
     )
     assert out.status == PackageStatus.ACTIVE
+
+
+# ── list_package_locations name resolution (2026-05-19 prod fix) ──────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_list_package_locations_resolves_names_from_cosh_core(db):
+    """Names come from cosh_core_items (full Cosh India universe),
+    not from the company's ClientLocation footprint, so a package
+    keeps rendering district names even after the CA narrows the
+    footprint and orphans the PackageLocations."""
+    from app.modules.sync.models import CoshCoreItem
+
+    client = await make_client(db)
+    user = await make_user(db, name="Expert")
+    await _seed_paddy_on_belt(db, client, user)
+    pkg, _ = await _create_two_packages(db, client=client, user=user)
+
+    state_id = "state:karnataka-test-uuid"
+    dist_id = "district:bagalkot-test-uuid"
+    db.add(CoshCoreItem(
+        cosh_id=state_id, core_type="state_list",
+        translations={"en": "Karnataka"},
+    ))
+    db.add(CoshCoreItem(
+        cosh_id=dist_id, core_type="district_list",
+        translations={"en": "Bagalkot"},
+    ))
+    db.add(PackageLocation(
+        package_id=pkg.id, state_cosh_id=state_id, district_cosh_id=dist_id,
+    ))
+    await db.commit()
+
+    out = await list_package_locations(
+        client_id=client.id, package_id=pkg.id,
+        db=db, current_user=user,
+    )
+    assert len(out) == 1
+    assert out[0]["state_cosh_id"] == state_id
+    assert out[0]["state_name"] == "Karnataka"
+    assert out[0]["district_cosh_id"] == dist_id
+    assert out[0]["district_name"] == "Bagalkot"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_list_package_locations_names_null_when_cosh_missing(db):
+    """If cosh_core_items hasn't synced a state/district yet, the
+    name fields are null and the frontend renders '(unnamed …)'.
+    Pending-sync rows must not break the read."""
+    client = await make_client(db)
+    user = await make_user(db, name="Expert")
+    await _seed_paddy_on_belt(db, client, user)
+    pkg, _ = await _create_two_packages(db, client=client, user=user)
+
+    db.add(PackageLocation(
+        package_id=pkg.id,
+        state_cosh_id="state:pending-sync",
+        district_cosh_id="district:pending-sync",
+    ))
+    await db.commit()
+
+    out = await list_package_locations(
+        client_id=client.id, package_id=pkg.id,
+        db=db, current_user=user,
+    )
+    assert len(out) == 1
+    assert out[0]["state_name"] is None
+    assert out[0]["district_name"] is None

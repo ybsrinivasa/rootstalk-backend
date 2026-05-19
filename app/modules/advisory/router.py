@@ -1197,18 +1197,46 @@ async def list_package_locations(
     current_user: User = Depends(get_current_user),
 ):
     """List the state/district pairs this Package is configured to
-    serve. Read-only; mutations go through PUT below."""
+    serve. Read-only; mutations go through PUT below.
+
+    Each row carries the resolved English name alongside the
+    cosh_id. Names come from `cosh_core_items` (the full Cosh India
+    universe), NOT from the company's ClientLocation footprint, so
+    a package keeps rendering district names even after the CA
+    narrows the footprint and orphans existing PackageLocations
+    relative to the picker universe. (Display universe ≠ picker
+    universe; the picker continues to use
+    `/client/{cid}/location-options-for-package`.)
+    """
+    from app.modules.sync.models import CoshCoreItem
+
     await _assert_can_view_client_advisory(db, current_user.id, client_id)
     await _get_package(db, package_id, client_id)
     rows = (await db.execute(
         select(PackageLocation).where(PackageLocation.package_id == package_id)
         .order_by(PackageLocation.state_cosh_id, PackageLocation.district_cosh_id)
     )).scalars().all()
+    if not rows:
+        return []
+    needed = {r.state_cosh_id for r in rows} | {r.district_cosh_id for r in rows}
+    cores = (await db.execute(
+        select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
+        .where(
+            CoshCoreItem.cosh_id.in_(needed),
+            CoshCoreItem.core_type.in_(["state_list", "district_list"]),
+        )
+    )).all()
+    name_by_id: dict[str, str | None] = {}
+    for cosh_id, translations in cores:
+        name = (translations or {}).get("en") if isinstance(translations, dict) else None
+        name_by_id[cosh_id] = name
     return [
         {
             "id": r.id,
             "state_cosh_id": r.state_cosh_id,
+            "state_name": name_by_id.get(r.state_cosh_id),
             "district_cosh_id": r.district_cosh_id,
+            "district_name": name_by_id.get(r.district_cosh_id),
         }
         for r in rows
     ]
