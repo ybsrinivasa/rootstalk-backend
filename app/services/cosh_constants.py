@@ -420,10 +420,26 @@ UNIT_TYPE_SLUG_TO_COSH_UUIDS: dict[str, list[str]] = {
     ],
     "volume_unit":      ["0462580b-0c2f-4607-ace5-76a00055c3db"],
     "temperature_unit": ["0d433397-7998-4c52-b469-d5ac6645570d"],
-    "distance_unit":    ["bd97312b-c5f1-42f3-b529-c1a81b33e45c"],
+    # The rule book uses the single `distance_unit` slug for every
+    # distance-y field (DISTANCE_UNIT, DEPTH_UNIT, SIZE_UNIT,
+    # SPACING_BETWEEN_BEDS_UNIT etc.) because the physical units are
+    # the same (cm, inch, m, …). Cosh's `unit_types` Core splits them
+    # into Distance / Depth / Size as separate categories, so the
+    # slug must include all three Cosh UUIDs — otherwise Sowing-depth
+    # rows tagged with "Depth Unit" and Raised-bed rows tagged with
+    # "Size Unit" never surface in the dropdown (Batch AA-1,
+    # 2026-05-19 — user-flagged: Line Sowing rows showed empty).
+    "distance_unit": [
+        "bd97312b-c5f1-42f3-b529-c1a81b33e45c",  # Distance Unit
+        "75d2d141-b711-4174-bc6d-50e95c007f2e",  # Depth Unit
+        "621b95a4-08a9-456d-9ba5-e158e16052db",  # Size Unit
+    ],
     "time_unit":        ["7fd6e2aa-e5be-4517-8c09-ad6a28f8ad72"],
     "number_unit":      ["5abe34c0-2dec-46ec-89cb-d8f1a683525f"],
     "irrigation_unit":  ["e1458bd8-4be7-43b5-9bb0-6c24447e6a0d"],
+    # `size_unit` and `depth_unit` slugs kept as alternates in case
+    # a future rule-book entry wants a narrower scope. Today they're
+    # unused — every distance-y field maps to `distance_unit` above.
     "size_unit":        ["621b95a4-08a9-456d-9ba5-e158e16052db"],
     "depth_unit":       ["75d2d141-b711-4174-bc6d-50e95c007f2e"],
 }
