@@ -104,12 +104,17 @@ def test_restore_revives_only_cascade_marked():
     cascade_marked = _pkg(
         PackageStatus.INACTIVE,
         cascade_at=datetime(2026, 5, 6, 12, 0, tzinfo=timezone.utc),
+        last_cascade_at=datetime(2026, 5, 6, 12, 0, tzinfo=timezone.utc),
     )
     independent = _pkg(PackageStatus.INACTIVE, cascade_at=None)
     changed = restore_cascade_inactivated_packages([cascade_marked, independent])
     assert changed == [cascade_marked]
     assert cascade_marked.status == PackageStatus.ACTIVE
     assert cascade_marked.cascade_inactivated_at is None
+    # Batch II: last_cascade_at clears too on revive so the package
+    # detail banner doesn't keep nudging the SE about an already-
+    # resolved cascade.
+    assert cascade_marked.last_cascade_at is None
     assert independent.status == PackageStatus.INACTIVE
     assert independent.cascade_inactivated_at is None
 
@@ -118,9 +123,11 @@ def test_restore_clears_timestamp():
     p = _pkg(
         PackageStatus.INACTIVE,
         cascade_at=datetime(2026, 5, 6, 12, 0, tzinfo=timezone.utc),
+        last_cascade_at=datetime(2026, 5, 6, 12, 0, tzinfo=timezone.utc),
     )
     restore_cascade_inactivated_packages([p])
     assert p.cascade_inactivated_at is None
+    assert p.last_cascade_at is None
 
 
 def test_restore_skips_locations_cascade_inactivations():
@@ -133,11 +140,13 @@ def test_restore_skips_locations_cascade_inactivations():
         PackageStatus.INACTIVE,
         cascade_at=datetime(2026, 5, 19, 12, 0, tzinfo=timezone.utc),
         cascade_reason="locations_cleared_by_cascade",
+        last_cascade_at=datetime(2026, 5, 19, 12, 0, tzinfo=timezone.utc),
     )
     crop_cascaded = _pkg(
         PackageStatus.INACTIVE,
         cascade_at=datetime(2026, 5, 6, 12, 0, tzinfo=timezone.utc),
         cascade_reason="crop_removed_from_belt",
+        last_cascade_at=datetime(2026, 5, 6, 12, 0, tzinfo=timezone.utc),
     )
     changed = restore_cascade_inactivated_packages(
         [locations_cascaded, crop_cascaded],
@@ -145,8 +154,12 @@ def test_restore_skips_locations_cascade_inactivations():
     assert changed == [crop_cascaded]
     assert locations_cascaded.status == PackageStatus.INACTIVE
     assert locations_cascaded.cascade_inactivated_at is not None
+    # locations-cascade keeps its last_cascade_at — the banner must
+    # still nudge the SE that recovery is required.
+    assert locations_cascaded.last_cascade_at is not None
     assert crop_cascaded.status == PackageStatus.ACTIVE
     assert crop_cascaded.cascade_inactivated_reason is None
+    assert crop_cascaded.last_cascade_at is None
 
 
 def test_restore_leaves_drafts_alone():

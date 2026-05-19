@@ -130,5 +130,12 @@ def restore_cascade_inactivated_packages(
             pkg.status = PackageStatus.ACTIVE
             pkg.cascade_inactivated_at = None
             pkg.cascade_inactivated_reason = None
+            # Batch II (2026-05-19): clear last_cascade_at on revive
+            # too. The package is fully recovered; the banner has
+            # nothing useful left to say, and leaving the stamp
+            # would surface the wrong (amber "footprint updated")
+            # copy on a package whose actual recent event was a
+            # crop removal/re-add, not a location change.
+            pkg.last_cascade_at = None
             changed.append(pkg)
     return changed

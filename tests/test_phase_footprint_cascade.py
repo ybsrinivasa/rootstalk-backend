@@ -282,3 +282,70 @@ async def test_remove_location_returns_422_then_succeeds_with_force(db):
     await db.refresh(pkg)
     assert pkg.status == PackageStatus.INACTIVE
     assert pkg.cascade_inactivated_reason == "locations_cleared_by_cascade"
+
+
+# ── Republish clears cascade stamps (Batch II) ────────────────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_republish_after_locations_cascade_clears_all_stamps(db):
+    """End-to-end Batch II: SE recovers a locations-cascaded
+    INACTIVE package by adding districts via Edit Locations and
+    publishing. The publish must clear cascade_inactivated_at,
+    cascade_inactivated_reason, AND last_cascade_at so the banner
+    has nothing left to surface."""
+    from app.modules.advisory.router import publish_package, set_package_locations
+    from app.modules.advisory.schemas import PackageLocationIn
+    from app.modules.clients.models import ClientCrop
+
+    pairs = [("S1", "D1")]
+    client = await _seed_client_with_footprint(db, pairs)
+    pkg = await _seed_package(db, client=client, locations=pairs)
+    # make_user auto-links to every existing client as SUBJECT_EXPERT
+    # (factories.py:_auto_link_user_to_existing_clients), so the SE
+    # gets edit rights for free — no explicit ClientUser row needed.
+    se = await make_user(db, name="SE")
+    db.add(ClientCrop(client_id=client.id, crop_cosh_id="crop:tomato"))
+    await db.commit()
+
+    # Drive the cascade — package goes INACTIVE with locations reason.
+    await diff_footprint_and_cascade(
+        db, client_id=client.id, new_pairs=set(), force=True,
+    )
+    await db.refresh(pkg)
+    assert pkg.status == PackageStatus.INACTIVE
+    assert pkg.cascade_inactivated_reason == "locations_cleared_by_cascade"
+    assert pkg.last_cascade_at is not None
+
+    # SE adds a new location (after the CA re-widens the footprint
+    # in real life; here we just seed it directly), then publishes.
+    db.add(ClientLocation(
+        client_id=client.id, state_cosh_id="S2", district_cosh_id="D2",
+        status=StatusEnum.ACTIVE,
+    ))
+    await db.flush()
+    await set_package_locations(
+        client_id=client.id, package_id=pkg.id,
+        locations=[PackageLocationIn(state_cosh_id="S2", district_cosh_id="D2")],
+        db=db, current_user=se,
+    )
+    # Authors + signature aren't strictly checked here because this
+    # is a minimal seed; publish-readiness will fail. Skip to a
+    # direct publish bypass by manually flipping fields the way the
+    # endpoint does. Easier: assert the endpoint clears the stamps
+    # when it succeeds — exercise via direct field-level expectation
+    # on a successful publish. To keep this test focused, drive the
+    # field clearing through `publish_package` directly with the
+    # bypass setup expected by other publish tests.
+    from app.modules.advisory.models import PackageAuthor
+    db.add(PackageAuthor(package_id=pkg.id, user_id=se.id))
+    await db.commit()
+
+    out = await publish_package(
+        client_id=client.id, package_id=pkg.id,
+        db=db, current_user=se,
+    )
+    assert out.status == PackageStatus.ACTIVE
+    assert out.cascade_inactivated_at is None
+    assert out.cascade_inactivated_reason is None
+    assert out.last_cascade_at is None
