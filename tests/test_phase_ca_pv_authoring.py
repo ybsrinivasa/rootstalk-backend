@@ -108,6 +108,55 @@ async def test_list_package_variables_after_set(db):
     assert out[0]["variable_id"] == v.id
 
 
+@requires_docker
+@pytest.mark.asyncio
+async def test_set_package_variables_reassign_same_parameter(db):
+    """Regression for 2026-05-19 prod 500: a second Save that reuses
+    a previously-set parameter_id (binding it to a different variable)
+    must not trip the (package_id, parameter_id) unique constraint.
+    Requires a flush between the delete loop and the insert loop;
+    without it SQLAlchemy may batch INSERT-before-DELETE in one flush."""
+    client = await make_client(db)
+    user = await _seed_se(db, client)
+    pkg = await _seed_client_pkg(db, client=client)
+    param = await create_parameter(
+        client_id=client.id,
+        request=ParameterCreate(
+            crop_cosh_id="crop:tomato", name="Irrigation",
+            variables=_SEED_VARS,
+        ),
+        db=db, current_user=user,
+    )
+    vs = (await db.execute(
+        select(Variable).where(Variable.parameter_id == param.id)
+    )).scalars().all()
+    assert len(vs) >= 2
+
+    await set_package_variables(
+        client_id=client.id, package_id=pkg.id,
+        request=PackageVariableSet(
+            assignments=[{"parameter_id": param.id, "variable_id": vs[0].id}],
+        ),
+        db=db, current_user=user,
+    )
+    # Re-Save with the SAME parameter bound to a DIFFERENT variable.
+    # This is the path that 500'd in prod when the missing flush left
+    # SQLAlchemy free to emit the INSERT before the DELETE in one go.
+    await set_package_variables(
+        client_id=client.id, package_id=pkg.id,
+        request=PackageVariableSet(
+            assignments=[{"parameter_id": param.id, "variable_id": vs[1].id}],
+        ),
+        db=db, current_user=user,
+    )
+    out = await list_package_variables(
+        client_id=client.id, package_id=pkg.id,
+        db=db, current_user=user,
+    )
+    assert len(out) == 1
+    assert out[0]["variable_id"] == vs[1].id
+
+
 # ── update_client_parameter (rename) ────────────────────────────────────────
 
 @requires_docker

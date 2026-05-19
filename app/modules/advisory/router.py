@@ -1915,6 +1915,12 @@ async def set_package_variables(
     )).scalars().all()
     for pv in existing:
         await db.delete(pv)
+    # Flush before adding the new rows — otherwise SQLAlchemy may
+    # batch the INSERTs ahead of the DELETEs in the same flush and
+    # the (package_id, parameter_id) unique constraint trips when
+    # the new assignment reuses a previously-set parameter_id.
+    # (Mirror of the SA-side fix in set_global_package_variables.)
+    await db.flush()
     for assignment in request.assignments:
         db.add(PackageVariable(
             package_id=package_id,
