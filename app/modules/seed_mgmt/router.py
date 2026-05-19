@@ -103,6 +103,31 @@ async def _assert_can_manage_seed_varieties(
     })
 
 
+# ── DUS options lookup (Batch W, 2026-05-19) ────────────────────────────────
+
+@router.get("/client/{client_id}/seed/dus-options")
+async def list_dus_options(
+    client_id: str,
+    crop_cosh_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Returns the crop-scoped DUS taxonomy as a nested tree for
+    cascading Part → Sub-Part → Character → Descriptor dropdowns on
+    the SE's variety edit form.
+
+    Source: Cosh `dus_characters_descriptors` Connect (1,562 rows on
+    first sync 2026-05-19). One round-trip per crop; cache client-side
+    for the lifetime of the form mount.
+
+    Empty array when Cosh hasn't characterised the crop yet — SE sees
+    "No DUS taxonomy for this crop in Cosh" on the form.
+    """
+    await _assert_can_manage_seed_varieties(db, current_user.id, client_id)
+    from app.services.cosh_dus_view import list_dus_options_for_crop
+    return await list_dus_options_for_crop(db, crop_cosh_id=crop_cosh_id)
+
+
 # ── SDM / Client Portal: Variety Catalog ─────────────────────────────────────
 
 @router.get("/client/{client_id}/varieties")

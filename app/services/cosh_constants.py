@@ -132,6 +132,38 @@ SPPC_POS_PG = 2
 SPPC_POS_CROP = 3
 
 
+# ── DUS Characters (synced 2026-05-19) ────────────────────────────────────
+#
+# Cosh's `dus_characters_descriptors` Connect wires a crop to its DUS
+# (Distinctness, Uniformity, Stability) characterisation taxonomy.
+# Each row encodes one valid (crop, part, sub-part, character,
+# descriptor-value) combination.
+#
+#   pos 1: biological_names   ← the crop
+#   pos 2: plant_parts        ← LEAF / SHOOT / SPIKE / FRUIT / …
+#   pos 3: plant_subparts     ← LAMINA / SPINES / CLOVES / …
+#   pos 4: dus_characters     ← "Lobing" / "Vigor" / "Shape in cross
+#                                section" — the trait being scored.
+#   pos 5: dus_descriptors    ← "Weak" / "Thick" / "Green" — the
+#                                discrete value the trait can take.
+#
+# 1,562 active rows on first prod sync. Drives the cascading
+# Part → Sub-Part → Character → Descriptor pickers on the SE's
+# /seed/varieties DUS section.
+
+COSH_PLANT_PARTS_CORE = "plant_parts"
+COSH_PLANT_SUBPARTS_CORE = "plant_subparts"
+COSH_DUS_CHARACTERS_CORE = "dus_characters"
+COSH_DUS_DESCRIPTORS_CORE = "dus_descriptors"
+COSH_DUS_CHARACTERS_DESCRIPTORS_CONNECT = "dus_characters_descriptors"
+
+DCD_POS_CROP = 1
+DCD_POS_PART = 2
+DCD_POS_SUBPART = 3
+DCD_POS_CHARACTER = 4
+DCD_POS_DESCRIPTOR = 5
+
+
 # ── Pest Diagnosis (synced 2026-05-14) ────────────────────────────────────
 #
 # Cosh ships one Connect — `pest_diagnosis` — that's 9 endpoints wide
