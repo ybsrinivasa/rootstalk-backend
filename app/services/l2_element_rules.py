@@ -337,9 +337,12 @@ _INSTRUCTION_FREQUENCY_TAIL: tuple[FieldRule, ...] = (
 
 _FERTILIZER_RULES: dict[str, L2Spec] = {
     "MANURES": L2Spec(
+        # FORMULATION dropped 2026-05-19 per user — manures don't
+        # carry a discrete formulation in the same way fertilizer
+        # products do. The other Fertilizer L2s keep FORMULATION
+        # because it's meaningful there.
         fields=(
             *_INPUT_BRAND_TRIPLET,
-            *_FORMULATION_L2_FILTERED,
             *_DOSAGE_TAIL_4DEC,
         ),
         plant_wise_extras=True,
