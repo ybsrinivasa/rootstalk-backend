@@ -27,6 +27,21 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 
+def _surface_dev_otp() -> bool:
+    """Return True when the OTP response should include the raw code
+    for test convenience. Production NEVER leaks codes; every other
+    environment (development, staging, anything not "production")
+    does — the testing server is team-only, SMS/SMTP gateways may
+    not be wired or may silently drop messages, and waiting on a
+    real SMS to test login is a perpetual blocker.
+
+    2026-05-20: broadened from `settings.environment == "development"`
+    so the testing server (ENVIRONMENT=staging) surfaces dev_otp
+    too. Production behaviour is unchanged.
+    """
+    return settings.environment != "production"
+
+
 async def _check_client_user(db: AsyncSession, user: User, short_name: str) -> Client:
     """When logging in via client portal: verify client is ACTIVE and
     user belongs to it. Returns the Client row so callers can bind
@@ -56,9 +71,11 @@ async def request_otp(request: PhoneOtpRequest, db: AsyncSession = Depends(get_d
     """Step 1: generate and send OTP to farmer's phone via Draft4SMS."""
     otp_code = await create_phone_otp(db, request.phone)
 
-    if settings.environment == "development":
-        logger.info(f"[DEV] OTP for {request.phone}: {otp_code}")
-        # In dev, also attempt SMS if key is configured — useful for testing with real phones
+    if _surface_dev_otp():
+        logger.info(f"[NON-PROD] OTP for {request.phone}: {otp_code}")
+        # Still attempt SMS if a gateway key is configured — useful
+        # for testing real-phone delivery. Failure is non-fatal in
+        # non-prod since the caller also gets dev_otp.
         if settings.draft_sms_key:
             await send_otp_sms(request.phone, otp_code)
         return {"detail": "OTP sent.", "dev_otp": otp_code}
@@ -145,11 +162,12 @@ async def request_email_otp(data: dict, db: AsyncSession = Depends(get_db)):
     </body>"""
     sent = _send_email(email, subject, body_html, body_plain)
 
-    # In dev we return the OTP in the response so the developer can use
-    # it directly even when SMTP isn't wired. In other envs we surface
-    # the SMTP failure as a 503 so the user knows to retry — pre-fix
-    # the helper swallowed the error and the API silently returned 200.
-    if settings.environment == "development":
+    # In non-prod we return the OTP in the response so the user can
+    # log in even when SMTP isn't wired or silently drops mail. In
+    # production we surface the SMTP failure as a 503 so the user
+    # knows to retry — pre-fix the helper swallowed the error and
+    # the API silently returned 200.
+    if _surface_dev_otp():
         return {"detail": "OTP sent", "dev_otp": otp_code}
     if not sent:
         raise HTTPException(
@@ -218,7 +236,7 @@ async def forgot_password(data: dict, db: AsyncSession = Depends(get_db)):
             f"<body style='font-family:sans-serif;padding:32px'><h2>Password Reset</h2><p>Your reset code: <strong style='font-size:28px;color:#1A5C2A;letter-spacing:6px'>{otp_code}</strong></p><p style='color:#666;font-size:12px'>Valid for {EMAIL_OTP_EXPIRY_MINUTES} minutes.</p></body>",
             f"Your password reset OTP: {otp_code} (valid {EMAIL_OTP_EXPIRY_MINUTES} min)",
         )
-        if settings.environment == "development":
+        if _surface_dev_otp():
             return {"detail": "OTP sent", "dev_otp": otp_code}
         # Production: surface the SMTP failure to the user instead of
         # the silent "OTP sent" lie, but only if the email actually
@@ -296,7 +314,7 @@ async def request_delete_otp(
         raise HTTPException(status_code=422, detail="No phone number on this account")
     otp_code = await create_phone_otp(db, current_user.phone)
     response = {"detail": "OTP sent to your phone"}
-    if settings.environment == "development":
+    if _surface_dev_otp():
         response["dev_otp"] = otp_code
     return response
 
