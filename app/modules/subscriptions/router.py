@@ -1693,23 +1693,139 @@ async def my_subscriptions(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Farmer's subscriptions, decorated with:
+
+    • package_name + crop_cosh_id + crop_name — so the PWA can
+      render "Chilli · DEMO 2" labels on the Home pending-payment
+      card without a second-hop lookup per row.
+    • pending_payment_from — for WAITLISTED subs only, who owes
+      the payment: null = the farmer himself (self-pay or
+      abandoned), or {user_id, name, role, expires_at} when the
+      farmer has delegated payment to a dealer/facilitator. Drives
+      the Home card's CTA shape:
+        - self-pending → "Complete payment" + "Cancel"
+        - delegated → "Waiting for <Name> (<Role>) to pay" with
+          "Pay myself instead" + "Cancel request"
+    """
+    from app.modules.advisory.models import Package
+    from app.modules.sync.models import CoshCoreItem
+    from app.modules.platform.models import User as UserModel, UserRole, RoleType
+    from app.modules.clients.models import ClientPromoter
+    from sqlalchemy import or_
+
     result = await db.execute(
         select(Subscription)
         .where(Subscription.farmer_user_id == current_user.id)
         .order_by(Subscription.created_at.desc())
     )
     subs = result.scalars().all()
-    return [
-        {
+    if not subs:
+        return []
+
+    # ── Package + crop name resolution (single round-trip each). ────
+    pkg_ids = list({s.package_id for s in subs})
+    pkg_rows = (await db.execute(
+        select(Package.id, Package.name, Package.crop_cosh_id)
+        .where(Package.id.in_(pkg_ids))
+    )).all()
+    pkg_by_id: dict[str, tuple[str, str]] = {
+        pid: (name, crop) for pid, name, crop in pkg_rows
+    }
+
+    crop_ids = {crop for _, crop in pkg_by_id.values() if crop}
+    crop_name_by_id: dict[str, str | None] = {}
+    if crop_ids:
+        name_rows = (await db.execute(
+            select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
+            .where(CoshCoreItem.cosh_id.in_(crop_ids))
+        )).all()
+        for cosh_id, translations in name_rows:
+            n = (translations or {}).get("en") if isinstance(translations, dict) else None
+            crop_name_by_id[cosh_id] = n
+
+    # ── Pending-delegation resolution for WAITLISTED rows. ──────────
+    waitlisted_ids = [s.id for s in subs if str(s.status) == "WAITLISTED"]
+    pending_delegate_by_sub_id: dict[str, dict] = {}
+    if waitlisted_ids:
+        # Find the most recent pending payment request per
+        # subscription. There should normally be only one PENDING
+        # row per sub, but order-by-created_at picks the newest if
+        # the farmer cycled through dealers/facilitators.
+        pending_rows = (await db.execute(
+            select(SubscriptionPaymentRequest)
+            .where(
+                SubscriptionPaymentRequest.subscription_id.in_(waitlisted_ids),
+                SubscriptionPaymentRequest.status == "PENDING",
+            )
+            .order_by(SubscriptionPaymentRequest.created_at.desc())
+        )).scalars().all()
+        # Keep only the newest per sub.
+        seen: set[str] = set()
+        latest: list[SubscriptionPaymentRequest] = []
+        for pr in pending_rows:
+            if pr.subscription_id in seen:
+                continue
+            seen.add(pr.subscription_id)
+            latest.append(pr)
+        if latest:
+            delegate_ids = list({pr.requested_from_user_id for pr in latest})
+            # Resolve names.
+            user_rows = (await db.execute(
+                select(UserModel.id, UserModel.name)
+                .where(UserModel.id.in_(delegate_ids))
+            )).all()
+            name_by_user_id: dict[str, str | None] = {uid: n for uid, n in user_rows}
+            # Resolve role — prefer ClientPromoter (most specific
+            # for delegation context); fall back to UserRole. If
+            # both exist, ClientPromoter wins.
+            promoter_rows = (await db.execute(
+                select(ClientPromoter.user_id, ClientPromoter.promoter_type)
+                .where(
+                    ClientPromoter.user_id.in_(delegate_ids),
+                    ClientPromoter.status == "ACTIVE",
+                )
+            )).all()
+            role_by_user_id: dict[str, str] = {}
+            for uid, ptype in promoter_rows:
+                role_by_user_id[uid] = str(ptype).upper()
+            # Fallback to UserRole for any not covered.
+            missing = [uid for uid in delegate_ids if uid not in role_by_user_id]
+            if missing:
+                ur_rows = (await db.execute(
+                    select(UserRole.user_id, UserRole.role_type).where(
+                        UserRole.user_id.in_(missing),
+                        UserRole.role_type.in_([RoleType.DEALER, RoleType.FACILITATOR]),
+                    )
+                )).all()
+                for uid, rt in ur_rows:
+                    role_by_user_id.setdefault(
+                        uid, rt.value if hasattr(rt, "value") else str(rt),
+                    )
+            for pr in latest:
+                pending_delegate_by_sub_id[pr.subscription_id] = {
+                    "user_id": pr.requested_from_user_id,
+                    "name": name_by_user_id.get(pr.requested_from_user_id),
+                    "role": role_by_user_id.get(pr.requested_from_user_id, "OTHER"),
+                    "expires_at": pr.expires_at,
+                }
+
+    # ── Compose response. ─────────────────────────────────────────
+    out = []
+    for s in subs:
+        pkg_name, crop_cosh_id = pkg_by_id.get(s.package_id, (None, None))
+        out.append({
             "id": s.id, "client_id": s.client_id, "package_id": s.package_id,
             "status": s.status, "crop_start_date": s.crop_start_date,
             "reference_number": s.reference_number, "subscription_type": s.subscription_type,
             "farm_area_acres": float(s.farm_area_acres) if s.farm_area_acres is not None else None,
             "area_unit": s.area_unit,
             "farm_area_confirmed_at": s.farm_area_confirmed_at,
-        }
-        for s in subs
-    ]
+            "package_name": pkg_name,
+            "crop_cosh_id": crop_cosh_id,
+            "crop_name": crop_name_by_id.get(crop_cosh_id) if crop_cosh_id else None,
+            "pending_payment_from": pending_delegate_by_sub_id.get(s.id),
+        })
+    return out
 
 
 # ── CHA: Dismiss and history ──────────────────────────────────────────────────
