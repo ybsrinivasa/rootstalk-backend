@@ -1157,16 +1157,29 @@ async def publish_package(
     # timeline ids.
     from app.modules.subscriptions.models import Subscription
 
+    # Demote only prior ACTIVE rows of THIS lineage (same name).
+    # Multi-PoP under the same (client, crop) is supported: each
+    # PoP has its own name and its own farmer profile, distinguished
+    # by the parameter-variable signature. Pre-fix the query
+    # omitted `name`, so publishing "Tomato-Drip" demoted every
+    # existing ACTIVE Tomato PoP (Flood, Greenhouse, …) and
+    # migrated their subscribers onto the new row — wiping out the
+    # whole Multi-PoP model. The §4.2 PV-uniqueness check above
+    # already prevents two PoPs sharing a district + fingerprint;
+    # demoting siblings here was both wrong AND redundant.
     existing_active = (await db.execute(
         select(Package).where(
             Package.client_id == client_id,
             Package.crop_cosh_id == pkg.crop_cosh_id,
+            Package.name == pkg.name,
             Package.status == PackageStatus.ACTIVE,
             Package.id != package_id,
         )
     )).scalars().all()
     for active in existing_active:
         active.status = PackageStatus.INACTIVE
+        # Subscriber migration is correct here — same lineage, so
+        # farmers on the prior version move to the new one.
         await db.execute(
             update(Subscription)
             .where(Subscription.package_id == active.id)

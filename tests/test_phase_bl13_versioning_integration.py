@@ -102,40 +102,99 @@ async def test_inactive_republish_creates_new_number_does_not_restore(db):
     assert out.version == 4
 
 
-# ── Sibling deactivation: one ACTIVE per (client, crop) ───────────────────────
+# ── Multi-PoP under the same (client, crop) — sibling NOT demoted ────────────
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_publishing_a_sibling_package_deactivates_the_previous_active(db):
-    """Spec: EXACTLY ONE ACTIVE version per (client, crop). Publishing
-    a second Package row with the same crop INACTIVATES the previous
-    one. The unique-on-(client, crop, name) schema permits multiple
-    rows; only one stays ACTIVE."""
+async def test_publishing_a_sibling_pop_does_not_demote_other_pops(db):
+    """Multi-PoP rule (corrected 2026-05-20): the partial unique
+    index `uq_package_client_crop_name_active` enforces "at most
+    one ACTIVE per (client, crop, NAME)" — different-name rows are
+    different PoPs (e.g. Tomato-Drip vs Tomato-Flood) and stay
+    co-ACTIVE. §4.2 PV-uniqueness handles the case where two PoPs
+    accidentally share a district + identical fingerprint.
+
+    Pre-fix the publish handler over-demoted: publishing any
+    sibling under the same (client, crop) flipped every other
+    ACTIVE PoP to INACTIVE and migrated their subscribers, wiping
+    out the entire Multi-PoP model."""
     sa = await make_user(db, name="SA")
     client = await make_client(db)
-    pkg_old = await make_package(db, client, name="Tomato Pack 2025")
-    pkg_new = await make_package(db, client, name="Tomato Pack 2026")
+    pkg_drip = await make_package(db, client, name="Tomato Drip")
+    pkg_flood = await make_package(db, client, name="Tomato Flood")
     await db.commit()
 
-    # Activate the old one first.
+    # Activate Drip first.
     await publish_package(
-        client_id=client.id, package_id=pkg_old.id,
+        client_id=client.id, package_id=pkg_drip.id,
         db=db, current_user=sa,
     )
-    # Publishing the new one should flip the old one to INACTIVE.
+    # Activate Flood — Drip must STAY ACTIVE (different name,
+    # same crop = sibling PoP, not a new version of Drip).
     await publish_package(
-        client_id=client.id, package_id=pkg_new.id,
+        client_id=client.id, package_id=pkg_flood.id,
         db=db, current_user=sa,
     )
 
-    refreshed_old = (await db.execute(
-        select(Package).where(Package.id == pkg_old.id)
+    refreshed_drip = (await db.execute(
+        select(Package).where(Package.id == pkg_drip.id)
     )).scalar_one()
-    refreshed_new = (await db.execute(
-        select(Package).where(Package.id == pkg_new.id)
+    refreshed_flood = (await db.execute(
+        select(Package).where(Package.id == pkg_flood.id)
     )).scalar_one()
-    assert refreshed_old.status == PackageStatus.INACTIVE
-    assert refreshed_new.status == PackageStatus.ACTIVE
+    assert refreshed_drip.status == PackageStatus.ACTIVE
+    assert refreshed_flood.status == PackageStatus.ACTIVE
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_publishing_a_new_version_of_same_pop_demotes_prior_version(db):
+    """Lineage demotion still applies (BL-13): publishing a second
+    Package row with the SAME name under the same (client, crop)
+    is a new version of that PoP — the prior ACTIVE version
+    INACTIVATES and subscribers migrate."""
+    from app.modules.advisory.models import (
+        PackageAuthor, PackageLocation, PackageType,
+    )
+
+    sa = await make_user(db, name="SA")
+    client = await make_client(db)
+    pkg_v1 = await make_package(db, client, name="Tomato Drip")
+    await db.commit()
+    await publish_package(
+        client_id=client.id, package_id=pkg_v1.id,
+        db=db, current_user=sa,
+    )
+    # v2 of the same PoP — seeded directly as DRAFT. The factory
+    # defaults to ACTIVE which would trip the partial unique
+    # `(client, crop, name) WHERE status='ACTIVE'` against the
+    # already-published v1. Mirror the publish-gate seed (one
+    # location, one author) so the readiness check passes.
+    pkg_v2 = Package(
+        client_id=client.id,
+        crop_cosh_id=pkg_v1.crop_cosh_id,
+        name="Tomato Drip",
+        package_type=PackageType.ANNUAL,
+        duration_days=120,
+        start_date_label_cosh_id="label:sowing_date",
+        status=PackageStatus.DRAFT,
+    )
+    db.add(pkg_v2)
+    await db.flush()
+    db.add(PackageLocation(
+        package_id=pkg_v2.id, state_cosh_id="S2", district_cosh_id="D2",
+    ))
+    db.add(PackageAuthor(package_id=pkg_v2.id, user_id=sa.id))
+    await db.commit()
+    await publish_package(
+        client_id=client.id, package_id=pkg_v2.id,
+        db=db, current_user=sa,
+    )
+
+    r_v1 = (await db.execute(select(Package).where(Package.id == pkg_v1.id))).scalar_one()
+    r_v2 = (await db.execute(select(Package).where(Package.id == pkg_v2.id))).scalar_one()
+    assert r_v1.status == PackageStatus.INACTIVE
+    assert r_v2.status == PackageStatus.ACTIVE
 
 
 # Note on ILLEGAL_PUBLISH_SOURCE coverage:
