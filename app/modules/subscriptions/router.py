@@ -1565,6 +1565,52 @@ async def verify_payment(
     return {"status": sub.status, "reference_number": sub.reference_number}
 
 
+# ── Staging-only: skip-Razorpay activation ────────────────────────────────────
+
+@router.post("/farmer/subscriptions/{subscription_id}/payment/staging-bypass")
+async def staging_bypass_activation(
+    subscription_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Activate a subscription without going through Razorpay.
+
+    Why: Razorpay TEST mode rejects real UPI handles ("Payment could
+    not be processed") because it isn't on NPCI rails. Demos and
+    end-to-end testing of the post-payment flow need a way to flip a
+    WAITLISTED sub to ACTIVE without typing `success@razorpay` into
+    the checkout sheet every time.
+
+    Hard-gated to non-production environments — refuses with 403 if
+    `settings.environment == 'production'`. Mirrors the activation
+    side-effects of `/payment/verify` exactly (status, BL-11 guard,
+    subscription_date, BL-15 reference number) so the resulting sub
+    is indistinguishable from a real one.
+    """
+    from app.config import settings
+    if settings.environment == "production":
+        raise HTTPException(
+            status_code=403,
+            detail="Bypass disabled in production. Use /payment/verify.",
+        )
+    sub = await _get_subscription(db, subscription_id, current_user.id)
+    res = validate_sub_transition(
+        sub.status, SubscriptionStatus.ACTIVE.value, BL11_FARMER,
+    )
+    if not res.allowed:
+        _raise_sub_transition(res)
+    sub.status = SubscriptionStatus.ACTIVE
+    sub.subscription_date = datetime.now(timezone.utc)
+    if not sub.reference_number:
+        sub.reference_number = await _generate_reference_for_sub(db, sub.client_id)
+    await db.commit()
+    return {
+        "status": sub.status,
+        "reference_number": sub.reference_number,
+        "bypass": True,
+    }
+
+
 # ── Farmer: Alert preferences ─────────────────────────────────────────────────
 
 @router.post("/farmer/subscriptions/{subscription_id}/alert-preferences")
