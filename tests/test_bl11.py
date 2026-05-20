@@ -115,9 +115,18 @@ def test_company_assigned_cannot_self_unsubscribe():
     assert is_self_unsubscribable("ASSIGNED", "ACTIVE") is False
 
 
-def test_waitlisted_self_sub_is_not_yet_unsubscribable():
-    """A SELF sub that hasn't paid yet isn't unsubscribable via the
-    /unsubscribe route — it just stays WAITLISTED until either paid
-    or eventually cleaned up. Closes the door on a half-finished
-    cancel that hits an unpaid sub."""
-    assert is_self_unsubscribable("SELF", "WAITLISTED") is False
+def test_waitlisted_self_sub_can_be_cancelled():
+    """2026-05-20: a SELF sub that hasn't paid yet IS cancellable
+    via the /unsubscribe route. The farmer's Home pending-payment
+    card needs a Cancel button; otherwise an abandoned-pay
+    subscription would linger forever, occupying a Home tile and
+    blocking the PV-uniqueness slot for any new attempt at the
+    same (district, fingerprint)."""
+    assert is_self_unsubscribable("SELF", "WAITLISTED") is True
+
+
+def test_waitlisted_assigned_sub_still_not_self_cancellable():
+    """ASSIGNED + WAITLISTED is the pending-approval state for a
+    promoter assignment. The farmer rejects those via the
+    /assignments/{id}/respond endpoint, NOT /unsubscribe."""
+    assert is_self_unsubscribable("ASSIGNED", "WAITLISTED") is False

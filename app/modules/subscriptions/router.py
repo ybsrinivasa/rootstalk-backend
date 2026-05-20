@@ -2186,21 +2186,27 @@ async def unsubscribe(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Self-subscribed: cancel freely. Company-assigned: returns 400 (request required).
+    """Self-subscribed: cancel freely (ACTIVE or pending-payment
+    WAITLISTED). Company-assigned: returns 400 (request required).
 
-    BL-11 audit (2026-05-06): the SELF-vs-ASSIGNED rule lives in the
-    `is_self_unsubscribable` predicate of bl11_subscription_state so
-    the policy is testable in isolation. Behaviour is unchanged.
+    2026-05-20: widened to include WAITLISTED so a farmer can
+    cancel a self-initiated payment-pending subscription from the
+    Home pending-payment card. The status filter on the lookup
+    accepts both ACTIVE and WAITLISTED; the SELF-vs-ASSIGNED
+    policy in is_self_unsubscribable still rejects assigned rows.
     """
     sub = (await db.execute(
         select(Subscription).where(
             Subscription.id == subscription_id,
             Subscription.farmer_user_id == current_user.id,
-            Subscription.status == SubscriptionStatus.ACTIVE,
+            Subscription.status.in_([
+                SubscriptionStatus.ACTIVE,
+                SubscriptionStatus.WAITLISTED,
+            ]),
         )
     )).scalar_one_or_none()
     if not sub:
-        raise HTTPException(status_code=404, detail="Active subscription not found")
+        raise HTTPException(status_code=404, detail="Subscription not found or already cancelled")
 
     sub_type = sub.subscription_type.value if hasattr(sub.subscription_type, "value") else str(sub.subscription_type)
     if not is_self_unsubscribable(sub_type, sub.status):
@@ -2208,9 +2214,13 @@ async def unsubscribe(
             status_code=400,
             detail="Company-assigned subscriptions cannot be cancelled by the farmer. Please contact your company.",
         )
+    was_waitlisted = sub.status == SubscriptionStatus.WAITLISTED
     sub.status = SubscriptionStatus.CANCELLED
     await db.commit()
-    return {"detail": "Unsubscribed successfully", "status": sub.status}
+    return {
+        "detail": ("Pending payment cancelled" if was_waitlisted else "Unsubscribed successfully"),
+        "status": sub.status,
+    }
 
 
 # ── Farmer: Active advisories in district ─────────────────────────────────────

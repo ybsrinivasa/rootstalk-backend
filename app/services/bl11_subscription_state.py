@@ -136,7 +136,17 @@ def is_self_unsubscribable(
     subscription_type: str, current_status: str,
 ) -> bool:
     """True iff the subscription can be voluntarily cancelled by the
-    farmer (BL-11 rule: SELF-subscribed only, only while ACTIVE).
-    Company-assigned subscriptions go through the company instead —
-    matches the live `/farmer/subscriptions/{id}/unsubscribe` 400."""
-    return subscription_type == "SELF" and current_status == "ACTIVE"
+    farmer (BL-11 rule: SELF-subscribed only).
+
+    2026-05-20: widened from ACTIVE-only to {ACTIVE, WAITLISTED}.
+    A farmer who created a SELF subscription but never finished
+    payment (WAITLISTED) must be able to cancel it from Home, not
+    just unsubscribe after activation. ASSIGNED subscriptions
+    still go through the company channel — assigned-but-not-yet-
+    accepted rows are rejected via the /assignments respond
+    endpoint, not this path.
+    """
+    return (
+        subscription_type == "SELF"
+        and current_status in {"ACTIVE", "WAITLISTED"}
+    )
