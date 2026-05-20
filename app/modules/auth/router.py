@@ -530,6 +530,14 @@ async def get_me(request: Request, current_user: User = Depends(get_current_user
         "client_id": token_client_id,
         "client_short_name": token_client_short_name,
         "is_cm_for_this_client": is_cm_for_this_client,
+        # 2026-05-20: PWA Profile + farmer-context screens read these
+        # from the cached /auth/me so they don't need a second hop
+        # to /auth/me/location.
+        "state_cosh_id": current_user.state_cosh_id,
+        "district_cosh_id": current_user.district_cosh_id,
+        "sub_district_cosh_id": current_user.sub_district_cosh_id,
+        "gps_lat": float(current_user.gps_lat) if current_user.gps_lat is not None else None,
+        "gps_lng": float(current_user.gps_lng) if current_user.gps_lng is not None else None,
     }
 
 

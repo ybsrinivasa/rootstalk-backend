@@ -57,6 +57,15 @@ class UserOut(BaseModel):
     # has an ACTIVE CM-EDIT assignment for the bound client. Frontend
     # uses this to grant full CA-equivalent sidebar visibility.
     is_cm_for_this_client: bool = False
+    # Farmer profile fields (2026-05-20). Surfaced so the PWA Profile
+    # page can render name + location + GPS in one `/auth/me` call
+    # instead of stitching together /auth/me + /auth/me/location.
+    # All optional — fresh farmer accounts won't have them set yet.
+    state_cosh_id: Optional[str] = None
+    district_cosh_id: Optional[str] = None
+    sub_district_cosh_id: Optional[str] = None
+    gps_lat: Optional[float] = None
+    gps_lng: Optional[float] = None
 
     class Config:
         from_attributes = True
