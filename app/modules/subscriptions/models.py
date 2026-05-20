@@ -64,6 +64,20 @@ class Subscription(Base):
     area_unit: Mapped[str] = mapped_column(String(20), nullable=True, default="acres")
     farm_area_confirmed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     crop_start_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Stamped on the FIRST PUT /start-date for this subscription.
+    # Drives the 15-day edit window: farmer can change crop_start_date
+    # within 15 calendar days of first-set; after that it locks.
+    # NULL on legacy rows where the date was set pre-feature.
+    crop_start_date_first_set_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    # Single optional extra alert recipient (replaces the old multi-row
+    # FARMER+PROMOTER pattern in alert_recipients). Farmer always gets
+    # push notifications regardless of this field. For ASSIGNED subs,
+    # GET /alert-preferences falls back to the promoter's phone when
+    # this is NULL.
+    extra_alert_phone: Mapped[str] = mapped_column(String(20), nullable=True)
+    extra_alert_name: Mapped[str] = mapped_column(String(100), nullable=True)
     subscription_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     lapsed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

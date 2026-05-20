@@ -808,11 +808,30 @@ async def set_start_date(
             detail="crop_start_date must be an ISO datetime string",
         )
 
-    # First ever start date — just set it
+    # First ever start date — just set it and stamp first_set_at
+    # so the 15-day edit window starts ticking from now.
     if not sub.crop_start_date:
+        from datetime import datetime as _dt, timezone as _tz
         sub.crop_start_date = new_start_dt
+        sub.crop_start_date_first_set_at = _dt.now(_tz.utc)
         await db.commit()
         return {"detail": "Start date set", "crop_start_date": sub.crop_start_date}
+
+    # 15-day edit window. Farmer set this on day 0; can change up to
+    # and including day 15; locks on day 16. Legacy rows with NULL
+    # first_set_at are grandfathered as editable (no retro-locking).
+    if sub.crop_start_date_first_set_at is not None:
+        from datetime import timezone as _tz
+        first_set_d = sub.crop_start_date_first_set_at.astimezone(_tz.utc).date()
+        days_since_first_set = (dt_date.today() - first_set_d).days
+        if days_since_first_set > 15:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Crop start date is locked. You can only change it "
+                    "within 15 days of first setting it."
+                ),
+            )
 
     # Parse old and new dates for date-shift math
     old_start = sub.crop_start_date.date() if hasattr(sub.crop_start_date, 'date') else sub.crop_start_date
@@ -1555,34 +1574,21 @@ async def set_alert_preferences(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Set who receives alerts for this subscription.
-    data: { send_to_self: bool, promoter_user_id: str | null }
+    """Save the farmer's chosen extra alert recipient.
+
+    Schema (2026-05-20 rewire — was multi-row FARMER+PROMOTER):
+      { extra_phone: str | null, extra_name: str | null }
+
+    The farmer always receives alerts via push notifications — that
+    is not configurable here. `extra_phone` captures one optional
+    second recipient (a dealer / facilitator / anyone the farmer
+    chooses). Empty string is normalised to NULL.
     """
     sub = await _get_subscription(db, subscription_id, current_user.id)
-
-    # Clear existing recipients
-    existing = (await db.execute(
-        select(AlertRecipient).where(AlertRecipient.subscription_id == sub.id)
-    )).scalars().all()
-    for r in existing:
-        r.status = "INACTIVE"
-
-    if data.get("send_to_self", True):
-        db.add(AlertRecipient(
-            subscription_id=sub.id,
-            recipient_user_id=current_user.id,
-            recipient_type="FARMER",
-            status="ACTIVE",
-        ))
-
-    if data.get("promoter_user_id"):
-        db.add(AlertRecipient(
-            subscription_id=sub.id,
-            recipient_user_id=data["promoter_user_id"],
-            recipient_type="PROMOTER",
-            status="ACTIVE",
-        ))
-
+    phone_raw = (data.get("extra_phone") or "").strip()
+    name_raw = (data.get("extra_name") or "").strip()
+    sub.extra_alert_phone = phone_raw or None
+    sub.extra_alert_name = name_raw or None
     await db.commit()
     return {"detail": "Alert preferences updated"}
 
@@ -1593,18 +1599,42 @@ async def get_alert_preferences(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Return the farmer's chosen extra alert recipient.
+
+    Response: { extra_phone, extra_name, source }
+
+    `source` values:
+      - 'override'      — farmer typed a number (sub.extra_alert_phone set)
+      - 'auto_promoter' — ASSIGNED sub, no override, promoter has a phone
+      - 'none'          — SELF sub with no override, OR ASSIGNED with no
+                          reachable promoter
+    """
     sub = await _get_subscription(db, subscription_id, current_user.id)
-    result = await db.execute(
-        select(AlertRecipient).where(
-            AlertRecipient.subscription_id == sub.id,
-            AlertRecipient.status == "ACTIVE",
-        )
-    )
-    recipients = result.scalars().all()
-    return [
-        {"recipient_user_id": r.recipient_user_id, "recipient_type": r.recipient_type}
-        for r in recipients
-    ]
+
+    if sub.extra_alert_phone:
+        return {
+            "extra_phone": sub.extra_alert_phone,
+            "extra_name": sub.extra_alert_name,
+            "source": "override",
+        }
+
+    is_assigned = (
+        sub.subscription_type.value
+        if hasattr(sub.subscription_type, "value")
+        else str(sub.subscription_type)
+    ) == "ASSIGNED"
+    if is_assigned and sub.promoter_user_id:
+        promoter = (await db.execute(
+            select(User).where(User.id == sub.promoter_user_id)
+        )).scalar_one_or_none()
+        if promoter and promoter.phone:
+            return {
+                "extra_phone": promoter.phone,
+                "extra_name": promoter.name,
+                "source": "auto_promoter",
+            }
+
+    return {"extra_phone": None, "extra_name": None, "source": "none"}
 
 
 # ── Dealer/Facilitator: Payment on behalf of farmer ───────────────────────────
@@ -1816,6 +1846,7 @@ async def my_subscriptions(
         out.append({
             "id": s.id, "client_id": s.client_id, "package_id": s.package_id,
             "status": s.status, "crop_start_date": s.crop_start_date,
+            "crop_start_date_first_set_at": s.crop_start_date_first_set_at,
             "reference_number": s.reference_number, "subscription_type": s.subscription_type,
             "farm_area_acres": float(s.farm_area_acres) if s.farm_area_acres is not None else None,
             "area_unit": s.area_unit,
