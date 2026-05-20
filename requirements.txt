@@ -47,6 +47,7 @@ python-jose==3.5.0
 python-multipart==0.0.27
 PyYAML==6.0.3
 qrcode==8.2
+razorpay==2.0.1
 redis==7.4.0
 rsa==4.9.1
 s3transfer==0.17.0
