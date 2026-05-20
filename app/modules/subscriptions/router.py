@@ -613,8 +613,14 @@ async def discover_crops(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """All crops that have at least one ACTIVE package in the given district."""
+    """All crops that have at least one ACTIVE package in the given
+    district. Returns the crop's English display name alongside the
+    cosh_id so the PWA can render "Paddy" instead of a UUID
+    (Cosh crop ids are real UUIDs, not the older `crop_paddy`
+    slug form, so a frontend de-slug helper isn't enough)."""
     from app.modules.advisory.models import PackageLocation, PackageStatus
+    from app.modules.sync.models import CoshCoreItem
+
     result = await db.execute(
         select(Package.crop_cosh_id)
         .join(PackageLocation, PackageLocation.package_id == Package.id)
@@ -625,8 +631,21 @@ async def discover_crops(
         )
         .distinct()
     )
-    crops = result.scalars().all()
-    return [{"crop_cosh_id": c} for c in crops]
+    crop_ids = list(result.scalars().all())
+    if not crop_ids:
+        return []
+    # Resolve names from cosh_core_items (Cosh stores crop labels
+    # under the `biological_names` core_type). Translations is a
+    # JSON map keyed by language code; English is the baseline.
+    name_rows = (await db.execute(
+        select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
+        .where(CoshCoreItem.cosh_id.in_(crop_ids))
+    )).all()
+    name_by_id: dict[str, str | None] = {}
+    for cosh_id, translations in name_rows:
+        name = (translations or {}).get("en") if isinstance(translations, dict) else None
+        name_by_id[cosh_id] = name
+    return [{"crop_cosh_id": c, "name": name_by_id.get(c)} for c in crop_ids]
 
 
 @router.get("/farmer/discover/companies")
