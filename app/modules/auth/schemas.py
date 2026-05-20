@@ -66,6 +66,7 @@ class UserOut(BaseModel):
     sub_district_cosh_id: Optional[str] = None
     gps_lat: Optional[float] = None
     gps_lng: Optional[float] = None
+    photo_url: Optional[str] = None
 
     class Config:
         from_attributes = True

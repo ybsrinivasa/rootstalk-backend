@@ -538,6 +538,7 @@ async def get_me(request: Request, current_user: User = Depends(get_current_user
         "sub_district_cosh_id": current_user.sub_district_cosh_id,
         "gps_lat": float(current_user.gps_lat) if current_user.gps_lat is not None else None,
         "gps_lng": float(current_user.gps_lng) if current_user.gps_lng is not None else None,
+        "photo_url": current_user.photo_url,
     }
 
 
@@ -565,7 +566,8 @@ async def update_my_profile(
     result = await db.execute(select(User).where(User.id == current_user.id))
     user = result.scalar_one()
     for field in ["name", "language_code", "state_cosh_id", "district_cosh_id",
-                  "sub_district_cosh_id", "address_line", "locality", "town", "pin_code"]:
+                  "sub_district_cosh_id", "address_line", "locality", "town", "pin_code",
+                  "photo_url"]:
         if data.get(field) is not None:
             setattr(user, field, data[field])
     # GPS fields are Decimal
