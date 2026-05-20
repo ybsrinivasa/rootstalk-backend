@@ -245,3 +245,65 @@ async def test_cca_governs_overlapping_cha_sp_input(db):
         "CHA's Mancozeb should be suppressed by the earlier-from_date CCA"
     )
     assert rt_cha["suppressed_count"] == 1
+
+
+# ── is_purchased decoration ─────────────────────────────────────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_is_purchased_flag_marks_only_approved_practices(db):
+    """Backend decorates each practice in /farmer/advisory/today with
+    is_purchased=True when an APPROVED OrderItem exists for it. PWA uses
+    this flag to flip INPUT detail visibility (hidden pre-purchase,
+    shown after). Practices on the same active timeline without an
+    APPROVED item must report is_purchased=False.
+    """
+    user = await make_user(db)
+    client = await make_client(db)
+    package = await make_package(db, client)
+    sub = await make_subscription(
+        db, farmer=user, client=client, package=package,
+    )
+    sub.crop_start_date = datetime.now(timezone.utc) - timedelta(days=5)
+    await db.commit()
+
+    tl = await make_timeline(
+        db, package, name="TL_purchased_flag",
+        from_type=TimelineFromType.DAS, from_value=0, to_value=30,
+        display_order=0,
+    )
+    p_bought = await _input_practice_with_identity(
+        db, tl, common_name_cosh="cosh:input:urea",
+        l1="FERTILIZER", l2="UREA",
+    )
+    p_unbought = await _input_practice_with_identity(
+        db, tl, common_name_cosh="cosh:input:dap",
+        l1="FERTILIZER", l2="DAP",
+    )
+    await db.commit()
+
+    order = Order(
+        subscription_id=sub.id,
+        farmer_user_id=user.id,
+        client_id=client.id,
+        date_from=datetime.now(timezone.utc) - timedelta(days=3),
+        date_to=datetime.now(timezone.utc),
+        status=OrderStatus.COMPLETED,
+    )
+    db.add(order)
+    await db.flush()
+    db.add(OrderItem(
+        order_id=order.id, practice_id=p_bought.id, timeline_id=tl.id,
+        status=OrderItemStatus.APPROVED, snapshot_id=None,
+    ))
+    await db.commit()
+
+    out = await get_today_advisory(db=db, current_user=user)
+    practices = {p["l2_type"]: p for p in out[0]["timelines"][0]["practices"]}
+
+    assert practices["UREA"]["is_purchased"] is True, (
+        "Practice with APPROVED OrderItem must report is_purchased=True"
+    )
+    assert practices["DAP"]["is_purchased"] is False, (
+        "Practice without an APPROVED item must report is_purchased=False"
+    )

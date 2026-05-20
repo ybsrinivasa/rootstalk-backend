@@ -2259,6 +2259,13 @@ async def get_today_advisory(
                         "relation_type": p.relation_type,
                         "frequency_days": p.frequency_days,
                         "is_frequency_due_today": True,  # always True — list is already filtered
+                        # Drives the PWA "hide INPUT details until
+                        # purchased" rule. Mirrors the BL-03 dedup
+                        # threshold (APPROVED order item == farmer
+                        # has the product in hand). Always set for
+                        # all L0 types; PWA only acts on it for
+                        # INPUT practices.
+                        "is_purchased": p.id in approved_ids,
                         "elements": [{"element_type": el.element_type, "cosh_ref": el.cosh_ref,
                                       "value": el.value, "unit_cosh_id": el.unit_cosh_id}
                                      for el in p.elements],
