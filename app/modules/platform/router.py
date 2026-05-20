@@ -23,6 +23,49 @@ async def list_languages(db: AsyncSession = Depends(get_db)):
     return result.scalars().all()
 
 
+@router.get("/platform/lookup-user-by-phone")
+async def lookup_user_by_phone(
+    phone: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Verify a phone number belongs to a real RootsTalk user.
+
+    Used wherever a farmer (or dealer, or facilitator) types
+    another person's phone number — alerts recipient, payment
+    delegation, custom-order routing, helper assignment — and
+    needs to see the matching name + photo + roles before
+    committing the action.
+
+    Input is normalised to the canonical `+91XXXXXXXXXX` shape
+    (last 10 digits, +91 prefix). 200 always — `found: false`
+    when no match. Caller decides whether to allow the action
+    on an unregistered number.
+    """
+    from app.modules.auth.service import get_user_by_phone
+    digits = ''.join(ch for ch in (phone or '') if ch.isdigit())
+    if len(digits) < 10:
+        return {"found": False, "phone": phone}
+    normalised = '+91' + digits[-10:]
+
+    user = await get_user_by_phone(db, normalised)
+    if not user:
+        return {"found": False, "phone": normalised}
+
+    role_values = [
+        (r.role_type.value if hasattr(r.role_type, 'value') else str(r.role_type))
+        for r in user.roles
+    ]
+    return {
+        "found": True,
+        "user_id": user.id,
+        "phone": user.phone,
+        "name": user.name,
+        "photo_url": user.photo_url,
+        "roles": role_values,
+    }
+
+
 @router.post("/platform/fcm-token")
 async def register_fcm_token(
     data: dict,
