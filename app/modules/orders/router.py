@@ -1816,27 +1816,76 @@ _CATEGORY_TO_L2S = {
 
 
 async def _walk_cosh_manufacturers(db: AsyncSession, category: str) -> dict[str, str]:
-    """The expensive walk: for each L2 in the category, list its
-    common names, then for each common name list its manufacturers,
-    union and dedup by cosh_id. Returns {cosh_id: name}.
+    """Returns {manufacturer_cosh_id: name} for every manufacturer
+    that makes a Trade Name under any L2 in the category.
 
-    Only called from the rebuild path — request-time reads hit the
-    materialised `dealer_manufacturer_catalog` table.
+    Three bulk passes over Connect rows, NOT per-CN re-walks. The
+    earlier naive implementation called `list_manufacturers_for_
+    common_name` once per CN — that re-scanned the entire
+    tradename_manufacturer table for every common name, producing
+    O(L2 × CN × table-size) row touches and timing out at ~14 min
+    on testing's full Cosh data (user report 2026-05-21).
+
+    Bypasses cosh_options_view._complete_trade_names_for_l2 on
+    purpose: that filter exists for the SE Add-Practice modal so
+    incomplete catalogue entries don't show up; for the dealer
+    contract list, an incomplete CN→MFR chain is still a real
+    manufacturer worth offering as a contract option.
     """
-    from app.services.cosh_options_view import (
-        list_common_names_for_l2, list_manufacturers_for_common_name,
+    from app.services.cosh_constants import (
+        COSH_COMMON_NAMES_CORE, COSH_COMMONNAMES_L2_CONNECT,
+        COSH_INPUT_MANUFACTURERS_CORE, COSH_L2_DATA_CORE,
+        COSH_TRADE_NAMES_CORE, COSH_TRADENAME_COMMONNAME_CONNECT,
+        COSH_TRADENAME_MANUFACTURER_CONNECT, PYTHON_L2_TO_COSH_UUID,
     )
+    from app.services.cosh_options_view import _resolve_names, _walk_connect
+
     l2_list = _CATEGORY_TO_L2S.get(category.upper(), [])
-    out: dict[str, str] = {}
-    for l2 in l2_list:
-        cns = await list_common_names_for_l2(db, l2)
-        for cn in cns:
-            mfrs = await list_manufacturers_for_common_name(
-                db, common_name_cosh_id=cn["cosh_id"], l2_type=l2,
-            )
-            for m in mfrs:
-                out[m["cosh_id"]] = m["name"]
-    return out
+    l2_uuids = {PYTHON_L2_TO_COSH_UUID.get(l2) for l2 in l2_list}
+    l2_uuids.discard(None)
+    if not l2_uuids:
+        return {}
+
+    # Pass 1 — commonnames_l2: collect CN cosh_ids belonging to any
+    # of the category's L2s.
+    eligible_cns: set[str] = set()
+    for r in await _walk_connect(db, connect_type=COSH_COMMONNAMES_L2_CONNECT):
+        ep = {e.get("role"): e.get("cosh_id") for e in (r.endpoints or [])}
+        if ep.get(COSH_L2_DATA_CORE) in l2_uuids:
+            cn = ep.get(COSH_COMMON_NAMES_CORE)
+            if cn:
+                eligible_cns.add(cn)
+    if not eligible_cns:
+        return {}
+
+    # Pass 2 — tradename_commonname: collect TN cosh_ids whose CN is
+    # in the eligible set.
+    eligible_tns: set[str] = set()
+    for r in await _walk_connect(db, connect_type=COSH_TRADENAME_COMMONNAME_CONNECT):
+        ep = {e.get("role"): e.get("cosh_id") for e in (r.endpoints or [])}
+        if ep.get(COSH_COMMON_NAMES_CORE) in eligible_cns:
+            tn = ep.get(COSH_TRADE_NAMES_CORE)
+            if tn:
+                eligible_tns.add(tn)
+    if not eligible_tns:
+        return {}
+
+    # Pass 3 — tradename_manufacturer: collect MFR cosh_ids whose
+    # TN is in the eligible set.
+    mfr_ids: set[str] = set()
+    for r in await _walk_connect(db, connect_type=COSH_TRADENAME_MANUFACTURER_CONNECT):
+        ep = {e.get("role"): e.get("cosh_id") for e in (r.endpoints or [])}
+        if ep.get(COSH_TRADE_NAMES_CORE) in eligible_tns:
+            m = ep.get(COSH_INPUT_MANUFACTURERS_CORE)
+            if m:
+                mfr_ids.add(m)
+    if not mfr_ids:
+        return {}
+
+    items = await _resolve_names(
+        db, core_type=COSH_INPUT_MANUFACTURERS_CORE, cosh_ids=mfr_ids,
+    )
+    return {i["cosh_id"]: i["name"] for i in items}
 
 
 async def _rebuild_manufacturer_catalog(
