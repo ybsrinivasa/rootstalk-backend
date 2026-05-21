@@ -648,6 +648,120 @@ async def discover_crops(
     return [{"crop_cosh_id": c, "name": name_by_id.get(c)} for c in crop_ids]
 
 
+@router.get("/farmer/discover/crops-and-companies")
+async def discover_crops_and_companies(
+    district_cosh_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Discovery view for the Crops & Companies page. One call returns:
+
+      - every crop with ≥1 ACTIVE Package whose PackageLocation
+        covers this district (with the client_ids that publish it)
+      - every company with ≥1 such Package (with the crop_cosh_ids
+        they cover)
+
+    The mappings let the PWA cross-filter locally on tap — no extra
+    round-trip per filter change. Also returns the district's
+    friendly name so the page can show "Crops & Companies in
+    Bengaluru Urban" without a second lookup.
+    """
+    from app.modules.advisory.models import PackageLocation, PackageStatus
+    from app.modules.clients.models import Client, ClientStatus
+    from app.modules.sync.models import CoshCoreItem
+
+    # One query gets every (crop, client) pair active in the district.
+    pkg_rows = (await db.execute(
+        select(Package.crop_cosh_id, Package.client_id)
+        .join(PackageLocation, PackageLocation.package_id == Package.id)
+        .join(Client, Client.id == Package.client_id)
+        .where(
+            Package.status == PackageStatus.ACTIVE,
+            PackageLocation.district_cosh_id == district_cosh_id,
+            Client.status == ClientStatus.ACTIVE,
+        )
+        .distinct()
+    )).all()
+
+    crop_to_clients: dict[str, set[str]] = {}
+    client_to_crops: dict[str, set[str]] = {}
+    for crop_id, client_id in pkg_rows:
+        if not crop_id or not client_id:
+            continue
+        crop_to_clients.setdefault(crop_id, set()).add(client_id)
+        client_to_crops.setdefault(client_id, set()).add(crop_id)
+
+    # Resolve crop English names from Cosh.
+    crop_ids = list(crop_to_clients.keys())
+    crop_name_by_id: dict[str, str] = {}
+    if crop_ids:
+        name_rows = (await db.execute(
+            select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
+            .where(CoshCoreItem.cosh_id.in_(crop_ids))
+        )).all()
+        for cosh_id, translations in name_rows:
+            if isinstance(translations, dict):
+                crop_name_by_id[cosh_id] = (
+                    translations.get("en") or translations.get("English") or cosh_id
+                )
+
+    # Resolve client details.
+    client_ids = list(client_to_crops.keys())
+    clients_by_id: dict[str, Client] = {}
+    if client_ids:
+        for c in (await db.execute(
+            select(Client).where(Client.id.in_(client_ids))
+        )).scalars().all():
+            clients_by_id[c.id] = c
+
+    # District display name — single core lookup.
+    district_name: str | None = None
+    dist_core = (await db.execute(
+        select(CoshCoreItem).where(
+            CoshCoreItem.cosh_id == district_cosh_id,
+            CoshCoreItem.core_type == "district_list",
+        )
+    )).scalar_one_or_none()
+    if dist_core and isinstance(dist_core.translations, dict):
+        district_name = (
+            dist_core.translations.get("en")
+            or dist_core.translations.get("English")
+        )
+
+    crops = sorted(
+        [
+            {
+                "crop_cosh_id": cid,
+                "name": crop_name_by_id.get(cid) or cid,
+                "client_ids": sorted(crop_to_clients[cid]),
+            }
+            for cid in crop_ids
+        ],
+        key=lambda x: x["name"].casefold(),
+    )
+    companies = sorted(
+        [
+            {
+                "id": c.id,
+                "display_name": c.display_name,
+                "tagline": c.tagline,
+                "logo_url": c.logo_url,
+                "primary_colour": c.primary_colour,
+                "crop_cosh_ids": sorted(client_to_crops.get(c.id, set())),
+            }
+            for c in clients_by_id.values()
+        ],
+        key=lambda x: (x["display_name"] or "").casefold(),
+    )
+
+    return {
+        "district_cosh_id": district_cosh_id,
+        "district_name": district_name,
+        "crops": crops,
+        "companies": companies,
+    }
+
+
 @router.get("/farmer/discover/companies")
 async def discover_companies(
     crop_cosh_id: str,
