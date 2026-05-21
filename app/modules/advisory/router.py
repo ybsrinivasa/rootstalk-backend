@@ -243,6 +243,47 @@ async def _assert_pg_recommendation_draft(
     return pg
 
 
+async def _assert_sp_draft(
+    db: AsyncSession, sp_id: str, *, client_id: str,
+) -> "SPRecommendation":
+    """Phase 1 of CA-SP versioning hardening (2026-05-21). Refuse
+    mutations on ACTIVE / INACTIVE SPRecommendation rows — they
+    leak straight to farmers (ACTIVE) or rewrite historical
+    record (INACTIVE).
+
+    Pre-fix, the SP mutation endpoints only gated on
+    `_assert_can_edit_client_advisory` (privilege only) and let
+    writes against ACTIVE rows go through silently. The published
+    SP would mutate under farmers' feet without a publish event.
+    This guard mirrors `_assert_pg_recommendation_draft` shape so
+    the frontend can branch programmatically on `code: sp_not_draft`.
+    """
+    from app.modules.advisory.models import SPRecommendation
+    sp = (await db.execute(
+        select(SPRecommendation).where(
+            SPRecommendation.id == sp_id,
+            SPRecommendation.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if sp is None:
+        raise HTTPException(
+            status_code=404, detail="SP recommendation not found",
+        )
+    if sp.status != "DRAFT":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "sp_not_draft",
+                "message": (
+                    f"This SP recommendation is {sp.status.lower()}. "
+                    "To make changes, start a new edit from this version."
+                ),
+                "current_status": sp.status,
+            },
+        )
+    return sp
+
+
 async def _assert_can_view_client_advisory(
     db: AsyncSession, user_id: str, client_id: str,
 ) -> None:
@@ -8058,6 +8099,7 @@ async def add_sp_timeline(
     current_user: User = Depends(get_current_user),
 ):
     await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    await _assert_sp_draft(db, sp_id, client_id=client_id)
     tl = Timeline(
         sp_recommendation_id=sp_id,
         name=request.name,
@@ -8085,6 +8127,7 @@ async def update_sp_timeline(
     `status` toggle excludes the Timeline from the farmer's daily
     advisory without deleting it."""
     await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    await _assert_sp_draft(db, sp_id, client_id=client_id)
     tl = (await db.execute(
         select(Timeline).where(
             Timeline.id == tl_id,
@@ -8120,6 +8163,7 @@ async def add_sp_practice(
 ):
     """SP practice — same UCAT shape as PG and Q&A."""
     await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    await _assert_sp_draft(db, sp_id, client_id=client_id)
     try:
         await assert_l2_elements_valid(
             db,
@@ -8175,6 +8219,7 @@ async def update_sp_practice(
     Edit. Elements wiped + reinserted to match what the form
     submits."""
     await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    await _assert_sp_draft(db, sp_id, client_id=client_id)
     try:
         await assert_l2_elements_valid(
             db,
@@ -8246,6 +8291,7 @@ async def add_sp_element(
     current_user: User = Depends(get_current_user),
 ):
     await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    await _assert_sp_draft(db, sp_id, client_id=client_id)
     practice = await _load_sp_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
     new = await _add_practice_element(
         db, practice=practice, element_model=Element, body=body,
@@ -8263,6 +8309,7 @@ async def update_sp_element(
     current_user: User = Depends(get_current_user),
 ):
     await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    await _assert_sp_draft(db, sp_id, client_id=client_id)
     practice = await _load_sp_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
     updated = await _update_practice_element(
         db, practice=practice, element_model=Element,
@@ -8281,6 +8328,7 @@ async def delete_sp_element(
     current_user: User = Depends(get_current_user),
 ):
     await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    await _assert_sp_draft(db, sp_id, client_id=client_id)
     practice = await _load_sp_practice_by_timeline(db, timeline_id=tl_id, practice_id=practice_id)
     await _delete_practice_element(
         db, practice=practice, element_model=Element, element_id=element_id,
@@ -8296,6 +8344,7 @@ async def delete_sp_timeline(
     current_user: User = Depends(get_current_user),
 ):
     await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    await _assert_sp_draft(db, sp_id, client_id=client_id)
     tl = (await db.execute(
         select(Timeline).where(Timeline.id == tl_id, Timeline.sp_recommendation_id == sp_id)
     )).scalar_one_or_none()
@@ -8916,6 +8965,7 @@ async def import_pg_into_sp(
     below); the SE who authored the source PG should be able to
     seed their own SP from it without round-tripping through the CM."""
     await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    await _assert_sp_draft(db, sp_id, client_id=client_id)
 
     sp = (await db.execute(
         select(SPRecommendation).where(
@@ -9053,6 +9103,7 @@ async def delete_client_sp_practice(
     """Mirror of delete_client_pg_practice. Cascades the practice's
     elements via ORM."""
     await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    await _assert_sp_draft(db, sp_id, client_id=client_id)
     from app.modules.advisory.models import Element, Practice
     practice = (await db.execute(
         select(Practice).where(
