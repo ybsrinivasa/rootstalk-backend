@@ -7284,6 +7284,56 @@ async def _copy_pg_content_into(
                 ))
 
 
+async def _copy_sp_content_into(
+    db: AsyncSession, *, src_sp: SPRecommendation, target_sp: SPRecommendation,
+) -> None:
+    """SP-side mirror of `_copy_pg_content_into`. Deep-copy timelines /
+    practices / elements between two SPRecommendation rows. Used by
+    CA-SP clone-to-draft (Phase 2)."""
+    tl_result = await db.execute(
+        select(Timeline).where(Timeline.sp_recommendation_id == src_sp.id)
+    )
+    for src_tl in tl_result.scalars().all():
+        new_tl = Timeline(
+            sp_recommendation_id=target_sp.id,
+            name=src_tl.name,
+            from_type=src_tl.from_type,
+            from_value=src_tl.from_value,
+            to_value=src_tl.to_value,
+        )
+        db.add(new_tl)
+        await db.flush()
+
+        p_result = await db.execute(
+            select(Practice).where(Practice.timeline_id == src_tl.id)
+        )
+        for src_p in p_result.scalars().all():
+            new_p = Practice(
+                timeline_id=new_tl.id,
+                l0_type=src_p.l0_type,
+                l1_type=src_p.l1_type,
+                l2_type=src_p.l2_type,
+                display_order=src_p.display_order,
+                is_special_input=src_p.is_special_input,
+                frequency_days=src_p.frequency_days,
+            )
+            db.add(new_p)
+            await db.flush()
+
+            el_result = await db.execute(
+                select(Element).where(Element.practice_id == src_p.id)
+            )
+            for src_el in el_result.scalars().all():
+                db.add(Element(
+                    practice_id=new_p.id,
+                    element_type=src_el.element_type,
+                    cosh_ref=src_el.cosh_ref,
+                    value=src_el.value,
+                    unit_cosh_id=src_el.unit_cosh_id,
+                    display_order=src_el.display_order,
+                ))
+
+
 async def _wipe_pg_content(db: AsyncSession, pg_id: str) -> dict:
     """Delete every Timeline / Practice / Element under a PG.
     Returns counts so the caller can report what was overwritten."""
@@ -9239,6 +9289,117 @@ async def publish_sp(
     await db.commit()
     await db.refresh(sp)
     return sp
+
+
+# ── CA-SP Phase 2 (2026-05-21): clone-to-draft + lineage ──────────────────
+# Mirror of the CA-PG clone/lineage pair, scoped on the SP natural key
+# `(client_id, specific_problem_cosh_id, crop_cosh_id)`. SP has no
+# source_version_id / parent column — lineage is computed from the
+# natural key alone, which is also the publish-time sibling-deactivation
+# scope (see publish_sp above). Single-DRAFT invariant: reuse the
+# existing DRAFT slot when one is already mid-edit.
+
+@router.post(
+    "/client/{client_id}/sp-recommendations/{sp_id}/clone-to-draft",
+    response_model=SPRecommendationOut, status_code=201,
+)
+async def clone_client_sp_to_draft(
+    client_id: str, sp_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SE picks an ACTIVE or INACTIVE row in the lineage to start
+    editing. Behaviour parallel to clone_client_pg_to_draft:
+      • Existing DRAFT in the lineage → return it (resume in place).
+      • No DRAFT → deep-copy this row's content into a new DRAFT row.
+    Refuses if the source is itself a DRAFT (`clone_source_is_draft`)."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    src = (await db.execute(
+        select(SPRecommendation).where(
+            SPRecommendation.id == sp_id,
+            SPRecommendation.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if src is None:
+        raise HTTPException(status_code=404, detail="SP recommendation not found")
+    if src.status == "DRAFT":
+        raise HTTPException(status_code=422, detail={
+            "code": "clone_source_is_draft",
+            "message": (
+                "clone-to-draft requires an ACTIVE or INACTIVE row of "
+                "the lineage as the source. The current row is already "
+                "a DRAFT — edit it in place."
+            ),
+        })
+
+    existing_draft = (await db.execute(
+        select(SPRecommendation).where(
+            SPRecommendation.client_id == client_id,
+            SPRecommendation.specific_problem_cosh_id == src.specific_problem_cosh_id,
+            SPRecommendation.crop_cosh_id == src.crop_cosh_id,
+            SPRecommendation.status == "DRAFT",
+        )
+    )).scalar_one_or_none()
+    if existing_draft is not None:
+        return existing_draft
+
+    new_draft = SPRecommendation(
+        specific_problem_cosh_id=src.specific_problem_cosh_id,
+        client_id=client_id,
+        crop_cosh_id=src.crop_cosh_id,
+        status="DRAFT",
+        version=1,
+    )
+    db.add(new_draft)
+    await db.flush()
+    await _copy_sp_content_into(db, src_sp=src, target_sp=new_draft)
+    await db.commit()
+    await db.refresh(new_draft)
+    return new_draft
+
+
+@router.get("/client/{client_id}/sp-recommendations/{sp_id}/lineage")
+async def get_client_sp_lineage(
+    client_id: str, sp_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Every row in this SP's lineage — rows sharing (client_id,
+    specific_problem_cosh_id, crop_cosh_id). Feeds the version-history
+    panel + ReadOnlyBanner on the CA-SP detail page."""
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
+    sp = (await db.execute(
+        select(SPRecommendation).where(
+            SPRecommendation.id == sp_id,
+            SPRecommendation.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if sp is None:
+        raise HTTPException(status_code=404, detail="SP recommendation not found")
+    rows = (await db.execute(
+        select(SPRecommendation).where(
+            SPRecommendation.client_id == client_id,
+            SPRecommendation.specific_problem_cosh_id == sp.specific_problem_cosh_id,
+            SPRecommendation.crop_cosh_id == sp.crop_cosh_id,
+        ).order_by(
+            SPRecommendation.version.desc(), SPRecommendation.created_at.desc(),
+        )
+    )).scalars().all()
+
+    def sort_key(r: SPRecommendation):
+        is_draft = 0 if r.status == "DRAFT" else 1
+        return (is_draft, -r.version, -r.created_at.timestamp())
+
+    return [
+        {
+            "id": r.id,
+            "status": r.status,
+            "version": r.version,
+            "created_at": r.created_at.isoformat(),
+            "is_current": r.id == sp_id,
+        }
+        for r in sorted(rows, key=sort_key)
+    ]
 
 
 # ── CCA Hub list endpoints (2026-05-10) ─────────────────────────────────────
