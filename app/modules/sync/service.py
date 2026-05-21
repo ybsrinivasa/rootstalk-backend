@@ -55,18 +55,38 @@ from app.modules.sync.models import CoshConnectRow, CoshCoreItem, CoshSyncLog
 
 
 # ── BlankBox sentinel ───────────────────────────────────────────────────────
-# Set per Cosh's chosen spelling. The contract doc tracks this; both
-# sides reference the same constant. Pin both common spellings until
-# Cosh confirms.
+# Cosh's wildcard / "no relevant data" sentinel — appears as the value
+# in connect endpoints where the row is intentionally unscoped (e.g.
+# pest_diagnosis crop=BlankBox means "this diagnosis applies to all
+# crops"). In flat Core lists it's noise and must be stripped from
+# every UI surface.
+#
+# 2026-05-21: testing surfaced "BLANK BOX" (all caps with a space)
+# in real Cosh data — the prior {"BlankBox", "Blank Box"} match was
+# case-sensitive and let it through. Comparison is now case- and
+# whitespace-normalised so every reasonable spelling (BlankBox /
+# Blank Box / BLANK BOX / "  blank  box  ") matches.
 
+def _normalise_for_blank_box(value: str) -> str:
+    """Lowercase + collapse internal whitespace + strip — so any
+    spelling Cosh emits collapses to the canonical 'blankbox' /
+    'blank box' for matching."""
+    return ' '.join(value.split()).strip().casefold()
+
+
+_BLANK_BOX_NORMALISED: frozenset[str] = frozenset({"blankbox", "blank box"})
+
+# Kept for back-compat with anything that imports this set directly.
+# Don't rely on equality membership against this — use _is_blank_box().
 BLANK_BOX_VALUES: frozenset[str] = frozenset({
-    "BlankBox",
-    "Blank Box",
+    "BlankBox", "Blank Box", "BLANK BOX", "blankbox", "blank box",
 })
 
 
 def _is_blank_box(value: Optional[str]) -> bool:
-    return value is not None and value in BLANK_BOX_VALUES
+    if value is None:
+        return False
+    return _normalise_for_blank_box(value) in _BLANK_BOX_NORMALISED
 
 
 # ── Connect-vs-Core classification (shape-driven) ───────────────────────────

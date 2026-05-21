@@ -134,6 +134,11 @@ async def test_blank_box_rows_are_filtered_out(db):
         cosh_id="Blank Box", core_type=COSH_PROBLEM_GROUPS_CORE,
         translations={"en": "Also Not Shown"}, status="active",
     ))
+    # 2026-05-21 — testing data has the all-caps spelling.
+    db.add(CoshCoreItem(
+        cosh_id="cosh-pg-bb-caps", core_type=COSH_PROBLEM_GROUPS_CORE,
+        translations={"en": "BLANK BOX"}, status="active",
+    ))
     db.add(CoshCoreItem(
         cosh_id="cosh-pg-bb-real", core_type=COSH_PROBLEM_GROUPS_CORE,
         translations={"en": "Real Group"}, status="active",
@@ -144,7 +149,8 @@ async def test_blank_box_rows_are_filtered_out(db):
     by_id = _by_id(out)
     # Real row survives.
     assert "cosh-pg-bb-real" in by_id
-    # Three flavours of BLANK BOX stripped.
+    # Four flavours of BLANK BOX stripped, including all-caps.
     assert "cosh-pg-bb-id-sentinel" not in by_id, "row with translation == BlankBox should be stripped"
     assert "BlankBox" not in by_id
     assert "Blank Box" not in by_id
+    assert "cosh-pg-bb-caps" not in by_id, "all-caps 'BLANK BOX' must also be stripped"
