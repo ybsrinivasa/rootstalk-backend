@@ -211,3 +211,44 @@ async def test_lookup_invalid_promoter_type_rejected(db):
             db=db, current_user=caller,
         )
     assert ei.value.status_code == 422
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_lookup_normalises_bare_10_digit_input(db):
+    """Regression 2026-05-21: frontend sends what the FM typed
+    (often bare 10 digits). User.phone is stored +91XXXXXXXXXX.
+    Pre-fix the lookup did `User.phone == phone` and returned
+    exists=False for every demonstrably-registered user."""
+    client = await make_client(db)
+    caller = await make_user(db, name="FM")
+    target = await make_self_registered_user(
+        db, phone="+919901399939", role="DEALER", name="Demo Dealer",
+    )
+    await db.commit()
+
+    # Bare 10 digits — what the modal usually sends.
+    out = await lookup_user_for_onboarding(
+        phone="9901399939",
+        client_id=client.id,
+        promoter_type="DEALER",
+        db=db, current_user=caller,
+    )
+    assert out["exists"] is True
+    assert out["user"]["id"] == target.id
+
+    # Messy formats — spaces / dashes / extra +91 — all resolve.
+    for messy in ("+91 99013 99939", "99013-99939", "91-9901399939"):
+        out2 = await lookup_user_for_onboarding(
+            phone=messy, client_id=client.id, promoter_type="DEALER",
+            db=db, current_user=caller,
+        )
+        assert out2["exists"] is True, f"failed on {messy!r}"
+        assert out2["user"]["id"] == target.id
+
+    # Too-short input short-circuits to not-found, no DB hit needed.
+    short = await lookup_user_for_onboarding(
+        phone="999", client_id=client.id, promoter_type="DEALER",
+        db=db, current_user=caller,
+    )
+    assert short["exists"] is False

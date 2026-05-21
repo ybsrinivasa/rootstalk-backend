@@ -1588,7 +1588,19 @@ async def register_promoter(
         raise HTTPException(status_code=422, detail="promoter_type must be DEALER or FACILITATOR")
     if not phone or not str(phone).strip():
         raise HTTPException(status_code=422, detail="Phone is required.")
-    phone = str(phone).strip()
+    # Normalise same as lookup_user_for_onboarding (and
+    # /platform/lookup-user-by-phone). Frontend often sends bare
+    # 10 digits; User.phone is stored +91XXXXXXXXXX.
+    digits = ''.join(ch for ch in str(phone) if ch.isdigit())
+    if len(digits) < 10:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "phone_invalid",
+                "message": "Enter a 10-digit Indian mobile number.",
+            },
+        )
+    phone = '+91' + digits[-10:]
 
     user = (await db.execute(
         select(User).where(User.phone == phone)
@@ -1705,8 +1717,21 @@ async def lookup_user_for_onboarding(
             detail="promoter_type must be DEALER or FACILITATOR",
         )
 
+    # Normalise — frontend sends what the FM typed (often bare 10
+    # digits). User.phone is stored as +91XXXXXXXXXX. Without this
+    # normalisation, every onboard attempt returned exists=False
+    # even for users who were demonstrably registered (user report
+    # 2026-05-21). Same shape as /platform/lookup-user-by-phone.
+    digits = ''.join(ch for ch in (phone or '') if ch.isdigit())
+    if len(digits) < 10:
+        return {
+            "exists": False, "user": None, "has_role": False,
+            "already_onboarded": False, "dealer_profile": None,
+        }
+    normalised_phone = '+91' + digits[-10:]
+
     user = (await db.execute(
-        select(User).where(User.phone == phone)
+        select(User).where(User.phone == normalised_phone)
     )).scalar_one_or_none()
     if user is None:
         return {
@@ -1788,8 +1813,13 @@ async def lookup_user_by_phone(
     behaviour), so this isn't a new fish-the-phone-book vector."""
     if not phone:
         raise HTTPException(status_code=422, detail="phone is required")
+    # Normalise — same shape as the other two onboarding lookups.
+    digits = ''.join(ch for ch in str(phone) if ch.isdigit())
+    if len(digits) < 10:
+        return {"exists": False, "name": None}
+    normalised_phone = '+91' + digits[-10:]
     existing = (await db.execute(
-        select(User).where(User.phone == phone)
+        select(User).where(User.phone == normalised_phone)
     )).scalar_one_or_none()
     if existing:
         return {"exists": True, "name": existing.name}
