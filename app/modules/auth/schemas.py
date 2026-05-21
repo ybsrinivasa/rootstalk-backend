@@ -1,3 +1,4 @@
+from datetime import datetime
 from pydantic import BaseModel, EmailStr
 from typing import Optional, List
 from app.modules.platform.models import RoleType, StatusEnum
@@ -67,6 +68,13 @@ class UserOut(BaseModel):
     gps_lat: Optional[float] = None
     gps_lng: Optional[float] = None
     photo_url: Optional[str] = None
+    # Role-setup gates (2026-05-21). The PWA drawer reads these to
+    # decide "Switch to my Shop" vs "Open my Shop / Set up →" and
+    # to gate /dealer/home and /facilitator/home. WITHOUT these
+    # being declared on the schema Pydantic silently strips them
+    # from the response — easy trap.
+    facilitator_declared_at: Optional[datetime] = None
+    dealer_profile_complete: bool = False
 
     class Config:
         from_attributes = True
