@@ -1570,12 +1570,21 @@ async def list_promoters(
             "shop_gps_lat": None,
             "shop_gps_lng": None,
         }
+        # Initialise the extended DealerProfile fields so callers
+        # can always read them (saves an "is field present" check
+        # on the FM frontend).
+        row["sell_categories"] = []
+        row["shop_photo_url"] = None
+        row["shop_registration_url"] = None
         dp = dealer_profiles_by_uid.get(user.id)
         if dp:
             row["shop_name"] = dp.shop_name
             row["shop_address"] = dp.shop_address
             row["shop_gps_lat"] = float(dp.shop_gps_lat) if dp.shop_gps_lat else None
             row["shop_gps_lng"] = float(dp.shop_gps_lng) if dp.shop_gps_lng else None
+            row["sell_categories"] = dp.sell_categories or []
+            row["shop_photo_url"] = dp.shop_photo_url
+            row["shop_registration_url"] = dp.shop_registration_url
         out.append(row)
     return out
 
