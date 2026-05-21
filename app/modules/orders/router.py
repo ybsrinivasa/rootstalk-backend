@@ -1713,6 +1713,29 @@ async def get_volume_estimate(
 
 # ── Dealer: Profile (what do you sell, shop details) ─────────────────────────
 
+def _dealer_profile_complete(profile) -> bool:
+    """All shop fields a dealer must capture before the PWA lets
+    them into /dealer/home. Drives both UI gating and the
+    `is_profile_complete` flag on the GET response.
+
+    Note: licence URLs are intentionally NOT required (2026-05-20
+    rule — RootsTalk does not collect dealer licences; verification
+    is the client's responsibility, see project_rootstalk_dealer_
+    profile_rules.md).
+    """
+    if profile is None:
+        return False
+    return (
+        bool(profile.shop_name and profile.shop_name.strip())
+        and bool(profile.shop_address and profile.shop_address.strip())
+        and bool(profile.sell_categories)
+        and profile.shop_gps_lat is not None
+        and profile.shop_gps_lng is not None
+        and bool(profile.shop_registration_url and profile.shop_registration_url.strip())
+        and bool(profile.shop_photo_url and profile.shop_photo_url.strip())
+    )
+
+
 @router.get("/dealer/profile")
 async def get_dealer_profile(
     db: AsyncSession = Depends(get_db),
@@ -1722,7 +1745,12 @@ async def get_dealer_profile(
         select(DealerProfile).where(DealerProfile.user_id == current_user.id)
     )).scalar_one_or_none()
     if not profile:
-        return {"user_id": current_user.id, "sell_categories": [], "shop_name": None}
+        return {
+            "user_id": current_user.id,
+            "sell_categories": [],
+            "shop_name": None,
+            "is_profile_complete": False,
+        }
     return {
         "user_id": profile.user_id,
         "shop_name": profile.shop_name,
@@ -1734,6 +1762,7 @@ async def get_dealer_profile(
         "shop_photo_url": profile.shop_photo_url,
         "shop_gps_lat": float(profile.shop_gps_lat) if profile.shop_gps_lat else None,
         "shop_gps_lng": float(profile.shop_gps_lng) if profile.shop_gps_lng else None,
+        "is_profile_complete": _dealer_profile_complete(profile),
     }
 
 

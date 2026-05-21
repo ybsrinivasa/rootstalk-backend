@@ -421,6 +421,44 @@ async def claim_role(
     return {"role": role_str, "status": "ACTIVE"}
 
 
+@router.post("/me/facilitator-declaration", status_code=200)
+async def confirm_facilitator_declaration(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Stamp users.facilitator_declared_at = now(). Required before
+    the PWA lets the user into /facilitator/home.
+
+    Idempotent: re-confirming preserves the original timestamp so
+    we don't reset the moment of declaration when the page is
+    re-saved (e.g. a noisy onClick).
+
+    Caller must already hold the FACILITATOR UserRole (granted via
+    /auth/me/claim-role); 409 otherwise so the PWA can route the
+    user back through /become-facilitator first.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    has_role = (await db.execute(
+        select(UserRole).where(
+            UserRole.user_id == current_user.id,
+            UserRole.role_type == RoleType.FACILITATOR,
+            UserRole.status == StatusEnum.ACTIVE,
+        )
+    )).scalar_one_or_none() is not None
+    if not has_role:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "facilitator_role_not_claimed",
+                "message": "Register as a Facilitator first.",
+            },
+        )
+    if current_user.facilitator_declared_at is None:
+        current_user.facilitator_declared_at = _dt.now(_tz.utc)
+        await db.commit()
+    return {"facilitator_declared_at": current_user.facilitator_declared_at}
+
+
 # ── Shared ─────────────────────────────────────────────────────────────────────
 
 @router.get("/me", response_model=UserOut)
@@ -539,6 +577,11 @@ async def get_me(request: Request, current_user: User = Depends(get_current_user
         "gps_lat": float(current_user.gps_lat) if current_user.gps_lat is not None else None,
         "gps_lng": float(current_user.gps_lng) if current_user.gps_lng is not None else None,
         "photo_url": current_user.photo_url,
+        # PWA gate: /facilitator/home checks this before letting
+        # the user in. Self-claiming the FACILITATOR role grants
+        # /facilitator/profile access; declaring there sets this
+        # timestamp and unlocks /facilitator/home.
+        "facilitator_declared_at": current_user.facilitator_declared_at,
     }
 
 

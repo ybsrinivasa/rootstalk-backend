@@ -74,6 +74,15 @@ class User(Base):
     # POST /platform/fcm-token when the device registers.
     # Single-device for V1; multi-device support deferred to V2.
     fcm_token: Mapped[str] = mapped_column(Text, nullable=True)
+    # Set when the user confirms the facilitator declaration on
+    # /facilitator/profile. Drives the PWA gate: /facilitator/home
+    # refuses to load until this is non-null. Self-claiming the
+    # FACILITATOR UserRole (via /auth/me/claim-role) grants access to
+    # /facilitator/profile but not /facilitator/home — completing
+    # the declaration is the second, intentional step.
+    facilitator_declared_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
 
     roles: Mapped[list["UserRole"]] = relationship("UserRole", back_populates="user")
 
