@@ -24,6 +24,12 @@ class CoshSyncLog(Base):
     items_synced: Mapped[int] = mapped_column(Integer, default=0)
     items_failed: Mapped[int] = mapped_column(Integer, default=0)
     error_log: Mapped[dict] = mapped_column(JSON, nullable=True)
+    # 2026-05-21 — per-batch breakdown of what got synced. Surfaced
+    # on the SA Sync Log page so the human reading the log can see
+    # "Crops: 1, Brands: 5" instead of a meaningless aggregate "6
+    # synced". Shape: [{"entity_type": "crops", "inserted": 1,
+    # "updated": 0, "failed": 0}, …]. Nullable for legacy rows.
+    entity_summary: Mapped[list] = mapped_column(JSON, nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
 

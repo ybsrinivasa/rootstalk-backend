@@ -313,6 +313,19 @@ async def process_payload(
 
     sync_log.items_synced = total_inserted + total_updated
     sync_log.items_failed = total_failed
+    # 2026-05-21 — per-batch breakdown surfaced on the Sync Log UI.
+    # Trimmed: drop the per-item `errors` list (can be large) and
+    # the `received` count; the UI shows changed-rows-per-type,
+    # not the noisy raw input.
+    sync_log.entity_summary = [
+        {
+            "entity_type": e["entity_type"],
+            "inserted": e["inserted"],
+            "updated": e["updated"],
+            "failed": e["failed"],
+        }
+        for e in entity_results
+    ]
     if total_failed > 0 and (total_inserted + total_updated) > 0:
         sync_log.status = "partial"
     elif total_failed > 0:

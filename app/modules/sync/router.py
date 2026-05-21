@@ -83,10 +83,12 @@ async def get_sync_log(
     return [
         {
             "sync_id": log.sync_id,
+            "initiated_by": log.initiated_by,
             "sync_mode": log.sync_mode,
             "status": log.status,
             "items_synced": log.items_synced,
             "items_failed": log.items_failed,
+            "entity_summary": log.entity_summary,
             "started_at": log.started_at,
             "completed_at": log.completed_at,
         }
