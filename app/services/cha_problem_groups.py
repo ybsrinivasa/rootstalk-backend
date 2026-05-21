@@ -56,7 +56,18 @@ LEGACY_V1_PROBLEM_GROUPS: list[dict] = [
 async def list_problem_groups(db: AsyncSession) -> list[dict]:
     """Return [{cosh_id, name_en, status}] sorted by name_en. Only
     `active` Cosh problem_groups items surface. Empty list when
-    Cosh has no rows."""
+    Cosh has no rows.
+
+    BLANK BOX rows are stripped (cosh_id OR name_en matches the
+    sentinel). Per the standing rule — BLANK BOX = "no relevant
+    data", never displayed in any UI list (see
+    project_rootstalk_pest_diagnosis.md). Cosh occasionally emits
+    Blank-Box rows for grouping placeholders; they're legitimate
+    in Connect rows where the wildcard has meaning, but in a flat
+    Core list they're noise.
+    """
+    from app.modules.sync.service import _is_blank_box
+
     rows = (await db.execute(
         select(CoshCoreItem).where(
             CoshCoreItem.core_type == COSH_PROBLEM_GROUPS_CORE,
@@ -66,9 +77,12 @@ async def list_problem_groups(db: AsyncSession) -> list[dict]:
     items = []
     for r in rows:
         t = r.translations or {}
+        name = t.get("en") or t.get("English") or r.cosh_id
+        if _is_blank_box(r.cosh_id) or _is_blank_box(name):
+            continue
         items.append({
             "cosh_id": r.cosh_id,
-            "name_en": t.get("en") or t.get("English") or r.cosh_id,
+            "name_en": name,
             "status": "active",
         })
     items.sort(key=lambda x: x["name_en"].casefold())
@@ -78,7 +92,11 @@ async def list_problem_groups(db: AsyncSession) -> list[dict]:
 async def is_known_problem_group(db: AsyncSession, cosh_id: str) -> bool:
     """Membership check used by the CA-side create-PG validator.
     True iff Cosh has an `active` `problem_groups` row for the given
-    cosh_id."""
+    cosh_id. BLANK BOX is rejected explicitly — even if Cosh has the
+    sentinel as an active row, it must never validate as a real PG."""
+    from app.modules.sync.service import _is_blank_box
+    if _is_blank_box(cosh_id):
+        return False
     row = (await db.execute(
         select(CoshCoreItem.cosh_id).where(
             CoshCoreItem.cosh_id == cosh_id,

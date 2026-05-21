@@ -110,3 +110,41 @@ async def test_endpoint_ignores_other_core_types(db):
     assert "cosh-pg-fungal" in by_id
     assert by_id["cosh-pg-fungal"]["name_en"] == "Fungal Diseases"
     assert "cosh-other" not in by_id
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_blank_box_rows_are_filtered_out(db):
+    """Regression 2026-05-21: testing surfaced BLANK BOX entries in
+    the PG list. Per the standing rule (project_rootstalk_pest_
+    diagnosis), BLANK BOX = "no relevant data" and never appears in
+    any user-facing list. Cosh occasionally emits Blank-Box rows;
+    list_problem_groups must strip them regardless of which spelling
+    (BlankBox / "Blank Box") shows up in cosh_id or translation."""
+    user = await make_user(db, name="CM BB")
+    db.add(CoshCoreItem(
+        cosh_id="cosh-pg-bb-id-sentinel", core_type=COSH_PROBLEM_GROUPS_CORE,
+        translations={"en": "BlankBox"}, status="active",
+    ))
+    db.add(CoshCoreItem(
+        cosh_id="BlankBox", core_type=COSH_PROBLEM_GROUPS_CORE,
+        translations={"en": "Should Not Show"}, status="active",
+    ))
+    db.add(CoshCoreItem(
+        cosh_id="Blank Box", core_type=COSH_PROBLEM_GROUPS_CORE,
+        translations={"en": "Also Not Shown"}, status="active",
+    ))
+    db.add(CoshCoreItem(
+        cosh_id="cosh-pg-bb-real", core_type=COSH_PROBLEM_GROUPS_CORE,
+        translations={"en": "Real Group"}, status="active",
+    ))
+    await db.commit()
+
+    out = await list_global_problem_groups(db=db, current_user=user)
+    by_id = _by_id(out)
+    # Real row survives.
+    assert "cosh-pg-bb-real" in by_id
+    # Three flavours of BLANK BOX stripped.
+    assert "cosh-pg-bb-id-sentinel" not in by_id, "row with translation == BlankBox should be stripped"
+    assert "BlankBox" not in by_id
+    assert "Blank Box" not in by_id

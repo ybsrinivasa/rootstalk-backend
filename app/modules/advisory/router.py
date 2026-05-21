@@ -6506,24 +6506,14 @@ async def list_global_problem_groups(
     their applicable-crop chips against `sp_pg_crops` Connect.
 
     Returns `[{cosh_id, name_en, status}]` sorted by `name_en`.
-    Only `active` Core items surface."""
-    from app.services.cosh_constants import COSH_PROBLEM_GROUPS_CORE
-    rows = (await db.execute(
-        select(CoshCoreItem).where(
-            CoshCoreItem.core_type == COSH_PROBLEM_GROUPS_CORE,
-            CoshCoreItem.status == "active",
-        )
-    )).scalars().all()
-    items = []
-    for r in rows:
-        t = r.translations or {}
-        items.append({
-            "cosh_id": r.cosh_id,
-            "name_en": t.get("en") or t.get("English") or r.cosh_id,
-            "status": "active",
-        })
-    items.sort(key=lambda x: x["name_en"].casefold())
-    return items
+    Only `active` Core items surface. BLANK BOX rows stripped
+    (see cha_problem_groups.list_problem_groups for the rule).
+    Previously this endpoint inlined the query — moved to the
+    shared helper 2026-05-21 so SA and CA pickers can't drift
+    on filter logic.
+    """
+    from app.services.cha_problem_groups import list_problem_groups
+    return await list_problem_groups(db)
 
 
 @router.get("/advisory/global/pg-recommendations", response_model=list[PGRecommendationOut])
