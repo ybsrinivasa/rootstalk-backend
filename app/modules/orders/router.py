@@ -15,7 +15,7 @@ from app.modules.orders.models import (
 )
 from app.modules.subscriptions.models import Subscription
 from app.modules.sync.models import VolumeFormula
-from app.modules.advisory.models import Practice, Element, Timeline
+from app.modules.advisory.models import Package, Practice, Element, Timeline
 from app.services.bl06_volume_calc import calculate_volume
 from math import radians, cos, sin, asin, sqrt
 from app.services.bl07_brand_options import get_brand_options

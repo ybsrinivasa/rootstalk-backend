@@ -261,6 +261,45 @@ async def test_cancelled_order_releases_practice_back_into_pool(db):
 
 @requires_docker
 @pytest.mark.asyncio
+async def test_preview_endpoint_handles_mixed_timeline_types(db):
+    """A package can carry DAS + DBS + CALENDAR timelines (the CCA
+    spec allows all three anchors). The preview must not crash on
+    non-DAS/DBS rows — it just skips them silently."""
+    user = await make_user(db, name="Farmer Mixed")
+    client = await make_client(db)
+    pkg = await make_package(db, client)
+    sub = await make_subscription(db, farmer=user, client=client, package=pkg)
+    sub.crop_start_date = datetime.now(timezone.utc)
+    await db.commit()
+
+    das = await make_timeline(
+        db, pkg, name="TL_das", from_type=TimelineFromType.DAS,
+        from_value=0, to_value=30,
+    )
+    cal = await make_timeline(
+        db, pkg, name="TL_cal", from_type=TimelineFromType.CALENDAR,
+        from_value=0, to_value=30,
+    )
+    pest_das = await make_practice(db, das, l0=PracticeL0.INPUT,
+        l1="PESTICIDE", l2="CHEMICAL_PESTICIDES")
+    pest_cal = await make_practice(db, cal, l0=PracticeL0.INPUT,
+        l1="PESTICIDE", l2="MICROBIAL_PESTICIDES")
+    await db.commit()
+
+    out = await order_preview(
+        subscription_id=sub.id, category="PESTICIDE",
+        to_date=(date.today() + timedelta(days=15)).isoformat(),
+        db=db, current_user=user,
+    )
+    ids = {p["id"] for p in out["practices"]}
+    assert pest_das.id in ids
+    assert pest_cal.id not in ids, "CALENDAR timeline skipped silently — handled by a different anchor path"
+    assert out["category"] == "PESTICIDE"
+    assert out["count"] == 1
+
+
+@requires_docker
+@pytest.mark.asyncio
 async def test_create_order_rejects_already_ordered_practice(db):
     """The safety net — even if a race lets a duplicate practice_id
     reach the POST, server refuses with 409 + clear code."""

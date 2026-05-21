@@ -64,18 +64,27 @@ def _timeline_window(
 ) -> tuple[date, date] | None:
     """Convert a Timeline's relative DAS/DBS offsets into absolute
     calendar dates, given the subscription's crop_start_date.
-    Returns None for unsupported timing types (e.g. CALENDAR with
-    no anchor in this minimal helper)."""
+
+    Returns None for:
+      - CALENDAR (no anchor — calendar-based timelines store absolute
+        dates elsewhere; bundle path doesn't need them for V1)
+      - DAYS_AFTER_DETECTION / DAYS_AFTER_RESPONSE — CHA-pipe
+        timelines anchored to a triggered event, not crop_start.
+        Handled by the diagnosis flow, not the order bundle.
+      - Any unexpected from_type / NULL offsets — defensive.
+    """
+    if tl.from_value is None or tl.to_value is None:
+        return None
     ftype = tl.from_type.value if hasattr(tl.from_type, "value") else str(tl.from_type)
     if ftype == "DAS":
         return (
-            crop_start + timedelta(days=tl.from_value),
-            crop_start + timedelta(days=tl.to_value),
+            crop_start + timedelta(days=int(tl.from_value)),
+            crop_start + timedelta(days=int(tl.to_value)),
         )
     if ftype == "DBS":
         return (
-            crop_start - timedelta(days=tl.from_value),
-            crop_start - timedelta(days=tl.to_value),
+            crop_start - timedelta(days=int(tl.from_value)),
+            crop_start - timedelta(days=int(tl.to_value)),
         )
     return None
 
