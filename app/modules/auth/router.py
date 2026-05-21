@@ -582,7 +582,34 @@ async def get_me(request: Request, current_user: User = Depends(get_current_user
         # /facilitator/profile access; declaring there sets this
         # timestamp and unlocks /facilitator/home.
         "facilitator_declared_at": current_user.facilitator_declared_at,
+        # PWA gate: drawer + /dealer/home check this. True only
+        # when the user has a DealerProfile row with every
+        # required field filled (mirrors GET /dealer/profile's
+        # is_profile_complete). Lets the right-drawer show
+        # "Open my Shop / Set up →" instead of "Switch to my
+        # Shop" until the setup is finished.
+        "dealer_profile_complete": await _is_dealer_profile_complete(db, current_user.id),
     }
+
+
+async def _is_dealer_profile_complete(db, user_id: str) -> bool:
+    """Mirror of orders.router._dealer_profile_complete — kept here
+    to avoid pulling the orders router into auth at import time."""
+    from app.modules.orders.models import DealerProfile
+    profile = (await db.execute(
+        select(DealerProfile).where(DealerProfile.user_id == user_id)
+    )).scalar_one_or_none()
+    if profile is None:
+        return False
+    return (
+        bool(profile.shop_name and profile.shop_name.strip())
+        and bool(profile.shop_address and profile.shop_address.strip())
+        and bool(profile.sell_categories)
+        and profile.shop_gps_lat is not None
+        and profile.shop_gps_lng is not None
+        and bool(profile.shop_registration_url and profile.shop_registration_url.strip())
+        and bool(profile.shop_photo_url and profile.shop_photo_url.strip())
+    )
 
 
 @router.get("/me/location")
