@@ -144,6 +144,14 @@ class DealerRelationship(Base):
     dealer_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
     manufacturer_name: Mapped[str] = mapped_column(String(500), nullable=False)
     manufacturer_client_id: Mapped[str] = mapped_column(String(36), ForeignKey("clients.id"), nullable=True)
+    # 2026-05-21 — Cosh-resolved selection. Replaces the free-text-only
+    # workflow with one driven by the manufacturer catalog. Nullable
+    # because pre-2026-05-21 rows captured names only (no cosh_id).
+    manufacturer_cosh_id: Mapped[str] = mapped_column(String(100), nullable=True)
+    # PESTICIDE | FERTILIZER. The same manufacturer can have one row per
+    # category — a dealer might stock Bayer pesticides but not Bayer
+    # fertilizers (or vice versa). Nullable for legacy rows.
+    category: Mapped[str] = mapped_column(String(20), nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 

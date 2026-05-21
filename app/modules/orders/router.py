@@ -1793,20 +1793,93 @@ async def upsert_dealer_profile(
 
 # ── Dealer: Dealerships (manufacturer relationships) ─────────────────────────
 
-@router.get("/dealer/dealerships")
-async def list_dealerships(
+# ── Dealer: Manufacturer catalog (Cosh-driven) ────────────────────────────────
+
+# L2 → category mapping. Pesticides + Special Inputs go under PESTICIDE
+# per user 2026-05-21; NPK-dosage L2s are excluded (no trade names →
+# no manufacturers, per cosh_options_view.L2_TYPES_WITHOUT_TRADE_NAMES).
+_PESTICIDE_L2S = [
+    "CHEMICAL_PESTICIDES", "MICROBIAL_PESTICIDES", "BOTANICAL_PESTICIDES",
+    "INSECT_BIOCONTROL_AGENTS", "INSECT_TRAPS", "CHEMICAL_HERBICIDES",
+    "OTHER_PESTICIDES",
+    "ADJUVANTS",  # L1: Special Inputs
+]
+_FERTILIZER_L2S = [
+    "MANURES", "CHEMICAL_FERTILIZER_PRODUCTS",
+    "CHEMICAL_FERTILIZER_FERTIGATION_PRODUCTS", "BIOFERTILIZERS",
+    "PGR_TONICS", "SOIL_AMENDMENTS",
+]
+_CATEGORY_TO_L2S = {
+    "PESTICIDE": _PESTICIDE_L2S,
+    "FERTILIZER": _FERTILIZER_L2S,
+}
+
+
+@router.get("/dealer/manufacturers-catalog")
+async def dealer_manufacturers_catalog(
+    category: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    result = await db.execute(
-        select(DealerRelationship).where(
-            DealerRelationship.dealer_user_id == current_user.id,
-            DealerRelationship.status == "ACTIVE",
-        ).order_by(DealerRelationship.manufacturer_name)
+    """Manufacturers in scope for the given dealer-side category.
+
+    Walks: for each L2 in the category, list its common names, then
+    for each common name list its manufacturers, then union and dedup
+    by cosh_id. Same manufacturer can surface in PESTICIDE and
+    FERTILIZER calls — that's intentional, lets the dealer select
+    them once per category.
+
+    Returns `[{cosh_id, name}, …]` sorted by name.
+    """
+    from app.services.cosh_options_view import (
+        list_common_names_for_l2, list_manufacturers_for_common_name,
     )
+    l2_list = _CATEGORY_TO_L2S.get(category.upper())
+    if not l2_list:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown category {category!r}. Use PESTICIDE or FERTILIZER.",
+        )
+    manufacturers: dict[str, str] = {}  # cosh_id → name
+    for l2 in l2_list:
+        cns = await list_common_names_for_l2(db, l2)
+        for cn in cns:
+            mfrs = await list_manufacturers_for_common_name(
+                db, common_name_cosh_id=cn["cosh_id"], l2_type=l2,
+            )
+            for m in mfrs:
+                manufacturers[m["cosh_id"]] = m["name"]
+    return sorted(
+        ({"cosh_id": cid, "name": n} for cid, n in manufacturers.items()),
+        key=lambda x: x["name"].casefold(),
+    )
+
+
+@router.get("/dealer/dealerships")
+async def list_dealerships(
+    category: str | None = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List the dealer's selected dealerships. Optional `category`
+    (PESTICIDE | FERTILIZER) narrows the response so the PWA tab
+    can fetch just what it needs. Legacy free-text rows have no
+    `category` and surface only when no filter is applied."""
+    q = select(DealerRelationship).where(
+        DealerRelationship.dealer_user_id == current_user.id,
+        DealerRelationship.status == "ACTIVE",
+    )
+    if category:
+        q = q.where(DealerRelationship.category == category.upper())
+    result = await db.execute(q.order_by(DealerRelationship.manufacturer_name))
     rows = result.scalars().all()
-    return [{"id": r.id, "manufacturer_name": r.manufacturer_name,
-             "manufacturer_client_id": r.manufacturer_client_id} for r in rows]
+    return [{
+        "id": r.id,
+        "manufacturer_name": r.manufacturer_name,
+        "manufacturer_cosh_id": r.manufacturer_cosh_id,
+        "manufacturer_client_id": r.manufacturer_client_id,
+        "category": r.category,
+    } for r in rows]
 
 
 @router.post("/dealer/dealerships", status_code=201)
@@ -1815,9 +1888,28 @@ async def add_dealership(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Add a dealership. Cosh-driven path: pass `manufacturer_cosh_id`
+    + `manufacturer_name` + `category`. Idempotent — re-adding the
+    same (dealer, cosh_id, category) returns the existing row instead
+    of creating a duplicate."""
+    cosh_id = data.get("manufacturer_cosh_id")
+    category = (data.get("category") or "").upper() or None
+    if cosh_id and category:
+        existing = (await db.execute(
+            select(DealerRelationship).where(
+                DealerRelationship.dealer_user_id == current_user.id,
+                DealerRelationship.manufacturer_cosh_id == cosh_id,
+                DealerRelationship.category == category,
+                DealerRelationship.status == "ACTIVE",
+            )
+        )).scalar_one_or_none()
+        if existing:
+            return {"id": existing.id, "manufacturer_name": existing.manufacturer_name}
     rel = DealerRelationship(
         dealer_user_id=current_user.id,
         manufacturer_name=data["manufacturer_name"],
+        manufacturer_cosh_id=cosh_id,
+        category=category,
         manufacturer_client_id=data.get("manufacturer_client_id"),
     )
     db.add(rel)
