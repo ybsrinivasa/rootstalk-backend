@@ -19,7 +19,11 @@ AUDIO_CONTENT_TYPES = {
     "audio/wav", "audio/x-wav", "audio/wave",
     "audio/webm",
 }
-ALLOWED_CONTENT_TYPES = IMAGE_CONTENT_TYPES | AUDIO_CONTENT_TYPES
+# 2026-05-21: dealer shop-registration certs are commonly PDFs.
+# Added at module scope so any document upload (not just the cert)
+# can include PDFs without each caller having to widen the set.
+DOCUMENT_CONTENT_TYPES = {"application/pdf"}
+ALLOWED_CONTENT_TYPES = IMAGE_CONTENT_TYPES | AUDIO_CONTENT_TYPES | DOCUMENT_CONTENT_TYPES
 # Audio voice-notes need more room than logos. 25 MB covers ~25 min
 # at 128 kbps mp3 — enough for a long advisory tip.
 MAX_SIZE_BYTES = 25 * 1024 * 1024
@@ -50,8 +54,10 @@ async def upload_to_s3(
             hint = "Use JPEG, PNG, WebP, or GIF."
         elif types == AUDIO_CONTENT_TYPES:
             hint = "Use MP3, AAC, OGG, WAV, or WebM."
+        elif types == DOCUMENT_CONTENT_TYPES:
+            hint = "Use PDF."
         else:
-            hint = "Use JPEG/PNG/WebP/GIF for images or MP3/AAC/OGG/WAV/WebM for audio."
+            hint = "Use JPEG/PNG/WebP/GIF or PDF for documents, or MP3/AAC/OGG/WAV/WebM for audio."
         raise HTTPException(
             status_code=422,
             detail=f"File type {file.content_type} not allowed. {hint}",
