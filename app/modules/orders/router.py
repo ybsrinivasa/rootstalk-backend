@@ -10,7 +10,7 @@ from app.dependencies import get_current_user
 from app.modules.platform.models import User
 from app.modules.orders.models import (
     Order, OrderItem, SeedOrder, PackingList, MissingBrandReport,
-    DealerProfile, DealerRelationship,
+    DealerProfile, DealerRelationship, DealerManufacturerCatalog,
     OrderStatus, OrderItemStatus,
 )
 from app.modules.subscriptions.models import Subscription
@@ -1815,32 +1815,19 @@ _CATEGORY_TO_L2S = {
 }
 
 
-@router.get("/dealer/manufacturers-catalog")
-async def dealer_manufacturers_catalog(
-    category: str,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """Manufacturers in scope for the given dealer-side category.
+async def _walk_cosh_manufacturers(db: AsyncSession, category: str) -> dict[str, str]:
+    """The expensive walk: for each L2 in the category, list its
+    common names, then for each common name list its manufacturers,
+    union and dedup by cosh_id. Returns {cosh_id: name}.
 
-    Walks: for each L2 in the category, list its common names, then
-    for each common name list its manufacturers, then union and dedup
-    by cosh_id. Same manufacturer can surface in PESTICIDE and
-    FERTILIZER calls — that's intentional, lets the dealer select
-    them once per category.
-
-    Returns `[{cosh_id, name}, …]` sorted by name.
+    Only called from the rebuild path — request-time reads hit the
+    materialised `dealer_manufacturer_catalog` table.
     """
     from app.services.cosh_options_view import (
         list_common_names_for_l2, list_manufacturers_for_common_name,
     )
-    l2_list = _CATEGORY_TO_L2S.get(category.upper())
-    if not l2_list:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Unknown category {category!r}. Use PESTICIDE or FERTILIZER.",
-        )
-    manufacturers: dict[str, str] = {}  # cosh_id → name
+    l2_list = _CATEGORY_TO_L2S.get(category.upper(), [])
+    out: dict[str, str] = {}
     for l2 in l2_list:
         cns = await list_common_names_for_l2(db, l2)
         for cn in cns:
@@ -1848,11 +1835,97 @@ async def dealer_manufacturers_catalog(
                 db, common_name_cosh_id=cn["cosh_id"], l2_type=l2,
             )
             for m in mfrs:
-                manufacturers[m["cosh_id"]] = m["name"]
-    return sorted(
-        ({"cosh_id": cid, "name": n} for cid, n in manufacturers.items()),
-        key=lambda x: x["name"].casefold(),
+                out[m["cosh_id"]] = m["name"]
+    return out
+
+
+async def _rebuild_manufacturer_catalog(
+    db: AsyncSession, *, only_category: str | None = None,
+) -> int:
+    """Truncate-and-reload the materialised catalog. Returns the
+    total number of rows written. Pass `only_category` to refresh
+    just one half (the other half's rows are untouched)."""
+    from datetime import datetime, timezone
+    cats = [only_category.upper()] if only_category else list(_CATEGORY_TO_L2S.keys())
+    total = 0
+    for cat in cats:
+        await db.execute(
+            DealerManufacturerCatalog.__table__.delete().where(
+                DealerManufacturerCatalog.category == cat,
+            )
+        )
+        mfrs = await _walk_cosh_manufacturers(db, cat)
+        now = datetime.now(timezone.utc)
+        for cosh_id, name in mfrs.items():
+            db.add(DealerManufacturerCatalog(
+                category=cat, manufacturer_cosh_id=cosh_id,
+                manufacturer_name=name, refreshed_at=now,
+            ))
+            total += 1
+    await db.commit()
+    return total
+
+
+@router.get("/dealer/manufacturers-catalog")
+async def dealer_manufacturers_catalog(
+    category: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Reads from the materialised catalog table — sub-second even
+    as Cosh data grows. Lazy-populates on first request per category.
+
+    Refresh-on-Cosh-update is manual for now (admin endpoint
+    POST /admin/dealer/manufacturers-catalog/refresh). Staleness
+    between Cosh sync and next refresh is acceptable; the catalog
+    is a list of manufacturer NAMES, not stock or prices.
+    """
+    cat = category.upper()
+    if cat not in _CATEGORY_TO_L2S:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown category {category!r}. Use PESTICIDE or FERTILIZER.",
+        )
+    rows = (await db.execute(
+        select(DealerManufacturerCatalog).where(
+            DealerManufacturerCatalog.category == cat,
+        ).order_by(DealerManufacturerCatalog.manufacturer_name)
+    )).scalars().all()
+    if not rows:
+        # Lazy bootstrap. First hit per category after deploy /
+        # migration pays the walk cost; everyone afterwards is
+        # sub-second.
+        await _rebuild_manufacturer_catalog(db, only_category=cat)
+        rows = (await db.execute(
+            select(DealerManufacturerCatalog).where(
+                DealerManufacturerCatalog.category == cat,
+            ).order_by(DealerManufacturerCatalog.manufacturer_name)
+        )).scalars().all()
+    return [
+        {"cosh_id": r.manufacturer_cosh_id, "name": r.manufacturer_name}
+        for r in rows
+    ]
+
+
+@router.post("/admin/dealer/manufacturers-catalog/refresh")
+async def admin_refresh_manufacturer_catalog(
+    category: str | None = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Force-rebuild the dealer manufacturer catalog from Cosh.
+    Call after a Cosh sync that added/renamed manufacturers in
+    scope. Optional `?category=PESTICIDE` (or FERTILIZER) refreshes
+    just one half; omit to refresh both.
+
+    SA-or-CONTENT_MANAGER only — same gate as other admin routes.
+    """
+    from app.modules.advisory.router import _assert_sa_or_cm
+    await _assert_sa_or_cm(db, current_user)
+    total = await _rebuild_manufacturer_catalog(
+        db, only_category=category if category else None,
     )
+    return {"rows_written": total, "category": category or "ALL"}
 
 
 @router.get("/dealer/dealerships")

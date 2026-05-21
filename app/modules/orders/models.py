@@ -156,6 +156,28 @@ class DealerRelationship(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class DealerManufacturerCatalog(Base):
+    """Materialised view of the Cosh manufacturer walk, per category.
+
+    Every dealer sees the same list — it's a pure function of Cosh
+    data — so we cache it once instead of redoing the L2-→-CN-→-MFR
+    walk per request. Cosh data turns over slowly; we accept staleness
+    up to the next rebuild (lazy on first read, or manual via an
+    admin endpoint).
+
+    Composite PK: a manufacturer in both PESTICIDE and FERTILIZER is
+    two rows. Truncate-and-reload is the only write path.
+    """
+    __tablename__ = "dealer_manufacturer_catalog"
+
+    category: Mapped[str] = mapped_column(String(20), primary_key=True)
+    manufacturer_cosh_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    manufacturer_name: Mapped[str] = mapped_column(String(500), nullable=False)
+    refreshed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow,
+    )
+
+
 class MissingBrandReport(Base):
     __tablename__ = "missing_brand_reports"
 

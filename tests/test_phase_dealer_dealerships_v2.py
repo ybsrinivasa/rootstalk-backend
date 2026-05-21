@@ -13,7 +13,7 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
 
-from app.modules.orders.models import DealerRelationship
+from app.modules.orders.models import DealerManufacturerCatalog, DealerRelationship
 from app.modules.orders.router import (
     add_dealership, dealer_manufacturers_catalog, list_dealerships,
 )
@@ -107,6 +107,43 @@ async def test_same_manufacturer_in_both_categories_is_two_rows(db):
     fert = await list_dealerships(category="FERTILIZER", db=db, current_user=user)
     assert len(pest) == 1 and pest[0]["category"] == "PESTICIDE"
     assert len(fert) == 1 and fert[0]["category"] == "FERTILIZER"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_catalog_reads_from_materialised_table(db):
+    """Catalog endpoint reads from dealer_manufacturer_catalog
+    rows directly — confirms we're not re-walking Cosh per call.
+    Seeded rows surface in the response sorted by name."""
+    user = await make_user(db, name="Dealer Mat")
+    db.add(DealerManufacturerCatalog(
+        category="PESTICIDE",
+        manufacturer_cosh_id="input_manufacturers:zeta",
+        manufacturer_name="Zeta Crop Care",
+    ))
+    db.add(DealerManufacturerCatalog(
+        category="PESTICIDE",
+        manufacturer_cosh_id="input_manufacturers:alpha",
+        manufacturer_name="Alpha AgriSciences",
+    ))
+    db.add(DealerManufacturerCatalog(
+        category="FERTILIZER",
+        manufacturer_cosh_id="input_manufacturers:beta",
+        manufacturer_name="Beta Fertilizers",
+    ))
+    await db.commit()
+
+    pest = await dealer_manufacturers_catalog(
+        category="PESTICIDE", db=db, current_user=user,
+    )
+    assert [r["name"] for r in pest] == [
+        "Alpha AgriSciences", "Zeta Crop Care",
+    ]
+    # FERTILIZER seed is isolated to its own category — no leak.
+    fert = await dealer_manufacturers_catalog(
+        category="FERTILIZER", db=db, current_user=user,
+    )
+    assert [r["name"] for r in fert] == ["Beta Fertilizers"]
 
 
 @requires_docker
