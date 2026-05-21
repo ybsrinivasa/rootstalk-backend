@@ -97,6 +97,31 @@ async def create_order(
                 detail="Cannot mix timing types in one order. Please order DBS, DAS, and Calendar items separately.",
             )
 
+    # ── One-practice-per-order rule (2026-05-21) ──────────────────────────
+    # Date-range bundling on the PWA can race with a concurrent
+    # order. Even without the race, an old caller might post the same
+    # practice twice. Refuse here so we never write a duplicate
+    # OrderItem; the PWA's preview is supposed to have filtered these
+    # out already.
+    if request.practice_ids:
+        from app.services.order_bundle import (
+            already_ordered_practice_ids, conflicts_with_existing_orders,
+        )
+        already = await already_ordered_practice_ids(db, request.subscription_id)
+        conflicts = conflicts_with_existing_orders(request.practice_ids, already)
+        if conflicts:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "practices_already_ordered",
+                    "message": (
+                        "Some of these practices are already in an active "
+                        "order. Open the existing order or cancel it first."
+                    ),
+                    "practice_ids": conflicts,
+                },
+            )
+
     # ── Hard-lock acreage on first DAS order ──────────────────────────────
     if not sub.farm_area_confirmed_at:
         if not request.farm_area_acres and not sub.farm_area_acres:
@@ -184,6 +209,89 @@ async def create_order(
     await db.commit()
     await db.refresh(order)
     return {"id": order.id, "status": order.status}
+
+
+@router.get("/farmer/subscriptions/{subscription_id}/order-preview")
+async def order_preview(
+    subscription_id: str,
+    category: str,
+    to_date: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Preview the bundle for a date-range order before it's
+    committed. Drives the PWA's "Choose date range" sheet — the
+    farmer adjusts the TO date, this endpoint returns the count
+    and list of practices that would go into the order.
+
+    Bundling rule (locked 2026-05-21):
+      - category PESTICIDE → L1 in {PESTICIDE, SPECIAL_INPUT}
+      - category FERTILIZER → L1 in {FERTILIZER}, minus NPK-dosage L2s
+      - practice's timeline window must overlap [today, to_date]
+        by at least one day (inclusive)
+      - practice must NOT already be in any non-CANCELLED order
+        for this subscription (one-practice-per-order rule)
+
+    Response also returns `package_end_date` so the PWA can clamp
+    the date picker.
+    """
+    from datetime import date as _date
+    from app.services.order_bundle import (
+        compute_bundle, ALL_CATEGORIES, package_end_date,
+    )
+
+    if category.upper() not in ALL_CATEGORIES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown category {category!r}. Use PESTICIDE or FERTILIZER.",
+        )
+
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    try:
+        to_d = _date.fromisoformat(to_date)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail=f"to_date must be ISO YYYY-MM-DD, got {to_date!r}",
+        )
+
+    today = _date.today()
+    if to_d < today:
+        raise HTTPException(
+            status_code=422,
+            detail="to_date cannot be before today.",
+        )
+
+    # Cap to_date at package_end so a stale PWA picker can't try
+    # to extend beyond the subscription's life.
+    pkg = (await db.execute(
+        select(Package).where(Package.id == sub.package_id)
+    )).scalar_one_or_none()
+    pkg_end = package_end_date(sub, pkg.duration_days) if pkg else None
+    if pkg_end and to_d > pkg_end:
+        to_d = pkg_end
+
+    bundle = await compute_bundle(
+        db, subscription=sub, category=category, to_date=to_d, today=today,
+    )
+    return {
+        "subscription_id": subscription_id,
+        "category": category.upper(),
+        "to_date": to_d.isoformat(),
+        "package_end_date": pkg_end.isoformat() if pkg_end else None,
+        "today": today.isoformat(),
+        "count": len(bundle["practices"]),
+        "practices": bundle["practices"],
+        "excluded_already_ordered": bundle["excluded_already_ordered"],
+    }
 
 
 @router.get("/farmer/orders")
