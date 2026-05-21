@@ -1536,6 +1536,8 @@ async def list_promoters(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    from app.modules.orders.models import DealerProfile
+
     q = select(ClientPromoter, User).join(User, User.id == ClientPromoter.user_id).where(
         ClientPromoter.client_id == client_id
     )
@@ -1543,16 +1545,39 @@ async def list_promoters(
         q = q.where(ClientPromoter.promoter_type == promoter_type.upper())
     result = await db.execute(q.order_by(ClientPromoter.registered_at.desc()))
     rows = result.all()
-    return [
-        {
+
+    # Bulk-fetch dealer profiles (one query, not N+1) so each
+    # dealer row carries its shop name + GPS for the FM's "View on
+    # Map" link. Facilitators have no DealerProfile.
+    dealer_user_ids = [u.id for _, u in rows if u]
+    dealer_profiles_by_uid: dict[str, DealerProfile] = {}
+    if dealer_user_ids:
+        for dp in (await db.execute(
+            select(DealerProfile).where(DealerProfile.user_id.in_(dealer_user_ids))
+        )).scalars().all():
+            dealer_profiles_by_uid[dp.user_id] = dp
+
+    out = []
+    for cp, user in rows:
+        row = {
             "id": cp.id, "user_id": user.id,
             "name": user.name, "phone": user.phone, "email": user.email,
             "promoter_type": cp.promoter_type, "status": cp.status,
             "is_promoter": cp.is_promoter,
             "territory_notes": cp.territory_notes, "registered_at": cp.registered_at,
+            "shop_name": None,
+            "shop_address": None,
+            "shop_gps_lat": None,
+            "shop_gps_lng": None,
         }
-        for cp, user in rows
-    ]
+        dp = dealer_profiles_by_uid.get(user.id)
+        if dp:
+            row["shop_name"] = dp.shop_name
+            row["shop_address"] = dp.shop_address
+            row["shop_gps_lat"] = float(dp.shop_gps_lat) if dp.shop_gps_lat else None
+            row["shop_gps_lng"] = float(dp.shop_gps_lng) if dp.shop_gps_lng else None
+        out.append(row)
+    return out
 
 
 @router.post("/client/{client_id}/field-manager/promoters", status_code=201)
