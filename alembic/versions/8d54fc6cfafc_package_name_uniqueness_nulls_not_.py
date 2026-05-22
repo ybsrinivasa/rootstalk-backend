@@ -42,6 +42,38 @@ def upgrade() -> None:
         "uq_package_client_crop_name_active",
         table_name="packages",
     )
+    # Pre-existing duplicates from before the app-layer name-uniqueness
+    # check landed (2026-05-22 commit fe47bf6). Keep the most-recently-
+    # published ACTIVE per (client, crop, LOWER(name)) and demote the
+    # older siblings to INACTIVE so the new unique index can be created.
+    # Auditable: cascade_inactivated_reason is stamped so an operator
+    # can identify the auto-demotions and re-activate via the UI if
+    # they picked the wrong "keeper" by published_at.
+    op.execute(
+        """
+        UPDATE packages p SET
+            status = 'INACTIVE',
+            cascade_inactivated_at = COALESCE(p.cascade_inactivated_at, now()),
+            cascade_inactivated_reason = 'deduplicated_pre_index_2026_05_22'
+        WHERE p.status = 'ACTIVE'
+          AND p.id NOT IN (
+            SELECT DISTINCT ON (client_id, crop_cosh_id, LOWER(name)) id
+            FROM packages
+            WHERE status = 'ACTIVE'
+            ORDER BY client_id, crop_cosh_id, LOWER(name),
+                     published_at DESC NULLS LAST,
+                     created_at DESC
+          )
+          AND EXISTS (
+            SELECT 1 FROM packages q
+            WHERE q.status = 'ACTIVE'
+              AND q.id != p.id
+              AND q.crop_cosh_id = p.crop_cosh_id
+              AND LOWER(q.name) = LOWER(p.name)
+              AND q.client_id IS NOT DISTINCT FROM p.client_id
+          )
+        """
+    )
     # Raw SQL for the partial expression index — alembic's
     # create_index doesn't expose NULLS NOT DISTINCT cleanly.
     op.execute(
