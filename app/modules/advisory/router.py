@@ -616,6 +616,71 @@ async def _assert_interval_fits_timeline(
         })
 
 
+# Package-name uniqueness (2026-05-22): within a (client_id,
+# crop_cosh_id) bucket, no two distinct Package lineages may share
+# a name (case-insensitive). Lineage is keyed by
+# (client_id, crop_cosh_id, name) — see the partial unique index
+# `uq_package_client_crop_name_active`. Same name CAN repeat across
+# crops (the CCA hub is crop-grouped, so the crop disambiguates),
+# and CAN repeat across versions of one lineage (DRAFT → ACTIVE
+# inherits the name on purpose).
+#
+# Pre-fix the existing partial unique index only fired on ACTIVE
+# rows, so a SE could create a DRAFT lineage with the same name as
+# an existing ACTIVE/DRAFT lineage and end up with two visually-
+# identical Packages — different IDs, same display. This helper
+# closes that gap at the app layer; the partial-unique index stays
+# as the structural backstop for the ACTIVE-vs-ACTIVE collision.
+
+async def _assert_package_name_available(
+    db: AsyncSession, *,
+    client_id: Optional[str],
+    crop_cosh_id: str,
+    name: str,
+    exclude_package_id: Optional[str] = None,
+) -> None:
+    """Reject if `name` is already in use by a non-INACTIVE Package
+    on the same (client_id, crop_cosh_id), case-insensitive. Callers
+    that are RENAMING in place should pass `exclude_package_id` AND
+    only call when the new name differs from the old — same-name
+    no-op rename must short-circuit at the caller, not here, because
+    lineage siblings share the name on purpose.
+
+    `client_id=None` checks the SA Global namespace, which is
+    evaluated separately from any client's namespace."""
+    norm = (name or "").strip().lower()
+    if not norm:
+        return
+    q = (
+        select(Package.id, Package.status, Package.name)
+        .where(
+            Package.client_id == client_id,
+            Package.crop_cosh_id == crop_cosh_id,
+            func.lower(Package.name) == norm,
+            Package.status != PackageStatus.INACTIVE,
+        )
+    )
+    if exclude_package_id is not None:
+        q = q.where(Package.id != exclude_package_id)
+    existing = (await db.execute(q)).first()
+    if existing is None:
+        return
+    status_label = (
+        existing.status.value if hasattr(existing.status, "value")
+        else str(existing.status)
+    ).lower()
+    raise HTTPException(status_code=422, detail={
+        "code": "package_name_taken",
+        "message": (
+            f'A {status_label} Package called "{existing.name}" already '
+            f'exists for this crop. Pick a different name, or open the '
+            f'existing one.'
+        ),
+        "existing_package_id": existing.id,
+        "existing_status": status_label,
+    })
+
+
 # Rule 1 (2026-05-22): a Common Name may appear at most once within
 # a single Timeline for PESTICIDE and FERTILIZER practices. Same
 # Common Name CAN repeat in other Timelines of the same Package /
@@ -957,6 +1022,12 @@ async def create_package(
             detail={"code": e.code, "message": e.message},
         )
 
+    # Name uniqueness within (client, crop) — see helper docstring.
+    await _assert_package_name_available(
+        db, client_id=client_id,
+        crop_cosh_id=request.crop_cosh_id, name=request.name,
+    )
+
     pkg = Package(
         client_id=client_id,
         crop_cosh_id=request.crop_cosh_id,
@@ -1070,6 +1141,17 @@ async def update_package(
                 status_code=422,
                 detail={"code": e.code, "message": e.message},
             )
+
+    # Rename gate (2026-05-22): only check when the name actually
+    # changes — same-name no-ops would falsely trip on lineage
+    # siblings that share the name on purpose.
+    new_name = update_data.get("name")
+    if new_name is not None and new_name.strip().lower() != (pkg.name or "").strip().lower():
+        await _assert_package_name_available(
+            db, client_id=client_id,
+            crop_cosh_id=pkg.crop_cosh_id, name=new_name,
+            exclude_package_id=pkg.id,
+        )
 
     for field, value in update_data.items():
         setattr(pkg, field, value)
@@ -4286,6 +4368,12 @@ async def create_global_package(
     current_user: User = Depends(get_current_user),
 ):
     await _assert_sa_or_cm(db, current_user)
+    # Name uniqueness within (Global namespace, crop) — Global is
+    # evaluated separately from any client's namespace.
+    await _assert_package_name_available(
+        db, client_id=None,
+        crop_cosh_id=request.crop_cosh_id, name=request.name,
+    )
     pkg = Package(
         client_id=None,
         crop_cosh_id=request.crop_cosh_id,
@@ -4354,6 +4442,16 @@ async def update_global_package(
                 status_code=422,
                 detail={"code": e.code, "message": e.message},
             )
+
+    # Rename gate (2026-05-22): same short-circuit pattern as the CA
+    # update — only fire when name actually changes.
+    new_name = update_data.get("name")
+    if new_name is not None and new_name.strip().lower() != (pkg.name or "").strip().lower():
+        await _assert_package_name_available(
+            db, client_id=None,
+            crop_cosh_id=pkg.crop_cosh_id, name=new_name,
+            exclude_package_id=pkg.id,
+        )
 
     # Batch 28: status toggle. SE can flip ACTIVE ↔ INACTIVE and may
     # discard a DRAFT (DRAFT → INACTIVE), but cannot promote DRAFT →
@@ -6284,6 +6382,16 @@ async def push_global_package(
                 "invalid_user_ids": invalid_authors,
             },
         )
+
+    # Name uniqueness (2026-05-22): the CM may pick a name that
+    # clashes with an existing CA Package on the same crop. Gate
+    # before persistence so the CM gets a clean field-level error
+    # instead of an opaque IntegrityError if the existing one was
+    # ACTIVE.
+    await _assert_package_name_available(
+        db, client_id=client_id,
+        crop_cosh_id=src.crop_cosh_id, name=request.name,
+    )
 
     # All input-side validations passed. Build the Local DRAFT.
     copy = Package(
