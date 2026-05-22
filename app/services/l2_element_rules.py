@@ -180,36 +180,23 @@ _INPUT_BRAND_TRIPLET: tuple[FieldRule, ...] = (
     ),
 )
 
-# Per user 2026-05-14: FORMULATION and AI_CONCENTRATION are selectable
-# as soon as COMMON_NAME is picked (no longer gated on BRAND_NAME being
-# set first). The cascade is CN-driven: pick CN → see all formulations
-# / a.i. values that span the CN's trade names. Pick BRAND_NAME → list
-# narrows to that brand's specific formulation + a.i. Neither field is
-# auto-determined any more — SE picks freely.
+# FORMULATION + AI_CONCENTRATION cascade. Selectable as soon as
+# COMMON_NAME is picked (no longer gated on BRAND_NAME being set
+# first — user 2026-05-14). The cascade is CN-driven: pick CN → see
+# all formulations / a.i. values that span the CN's trade names.
+# Pick BRAND_NAME → list narrows to that brand's specific values.
+# Neither field is auto-determined — SE picks freely.
 #
-# Variable name kept (it's module-internal); the AUTOCASCADE suffix is
-# historical from when the fields were auto_selected.
-_FORMULATION_AI_AUTOCASCADE: tuple[FieldRule, ...] = (
-    FieldRule(
-        "FORMULATION",
-        source="cosh_cascade:formulation_for_brand",
-        cascade_from=("COMMON_NAME",),
-        cascade_optional_inputs=("BRAND_NAME",),
-    ),
-    FieldRule(
-        "AI_CONCENTRATION",
-        source="cosh_cascade:ai_concentration_for_brand",
-        cascade_from=("COMMON_NAME",),
-        cascade_optional_inputs=("BRAND_NAME",),
-    ),
-)
-
-# 2026-05-22 — variant of _FORMULATION_AI_AUTOCASCADE with both
-# fields mandatory. Used by CHEMICAL_PESTICIDES per user, where
-# the SE must commit to a specific formulation + a.i. concentration
-# (the safety / dosage math depends on it). CHEMICAL_HERBICIDES
-# keeps the optional variant — user can extend the mandatory
-# treatment there if they want the same behaviour.
+# 2026-05-22 — both fields mandatory on CHEMICAL_PESTICIDES and
+# CHEMICAL_HERBICIDES (the only two L2s using this cascade today);
+# the safety / dosage math downstream depends on having both
+# explicit. If a future L2 needs the optional variant, define a
+# sibling `_FORMULATION_AI_AUTOCASCADE_OPTIONAL` rather than
+# mutating this tuple — sibling tuples on tightening, never
+# mutation (see feedback_l2_rule_book_evolution.md).
+#
+# Variable name kept (it's module-internal); the AUTOCASCADE suffix
+# is historical from when the fields were auto_selected.
 _FORMULATION_AI_AUTOCASCADE_MANDATORY: tuple[FieldRule, ...] = (
     FieldRule(
         "FORMULATION",
@@ -303,7 +290,7 @@ _PESTICIDE_RULES: dict[str, L2Spec] = {
     "CHEMICAL_HERBICIDES": L2Spec(
         fields=(
             *_INPUT_BRAND_TRIPLET,
-            *_FORMULATION_AI_AUTOCASCADE,
+            *_FORMULATION_AI_AUTOCASCADE_MANDATORY,
             *_DOSAGE_TAIL_4DEC,
         ),
         plant_wise_extras=True,
