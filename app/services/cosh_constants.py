@@ -96,6 +96,24 @@ COSH_TRADENAME_MANUFACTURER_CONNECT = "tradename_manufacturer"
 COSH_TRADENAME_FORMULATION_CONNECT = "tradename_formulation"
 COSH_TRADENAME_AI_CONNECT = "tradename_ai"
 
+# Connect 2026-05-22: per-L2 Formulations for the two NPK Dosages L2s.
+# These L2s have no Common Name / Trade Name on the Practice (the
+# practitioner specifies N/P/K dosages directly), so the brand-cascade
+# `tradename_formulation` Connect doesn't apply. Instead, this Connect
+# pairs each NPK L2 (via the `l2_data` Core) with the Formulations
+# valid for it. Two endpoints per row: role=formulations + role=l2_data.
+COSH_FORMULATIONS_L2_NPK_CONNECT = "formulations_L2_npk"
+
+# Bridge from our L2 enum string to the `l2_data` Core's English
+# translation, used to resolve the NPK L2 → l2_data cosh_id.
+# Cosh ships no slug field on `l2_data`, so we match by translation.
+# Add a new entry here whenever another L2 starts using a similar
+# l2_data-keyed Connect.
+NPK_L2_TO_L2DATA_EN: dict[str, str] = {
+    "CHEMICAL_FERTILIZERS_NPK_DOSAGES": "Chemical fertilizers - NPK dosages",
+    "FERTIGATION_NPK_DOSAGES":          "Fertigation - NPK dosages",
+}
+
 # Non-input Cores (synced 2026-05-16). Flat Cosh Cores driving the three
 # Non-input element dropdowns: PLANTING_MATERIAL_QUANTITY → planting_material,
 # ITKS → itk_data, HARVESTING_MANUAL → maturity_index. Maturity indices are

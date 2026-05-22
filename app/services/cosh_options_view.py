@@ -40,6 +40,7 @@ from app.services.cosh_constants import (
     COSH_COMMON_NAMES_CORE,
     COSH_COMMONNAMES_L2_CONNECT,
     COSH_FORMULATIONS_CORE,
+    COSH_FORMULATIONS_L2_NPK_CONNECT,
     COSH_INPUT_MANUFACTURERS_CORE,
     COSH_L2_DATA_CORE,
     COSH_L2_UNITS_UNITTYPES_CONNECT,
@@ -50,6 +51,7 @@ from app.services.cosh_constants import (
     COSH_TRADENAME_MANUFACTURER_CONNECT,
     COSH_UNIT_TYPES_CORE,
     COSH_UNITS_DATA_CORE,
+    NPK_L2_TO_L2DATA_EN,
     PYTHON_L2_TO_COSH_UUID,
     UNIT_TYPE_SLUG_TO_COSH_UUIDS,
 )
@@ -602,6 +604,55 @@ async def _resolve_trade_name_filter(
     return None
 
 
+async def _list_formulations_for_npk_l2(
+    db: AsyncSession, *, l2_type: str,
+) -> list[dict]:
+    """NPK Dosages don't carry Common Name / Trade Name on the
+    Practice — the brand-cascade Connect doesn't apply. Cosh's
+    `formulations_L2_npk` Connect pairs each NPK L2 (via the
+    `l2_data` Core) with its valid Formulations. Walk:
+        L2 enum -> l2_data Core (match by English translation)
+                -> formulations_L2_npk Connect rows
+                -> Formulations Core ids
+        -> _resolve_names
+    """
+    en_name = NPK_L2_TO_L2DATA_EN.get(l2_type)
+    if not en_name:
+        return []
+    # Resolve l2_data cosh_id by English translation. The `translations`
+    # column is JSON (not JSONB), so `.astext` isn't available — we
+    # filter in Python. The l2_data Core is small enough that this is
+    # a cheap fetch.
+    l2data_rows = (await db.execute(
+        select(CoshCoreItem).where(
+            CoshCoreItem.core_type == COSH_L2_DATA_CORE,
+            CoshCoreItem.status == "active",
+        )
+    )).scalars().all()
+    l2data_cosh_id: Optional[str] = None
+    for r in l2data_rows:
+        if (r.translations or {}).get("en") == en_name:
+            l2data_cosh_id = r.cosh_id
+            break
+    if l2data_cosh_id is None:
+        return []
+    # Walk the Connect for rows whose l2_data endpoint matches.
+    rows = await _walk_connect(
+        db, connect_type=COSH_FORMULATIONS_L2_NPK_CONNECT,
+    )
+    form_ids: set[str] = set()
+    for r in rows:
+        eps = {e["role"]: e["cosh_id"] for e in (r.endpoints or [])}
+        if eps.get("l2_data") != l2data_cosh_id:
+            continue
+        fid = eps.get("formulations")
+        if fid:
+            form_ids.add(fid)
+    return await _resolve_names(
+        db, core_type=COSH_FORMULATIONS_CORE, cosh_ids=form_ids,
+    )
+
+
 async def list_formulations(
     db: AsyncSession,
     common_name_cosh_id: Optional[str] = None,
@@ -611,7 +662,13 @@ async def list_formulations(
     """Formulations filtered by SE's selection: when only Common Name
     is set, span all trade names sharing that common name; when Trade
     Name is set, narrow to just that one. `l2_type` opts into the
-    Batch 39D completeness filter."""
+    Batch 39D completeness filter.
+
+    Special case (2026-05-22): NPK Dosages L2s carry no Common Name on
+    the Practice; they route through the `formulations_L2_npk` Connect
+    instead of the brand-cascade `tradename_formulation`."""
+    if l2_type in NPK_L2_TO_L2DATA_EN:
+        return await _list_formulations_for_npk_l2(db, l2_type=l2_type)
     tn_filter = await _resolve_trade_name_filter(
         db, common_name_cosh_id, trade_name_cosh_id, l2_type,
     )
