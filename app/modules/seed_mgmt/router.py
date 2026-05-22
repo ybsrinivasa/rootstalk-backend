@@ -163,15 +163,43 @@ async def list_assignable_packages(
     )
     from app.modules.sync.models import CoshCoreItem
 
-    pkgs = (await db.execute(
+    # 2026-05-22 — pull every non-INACTIVE row, then roll up by
+    # lineage `(client, crop, lower(name))` so the picker shows one
+    # row per lineage (DRAFT > ACTIVE precedence) instead of every
+    # version. Variety assignment is per-lineage anyway — the SE
+    # picks the package, not a specific historical version.
+    raw_pkgs = (await db.execute(
         select(Package).where(
             Package.client_id == client_id,
             Package.crop_cosh_id == crop_cosh_id,
             Package.status.in_(("DRAFT", "ACTIVE")),
         ).order_by(Package.name)
     )).scalars().all()
-    if not pkgs:
+    if not raw_pkgs:
         return []
+
+    _STATUS_RANK = {"DRAFT": 0, "ACTIVE": 1, "INACTIVE": 2}
+
+    def _lineage_key(p):
+        return (p.crop_cosh_id, (p.name or "").strip().lower())
+
+    def _sort_within_lineage(p):
+        # Most-current-first inside the bucket: DRAFT > ACTIVE; ties
+        # broken by version desc, created_at desc.
+        return (
+            _STATUS_RANK.get(getattr(p.status, "value", p.status), 99),
+            -p.version,
+            -p.created_at.timestamp(),
+        )
+
+    by_lineage: dict[tuple, list] = {}
+    for p in raw_pkgs:
+        by_lineage.setdefault(_lineage_key(p), []).append(p)
+    pkgs = [
+        sorted(group, key=_sort_within_lineage)[0]
+        for group in by_lineage.values()
+    ]
+    pkgs.sort(key=lambda p: (p.name or "").casefold())
 
     pkg_ids = [p.id for p in pkgs]
 
