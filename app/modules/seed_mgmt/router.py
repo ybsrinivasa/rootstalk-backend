@@ -25,7 +25,15 @@ router = APIRouter(tags=["Seed Management"])
 # refused at the request boundary; this helper only fires on
 # same-client access.
 
-SEED_COMPANY_COSH_ID = "org_type_seed_companies"
+# 2026-05-22 — switched from the legacy hardcoded slug
+# "org_type_seed_companies" to the live Cosh `organization_types`
+# Core UUID for "Seed Company" (synced 2026-05-22). The hardcoded
+# UUID is acceptable here because (a) Cosh UUIDs are stable, and
+# (b) this gate fires on every Seed Module request — a per-call
+# Cosh lookup by English name would add an extra DB roundtrip.
+# If Cosh ever renames or replaces the "Seed Company" row, update
+# this constant.
+SEED_COMPANY_COSH_ID = "4b0847f9-a590-452f-9129-ee0e2d946dd9"
 
 
 async def _assert_can_manage_seed_varieties(

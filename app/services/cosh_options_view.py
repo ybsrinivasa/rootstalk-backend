@@ -742,6 +742,21 @@ async def list_itks(db: AsyncSession) -> list[dict]:
     return await _list_all_of_core_type(db, core_type="itk_data")
 
 
+async def list_organization_types(db: AsyncSession) -> list[dict]:
+    """Live Cosh list for the client-onboarding org-type checklist
+    (2026-05-22). Replaces the hardcoded `ORG_TYPES` constants the
+    SA + CA portals shipped before this Core synced."""
+    return await _list_all_of_core_type(db, core_type="organization_types")
+
+
+async def list_startdate_names(db: AsyncSession) -> list[dict]:
+    """Live Cosh list for the Package's "start-date label" dropdown
+    (Sowing / Planting / Pruning / Start Date — Cosh-managed copy).
+    Used by SA-CCA + CA-CCA Package create + edit modals. Replaces
+    the hardcoded `START_DATE_LABELS` constants (2026-05-22)."""
+    return await _list_all_of_core_type(db, core_type="startdate_names")
+
+
 async def list_maturity_indices_for_crop(
     db: AsyncSession, *, crop_cosh_id: str,
 ) -> list[dict]:

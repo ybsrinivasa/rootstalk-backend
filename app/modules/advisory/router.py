@@ -5434,6 +5434,30 @@ async def cosh_maturity_indices(
     return await list_maturity_indices_for_crop(db, crop_cosh_id=crop)
 
 
+@router.get("/cosh/options/organization-types")
+async def cosh_organization_types(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Live Cosh list for the client-onboarding org-type checklist
+    (2026-05-22). Replaces the hardcoded ORG_TYPES constants the
+    SA + CA portals shipped before this Core synced."""
+    from app.services.cosh_options_view import list_organization_types
+    return await list_organization_types(db)
+
+
+@router.get("/cosh/options/start-date-names")
+async def cosh_start_date_names(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Live Cosh list for the Package's start-date-label dropdown
+    on SA-CCA + CA-CCA Package create + edit modals. Replaces the
+    hardcoded START_DATE_LABELS constants (2026-05-22)."""
+    from app.services.cosh_options_view import list_startdate_names
+    return await list_startdate_names(db)
+
+
 # Diagnosis lookups moved to `app/modules/diagnosis/router.py` in
 # Batch 23 (2026-05-14). See that module for `/diagnosis/*` endpoints.
 

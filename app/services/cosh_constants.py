@@ -123,6 +123,13 @@ COSH_ITK_DATA_CORE = "itk_data"
 COSH_MATURITY_INDEX_CORE = "maturity_index"
 COSH_MATURITY_INDEX_CROPS_CONNECT = "maturity_index_crops"
 
+# 2026-05-22: Cores synced to replace legacy hardcoded lists.
+# organization_types feeds the client-onboarding checklist;
+# startdate_names feeds the Package's start-date-label dropdown
+# (SA-CCA + CA-CCA). Flat Cores — no cascade, no L2 filter.
+COSH_ORGANIZATION_TYPES_CORE = "organization_types"
+COSH_STARTDATE_NAMES_CORE = "startdate_names"
+
 # ── SP × PG × Crop applicability (Cosh shipped 2026-05-14) ───────────────
 #
 # Cosh's `sp_pg_crops` Connect ties each Specific Problem (SP) to one
