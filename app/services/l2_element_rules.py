@@ -313,8 +313,15 @@ _SPECIAL_INPUT_RULES: dict[str, L2Spec] = {
 # In all Fertilizer L2s where Formulation is Cosh-linked, Formulation is
 # filtered at the L2 level (cosh_core:formulation), NOT cascaded from Brand.
 
+# 2026-05-22 — interval fields are non-mandatory. Per user: when the
+# SE wants a single application during the timeline (not a recurring
+# cadence), they leave the interval blank and the farmer sees a
+# "apply once at any time during this period" instruction. The
+# FREQUENCY_MISMATCH check in the validator only fires when interval
+# IS provided (intentional). `_assert_interval_fits_timeline` in the
+# router also short-circuits on blank.
 _FERTIGATION_FREQUENCY_TAIL: tuple[FieldRule, ...] = (
-    FieldRule("FERTIGATION_INTERVAL", source="number_2dec", mandatory=True, is_interval=True),
+    FieldRule("FERTIGATION_INTERVAL", source="number_2dec", mandatory=False, is_interval=True),
     FieldRule("NUMBER_OF_APPLICATIONS", source="auto_calculated"),
 )
 
@@ -327,11 +334,11 @@ _FERTIGATION_FREQUENCY_TAIL: tuple[FieldRule, ...] = (
 # validator's FREQUENCY_MISMATCH check and the handler's "interval
 # must produce ≥ 2 applications across the timeline" gate.
 _IRRIGATION_FREQUENCY_TAIL: tuple[FieldRule, ...] = (
-    FieldRule("IRRIGATION_INTERVAL", source="number_2dec", mandatory=True, is_interval=True),
+    FieldRule("IRRIGATION_INTERVAL", source="number_2dec", mandatory=False, is_interval=True),
     FieldRule("NUMBER_OF_APPLICATIONS", source="auto_calculated"),
 )
 _INSTRUCTION_FREQUENCY_TAIL: tuple[FieldRule, ...] = (
-    FieldRule("REPEAT_INTERVAL", source="number_2dec", mandatory=True, is_interval=True),
+    FieldRule("REPEAT_INTERVAL", source="number_2dec", mandatory=False, is_interval=True),
     FieldRule("NUMBER_OF_APPLICATIONS", source="auto_calculated"),
 )
 

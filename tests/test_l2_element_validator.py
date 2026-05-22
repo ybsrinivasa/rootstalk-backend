@@ -358,6 +358,39 @@ async def test_frequency_match_passes():
     assert not any(e.code == "FREQUENCY_MISMATCH" for e in r.errors), r.errors
 
 
+@pytest.mark.asyncio
+async def test_interval_blank_accepted_one_shot_path():
+    """2026-05-22 — INTERVAL fields are non-mandatory. When the SE
+    leaves it blank, the practice is treated as a one-shot ("apply
+    once at any time during this timeline"); the validator accepts
+    it without MISSING_MANDATORY and FREQUENCY_MISMATCH doesn't
+    fire (no interval to mismatch)."""
+    elements = [
+        el("N_DOSAGE", value="100"),
+        el("P_DOSAGE", value="50"),
+        el("K_DOSAGE", value="50"),
+        el("UNIT", cosh_ref="du:kg_per_acre"),
+        el("FORMULATION", cosh_ref="form:water_soluble"),
+        el("APPLICATION_METHOD", cosh_ref="am:fertigation"),
+        # FERTIGATION_INTERVAL omitted on purpose.
+    ]
+    core = {
+        "units_data":             [CascadeOption("du:kg_per_acre", "kg/acre")],
+        "formulations":           [CascadeOption("form:water_soluble", "Water-soluble")],
+        "application_methods":    [CascadeOption("am:fertigation", "Fertigation")],
+    }
+    with patches(core_returns=core):
+        r = await validate_l2_elements(
+            db=None, l2_type="FERTIGATION_NPK_DOSAGES",
+            elements=elements,
+            practice_frequency_days=None,
+        )
+    missing = [e for e in r.errors if e.code == "MISSING_MANDATORY"
+               and e.field_name == "FERTIGATION_INTERVAL"]
+    assert not missing, f"FERTIGATION_INTERVAL should be optional: {r.errors}"
+    assert not any(e.code == "FREQUENCY_MISMATCH" for e in r.errors)
+
+
 # ── Plant-wise extras ───────────────────────────────────────────────────────
 
 @pytest.mark.asyncio

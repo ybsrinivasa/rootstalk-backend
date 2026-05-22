@@ -248,6 +248,10 @@ def list_l2_elements(
             "cascade_from": list(f.cascade_from),
             "cascade_optional_inputs": list(f.cascade_optional_inputs),
             "auto_selected": f.auto_selected,
+            # 2026-05-22 — surface is_interval so the frontend can
+            # show the "leave blank for one-time application" hint
+            # without re-deriving from the name pattern.
+            "is_interval": f.is_interval,
         }
         for f in fields
     ]
