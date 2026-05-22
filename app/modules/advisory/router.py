@@ -6555,29 +6555,35 @@ async def clone_to_draft(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """**SE starts a new edit cycle**. Takes the current ACTIVE row
-    in a lineage and creates a new DRAFT with deep-copied content
-    + locations + authors + PVs. The DRAFT is the SE's working
-    surface for the next publish.
+    """**SE starts a new edit cycle**. Takes any non-DRAFT row in
+    the lineage (ACTIVE or INACTIVE) and creates a new DRAFT with
+    deep-copied content + locations + authors + PVs. The DRAFT is
+    the SE's working surface for the next publish.
 
-    Source must be ACTIVE and Local. Historical INACTIVE rows are
-    handled by `rollback-publish` (creates a PUBLISHED row directly,
-    no DRAFT step) per the user's locked model.
+    2026-05-22: widened to accept INACTIVE source so the SE can
+    review/edit a historical version before publishing it back to
+    live — same pattern as the Global Package clone-to-draft and
+    the CA-PG / CA-SP siblings. The previous ACTIVE-only restriction
+    forced the SE to either accept the historical content unchanged
+    (via rollback-publish) or recreate it from scratch; neither
+    matched the "open → start new edit → tweak → publish" flow the
+    user expected. `rollback-publish` stays available as the
+    no-review shortcut, but the UI no longer surfaces it.
 
     Single-DRAFT invariant: any existing DRAFT in the same lineage
     (client + crop + name) is auto-flipped to INACTIVE.
     """
     await _assert_client_user_can_edit(db, current_user.id, client_id)
     src = await _get_package(db, package_id, client_id)
-    if src.status != PackageStatus.ACTIVE:
+    if src.status == PackageStatus.DRAFT:
         raise HTTPException(
             status_code=422,
             detail={
-                "code": "clone_source_not_active",
+                "code": "clone_source_is_draft",
                 "message": (
-                    "clone-to-draft requires the current ACTIVE row of "
-                    "the lineage as the source. To republish historical "
-                    "content, use rollback-publish."
+                    "clone-to-draft requires an ACTIVE or INACTIVE row "
+                    "of the lineage as the source. The current row is "
+                    "already a DRAFT — edit it in place."
                 ),
                 "current_status": (
                     src.status.value if hasattr(src.status, "value")

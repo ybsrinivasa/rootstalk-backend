@@ -156,12 +156,35 @@ async def test_clone_to_draft_creates_new_draft_with_marker(db):
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_clone_to_draft_refuses_inactive_source(db):
-    """Cloning from a non-ACTIVE row → 422
-    `clone_source_not_active`. Historical rows go through
-    rollback-publish."""
+async def test_clone_to_draft_allows_inactive_source(db):
+    """2026-05-22 — widened. Cloning from an INACTIVE historical
+    row succeeds; the new DRAFT carries the historical content for
+    the SE to review/edit before re-publishing. Replaces the prior
+    ACTIVE-only restriction that forced the SE through
+    rollback-publish (no review window). Matches Global Package
+    + CA-PG + CA-SP behaviour."""
     _, se, client, active = await _se_and_client(db)
     active.status = PackageStatus.INACTIVE
+    await db.commit()
+
+    new_draft = await clone_to_draft(
+        client_id=client.id, package_id=active.id,
+        db=db, current_user=se,
+    )
+    assert new_draft.id != active.id
+    assert new_draft.status == PackageStatus.DRAFT
+    assert new_draft.crop_cosh_id == active.crop_cosh_id
+    assert new_draft.name == active.name
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_clone_to_draft_refuses_draft_source(db):
+    """DRAFT-source rejection stays — the SE should just edit the
+    existing DRAFT in place. Error code aligns with Global Package
+    + CA-PG + CA-SP siblings: `clone_source_is_draft`."""
+    _, se, client, active = await _se_and_client(db)
+    active.status = PackageStatus.DRAFT
     await db.commit()
 
     with pytest.raises(HTTPException) as exc:
@@ -170,7 +193,7 @@ async def test_clone_to_draft_refuses_inactive_source(db):
             db=db, current_user=se,
         )
     assert exc.value.status_code == 422
-    assert exc.value.detail["code"] == "clone_source_not_active"
+    assert exc.value.detail["code"] == "clone_source_is_draft"
 
 
 @requires_docker
