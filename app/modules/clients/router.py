@@ -216,14 +216,51 @@ async def check_short_name(
     return {"available": existing is None, "short_name": short_name.lower().strip()}
 
 
-def _client_to_out(client: Client) -> ClientOut:
-    """Convert a Client row to ClientOut and fill in the env-driven
-    login_url. Centralised so list, get, and other admin endpoints
-    return a consistent shape — no rootstalk.in / wrong-host hardcoding
-    on the frontend."""
+async def _client_to_out(db: AsyncSession, client: Client) -> ClientOut:
+    """Convert a Client row to ClientOut, fill in the env-driven
+    login_url, and join the current `org_type_cosh_ids` from
+    `client_organisation_types`. Centralised so list, get, and
+    other admin endpoints return a consistent shape — no
+    rootstalk.in / wrong-host hardcoding on the frontend, and no
+    missing org-types regression like the 2026-05-22 SA Edit-modal
+    bug (the SAVE was correct; the GET was silently dropping the
+    field, so the modal misled the SA into wiping their own tags).
+
+    `list_clients` uses the bulk variant `_clients_to_out_bulk`
+    to avoid an N+1 query."""
+    org_rows = (await db.execute(
+        select(ClientOrganisationType).where(
+            ClientOrganisationType.client_id == client.id,
+        )
+    )).scalars().all()
     out = ClientOut.model_validate(client)
     out.login_url = f"{_base_url()}/login/{client.short_name}"
+    out.org_type_cosh_ids = [r.org_type_cosh_id for r in org_rows]
     return out
+
+
+async def _clients_to_out_bulk(
+    db: AsyncSession, clients: list[Client],
+) -> list[ClientOut]:
+    """Bulk variant — single query for all clients' org types so the
+    list endpoint stays one round-trip."""
+    if not clients:
+        return []
+    rows = (await db.execute(
+        select(ClientOrganisationType).where(
+            ClientOrganisationType.client_id.in_([c.id for c in clients]),
+        )
+    )).scalars().all()
+    by_client: dict[str, list[str]] = {}
+    for r in rows:
+        by_client.setdefault(r.client_id, []).append(r.org_type_cosh_id)
+    out_list: list[ClientOut] = []
+    for c in clients:
+        out = ClientOut.model_validate(c)
+        out.login_url = f"{_base_url()}/login/{c.short_name}"
+        out.org_type_cosh_ids = by_client.get(c.id, [])
+        out_list.append(out)
+    return out_list
 
 
 @router.get("/admin/clients", response_model=list[ClientOut])
@@ -237,7 +274,7 @@ async def list_clients(
     if status_filter:
         q = q.where(Client.status == status_filter)
     result = await db.execute(q)
-    return [_client_to_out(c) for c in result.scalars().all()]
+    return await _clients_to_out_bulk(db, list(result.scalars().all()))
 
 
 @router.get("/admin/clients/{client_id}", response_model=ClientOut)
@@ -251,7 +288,7 @@ async def get_client(
     client = result.scalar_one_or_none()
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
-    return _client_to_out(client)
+    return await _client_to_out(db, client)
 
 
 # ── SA: Initiate onboarding ────────────────────────────────────────────────────
@@ -540,7 +577,7 @@ async def edit_client(
 
     await db.commit()
     await db.refresh(client)
-    return client
+    return await _client_to_out(db, client)
 
 
 @router.put("/admin/clients/{client_id}/status", response_model=ClientOut)

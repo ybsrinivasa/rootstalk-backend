@@ -116,6 +116,14 @@ class ClientOut(BaseModel):
     # Reserved Optional in the schema so legacy callers / response_model
     # validation tolerate rows where the route hasn't computed it.
     login_url: Optional[str] = None
+    # 2026-05-22 — populated by `_client_to_out` from the
+    # `client_organisation_types` join. Was missing from the response,
+    # so the SA Edit modal opened with all checkboxes unchecked even
+    # for clients that DID have org types; subsequent saves silently
+    # wiped the existing tags. Default `[]` keeps existing tests +
+    # response_model validation tolerant of routes that haven't been
+    # updated.
+    org_type_cosh_ids: List[str] = []
 
     class Config:
         from_attributes = True
