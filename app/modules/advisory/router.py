@@ -616,6 +616,69 @@ async def _assert_interval_fits_timeline(
         })
 
 
+# Rule 1 (2026-05-22): a Common Name may appear at most once within
+# a single Timeline for PESTICIDE and FERTILIZER practices. Same
+# Common Name CAN repeat in other Timelines of the same Package /
+# PG / SP / QA — the scope is per-timeline. Other L1 types (HOST,
+# NON_INPUT, INSTRUCTION, MEDIA) are exempt: the field doesn't apply
+# or duplication is meaningful (e.g. an instruction reused verbatim).
+#
+# Common Name is stored as an Element row with element_type="COMMON_NAME"
+# — the Practice.common_name_cosh_id column is a stale cache only
+# refreshed by import / relation-save paths, so we read from Element.
+_CN_L1_TYPES = {"PESTICIDE", "FERTILIZER"}
+
+
+async def _assert_no_duplicate_common_name_in_timeline(
+    db: AsyncSession, *,
+    timeline_id: str,
+    l1_type: Optional[str],
+    elements,
+    exclude_practice_id: Optional[str] = None,
+) -> None:
+    """Raises 422 common_name_duplicate_in_timeline when a peer Practice
+    in this Timeline has the same Common Name + l1_type. Pass
+    `exclude_practice_id` on update so the row being edited doesn't
+    flag itself."""
+    if l1_type not in _CN_L1_TYPES:
+        return
+    cn_cosh_id: Optional[str] = None
+    for e in elements:
+        et = e.element_type if hasattr(e, "element_type") else e.get("element_type")
+        if et != "COMMON_NAME":
+            continue
+        v = e.cosh_ref if hasattr(e, "cosh_ref") else e.get("cosh_ref")
+        cn_cosh_id = v
+        break
+    if not cn_cosh_id:
+        return
+    q = (
+        select(Practice.id)
+        .join(Element, Element.practice_id == Practice.id)
+        .where(
+            Practice.timeline_id == timeline_id,
+            Practice.l1_type == l1_type,
+            Element.element_type == "COMMON_NAME",
+            Element.cosh_ref == cn_cosh_id,
+        )
+    )
+    if exclude_practice_id is not None:
+        q = q.where(Practice.id != exclude_practice_id)
+    dup_id = (await db.execute(q)).scalar()
+    if dup_id is not None:
+        raise HTTPException(status_code=422, detail={
+            "code": "common_name_duplicate_in_timeline",
+            "message": (
+                f"This Common Name is already used by another "
+                f"{l1_type.lower()} practice in this Timeline. "
+                f"Pick a different Common Name, or add this practice "
+                f"to another Timeline."
+            ),
+            "existing_practice_id": dup_id,
+            "l1_type": l1_type,
+        })
+
+
 # ── Element-level CRUD helpers (Round 2 — element-level authoring) ─────────
 
 def _element_row_to_in(row) -> ElementIn:
@@ -2343,6 +2406,10 @@ async def create_practice(
         elements=request.elements, timeline_id=timeline_id,
     )
     _validate_brand_lock(request)
+    await _assert_no_duplicate_common_name_in_timeline(
+        db, timeline_id=timeline_id,
+        l1_type=request.l1_type, elements=request.elements,
+    )
 
     practice = Practice(
         timeline_id=timeline_id,
@@ -2411,6 +2478,11 @@ async def update_practice(
         elements=request.elements, timeline_id=timeline_id,
     )
     _validate_brand_lock(request)
+    await _assert_no_duplicate_common_name_in_timeline(
+        db, timeline_id=timeline_id,
+        l1_type=request.l1_type, elements=request.elements,
+        exclude_practice_id=practice_id,
+    )
 
     practice.l0_type = request.l0_type
     practice.l1_type = request.l1_type
@@ -5506,6 +5578,10 @@ async def _create_practice_at_global_timeline(
         elements=request.elements, timeline_id=timeline_id,
     )
     _validate_brand_lock(request)
+    await _assert_no_duplicate_common_name_in_timeline(
+        db, timeline_id=timeline_id,
+        l1_type=request.l1_type, elements=request.elements,
+    )
 
     practice = Practice(
         timeline_id=timeline_id,
@@ -5564,6 +5640,11 @@ async def _update_practice_at_global_timeline(
         elements=request.elements, timeline_id=timeline_id,
     )
     _validate_brand_lock(request)
+    await _assert_no_duplicate_common_name_in_timeline(
+        db, timeline_id=timeline_id,
+        l1_type=request.l1_type, elements=request.elements,
+        exclude_practice_id=practice_id,
+    )
 
     practice.l0_type = request.l0_type
     practice.l1_type = request.l1_type
@@ -7864,6 +7945,10 @@ async def add_client_pg_practice(
         )
     except L2ElementValidationError as e:
         _raise_l2_element_validation(e)
+    await _assert_no_duplicate_common_name_in_timeline(
+        db, timeline_id=tl_id,
+        l1_type=request.l1_type, elements=request.elements,
+    )
 
     practice = Practice(
         timeline_id=tl_id,
@@ -7920,6 +8005,12 @@ async def update_client_pg_practice(
         )
     except L2ElementValidationError as e:
         _raise_l2_element_validation(e)
+
+    await _assert_no_duplicate_common_name_in_timeline(
+        db, timeline_id=tl_id,
+        l1_type=request.l1_type, elements=request.elements,
+        exclude_practice_id=practice_id,
+    )
 
     practice = (await db.execute(
         select(Practice).where(
@@ -8224,6 +8315,10 @@ async def add_sp_practice(
         )
     except L2ElementValidationError as e:
         _raise_l2_element_validation(e)
+    await _assert_no_duplicate_common_name_in_timeline(
+        db, timeline_id=tl_id,
+        l1_type=request.l1_type, elements=request.elements,
+    )
 
     practice = Practice(
         timeline_id=tl_id,
@@ -8280,6 +8375,11 @@ async def update_sp_practice(
         )
     except L2ElementValidationError as e:
         _raise_l2_element_validation(e)
+    await _assert_no_duplicate_common_name_in_timeline(
+        db, timeline_id=tl_id,
+        l1_type=request.l1_type, elements=request.elements,
+        exclude_practice_id=practice_id,
+    )
 
     practice = (await db.execute(
         select(Practice).where(
@@ -8668,6 +8768,10 @@ async def add_qa_practice(
         )
     except L2ElementValidationError as e:
         _raise_l2_element_validation(e)
+    await _assert_no_duplicate_common_name_in_timeline(
+        db, timeline_id=tl_id,
+        l1_type=request.l1_type, elements=request.elements,
+    )
 
     practice = Practice(
         timeline_id=tl_id,
@@ -8749,6 +8853,11 @@ async def update_qa_practice(
         )
     except L2ElementValidationError as e:
         _raise_l2_element_validation(e)
+    await _assert_no_duplicate_common_name_in_timeline(
+        db, timeline_id=tl_id,
+        l1_type=request.l1_type, elements=request.elements,
+        exclude_practice_id=practice_id,
+    )
 
     practice = (await db.execute(
         select(Practice).where(

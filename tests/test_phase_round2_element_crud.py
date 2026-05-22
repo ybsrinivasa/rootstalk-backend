@@ -30,7 +30,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 
 from app.modules.advisory.models import (
-Element,Practice,PGRecommendation,Timeline,
+Element,Package,Practice,PGRecommendation,Timeline,
 PracticeL0,TimelineFromType,
 )
 from app.modules.advisory.router import (
@@ -284,9 +284,18 @@ async def test_cca_element_update_404_on_wrong_practice(db):
 select(Element).where(Element.practice_id == practice.id)
     )).scalars().all()
     elem = rows[0]
-    # Make a second practice in the same timeline.
+    # Make a second practice in a SEPARATE timeline (so the elements
+    # validator's cascading-cosh seed stays happy AND Rule 1's
+    # per-timeline CN uniqueness isn't tripped). The test asserts
+    # URL-tampering across two practices; same-timeline isn't part
+    # of the contract being verified.
+    pkg = (await db.execute(
+        select(Package).where(Package.id == tl.package_id)
+    )).scalar_one()
+    tl2 = await make_timeline(db, pkg, name="TL2")
+    await db.commit()
     other = await create_practice(
-client_id=client.id,timeline_id=tl.id,
+client_id=client.id,timeline_id=tl2.id,
 request=PracticeCreate(
 l0_type=PracticeL0.INPUT,l1_type="PESTICIDE",
 l2_type="CHEMICAL_PESTICIDES",

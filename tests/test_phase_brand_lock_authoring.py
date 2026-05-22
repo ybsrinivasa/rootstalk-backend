@@ -202,12 +202,18 @@ async def test_list_global_practices_surfaces_brand_locked_flag(db, monkeypatch)
     await db.commit()
     await create_global_practice(
         pkg_id=pkg.id, tl_id=tl.id,
-        request=_practice_request_with_brand(is_brand_locked=True),
+        request=_practice_request_with_brand(
+            is_brand_locked=True, common_name_cosh_id="cn:imid",
+        ),
         db=db, current_user=user,
     )
+    # Distinct Common Name on the second practice — Rule 1 forbids
+    # duplicate CN per Timeline for PESTICIDE/FERTILIZER (2026-05-22).
     await create_global_practice(
         pkg_id=pkg.id, tl_id=tl.id,
-        request=_practice_request_with_brand(is_brand_locked=False),
+        request=_practice_request_with_brand(
+            is_brand_locked=False, common_name_cosh_id="cn:other",
+        ),
         db=db, current_user=user,
     )
     listed = await list_global_practices(

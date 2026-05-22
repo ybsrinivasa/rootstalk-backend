@@ -544,6 +544,16 @@ class PracticeConditional(Base):
     practice: Mapped["Practice"] = relationship("Practice", back_populates="conditionals")
     question: Mapped["ConditionalQuestion"] = relationship("ConditionalQuestion", back_populates="practice_conditionals")
 
+    # Rule 3 (2026-05-22): a Practice can be linked to AT MOST one
+    # Conditional Question, regardless of answer. Covers Yes-vs-No
+    # exclusivity within a CQ and cross-CQ exclusivity at the DB
+    # level. App-layer check in `link_practice_conditional` still
+    # runs and surfaces a friendly error before the DB ever sees the
+    # IntegrityError.
+    __table_args__ = (
+        UniqueConstraint("practice_id", name="uq_practice_conditionals_practice_id"),
+    )
+
 
 class RelationConditional(Base):
     """CCA Step 4 / Batch 4B — Path A.
@@ -561,7 +571,13 @@ class RelationConditional(Base):
     question_id: Mapped[str] = mapped_column(String(36), ForeignKey("conditional_questions.id"), nullable=False)
     answer: Mapped[ConditionalAnswer] = mapped_column(SAEnum(ConditionalAnswer), nullable=False)
 
-    __table_args__ = (UniqueConstraint("relation_id", "question_id"),)
+    # Rule 3 (2026-05-22): a Relation can be linked to AT MOST one
+    # Conditional Question. Mirror of PracticeConditional's constraint.
+    # Supersedes the previous (relation_id, question_id) pair which
+    # only prevented same-CQ duplicates.
+    __table_args__ = (
+        UniqueConstraint("relation_id", name="uq_relation_conditionals_relation_id"),
+    )
 
 
 # ── Domain 4: CHA — Problem Groups and Specific Problems ──────────────────────
