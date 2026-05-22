@@ -27,7 +27,18 @@ from app.services.l2_element_rules import (
 # Display labels keep the same ALL_CAPS storage form but show
 # something friendlier in dropdowns ("Chemical Pesticide" rather
 # than "CHEMICAL_PESTICIDES"). Generated on demand below.
+#
+# 2026-05-22: special-cased labels that the title-case-on-underscore
+# default gets wrong. Extend this map when a new id can't be
+# rendered correctly by the default capitalisation (acronyms with
+# their own typographic convention, scientific notation, etc.).
+_LABEL_OVERRIDES: dict[str, str] = {
+    "AI_CONCENTRATION": "a.i. concentration",
+}
+
 def _label_from_id(value: str) -> str:
+    if value in _LABEL_OVERRIDES:
+        return _LABEL_OVERRIDES[value]
     return " ".join(part.capitalize() for part in value.split("_"))
 
 

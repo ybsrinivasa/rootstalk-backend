@@ -231,10 +231,15 @@ async def test_formulation_optional_when_brand_set():
 
 
 @pytest.mark.asyncio
-async def test_formulation_optional_when_only_cn_set():
-    """CN set, F+AI+MFR+BRAND all omitted → no error. The user's
-    'CN + Formulation optional + dosage' use case (Batch 24) keeps
-    working — and F is genuinely optional, not implicitly required."""
+async def test_formulation_and_ai_mandatory_on_chemical_pesticides():
+    """2026-05-22 — per user: CHEMICAL_PESTICIDES treats FORMULATION
+    and AI_CONCENTRATION as mandatory. Earlier (Batch 24) they were
+    optional even when CN was set; the user reversed that decision
+    because the safety / dosage math depends on those values being
+    explicit.
+
+    Replaces the prior `test_formulation_optional_when_only_cn_set`.
+    Sister L2s (CHEMICAL_HERBICIDES) keep the optional variant."""
     elements = [
         el("COMMON_NAME", cosh_ref="cn:imida"),
         el("APPLICATION_METHOD", cosh_ref="am:foliar_spray"),
@@ -250,7 +255,11 @@ async def test_formulation_optional_when_only_cn_set():
         r = await validate_l2_elements(
             db=None, l2_type="CHEMICAL_PESTICIDES", elements=elements,
         )
-    assert r.is_valid, r.errors
+    missing_fields = {
+        e.field_name for e in r.errors if e.code == "MISSING_MANDATORY"
+    }
+    assert "FORMULATION" in missing_fields, r.errors
+    assert "AI_CONCENTRATION" in missing_fields, r.errors
 
 
 # ── is_special_input invariant ──────────────────────────────────────────────

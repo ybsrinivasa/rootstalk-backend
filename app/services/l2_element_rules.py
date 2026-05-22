@@ -204,6 +204,29 @@ _FORMULATION_AI_AUTOCASCADE: tuple[FieldRule, ...] = (
     ),
 )
 
+# 2026-05-22 — variant of _FORMULATION_AI_AUTOCASCADE with both
+# fields mandatory. Used by CHEMICAL_PESTICIDES per user, where
+# the SE must commit to a specific formulation + a.i. concentration
+# (the safety / dosage math depends on it). CHEMICAL_HERBICIDES
+# keeps the optional variant — user can extend the mandatory
+# treatment there if they want the same behaviour.
+_FORMULATION_AI_AUTOCASCADE_MANDATORY: tuple[FieldRule, ...] = (
+    FieldRule(
+        "FORMULATION",
+        source="cosh_cascade:formulation_for_brand",
+        mandatory=True,
+        cascade_from=("COMMON_NAME",),
+        cascade_optional_inputs=("BRAND_NAME",),
+    ),
+    FieldRule(
+        "AI_CONCENTRATION",
+        source="cosh_cascade:ai_concentration_for_brand",
+        mandatory=True,
+        cascade_from=("COMMON_NAME",),
+        cascade_optional_inputs=("BRAND_NAME",),
+    ),
+)
+
 _FORMULATION_AI_TEXTBOX: tuple[FieldRule, ...] = (
     FieldRule("FORMULATION_AI_CONC", source="text_box", mandatory=False),
 )
@@ -241,7 +264,7 @@ _PESTICIDE_RULES: dict[str, L2Spec] = {
     "CHEMICAL_PESTICIDES": L2Spec(
         fields=(
             *_INPUT_BRAND_TRIPLET,
-            *_FORMULATION_AI_AUTOCASCADE,
+            *_FORMULATION_AI_AUTOCASCADE_MANDATORY,
             *_DOSAGE_TAIL_4DEC,
         ),
         plant_wise_extras=True,
