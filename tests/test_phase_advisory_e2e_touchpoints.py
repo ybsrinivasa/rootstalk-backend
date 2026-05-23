@@ -35,7 +35,7 @@ ClientFarmPundit,FarmPunditProfile,PunditRole,Query,QueryStatus,
 StandardResponse,
 )
 from app.modules.farmpundit.router import (
-create_standard_response,respond_to_query,
+create_standard_response,publish_standard_response,respond_to_query,
 )
 from app.modules.subscriptions.models import (
 Subscription,SubscriptionStatus,TriggeredCHAEntry,
@@ -156,6 +156,11 @@ async def test_qa_timeline_reaches_farmer_today(db):
 client_id=client.id,
 data={"question_text": "How to control aphids?"},
 db=db,current_user=se,
+)
+    # Pundit can only pick ACTIVE SRs; respond_to_query's trigger
+    # filters non-ACTIVE rows out as a defence-in-depth gate.
+    await publish_standard_response(
+client_id=client.id,sr_id=sr["id"],db=db,current_user=se,
 )
     qa_tl, _ = await _add_qa_timeline_to_sr(
 db,sr_id=sr["id"],name="QA-Aphids",

@@ -25,7 +25,8 @@ from app.modules.farmpundit.models import (
     FarmPunditProfile, Query, QueryResponse, QueryStatus,
 )
 from app.modules.farmpundit.router import (
-    _trigger_qa_for_query, create_standard_response, respond_to_query,
+    _trigger_qa_for_query, create_standard_response, publish_standard_response,
+    respond_to_query,
 )
 from app.modules.subscriptions.models import (
     Subscription, SubscriptionStatus, TriggeredCHAEntry,
@@ -89,6 +90,9 @@ async def test_trigger_qa_creates_entry_with_qa_shape(db):
         client_id=client.id,
         data={"question_text": "How to handle aphids?"},
         db=db, current_user=se,
+    )
+    await publish_standard_response(
+        client_id=client.id, sr_id=sr_out["id"], db=db, current_user=se,
     )
     _, _, query = await _seed_pundit_with_query(db, client=client, farmer=farmer, sub=sub)
     await db.commit()
@@ -163,6 +167,11 @@ async def test_trigger_qa_silent_noop_when_no_active_subscription(db):
         data={"question_text": "Q?"},
         db=db, current_user=se,
     )
+    # Publish so the no-op below is provably caused by the subscription
+    # gate, not the SR-status filter that runs earlier.
+    await publish_standard_response(
+        client_id=client.id, sr_id=sr["id"], db=db, current_user=se,
+    )
     _, _, query = await _seed_pundit_with_query(db, client=client, farmer=farmer, sub=sub)
     await db.commit()
 
@@ -194,6 +203,9 @@ async def test_respond_to_query_with_standard_response_triggers_qa_entry(db):
         client_id=client.id,
         data={"question_text": "How to control aphids?"},
         db=db, current_user=se,
+    )
+    await publish_standard_response(
+        client_id=client.id, sr_id=sr["id"], db=db, current_user=se,
     )
     pundit_user, _, query = await _seed_pundit_with_query(
         db, client=client, farmer=farmer, sub=sub,

@@ -23,8 +23,8 @@ from sqlalchemy import select
 from app.modules.farmpundit.models import StandardResponse
 from app.modules.farmpundit.router import (
 create_standard_response,delete_standard_response,
-list_standard_responses,search_standard_responses,
-update_standard_response,
+list_standard_responses,publish_standard_response,
+search_standard_responses,update_standard_response,
 )
 from tests.conftest import requires_docker
 from tests.factories import make_client, make_client_user, make_user
@@ -316,10 +316,14 @@ async def test_pundit_search_returns_metadata(db):
     pundit = await make_user(db, name="Pundit")
     await db.commit()
 
-    await create_standard_response(
+    sr = await create_standard_response(
 client_id=client.id,
 data={"question_text": "How to control aphids?"},
 db=db,current_user=se,
+)
+    # Pundit-side search only sees ACTIVE rows.
+    await publish_standard_response(
+client_id=client.id,sr_id=sr["id"],db=db,current_user=se,
 )
 
     out = await search_standard_responses(

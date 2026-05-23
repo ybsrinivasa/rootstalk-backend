@@ -10684,6 +10684,7 @@ async def qa_list_standard_responses(
                 crop_names.get(s.crop_cosh_id, s.crop_cosh_id)
                 if s.crop_cosh_id else None
             ),
+            "status": s.status,
             "timeline_count": tl_counts.get(s.id, 0),
             "created_at": s.created_at,
             "updated_at": s.updated_at,

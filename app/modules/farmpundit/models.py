@@ -234,6 +234,12 @@ class StandardResponse(Base):
     client_id: Mapped[str] = mapped_column(String(36), ForeignKey("clients.id"), nullable=False)
     crop_cosh_id: Mapped[str] = mapped_column(String(100), nullable=True)
     question_text: Mapped[str] = mapped_column(Text, nullable=False)
+    # DRAFT → ACTIVE (one-time publish, with a CA-side confirmation gate)
+    # → INACTIVE ↔ ACTIVE thereafter. Only ACTIVE rows are visible to
+    # Pundits. No version history — edits to an ACTIVE row propagate
+    # immediately; the Inactive toggle is the curator's hide affordance
+    # during rewrites.
+    status: Mapped[str] = mapped_column(String(20), default="DRAFT", nullable=False)
     created_by: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(

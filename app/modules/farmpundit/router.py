@@ -622,6 +622,7 @@ def _serialise_standard_response(sr: StandardResponse) -> dict:
         "client_id": sr.client_id,
         "crop_cosh_id": sr.crop_cosh_id,
         "question_text": sr.question_text,
+        "status": sr.status,
         "created_by": sr.created_by,
         "created_at": sr.created_at,
         "updated_at": sr.updated_at,
@@ -717,6 +718,96 @@ async def update_standard_response(
     return _serialise_standard_response(sr)
 
 
+def _sr_state_error(sr: StandardResponse, expected: str, code: str, action: str) -> HTTPException:
+    """Stable 422 shape for state-transition refusals — mirrors the
+    `pg_not_draft` / `sp_not_draft` pattern so the frontend can branch
+    on `detail.code` programmatically."""
+    return HTTPException(
+        status_code=422,
+        detail={
+            "code": code,
+            "message": (
+                f"Cannot {action} a {sr.status.lower()} question. "
+                f"Expected status: {expected}."
+            ),
+            "current_status": sr.status,
+            "expected_status": expected,
+        },
+    )
+
+
+async def _load_sr_for_transition(
+    db: AsyncSession, sr_id: str, client_id: str,
+) -> StandardResponse:
+    sr = (await db.execute(
+        select(StandardResponse).where(
+            StandardResponse.id == sr_id,
+            StandardResponse.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if not sr:
+        raise HTTPException(status_code=404, detail="Standard response not found")
+    return sr
+
+
+@router.post("/client/{client_id}/standard-responses/{sr_id}/publish")
+async def publish_standard_response(
+    client_id: str,
+    sr_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """DRAFT → ACTIVE. One-time gate; CA-side renders a confirmation
+    card before calling this. Refuses if not DRAFT."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    sr = await _load_sr_for_transition(db, sr_id, client_id)
+    if sr.status != "DRAFT":
+        raise _sr_state_error(sr, "DRAFT", "sr_not_draft", "publish")
+    sr.status = "ACTIVE"
+    await db.commit()
+    await db.refresh(sr)
+    return _serialise_standard_response(sr)
+
+
+@router.post("/client/{client_id}/standard-responses/{sr_id}/deactivate")
+async def deactivate_standard_response(
+    client_id: str,
+    sr_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """ACTIVE → INACTIVE. Hides the question from the Pundit pick list
+    without deleting; the curator's escape hatch while rewriting."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    sr = await _load_sr_for_transition(db, sr_id, client_id)
+    if sr.status != "ACTIVE":
+        raise _sr_state_error(sr, "ACTIVE", "sr_not_active", "deactivate")
+    sr.status = "INACTIVE"
+    await db.commit()
+    await db.refresh(sr)
+    return _serialise_standard_response(sr)
+
+
+@router.post("/client/{client_id}/standard-responses/{sr_id}/activate")
+async def activate_standard_response(
+    client_id: str,
+    sr_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """INACTIVE → ACTIVE. Re-exposes a previously hidden question.
+    Separate from publish so the DRAFT-only confirmation copy doesn't
+    leak into the re-activate flow."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    sr = await _load_sr_for_transition(db, sr_id, client_id)
+    if sr.status != "INACTIVE":
+        raise _sr_state_error(sr, "INACTIVE", "sr_not_inactive", "activate")
+    sr.status = "ACTIVE"
+    await db.commit()
+    await db.refresh(sr)
+    return _serialise_standard_response(sr)
+
+
 @router.delete("/client/{client_id}/standard-responses/{sr_id}", status_code=204)
 async def delete_standard_response(
     client_id: str,
@@ -751,8 +842,13 @@ async def search_standard_responses(
 ):
     """Pundit-side search — used while responding to a farmer's
     query. Same shape as the CA-side list but no auth-membership
-    gate (Pundits act on behalf of multiple companies)."""
-    q = select(StandardResponse).where(StandardResponse.client_id == client_id)
+    gate (Pundits act on behalf of multiple companies). Only ACTIVE
+    questions are returned; DRAFTs and INACTIVE rows are curator-
+    only state and must not leak into a Pundit's pick list."""
+    q = select(StandardResponse).where(
+        StandardResponse.client_id == client_id,
+        StandardResponse.status == "ACTIVE",
+    )
     if search:
         q = q.where(StandardResponse.question_text.ilike(f"%{search}%"))
     rows = (await db.execute(q)).scalars().all()
@@ -1642,6 +1738,7 @@ async def _trigger_qa_for_query(
         select(StandardResponse).where(
             StandardResponse.id == standard_response_id,
             StandardResponse.client_id == query.client_id,
+            StandardResponse.status == "ACTIVE",
         )
     )).scalar_one_or_none()
     if not sr:
