@@ -152,6 +152,27 @@ async def list_sps_for_pg_crop(
     return _name_items(sp_ids, names)
 
 
+async def pg_for_sp_crop(
+    db: AsyncSession, *, sp_cosh_id: str, crop_cosh_id: str,
+) -> Optional[str]:
+    """Return the `problem_groups` cosh_id for the (specific-problem,
+    crop) pair, or None when `sp_pg_crops` has no row connecting them.
+
+    The diagnose-to-advisory bridge: BL-08 narrows to a
+    `biological_names` pest (the SP). PG recommendations are keyed on
+    `problem_groups`. This Connect is the canonical mapping between
+    the two, and is also the source the CA portal's SP authoring
+    pickers read from — single source of truth.
+    """
+    for r in await _walk_active_rows(db):
+        if _endpoint_at_position(r, SPPC_POS_SP) != sp_cosh_id:
+            continue
+        if _endpoint_at_position(r, SPPC_POS_CROP) != crop_cosh_id:
+            continue
+        return _endpoint_at_position(r, SPPC_POS_PG)
+    return None
+
+
 async def list_sps_for_crop(
     db: AsyncSession, *, crop_cosh_id: str,
 ) -> list[dict]:

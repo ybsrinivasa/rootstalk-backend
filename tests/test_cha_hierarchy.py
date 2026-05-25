@@ -1,262 +1,196 @@
-"""
-CHA Recommendation Hierarchy Resolver — unit tests.
-Uses mock data to verify the SP→PG lookup priority chain.
+"""CHA Recommendation Hierarchy Resolver — integration tests.
 
-Hierarchy (spec §8.7):
-1. SP recommendation (client-specific, exact specific_problem match)
-2. PG recommendation (client-specific, parent problem_group of the SP)
-3. PG recommendation (global, same parent problem_group)
-4. None — no recommendation
+Spec: RootsTalk_AgriTeam_Document_v5-2.pdf §8.7. Rewired 2026-05-25 to
+read the real Cosh wire shape:
+- The diagnosed cosh_id is a `biological_names` pest (BL-08 output).
+- The SP recommendation's `specific_problem_cosh_id` column stores the
+  same biological_names id (the column name is legacy).
+- The bridge from a pest to its parent `problem_groups` Core item lives
+  in Cosh's `sp_pg_crops` Connect.
+- PG recommendations are keyed on a `problem_groups` cosh_id.
+
+Mock-based tests previously stubbed `cosh_core_items` lookups by core
+type; that pattern stopped reflecting the production query path after
+the rewire. These integration tests use real DB rows so the resolver
+exercises actual SQL.
 """
+from __future__ import annotations
+
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
+
+from app.modules.advisory.models import PGRecommendation, SPRecommendation
+from app.modules.sync.models import CoshConnectRow
+from app.services.cha_hierarchy import resolve_cha_recommendation
+from tests.conftest import requires_docker
+from tests.factories import make_client, make_crop_reference
 
 
-def make_sp_entry(cosh_id: str, parent_pg_id: str, name_en: str):
-    e = MagicMock()
-    e.cosh_id = cosh_id
-    e.core_type = "specific_problem"
-    e.parent_cosh_id = parent_pg_id
-    e.translations = {"en": name_en}
-    return e
+CROP = "crop:tomato"
+PEST = "bn:tomato_early_blight"   # biological_names pest cosh_id
+PG_GROUP = "pg:fungal_diseases"   # problem_groups cosh_id (seeded by conftest)
 
 
-def make_pg_entry(cosh_id: str, name_en: str):
-    e = MagicMock()
-    e.cosh_id = cosh_id
-    e.core_type = "problem_group"
-    e.parent_cosh_id = None
-    e.translations = {"en": name_en}
-    return e
+def _sp_pg_crops_row(connect_id: str, *, sp: str, pg: str, crop: str) -> CoshConnectRow:
+    """Build an sp_pg_crops Connect row in the real 3-position shape:
+    pos 1 = biological_names (SP), pos 2 = problem_groups (PG),
+    pos 3 = biological_names (crop)."""
+    return CoshConnectRow(
+        connect_id=connect_id,
+        connect_type="sp_pg_crops",
+        status="active",
+        endpoints=[
+            {"role": "biological_names", "cosh_id": sp,   "position": 1},
+            {"role": "problem_groups",   "cosh_id": pg,   "position": 2},
+            {"role": "biological_names", "cosh_id": crop, "position": 3},
+        ],
+        metadata_=None,
+    )
 
 
-def make_sp_rec(rec_id: str, specific_problem_cosh_id: str, client_id: str):
-    r = MagicMock()
-    r.id = rec_id
-    r.specific_problem_cosh_id = specific_problem_cosh_id
-    r.client_id = client_id
-    r.status = "ACTIVE"
-    return r
-
-
-def make_pg_rec(rec_id: str, problem_group_cosh_id: str, client_id):
-    r = MagicMock()
-    r.id = rec_id
-    r.problem_group_cosh_id = problem_group_cosh_id
-    r.client_id = client_id
-    r.status = "ACTIVE"
-    return r
-
-
-# ── Helpers to build a mock DB session ───────────────────────────────────────
-
-def mock_db_returning(
-    cosh_entry=None,
-    sp_rec=None,
-    pg_client_rec=None,
-    pg_global_rec=None,
-):
-    """Returns an AsyncSession mock that returns controlled data for each query."""
-    db = AsyncMock()
-
-    async def execute_side_effect(query):
-        result = MagicMock()
-        q_str = str(query)
-
-        # Route by what seems to be queried (fragile but sufficient for unit tests)
-        if 'cosh_core_items' in q_str.lower() or hasattr(query, 'froms'):
-            result.scalar_one_or_none = MagicMock(return_value=cosh_entry)
-        else:
-            result.scalar_one_or_none = MagicMock(return_value=None)
-
-        return result
-
-    db.execute = AsyncMock(side_effect=execute_side_effect)
-    return db
-
-
-# ── Tests using the service directly with mocked DB ──────────────────────────
-
+@requires_docker
 @pytest.mark.asyncio
-async def test_sp_client_takes_priority():
-    """If SP recommendation exists for client → deliver SP, never check PG."""
-    from app.services.cha_hierarchy import resolve_cha_recommendation
+async def test_sp_client_wins_when_authored_for_the_diagnosed_pest(db):
+    """SP recommendation for the exact diagnosed problem (by this
+    client, this crop) wins over any PG bundle. The SP row's
+    specific_problem_cosh_id matches the biological_names id BL-08
+    emits — no Cosh lookup needed for that branch."""
+    client = await make_client(db)
+    await make_crop_reference(db, CROP, name="Tomato", measure="AREA_WISE")
+    sp = SPRecommendation(
+        specific_problem_cosh_id=PEST, client_id=client.id,
+        crop_cosh_id=CROP, status="ACTIVE",
+    )
+    # Also seed a client PG bundle that SHOULDN'T win.
+    pg = PGRecommendation(
+        problem_group_cosh_id=PG_GROUP, client_id=client.id,
+        area_or_plant="AREA_WISE", status="ACTIVE",
+    )
+    db.add(_sp_pg_crops_row("sppc:tomato-eb", sp=PEST, pg=PG_GROUP, crop=CROP))
+    db.add_all([sp, pg])
+    await db.commit()
 
-    sp_entry = make_sp_entry("sp_blast_paddy", "pg_foliar_fungal", "Leaf Blast")
-    sp_rec = make_sp_rec("sp_rec_1", "sp_blast_paddy", "client_A")
-
-    db = AsyncMock()
-    call_count = [0]
-
-    async def mock_execute(query):
-        call_count[0] += 1
-        result = MagicMock()
-        if call_count[0] == 1:
-            # First call: cosh_core_items lookup → return SP entry
-            result.scalar_one_or_none = MagicMock(return_value=sp_entry)
-        elif call_count[0] == 2:
-            # Second call: SP recommendation lookup → return match
-            result.scalar_one_or_none = MagicMock(return_value=sp_rec)
-        else:
-            result.scalar_one_or_none = MagicMock(return_value=None)
-        return result
-
-    db.execute = AsyncMock(side_effect=mock_execute)
-
-    resolved = await resolve_cha_recommendation(db, "client_A", "sp_blast_paddy")
-
-    assert resolved is not None
-    assert resolved.recommendation_type == "SP"
-    assert resolved.recommendation_id == "sp_rec_1"
-    assert resolved.level == "SP_CLIENT"
-    assert resolved.problem_name == "Leaf Blast"
-    assert resolved.parent_pg_cosh_id == "pg_foliar_fungal"
+    out = await resolve_cha_recommendation(
+        db, client.id, PEST, crop_cosh_id=CROP,
+    )
+    assert out is not None
+    assert out.level == "SP_CLIENT"
+    assert out.recommendation_type == "SP"
+    assert out.recommendation_id == sp.id
 
 
+@requires_docker
 @pytest.mark.asyncio
-async def test_pg_client_when_no_sp():
-    """No SP recommendation → fall back to client-specific PG."""
-    from app.services.cha_hierarchy import resolve_cha_recommendation
+async def test_pg_client_via_sp_pg_crops_bridge(db):
+    """No SP authored → resolver walks sp_pg_crops to find the
+    pest's parent problem_groups, then matches the client's PG
+    bundle on that group."""
+    client = await make_client(db)
+    await make_crop_reference(db, CROP, name="Tomato", measure="AREA_WISE")
+    db.add(_sp_pg_crops_row("sppc:tomato-eb", sp=PEST, pg=PG_GROUP, crop=CROP))
+    pg = PGRecommendation(
+        problem_group_cosh_id=PG_GROUP, client_id=client.id,
+        area_or_plant="AREA_WISE", status="ACTIVE",
+    )
+    db.add(pg)
+    await db.commit()
 
-    sp_entry = make_sp_entry("sp_blast_paddy", "pg_foliar_fungal", "Leaf Blast")
-    pg_rec = make_pg_rec("pg_rec_1", "pg_foliar_fungal", "client_A")
-
-    call_count = [0]
-    db = AsyncMock()
-
-    async def mock_execute(query):
-        call_count[0] += 1
-        result = MagicMock()
-        if call_count[0] == 1:
-            result.scalar_one_or_none = MagicMock(return_value=sp_entry)  # cosh cache
-        elif call_count[0] == 2:
-            result.scalar_one_or_none = MagicMock(return_value=None)       # no SP rec
-        elif call_count[0] == 3:
-            result.scalar_one_or_none = MagicMock(return_value=pg_rec)     # client PG rec
-        else:
-            result.scalar_one_or_none = MagicMock(return_value=None)
-        return result
-
-    db.execute = AsyncMock(side_effect=mock_execute)
-
-    resolved = await resolve_cha_recommendation(db, "client_A", "sp_blast_paddy")
-
-    assert resolved is not None
-    assert resolved.recommendation_type == "PG"
-    assert resolved.recommendation_id == "pg_rec_1"
-    assert resolved.level == "PG_CLIENT"
-    assert resolved.parent_pg_cosh_id == "pg_foliar_fungal"
+    out = await resolve_cha_recommendation(
+        db, client.id, PEST, crop_cosh_id=CROP,
+    )
+    assert out is not None
+    assert out.level == "PG_CLIENT"
+    assert out.recommendation_type == "PG"
+    assert out.recommendation_id == pg.id
+    assert out.parent_pg_cosh_id == PG_GROUP
 
 
+@requires_docker
 @pytest.mark.asyncio
-async def test_pg_global_when_no_client_pg():
-    """No SP, no client PG → fall back to global PG."""
-    from app.services.cha_hierarchy import resolve_cha_recommendation
+async def test_pg_global_fallback_via_bridge(db):
+    """When the client has neither SP nor PG for the diagnosed pest,
+    fall back to RootsTalk's global PG bundle (client_id IS NULL)."""
+    client = await make_client(db)
+    await make_crop_reference(db, CROP, name="Tomato", measure="AREA_WISE")
+    db.add(_sp_pg_crops_row("sppc:tomato-eb", sp=PEST, pg=PG_GROUP, crop=CROP))
+    pg_global = PGRecommendation(
+        problem_group_cosh_id=PG_GROUP, client_id=None,
+        area_or_plant="AREA_WISE", status="ACTIVE",
+    )
+    db.add(pg_global)
+    await db.commit()
 
-    sp_entry = make_sp_entry("sp_blast_paddy", "pg_foliar_fungal", "Leaf Blast")
-    pg_global = make_pg_rec("pg_global_1", "pg_foliar_fungal", None)
-
-    call_count = [0]
-    db = AsyncMock()
-
-    async def mock_execute(query):
-        call_count[0] += 1
-        result = MagicMock()
-        if call_count[0] == 1:
-            result.scalar_one_or_none = MagicMock(return_value=sp_entry)   # cosh cache
-        elif call_count[0] == 2:
-            result.scalar_one_or_none = MagicMock(return_value=None)        # no SP rec
-        elif call_count[0] == 3:
-            result.scalar_one_or_none = MagicMock(return_value=None)        # no client PG
-        elif call_count[0] == 4:
-            result.scalar_one_or_none = MagicMock(return_value=pg_global)   # global PG
-        else:
-            result.scalar_one_or_none = MagicMock(return_value=None)
-        return result
-
-    db.execute = AsyncMock(side_effect=mock_execute)
-
-    resolved = await resolve_cha_recommendation(db, "client_A", "sp_blast_paddy")
-
-    assert resolved is not None
-    assert resolved.recommendation_type == "PG"
-    assert resolved.recommendation_id == "pg_global_1"
-    assert resolved.level == "PG_GLOBAL"
+    out = await resolve_cha_recommendation(
+        db, client.id, PEST, crop_cosh_id=CROP,
+    )
+    assert out is not None
+    assert out.level == "PG_GLOBAL"
+    assert out.recommendation_id == pg_global.id
 
 
+@requires_docker
 @pytest.mark.asyncio
-async def test_none_when_no_recommendations():
-    """No SP, no client PG, no global PG → returns None."""
-    from app.services.cha_hierarchy import resolve_cha_recommendation
-
-    sp_entry = make_sp_entry("sp_unknown", "pg_unknown_group", "Unknown Problem")
-
-    db = AsyncMock()
-    result = MagicMock()
-    result.scalar_one_or_none = MagicMock(side_effect=[
-        sp_entry,   # cosh cache
-        None,        # no SP rec
-        None,        # no client PG
-        None,        # no global PG
-    ])
-    db.execute = AsyncMock(return_value=result)
-
-    resolved = await resolve_cha_recommendation(db, "client_A", "sp_unknown")
-    assert resolved is None
+async def test_none_when_no_bridge_and_no_pg(db):
+    """A diagnosed pest with no sp_pg_crops row and no
+    direct-`problem_groups` cosh_id match → no recommendation.
+    The commit endpoint still succeeds upstream, but no
+    TriggeredCHAEntry is created."""
+    client = await make_client(db)
+    await make_crop_reference(db, CROP, name="Tomato", measure="AREA_WISE")
+    # No sp_pg_crops row; no PG/SP recs.
+    out = await resolve_cha_recommendation(
+        db, client.id, "bn:some-pest-cosh hasnt mapped yet",
+        crop_cosh_id=CROP,
+    )
+    assert out is None
 
 
+@requires_docker
 @pytest.mark.asyncio
-async def test_problem_group_input_skips_sp_lookup():
-    """If problem_cosh_id is a problem_group (not a specific_problem), skip SP lookup."""
-    from app.services.cha_hierarchy import resolve_cha_recommendation
+async def test_problem_groups_input_skips_bridge(db):
+    """Edge: BL-08 narrows directly to a problem_groups item (rare
+    but valid when Cosh hasn't split a group into sub-pests).
+    The bridge lookup returns nothing, but the resolver recognises
+    the cosh_id as a problem_groups Core and proceeds to PG lookup."""
+    client = await make_client(db)
+    await make_crop_reference(db, CROP, name="Tomato", measure="AREA_WISE")
+    # No sp_pg_crops row needed — diagnosed cosh_id IS the
+    # problem_groups id (seeded by conftest as
+    # COSH_PROBLEM_GROUPS_CORE).
+    pg = PGRecommendation(
+        problem_group_cosh_id=PG_GROUP, client_id=client.id,
+        area_or_plant="AREA_WISE", status="ACTIVE",
+    )
+    db.add(pg); await db.commit()
 
-    pg_entry = make_pg_entry("pg_foliar_fungal", "Foliar Fungal Diseases")
-    pg_rec = make_pg_rec("pg_rec_1", "pg_foliar_fungal", "client_A")
-
-    call_count = [0]
-    db = AsyncMock()
-
-    async def mock_execute(query):
-        call_count[0] += 1
-        result = MagicMock()
-        if call_count[0] == 1:
-            result.scalar_one_or_none = MagicMock(return_value=pg_entry)  # cosh cache → it's a PG
-        elif call_count[0] == 2:
-            result.scalar_one_or_none = MagicMock(return_value=pg_rec)    # client PG rec
-        else:
-            result.scalar_one_or_none = MagicMock(return_value=None)
-        return result
-
-    db.execute = AsyncMock(side_effect=mock_execute)
-
-    resolved = await resolve_cha_recommendation(db, "client_A", "pg_foliar_fungal")
-
-    assert resolved is not None
-    assert resolved.recommendation_type == "PG"
-    assert call_count[0] == 2   # Only 2 queries: cosh cache + client PG (no SP query)
+    out = await resolve_cha_recommendation(
+        db, client.id, PG_GROUP, crop_cosh_id=CROP,
+    )
+    assert out is not None
+    assert out.level == "PG_CLIENT"
+    assert out.parent_pg_cosh_id == PG_GROUP
 
 
+@requires_docker
 @pytest.mark.asyncio
-async def test_problem_name_set_correctly_from_cosh():
-    """problem_name in result comes from cosh_core_items translations."""
-    from app.services.cha_hierarchy import resolve_cha_recommendation
+async def test_resolver_returns_friendly_name_from_cosh(db):
+    """The diagnosed problem's display name resolves through Cosh
+    `cosh_core_items.translations.en` so the advisory card shows
+    "Tomato - Early Blight" rather than a raw cosh_id."""
+    from app.modules.sync.models import CoshCoreItem
+    client = await make_client(db)
+    await make_crop_reference(db, CROP, name="Tomato", measure="AREA_WISE")
+    db.add(CoshCoreItem(
+        cosh_id=PEST, core_type="biological_names", status="active",
+        translations={"en": "Tomato - Early Blight"},
+    ))
+    db.add(_sp_pg_crops_row("sppc:tomato-eb", sp=PEST, pg=PG_GROUP, crop=CROP))
+    pg = PGRecommendation(
+        problem_group_cosh_id=PG_GROUP, client_id=client.id,
+        area_or_plant="AREA_WISE", status="ACTIVE",
+    )
+    db.add(pg); await db.commit()
 
-    sp_entry = make_sp_entry("sp_blast_paddy", "pg_foliar_fungal", "Paddy Leaf Blast")
-    sp_rec = make_sp_rec("sp_rec_1", "sp_blast_paddy", "client_A")
-
-    call_count = [0]
-    db = AsyncMock()
-
-    async def mock_execute(query):
-        call_count[0] += 1
-        result = MagicMock()
-        result.scalar_one_or_none = MagicMock(
-            return_value=sp_entry if call_count[0] == 1 else sp_rec
-        )
-        return result
-
-    db.execute = AsyncMock(side_effect=mock_execute)
-
-    resolved = await resolve_cha_recommendation(db, "client_A", "sp_blast_paddy")
-
-    assert resolved.problem_name == "Paddy Leaf Blast"
+    out = await resolve_cha_recommendation(
+        db, client.id, PEST, crop_cosh_id=CROP,
+    )
+    assert out.problem_name == "Tomato - Early Blight"
