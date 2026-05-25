@@ -48,6 +48,19 @@ class ExplainSymptomRequest(BaseModel):
     language_name: str = "English"
 
 
+class AIDirectImage(BaseModel):
+    base64: str
+    media_type: str = "image/jpeg"
+
+
+class AIDirectDiagnoseRequest(BaseModel):
+    subscription_id: str
+    crop_cosh_id: str
+    crop_stage_cosh_id: Optional[str] = None
+    images: list[AIDirectImage]
+    language_code: str = "en"
+
+
 class ReferenceImagesRequest(BaseModel):
     crop_cosh_id: str
     crop_stage_cosh_id: Optional[str] = None

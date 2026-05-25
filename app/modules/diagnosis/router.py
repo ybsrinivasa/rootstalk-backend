@@ -38,6 +38,7 @@ from app.database import get_db
 from app.dependencies import get_current_user
 from app.modules.diagnosis.models import DiagnosisSession
 from app.modules.diagnosis.schemas import (
+    AIDirectDiagnoseRequest,
     AnswerRequest,
     ExplainSymptomRequest,
     ImageAnalysisRequest,
@@ -55,6 +56,7 @@ from app.services.bl08_diagnosis_path import (
 )
 from app.services.claude_service import (
     analyze_crop_image,
+    analyze_crop_images_constrained,
     enrich_problem_with_description,
     explain_symptom,
 )
@@ -760,6 +762,132 @@ async def commit_diagnosis_to_advisory(
         "committed_to_advisory": True,
         "already_committed": False,
         "subscription_id": session.subscription_id,
+    }
+
+
+@router.post("/diagnosis/ai-direct-diagnose")
+async def ai_direct_diagnose(
+    request: AIDirectDiagnoseRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Direct AI diagnosis — alternative to BL-08 dichotomous Q&A.
+
+    The farmer skips part-picking + YES/NO narrowing entirely; uploads
+    one or more photos; Claude vision is constrained to pick from the
+    crop's known problem catalogue (filtered by stage if supplied) or
+    return `needs_expert=true`.
+
+    On a confident match we seed a DIAGNOSED `DiagnosisSession` so the
+    existing `/commit-to-advisory` endpoint can route the resulting
+    PG/SP recommendation into the farmer's advisory — same downstream
+    path as a BL-08-narrowed diagnosis. On `needs_expert` we return
+    without creating a session; the PWA routes the farmer to the
+    FarmPundit query flow.
+
+    The constraint to a known list is deliberate: Claude is told
+    explicitly NOT to invent a problem name outside the catalogue
+    (defence-in-depth check coerces a stray cosh_id back to
+    `needs_expert`). This keeps the advisory bridge sound — a phantom
+    pest with no curated recommendation would land on a dead end.
+    """
+    from app.modules.subscriptions.models import Subscription
+    from app.services.pest_diagnosis_view import list_candidates
+
+    # Subscription ownership — same gate the BL-08 start endpoint
+    # uses. Closes the cross-farmer trigger gap.
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == request.subscription_id,
+            Subscription.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    # Build the candidate catalogue. `list_candidates` already dedupes
+    # by (pest, pest_stage) and orders by priority rank — best signal
+    # for the AI.
+    candidates = await list_candidates(
+        db,
+        crop_cosh_id=request.crop_cosh_id,
+        crop_stage=request.crop_stage_cosh_id,
+    )
+    # Collapse to one entry per pest (Claude shouldn't see the same
+    # pest 3× because Cosh has separate rows per life-stage); keep
+    # the first occurrence which is already the highest-priority row.
+    seen: set[str] = set()
+    catalogue: list[dict] = []
+    for c in candidates:
+        pid = c.get("pest_cosh_id") or c.get("cosh_id")
+        if not pid or pid in seen:
+            continue
+        seen.add(pid)
+        catalogue.append(c)
+
+    known_ids = [c["pest_cosh_id"] for c in catalogue if c.get("pest_cosh_id")]
+    known_names = [
+        c.get("pest_name") or c.get("pest_cosh_id", "")
+        for c in catalogue if c.get("pest_cosh_id")
+    ]
+
+    crop_name = await _resolve_name_for_cosh_id(
+        db, request.crop_cosh_id, request.language_code,
+    ) or request.crop_cosh_id
+    stage_name = await _resolve_name_for_cosh_id(
+        db, request.crop_stage_cosh_id, request.language_code,
+    ) if request.crop_stage_cosh_id else None
+
+    result = await analyze_crop_images_constrained(
+        images=[{"base64": i.base64, "media_type": i.media_type} for i in request.images],
+        crop_name=crop_name,
+        crop_stage_name=stage_name,
+        known_problem_ids=known_ids,
+        known_problem_names=known_names,
+        language_code=request.language_code,
+    )
+
+    if result.needs_expert or not result.problem_cosh_id:
+        return {
+            "needs_expert": True,
+            "analysis": result.to_dict(),
+            "subscription_id": request.subscription_id,
+        }
+
+    # Confident match — seed a DIAGNOSED session so the existing
+    # commit-to-advisory endpoint owns the trigger. No answers
+    # recorded; remaining_problem_ids carries only the picked pest
+    # so audit-trail queries can still see what the AI surfaced.
+    session = DiagnosisSession(
+        subscription_id=request.subscription_id,
+        farmer_user_id=current_user.id,
+        crop_cosh_id=request.crop_cosh_id,
+        crop_stage_cosh_id=request.crop_stage_cosh_id,
+        initial_plant_part_cosh_id="",  # not chosen on AI path
+        remaining_problem_ids=[result.problem_cosh_id],
+        answers=[],
+        has_yes_answer=False,
+        status="DIAGNOSED",
+        diagnosed_problem_cosh_id=result.problem_cosh_id,
+    )
+    db.add(session)
+    await db.commit()
+    await db.refresh(session)
+
+    # Enrich the problem info with a Claude-generated farmer-friendly
+    # description in the farmer's language — same enrichment path the
+    # BL-08 DIAGNOSED branch uses, so the diagnosed-screen render is
+    # uniform regardless of which path landed us here.
+    problem_info = await _get_problem_info(db, result.problem_cosh_id)
+    problem_info = await enrich_problem_with_description(problem_info, crop_name)
+
+    return {
+        "needs_expert": False,
+        "session_id": session.id,
+        "analysis": result.to_dict(),
+        "problem_info": problem_info,
+        "subscription_id": request.subscription_id,
+        "committed_to_advisory": False,
     }
 
 

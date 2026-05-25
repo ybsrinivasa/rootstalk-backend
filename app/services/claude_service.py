@@ -28,6 +28,7 @@ class ImageAnalysisResult:
         description: str,         # 2-sentence farmer-friendly text
         symptoms_observed: list[str],
         raw_response: Optional[str] = None,
+        needs_expert: bool = False,
     ):
         self.problem_name = problem_name
         self.problem_cosh_id = problem_cosh_id
@@ -35,6 +36,12 @@ class ImageAnalysisResult:
         self.description = description
         self.symptoms_observed = symptoms_observed
         self.raw_response = raw_response
+        # True when Claude refused to commit to any item in the known
+        # problem list (image shows something outside the catalogue,
+        # or the photo is unclear). Caller routes the farmer to the
+        # FarmPundit query flow instead of forcing a low-confidence
+        # advisory commit.
+        self.needs_expert = needs_expert
 
     def to_dict(self) -> dict:
         return {
@@ -43,6 +50,7 @@ class ImageAnalysisResult:
             "confidence": self.confidence,
             "description": self.description,
             "symptoms_observed": self.symptoms_observed,
+            "needs_expert": self.needs_expert,
         }
 
 
@@ -183,6 +191,182 @@ Respond with ONLY valid JSON, no other text:
             confidence="LOW",
             description="Image analysis is temporarily unavailable. Please use the guided diagnosis path.",
             symptoms_observed=[],
+        )
+
+
+# ── Multi-image direct AI diagnosis ────────────────────────────────────────────
+
+
+async def analyze_crop_images_constrained(
+    images: list[dict],                 # [{"base64": str, "media_type": str}]
+    crop_name: str,
+    crop_stage_name: Optional[str],
+    known_problem_ids: list[str],
+    known_problem_names: list[str],
+    language_code: str = "en",
+) -> ImageAnalysisResult:
+    """Direct-AI diagnose path (alternative to BL-08 Q&A): farmer uploads
+    one or more photos; Claude either picks a problem from the
+    `known_problem_*` catalogue or signals "needs_expert" — never
+    invents an answer outside the list.
+
+    Differs from `analyze_crop_image` in three ways:
+      1. Accepts a list of images (typically 1–5). Multi-angle context
+         improves accuracy: a single shot often loses the spread,
+         severity, or sub-part the farmer wanted to highlight.
+      2. No plant-part is required — the AI infers it from the
+         images. (The farmer's whole point in choosing AI is "I
+         don't have to figure out which part".)
+      3. The prompt is strict about the known-problem constraint:
+         Claude MUST return either a problem_cosh_id from the list
+         or `needs_expert=true`. Anything outside the list is
+         disallowed so the advisory bridge never lands on a phantom
+         pest with no curated recommendations.
+    """
+    if not settings.anthropic_api_key:
+        logger.warning("ANTHROPIC_API_KEY not set — returning placeholder direct-AI diagnosis")
+        return ImageAnalysisResult(
+            problem_name="Analysis unavailable",
+            problem_cosh_id=None,
+            confidence="LOW",
+            description="AI diagnosis is not available right now. Please use the guided YES/NO path or ask a FarmPundit expert.",
+            symptoms_observed=[],
+            needs_expert=True,
+        )
+
+    if not images:
+        return ImageAnalysisResult(
+            problem_name="No images supplied",
+            problem_cosh_id=None,
+            confidence="LOW",
+            description="Please add at least one photo so the AI can take a look.",
+            symptoms_observed=[],
+            needs_expert=True,
+        )
+
+    if not known_problem_ids or not known_problem_names:
+        # Defensive — refuse to call Claude without a constrained
+        # catalogue, otherwise the model is free to invent labels
+        # that won't bridge to any recommendation.
+        return ImageAnalysisResult(
+            problem_name="No diagnosable problems for this stage",
+            problem_cosh_id=None,
+            confidence="LOW",
+            description="There are no known problems catalogued for this crop and stage yet. Please ask a FarmPundit expert.",
+            symptoms_observed=[],
+            needs_expert=True,
+        )
+
+    try:
+        import anthropic
+
+        problems_list = "\n".join(
+            f"- {pid}: {name}"
+            for pid, name in zip(known_problem_ids, known_problem_names)
+        )
+        stage_clause = (
+            f" The crop is currently in the **{crop_stage_name}** stage."
+            if crop_stage_name else ""
+        )
+        prompt = f"""You are an expert agricultural diagnostician helping farmers in India identify crop health problems from photos.
+
+A farmer has uploaded {len(images)} photo{'s' if len(images) != 1 else ''} of their {crop_name} crop.{stage_clause} They want you to diagnose what is wrong.
+
+Below is the EXHAUSTIVE list of problems that are known to affect this crop at this stage. You MUST either:
+  (a) pick exactly one problem from this list and return its EXACT cosh_id, OR
+  (b) if none of the listed problems matches what you see (or the photos are unclear), return needs_expert=true and explain briefly why.
+
+Do NOT invent a problem name or cosh_id outside the list. Do NOT guess if the photos are ambiguous — refer to an expert instead.
+
+Problem catalogue for {crop_name}:
+{problems_list}
+
+Write exactly 2 plain sentences describing what you see — simple language a farmer with no technical background can understand, no jargon.
+
+Rate your confidence: HIGH (very clear), MEDIUM (likely but not certain), LOW (unclear).
+
+Respond with ONLY valid JSON, no other text:
+{{
+  "problem_name": "exact name from the list, or null if needs_expert",
+  "problem_cosh_id": "exact_cosh_id_from_list_or_null",
+  "confidence": "HIGH|MEDIUM|LOW",
+  "description": "Sentence one about what you see. Sentence two about what causes it or how serious it is.",
+  "symptoms_observed": ["symptom1", "symptom2"],
+  "needs_expert": false
+}}
+
+If you cannot match any listed problem, set needs_expert=true, problem_name=null, problem_cosh_id=null, and write description as a one-sentence reason."""
+
+        content_blocks: list[dict] = []
+        for img in images:
+            content_blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": img.get("media_type", "image/jpeg"),
+                    "data": img["base64"],
+                },
+            })
+        content_blocks.append({"type": "text", "text": prompt})
+
+        client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=600,
+            messages=[{"role": "user", "content": content_blocks}],
+        )
+        raw = response.content[0].text.strip()
+
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        parsed = json.loads(raw)
+
+        needs_expert = bool(parsed.get("needs_expert"))
+        picked_cosh_id = parsed.get("problem_cosh_id")
+        # Defense in depth: if Claude returned a cosh_id that isn't
+        # in the list (despite the prompt), treat it as needs_expert.
+        if picked_cosh_id and picked_cosh_id not in set(known_problem_ids):
+            logger.warning(
+                "Claude returned cosh_id %s outside known list — coercing to needs_expert",
+                picked_cosh_id,
+            )
+            picked_cosh_id = None
+            needs_expert = True
+
+        if not picked_cosh_id:
+            needs_expert = True
+
+        return ImageAnalysisResult(
+            problem_name=parsed.get("problem_name") or "Outside known catalogue",
+            problem_cosh_id=picked_cosh_id,
+            confidence=parsed.get("confidence", "LOW"),
+            description=parsed.get("description", ""),
+            symptoms_observed=parsed.get("symptoms_observed", []),
+            raw_response=raw,
+            needs_expert=needs_expert,
+        )
+
+    except json.JSONDecodeError as e:
+        logger.error(f"Claude returned invalid JSON for direct-AI diagnosis: {e}")
+        return ImageAnalysisResult(
+            problem_name="Could not read the response",
+            problem_cosh_id=None,
+            confidence="LOW",
+            description="The AI's response could not be parsed. Please try again with clearer photos or ask a FarmPundit expert.",
+            symptoms_observed=[],
+            needs_expert=True,
+        )
+    except Exception as e:
+        logger.error(f"Claude direct-AI diagnosis failed: {e}")
+        return ImageAnalysisResult(
+            problem_name="Analysis failed",
+            problem_cosh_id=None,
+            confidence="LOW",
+            description="AI diagnosis is temporarily unavailable. Please use the guided diagnosis or ask a FarmPundit expert.",
+            symptoms_observed=[],
+            needs_expert=True,
         )
 
 
