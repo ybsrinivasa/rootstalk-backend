@@ -2599,6 +2599,12 @@ async def delete_practice(
     practice = result.scalar_one_or_none()
     if not practice:
         raise HTTPException(status_code=404, detail="Practice not found")
+    # Element.practice_id is NOT NULL with no ON DELETE CASCADE — drop
+    # children first or the practice delete trips a FK violation.
+    # Matches the SA-Global / CA-PG / CA-SP / CA-QA pattern.
+    await db.execute(
+        Element.__table__.delete().where(Element.practice_id == practice_id)
+    )
     await db.delete(practice)
     await db.commit()
 

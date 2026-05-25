@@ -156,6 +156,45 @@ async def test_delete_client_relation_clears_practice_role(db):
 
 @requires_docker
 @pytest.mark.asyncio
+async def test_list_client_relations_excludes_deleted_relation(db):
+    """Repro guard for tester report 2026-05-25: a Relation that was
+    deleted continued to appear in the relations table. Asserts that
+    list_client_relations no longer surfaces the row immediately
+    after delete_client_relation completes — i.e. the API contract
+    the frontend relies on (await delete; await list)."""
+    client = await make_client(db)
+    se = await make_user(db, name="SE", skip_auto_link=True)
+    await make_client_user(
+        db, user=se, client=client, role=ClientUserRole.SUBJECT_EXPERT,
+    )
+    pkg = await make_package(db, client, crop_cosh_id="crop:test")
+    tl = await make_timeline(db, pkg, from_type=TimelineFromType.DAS)
+    practices = await _seed_two_practices(db, tl)
+    await db.commit()
+    rel = await _make_relation_on_timeline(db, se, client, tl, practices)
+
+    before = await list_client_relations(
+        client_id=client.id, timeline_id=tl.id,
+        db=db, current_user=se,
+    )
+    assert len(before) == 1
+
+    await delete_client_relation(
+        client_id=client.id, relation_id=rel["id"],
+        db=db, current_user=se,
+    )
+
+    after = await list_client_relations(
+        client_id=client.id, timeline_id=tl.id,
+        db=db, current_user=se,
+    )
+    assert after == [], (
+        f"Deleted Relation still surfaces in list: {after}"
+    )
+
+
+@requires_docker
+@pytest.mark.asyncio
 async def test_delete_client_relation_404_for_other_client(db):
     client_a = await make_client(db)
     client_b = await make_client(db)
