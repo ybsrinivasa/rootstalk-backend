@@ -622,7 +622,9 @@ async def answer_question(
             db, session.crop_cosh_id, current_user.language_code or "en",
         ) or session.crop_cosh_id
         problem_info = await enrich_problem_with_description(problem_info, crop_name)
-        await _trigger_cha_from_diagnosis(db, session, step.diagnosed_problem_cosh_id)
+        # NB: CHA trigger is no longer fired here. The farmer commits
+        # the diagnosis to their advisory explicitly via the
+        # /diagnosis/{session_id}/commit-to-advisory endpoint.
     elif step.status == "INCONCLUSIVE":
         session.status = "ABORTED"
         problem_info = None
@@ -639,6 +641,7 @@ async def answer_question(
         ),
         "diagnosed_problem_cosh_id": step.diagnosed_problem_cosh_id,
         "problem_info": problem_info,
+        "committed_to_advisory": session.committed_at is not None,
     }
 
 
@@ -671,7 +674,7 @@ async def abort_diagnosis(
             )
         session.status = "DIAGNOSED"
         session.diagnosed_problem_cosh_id = problem_cosh_id
-        await _trigger_cha_from_diagnosis(db, session, problem_cosh_id)
+        # CHA trigger deferred to /commit-to-advisory (opt-in).
         await db.commit()
         problem_info = await _get_problem_info(db, problem_cosh_id)
         crop_name = await _resolve_name_for_cosh_id(
@@ -682,6 +685,7 @@ async def abort_diagnosis(
             "status": "DIAGNOSED",
             "diagnosed_problem_cosh_id": problem_cosh_id,
             "problem_info": problem_info,
+            "committed_to_advisory": session.committed_at is not None,
         }
     session.status = "ABORTED"
     await db.commit()
@@ -690,6 +694,72 @@ async def abort_diagnosis(
         "next_action": "QUERY",
         "subscription_id": session.subscription_id,
         "message": "Opening FarmPundit query form.",
+    }
+
+
+@router.post("/diagnosis/{session_id}/commit-to-advisory")
+async def commit_diagnosis_to_advisory(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Commit a diagnosed session to the farmer's advisory.
+
+    Per user direction 2026-05-25: the CHA trigger no longer fires
+    automatically on DIAGNOSED. The farmer reaches the diagnosed
+    screen, reviews the problem + Claude description + reference
+    images, and only then taps "Add Treatment Recommendations to
+    the Advisory" — that lands here.
+
+    Idempotent — a session can be committed at most once. Re-tap is
+    a no-op that returns the same success payload.
+
+    Refuses (422 `not_diagnosed`) if the session hasn't reached the
+    DIAGNOSED state; the caller shouldn't have surfaced the CTA in
+    that case but we guard server-side anyway.
+    """
+    session = (await db.execute(
+        select(DiagnosisSession).where(
+            DiagnosisSession.id == session_id,
+            DiagnosisSession.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    if session.status != "DIAGNOSED" or not session.diagnosed_problem_cosh_id:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "not_diagnosed",
+                "message": (
+                    "This session hasn't reached a diagnosis yet. "
+                    "Answer the questions to identify the problem first."
+                ),
+                "current_status": session.status,
+            },
+        )
+
+    if session.committed_at is not None:
+        # Idempotent — already committed; surface the same success
+        # shape so the client doesn't need a separate "already done"
+        # branch.
+        return {
+            "committed_to_advisory": True,
+            "already_committed": True,
+            "subscription_id": session.subscription_id,
+        }
+
+    from datetime import datetime, timezone
+    await _trigger_cha_from_diagnosis(
+        db, session, session.diagnosed_problem_cosh_id,
+    )
+    session.committed_at = datetime.now(timezone.utc)
+    await db.commit()
+    return {
+        "committed_to_advisory": True,
+        "already_committed": False,
+        "subscription_id": session.subscription_id,
     }
 
 

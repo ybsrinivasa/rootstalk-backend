@@ -45,5 +45,11 @@ class DiagnosisSession(Base):
     has_yes_answer: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
     diagnosed_problem_cosh_id: Mapped[str] = mapped_column(String(200), nullable=True)
+    # Set when the farmer explicitly commits the diagnosis to their
+    # advisory via POST /diagnosis/{id}/commit-to-advisory. Before
+    # 2026-05-25 the trigger fired automatically on DIAGNOSED; now
+    # opt-in per user direction (the farmer chooses whether to
+    # bring treatment recommendations into their advisory).
+    committed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
