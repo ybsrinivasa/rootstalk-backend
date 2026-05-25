@@ -241,41 +241,94 @@ async def _load_problem_symptom_rows(
     return rows
 
 
-def _get_display_name(entity_cosh_id: str, lang: str = "en") -> str:
-    """Placeholder — production lookup goes through cosh_core_items
-    translations. Left in place so the BL-08 path still produces
-    farmer-readable question text."""
-    return entity_cosh_id.replace("_", " ").title()
+async def _resolve_name_for_cosh_id(
+    db: AsyncSession, cosh_id: Optional[str], lang: str = "en",
+) -> Optional[str]:
+    """Convenience for resolving a single cosh_id. Returns None when
+    the input is empty or no translation row exists; callers feeding
+    Claude prompts or farmer-facing copy must NOT pass a raw
+    cosh_id forward."""
+    if not cosh_id:
+        return None
+    names = await _resolve_display_names_by_cosh_id(db, {cosh_id}, lang)
+    return names.get(cosh_id)
 
 
-def _format_question(question):
+async def _resolve_display_names_by_cosh_id(
+    db: AsyncSession, cosh_ids: set[str], lang: str = "en",
+) -> dict[str, str]:
+    """Bulk lookup of cosh_core_items.translations for a set of
+    cosh_ids. Returns `{cosh_id: friendly_name}`; cosh_ids without a
+    Core row are simply absent (the caller decides the fallback).
+    Prefers the requested language, then English."""
+    if not cosh_ids:
+        return {}
+    rows = (await db.execute(
+        select(CoshCoreItem).where(
+            CoshCoreItem.cosh_id.in_(cosh_ids),
+            CoshCoreItem.status == "active",
+        )
+    )).scalars().all()
+    out: dict[str, str] = {}
+    for r in rows:
+        t = r.translations or {}
+        name = t.get(lang) or t.get("en")
+        if name:
+            out[r.cosh_id] = name
+    return out
+
+
+def _safe_name(cosh_id: Optional[str], names: dict[str, str]) -> Optional[str]:
+    """Return the resolved name for a cosh_id, or None when it can't
+    be resolved (caller drops the term from the question text rather
+    than leaking a UUID into the farmer-facing string)."""
+    if not cosh_id:
+        return None
+    return names.get(cosh_id)
+
+
+def _build_question_text(question, names: dict[str, str]) -> str:
+    """Compose the farmer-facing question string from resolved Cosh
+    names. If any required term can't be resolved we fall back to
+    generic copy — never echo a raw cosh_id."""
+    part = _safe_name(question.plant_part_cosh_id, names) or "this plant part"
+    symptom = _safe_name(question.symptom_cosh_id, names) or "this symptom"
+    sub_part = _safe_name(question.sub_part_cosh_id, names)
+    sub_symptom = _safe_name(question.sub_symptom_cosh_id, names)
+    if sub_part and sub_symptom:
+        return f"Is there {sub_symptom} on the {sub_part} of the {part}?"
+    elif sub_symptom:
+        return f"Do the {symptom} on the {part} look like: {sub_symptom}?"
+    elif sub_part:
+        return f"Is the {symptom} on the {sub_part} of the {part}?"
+    else:
+        return f"Do you see {symptom} on the {part}?"
+
+
+async def _format_question(question, db: AsyncSession, lang: str = "en"):
+    """Resolve the question's cosh_ids to friendly names and emit the
+    farmer-facing payload. Always returns names alongside ids so the
+    PWA can drop the cosh_id-fallback breadcrumb entirely."""
     if not question:
         return None
+    cosh_ids = {
+        question.plant_part_cosh_id, question.symptom_cosh_id,
+        question.sub_part_cosh_id, question.sub_symptom_cosh_id,
+    }
+    cosh_ids.discard(None)
+    names = await _resolve_display_names_by_cosh_id(db, cosh_ids, lang)
     return {
         "plant_part_cosh_id": question.plant_part_cosh_id,
         "symptom_cosh_id": question.symptom_cosh_id,
         "sub_part_cosh_id": question.sub_part_cosh_id,
         "sub_symptom_cosh_id": question.sub_symptom_cosh_id,
+        "plant_part_name": _safe_name(question.plant_part_cosh_id, names),
+        "symptom_name": _safe_name(question.symptom_cosh_id, names),
+        "sub_part_name": _safe_name(question.sub_part_cosh_id, names),
+        "sub_symptom_name": _safe_name(question.sub_symptom_cosh_id, names),
         "question_type": question.question_type,
-        "display_text": _build_question_text(question),
+        "display_text": _build_question_text(question, names),
     }
-
-
-def _build_question_text(question) -> str:
-    part = _get_display_name(question.plant_part_cosh_id)
-    symptom = _get_display_name(question.symptom_cosh_id)
-    if question.sub_part_cosh_id and question.sub_symptom_cosh_id:
-        sub_part = _get_display_name(question.sub_part_cosh_id)
-        sub_symptom = _get_display_name(question.sub_symptom_cosh_id)
-        return f"Is there {sub_symptom} on {sub_part} of the {part}?"
-    elif question.sub_symptom_cosh_id:
-        sub_symptom = _get_display_name(question.sub_symptom_cosh_id)
-        return f"Do the {symptom} on the {part} look like: {sub_symptom}?"
-    elif question.sub_part_cosh_id:
-        sub_part = _get_display_name(question.sub_part_cosh_id)
-        return f"Is the {symptom} on the {sub_part} of the {part}?"
-    else:
-        return f"Do you see {symptom} on the {part}?"
 
 
 async def _trigger_cha_from_diagnosis(
@@ -345,9 +398,25 @@ async def _get_problem_info(db: AsyncSession, problem_cosh_id: str) -> dict:
                 "type": "problem_group",
                 "parent_cosh_id": pg.parent_cosh_id,
             }
+        # Fall back to a Core lookup by cosh_id alone (the problem
+        # may be a `biological_names` pest from the BL-08 path, which
+        # isn't under "specific_problem" or "problem_group" cores).
+        any_core = (await db.execute(
+            select(CoshCoreItem).where(
+                CoshCoreItem.cosh_id == problem_cosh_id,
+                CoshCoreItem.status == "active",
+            )
+        )).scalar_one_or_none()
+        if any_core:
+            return {
+                "cosh_id": problem_cosh_id,
+                "name": (any_core.translations or {}).get("en", problem_cosh_id),
+                "translations": any_core.translations,
+                "type": any_core.core_type,
+            }
         return {
             "cosh_id": problem_cosh_id,
-            "name": _get_display_name(problem_cosh_id),
+            "name": problem_cosh_id,
             "type": "unknown",
         }
     return {
@@ -487,7 +556,9 @@ async def start_diagnosis(
         "session_id": session.id,
         "status": step.status,
         "remaining_count": step.remaining_count,
-        "question": _format_question(step.question) if step.question else None,
+        "question": await _format_question(
+            step.question, db, current_user.language_code or "en",
+        ),
         "diagnosed_problem_cosh_id": step.diagnosed_problem_cosh_id,
     }
 
@@ -547,7 +618,9 @@ async def answer_question(
         session.status = "DIAGNOSED"
         session.diagnosed_problem_cosh_id = step.diagnosed_problem_cosh_id
         problem_info = await _get_problem_info(db, step.diagnosed_problem_cosh_id)
-        crop_name = _get_display_name(session.crop_cosh_id)
+        crop_name = await _resolve_name_for_cosh_id(
+            db, session.crop_cosh_id, current_user.language_code or "en",
+        ) or session.crop_cosh_id
         problem_info = await enrich_problem_with_description(problem_info, crop_name)
         await _trigger_cha_from_diagnosis(db, session, step.diagnosed_problem_cosh_id)
     elif step.status == "INCONCLUSIVE":
@@ -561,7 +634,9 @@ async def answer_question(
         "session_id": session_id,
         "status": step.status,
         "remaining_count": step.remaining_count,
-        "question": _format_question(step.question) if step.question else None,
+        "question": await _format_question(
+            step.question, db, current_user.language_code or "en",
+        ),
         "diagnosed_problem_cosh_id": step.diagnosed_problem_cosh_id,
         "problem_info": problem_info,
     }
@@ -599,7 +674,9 @@ async def abort_diagnosis(
         await _trigger_cha_from_diagnosis(db, session, problem_cosh_id)
         await db.commit()
         problem_info = await _get_problem_info(db, problem_cosh_id)
-        crop_name = _get_display_name(session.crop_cosh_id)
+        crop_name = await _resolve_name_for_cosh_id(
+            db, session.crop_cosh_id, current_user.language_code or "en",
+        ) or session.crop_cosh_id
         problem_info = await enrich_problem_with_description(problem_info, crop_name)
         return {
             "status": "DIAGNOSED",
@@ -679,18 +756,29 @@ async def analyse_image_with_claude(
 @router.post("/diagnosis/explain-symptom")
 async def explain_symptom_route(
     request: ExplainSymptomRequest,
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Two plain-language sentences telling the farmer how to verify
-    the current question's symptom. Auth-only (no DB access, no
-    per-subscription state) — the explanation is the same for every
-    farmer asking about the same (crop, part, symptom)."""
+    the current question's symptom. Names get resolved through Cosh
+    (cosh_core_items.translations) before they reach Claude — a raw
+    UUID in the prompt would confuse the model."""
+    lang = request.language_code or "en"
+    names = await _resolve_display_names_by_cosh_id(
+        db,
+        {
+            request.crop_cosh_id, request.plant_part_cosh_id,
+            request.symptom_cosh_id, request.sub_part_cosh_id,
+            request.sub_symptom_cosh_id,
+        } - {None, ""},
+        lang,
+    )
     text = await explain_symptom(
-        crop_name=_get_display_name(request.crop_cosh_id),
-        plant_part_name=_get_display_name(request.plant_part_cosh_id),
-        symptom_name=_get_display_name(request.symptom_cosh_id),
-        sub_part_name=_get_display_name(request.sub_part_cosh_id) if request.sub_part_cosh_id else None,
-        sub_symptom_name=_get_display_name(request.sub_symptom_cosh_id) if request.sub_symptom_cosh_id else None,
+        crop_name=names.get(request.crop_cosh_id) or request.crop_cosh_id,
+        plant_part_name=names.get(request.plant_part_cosh_id) or request.plant_part_cosh_id,
+        symptom_name=names.get(request.symptom_cosh_id) or request.symptom_cosh_id,
+        sub_part_name=names.get(request.sub_part_cosh_id) if request.sub_part_cosh_id else None,
+        sub_symptom_name=names.get(request.sub_symptom_cosh_id) if request.sub_symptom_cosh_id else None,
         language_code=request.language_code,
         language_name=request.language_name,
     )

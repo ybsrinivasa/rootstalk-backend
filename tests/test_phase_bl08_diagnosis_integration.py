@@ -362,7 +362,7 @@ async def test_explain_symptom_returns_text_in_fallback_mode(db, monkeypatch):
             plant_part_cosh_id="part:leaf",
             symptom_cosh_id="symptom:yellow",
         ),
-        current_user=farmer,
+        db=db, current_user=farmer,
     )
     assert out["language_code"] == "en"
     assert "yellow" in out["explanation"].lower()
