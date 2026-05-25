@@ -284,6 +284,127 @@ async def _assert_sp_draft(
     return sp
 
 
+def _format_relation_label(rel: "Relation") -> str:
+    """Short label for refusal messages. Prefer the user-authored
+    expression; fall back to the raw id slice when blank (some
+    historical rows have null expressions)."""
+    if rel.expression and rel.expression.strip():
+        return rel.expression.strip()
+    return f"Relation {rel.id[:8]}…"
+
+
+def _format_cq_label(cq: "ConditionalQuestion") -> str:
+    text = (cq.question_text or "").strip()
+    if not text:
+        return f"Conditional Question {cq.id[:8]}…"
+    # Long question texts make the refusal alert hard to read; trim.
+    return text if len(text) <= 80 else text[:77].rstrip() + "…"
+
+
+async def _assert_practice_not_locked(
+    db: AsyncSession, practice: "Practice",
+) -> None:
+    """Refuse to delete a Practice that's still referenced by a
+    Relation or by a PracticeConditional binding. Per the user-stated
+    rule (2026-05-25): cascading deletes are too aggressive — the user
+    must dismantle the containing construct first.
+
+    A Practice can be in at most ONE of these states at a time
+    (`link_practice_conditional` refuses to bind a PC to a Practice
+    that's already in a Relation), so the two refusal codes are
+    mutually exclusive.
+
+    Raises:
+      422 `practice_in_relation` — name the Relation in the message.
+      422 `practice_in_conditional_question` — name the CQ + side.
+    """
+    if practice.relation_id is not None:
+        rel = (await db.execute(
+            select(Relation).where(Relation.id == practice.relation_id)
+        )).scalar_one_or_none()
+        label = _format_relation_label(rel) if rel else "(unknown)"
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "practice_in_relation",
+                "message": (
+                    f"This Practice is part of the Relation \"{label}\". "
+                    "Delete that Relation first, then try again."
+                ),
+                "relation_id": practice.relation_id,
+                "relation_label": label,
+            },
+        )
+
+    pc = (await db.execute(
+        select(PracticeConditional).where(
+            PracticeConditional.practice_id == practice.id,
+        )
+    )).scalar_one_or_none()
+    if pc is not None:
+        cq = (await db.execute(
+            select(ConditionalQuestion).where(
+                ConditionalQuestion.id == pc.question_id,
+            )
+        )).scalar_one_or_none()
+        label = _format_cq_label(cq) if cq else "(unknown)"
+        side = pc.answer.value if hasattr(pc.answer, "value") else str(pc.answer)
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "practice_in_conditional_question",
+                "message": (
+                    f"This Practice answers the Conditional Question "
+                    f"\"{label}\" ({side} side). Delete that Conditional "
+                    "Question first, then try again."
+                ),
+                "question_id": pc.question_id,
+                "question_label": label,
+                "answer_side": side,
+            },
+        )
+
+
+async def _assert_relation_not_locked(
+    db: AsyncSession, relation_id: str,
+) -> None:
+    """Refuse to delete a Relation that's still bound to a Conditional
+    Question. Mirror of `_assert_practice_not_locked` for the
+    Relation-side. Same rule: user dismantles the CQ first.
+
+    Raises:
+      422 `relation_in_conditional_question`.
+    """
+    rc = (await db.execute(
+        select(RelationConditional).where(
+            RelationConditional.relation_id == relation_id,
+        )
+    )).scalar_one_or_none()
+    if rc is None:
+        return
+    cq = (await db.execute(
+        select(ConditionalQuestion).where(
+            ConditionalQuestion.id == rc.question_id,
+        )
+    )).scalar_one_or_none()
+    label = _format_cq_label(cq) if cq else "(unknown)"
+    side = rc.answer.value if hasattr(rc.answer, "value") else str(rc.answer)
+    raise HTTPException(
+        status_code=422,
+        detail={
+            "code": "relation_in_conditional_question",
+            "message": (
+                f"This Relation answers the Conditional Question "
+                f"\"{label}\" ({side} side). Delete that Conditional "
+                "Question first, then try again."
+            ),
+            "question_id": rc.question_id,
+            "question_label": label,
+            "answer_side": side,
+        },
+    )
+
+
 async def _assert_can_view_client_advisory(
     db: AsyncSession, user_id: str, client_id: str,
 ) -> None:
@@ -2599,6 +2720,7 @@ async def delete_practice(
     practice = result.scalar_one_or_none()
     if not practice:
         raise HTTPException(status_code=404, detail="Practice not found")
+    await _assert_practice_not_locked(db, practice)
     # Element.practice_id is NOT NULL with no ON DELETE CASCADE — drop
     # children first or the practice delete trips a FK violation.
     # Matches the SA-Global / CA-PG / CA-SP / CA-QA pattern.
@@ -3065,11 +3187,15 @@ async def delete_client_relation(
     current_user: User = Depends(get_current_user),
 ):
     """Drop a Relation on a client-side Timeline. Clears
-    relation_id / relation_role on every Practice in this Relation
-    and removes any RelationConditional binding. Mirror of
-    delete_global_relation."""
+    relation_id / relation_role on every Practice in this Relation.
+    Mirror of delete_global_relation.
+
+    Refuses (422 `relation_in_conditional_question`) if the Relation
+    is still bound to a Conditional Question — per the rule
+    established 2026-05-25 the user dismantles the CQ first."""
     await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     await _get_relation_for_client(db, relation_id, client_id)
+    await _assert_relation_not_locked(db, relation_id)
 
     practices = (await db.execute(
         select(Practice).where(Practice.relation_id == relation_id)
@@ -3077,14 +3203,6 @@ async def delete_client_relation(
     for p in practices:
         p.relation_id = None
         p.relation_role = None
-
-    rcs = (await db.execute(
-        select(RelationConditional).where(
-            RelationConditional.relation_id == relation_id,
-        )
-    )).scalars().all()
-    for rc in rcs:
-        await db.delete(rc)
 
     rel = (await db.execute(
         select(Relation).where(Relation.id == relation_id)
@@ -3646,13 +3764,17 @@ async def delete_global_relation(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Remove a Relation. Clears `relation_id` and `relation_role` on every
-    Practice that was part of it (the practices stay in place — only the
-    Relation grouping is dropped) and deletes any RelationConditional
-    binding. Edit-saved-Relation is deferred to V1.1; the SE deletes and
-    rebuilds instead."""
+    """Remove a Relation. Clears `relation_id` and `relation_role` on
+    every Practice that was part of it (the practices stay in place —
+    only the Relation grouping is dropped). Edit-saved-Relation is
+    deferred to V1.1; the SE deletes and rebuilds instead.
+
+    Refuses (422 `relation_in_conditional_question`) if the Relation
+    is still bound to a Conditional Question — per the rule
+    established 2026-05-25 the user dismantles the CQ first."""
     await _assert_sa_or_cm(db, current_user)
     await _get_global_relation(db, relation_id)
+    await _assert_relation_not_locked(db, relation_id)
 
     # Clear relation_id/role on practices in this relation.
     practices = (await db.execute(
@@ -3661,15 +3783,6 @@ async def delete_global_relation(
     for p in practices:
         p.relation_id = None
         p.relation_role = None
-
-    # Drop any RelationConditional binding(s) for this relation.
-    rcs = (await db.execute(
-        select(RelationConditional).where(
-            RelationConditional.relation_id == relation_id,
-        )
-    )).scalars().all()
-    for rc in rcs:
-        await db.delete(rc)
 
     # Finally, drop the Relation itself.
     relation = (await db.execute(
@@ -5831,7 +5944,11 @@ async def _delete_practice_at_global_timeline(
     """Pipe-agnostic Practice delete. Explicitly removes child Elements
     first (the FK isn't `ON DELETE CASCADE`; `db.delete(practice)`
     alone would orphan the Elements and trip the NOT NULL on
-    `element.practice_id`)."""
+    `element.practice_id`).
+
+    Refuses (422) if the Practice is locked by a Relation or a
+    Conditional Question — the user dismantles the containing
+    construct first, per the rule established 2026-05-25."""
     practice = (await db.execute(
         select(Practice).where(
             Practice.id == practice_id, Practice.timeline_id == timeline_id,
@@ -5839,6 +5956,7 @@ async def _delete_practice_at_global_timeline(
     )).scalar_one_or_none()
     if not practice:
         raise HTTPException(status_code=404, detail="Practice not found")
+    await _assert_practice_not_locked(db, practice)
     await db.execute(
         Element.__table__.delete().where(Element.practice_id == practice_id)
     )
@@ -8268,6 +8386,7 @@ async def delete_client_pg_practice(
     )).scalar_one_or_none()
     if not practice:
         raise HTTPException(status_code=404, detail="Practice not found")
+    await _assert_practice_not_locked(db, practice)
     elems = (await db.execute(
         select(Element).where(Element.practice_id == practice.id)
     )).scalars().all()
@@ -9174,6 +9293,7 @@ async def delete_qa_practice(
     )).scalar_one_or_none()
     if not practice:
         raise HTTPException(status_code=404, detail="Practice not found")
+    await _assert_practice_not_locked(db, practice)
 
     # Same parent-walk validation as the timeline endpoints — make
     # sure the timeline really belongs to this Standard Response
@@ -9415,6 +9535,7 @@ async def delete_client_sp_practice(
     )).scalar_one_or_none()
     if not practice:
         raise HTTPException(status_code=404, detail="Practice not found")
+    await _assert_practice_not_locked(db, practice)
     elems = (await db.execute(
         select(Element).where(Element.practice_id == practice.id)
     )).scalars().all()

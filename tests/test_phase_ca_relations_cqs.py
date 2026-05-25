@@ -195,6 +195,58 @@ async def test_list_client_relations_excludes_deleted_relation(db):
 
 @requires_docker
 @pytest.mark.asyncio
+async def test_delete_client_relation_refuses_when_in_conditional_question(db):
+    """Lock rule (2026-05-25): a Relation bound to a CQ refuses delete
+    with `relation_in_conditional_question`. User dismantles the CQ
+    first."""
+    from app.modules.advisory.router import link_relation_conditional
+    from app.modules.advisory.schemas import PracticeConditionalCreate
+    from fastapi import HTTPException
+
+    client = await make_client(db)
+    se = await make_user(db, name="SE", skip_auto_link=True)
+    await make_client_user(
+        db, user=se, client=client, role=ClientUserRole.SUBJECT_EXPERT,
+    )
+    pkg = await make_package(db, client, crop_cosh_id="crop:test")
+    tl = await make_timeline(db, pkg, from_type=TimelineFromType.DAS)
+    practices = await _seed_two_practices(db, tl)
+    await db.commit()
+    rel = await _make_relation_on_timeline(db, se, client, tl, practices)
+
+    cq = ConditionalQuestion(
+        timeline_id=tl.id, question_text="Is the field irrigated?",
+    )
+    db.add(cq)
+    await db.commit()
+
+    await link_relation_conditional(
+        client_id=client.id, relation_id=rel["id"],
+        request=PracticeConditionalCreate(
+            practice_id="ignored", question_id=cq.id,
+            answer=ConditionalAnswer.NO,
+        ),
+        db=db, current_user=se,
+    )
+
+    with pytest.raises(HTTPException) as ei:
+        await delete_client_relation(
+            client_id=client.id, relation_id=rel["id"],
+            db=db, current_user=se,
+        )
+    assert ei.value.status_code == 422
+    assert ei.value.detail["code"] == "relation_in_conditional_question"
+    assert "Is the field irrigated?" in ei.value.detail["message"]
+    assert ei.value.detail["answer_side"] == "NO"
+
+    # Relation still exists.
+    assert (await db.execute(
+        select(Relation).where(Relation.id == rel["id"])
+    )).scalar_one_or_none() is not None
+
+
+@requires_docker
+@pytest.mark.asyncio
 async def test_delete_client_relation_404_for_other_client(db):
     client_a = await make_client(db)
     client_b = await make_client(db)
@@ -341,3 +393,86 @@ async def test_delete_client_cq_drops_attachments_too(db):
         select(Practice).where(Practice.id == practices[0].id)
     )).scalar_one()
     assert fresh is not None
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_delete_client_cq_with_practice_and_relation_attachments(db):
+    """Tester report 2026-05-25: CQ delete reportedly fails on CA.
+    Reproducer with the fullest attachment shape — PracticeConditional
+    on YES, RelationConditional on NO. Confirms backend cascades both
+    sides cleanly."""
+    from app.modules.advisory.router import (
+        link_practice_conditional, link_relation_conditional,
+    )
+    from app.modules.advisory.schemas import PracticeConditionalCreate
+
+    client = await make_client(db)
+    se = await make_user(db, name="SE", skip_auto_link=True)
+    await make_client_user(
+        db, user=se, client=client, role=ClientUserRole.SUBJECT_EXPERT,
+    )
+    pkg = await make_package(db, client, crop_cosh_id="crop:test")
+    tl = await make_timeline(db, pkg, from_type=TimelineFromType.DAS)
+    practices = await _seed_two_practices(db, tl)
+    await db.commit()
+    # Need a third practice for the YES-side independent binding —
+    # the first two are now in a Relation and can't carry their own CQ.
+    independent = Practice(
+        timeline_id=tl.id,
+        l0_type=PracticeL0.INPUT,
+        l1_type="FERTILIZER",
+        l2_type="CHEMICAL_FERTILIZER_FERTIGATION_PRODUCTS",
+        display_order=2,
+    )
+    db.add(independent)
+    await db.flush()
+    db.add(Element(
+        practice_id=independent.id, element_type="COMMON_NAME",
+        cosh_ref="cn:mop", display_order=0,
+    ))
+    await db.commit()
+    rel = await _make_relation_on_timeline(db, se, client, tl, practices)
+
+    cq = ConditionalQuestion(timeline_id=tl.id, question_text="Q?")
+    db.add(cq)
+    await db.flush()
+    await db.commit()
+
+    await link_practice_conditional(
+        client_id=client.id, practice_id=independent.id,
+        request=PracticeConditionalCreate(
+            practice_id=independent.id, question_id=cq.id,
+            answer=ConditionalAnswer.YES,
+        ),
+        db=db, current_user=se,
+    )
+    await link_relation_conditional(
+        client_id=client.id, relation_id=rel["id"],
+        request=PracticeConditionalCreate(
+            practice_id="ignored", question_id=cq.id,
+            answer=ConditionalAnswer.NO,
+        ),
+        db=db, current_user=se,
+    )
+
+    await delete_client_conditional_question(
+        client_id=client.id, question_id=cq.id,
+        db=db, current_user=se,
+    )
+    assert (await db.execute(
+        select(ConditionalQuestion).where(ConditionalQuestion.id == cq.id)
+    )).scalar_one_or_none() is None
+    assert (await db.execute(
+        select(PracticeConditional).where(PracticeConditional.question_id == cq.id)
+    )).scalar_one_or_none() is None
+    assert (await db.execute(
+        select(RelationConditional).where(RelationConditional.question_id == cq.id)
+    )).scalar_one_or_none() is None
+    # Practices + Relation survive — only the CQ + bindings go.
+    assert (await db.execute(
+        select(Practice).where(Practice.id == independent.id)
+    )).scalar_one_or_none() is not None
+    assert (await db.execute(
+        select(Relation).where(Relation.id == rel["id"])
+    )).scalar_one_or_none() is not None

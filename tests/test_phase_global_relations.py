@@ -206,7 +206,10 @@ async def test_create_global_relation_refuses_timeline_on_other_package(db):
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_delete_global_relation_clears_role_and_conditional(db):
+async def test_delete_global_relation_refuses_when_in_conditional_question(db):
+    """Lock rule (2026-05-25): SA-Global Relation delete refuses when
+    a Conditional Question still binds it. Replaces the previous
+    cascading behaviour — the user dismantles the CQ first."""
     pkg, tl, user = await _setup_global_timeline(db)
     p1 = await _seed_practice(db, timeline=tl, common_name_cosh_id="cn:1")
     p2 = await _seed_practice(db, timeline=tl, common_name_cosh_id="cn:2")
@@ -218,7 +221,6 @@ async def test_delete_global_relation_clears_role_and_conditional(db):
         ),
         db=db, current_user=user,
     )
-    # Bind a CQ to the relation.
     q = await create_global_conditional_question(
         pkg_id=pkg.id, timeline_id=tl.id,
         request=ConditionalQuestionCreate(question_text="Is the field flooded?"),
@@ -233,6 +235,60 @@ async def test_delete_global_relation_clears_role_and_conditional(db):
         db=db, current_user=user,
     )
 
+    with pytest.raises(HTTPException) as ei:
+        await delete_global_relation(
+            relation_id=out["id"], db=db, current_user=user,
+        )
+    assert ei.value.status_code == 422
+    assert ei.value.detail["code"] == "relation_in_conditional_question"
+    assert "Is the field flooded?" in ei.value.detail["message"]
+
+    # Relation + binding both still in place.
+    assert (await db.execute(
+        select(Relation).where(Relation.id == out["id"])
+    )).scalar_one_or_none() is not None
+    assert (await db.execute(
+        select(RelationConditional).where(
+            RelationConditional.relation_id == out["id"],
+        )
+    )).scalar_one_or_none() is not None
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_delete_global_relation_succeeds_after_cq_removed(db):
+    """Happy-path follow-up: delete the CQ first, then the Relation
+    deletes cleanly and clears the practice roles."""
+    pkg, tl, user = await _setup_global_timeline(db)
+    p1 = await _seed_practice(db, timeline=tl, common_name_cosh_id="cn:1")
+    p2 = await _seed_practice(db, timeline=tl, common_name_cosh_id="cn:2")
+    await db.commit()
+    out = await create_global_relation(
+        pkg_id=pkg.id, timeline_id=tl.id,
+        request=RelationCreate(
+            relation_type=RelationType.AND, parts=[[[p1.id, p2.id]]],
+        ),
+        db=db, current_user=user,
+    )
+    q = await create_global_conditional_question(
+        pkg_id=pkg.id, timeline_id=tl.id,
+        request=ConditionalQuestionCreate(question_text="Q?"),
+        db=db, current_user=user,
+    )
+    await link_global_relation_conditional(
+        relation_id=out["id"],
+        request=PracticeConditionalCreate(
+            practice_id="ignored",
+            question_id=q.id, answer=ConditionalAnswer.YES,
+        ),
+        db=db, current_user=user,
+    )
+
+    # Dismantle the CQ first — its delete cascades through the binding.
+    await delete_global_conditional_question(
+        question_id=q.id, db=db, current_user=user,
+    )
+    # Now the Relation is unlocked and deletes cleanly.
     await delete_global_relation(
         relation_id=out["id"], db=db, current_user=user,
     )
@@ -245,18 +301,9 @@ async def test_delete_global_relation_clears_role_and_conditional(db):
     for p in refreshed:
         assert p.relation_id is None
         assert p.relation_role is None
-    # Relation gone.
-    rel = (await db.execute(
+    assert (await db.execute(
         select(Relation).where(Relation.id == out["id"])
-    )).scalar_one_or_none()
-    assert rel is None
-    # RelationConditional gone.
-    rc = (await db.execute(
-        select(RelationConditional).where(
-            RelationConditional.relation_id == out["id"],
-        )
-    )).scalar_one_or_none()
-    assert rc is None
+    )).scalar_one_or_none() is None
 
 
 # ── Conditional Questions ────────────────────────────────────────────────────
