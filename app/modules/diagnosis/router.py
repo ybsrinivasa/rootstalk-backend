@@ -93,10 +93,13 @@ async def _load_priority_rank_values(
     designer can put the value in either place)."""
     if not rank_cosh_ids:
         return {}
+    # Real Cosh ships ranks on `priority_rank_pests`. The earlier
+    # legacy slug was `priority_rank`; we also accept it so any old
+    # seeded data (incl. tests) keeps resolving.
     rows = (await db.execute(
         select(CoshCoreItem).where(
             CoshCoreItem.cosh_id.in_(rank_cosh_ids),
-            CoshCoreItem.core_type == "priority_rank",
+            CoshCoreItem.core_type.in_(["priority_rank_pests", "priority_rank"]),
             CoshCoreItem.status == "active",
         )
     )).scalars().all()
@@ -120,54 +123,120 @@ async def _load_problem_symptom_rows(
     crop_cosh_id: str,
     crop_stage_cosh_id: Optional[str],
 ) -> list[ProblemSymptomRow]:
-    """Load `pest_diagnosis_chain` rows from `cosh_connect_rows`,
-    filter by crop (mandatory) and crop_stage (optional), and pivot
-    typed endpoints into the BL-08 dataclass.
+    """Load `pest_diagnosis` Connect rows from `cosh_connect_rows`,
+    filter to this crop (mandatory) and crop_stage (optional), and
+    pivot the 9-position shape into BL-08's role-keyed dataclass.
 
-    KNOWN GAP: the Cosh slug `pest_diagnosis_chain` never landed in
-    production sync (Cosh ships `pest_diagnosis` instead, on the
-    9-endpoint position-based shape). This function returns empty in
-    prod today. A future batch will rewire to the real shape; the
-    test suite seeds synthetic `_chain` rows so the BL-08 algorithm
-    is still exercised."""
+    Wire shape (locked 2026-05-14, see project memory
+    `project_rootstalk_pest_diagnosis.md`):
+      pos 1 = damage_symptoms   → symptom
+      pos 2 = damage_subsymptoms→ sub_symptom (BLANK BOX = wildcard)
+      pos 3 = biological_names  → pest
+      pos 4 = pest_stages       → pest_stage
+      pos 5 = plant_parts       → part
+      pos 6 = plant_subparts    → sub_part   (BLANK BOX = wildcard)
+      pos 7 = biological_names  → crop
+      pos 8 = crop_stages       → crop_stage (BLANK BOX = wildcard)
+      pos 9 = priority_rank_pests → priority_rank (English "0".."5")
+
+    BLANK BOX semantics: where a dimension on a row carries the
+    sentinel cosh_id, the constraint is vacuously satisfied — the
+    row behaves as a wildcard along that axis, and the dataclass
+    field is set to None so the downstream BL-08 algorithm reads it
+    as "applies regardless".
+
+    Rewired from `pest_diagnosis_chain` (slug Cosh never shipped) on
+    2026-05-25 to unblock the farmer-PWA Diagnose flow on real data.
+    """
+    from app.services.cosh_constants import (
+        PD_POS_SYMPTOM, PD_POS_SUBSYMPTOM, PD_POS_PEST, PD_POS_PEST_STAGE,
+        PD_POS_PLANT_PART, PD_POS_PLANT_SUBPART, PD_POS_CROP,
+        PD_POS_CROP_STAGE, PD_POS_PRIORITY_RANK,
+        PD_BLANK_BOX_BY_CORE,
+        COSH_DAMAGE_SUBSYMPTOMS_CORE, COSH_PLANT_SUBPARTS_CORE,
+        COSH_CROP_STAGES_CORE,
+    )
+
+    subsymptom_blank = PD_BLANK_BOX_BY_CORE.get(COSH_DAMAGE_SUBSYMPTOMS_CORE)
+    subpart_blank = PD_BLANK_BOX_BY_CORE.get(COSH_PLANT_SUBPARTS_CORE)
+    crop_stage_blank = PD_BLANK_BOX_BY_CORE.get(COSH_CROP_STAGES_CORE)
+
+    def at(row: CoshConnectRow, position: int) -> Optional[str]:
+        for ep in (row.endpoints or []):
+            if ep.get("position") == position:
+                return ep.get("cosh_id")
+        return None
+
     q = select(CoshConnectRow).where(
-        CoshConnectRow.connect_type == "pest_diagnosis_chain",
+        CoshConnectRow.connect_type == "pest_diagnosis",
         CoshConnectRow.status == "active",
     )
     raw = (await db.execute(q)).scalars().all()
 
-    accepted: list[tuple[CoshConnectRow, dict]] = []
+    accepted: list[dict] = []
     rank_cosh_ids: set[str] = set()
     for r in raw:
-        endpoints = {ep["role"]: ep["cosh_id"] for ep in (r.endpoints or [])
-                     if ep.get("role") and ep.get("cosh_id")}
-        if endpoints.get("crop") != crop_cosh_id:
+        row_crop = at(r, PD_POS_CROP)
+        if row_crop != crop_cosh_id:
             continue
-        if crop_stage_cosh_id and endpoints.get("crop_stage") != crop_stage_cosh_id:
+
+        row_stage = at(r, PD_POS_CROP_STAGE)
+        if crop_stage_cosh_id is not None:
+            # Match strictly OR honour BLANK BOX wildcard.
+            if row_stage != crop_stage_cosh_id and row_stage != crop_stage_blank:
+                continue
+
+        pest = at(r, PD_POS_PEST)
+        part = at(r, PD_POS_PLANT_PART)
+        symptom = at(r, PD_POS_SYMPTOM)
+        # BL-08 dataclass requires all three. A row missing any of
+        # them is degenerate Cosh data; skip silently.
+        if not (pest and part and symptom):
             continue
-        if not endpoints.get("pest") or not endpoints.get("part") \
-                or not endpoints.get("symptom"):
-            continue
-        accepted.append((r, endpoints))
-        rk = endpoints.get("priority_rank")
-        if rk:
-            rank_cosh_ids.add(rk)
+
+        sub_symptom = at(r, PD_POS_SUBSYMPTOM)
+        if subsymptom_blank is not None and sub_symptom == subsymptom_blank:
+            sub_symptom = None
+
+        sub_part = at(r, PD_POS_PLANT_SUBPART)
+        if subpart_blank is not None and sub_part == subpart_blank:
+            sub_part = None
+
+        pest_stage = at(r, PD_POS_PEST_STAGE)
+        priority_rank_id = at(r, PD_POS_PRIORITY_RANK)
+
+        # Normalise the row's crop_stage to None when it carries the
+        # wildcard sentinel — the BL-08 algorithm reads this field as
+        # an absolute filter, not a wildcard, so the sentinel must
+        # not leak through.
+        normalised_stage = row_stage if row_stage != crop_stage_blank else None
+
+        accepted.append({
+            "pest": pest, "part": part, "symptom": symptom,
+            "sub_symptom": sub_symptom, "sub_part": sub_part,
+            "pest_stage": pest_stage,
+            "crop": row_crop,
+            "crop_stage": normalised_stage,
+            "priority_rank_id": priority_rank_id,
+        })
+        if priority_rank_id:
+            rank_cosh_ids.add(priority_rank_id)
 
     rank_values = await _load_priority_rank_values(db, rank_cosh_ids)
 
     rows: list[ProblemSymptomRow] = []
-    for _r, endpoints in accepted:
-        rank_id = endpoints.get("priority_rank")
+    for a in accepted:
+        rid = a["priority_rank_id"]
         rows.append(ProblemSymptomRow(
-            pest_cosh_id=endpoints["pest"],
-            part_cosh_id=endpoints["part"],
-            symptom_cosh_id=endpoints["symptom"],
-            crop_cosh_id=endpoints.get("crop"),
-            crop_stage_cosh_id=endpoints.get("crop_stage"),
-            pest_stage_cosh_id=endpoints.get("pest_stage"),
-            sub_part_cosh_id=endpoints.get("sub_part"),
-            sub_symptom_cosh_id=endpoints.get("sub_symptom"),
-            priority_rank=rank_values.get(rank_id) if rank_id else None,
+            pest_cosh_id=a["pest"],
+            part_cosh_id=a["part"],
+            symptom_cosh_id=a["symptom"],
+            crop_cosh_id=a["crop"],
+            crop_stage_cosh_id=a["crop_stage"],
+            pest_stage_cosh_id=a["pest_stage"],
+            sub_part_cosh_id=a["sub_part"],
+            sub_symptom_cosh_id=a["sub_symptom"],
+            priority_rank=rank_values.get(rid) if rid else None,
         ))
     return rows
 

@@ -7,29 +7,26 @@ the reference images Cosh has curated for matching scenarios. Used by
 the PWA to show "this is what the symptom looks like" carousel during
 self-diagnosis.
 
-Cosh data shape (per docs/COSH_2_SYNC_CONTRACT.md):
+Cosh wire shape (locked 2026-05-14):
 
-  • `pest_diagnosis_chain` Connect rows carry endpoints with roles
-    crop / crop_stage / pest / pest_stage / part / sub_part / symptom /
-    sub_symptom.
+  • `pest_diagnosis` Connect rows carry 9 typed endpoints by position
+    (see `app/services/cosh_constants.py::PD_POS_*` and the project
+    memory `project_rootstalk_pest_diagnosis.md`).
 
-  • `<crop>_pest_images` Connect rows (one per crop) link a single
-    `pest_diagnosis_chain` row to a single `media` Core item.
+  • `image_index` Connect maps a crop → a per-crop image Connect slug
+    (e.g. `tomato_symptom_images`).
 
-  • `media` Core items carry the asset URL in `metadata.s3_path` (or
-    `metadata.url`) and the type in `metadata.media_type`.
+  • `{crop}_symptom_images` Connect rows carry (pos 1 = the
+    pest_diagnosis row id, pos 2 = the image Core cosh_id).
 
-Lookup:
-  1. Filter `pest_diagnosis_chain` rows by the question.
-  2. For each matching row's cosh_id, find any other Connect row whose
-     endpoints contain {role: 'pest_diagnosis_chain', cosh_id: <row_id>}
-     AND a {role: 'media', cosh_id: <media_id>} entry.
-  3. Look up each `media` Core item, pull the S3 path + caption.
-  4. Return de-duplicated.
+  • image Core items carry the asset URL in `metadata_.s3_path`.
 
-Result is intentionally connect_type-agnostic — any image Connect type
-(`tomato_pest_images`, `paddy_pest_images`, future per-crop ones) works
-without code change.
+Rewired from `pest_diagnosis_chain` (slug Cosh never shipped) on
+2026-05-25 to consume real Cosh data. The filter step now reuses
+`pest_diagnosis_view._filter_rows`; the image-resolution step
+reuses `pest_diagnosis_images_view.images_for_pest_diagnosis_rows`.
+Both already power the `/diagnosis/candidates` `image_urls` field,
+so this function inherits the same correctness.
 
 Fallback when zero images are found is the caller's job — this service
 just returns `[]`. The endpoint layer adds the Google-Images URL.
@@ -42,7 +39,7 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.sync.models import CoshConnectRow, CoshCoreItem
+from app.modules.sync.models import CoshCoreItem
 
 
 @dataclass(frozen=True)
@@ -66,74 +63,76 @@ async def find_reference_images(
 ) -> list[ReferenceImage]:
     """Return reference images for a diagnosis question. Empty list
     when no curated images exist for the matching scenario."""
+    from app.services.pest_diagnosis_view import (
+        DiagnosisFilters, _filter_rows,
+    )
+    from app.services.pest_diagnosis_images_view import (
+        images_for_pest_diagnosis_rows,
+    )
 
-    # 1. Find pest_diagnosis_chain rows that match this question.
-    diagnosis_rows = (await db.execute(
-        select(CoshConnectRow).where(
-            CoshConnectRow.connect_type == "pest_diagnosis_chain",
-            CoshConnectRow.status == "active",
-        )
-    )).scalars().all()
-
-    matching_diagnosis_ids: set[str] = set()
-    for r in diagnosis_rows:
-        eps = {ep["role"]: ep["cosh_id"] for ep in (r.endpoints or [])
-               if ep.get("role") and ep.get("cosh_id")}
-        if eps.get("crop") != crop_cosh_id:
-            continue
-        if crop_stage_cosh_id and eps.get("crop_stage") != crop_stage_cosh_id:
-            continue
-        if eps.get("part") != part_cosh_id:
-            continue
-        if eps.get("symptom") != symptom_cosh_id:
-            continue
-        if sub_part_cosh_id and eps.get("sub_part") != sub_part_cosh_id:
-            continue
-        if sub_symptom_cosh_id and eps.get("sub_symptom") != sub_symptom_cosh_id:
-            continue
-        matching_diagnosis_ids.add(r.connect_id)
-
-    if not matching_diagnosis_ids:
+    # 1. Filter pest_diagnosis rows that match this question.
+    matching_rows = await _filter_rows(
+        db,
+        DiagnosisFilters(
+            crop_cosh_id=crop_cosh_id,
+            crop_stage=crop_stage_cosh_id,
+            plant_part=part_cosh_id,
+            plant_subpart=sub_part_cosh_id,
+            symptom=symptom_cosh_id,
+            subsymptom=sub_symptom_cosh_id,
+        ),
+    )
+    if not matching_rows:
         return []
 
-    # 2. Find image-link Connect rows pointing to any matching diagnosis row.
-    # We don't filter by connect_type — any Connect (tomato_pest_images,
-    # paddy_pest_images, future per-crop ones) qualifies as long as its
-    # endpoints carry the right role pair.
-    all_active = (await db.execute(
-        select(CoshConnectRow).where(CoshConnectRow.status == "active")
-    )).scalars().all()
+    # 2. Walk image_index → {crop}_symptom_images → image Core to
+    # collect curated images for these rows. Returns a dict keyed by
+    # diagnosis row id; we flatten + dedupe order-preserving.
+    diag_row_ids = [r.connect_id for r in matching_rows]
+    urls_by_diag = await images_for_pest_diagnosis_rows(
+        db,
+        crop_cosh_id=crop_cosh_id,
+        diag_row_ids=diag_row_ids,
+    )
 
-    media_ids: set[str] = set()
-    for r in all_active:
-        if r.connect_type == "pest_diagnosis_chain":
-            continue
-        eps = {ep["role"]: ep["cosh_id"] for ep in (r.endpoints or [])
-               if ep.get("role") and ep.get("cosh_id")}
-        diag_id = eps.get("pest_diagnosis_chain")
-        media_id = eps.get("media")
-        if diag_id in matching_diagnosis_ids and media_id:
-            media_ids.add(media_id)
+    seen_urls: set[str] = set()
+    ordered_urls: list[str] = []
+    for diag_id in diag_row_ids:
+        for u in urls_by_diag.get(diag_id, []):
+            if u in seen_urls:
+                continue
+            seen_urls.add(u)
+            ordered_urls.append(u)
 
-    if not media_ids:
+    if not ordered_urls:
         return []
 
-    # 3. Fetch Media Core items.
-    media_items = (await db.execute(
+    # 3. Fetch the image Core items for their cosh_id + caption.
+    # `urls_by_diag` returns S3 URLs, not Core ids — to surface
+    # captions in the farmer's language we re-query the image Cores
+    # whose metadata_.s3_path matches one of the urls we collected.
+    candidates = (await db.execute(
         select(CoshCoreItem).where(
-            CoshCoreItem.cosh_id.in_(media_ids),
-            CoshCoreItem.core_type == "media",
+            CoshCoreItem.core_type == "image",
             CoshCoreItem.status == "active",
         )
     )).scalars().all()
 
+    by_url: dict[str, CoshCoreItem] = {}
+    for c in candidates:
+        meta = c.metadata_ or {}
+        url = meta.get("s3_path") or meta.get("url")
+        if url:
+            by_url[url] = c
+
     out: list[ReferenceImage] = []
-    for m in media_items:
-        meta = m.metadata_ or {}
-        translations = m.translations or {}
+    for url in ordered_urls:
+        c = by_url.get(url)
+        translations = (c.translations or {}) if c else {}
+        meta = (c.metadata_ or {}) if c else {}
         out.append(ReferenceImage(
-            cosh_id=m.cosh_id,
-            url=meta.get("s3_path") or meta.get("url"),
+            cosh_id=c.cosh_id if c else url,
+            url=url,
             media_type=meta.get("media_type", "image"),
             caption=translations.get(language_code) or translations.get("en"),
         ))

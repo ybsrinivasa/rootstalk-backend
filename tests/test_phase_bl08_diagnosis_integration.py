@@ -28,39 +28,69 @@ CROP = "crop:tomato"
 STAGE = "stage:vegetative"
 
 
-async def _seed_diagnosis_data(db):
-    """Seed two `pest_diagnosis_chain` rows for two distinct pests on
-    the same crop+stage+part. Algorithm asks one question; YES diagnoses
-    one, NO narrows to the other.
+def _pd_row(
+    connect_id: str,
+    *,
+    crop: str,
+    pest: str,
+    part: str,
+    symptom: str,
+    crop_stage: str | None = None,
+    pest_stage: str = "pest_stage:any",
+    sub_symptom: str | None = None,
+    sub_part: str | None = None,
+    priority_rank: str | None = None,
+) -> CoshConnectRow:
+    """Build a `pest_diagnosis` Connect row in the real 9-position
+    wire shape (locked 2026-05-14). Dimensions left as None are
+    filled with the BLANK BOX sentinel where one exists, so the
+    loader treats them as wildcards. Crop / pest / part / symptom
+    are mandatory; the rest are optional and carry safe defaults."""
+    from app.services.cosh_constants import (
+        PD_BLANK_BOX_BY_CORE,
+        COSH_DAMAGE_SUBSYMPTOMS_CORE, COSH_PLANT_SUBPARTS_CORE,
+        COSH_CROP_STAGES_CORE,
+    )
+    subsymptom_blank = PD_BLANK_BOX_BY_CORE[COSH_DAMAGE_SUBSYMPTOMS_CORE]
+    subpart_blank = PD_BLANK_BOX_BY_CORE[COSH_PLANT_SUBPARTS_CORE]
+    crop_stage_blank = PD_BLANK_BOX_BY_CORE[COSH_CROP_STAGES_CORE]
 
-    Endpoint role names mirror Cosh's entity_type vocabulary
-    (see docs/COSH_2_SYNC_CONTRACT.md): crop, crop_stage, pest,
-    pest_stage, part, sub_part, symptom, sub_symptom."""
-    db.add(CoshConnectRow(
-        connect_id="pdc:p1-leaf-spot",
-        connect_type="pest_diagnosis_chain",
+    endpoints = [
+        {"role": "damage_symptoms",     "cosh_id": symptom,                              "position": 1},
+        {"role": "damage_subsymptoms",  "cosh_id": sub_symptom or subsymptom_blank,      "position": 2},
+        {"role": "biological_names",    "cosh_id": pest,                                 "position": 3},
+        {"role": "pest_stages",         "cosh_id": pest_stage,                           "position": 4},
+        {"role": "plant_parts",         "cosh_id": part,                                 "position": 5},
+        {"role": "plant_subparts",      "cosh_id": sub_part or subpart_blank,            "position": 6},
+        {"role": "biological_names",    "cosh_id": crop,                                 "position": 7},
+        {"role": "crop_stages",         "cosh_id": crop_stage or crop_stage_blank,       "position": 8},
+    ]
+    if priority_rank:
+        endpoints.append(
+            {"role": "priority_rank_pests", "cosh_id": priority_rank, "position": 9},
+        )
+    return CoshConnectRow(
+        connect_id=connect_id,
+        connect_type="pest_diagnosis",
         status="active",
-        endpoints=[
-            {"role": "crop",       "cosh_id": CROP, "position": 1},
-            {"role": "crop_stage", "cosh_id": STAGE, "position": 2},
-            {"role": "pest",       "cosh_id": "pest:leaf-blight", "position": 3},
-            {"role": "part",       "cosh_id": "part:leaf", "position": 5},
-            {"role": "symptom",    "cosh_id": "symptom:spot", "position": 7},
-        ],
+        endpoints=endpoints,
         metadata_=None,
+    )
+
+
+async def _seed_diagnosis_data(db):
+    """Seed two rows for two distinct pests on the same crop+stage+part.
+    Algorithm asks one question; YES diagnoses one, NO narrows to the
+    other."""
+    db.add(_pd_row(
+        "pdc:p1-leaf-spot",
+        crop=CROP, crop_stage=STAGE,
+        pest="pest:leaf-blight", part="part:leaf", symptom="symptom:spot",
     ))
-    db.add(CoshConnectRow(
-        connect_id="pdc:p2-leaf-yellow",
-        connect_type="pest_diagnosis_chain",
-        status="active",
-        endpoints=[
-            {"role": "crop",       "cosh_id": CROP, "position": 1},
-            {"role": "crop_stage", "cosh_id": STAGE, "position": 2},
-            {"role": "pest",       "cosh_id": "pest:nutrient-deficiency", "position": 3},
-            {"role": "part",       "cosh_id": "part:leaf", "position": 5},
-            {"role": "symptom",    "cosh_id": "symptom:yellow", "position": 7},
-        ],
-        metadata_=None,
+    db.add(_pd_row(
+        "pdc:p2-leaf-yellow",
+        crop=CROP, crop_stage=STAGE,
+        pest="pest:nutrient-deficiency", part="part:leaf", symptom="symptom:yellow",
     ))
     await db.commit()
 
@@ -237,47 +267,23 @@ async def test_priority_rank_demotes_problem_through_live_router(db):
     ))
 
     # Ranked pest: LEAF+Spots is rank 1, LEAF+Colour_Change is rank 2.
-    db.add(CoshConnectRow(
-        connect_id="pdc:ranked-spots",
-        connect_type="pest_diagnosis_chain",
-        status="active",
-        endpoints=[
-            {"role": "crop",          "cosh_id": CROP},
-            {"role": "crop_stage",    "cosh_id": STAGE},
-            {"role": "pest",          "cosh_id": "pest:ranked"},
-            {"role": "part",          "cosh_id": "part:leaf"},
-            {"role": "symptom",       "cosh_id": "symptom:spots"},
-            {"role": "priority_rank", "cosh_id": "pr:1"},
-        ],
-        metadata_=None,
+    db.add(_pd_row(
+        "pdc:ranked-spots",
+        crop=CROP, crop_stage=STAGE,
+        pest="pest:ranked", part="part:leaf", symptom="symptom:spots",
+        priority_rank="pr:1",
     ))
-    db.add(CoshConnectRow(
-        connect_id="pdc:ranked-colour",
-        connect_type="pest_diagnosis_chain",
-        status="active",
-        endpoints=[
-            {"role": "crop",          "cosh_id": CROP},
-            {"role": "crop_stage",    "cosh_id": STAGE},
-            {"role": "pest",          "cosh_id": "pest:ranked"},
-            {"role": "part",          "cosh_id": "part:leaf"},
-            {"role": "symptom",       "cosh_id": "symptom:colour"},
-            {"role": "priority_rank", "cosh_id": "pr:2"},
-        ],
-        metadata_=None,
+    db.add(_pd_row(
+        "pdc:ranked-colour",
+        crop=CROP, crop_stage=STAGE,
+        pest="pest:ranked", part="part:leaf", symptom="symptom:colour",
+        priority_rank="pr:2",
     ))
-    # Unranked sibling — only has Colour_Change, no priority_rank endpoint.
-    db.add(CoshConnectRow(
-        connect_id="pdc:unranked-colour",
-        connect_type="pest_diagnosis_chain",
-        status="active",
-        endpoints=[
-            {"role": "crop",       "cosh_id": CROP},
-            {"role": "crop_stage", "cosh_id": STAGE},
-            {"role": "pest",       "cosh_id": "pest:unranked"},
-            {"role": "part",       "cosh_id": "part:leaf"},
-            {"role": "symptom",    "cosh_id": "symptom:colour"},
-        ],
-        metadata_=None,
+    # Unranked sibling — only has Colour_Change, no priority_rank.
+    db.add(_pd_row(
+        "pdc:unranked-colour",
+        crop=CROP, crop_stage=STAGE,
+        pest="pest:unranked", part="part:leaf", symptom="symptom:colour",
     ))
     await db.commit()
 
@@ -317,32 +323,16 @@ async def test_priority_rank_translation_fallback(db):
         translations={"en": "1"},
         metadata_=None,
     ))
-    db.add(CoshConnectRow(
-        connect_id="pdc:t1",
-        connect_type="pest_diagnosis_chain",
-        status="active",
-        endpoints=[
-            {"role": "crop",          "cosh_id": CROP},
-            {"role": "crop_stage",    "cosh_id": STAGE},
-            {"role": "pest",          "cosh_id": "pest:tonly"},
-            {"role": "part",          "cosh_id": "part:leaf"},
-            {"role": "symptom",       "cosh_id": "symptom:fallback"},
-            {"role": "priority_rank", "cosh_id": "pr:translatedonly"},
-        ],
-        metadata_=None,
+    db.add(_pd_row(
+        "pdc:t1",
+        crop=CROP, crop_stage=STAGE,
+        pest="pest:tonly", part="part:leaf", symptom="symptom:fallback",
+        priority_rank="pr:translatedonly",
     ))
-    db.add(CoshConnectRow(
-        connect_id="pdc:t2",
-        connect_type="pest_diagnosis_chain",
-        status="active",
-        endpoints=[
-            {"role": "crop",       "cosh_id": CROP},
-            {"role": "crop_stage", "cosh_id": STAGE},
-            {"role": "pest",       "cosh_id": "pest:tonly"},
-            {"role": "part",       "cosh_id": "part:leaf"},
-            {"role": "symptom",    "cosh_id": "symptom:other"},
-        ],
-        metadata_=None,
+    db.add(_pd_row(
+        "pdc:t2",
+        crop=CROP, crop_stage=STAGE,
+        pest="pest:tonly", part="part:leaf", symptom="symptom:other",
     ))
     await db.commit()
 
