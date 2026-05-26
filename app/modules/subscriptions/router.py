@@ -1933,6 +1933,28 @@ async def my_subscriptions(
             n = (translations or {}).get("en") if isinstance(translations, dict) else None
             crop_name_by_id[cosh_id] = n
 
+    # ── Client identity per subscription. Surfaced so inside
+    # screens (advisory, diagnose, ask-expert, …) can render a
+    # consistent "you're in COMPANY · CROP" chip without each
+    # page making a separate /client/{id}/info round-trip.
+    from app.modules.clients.models import Client
+    client_ids = list({s.client_id for s in subs})
+    client_info_by_id: dict[str, dict] = {}
+    if client_ids:
+        client_rows = (await db.execute(
+            select(
+                Client.id, Client.display_name, Client.full_name,
+                Client.logo_url, Client.primary_colour, Client.short_name,
+            ).where(Client.id.in_(client_ids))
+        )).all()
+        for cid, display, full, logo, colour, short in client_rows:
+            client_info_by_id[cid] = {
+                "client_display_name": display or full,
+                "client_logo_url": logo,
+                "client_primary_colour": colour,
+                "client_short_name": short,
+            }
+
     # ── Pending-delegation resolution for WAITLISTED rows. ──────────
     waitlisted_ids = [s.id for s in subs if str(s.status) == "WAITLISTED"]
     pending_delegate_by_sub_id: dict[str, dict] = {}
@@ -2003,6 +2025,7 @@ async def my_subscriptions(
     out = []
     for s in subs:
         pkg_name, crop_cosh_id = pkg_by_id.get(s.package_id, (None, None))
+        client = client_info_by_id.get(s.client_id, {})
         out.append({
             "id": s.id, "client_id": s.client_id, "package_id": s.package_id,
             "status": s.status, "crop_start_date": s.crop_start_date,
@@ -2014,6 +2037,10 @@ async def my_subscriptions(
             "package_name": pkg_name,
             "crop_cosh_id": crop_cosh_id,
             "crop_name": crop_name_by_id.get(crop_cosh_id) if crop_cosh_id else None,
+            "client_display_name": client.get("client_display_name"),
+            "client_logo_url": client.get("client_logo_url"),
+            "client_primary_colour": client.get("client_primary_colour"),
+            "client_short_name": client.get("client_short_name"),
             "pending_payment_from": pending_delegate_by_sub_id.get(s.id),
         })
     return out
