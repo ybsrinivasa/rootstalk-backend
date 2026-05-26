@@ -194,6 +194,28 @@ async def get_pundit_profile_detail(
     companies = (await db.execute(
         select(ClientFarmPundit).where(ClientFarmPundit.pundit_id == profile.id, ClientFarmPundit.status == "ACTIVE")
     )).scalars().all()
+
+    # Resolve state / district cosh_ids → friendly English names so the
+    # profile UI never has to show "state_karnataka" to the Pundit. Same
+    # batch-lookup shape used elsewhere (one query for the lot).
+    from app.modules.sync.models import CoshCoreItem
+    ref_ids = {a.state_cosh_id for a in areas if a.state_cosh_id} | {
+        a.district_cosh_id for a in areas if a.district_cosh_id
+    }
+    name_by_cosh_id: dict[str, str] = {}
+    if ref_ids:
+        for cosh_id, translations in (await db.execute(
+            select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
+            .where(
+                CoshCoreItem.cosh_id.in_(ref_ids),
+                CoshCoreItem.core_type.in_(["state_list", "district_list"]),
+            )
+        )).all():
+            if isinstance(translations, dict):
+                label = translations.get("en") or translations.get("English")
+                if label:
+                    name_by_cosh_id[cosh_id] = label
+
     return {
         "id": profile.id,
         "user_id": profile.user_id,
@@ -206,7 +228,12 @@ async def get_pundit_profile_detail(
         "phone_hidden": profile.phone_hidden,
         "declaration_accepted": profile.declaration_accepted,
         "expertise_domains": [d.domain for d in domains],
-        "support_areas": [{"state_cosh_id": a.state_cosh_id, "district_cosh_id": a.district_cosh_id} for a in areas],
+        "support_areas": [{
+            "state_cosh_id": a.state_cosh_id,
+            "state_name": name_by_cosh_id.get(a.state_cosh_id),
+            "district_cosh_id": a.district_cosh_id,
+            "district_name": name_by_cosh_id.get(a.district_cosh_id) if a.district_cosh_id else None,
+        } for a in areas],
         "languages": [l.language_code for l in langs],
         "crop_groups": [c.crop_group_cosh_id for c in crop_groups],
         "companies": [{"client_id": c.client_id, "role": c.role, "is_promoter_pundit": c.is_promoter_pundit} for c in companies],
