@@ -36,17 +36,46 @@ class PunditRole(str, enum.Enum):
 
 
 class FarmPunditProfile(Base):
+    """Regular FarmPundit registration profile.
+
+    Scope: this profile and every related junction (expertise,
+    languages, crop_groups, farming_methods, cultivation_types,
+    support_areas) only apply to regular FarmPundits. Promoter-
+    Pundits are designated through the CA portal (Promoter UI) and
+    don't fill any of this — they skip the /pundit/register flow
+    entirely. See `client_farm_pundits.is_promoter_pundit`.
+
+    All single-value dropdowns store the selection as a Cosh
+    `cosh_core_items.cosh_id`, against these `core_type` slugs:
+        education_cosh_id          → pundit_education
+        experience_cosh_id         → pundit_experience
+        organisation_type_cosh_id  → pundit_organization_types
+    The companion multi-select tables key against:
+        farm_pundit_farming_methods    → pundit_farming_methods
+        farm_pundit_cultivation_types  → pundit_cultivation_types
+        farm_pundit_expertise.domain   → pundit_domain_expertise
+        farm_pundit_languages.language_code → pundit_languages
+        farm_pundit_crop_groups.crop_group_cosh_id → pundit_crop_groups
+        farm_pundit_support_areas.state_cosh_id → state_list
+
+    Employment flag (`is_employed_by_organization`):
+      True  → `organisation_type_cosh_id` is the selection;
+              `non_employed_kind` is NULL.
+      False → `organisation_type_cosh_id` is NULL;
+              `non_employed_kind` is optionally one of
+              RETIRED / EXPERIENCED_FARMER.
+    No history is kept on toggle — only the latest answer survives.
+    """
     __tablename__ = "farm_pundit_profiles"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), unique=True, nullable=False)
     email: Mapped[str] = mapped_column(String(255), nullable=True)
-    education: Mapped[str] = mapped_column(String(50), nullable=True)
-    experience_band: Mapped[str] = mapped_column(String(30), nullable=True)
-    support_method: Mapped[str] = mapped_column(String(20), nullable=True)
-    cultivation_type: Mapped[str] = mapped_column(String(100), nullable=True)
-    organisation_name: Mapped[str] = mapped_column(String(500), nullable=True)
+    education_cosh_id: Mapped[str] = mapped_column(String(100), nullable=True)
+    experience_cosh_id: Mapped[str] = mapped_column(String(100), nullable=True)
+    is_employed_by_organization: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     organisation_type_cosh_id: Mapped[str] = mapped_column(String(100), nullable=True)
+    non_employed_kind: Mapped[str] = mapped_column(String(30), nullable=True)
     phone_hidden: Mapped[bool] = mapped_column(Boolean, default=False)
     declaration_accepted: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -54,6 +83,26 @@ class FarmPunditProfile(Base):
     company_pundits: Mapped[list["ClientFarmPundit"]] = relationship("ClientFarmPundit", back_populates="pundit")
     queries_holding: Mapped[list["Query"]] = relationship("Query", back_populates="current_holder",
                                                            foreign_keys="Query.current_holder_id")
+
+
+class FarmPunditFarmingMethod(Base):
+    __tablename__ = "farm_pundit_farming_methods"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    pundit_id: Mapped[str] = mapped_column(String(36), ForeignKey("farm_pundit_profiles.id"), nullable=False)
+    farming_method_cosh_id: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    __table_args__ = (UniqueConstraint("pundit_id", "farming_method_cosh_id"),)
+
+
+class FarmPunditCultivationType(Base):
+    __tablename__ = "farm_pundit_cultivation_types"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    pundit_id: Mapped[str] = mapped_column(String(36), ForeignKey("farm_pundit_profiles.id"), nullable=False)
+    cultivation_type_cosh_id: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    __table_args__ = (UniqueConstraint("pundit_id", "cultivation_type_cosh_id"),)
 
 
 class FarmPunditExpertise(Base):

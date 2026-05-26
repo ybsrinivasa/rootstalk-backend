@@ -20,8 +20,9 @@ from __future__ import annotations
 import pytest
 
 from app.modules.farmpundit.models import (
-    ClientFarmPundit, FarmPunditCropGroup, FarmPunditExpertise,
-    FarmPunditLanguage, FarmPunditProfile, FarmPunditSupportArea,
+    ClientFarmPundit, FarmPunditCropGroup, FarmPunditCultivationType,
+    FarmPunditExpertise, FarmPunditFarmingMethod, FarmPunditLanguage,
+    FarmPunditProfile, FarmPunditSupportArea,
     PunditInvitation, PunditRole,
 )
 from app.modules.farmpundit.router import (
@@ -44,16 +45,19 @@ async def _ca_user_for(db, *, client):
 async def _make_full_pundit(
     db, *, name="Pundit",
     states=(), domains=(), languages=(), crop_groups=(),
-    education=None, experience_band=None, support_method=None,
-    cultivation_type=None,
+    farming_methods=(), cultivation_types=(),
+    education_cosh_id=None, experience_cosh_id=None,
 ):
-    """Build a profile + linked rows in a single helper. Each list-arg
-    is the cosh_id (or code) string list to attach."""
+    """Build a profile + linked rows in a single helper. Every list-arg
+    is the cosh_id (or code) string list to attach. Post 2026-05-26
+    Cosh reshape: education / experience are single cosh_ids; the
+    former single-select support_method + cultivation_type are now
+    multi-select junction tables."""
     user = await make_user(db, name=name)
     profile = FarmPunditProfile(
         user_id=user.id, declaration_accepted=True,
-        education=education, experience_band=experience_band,
-        support_method=support_method, cultivation_type=cultivation_type,
+        education_cosh_id=education_cosh_id,
+        experience_cosh_id=experience_cosh_id,
     )
     db.add(profile)
     await db.flush()
@@ -66,6 +70,10 @@ async def _make_full_pundit(
         db.add(FarmPunditLanguage(pundit_id=profile.id, language_code=lang))
     for cg in crop_groups:
         db.add(FarmPunditCropGroup(pundit_id=profile.id, crop_group_cosh_id=cg))
+    for fm in farming_methods:
+        db.add(FarmPunditFarmingMethod(pundit_id=profile.id, farming_method_cosh_id=fm))
+    for ct in cultivation_types:
+        db.add(FarmPunditCultivationType(pundit_id=profile.id, cultivation_type_cosh_id=ct))
     await db.flush()
     return user, profile
 
@@ -87,6 +95,7 @@ async def test_search_multi_state_returns_union(db):
         client_id=client.id,
         state_cosh_ids=["state_karnataka", "state_tamil_nadu"],
         expertise_domains=[], language_codes=[], crop_groups=[],
+        farming_methods=[], cultivation_types=[],
         db=db, current_user=await _ca_user_for(db, client=client),
     )
     names = {r["name"] for r in results}
@@ -108,6 +117,7 @@ async def test_search_multi_expertise_returns_union(db):
         state_cosh_ids=[],
         expertise_domains=["plant_protection", "plant_nutrition"],
         language_codes=[], crop_groups=[],
+        farming_methods=[], cultivation_types=[],
         db=db, current_user=await _ca_user_for(db, client=client),
     )
     assert {r["name"] for r in results} == {"Protection", "Nutrition"}
@@ -127,6 +137,7 @@ async def test_search_multi_language_returns_union(db):
         state_cosh_ids=[], expertise_domains=[],
         language_codes=["kn", "ta"],
         crop_groups=[],
+        farming_methods=[], cultivation_types=[],
         db=db, current_user=await _ca_user_for(db, client=client),
     )
     assert {r["name"] for r in results} == {"Kannada-only", "Tamil-only"}
@@ -145,6 +156,7 @@ async def test_search_multi_crop_group_returns_union(db):
         client_id=client.id,
         state_cosh_ids=[], expertise_domains=[], language_codes=[],
         crop_groups=["cereals", "fruit_trees"],
+        farming_methods=[], cultivation_types=[],
         db=db, current_user=await _ca_user_for(db, client=client),
     )
     assert {r["name"] for r in results} == {"Cereals", "Fruits"}
@@ -153,16 +165,17 @@ async def test_search_multi_crop_group_returns_union(db):
 @requires_docker
 @pytest.mark.asyncio
 async def test_search_cultivation_type_filter(db):
-    """New single-select per spec §14.3 — wasn't in the old endpoint."""
+    """cultivation_types is now multi-select (post-Cosh reshape).
+    Filtering by one value returns the pundit who has it tagged."""
     client = await make_client(db)
-    await _make_full_pundit(db, name="Open Field", cultivation_type="open_field")
-    await _make_full_pundit(db, name="Greenhouse", cultivation_type="greenhouse")
+    await _make_full_pundit(db, name="Open Field", cultivation_types=["ct_open"])
+    await _make_full_pundit(db, name="Greenhouse", cultivation_types=["ct_green"])
     await db.commit()
 
     results = await search_pundits(
         client_id=client.id,
         state_cosh_ids=[], expertise_domains=[], language_codes=[], crop_groups=[],
-        cultivation_type="greenhouse",
+        farming_methods=[], cultivation_types=["ct_green"],
         db=db, current_user=await _ca_user_for(db, client=client),
     )
     assert {r["name"] for r in results} == {"Greenhouse"}
@@ -177,15 +190,15 @@ async def test_search_combines_multi_and_single_filters(db):
     client = await make_client(db)
     await _make_full_pundit(
         db, name="K + Doc",
-        states=["state_karnataka"], education="DOCTORATE",
+        states=["state_karnataka"], education_cosh_id="ed_doctorate",
     )
     await _make_full_pundit(
         db, name="K + Masters",
-        states=["state_karnataka"], education="MASTERS",
+        states=["state_karnataka"], education_cosh_id="ed_masters",
     )
     await _make_full_pundit(
         db, name="TN + Doc",
-        states=["state_tamil_nadu"], education="DOCTORATE",
+        states=["state_tamil_nadu"], education_cosh_id="ed_doctorate",
     )
     await db.commit()
 
@@ -193,7 +206,8 @@ async def test_search_combines_multi_and_single_filters(db):
         client_id=client.id,
         state_cosh_ids=["state_karnataka"],
         expertise_domains=[], language_codes=[], crop_groups=[],
-        education="DOCTORATE",
+        farming_methods=[], cultivation_types=[],
+        education_cosh_id="ed_doctorate",
         db=db, current_user=await _ca_user_for(db, client=client),
     )
     assert {r["name"] for r in results} == {"K + Doc"}
@@ -215,6 +229,7 @@ async def test_search_empty_filters_returns_all_with_declaration(db):
     results = await search_pundits(
         client_id=client.id,
         state_cosh_ids=[], expertise_domains=[], language_codes=[], crop_groups=[],
+        farming_methods=[], cultivation_types=[],
         db=db, current_user=await _ca_user_for(db, client=client),
     )
     names = {r["name"] for r in results}

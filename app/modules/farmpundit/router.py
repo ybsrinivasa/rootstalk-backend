@@ -11,6 +11,7 @@ from app.modules.platform.models import User
 from app.modules.farmpundit.models import (
     FarmPunditProfile, FarmPunditExpertise, FarmPunditSupportArea,
     FarmPunditLanguage, FarmPunditCropGroup, FarmPunditPreference,
+    FarmPunditFarmingMethod, FarmPunditCultivationType,
     ClientFarmPundit, PunditInvitation, PunditRole,
     Query, QueryMedia, QueryRemark, QueryResponse, QueryResponseMedia,
     StandardResponse, QueryStatus, QueryRemarkAction,
@@ -110,19 +111,83 @@ async def _assert_portal_member(
 
 # ── FarmPundit Profile ─────────────────────────────────────────────────────────
 
+# Slugs (Cosh `core_type` values) that drive every dropdown on the
+# /pundit/register form. Listed here so /cosh/pundit-options can
+# refuse anything outside this allowlist (the endpoint is just
+# `/cosh/core-items` with an allowlist filter; we never expose the
+# generic lookup to PWA users).
+PUNDIT_OPTION_SLUGS: frozenset[str] = frozenset({
+    "pundit_education",
+    "pundit_experience",
+    "pundit_farming_methods",
+    "pundit_cultivation_types",
+    "pundit_domain_expertise",
+    "pundit_crop_groups",
+    "pundit_languages",
+    "pundit_organization_types",
+})
+
+NON_EMPLOYED_KINDS: frozenset[str] = frozenset({"RETIRED", "EXPERIENCED_FARMER"})
+
+
 class PunditProfileCreate(BaseModel):
     email: Optional[str] = None
-    education: Optional[str] = None
-    experience_band: Optional[str] = None
-    support_method: Optional[str] = None
-    cultivation_type: Optional[str] = None
-    organisation_name: Optional[str] = None
-    organisation_type_cosh_id: Optional[str] = None
+    # Single-select cosh_id picks
+    education_cosh_id: Optional[str] = None
+    experience_cosh_id: Optional[str] = None
+    # Employment branch
+    is_employed_by_organization: bool = False
+    organisation_type_cosh_id: Optional[str] = None    # only set when employed
+    non_employed_kind: Optional[str] = None             # RETIRED | EXPERIENCED_FARMER, optional
     declaration_accepted: bool = False
-    expertise_domains: list[str] = []
-    support_areas: list[dict] = []    # [{"state_cosh_id": ..., "district_cosh_id": ...}]
-    languages: list[str] = []          # language_code list
-    crop_groups: list[str] = []        # crop_group_cosh_id list
+    # Multi-select cosh_id lists
+    farming_methods: list[str] = []        # pundit_farming_methods cosh_ids
+    cultivation_types: list[str] = []      # pundit_cultivation_types cosh_ids
+    expertise_domains: list[str] = []      # pundit_domain_expertise cosh_ids
+    crop_groups: list[str] = []            # pundit_crop_groups cosh_ids
+    languages: list[str] = []              # pundit_languages cosh_ids
+    support_areas: list[dict] = []         # [{"state_cosh_id": ...}]
+
+
+@router.get("/cosh/pundit-options")
+async def cosh_pundit_options(
+    slug: str = QueryParam(..., description="Cosh core_type slug"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Dropdown options for the /pundit/register form.
+
+    Returns `[{cosh_id, name}]` sorted by English name for the
+    requested `core_type` slug. The slug must be one of
+    PUNDIT_OPTION_SLUGS — we don't expose a generic Cosh-core
+    lookup to PWA users.
+
+    Items missing an English translation (Cosh sync partial) are
+    skipped silently rather than rendered as "(unnamed)" — the form
+    is rendering a picker, not an audit view.
+    """
+    if slug not in PUNDIT_OPTION_SLUGS:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "unknown_pundit_slug",
+                "message": f"slug must be one of {sorted(PUNDIT_OPTION_SLUGS)}",
+            },
+        )
+    from app.modules.sync.models import CoshCoreItem
+    rows = (await db.execute(
+        select(CoshCoreItem.cosh_id, CoshCoreItem.translations).where(
+            CoshCoreItem.core_type == slug,
+            CoshCoreItem.status == "active",
+        )
+    )).all()
+    out = []
+    for cosh_id, translations in rows:
+        name = (translations or {}).get("en") if isinstance(translations, dict) else None
+        if name:
+            out.append({"cosh_id": cosh_id, "name": name})
+    out.sort(key=lambda x: x["name"].casefold())
+    return out
 
 
 @router.post("/pundit/profile", status_code=201)
@@ -131,30 +196,66 @@ async def create_pundit_profile(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Regular FarmPundit self-registration.
+
+    Promoter-Pundits never reach this endpoint — they're designated
+    through the CA portal Promoter UI and skip these fields entirely.
+    """
     existing = (await db.execute(
         select(FarmPunditProfile).where(FarmPunditProfile.user_id == current_user.id)
     )).scalar_one_or_none()
     if existing:
         raise HTTPException(status_code=409, detail="Profile already exists. Use PUT to update.")
 
+    # Enforce the employment-branch invariant. The Pydantic shape allows
+    # both fields nullable so partial drafts validate; the actual rule
+    # is "exactly one branch carries data". User direction 2026-05-26:
+    # we only ever surface the latest answer to clients — no toggle
+    # history — so we just store whichever branch the form filled in.
+    if request.is_employed_by_organization:
+        org_type = request.organisation_type_cosh_id
+        non_emp_kind = None
+    else:
+        org_type = None
+        non_emp_kind = request.non_employed_kind
+        if non_emp_kind and non_emp_kind not in NON_EMPLOYED_KINDS:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "invalid_non_employed_kind",
+                    "message": (
+                        f"non_employed_kind must be one of {sorted(NON_EMPLOYED_KINDS)} "
+                        f"or null"
+                    ),
+                },
+            )
+
     profile = FarmPunditProfile(
         user_id=current_user.id,
         email=request.email,
-        education=request.education,
-        experience_band=request.experience_band,
-        support_method=request.support_method,
-        cultivation_type=request.cultivation_type,
-        organisation_name=request.organisation_name,
-        organisation_type_cosh_id=request.organisation_type_cosh_id,
+        education_cosh_id=request.education_cosh_id,
+        experience_cosh_id=request.experience_cosh_id,
+        is_employed_by_organization=request.is_employed_by_organization,
+        organisation_type_cosh_id=org_type,
+        non_employed_kind=non_emp_kind,
         declaration_accepted=request.declaration_accepted,
     )
     db.add(profile)
     await db.flush()
 
+    for cosh_id in request.farming_methods:
+        db.add(FarmPunditFarmingMethod(pundit_id=profile.id, farming_method_cosh_id=cosh_id))
+    for cosh_id in request.cultivation_types:
+        db.add(FarmPunditCultivationType(pundit_id=profile.id, cultivation_type_cosh_id=cosh_id))
     for domain in request.expertise_domains:
         db.add(FarmPunditExpertise(pundit_id=profile.id, domain=domain))
     for area in request.support_areas:
-        db.add(FarmPunditSupportArea(pundit_id=profile.id, **area))
+        # Pundits register at state granularity only — drop any keys the
+        # form might still send (e.g. legacy district_cosh_id from older
+        # PWA builds), and skip empty rows.
+        state = (area or {}).get("state_cosh_id")
+        if state:
+            db.add(FarmPunditSupportArea(pundit_id=profile.id, state_cosh_id=state))
     for lang in request.languages:
         db.add(FarmPunditLanguage(pundit_id=profile.id, language_code=lang))
     for cg in request.crop_groups:
@@ -191,51 +292,94 @@ async def get_pundit_profile_detail(
     crop_groups = (await db.execute(
         select(FarmPunditCropGroup).where(FarmPunditCropGroup.pundit_id == profile.id)
     )).scalars().all()
+    farming_methods = (await db.execute(
+        select(FarmPunditFarmingMethod).where(FarmPunditFarmingMethod.pundit_id == profile.id)
+    )).scalars().all()
+    cultivation_types = (await db.execute(
+        select(FarmPunditCultivationType).where(FarmPunditCultivationType.pundit_id == profile.id)
+    )).scalars().all()
     companies = (await db.execute(
         select(ClientFarmPundit).where(ClientFarmPundit.pundit_id == profile.id, ClientFarmPundit.status == "ACTIVE")
     )).scalars().all()
 
-    # Resolve state / district cosh_ids → friendly English names so the
-    # profile UI never has to show "state_karnataka" to the Pundit. Same
-    # batch-lookup shape used elsewhere (one query for the lot).
+    # One batch lookup against cosh_core_items to resolve every cosh_id
+    # (single-select picks + multi-select lists + state list) into an
+    # English label. The Pundit's profile screen never sees UUIDs.
     from app.modules.sync.models import CoshCoreItem
-    ref_ids = {a.state_cosh_id for a in areas if a.state_cosh_id} | {
-        a.district_cosh_id for a in areas if a.district_cosh_id
-    }
+    ref_ids: set[str] = set()
+    for sid in (
+        profile.education_cosh_id, profile.experience_cosh_id,
+        profile.organisation_type_cosh_id,
+    ):
+        if sid:
+            ref_ids.add(sid)
+    for a in areas:
+        if a.state_cosh_id: ref_ids.add(a.state_cosh_id)
+        if a.district_cosh_id: ref_ids.add(a.district_cosh_id)
+    for fm in farming_methods: ref_ids.add(fm.farming_method_cosh_id)
+    for ct in cultivation_types: ref_ids.add(ct.cultivation_type_cosh_id)
+    for d in domains: ref_ids.add(d.domain)
+    for cg in crop_groups: ref_ids.add(cg.crop_group_cosh_id)
+    for l in langs: ref_ids.add(l.language_code)
+
     name_by_cosh_id: dict[str, str] = {}
     if ref_ids:
         for cosh_id, translations in (await db.execute(
             select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
-            .where(
-                CoshCoreItem.cosh_id.in_(ref_ids),
-                CoshCoreItem.core_type.in_(["state_list", "district_list"]),
-            )
+            .where(CoshCoreItem.cosh_id.in_(ref_ids))
         )).all():
             if isinstance(translations, dict):
                 label = translations.get("en") or translations.get("English")
                 if label:
                     name_by_cosh_id[cosh_id] = label
 
+    def _named(cosh_id: Optional[str]) -> Optional[dict]:
+        if not cosh_id:
+            return None
+        return {"cosh_id": cosh_id, "name": name_by_cosh_id.get(cosh_id)}
+
     return {
         "id": profile.id,
         "user_id": profile.user_id,
+        "phone": current_user.phone,
         "email": profile.email,
-        "education": profile.education,
-        "experience_band": profile.experience_band,
-        "support_method": profile.support_method,
-        "cultivation_type": profile.cultivation_type,
-        "organisation_name": profile.organisation_name,
+        "education": _named(profile.education_cosh_id),
+        "experience": _named(profile.experience_cosh_id),
+        "is_employed_by_organization": profile.is_employed_by_organization,
+        "organisation_type": _named(profile.organisation_type_cosh_id),
+        "non_employed_kind": profile.non_employed_kind,
         "phone_hidden": profile.phone_hidden,
         "declaration_accepted": profile.declaration_accepted,
-        "expertise_domains": [d.domain for d in domains],
+        "farming_methods": [
+            {"cosh_id": fm.farming_method_cosh_id,
+             "name": name_by_cosh_id.get(fm.farming_method_cosh_id)}
+            for fm in farming_methods
+        ],
+        "cultivation_types": [
+            {"cosh_id": ct.cultivation_type_cosh_id,
+             "name": name_by_cosh_id.get(ct.cultivation_type_cosh_id)}
+            for ct in cultivation_types
+        ],
+        "expertise_domains": [
+            {"cosh_id": d.domain, "name": name_by_cosh_id.get(d.domain)}
+            for d in domains
+        ],
+        "crop_groups": [
+            {"cosh_id": c.crop_group_cosh_id,
+             "name": name_by_cosh_id.get(c.crop_group_cosh_id)}
+            for c in crop_groups
+        ],
+        "languages": [
+            {"cosh_id": l.language_code,
+             "name": name_by_cosh_id.get(l.language_code)}
+            for l in langs
+        ],
         "support_areas": [{
             "state_cosh_id": a.state_cosh_id,
             "state_name": name_by_cosh_id.get(a.state_cosh_id),
             "district_cosh_id": a.district_cosh_id,
             "district_name": name_by_cosh_id.get(a.district_cosh_id) if a.district_cosh_id else None,
         } for a in areas],
-        "languages": [l.language_code for l in langs],
-        "crop_groups": [c.crop_group_cosh_id for c in crop_groups],
         "companies": [{"client_id": c.client_id, "role": c.role, "is_promoter_pundit": c.is_promoter_pundit} for c in companies],
     }
 
@@ -887,45 +1031,65 @@ async def search_standard_responses(
 @router.get("/client/{client_id}/pundit-search")
 async def search_pundits(
     client_id: str,
-    # Multi-value filters per spec §14.3 Step 1 — state/expertise/language/
-    # crop-group are explicitly multi-select. FastAPI treats list[str] +
-    # Query() as repeated query params (?state_cosh_ids=a&state_cosh_ids=b).
+    # Multi-value filters per spec §14.3 Step 1 — every dropdown is now
+    # multi-select after the Cosh reshape. Query-param shape unchanged
+    # for state/expertise/language/crop-group; farming_methods and
+    # cultivation_types are net-new lists.
     state_cosh_ids: list[str] = QueryParam(default=[]),
     expertise_domains: list[str] = QueryParam(default=[]),
     language_codes: list[str] = QueryParam(default=[]),
     crop_groups: list[str] = QueryParam(default=[]),
-    # Single-value filters per spec §14.3 Step 1.
-    education: Optional[str] = None,
-    experience_band: Optional[str] = None,
-    support_method: Optional[str] = None,
-    cultivation_type: Optional[str] = None,
+    farming_methods: list[str] = QueryParam(default=[]),
+    cultivation_types: list[str] = QueryParam(default=[]),
+    # Single-value filters per spec §14.3 Step 1. These two stayed
+    # single after the rewrite; values are Cosh ids now (matched
+    # against `education_cosh_id` / `experience_cosh_id`).
+    education_cosh_id: Optional[str] = None,
+    experience_cosh_id: Optional[str] = None,
     phone: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Multi-filter search across all registered FarmPundits (declaration_accepted=True).
+    """Multi-filter search across all registered FarmPundits.
 
-    Spec §14.3 Step 1 — eight filter fields. Four are multi-select
-    (state, expertise, language, crop group) and four single-select
-    (education, experience, support method, cultivation type). Phone
-    is a search aid, not in spec.
+    Spec §14.3 Step 1 with the 2026-05-26 Cosh reshape:
+      - state / expertise / language / crop_group / farming_methods /
+        cultivation_types → multi-select; pundit matches if ANY value
+        intersects the filter list
+      - education / experience → single-select cosh_id picks
+      - phone → free-text search aid (not in spec)
 
-    Multi-value semantics: a pundit matches a multi-filter if ANY of
-    their values intersect the query — i.e. "experts who support
-    Karnataka OR Tamil Nadu", not AND. Empty list = no filter applied.
+    `declaration_accepted=True` is the registration-complete gate.
+    Empty filter list / null single-filter = no filter applied.
     """
     await _assert_portal_member(db, current_user.id, client_id)
     q = select(FarmPunditProfile).where(FarmPunditProfile.declaration_accepted == True)  # noqa: E712
-    if education:
-        q = q.where(FarmPunditProfile.education == education)
-    if experience_band:
-        q = q.where(FarmPunditProfile.experience_band == experience_band)
-    if support_method:
-        q = q.where(FarmPunditProfile.support_method == support_method)
-    if cultivation_type:
-        q = q.where(FarmPunditProfile.cultivation_type == cultivation_type)
+    if education_cosh_id:
+        q = q.where(FarmPunditProfile.education_cosh_id == education_cosh_id)
+    if experience_cosh_id:
+        q = q.where(FarmPunditProfile.experience_cosh_id == experience_cosh_id)
 
     profiles = (await db.execute(q)).scalars().all()
+
+    # Multi-value filters for the two new Cosh-backed lists.
+    if farming_methods:
+        fm_ids = {
+            r.pundit_id for r in (await db.execute(
+                select(FarmPunditFarmingMethod).where(
+                    FarmPunditFarmingMethod.farming_method_cosh_id.in_(farming_methods)
+                )
+            )).scalars().all()
+        }
+        profiles = [p for p in profiles if p.id in fm_ids]
+    if cultivation_types:
+        ct_ids = {
+            r.pundit_id for r in (await db.execute(
+                select(FarmPunditCultivationType).where(
+                    FarmPunditCultivationType.cultivation_type_cosh_id.in_(cultivation_types)
+                )
+            )).scalars().all()
+        }
+        profiles = [p for p in profiles if p.id in ct_ids]
 
     # Multi-value filters resolved via membership in the joined table.
     # Each multi-filter intersects with the running profile set.
@@ -984,6 +1148,24 @@ async def search_pundits(
         )).scalars().all()
     }
 
+    # Resolve education + experience cosh_ids to friendly names so
+    # the CA portal search results show "Masters" / "5 to 10 years"
+    # instead of UUIDs.
+    from app.modules.sync.models import CoshCoreItem
+    ref_ids = {p.education_cosh_id for p in profiles if p.education_cosh_id} | {
+        p.experience_cosh_id for p in profiles if p.experience_cosh_id
+    }
+    name_by_cosh_id: dict[str, str] = {}
+    if ref_ids:
+        for cosh_id, translations in (await db.execute(
+            select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
+            .where(CoshCoreItem.cosh_id.in_(ref_ids))
+        )).all():
+            if isinstance(translations, dict):
+                label = translations.get("en") or translations.get("English")
+                if label:
+                    name_by_cosh_id[cosh_id] = label
+
     result_out = []
     for p in profiles:
         user = (await db.execute(select(User).where(User.id == p.user_id))).scalar_one_or_none()
@@ -993,9 +1175,16 @@ async def search_pundits(
             "name": user.name if user else None,
             "phone": user.phone if (user and not p.phone_hidden) else None,
             "email": p.email,
-            "education": p.education,
-            "experience_band": p.experience_band,
-            "support_method": p.support_method,
+            "education": (
+                {"cosh_id": p.education_cosh_id,
+                 "name": name_by_cosh_id.get(p.education_cosh_id)}
+                if p.education_cosh_id else None
+            ),
+            "experience": (
+                {"cosh_id": p.experience_cosh_id,
+                 "name": name_by_cosh_id.get(p.experience_cosh_id)}
+                if p.experience_cosh_id else None
+            ),
             "already_onboarded": p.id in onboarded_ids,
         })
     return result_out

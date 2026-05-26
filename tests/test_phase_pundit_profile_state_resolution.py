@@ -25,9 +25,7 @@ from tests.factories import make_user
 async def test_pundit_profile_resolves_state_cosh_ids_to_names(db):
     user = await make_user(db, name="Pundit Test")
     profile = FarmPunditProfile(
-        user_id=user.id, email="p@example.com",
-        education="MASTERS", experience_band="FROM_5_TO_10",
-        support_method="NON_CHEMICAL", declaration_accepted=True,
+        user_id=user.id, email="p@example.com", declaration_accepted=True,
     )
     db.add(profile)
     await db.flush()
@@ -74,9 +72,7 @@ async def test_pundit_profile_handles_unknown_state_cosh_id(db):
     cosh_id."""
     user = await make_user(db, name="Pundit Unknown")
     profile = FarmPunditProfile(
-        user_id=user.id, email="u@example.com",
-        education="MASTERS", experience_band="FROM_5_TO_10",
-        support_method="NON_CHEMICAL", declaration_accepted=True,
+        user_id=user.id, email="u@example.com", declaration_accepted=True,
     )
     db.add(profile)
     await db.flush()
