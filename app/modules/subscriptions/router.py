@@ -614,20 +614,28 @@ async def discover_crops(
     current_user: User = Depends(get_current_user),
 ):
     """All crops that have at least one ACTIVE package in the given
-    district. Returns the crop's English display name alongside the
-    cosh_id so the PWA can render "Paddy" instead of a UUID
-    (Cosh crop ids are real UUIDs, not the older `crop_paddy`
-    slug form, so a frontend de-slug helper isn't enough)."""
+    district, scoped to FARMER_PAYS clients only. Returns the crop's
+    English display name alongside the cosh_id so the PWA can render
+    "Paddy" instead of a UUID (Cosh crop ids are real UUIDs, not the
+    older `crop_paddy` slug form, so a frontend de-slug helper isn't
+    enough).
+
+    COMPANY_PAYS clients are excluded from direct-subscription
+    discovery — their crops never appear here even if a package
+    matches the district. They onboard farmers via promoters."""
     from app.modules.advisory.models import PackageLocation, PackageStatus
+    from app.modules.clients.models import Client, PaymentModel
     from app.modules.sync.models import CoshCoreItem
 
     result = await db.execute(
         select(Package.crop_cosh_id)
         .join(PackageLocation, PackageLocation.package_id == Package.id)
+        .join(Client, Client.id == Package.client_id)
         .where(
             Package.client_id != None,  # noqa
             Package.status == PackageStatus.ACTIVE,
             PackageLocation.district_cosh_id == district_cosh_id,
+            Client.payment_model == PaymentModel.FARMER_PAYS,
         )
         .distinct()
     )
@@ -667,10 +675,13 @@ async def discover_crops_and_companies(
     Bengaluru Urban" without a second lookup.
     """
     from app.modules.advisory.models import PackageLocation, PackageStatus
-    from app.modules.clients.models import Client, ClientStatus
+    from app.modules.clients.models import Client, ClientStatus, PaymentModel
     from app.modules.sync.models import CoshCoreItem
 
     # One query gets every (crop, client) pair active in the district.
+    # COMPANY_PAYS clients are excluded — they don't accept direct
+    # farmer subscriptions, so neither their crops nor their tile
+    # should ever appear on this discovery surface.
     pkg_rows = (await db.execute(
         select(Package.crop_cosh_id, Package.client_id)
         .join(PackageLocation, PackageLocation.package_id == Package.id)
@@ -679,6 +690,7 @@ async def discover_crops_and_companies(
             Package.status == PackageStatus.ACTIVE,
             PackageLocation.district_cosh_id == district_cosh_id,
             Client.status == ClientStatus.ACTIVE,
+            Client.payment_model == PaymentModel.FARMER_PAYS,
         )
         .distinct()
     )).all()
@@ -769,17 +781,24 @@ async def discover_companies(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """All companies (clients) with at least one ACTIVE package for this crop+district."""
+    """All companies (clients) with at least one ACTIVE package for
+    this crop+district, scoped to FARMER_PAYS clients only.
+
+    COMPANY_PAYS clients are intentionally invisible to direct
+    subscription flows — farmers reach those companies only through
+    a promoter (dealer/facilitator) onboarding."""
     from app.modules.advisory.models import PackageLocation, PackageStatus
-    from app.modules.clients.models import Client, ClientStatus
+    from app.modules.clients.models import Client, ClientStatus, PaymentModel
     result = await db.execute(
         select(Package.client_id)
         .join(PackageLocation, PackageLocation.package_id == Package.id)
+        .join(Client, Client.id == Package.client_id)
         .where(
             Package.client_id != None,  # noqa
             Package.crop_cosh_id == crop_cosh_id,
             Package.status == PackageStatus.ACTIVE,
             PackageLocation.district_cosh_id == district_cosh_id,
+            Client.payment_model == PaymentModel.FARMER_PAYS,
         )
         .distinct()
     )
