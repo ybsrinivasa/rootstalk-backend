@@ -1,3 +1,4 @@
+import re
 from datetime import datetime, timedelta, timezone, date
 from math import radians, cos, sin, asin, sqrt
 from fastapi import APIRouter, Depends, HTTPException
@@ -2168,6 +2169,16 @@ async def submit_conditional_answer(
 
 # ── Farmer: Daily advisory (BL-02 + BL-03 + BL-04 + triggered CHA) ────────────
 
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+def _is_uuid(s: str | None) -> bool:
+    return bool(s and _UUID_RE.match(s))
+
+
 @router.get("/farmer/advisory/today")
 async def get_today_advisory(
     db: AsyncSession = Depends(get_db),
@@ -2482,6 +2493,38 @@ async def get_today_advisory(
 
         deduped = deduplicate_advisory(tl_windows, approved_practice_ids=approved_ids)
 
+        # ── Resolve cosh_ref / unit_cosh_id UUIDs → friendly names. ──────────
+        # Elements that point at a Cosh Core (COMMON_NAME, APPLICATION_METHOD,
+        # ITK_NAME, *_UNIT, …) store the selection as a Cosh UUID in either
+        # `cosh_ref` or `unit_cosh_id`. The PWA can't display UUIDs, so we
+        # batch-resolve them here against `cosh_core_items.translations.en`.
+        # One-shot lookup across every dedup-surviving practice keeps the
+        # query cost flat regardless of advisory size.
+        ref_ids: set[str] = set()
+        for dedup_tl in deduped:
+            for p in dedup_tl.visible_practices:
+                for el in p.elements:
+                    if el.cosh_ref and _is_uuid(el.cosh_ref):
+                        ref_ids.add(el.cosh_ref)
+                    if el.unit_cosh_id and _is_uuid(el.unit_cosh_id):
+                        ref_ids.add(el.unit_cosh_id)
+        name_by_cosh_id: dict[str, str] = {}
+        if ref_ids:
+            from app.modules.sync.models import CoshCoreItem
+            for cosh_id, translations in (await db.execute(
+                select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
+                .where(CoshCoreItem.cosh_id.in_(ref_ids))
+            )).all():
+                if isinstance(translations, dict):
+                    label = translations.get("en") or translations.get("English")
+                    if label:
+                        name_by_cosh_id[cosh_id] = label
+
+        def _resolve(uuid_or_label: str | None) -> str | None:
+            if not uuid_or_label:
+                return uuid_or_label
+            return name_by_cosh_id.get(uuid_or_label, uuid_or_label)
+
         # ── Build response ────────────────────────────────────────────────────
         timeline_data = []
         for dedup_tl in deduped:
@@ -2523,9 +2566,12 @@ async def get_today_advisory(
                         # all L0 types; PWA only acts on it for
                         # INPUT practices.
                         "is_purchased": p.id in approved_ids,
-                        "elements": [{"element_type": el.element_type, "cosh_ref": el.cosh_ref,
-                                      "value": el.value, "unit_cosh_id": el.unit_cosh_id}
-                                     for el in p.elements],
+                        "elements": [{
+                            "element_type": el.element_type,
+                            "cosh_ref": _resolve(el.cosh_ref),
+                            "value": el.value,
+                            "unit_cosh_id": _resolve(el.unit_cosh_id),
+                        } for el in p.elements],
                     }
                     for p in freq_filtered_practices
                 ],

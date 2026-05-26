@@ -396,6 +396,103 @@ db=db,current_user=pundit,
     assert any(p["l2_type"] == "COPPER_OXYCHLORIDE" for p in rt["practices"])
 
 
+# ── Element cosh_ref UUID resolution — UUIDs must become friendly names ─────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_advisory_resolves_cosh_ref_uuid_to_friendly_name(db):
+    """When a practice element's cosh_ref is a Cosh UUID (e.g.
+    COMMON_NAME selection), /today must return the resolved English
+    label from cosh_core_items.translations.en — not the raw UUID.
+    Without this, the PWA's "hide UUIDs" guard drops the value
+    entirely and the farmer sees just the label with no detail."""
+    from app.modules.advisory.models import SPRecommendation, Timeline
+    from tests.factories import make_sp_element, make_sp_practice
+
+    client = await make_client(db)
+    farmer = await make_user(db, name="Farmer Res")
+    await make_crop_reference(
+        db, "crop:tomato", name="Tomato", measure="AREA_WISE",
+    )
+    pkg = await make_package(db, client, crop_cosh_id="crop:tomato")
+    sub = await make_subscription(db, farmer=farmer, client=client, package=pkg)
+    sub.crop_start_date = datetime.now(timezone.utc) - timedelta(days=10)
+
+    # Seed the Cosh Core that the element cosh_ref points at.
+    common_name_uuid = "11111111-1111-4111-8111-111111111111"
+    unit_uuid = "22222222-2222-4222-8222-222222222222"
+    db.add(CoshCoreItem(
+        cosh_id=common_name_uuid, core_type="common_names",
+        translations={"en": "Mancozeb"}, status="active",
+    ))
+    db.add(CoshCoreItem(
+        cosh_id=unit_uuid, core_type="dosage_unit",
+        translations={"en": "ml"}, status="active",
+    ))
+    db.add(CoshCoreItem(
+        cosh_id="sp:tomato_late_blight", core_type="specific_problem",
+        parent_cosh_id="pg:fungal_diseases",
+        translations={"en": "Tomato Late Blight"}, status="active",
+    ))
+
+    sp_rec = SPRecommendation(
+        specific_problem_cosh_id="sp:tomato_late_blight",
+        client_id=client.id, crop_cosh_id="crop:tomato", status="ACTIVE",
+    )
+    db.add(sp_rec)
+    await db.flush()
+    sp_tl = Timeline(
+        sp_recommendation_id=sp_rec.id, name=f"SP-{uuid.uuid4().hex[:6]}",
+        from_value=0, to_value=10,
+    )
+    db.add(sp_tl)
+    await db.flush()
+    sp_p = await make_sp_practice(db, sp_tl, l1_type="PESTICIDE")
+    sp_p.l2_type = "FUNGICIDE"
+    # Element with cosh_ref = UUID (resolves to "Mancozeb")
+    await make_sp_element(
+        db, sp_p, element_type="COMMON_NAME",
+        cosh_ref=common_name_uuid, value=None,
+    )
+    # Element with cosh_ref = UUID (resolves to "ml") — unit row that
+    # the PWA will fold onto the preceding DOSAGE element.
+    await make_sp_element(
+        db, sp_p, element_type="DOSAGE", value="5",
+    )
+    e3 = await make_sp_element(
+        db, sp_p, element_type="DOSAGE_UNIT", cosh_ref=unit_uuid, value=None,
+    )
+    e3.unit_cosh_id = None  # explicit — unit is in cosh_ref, not unit_cosh_id
+
+    pundit, _, query = await _seed_pundit_with_query(
+        db, client=client, farmer=farmer, sub=sub,
+    )
+    await db.commit()
+    await respond_to_query(
+        query_id=query.id,
+        data={"problem_cosh_id": "sp:tomato_late_blight"},
+        db=db, current_user=pundit,
+    )
+
+    out = await get_today_advisory(db=db, current_user=farmer)
+    cha_id = f"cha-sp-{sp_tl.id}"
+    rt = {t["id"]: t for t in out[0]["timelines"]}[cha_id]
+    els_by_type = {e["element_type"]: e for e in rt["practices"][0]["elements"]}
+
+    # COMMON_NAME's UUID resolved to its English translation.
+    assert els_by_type["COMMON_NAME"]["cosh_ref"] == "Mancozeb", (
+        f"COMMON_NAME cosh_ref must resolve to 'Mancozeb'; "
+        f"got {els_by_type['COMMON_NAME']['cosh_ref']!r}"
+    )
+    # DOSAGE_UNIT's UUID resolved to "ml" (PWA will fold this onto DOSAGE).
+    assert els_by_type["DOSAGE_UNIT"]["cosh_ref"] == "ml", (
+        f"DOSAGE_UNIT cosh_ref must resolve to 'ml'; "
+        f"got {els_by_type['DOSAGE_UNIT']['cosh_ref']!r}"
+    )
+    # Non-UUID values pass through untouched.
+    assert els_by_type["DOSAGE"]["value"] == "5"
+
+
 # ── Test 5: bundle correctness — area-wise crop picks area-wise bundle ──────
 
 @requires_docker
