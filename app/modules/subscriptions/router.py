@@ -2302,6 +2302,11 @@ async def get_today_advisory(
             )
         )).scalars().all()
 
+        # Per-timeline CHA/QA metadata for the response composer.
+        # Keyed by the synthetic `cha_tl_id` we build below so it
+        # survives BL-03's dedup pass (which keeps the same `tl.id`).
+        cha_meta_by_tl_id: dict[str, dict] = {}
+
         for cha in cha_entries:
             if cha.recommendation_type == "SP":
                 sp_timelines = (await db.execute(
@@ -2331,7 +2336,7 @@ async def get_today_advisory(
                     content, _locked = await resolve_cha_content(db, sub.id, sp_tl.id, "SP")
                     stubs = render_cha_from_content(content)
                     cha_tl_id = f"cha-sp-{sp_tl.id}"
-                    problem_label = cha.problem_name or problem_cosh_id
+                    problem_label = cha.problem_name or cha.problem_cosh_id
                     tl_windows.append(TLWindow(
                         id=cha_tl_id, name=f"CHA — {problem_label}: {sp_tl.name}",
                         from_date=from_d, to_date=to_d,
@@ -2339,6 +2344,11 @@ async def get_today_advisory(
                         practices=stubs, source="CHA",
                     ))
                     tl_date_map[cha_tl_id] = (from_d, to_d, 0)
+                    cha_meta_by_tl_id[cha_tl_id] = {
+                        "problem_name": problem_label,
+                        "triggered_at": cha.triggered_at.isoformat()
+                            if hasattr(cha.triggered_at, "isoformat") else None,
+                    }
             elif cha.recommendation_type == "PG":
                 pg_timelines = (await db.execute(
                     select(Timeline).where(Timeline.pg_recommendation_id == cha.recommendation_id)
@@ -2365,7 +2375,7 @@ async def get_today_advisory(
                     content, _locked = await resolve_cha_content(db, sub.id, pg_tl.id, "PG")
                     stubs = render_cha_from_content(content)
                     cha_tl_id = f"cha-pg-{pg_tl.id}"
-                    problem_label = cha.problem_name or problem_cosh_id
+                    problem_label = cha.problem_name or cha.problem_cosh_id
                     tl_windows.append(TLWindow(
                         id=cha_tl_id, name=f"CHA — {problem_label}: {pg_tl.name}",
                         from_date=from_d, to_date=to_d,
@@ -2373,6 +2383,11 @@ async def get_today_advisory(
                         practices=stubs, source="CHA",
                     ))
                     tl_date_map[cha_tl_id] = (from_d, to_d, 0)
+                    cha_meta_by_tl_id[cha_tl_id] = {
+                        "problem_name": problem_label,
+                        "triggered_at": cha.triggered_at.isoformat()
+                            if hasattr(cha.triggered_at, "isoformat") else None,
+                    }
             elif cha.recommendation_type == "QA":
                 # UCAT pipe-3: Q&A timelines live in pg_timelines via
                 # standard_response_id. Mirror PG branch but keyed
@@ -2413,6 +2428,11 @@ async def get_today_advisory(
                         practices=stubs, source="QA",
                     ))
                     tl_date_map[cha_tl_id] = (from_d, to_d, 0)
+                    cha_meta_by_tl_id[cha_tl_id] = {
+                        "problem_name": question_label,
+                        "triggered_at": cha.triggered_at.isoformat()
+                            if hasattr(cha.triggered_at, "isoformat") else None,
+                    }
 
         # ── BL-03 deduplication across CCA + CHA timelines ───────────────────
         # Includes a "context-only" pass: timelines referenced by APPROVED
@@ -2517,6 +2537,13 @@ async def get_today_advisory(
             # Per spec §6.4: blank-path questions for this timeline (named, with farmer's answer)
             if tl.id in blank_paths_by_tl:
                 tl_entry["blank_path_questions"] = blank_paths_by_tl[tl.id]
+            # CHA / QA metadata so the PWA can show "FruitFly" alongside
+            # the date band and sort fresh diagnoses to the top of the
+            # list. Only set on CHA/QA-source timelines; CCA gets nothing.
+            cha_meta = cha_meta_by_tl_id.get(tl.id)
+            if cha_meta:
+                tl_entry["problem_name"] = cha_meta["problem_name"]
+                tl_entry["triggered_at"] = cha_meta["triggered_at"]
             timeline_data.append(tl_entry)
 
         out.append({

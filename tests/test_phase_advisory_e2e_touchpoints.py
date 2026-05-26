@@ -192,6 +192,15 @@ f"Got: {list(timelines_by_id)}"
 p["l2_type"] == "NEEM_OIL" for p in rt["practices"]
 ), "Authored QA practice must be present"
 
+    # The PWA renders the problem name under the date band and uses
+    # triggered_at to float fresh CHA/QA timelines to the top.
+    assert rt.get("problem_name"), (
+        f"QA timeline must expose problem_name; got: {rt.get('problem_name')!r}"
+    )
+    assert rt.get("triggered_at"), (
+        f"QA timeline must expose triggered_at; got: {rt.get('triggered_at')!r}"
+    )
+
 
 # ── Test 2: QA window anchors to triggered_at, not crop_start ────────────────
 
