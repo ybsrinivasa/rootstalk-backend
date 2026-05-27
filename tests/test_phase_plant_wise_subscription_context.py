@@ -176,6 +176,25 @@ async def test_my_subscriptions_carries_measure_and_age_plant_wise(db):
 
 @requires_docker
 @pytest.mark.asyncio
+async def test_crop_age_beyond_floor_returns_is_minimum(db):
+    """planting_year < 1970 (the dropdown floor) — set when the
+    farmer picks "Beyond 1970" — returns is_minimum=true with a
+    value clipped at current_year - 1970. PWA renders that as
+    "> N years"."""
+    from datetime import date as _date
+    farmer, sub = await _sub_for_crop(db, CROP_COCONUT, "PLANT_WISE")
+    sub.number_of_plants = 200
+    sub.planting_year = 1969   # sentinel for "Beyond 1970"
+    await db.commit()
+    out = await my_subscriptions(db=db, current_user=farmer)
+    row = next(r for r in out if r["id"] == sub.id)
+    assert row["crop_age"]["unit"] == "years"
+    assert row["crop_age"]["is_minimum"] is True
+    assert row["crop_age"]["value"] == _date.today().year - 1970
+
+
+@requires_docker
+@pytest.mark.asyncio
 async def test_my_subscriptions_handles_untyped_crop_as_area_wise(db):
     """An untyped crop (no entry in `crop_area_plant_wise` Connect)
     defaults to AREA_WISE so legacy data doesn't trip the renderer."""

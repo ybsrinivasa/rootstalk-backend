@@ -2086,24 +2086,44 @@ async def my_subscriptions(
     return out
 
 
+PLANTING_YEAR_FLOOR = 1970   # earliest year exposed in the dropdown
+
+
 def _compute_crop_age(sub: Subscription, measure: str) -> dict | None:
     """Single-source crop-age calc for the Crop Dashboard.
 
     - AREA_WISE: days since crop_start_date.
     - PLANT_WISE: years since planting_year.
+      * If planting_year < PLANTING_YEAR_FLOOR (i.e. the farmer
+        selected "Beyond 1970" — stored as the sentinel 1969 — or
+        any legacy value), the envelope returns the age as
+        `current_year - PLANTING_YEAR_FLOOR` and sets
+        `is_minimum: true`. PWA renders this as "> 56 years"
+        (or whatever the current difference is).
 
-    Returns `{value, unit, source}` or None when the source field is
-    missing. Surfaced on /my-subscriptions and the crop-detail
-    response so multiple consumers don't reimplement.
+    Returns `{value, unit, source, is_minimum}` or None when the
+    source field is missing.
     """
     from datetime import date as _date
     if measure == "PLANT_WISE":
         if sub.planting_year is None:
             return None
-        age_years = _date.today().year - int(sub.planting_year)
+        current_year = _date.today().year
+        py = int(sub.planting_year)
+        if py < PLANTING_YEAR_FLOOR:
+            return {
+                "value": current_year - PLANTING_YEAR_FLOOR,
+                "unit": "years",
+                "source": "PLANTING_YEAR",
+                "is_minimum": True,
+            }
+        age_years = current_year - py
         if age_years < 0:
             return None
-        return {"value": age_years, "unit": "years", "source": "PLANTING_YEAR"}
+        return {
+            "value": age_years, "unit": "years",
+            "source": "PLANTING_YEAR", "is_minimum": False,
+        }
     # AREA_WISE (default)
     if sub.crop_start_date is None:
         return None
@@ -2111,7 +2131,10 @@ def _compute_crop_age(sub: Subscription, measure: str) -> dict | None:
     age_days = (_date.today() - start).days
     if age_days < 0:
         return None
-    return {"value": age_days, "unit": "days", "source": "START_DATE"}
+    return {
+        "value": age_days, "unit": "days",
+        "source": "START_DATE", "is_minimum": False,
+    }
 
 
 # ── CHA: Dismiss and history ──────────────────────────────────────────────────
