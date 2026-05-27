@@ -5,7 +5,7 @@ import razorpay
 from app.config import settings
 
 SUBSCRIPTION_AMOUNT_PAISE = 19900  # Rs. 199.00
-QUERY_AMOUNT_PAISE = 2500          # Rs. 25.00
+QUERY_AMOUNT_PAISE = 2000          # Rs. 20.00 (locked 2026-05-27 per spec)
 
 
 def _client() -> razorpay.Client:

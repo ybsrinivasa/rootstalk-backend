@@ -288,6 +288,61 @@ async def test_quota_flags_paid_after_free_limit(db):
     assert quota["next_query_is_paid"] is True
 
 
+# ── Paywall (Batch 2) ───────────────────────────────────────────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_submit_refuses_402_when_over_quota_without_payment(db):
+    """Past the 6 free queries, a submit without Razorpay artefacts
+    lands a 402 `payment_required`. The PWA reads this and starts
+    the payment flow."""
+    farmer, client, sub = await _farmer_sub(db)
+    await _seed_query_types(db)
+    await db.commit()
+
+    for _ in range(FREE_QUERIES_PER_COMPANY):
+        await submit_query(
+            request=QueryCreate(
+                subscription_id=sub.id, client_id=client.id,
+                query_type_cosh_id=QT_INSECT, severity="MODERATE",
+                media=[_img()],
+            ),
+            db=db, current_user=farmer,
+        )
+    with pytest.raises(HTTPException) as exc:
+        await submit_query(
+            request=QueryCreate(
+                subscription_id=sub.id, client_id=client.id,
+                query_type_cosh_id=QT_INSECT, severity="HIGH",
+                media=[_img()],
+            ),
+            db=db, current_user=farmer,
+        )
+    assert exc.value.status_code == 402
+    assert exc.value.detail["code"] == "payment_required"
+    assert exc.value.detail["price_paise"] == QUERY_PAID_PRICE_PAISE
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_init_payment_refuses_when_free_quota_remains(db):
+    """Init-payment is a no-op when the farmer still has free
+    queries left — the PWA must not pop the Razorpay sheet."""
+    from app.modules.farmpundit.router import (
+        QueryPaymentInit, init_query_payment,
+    )
+    farmer, client, _sub = await _farmer_sub(db)
+    await db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await init_query_payment(
+            request=QueryPaymentInit(client_id=client.id),
+            db=db, current_user=farmer,
+        )
+    assert exc.value.status_code == 422
+    assert exc.value.detail["code"] == "quota_available_no_payment_needed"
+
+
 @requires_docker
 @pytest.mark.asyncio
 async def test_cosh_query_types_returns_sorted_active_only(db):
