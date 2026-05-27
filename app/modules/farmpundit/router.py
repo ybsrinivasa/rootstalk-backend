@@ -2151,24 +2151,78 @@ async def get_query_detail_pundit(
         )).scalar_one_or_none()
         standard_response_question = sr_row.question_text if sr_row else None
 
-    # Resolve Nature of Query → friendly English name so the Pundit
-    # UI can label it "Nature of Query" explicitly. The title column
-    # already carries this English label (auto-derived at submit),
-    # but exposing the cosh_id discretely matches the {cosh_id, name}
-    # envelope used elsewhere.
-    query_type_name = None
-    if query.query_type_cosh_id:
-        from app.modules.sync.models import CoshCoreItem
-        qt_row = (await db.execute(
-            select(CoshCoreItem).where(
-                CoshCoreItem.cosh_id == query.query_type_cosh_id,
-            )
-        )).scalar_one_or_none()
-        if qt_row and isinstance(qt_row.translations, dict):
-            query_type_name = (
-                qt_row.translations.get("en")
-                or qt_row.translations.get("English")
-            )
+    # Batch resolve every Cosh translation the response needs in
+    # one query: query_types (Nature of Query), the crop name, and
+    # the farmer's state + district. Cheaper than three separate
+    # lookups and the union is small.
+    from app.modules.sync.models import CoshCoreItem
+    from app.modules.platform.models import User as _User
+    from app.modules.subscriptions.models import Subscription as _Sub
+    from app.modules.subscriptions.router import _compute_crop_age
+    from app.services.cosh_crop_view import get_measure_for_biological_name
+
+    farmer_user = (await db.execute(
+        select(_User).where(_User.id == query.farmer_user_id)
+    )).scalar_one_or_none()
+    sub_row = (await db.execute(
+        select(_Sub).where(_Sub.id == query.subscription_id)
+    )).scalar_one_or_none()
+
+    ref_ids: set[str] = set()
+    if query.query_type_cosh_id: ref_ids.add(query.query_type_cosh_id)
+    if query.crop_cosh_id: ref_ids.add(query.crop_cosh_id)
+    if farmer_user:
+        if farmer_user.state_cosh_id: ref_ids.add(farmer_user.state_cosh_id)
+        if farmer_user.district_cosh_id: ref_ids.add(farmer_user.district_cosh_id)
+    name_by_cosh_id: dict[str, str] = {}
+    if ref_ids:
+        for cid, tr in (await db.execute(
+            select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
+            .where(CoshCoreItem.cosh_id.in_(ref_ids))
+        )).all():
+            label = (tr or {}).get("en") if isinstance(tr, dict) else None
+            if label:
+                name_by_cosh_id[cid] = label
+
+    query_type_name = (
+        name_by_cosh_id.get(query.query_type_cosh_id)
+        if query.query_type_cosh_id else None
+    )
+    crop_name = (
+        name_by_cosh_id.get(query.crop_cosh_id)
+        if query.crop_cosh_id else None
+    )
+
+    # Crop measure + computed age (years for plant-wise, days for
+    # area-wise). Same `_compute_crop_age` the Crop Dashboard uses
+    # so the Pundit and the farmer see the same number.
+    crop_measure = "AREA_WISE"
+    if query.crop_cosh_id:
+        m = await get_measure_for_biological_name(db, query.crop_cosh_id)
+        crop_measure = m or "AREA_WISE"
+    computed_crop_age = _compute_crop_age(sub_row, crop_measure) if sub_row else None
+
+    # Farmer card — name, phone (always visible to the Pundit who's
+    # responding; phone_hidden on the FarmPundit profile is about
+    # the Pundit's own phone, not the farmer's), address from the
+    # User profile. Pundit can `tel:` the number when needed.
+    farmer_block = None
+    if farmer_user:
+        farmer_block = {
+            "name": farmer_user.name,
+            "phone": farmer_user.phone,
+            "address": {
+                "town": farmer_user.town,
+                "district": (
+                    name_by_cosh_id.get(farmer_user.district_cosh_id)
+                    if farmer_user.district_cosh_id else None
+                ),
+                "state": (
+                    name_by_cosh_id.get(farmer_user.state_cosh_id)
+                    if farmer_user.state_cosh_id else None
+                ),
+            },
+        }
 
     return {
         "id": query.id,
@@ -2182,7 +2236,15 @@ async def get_query_detail_pundit(
         # is client-scoped per spec §14.9).
         "client_id": query.client_id,
         "crop_cosh_id": query.crop_cosh_id,
+        "crop_name": crop_name,
+        "crop_measure": crop_measure,
+        # `crop_age` is the FARMER-TYPED free-text string (e.g. "45 DAS")
+        # — kept for backward compat. `computed_crop_age` is the
+        # server-derived envelope ({value, unit, source}) preferred by
+        # the new UI.
         "crop_age": query.crop_age,
+        "computed_crop_age": computed_crop_age,
+        "farmer": farmer_block,
         "status": query.status,
         "created_at": query.created_at,
         "expires_at": query.expires_at,
