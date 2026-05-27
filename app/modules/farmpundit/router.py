@@ -1036,6 +1036,76 @@ async def respond_to_query(
     return {"status": "RESPONDED", "response_id": response.id}
 
 
+@router.get("/pundit/queries/{query_id}/forward-candidates")
+async def list_forward_candidates(
+    query_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Colleagues at this client the current holder can forward TO.
+
+    Returns active FarmPundits at the query's client (Primary + Panel),
+    excluding the current holder themselves. Sorted PRIMARY first (by
+    round-robin sequence), then PANEL (by name). Phone follows the
+    profile's `phone_hidden` toggle — a Pundit who explicitly hid
+    their phone won't have it shown to colleagues either.
+
+    Auth: caller must be the query's current_holder. A Pundit who
+    isn't holding the query has no business listing potential
+    recipients.
+    """
+    profile = await _get_pundit_profile(db, current_user.id)
+    query = await _get_query(db, query_id)
+    if query.current_holder_id != profile.id:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the current holder can list forward candidates.",
+        )
+
+    rows = (await db.execute(
+        select(ClientFarmPundit).where(
+            ClientFarmPundit.client_id == query.client_id,
+            ClientFarmPundit.status == "ACTIVE",
+            ClientFarmPundit.pundit_id != profile.id,
+        )
+    )).scalars().all()
+    if not rows:
+        return []
+
+    pundit_ids = [r.pundit_id for r in rows]
+    profiles = (await db.execute(
+        select(FarmPunditProfile).where(FarmPunditProfile.id.in_(pundit_ids))
+    )).scalars().all()
+    profile_by_id = {p.id: p for p in profiles}
+    user_ids = [p.user_id for p in profiles]
+    users = (await db.execute(
+        select(User).where(User.id.in_(user_ids))
+    )).scalars().all() if user_ids else []
+    user_by_id = {u.id: u for u in users}
+
+    out = []
+    for r in rows:
+        prof = profile_by_id.get(r.pundit_id)
+        if prof is None:
+            continue
+        user = user_by_id.get(prof.user_id)
+        role = r.role.value if hasattr(r.role, "value") else str(r.role)
+        out.append({
+            "pundit_id": r.pundit_id,
+            "name": user.name if user else None,
+            "phone": (user.phone if (user and not prof.phone_hidden) else None),
+            "role": role,
+            "round_robin_sequence": r.round_robin_sequence,
+        })
+    # Primaries first by round-robin sequence; Panels after, by name.
+    out.sort(key=lambda p: (
+        0 if p["role"] == "PRIMARY" else 1,
+        p["round_robin_sequence"] if p["round_robin_sequence"] is not None else 9999,
+        (p["name"] or "").casefold(),
+    ))
+    return out
+
+
 @router.put("/pundit/queries/{query_id}/forward")
 async def forward_query(
     query_id: str,
