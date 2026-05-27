@@ -2151,9 +2151,30 @@ async def get_query_detail_pundit(
         )).scalar_one_or_none()
         standard_response_question = sr_row.question_text if sr_row else None
 
+    # Resolve Nature of Query → friendly English name so the Pundit
+    # UI can label it "Nature of Query" explicitly. The title column
+    # already carries this English label (auto-derived at submit),
+    # but exposing the cosh_id discretely matches the {cosh_id, name}
+    # envelope used elsewhere.
+    query_type_name = None
+    if query.query_type_cosh_id:
+        from app.modules.sync.models import CoshCoreItem
+        qt_row = (await db.execute(
+            select(CoshCoreItem).where(
+                CoshCoreItem.cosh_id == query.query_type_cosh_id,
+            )
+        )).scalar_one_or_none()
+        if qt_row and isinstance(qt_row.translations, dict):
+            query_type_name = (
+                qt_row.translations.get("en")
+                or qt_row.translations.get("English")
+            )
+
     return {
         "id": query.id,
         "title": query.title,
+        "query_type_cosh_id": query.query_type_cosh_id,
+        "query_type_name": query_type_name,
         "description": query.description,
         "severity": query.severity,
         # client_id surfaces to the response screen so it can search
