@@ -410,12 +410,60 @@ async def invite_pundit(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Send a PENDING invitation to a FarmPundit.
+
+    Refuses with 409 when the (client, pundit) pair already has:
+      - an in-flight PENDING invitation (`invitation_already_pending`)
+      - an ACTIVE ClientFarmPundit row (`pundit_already_onboarded`)
+
+    A previously REJECTED invitation does NOT block — the CA can
+    re-invite at will (user direction 2026-05-27).
+    """
     await _assert_portal_member(db, current_user.id, client_id)
     profile = (await db.execute(
         select(FarmPunditProfile).where(FarmPunditProfile.user_id == request.pundit_user_id)
     )).scalar_one_or_none()
     if not profile:
         raise HTTPException(status_code=404, detail="FarmPundit profile not found")
+
+    # Already onboarded with this client? 409 — onboarding is the
+    # terminal accepted state; "Onboarded" is the search-card label.
+    existing_active = (await db.execute(
+        select(ClientFarmPundit.id).where(
+            ClientFarmPundit.client_id == client_id,
+            ClientFarmPundit.pundit_id == profile.id,
+            ClientFarmPundit.status == "ACTIVE",
+        ).limit(1)
+    )).scalar_one_or_none()
+    if existing_active is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "pundit_already_onboarded",
+                "message": "This FarmPundit is already onboarded with your company.",
+            },
+        )
+
+    # In-flight PENDING invitation? 409. REJECTED rows are ignored —
+    # re-invite is allowed after rejection.
+    existing_pending = (await db.execute(
+        select(PunditInvitation.id).where(
+            PunditInvitation.client_id == client_id,
+            PunditInvitation.pundit_id == profile.id,
+            PunditInvitation.status == "PENDING",
+        ).limit(1)
+    )).scalar_one_or_none()
+    if existing_pending is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "invitation_already_pending",
+                "message": (
+                    "An invitation is already pending. Wait for the expert "
+                    "to accept or decline before re-inviting."
+                ),
+            },
+        )
 
     invitation = PunditInvitation(
         client_id=client_id,
@@ -1157,51 +1205,90 @@ async def search_pundits(
             }
             profiles = [p for p in profiles if p.id in cg_pundit_ids]
 
-    # Already onboarded by this client?
+    # Per-pundit invitation state with this client. ACTIVE membership
+    # is terminal-accepted; a PENDING invitation is in-flight. REJECTED
+    # rows don't surface here — re-invite is allowed after a decline.
     onboarded_ids = {
         r.pundit_id for r in (await db.execute(
-            select(ClientFarmPundit).where(ClientFarmPundit.client_id == client_id)
+            select(ClientFarmPundit).where(
+                ClientFarmPundit.client_id == client_id,
+                ClientFarmPundit.status == "ACTIVE",
+            )
+        )).scalars().all()
+    }
+    pending_invited_ids = {
+        r.pundit_id for r in (await db.execute(
+            select(PunditInvitation).where(
+                PunditInvitation.client_id == client_id,
+                PunditInvitation.status == "PENDING",
+            )
         )).scalars().all()
     }
 
-    # Resolve education + experience cosh_ids to friendly names so
-    # the CA portal search results show "Masters" / "5 to 10 years"
-    # instead of UUIDs.
+    # Resolve the address cosh_ids (state + district from the User's
+    # *profile data*, NOT from the FP register form's support_areas).
+    # Result cards just need to show where the expert lives — search
+    # criteria themselves stay visible on the form.
     from app.modules.sync.models import CoshCoreItem
-    ref_ids = {p.education_cosh_id for p in profiles if p.education_cosh_id} | {
-        p.experience_cosh_id for p in profiles if p.experience_cosh_id
-    }
+    users_by_id: dict[str, User] = {}
+    if profiles:
+        for u in (await db.execute(
+            select(User).where(User.id.in_({p.user_id for p in profiles}))
+        )).scalars().all():
+            users_by_id[u.id] = u
+
+    address_ids: set[str] = set()
+    for u in users_by_id.values():
+        if u.state_cosh_id: address_ids.add(u.state_cosh_id)
+        if u.district_cosh_id: address_ids.add(u.district_cosh_id)
     name_by_cosh_id: dict[str, str] = {}
-    if ref_ids:
+    if address_ids:
         for cosh_id, translations in (await db.execute(
             select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
-            .where(CoshCoreItem.cosh_id.in_(ref_ids))
+            .where(
+                CoshCoreItem.cosh_id.in_(address_ids),
+                CoshCoreItem.core_type.in_(["state_list", "district_list"]),
+            )
         )).all():
             if isinstance(translations, dict):
                 label = translations.get("en") or translations.get("English")
                 if label:
                     name_by_cosh_id[cosh_id] = label
 
+    def _invitation_status(pundit_id: str) -> str:
+        if pundit_id in onboarded_ids:
+            return "ONBOARDED"
+        if pundit_id in pending_invited_ids:
+            return "PENDING"
+        return "NONE"
+
     result_out = []
     for p in profiles:
-        user = (await db.execute(select(User).where(User.id == p.user_id))).scalar_one_or_none()
+        user = users_by_id.get(p.user_id)
         result_out.append({
             "id": p.id,
             "user_id": p.user_id,
             "name": user.name if user else None,
             "phone": user.phone if (user and not p.phone_hidden) else None,
             "email": p.email,
-            "education": (
-                {"cosh_id": p.education_cosh_id,
-                 "name": name_by_cosh_id.get(p.education_cosh_id)}
-                if p.education_cosh_id else None
-            ),
-            "experience": (
-                {"cosh_id": p.experience_cosh_id,
-                 "name": name_by_cosh_id.get(p.experience_cosh_id)}
-                if p.experience_cosh_id else None
-            ),
-            "already_onboarded": p.id in onboarded_ids,
+            "address": {
+                # Address comes from User profile (initial signup),
+                # not from the FP register form. Any field may be null
+                # if the User hasn't completed their address yet.
+                "line": (user.address_line if user else None),
+                "locality": (user.locality if user else None),
+                "town": (user.town if user else None),
+                "pin_code": (user.pin_code if user else None),
+                "district": (
+                    name_by_cosh_id.get(user.district_cosh_id)
+                    if (user and user.district_cosh_id) else None
+                ),
+                "state": (
+                    name_by_cosh_id.get(user.state_cosh_id)
+                    if (user and user.state_cosh_id) else None
+                ),
+            } if user else None,
+            "invitation_status": _invitation_status(p.id),
         })
     return result_out
 
@@ -1244,6 +1331,167 @@ async def list_company_pundits(
             "onboarded_at": cp.onboarded_at,
         })
     return out
+
+
+@router.get("/client/{client_id}/pundits/{cp_id}/profile")
+async def get_company_pundit_profile(
+    client_id: str,
+    cp_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Full Cosh-resolved profile of an onboarded FarmPundit.
+
+    The CA drills in from the My Experts row to see the expert's
+    full registration data (latest — no caching, read straight from
+    the DB). Scoped to the path-client so a CA can't peek at
+    another company's Pundits via id-guessing; `cp_id` must belong
+    to `client_id`.
+
+    Response shape mirrors the Pundit's own `GET /pundit/profile`
+    so the CA modal can reuse the same render logic the Pundit's
+    PWA already uses.
+    """
+    await _assert_portal_member(db, current_user.id, client_id)
+
+    cp = (await db.execute(
+        select(ClientFarmPundit).where(
+            ClientFarmPundit.id == cp_id,
+            ClientFarmPundit.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if not cp:
+        raise HTTPException(status_code=404, detail={
+            "code": "pundit_not_in_client",
+            "message": "FarmPundit not found in this company.",
+        })
+
+    profile = (await db.execute(
+        select(FarmPunditProfile).where(FarmPunditProfile.id == cp.pundit_id)
+    )).scalar_one_or_none()
+    if not profile:
+        raise HTTPException(status_code=404, detail="FarmPundit profile not found")
+
+    user = (await db.execute(
+        select(User).where(User.id == profile.user_id)
+    )).scalar_one_or_none()
+
+    domains = (await db.execute(
+        select(FarmPunditExpertise).where(FarmPunditExpertise.pundit_id == profile.id)
+    )).scalars().all()
+    areas = (await db.execute(
+        select(FarmPunditSupportArea).where(FarmPunditSupportArea.pundit_id == profile.id)
+    )).scalars().all()
+    langs = (await db.execute(
+        select(FarmPunditLanguage).where(FarmPunditLanguage.pundit_id == profile.id)
+    )).scalars().all()
+    crop_groups = (await db.execute(
+        select(FarmPunditCropGroup).where(FarmPunditCropGroup.pundit_id == profile.id)
+    )).scalars().all()
+    farming_methods = (await db.execute(
+        select(FarmPunditFarmingMethod).where(FarmPunditFarmingMethod.pundit_id == profile.id)
+    )).scalars().all()
+    cultivation_types = (await db.execute(
+        select(FarmPunditCultivationType).where(FarmPunditCultivationType.pundit_id == profile.id)
+    )).scalars().all()
+
+    from app.modules.sync.models import CoshCoreItem
+    ref_ids: set[str] = set()
+    for sid in (profile.education_cosh_id, profile.experience_cosh_id,
+                profile.organisation_type_cosh_id):
+        if sid: ref_ids.add(sid)
+    for a in areas:
+        if a.state_cosh_id: ref_ids.add(a.state_cosh_id)
+        if a.district_cosh_id: ref_ids.add(a.district_cosh_id)
+    for fm in farming_methods: ref_ids.add(fm.farming_method_cosh_id)
+    for ct in cultivation_types: ref_ids.add(ct.cultivation_type_cosh_id)
+    for d in domains: ref_ids.add(d.domain)
+    for cg in crop_groups: ref_ids.add(cg.crop_group_cosh_id)
+    for l in langs: ref_ids.add(l.language_code)
+    if user:
+        if user.state_cosh_id: ref_ids.add(user.state_cosh_id)
+        if user.district_cosh_id: ref_ids.add(user.district_cosh_id)
+
+    name_by_cosh_id: dict[str, str] = {}
+    if ref_ids:
+        for cosh_id, translations in (await db.execute(
+            select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
+            .where(CoshCoreItem.cosh_id.in_(ref_ids))
+        )).all():
+            if isinstance(translations, dict):
+                label = translations.get("en") or translations.get("English")
+                if label:
+                    name_by_cosh_id[cosh_id] = label
+
+    def _named(cosh_id: Optional[str]) -> Optional[dict]:
+        if not cosh_id:
+            return None
+        return {"cosh_id": cosh_id, "name": name_by_cosh_id.get(cosh_id)}
+
+    return {
+        "id": profile.id,
+        "user_id": profile.user_id,
+        "name": user.name if user else None,
+        # Phone surfaces only when the Pundit hasn't toggled phone-hidden.
+        # CA sees the same privacy state the search results enforce.
+        "phone": user.phone if (user and not profile.phone_hidden) else None,
+        "email": profile.email,
+        "address": {
+            "line": user.address_line if user else None,
+            "locality": user.locality if user else None,
+            "town": user.town if user else None,
+            "pin_code": user.pin_code if user else None,
+            "district": (
+                name_by_cosh_id.get(user.district_cosh_id)
+                if (user and user.district_cosh_id) else None
+            ),
+            "state": (
+                name_by_cosh_id.get(user.state_cosh_id)
+                if (user and user.state_cosh_id) else None
+            ),
+        } if user else None,
+        "education": _named(profile.education_cosh_id),
+        "experience": _named(profile.experience_cosh_id),
+        "is_employed_by_organization": profile.is_employed_by_organization,
+        "organisation_type": _named(profile.organisation_type_cosh_id),
+        "non_employed_kind": profile.non_employed_kind,
+        "farming_methods": [
+            {"cosh_id": fm.farming_method_cosh_id,
+             "name": name_by_cosh_id.get(fm.farming_method_cosh_id)}
+            for fm in farming_methods
+        ],
+        "cultivation_types": [
+            {"cosh_id": ct.cultivation_type_cosh_id,
+             "name": name_by_cosh_id.get(ct.cultivation_type_cosh_id)}
+            for ct in cultivation_types
+        ],
+        "expertise_domains": [
+            {"cosh_id": d.domain, "name": name_by_cosh_id.get(d.domain)}
+            for d in domains
+        ],
+        "crop_groups": [
+            {"cosh_id": c.crop_group_cosh_id,
+             "name": name_by_cosh_id.get(c.crop_group_cosh_id)}
+            for c in crop_groups
+        ],
+        "languages": [
+            {"cosh_id": l.language_code,
+             "name": name_by_cosh_id.get(l.language_code)}
+            for l in langs
+        ],
+        "support_areas": [{
+            "state_cosh_id": a.state_cosh_id,
+            "state_name": name_by_cosh_id.get(a.state_cosh_id),
+            "district_cosh_id": a.district_cosh_id,
+            "district_name": name_by_cosh_id.get(a.district_cosh_id) if a.district_cosh_id else None,
+        } for a in areas],
+        # Companion fields the CA may want to see at a glance.
+        "role": cp.role,
+        "status": cp.status,
+        "round_robin_sequence": cp.round_robin_sequence,
+        "is_promoter_pundit": cp.is_promoter_pundit,
+        "onboarded_at": cp.onboarded_at,
+    }
 
 
 @router.get("/client/{client_id}/pundit-invitations")
