@@ -60,9 +60,22 @@ class Subscription(Base):
     promoter_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
     subscription_type: Mapped[SubscriptionType] = mapped_column(String(20), nullable=False)
     status: Mapped[SubscriptionStatus] = mapped_column(String(20), default=SubscriptionStatus.WAITLISTED)
+    # Area-wise crop context. Used by volume calcs that multiply
+    # per-acre dosage by acreage. Set + locked via the
+    # /farm-area + /farm-area/confirm endpoints. Stays NULL for
+    # plant-wise crops.
     farm_area_acres: Mapped[float] = mapped_column(DECIMAL(10, 2), nullable=True)
     area_unit: Mapped[str] = mapped_column(String(20), nullable=True, default="acres")
     farm_area_confirmed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Plant-wise crop context (2026-05-27). Mirrors farm_area_acres
+    # + farm_area_confirmed_at for perennial / plant-wise crops where
+    # per-plant dosage + total plant count drive the volume calc
+    # instead of acreage. planting_year is just the integer year
+    # (e.g. 2015) — perennial age is rounded to years. Stays NULL
+    # for area-wise crops.
+    number_of_plants: Mapped[int] = mapped_column(Integer, nullable=True)
+    planting_year: Mapped[int] = mapped_column(Integer, nullable=True)
+    plant_count_confirmed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     crop_start_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     # Stamped on the FIRST PUT /start-date for this subscription.
     # Drives the 15-day edit window: farmer can change crop_start_date

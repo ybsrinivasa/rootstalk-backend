@@ -2043,17 +2043,37 @@ async def my_subscriptions(
 
     # ── Compose response. ─────────────────────────────────────────
     out = []
+    # Per-crop AREA_WISE / PLANT_WISE measure from Cosh. Drives the
+    # Crop Dashboard's conditional fields. Untyped crops default to
+    # AREA_WISE so legacy data renders correctly.
+    from app.services.cosh_crop_view import get_measure_for_biological_name
+    measure_by_crop: dict[str, str] = {}
+    for cid in crop_ids:
+        if cid:
+            measure = await get_measure_for_biological_name(db, cid)
+            measure_by_crop[cid] = measure or "AREA_WISE"
+
     for s in subs:
         pkg_name, crop_cosh_id = pkg_by_id.get(s.package_id, (None, None))
         client = client_info_by_id.get(s.client_id, {})
+        measure = measure_by_crop.get(crop_cosh_id, "AREA_WISE") if crop_cosh_id else "AREA_WISE"
         out.append({
             "id": s.id, "client_id": s.client_id, "package_id": s.package_id,
             "status": s.status, "crop_start_date": s.crop_start_date,
             "crop_start_date_first_set_at": s.crop_start_date_first_set_at,
             "reference_number": s.reference_number, "subscription_type": s.subscription_type,
+            # Area-wise context
             "farm_area_acres": float(s.farm_area_acres) if s.farm_area_acres is not None else None,
             "area_unit": s.area_unit,
             "farm_area_confirmed_at": s.farm_area_confirmed_at,
+            # Plant-wise context (2026-05-27)
+            "number_of_plants": s.number_of_plants,
+            "planting_year": s.planting_year,
+            "plant_count_confirmed_at": s.plant_count_confirmed_at,
+            # Crop typing — area-wise vs plant-wise. PWA renders the
+            # right input set per this value.
+            "crop_measure": measure,
+            "crop_age": _compute_crop_age(s, measure),
             "package_name": pkg_name,
             "crop_cosh_id": crop_cosh_id,
             "crop_name": crop_name_by_id.get(crop_cosh_id) if crop_cosh_id else None,
@@ -2064,6 +2084,34 @@ async def my_subscriptions(
             "pending_payment_from": pending_delegate_by_sub_id.get(s.id),
         })
     return out
+
+
+def _compute_crop_age(sub: Subscription, measure: str) -> dict | None:
+    """Single-source crop-age calc for the Crop Dashboard.
+
+    - AREA_WISE: days since crop_start_date.
+    - PLANT_WISE: years since planting_year.
+
+    Returns `{value, unit, source}` or None when the source field is
+    missing. Surfaced on /my-subscriptions and the crop-detail
+    response so multiple consumers don't reimplement.
+    """
+    from datetime import date as _date
+    if measure == "PLANT_WISE":
+        if sub.planting_year is None:
+            return None
+        age_years = _date.today().year - int(sub.planting_year)
+        if age_years < 0:
+            return None
+        return {"value": age_years, "unit": "years", "source": "PLANTING_YEAR"}
+    # AREA_WISE (default)
+    if sub.crop_start_date is None:
+        return None
+    start = sub.crop_start_date.date() if hasattr(sub.crop_start_date, "date") else sub.crop_start_date
+    age_days = (_date.today() - start).days
+    if age_days < 0:
+        return None
+    return {"value": age_days, "unit": "days", "source": "START_DATE"}
 
 
 # ── CHA: Dismiss and history ──────────────────────────────────────────────────
@@ -3078,6 +3126,63 @@ async def check_seed_availability(
 
 # ── Farmer: Update tentative/soft-confirmed farm area (does not lock) ────────
 
+async def _assert_area_wise_or_untyped(db: AsyncSession, sub: Subscription) -> None:
+    """Refuse the call when the subscription's crop is PLANT_WISE.
+
+    Lenient direction (2026-05-27): we don't auto-null any
+    farm_area_acres value that may already exist on a plant-wise
+    subscription (legacy / Cosh-reclassified), but a fresh write to
+    the area-wise endpoints is refused so we don't compound the
+    drift. Untyped crops fall back to area-wise so the write goes
+    through.
+    """
+    from app.services.cosh_crop_view import get_measure_for_biological_name
+    from app.modules.advisory.models import Package as _Pkg
+    pkg = (await db.execute(
+        select(_Pkg).where(_Pkg.id == sub.package_id)
+    )).scalar_one_or_none()
+    if pkg is None or not pkg.crop_cosh_id:
+        return  # No crop to look up; permit the write.
+    measure = await get_measure_for_biological_name(db, pkg.crop_cosh_id)
+    if measure == "PLANT_WISE":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "wrong_measure_for_area_endpoint",
+                "message": (
+                    "This crop is plant-wise. Use the plant-count "
+                    "endpoints instead of the farm-area endpoints."
+                ),
+            },
+        )
+
+
+async def _assert_plant_wise_or_untyped(db: AsyncSession, sub: Subscription) -> None:
+    """Refuse the call when the subscription's crop is AREA_WISE.
+    Mirror of `_assert_area_wise_or_untyped` for the plant-count
+    endpoints. Untyped crops are tolerated (default area-wise) — a
+    plant-count write on an untyped crop is permitted but unusual."""
+    from app.services.cosh_crop_view import get_measure_for_biological_name
+    from app.modules.advisory.models import Package as _Pkg
+    pkg = (await db.execute(
+        select(_Pkg).where(_Pkg.id == sub.package_id)
+    )).scalar_one_or_none()
+    if pkg is None or not pkg.crop_cosh_id:
+        return
+    measure = await get_measure_for_biological_name(db, pkg.crop_cosh_id)
+    if measure == "AREA_WISE":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "wrong_measure_for_plant_endpoint",
+                "message": (
+                    "This crop is area-wise. Use the farm-area "
+                    "endpoints instead of the plant-count endpoints."
+                ),
+            },
+        )
+
+
 @router.put("/farmer/subscriptions/{subscription_id}/farm-area")
 async def update_farm_area(
     subscription_id: str,
@@ -3087,6 +3192,7 @@ async def update_farm_area(
 ):
     """Update tentative or soft-confirmed farm area. Rejected if hard-locked."""
     sub = await _get_subscription(db, subscription_id, current_user.id)
+    await _assert_area_wise_or_untyped(db, sub)
     if sub.farm_area_confirmed_at:
         raise HTTPException(status_code=400, detail="Farm area is locked and cannot be changed")
     new_area = data.get("farm_area_acres")
@@ -3100,6 +3206,77 @@ async def update_farm_area(
         "farm_area_acres": float(sub.farm_area_acres),
         "area_unit": sub.area_unit,
         "farm_area_confirmed_at": sub.farm_area_confirmed_at,
+    }
+
+
+# ── Farmer: Plant count + planting year (plant-wise crops) ───────────────────
+
+@router.put("/farmer/subscriptions/{subscription_id}/plant-count")
+async def update_plant_count(
+    subscription_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Update tentative or soft-confirmed plant count + planting year.
+
+    Plant-wise mirror of /farm-area. Refuses 400 if locked
+    (`plant_count_confirmed_at`). At least one of (number_of_plants,
+    planting_year) must be present in the payload.
+    """
+    sub = await _get_subscription(db, subscription_id, current_user.id)
+    await _assert_plant_wise_or_untyped(db, sub)
+    if sub.plant_count_confirmed_at:
+        raise HTTPException(status_code=400, detail="Plant count is locked and cannot be changed")
+    n = data.get("number_of_plants")
+    y = data.get("planting_year")
+    if n is None and y is None:
+        raise HTTPException(
+            status_code=422,
+            detail="At least one of number_of_plants / planting_year required",
+        )
+    if n is not None:
+        if not isinstance(n, int) or n <= 0:
+            raise HTTPException(status_code=422, detail="number_of_plants must be a positive integer")
+        sub.number_of_plants = n
+    if y is not None:
+        if not isinstance(y, int) or y < 1900 or y > 2100:
+            raise HTTPException(status_code=422, detail="planting_year must be a year between 1900 and 2100")
+        sub.planting_year = y
+    await db.commit()
+    return {
+        "number_of_plants": sub.number_of_plants,
+        "planting_year": sub.planting_year,
+        "plant_count_confirmed_at": sub.plant_count_confirmed_at,
+    }
+
+
+@router.post("/farmer/subscriptions/{subscription_id}/plant-count/confirm")
+async def confirm_plant_count(
+    subscription_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Hard-lock the plant count + planting year. Mirror of
+    /farm-area/confirm. Both fields must be set before confirmation."""
+    sub = await _get_subscription(db, subscription_id, current_user.id)
+    await _assert_plant_wise_or_untyped(db, sub)
+    if data.get("number_of_plants") is not None:
+        sub.number_of_plants = data["number_of_plants"]
+    if data.get("planting_year") is not None:
+        sub.planting_year = data["planting_year"]
+    if not sub.number_of_plants or not sub.planting_year:
+        raise HTTPException(
+            status_code=422,
+            detail="Both number_of_plants and planting_year are required to confirm",
+        )
+    sub.plant_count_confirmed_at = datetime.now(timezone.utc)
+    await db.commit()
+    return {
+        "number_of_plants": sub.number_of_plants,
+        "planting_year": sub.planting_year,
+        "confirmed_at": sub.plant_count_confirmed_at,
     }
 
 
