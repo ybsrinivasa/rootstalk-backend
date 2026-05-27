@@ -1307,6 +1307,25 @@ async def list_company_pundits(
         .order_by(ClientFarmPundit.onboarded_at)
     )
     pundits = result.scalars().all()
+
+    # Pre-fetch the set of user_ids that satisfy the M5 / spec §14.2
+    # eligibility for Promoter-Pundit at this client: ACTIVE
+    # Facilitator-type ClientPromoter row with is_promoter=True. The
+    # CA portal uses this to gate the Mark-PP button — clicking it
+    # for an ineligible Pundit otherwise lands a 422 / 409 with the
+    # `promoter_pundit_requires_facilitator_promoter` code.
+    from app.modules.clients.models import ClientPromoter
+    pp_eligible_user_ids = {
+        r.user_id for r in (await db.execute(
+            select(ClientPromoter).where(
+                ClientPromoter.client_id == client_id,
+                ClientPromoter.promoter_type == "FACILITATOR",
+                ClientPromoter.status == "ACTIVE",
+                ClientPromoter.is_promoter == True,  # noqa: E712
+            )
+        )).scalars().all()
+    }
+
     out = []
     for cp in pundits:
         profile = (await db.execute(
@@ -1326,6 +1345,9 @@ async def list_company_pundits(
             "role": cp.role,
             "status": cp.status,
             "is_promoter_pundit": cp.is_promoter_pundit,
+            "can_be_promoter_pundit": (
+                user is not None and user.id in pp_eligible_user_ids
+            ),
             "round_robin_sequence": cp.round_robin_sequence,
             "active_query_count": active_query_count,
             "onboarded_at": cp.onboarded_at,

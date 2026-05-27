@@ -261,6 +261,60 @@ async def test_company_pundit_profile_returns_full_resolved_shape(db):
 
 @requires_docker
 @pytest.mark.asyncio
+async def test_list_company_pundits_flags_pp_eligibility(db):
+    """`can_be_promoter_pundit` mirrors the M5 server-side gate so the
+    CA portal can hide the Mark-PP button when the Pundit isn't an
+    ACTIVE Facilitator-Promoter at this client. Otherwise the button
+    is offered, clicked, and the user gets a confusing 409."""
+    from app.modules.clients.models import ClientPromoter
+    from app.modules.farmpundit.router import list_company_pundits
+
+    client = await make_client(db)
+
+    # Pundit A: a Facilitator-Promoter at this client → eligible.
+    user_a, profile_a = await _seed_pundit(db, name="FP-A (Facilitator)", user_phone="+91A")
+    db.add(ClientPromoter(
+        client_id=client.id, user_id=user_a.id,
+        promoter_type="FACILITATOR", status="ACTIVE", is_promoter=True,
+    ))
+    db.add(ClientFarmPundit(
+        client_id=client.id, pundit_id=profile_a.id,
+        role=PunditRole.PRIMARY, status="ACTIVE", round_robin_sequence=1,
+    ))
+
+    # Pundit B: NOT a Facilitator at this client → ineligible.
+    _, profile_b = await _seed_pundit(db, name="FP-B (just Pundit)", user_phone="+91B")
+    db.add(ClientFarmPundit(
+        client_id=client.id, pundit_id=profile_b.id,
+        role=PunditRole.PANEL, status="ACTIVE", round_robin_sequence=None,
+    ))
+
+    # Pundit C: Facilitator but is_promoter=False (Option C separation)
+    # → ineligible. Onboarded ≠ Promoter.
+    user_c, profile_c = await _seed_pundit(db, name="FP-C (Facilitator-only)", user_phone="+91C")
+    db.add(ClientPromoter(
+        client_id=client.id, user_id=user_c.id,
+        promoter_type="FACILITATOR", status="ACTIVE", is_promoter=False,
+    ))
+    db.add(ClientFarmPundit(
+        client_id=client.id, pundit_id=profile_c.id,
+        role=PunditRole.PANEL, status="ACTIVE", round_robin_sequence=None,
+    ))
+
+    await db.commit()
+
+    out = await list_company_pundits(
+        client_id=client.id, db=db,
+        current_user=await _ca_user_for(db, client=client),
+    )
+    by_name = {r["name"]: r for r in out}
+    assert by_name["FP-A (Facilitator)"]["can_be_promoter_pundit"] is True
+    assert by_name["FP-B (just Pundit)"]["can_be_promoter_pundit"] is False
+    assert by_name["FP-C (Facilitator-only)"]["can_be_promoter_pundit"] is False
+
+
+@requires_docker
+@pytest.mark.asyncio
 async def test_company_pundit_profile_refuses_cross_client_id(db):
     """CA of client A cannot view a Pundit onboarded only at client B
     by guessing the cp_id."""
