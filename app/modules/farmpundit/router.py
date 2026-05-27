@@ -1057,89 +1057,105 @@ async def search_pundits(
         cultivation_types → multi-select; pundit matches if ANY value
         intersects the filter list
       - education / experience → single-select cosh_id picks
-      - phone → free-text search aid (not in spec)
+      - phone → independent quick-lookup (NOT a refinement)
 
     `declaration_accepted=True` is the registration-complete gate.
     Empty filter list / null single-filter = no filter applied.
+
+    Phone is independent: when `phone` is non-empty the other filters
+    are ignored entirely and results are everyone whose phone
+    contains the query. This matches the "find a specific person by
+    number" mental model (user direction 2026-05-27). The other
+    filters only matter when phone is blank.
     """
     await _assert_portal_member(db, current_user.id, client_id)
-    q = select(FarmPunditProfile).where(FarmPunditProfile.declaration_accepted == True)  # noqa: E712
-    if education_cosh_id:
-        q = q.where(FarmPunditProfile.education_cosh_id == education_cosh_id)
-    if experience_cosh_id:
-        q = q.where(FarmPunditProfile.experience_cosh_id == experience_cosh_id)
-
-    profiles = (await db.execute(q)).scalars().all()
-
-    # Multi-value filters for the two new Cosh-backed lists.
-    if farming_methods:
-        fm_ids = {
-            r.pundit_id for r in (await db.execute(
-                select(FarmPunditFarmingMethod).where(
-                    FarmPunditFarmingMethod.farming_method_cosh_id.in_(farming_methods)
-                )
-            )).scalars().all()
-        }
-        profiles = [p for p in profiles if p.id in fm_ids]
-    if cultivation_types:
-        ct_ids = {
-            r.pundit_id for r in (await db.execute(
-                select(FarmPunditCultivationType).where(
-                    FarmPunditCultivationType.cultivation_type_cosh_id.in_(cultivation_types)
-                )
-            )).scalars().all()
-        }
-        profiles = [p for p in profiles if p.id in ct_ids]
-
-    # Multi-value filters resolved via membership in the joined table.
-    # Each multi-filter intersects with the running profile set.
-    if state_cosh_ids:
-        area_pundit_ids = {
-            r.pundit_id for r in (await db.execute(
-                select(FarmPunditSupportArea).where(
-                    FarmPunditSupportArea.state_cosh_id.in_(state_cosh_ids)
-                )
-            )).scalars().all()
-        }
-        profiles = [p for p in profiles if p.id in area_pundit_ids]
-
-    if expertise_domains:
-        domain_pundit_ids = {
-            r.pundit_id for r in (await db.execute(
-                select(FarmPunditExpertise).where(
-                    FarmPunditExpertise.domain.in_(expertise_domains)
-                )
-            )).scalars().all()
-        }
-        profiles = [p for p in profiles if p.id in domain_pundit_ids]
-
-    if language_codes:
-        lang_pundit_ids = {
-            r.pundit_id for r in (await db.execute(
-                select(FarmPunditLanguage).where(
-                    FarmPunditLanguage.language_code.in_(language_codes)
-                )
-            )).scalars().all()
-        }
-        profiles = [p for p in profiles if p.id in lang_pundit_ids]
-
-    if crop_groups:
-        cg_pundit_ids = {
-            r.pundit_id for r in (await db.execute(
-                select(FarmPunditCropGroup).where(
-                    FarmPunditCropGroup.crop_group_cosh_id.in_(crop_groups)
-                )
-            )).scalars().all()
-        }
-        profiles = [p for p in profiles if p.id in cg_pundit_ids]
 
     if phone:
+        # Independent quick-lookup path. Every other filter is ignored.
         phone_user_ids = {
             u.id for u in (await db.execute(
                 select(User).where(User.phone.like(f"%{phone}%"))
             )).scalars().all()
         }
-        profiles = [p for p in profiles if p.user_id in phone_user_ids]
+        if not phone_user_ids:
+            profiles = []
+        else:
+            profiles = (await db.execute(
+                select(FarmPunditProfile).where(
+                    FarmPunditProfile.declaration_accepted == True,  # noqa: E712
+                    FarmPunditProfile.user_id.in_(phone_user_ids),
+                )
+            )).scalars().all()
+    else:
+        q = select(FarmPunditProfile).where(FarmPunditProfile.declaration_accepted == True)  # noqa: E712
+        if education_cosh_id:
+            q = q.where(FarmPunditProfile.education_cosh_id == education_cosh_id)
+        if experience_cosh_id:
+            q = q.where(FarmPunditProfile.experience_cosh_id == experience_cosh_id)
+
+        profiles = (await db.execute(q)).scalars().all()
+
+        # Multi-value filters for the two new Cosh-backed lists.
+        if farming_methods:
+            fm_ids = {
+                r.pundit_id for r in (await db.execute(
+                    select(FarmPunditFarmingMethod).where(
+                        FarmPunditFarmingMethod.farming_method_cosh_id.in_(farming_methods)
+                    )
+                )).scalars().all()
+            }
+            profiles = [p for p in profiles if p.id in fm_ids]
+        if cultivation_types:
+            ct_ids = {
+                r.pundit_id for r in (await db.execute(
+                    select(FarmPunditCultivationType).where(
+                        FarmPunditCultivationType.cultivation_type_cosh_id.in_(cultivation_types)
+                    )
+                )).scalars().all()
+            }
+            profiles = [p for p in profiles if p.id in ct_ids]
+
+        # Multi-value filters resolved via membership in the joined table.
+        # Each multi-filter intersects with the running profile set.
+        if state_cosh_ids:
+            area_pundit_ids = {
+                r.pundit_id for r in (await db.execute(
+                    select(FarmPunditSupportArea).where(
+                        FarmPunditSupportArea.state_cosh_id.in_(state_cosh_ids)
+                    )
+                )).scalars().all()
+            }
+            profiles = [p for p in profiles if p.id in area_pundit_ids]
+
+        if expertise_domains:
+            domain_pundit_ids = {
+                r.pundit_id for r in (await db.execute(
+                    select(FarmPunditExpertise).where(
+                        FarmPunditExpertise.domain.in_(expertise_domains)
+                    )
+                )).scalars().all()
+            }
+            profiles = [p for p in profiles if p.id in domain_pundit_ids]
+
+        if language_codes:
+            lang_pundit_ids = {
+                r.pundit_id for r in (await db.execute(
+                    select(FarmPunditLanguage).where(
+                        FarmPunditLanguage.language_code.in_(language_codes)
+                    )
+                )).scalars().all()
+            }
+            profiles = [p for p in profiles if p.id in lang_pundit_ids]
+
+        if crop_groups:
+            cg_pundit_ids = {
+                r.pundit_id for r in (await db.execute(
+                    select(FarmPunditCropGroup).where(
+                        FarmPunditCropGroup.crop_group_cosh_id.in_(crop_groups)
+                    )
+                )).scalars().all()
+            }
+            profiles = [p for p in profiles if p.id in cg_pundit_ids]
 
     # Already onboarded by this client?
     onboarded_ids = {

@@ -236,6 +236,71 @@ async def test_search_empty_filters_returns_all_with_declaration(db):
     assert "A" in names and "B" in names and "C" not in names
 
 
+# ── Phone is an independent quick-lookup (2026-05-27) ──────────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_phone_search_ignores_other_filters(db):
+    """When `phone` is non-empty the other filters MUST be ignored.
+
+    The CA is searching for a specific person by number, not refining
+    the main filter set. A Pundit matching the phone substring but
+    NOT matching the other filters should still surface — and a
+    Pundit matching the other filters but not the phone should not."""
+    client = await make_client(db)
+
+    # Phone-target Pundit: no state, no expertise tags. Just the
+    # phone we'll search for.
+    u_phone, _ = await _make_full_pundit(db, name="Phone Target")
+    u_phone.phone = "+919876543210"
+    await db.flush()
+
+    # State-matching Pundit, no shared digits in phone.
+    u_state, _ = await _make_full_pundit(
+        db, name="State Karnataka", states=["state_karnataka"],
+    )
+    u_state.phone = "+918000000000"
+    await db.flush()
+    await db.commit()
+
+    ca = await _ca_user_for(db, client=client)
+
+    # Phone='9876' alone → only Phone Target, even though we set no
+    # state and the state-filter would normally narrow further.
+    by_phone = await search_pundits(
+        client_id=client.id,
+        state_cosh_ids=[], expertise_domains=[], language_codes=[], crop_groups=[],
+        farming_methods=[], cultivation_types=[],
+        phone="9876",
+        db=db, current_user=ca,
+    )
+    assert {r["name"] for r in by_phone} == {"Phone Target"}
+
+    # Phone='9876' + state filter that would normally exclude Phone
+    # Target → phone wins, state filter ignored. Phone Target still
+    # returned; State Karnataka NOT returned because its phone doesn't
+    # match '9876'.
+    by_phone_with_state = await search_pundits(
+        client_id=client.id,
+        state_cosh_ids=["state_karnataka"],
+        expertise_domains=[], language_codes=[], crop_groups=[],
+        farming_methods=[], cultivation_types=[],
+        phone="9876",
+        db=db, current_user=ca,
+    )
+    assert {r["name"] for r in by_phone_with_state} == {"Phone Target"}
+
+    # Sanity: no phone, state filter applied → only State Karnataka.
+    by_state_only = await search_pundits(
+        client_id=client.id,
+        state_cosh_ids=["state_karnataka"],
+        expertise_domains=[], language_codes=[], crop_groups=[],
+        farming_methods=[], cultivation_types=[],
+        db=db, current_user=ca,
+    )
+    assert {r["name"] for r in by_state_only} == {"State Karnataka"}
+
+
 # ── H2 — pending invitations visible to CA ──────────────────────────────────
 
 @requires_docker
