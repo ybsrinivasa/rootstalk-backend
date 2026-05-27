@@ -1240,10 +1240,43 @@ async def query_history(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Queries this Pundit interacted with that have reached a terminal
+    state (RESPONDED / REJECTED / EXPIRED).
+
+    Why this isn't a simple `current_holder_id == profile.id` filter:
+    `respond_to_query` (and the reject path) nulls `current_holder_id`
+    when closing the query — that's correct ("no active holder once
+    closed") but it means history is invisible if we only look at the
+    live holder column. Source of truth for "I touched this" is the
+    remark/response audit trail.
+
+    A query lands in this Pundit's history if either:
+      - they wrote a QueryRemark on it (RECEIVED / FORWARDED / RETURNED
+        / RESPONDED / REJECTED actions all leave a remark row), OR
+      - they were the responder on QueryResponse (defensive — a remark
+        is always written alongside, but the union covers it either
+        way).
+    Plus the query is in a terminal status.
+    """
     profile = await _get_pundit_profile(db, current_user.id)
+
+    touched_via_remarks = (await db.execute(
+        select(QueryRemark.query_id).where(
+            QueryRemark.pundit_id == profile.id,
+        ).distinct()
+    )).scalars().all()
+    touched_via_responses = (await db.execute(
+        select(QueryResponse.query_id).where(
+            QueryResponse.pundit_id == profile.id,
+        )
+    )).scalars().all()
+    query_ids = set(touched_via_remarks) | set(touched_via_responses)
+    if not query_ids:
+        return []
+
     result = await db.execute(
         select(Query).where(
-            Query.current_holder_id == profile.id,
+            Query.id.in_(query_ids),
             Query.status.in_([QueryStatus.RESPONDED, QueryStatus.REJECTED, QueryStatus.EXPIRED]),
         ).order_by(Query.created_at.desc())
     )
