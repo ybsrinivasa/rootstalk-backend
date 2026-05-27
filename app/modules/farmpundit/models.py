@@ -127,7 +127,10 @@ class FarmPunditLanguage(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     pundit_id: Mapped[str] = mapped_column(String(36), ForeignKey("farm_pundit_profiles.id"), nullable=False)
-    language_code: Mapped[str] = mapped_column(String(10), nullable=False)
+    # Column historically held 2-letter ISO codes ("en"); post-Cosh-reshape
+    # (2026-05-26) it stores a Cosh `pundit_languages` UUID. Widened to 100
+    # in migration b3e4f7a52d11 to match the sibling cosh_id columns.
+    language_code: Mapped[str] = mapped_column(String(100), nullable=False)
 
     __table_args__ = (UniqueConstraint("pundit_id", "language_code"),)
 

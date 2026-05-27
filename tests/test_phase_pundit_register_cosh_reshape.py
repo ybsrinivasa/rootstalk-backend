@@ -158,6 +158,35 @@ async def test_register_non_employed_with_retired_kind(db):
 
 @requires_docker
 @pytest.mark.asyncio
+async def test_register_accepts_uuid_shaped_language_cosh_id(db):
+    """Regression — `farm_pundit_languages.language_code` was originally
+    VARCHAR(10) for ISO codes. After the Cosh reshape (2026-05-26) it
+    stores a 36-char Cosh UUID. The first real-world register submit
+    hit "value too long for type character varying(10)" because tests
+    used short codes like 'lang_kn' that fit. Column widened in
+    migration b3e4f7a52d11; this test pins the new shape."""
+    user = await make_user(db, name="Lang UUID Pundit")
+    await _seed_cosh_pundit_cores(db)
+    uuid_lang = "11111111-2222-4333-8444-555555555555"
+    db.add(CoshCoreItem(
+        cosh_id=uuid_lang, core_type="pundit_languages",
+        translations={"en": "Tamil"}, status="active",
+    ))
+    await db.commit()
+
+    payload = PunditProfileCreate(
+        education_cosh_id="ed_doc",
+        is_employed_by_organization=False,
+        declaration_accepted=True,
+        languages=[uuid_lang],
+    )
+    await create_pundit_profile(request=payload, db=db, current_user=user)
+    out = await get_pundit_profile_detail(db=db, current_user=user)
+    assert out["languages"] == [{"cosh_id": uuid_lang, "name": "Tamil"}]
+
+
+@requires_docker
+@pytest.mark.asyncio
 async def test_register_rejects_unknown_non_employed_kind(db):
     user = await make_user(db, name="Bad Kind")
     await _seed_cosh_pundit_cores(db)
