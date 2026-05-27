@@ -14,10 +14,19 @@ router = APIRouter(tags=["Media"])
 IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 AUDIO_CONTENT_TYPES = {
     "audio/mpeg", "audio/mp3",
-    "audio/mp4", "audio/aac",
+    # 2026-05-27: Android voice recorder reports `audio/x-m4a` (and
+    # some browsers send `audio/m4a` / `audio/x-mp4`); iOS reports
+    # `audio/mp4`. All four are the same underlying container — accept
+    # every spelling so the farmer's m4a voice note doesn't bounce.
+    "audio/mp4", "audio/x-m4a", "audio/m4a", "audio/x-mp4",
+    "audio/aac",
     "audio/ogg", "audio/opus",
     "audio/wav", "audio/x-wav", "audio/wave",
     "audio/webm",
+    # Older Android devices fall back to 3GPP audio in some recorder
+    # apps.
+    "audio/3gpp", "audio/amr",
+    "audio/flac",
 }
 # 2026-05-27: video provisioned but the PWA doesn't ship the picker
 # in V1 — the back-end column QueryMedia.media_type accepts "VIDEO"
@@ -66,11 +75,11 @@ async def upload_to_s3(
         if types == IMAGE_CONTENT_TYPES:
             hint = "Use JPEG, PNG, WebP, or GIF."
         elif types == AUDIO_CONTENT_TYPES:
-            hint = "Use MP3, AAC, OGG, WAV, or WebM."
+            hint = "Use MP3, M4A, AAC, OGG, WAV, or WebM."
         elif types == DOCUMENT_CONTENT_TYPES:
             hint = "Use PDF."
         else:
-            hint = "Use JPEG/PNG/WebP/GIF or PDF for documents, or MP3/AAC/OGG/WAV/WebM for audio."
+            hint = "Use JPEG/PNG/WebP/GIF or PDF for documents, or MP3/M4A/AAC/OGG/WAV/WebM for audio."
         raise HTTPException(
             status_code=422,
             detail=f"File type {file.content_type} not allowed. {hint}",
