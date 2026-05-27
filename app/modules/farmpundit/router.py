@@ -957,8 +957,44 @@ async def respond_to_query(
     if not res.allowed:
         _raise_query_transition(res)
 
-    if not any([data.get("text"), data.get("problem_cosh_id"), data.get("standard_response_id")]):
-        raise HTTPException(status_code=422, detail="At least one response element required")
+    has_structured = bool(data.get("problem_cosh_id") or data.get("standard_response_id"))
+    media_list = data.get("media", []) or []
+
+    # Text is mandatory only when the Pundit didn't pick a Crop Health
+    # problem AND didn't pick a Standard Answer — without one of those,
+    # the farmer's only thing to read is the free-form text.
+    if not has_structured and not (data.get("text") or "").strip():
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "response_text_required",
+                "message": (
+                    "Free-form text is required when no Crop Health problem "
+                    "or Standard Answer is picked."
+                ),
+            },
+        )
+
+    # Media limits per user direction 2026-05-27: up to 4 IMAGE, 1
+    # AUDIO, 1 HYPERLINK. All non-mandatory.
+    image_count = sum(1 for m in media_list if m.get("media_type") == "IMAGE")
+    audio_count = sum(1 for m in media_list if m.get("media_type") == "AUDIO")
+    hyperlink_count = sum(1 for m in media_list if m.get("media_type") == "HYPERLINK")
+    if image_count > 4:
+        raise HTTPException(status_code=422, detail={
+            "code": "too_many_response_images",
+            "message": "At most 4 images are allowed in the response.",
+        })
+    if audio_count > 1:
+        raise HTTPException(status_code=422, detail={
+            "code": "too_many_response_audios",
+            "message": "At most 1 audio is allowed in the response.",
+        })
+    if hyperlink_count > 1:
+        raise HTTPException(status_code=422, detail={
+            "code": "too_many_response_hyperlinks",
+            "message": "At most 1 hyperlink is allowed in the response.",
+        })
 
     response = QueryResponse(
         query_id=query_id,
@@ -971,7 +1007,7 @@ async def respond_to_query(
     await db.flush()
 
     # Attach response media if provided
-    for media in data.get("media", []):
+    for media in media_list:
         db.add(QueryResponseMedia(
             response_id=response.id,
             media_type=media.get("media_type", "IMAGE"),
@@ -2175,6 +2211,23 @@ async def get_query_detail_pundit(
         )).scalar_one_or_none()
         standard_response_question = sr_row.question_text if sr_row else None
 
+    # Resolve the picked Crop Health problem (if any) to its English
+    # name so the Pundit's response card reads "Fruit Fly" instead of
+    # a UUID. Same resolution path the farmer-side uses.
+    response_problem_name = None
+    if response is not None and response.problem_cosh_id:
+        from app.modules.sync.models import CoshCoreItem
+        rp_row = (await db.execute(
+            select(CoshCoreItem).where(
+                CoshCoreItem.cosh_id == response.problem_cosh_id,
+            )
+        )).scalar_one_or_none()
+        if rp_row and isinstance(rp_row.translations, dict):
+            response_problem_name = (
+                rp_row.translations.get("en")
+                or rp_row.translations.get("English")
+            )
+
     # Batch resolve every Cosh translation the response needs in
     # one query: query_types (Nature of Query), the crop name, and
     # the farmer's state + district. Cheaper than three separate
@@ -2285,6 +2338,7 @@ async def get_query_detail_pundit(
         ],
         "response": {
             "problem_cosh_id": response.problem_cosh_id,
+            "problem_name": response_problem_name,
             "standard_response_id": response.standard_response_id,
             "standard_response_question": standard_response_question,
             "text": response.text,
@@ -2322,6 +2376,20 @@ async def get_query_detail_farmer(
         select(QueryMedia).where(QueryMedia.query_id == query_id)
     )).scalars().all()
 
+    # Resolve problem_cosh_id to a friendly English name so the
+    # farmer doesn't see "sp_blast_rice" / a UUID on the response card.
+    problem_name = None
+    if response and response.problem_cosh_id:
+        from app.modules.sync.models import CoshCoreItem
+        prow = (await db.execute(
+            select(CoshCoreItem).where(CoshCoreItem.cosh_id == response.problem_cosh_id)
+        )).scalar_one_or_none()
+        if prow and isinstance(prow.translations, dict):
+            problem_name = (
+                prow.translations.get("en")
+                or prow.translations.get("English")
+            )
+
     return {
         "id": query.id,
         "title": query.title,
@@ -2336,6 +2404,7 @@ async def get_query_detail_farmer(
         "response": {
             "text": response.text,
             "problem_cosh_id": response.problem_cosh_id,
+            "problem_name": problem_name,
             "media": response_media,
             "created_at": response.created_at,
             "has_cha_recommendation": bool(response.problem_cosh_id),
