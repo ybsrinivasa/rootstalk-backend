@@ -325,6 +325,77 @@ async def test_submit_refuses_402_when_over_quota_without_payment(db):
 
 @requires_docker
 @pytest.mark.asyncio
+async def test_staging_bypass_skips_razorpay_when_not_production(db):
+    """Non-production deploys can pass staging_bypass=True on an
+    over-quota submit and skip the Razorpay verification. The
+    resulting query is is_paid=True (counted as paid for accounting)
+    so the rest of the flow looks identical to a real paid one."""
+    from app.config import settings
+    farmer, client, sub = await _farmer_sub(db)
+    await _seed_query_types(db)
+    await db.commit()
+
+    for _ in range(FREE_QUERIES_PER_COMPANY):
+        await submit_query(
+            request=QueryCreate(
+                subscription_id=sub.id, client_id=client.id,
+                query_type_cosh_id=QT_INSECT, severity="MODERATE",
+                media=[_img()],
+            ),
+            db=db, current_user=farmer,
+        )
+    # Test env defaults to non-production; bypass should succeed.
+    assert settings.environment != "production"
+    out = await submit_query(
+        request=QueryCreate(
+            subscription_id=sub.id, client_id=client.id,
+            query_type_cosh_id=QT_INSECT, severity="HIGH",
+            media=[_img()],
+            staging_bypass=True,
+        ),
+        db=db, current_user=farmer,
+    )
+    q = (await db.execute(select(Query).where(Query.id == out["id"]))).scalar_one()
+    assert q.is_paid is True
+    assert q.razorpay_payment_id is None
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_staging_bypass_refused_on_production(db, monkeypatch):
+    """`settings.environment == "production"` → bypass refuses 403
+    regardless of payload. Prevents shipping a free backdoor live."""
+    from app.config import settings
+    farmer, client, sub = await _farmer_sub(db)
+    await _seed_query_types(db)
+    await db.commit()
+
+    for _ in range(FREE_QUERIES_PER_COMPANY):
+        await submit_query(
+            request=QueryCreate(
+                subscription_id=sub.id, client_id=client.id,
+                query_type_cosh_id=QT_INSECT, severity="MODERATE",
+                media=[_img()],
+            ),
+            db=db, current_user=farmer,
+        )
+    monkeypatch.setattr(settings, "environment", "production")
+    with pytest.raises(HTTPException) as exc:
+        await submit_query(
+            request=QueryCreate(
+                subscription_id=sub.id, client_id=client.id,
+                query_type_cosh_id=QT_INSECT, severity="HIGH",
+                media=[_img()],
+                staging_bypass=True,
+            ),
+            db=db, current_user=farmer,
+        )
+    assert exc.value.status_code == 403
+    assert exc.value.detail["code"] == "bypass_disabled_in_production"
+
+
+@requires_docker
+@pytest.mark.asyncio
 async def test_init_payment_refuses_when_free_quota_remains(db):
     """Init-payment is a no-op when the farmer still has free
     queries left — the PWA must not pop the Razorpay sheet."""

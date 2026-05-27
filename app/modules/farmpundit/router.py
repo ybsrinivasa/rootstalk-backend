@@ -595,6 +595,13 @@ class QueryCreate(BaseModel):
     razorpay_order_id: Optional[str] = None
     razorpay_payment_id: Optional[str] = None
     razorpay_signature: Optional[str] = None
+    # Non-production-only flag that skips the Razorpay verification
+    # for over-quota queries. Same shape + intent as the
+    # /payment/staging-bypass endpoint on subscriptions: Razorpay
+    # TEST mode rejects real UPI handles, blocking end-to-end query
+    # testing past the 6th free. Server-side `settings.environment
+    # == "production"` check refuses the flag on prod.
+    staging_bypass: bool = False
 
 
 class QueryPaymentInit(BaseModel):
@@ -719,47 +726,62 @@ async def submit_query(
     )).scalar_one()
     is_paid = False
     if used >= FREE_QUERIES_PER_COMPANY:
-        all_present = all([
-            request.razorpay_order_id,
-            request.razorpay_payment_id,
-            request.razorpay_signature,
-        ])
-        if not all_present:
-            raise HTTPException(
-                status_code=402,
-                detail={
-                    "code": "payment_required",
-                    "message": (
-                        f"You've used all {FREE_QUERIES_PER_COMPANY} free queries "
-                        f"for this company. Pay ₹{QUERY_PAID_PRICE_PAISE // 100} "
-                        f"to rootsTALK.in to submit this query."
-                    ),
-                    "price_paise": QUERY_PAID_PRICE_PAISE,
-                },
+        # Non-production staging bypass — flips the query to is_paid
+        # without going through Razorpay. Refused on prod so we never
+        # ship a free-of-charge backdoor to live users.
+        if request.staging_bypass:
+            from app.config import settings
+            if settings.environment == "production":
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "bypass_disabled_in_production",
+                        "message": "Staging bypass is not available in production.",
+                    },
+                )
+            is_paid = True
+        else:
+            all_present = all([
+                request.razorpay_order_id,
+                request.razorpay_payment_id,
+                request.razorpay_signature,
+            ])
+            if not all_present:
+                raise HTTPException(
+                    status_code=402,
+                    detail={
+                        "code": "payment_required",
+                        "message": (
+                            f"You've used all {FREE_QUERIES_PER_COMPANY} free queries "
+                            f"for this company. Pay ₹{QUERY_PAID_PRICE_PAISE // 100} "
+                            f"to rootsTALK.in to submit this query."
+                        ),
+                        "price_paise": QUERY_PAID_PRICE_PAISE,
+                    },
+                )
+            from app.services.payment_service import (
+                fetch_order_amount_paise, verify_payment_signature,
             )
-        from app.services.payment_service import (
-            fetch_order_amount_paise, verify_payment_signature,
-        )
-        if not verify_payment_signature(
-            request.razorpay_order_id,
-            request.razorpay_payment_id,
-            request.razorpay_signature,
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail={"code": "invalid_payment_signature",
-                        "message": "Payment signature verification failed."},
-            )
-        # Defence in depth: the order's amount on Razorpay's side must
-        # match our locked ₹20 — guards against a tampered front-end
-        # that mints a cheaper order id.
-        if fetch_order_amount_paise(request.razorpay_order_id) != QUERY_PAID_PRICE_PAISE:
-            raise HTTPException(
-                status_code=400,
-                detail={"code": "payment_amount_mismatch",
-                        "message": f"Order must be for ₹{QUERY_PAID_PRICE_PAISE // 100}."},
-            )
-        is_paid = True
+            if not verify_payment_signature(
+                request.razorpay_order_id,
+                request.razorpay_payment_id,
+                request.razorpay_signature,
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "invalid_payment_signature",
+                            "message": "Payment signature verification failed."},
+                )
+            # Defence in depth: the order's amount on Razorpay's side must
+            # match our locked ₹20 — guards against a tampered front-end
+            # that mints a cheaper order id.
+            if fetch_order_amount_paise(request.razorpay_order_id) != QUERY_PAID_PRICE_PAISE:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "payment_amount_mismatch",
+                            "message": f"Order must be for ₹{QUERY_PAID_PRICE_PAISE // 100}."},
+                )
+            is_paid = True
 
     now_utc = datetime.now(timezone.utc)
     expires_at = _compute_query_expiry(now_utc)
