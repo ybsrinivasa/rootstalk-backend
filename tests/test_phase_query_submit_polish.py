@@ -52,10 +52,25 @@ async def _seed_query_types(db):
 
 
 async def _farmer_sub(db, client=None):
+    """Seed a farmer + sub at a client that ALSO has at least one
+    ACTIVE PRIMARY pundit — the routing chain needs a destination
+    or submit_query refuses 422 no_primary_expert_available."""
+    from app.modules.farmpundit.models import (
+        ClientFarmPundit, FarmPunditProfile, PunditRole,
+    )
     client = client or await make_client(db)
     farmer = await make_user(db, name="Q-Farmer")
     pkg = await make_package(db, client, crop_cosh_id="crop:tomato")
     sub = await make_subscription(db, farmer=farmer, client=client, package=pkg)
+    # Pundit + onboarding so submit_query's PRIMARY gate passes.
+    pundit_user = await make_user(db, name="Q-Pundit")
+    profile = FarmPunditProfile(user_id=pundit_user.id, declaration_accepted=True)
+    db.add(profile)
+    await db.flush()
+    db.add(ClientFarmPundit(
+        client_id=client.id, pundit_id=profile.id,
+        role=PunditRole.PRIMARY, status="ACTIVE", round_robin_sequence=1,
+    ))
     return farmer, client, sub
 
 
@@ -64,6 +79,37 @@ def _img(url: str = "https://placeholder.rootstalk.in/q/photo.jpg") -> QueryMedi
 
 
 # ── Cosh nature gate ────────────────────────────────────────────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_submit_refuses_when_client_has_no_primary_expert(db):
+    """If the client hasn't onboarded any ACTIVE PRIMARY pundit, the
+    routing chain has nowhere to land — submit refuses 422
+    no_primary_expert_available. The PWA hides the Ask Expert button
+    via the my-subscriptions flag, but this is the server-side guard
+    against tampering / race conditions."""
+    from app.modules.farmpundit.models import ClientFarmPundit
+    from sqlalchemy import delete
+
+    farmer, client, sub = await _farmer_sub(db)
+    await _seed_query_types(db)
+    # Ensure no PRIMARY pundit exists for this client. `_farmer_sub`
+    # doesn't seed one, but be explicit so the test is self-documenting.
+    await db.execute(delete(ClientFarmPundit).where(ClientFarmPundit.client_id == client.id))
+    await db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await submit_query(
+            request=QueryCreate(
+                subscription_id=sub.id, client_id=client.id,
+                query_type_cosh_id=QT_INSECT, severity="HIGH",
+                media=[_img()],
+            ),
+            db=db, current_user=farmer,
+        )
+    assert exc.value.status_code == 422
+    assert exc.value.detail["code"] == "no_primary_expert_available"
+
 
 @requires_docker
 @pytest.mark.asyncio

@@ -783,6 +783,30 @@ async def submit_query(
                 )
             is_paid = True
 
+    # Refuse the submit when the client has no ACTIVE PRIMARY pundit
+    # to route the query to. The PWA hides the Ask Expert button in
+    # this state (it reads `client_has_primary_expert` from
+    # /my-subscriptions), but defence in depth — a tampered client or
+    # a race against a deactivation must not orphan a query.
+    has_primary = (await db.execute(
+        select(ClientFarmPundit.id).where(
+            ClientFarmPundit.client_id == request.client_id,
+            ClientFarmPundit.role == PunditRole.PRIMARY,
+            ClientFarmPundit.status == "ACTIVE",
+        ).limit(1)
+    )).scalar_one_or_none()
+    if has_primary is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "no_primary_expert_available",
+                "message": (
+                    "This company hasn't onboarded a Primary expert yet. "
+                    "Your query cannot be sent until they do."
+                ),
+            },
+        )
+
     now_utc = datetime.now(timezone.utc)
     expires_at = _compute_query_expiry(now_utc)
 

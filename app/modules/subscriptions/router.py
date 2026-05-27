@@ -2053,6 +2053,28 @@ async def my_subscriptions(
             measure = await get_measure_for_biological_name(db, cid)
             measure_by_crop[cid] = measure or "AREA_WISE"
 
+    # Per-client: does the client have at least one ACTIVE PRIMARY
+    # FarmPundit? Drives the "Ask Expert" gate on the PWA. Without
+    # a Primary, the routing chain (preference → Promoter-Pundit →
+    # round-robin Primary) has nowhere to land and the query would
+    # be orphaned. One batch query covers every client referenced
+    # by the farmer's subscriptions.
+    from app.modules.farmpundit.models import (
+        ClientFarmPundit, PunditRole,
+    )
+    client_ids_for_pundit_check = list({s.client_id for s in subs})
+    has_primary_by_client: dict[str, bool] = {cid: False for cid in client_ids_for_pundit_check}
+    if client_ids_for_pundit_check:
+        primary_rows = (await db.execute(
+            select(ClientFarmPundit.client_id).where(
+                ClientFarmPundit.client_id.in_(client_ids_for_pundit_check),
+                ClientFarmPundit.role == PunditRole.PRIMARY,
+                ClientFarmPundit.status == "ACTIVE",
+            )
+        )).scalars().all()
+        for cid in primary_rows:
+            has_primary_by_client[cid] = True
+
     for s in subs:
         pkg_name, crop_cosh_id = pkg_by_id.get(s.package_id, (None, None))
         client = client_info_by_id.get(s.client_id, {})
@@ -2081,6 +2103,10 @@ async def my_subscriptions(
             "client_logo_url": client.get("client_logo_url"),
             "client_primary_colour": client.get("client_primary_colour"),
             "client_short_name": client.get("client_short_name"),
+            # Drives the Ask Expert button + Diagnose-IDK gateway gate
+            # on the PWA. False → no PRIMARY pundit is available to
+            # receive a query at this client.
+            "client_has_primary_expert": has_primary_by_client.get(s.client_id, False),
             "pending_payment_from": pending_delegate_by_sub_id.get(s.id),
         })
     return out

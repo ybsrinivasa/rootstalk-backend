@@ -37,6 +37,9 @@ CROP_COCONUT = "crop:coconut"
 
 
 async def _sub_for_crop(db, crop_cosh_id: str, measure: str):
+    """Seed a farmer + sub at a client. No Primary pundit needed for
+    these tests (they don't submit queries); update_plant_count + the
+    measure-resolution path don't require routing."""
     client = await make_client(db)
     farmer = await make_user(db, name=f"Farmer-{crop_cosh_id}")
     await make_crop_reference(db, crop_cosh_id, name=crop_cosh_id, measure=measure)
