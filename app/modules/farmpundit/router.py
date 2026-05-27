@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi import Query as QueryParam  # avoid clash with farmpundit.Query model
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import func, select
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.modules.platform.models import User
@@ -62,8 +62,46 @@ async def _holder_role(
     role = holder_slot.role.value if hasattr(holder_slot.role, "value") else str(holder_slot.role)
     return BL12_PRIMARY if role == "PRIMARY" else BL12_PANEL
 
-QUERY_EXPIRE_DAYS = 7
+# Expert response window. "2 days, leaving the date of submission"
+# per user direction 2026-05-27 — submitted on Day 0, expert has all
+# of Day 1 + Day 2 to respond, expires at end of Day 2 (IST). The
+# calculation lives in `_compute_query_expiry`.
+QUERY_EXPIRE_DAYS = 2
+
+# Per-(farmer, client) free quota. The 7th and later queries cost
+# `QUERY_PAID_PRICE_PAISE` (Batch 2 paywall). Constant has existed
+# since the original FarmPundit model; the gate was wired live
+# 2026-05-27.
 FREE_QUERIES_PER_COMPANY = 6
+QUERY_PAID_PRICE_PAISE = 20_00   # ₹20
+
+# IST offset for the end-of-Day-2 expiry calc. The farmer's calendar
+# day is what matters here, not UTC — a query submitted just before
+# midnight IST should still get all of "tomorrow IST" plus the day
+# after, not lose an effective day to UTC bucketing.
+from datetime import time as _dtime
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _compute_query_expiry(now_utc: datetime) -> datetime:
+    """end-of-Day-2 (IST) for a query submitted at `now_utc`.
+
+    Day 0 = the IST calendar day of submission; the expert has Day 1
+    and Day 2 to respond; expires at the last second of Day 2.
+    Stored as UTC.
+    """
+    ist_today = now_utc.astimezone(_IST).date()
+    ist_expiry = datetime.combine(
+        ist_today + timedelta(days=QUERY_EXPIRE_DAYS),
+        _dtime(23, 59, 59),
+        tzinfo=_IST,
+    )
+    return ist_expiry.astimezone(timezone.utc)
+
+
+# Allowlisted Cosh slugs the /cosh/query-types endpoint will serve.
+# Same one-route pattern as /cosh/pundit-options.
+QUERY_OPTION_SLUGS: frozenset[str] = frozenset({"query_types"})
 
 
 async def _assert_portal_member(
@@ -530,14 +568,28 @@ async def reject_invitation(
 
 # ── Query Management (Farmer) ──────────────────────────────────────────────────
 
+class QueryMediaItem(BaseModel):
+    media_type: str   # IMAGE | AUDIO | VIDEO — VIDEO column-ready but
+                      # the PWA UI hides the picker in V1.
+    url: str
+
+
 class QueryCreate(BaseModel):
     subscription_id: str
     client_id: str
     crop_cosh_id: Optional[str] = None
     crop_age: Optional[str] = None
-    title: str
+    # Mandatory Cosh-driven nature of the query (replaces the old
+    # free-text title that the PWA used to ask for). The title column
+    # is auto-populated from the resolved English name so existing
+    # Pundit/CA list UIs keep working unchanged.
+    query_type_cosh_id: str
     description: Optional[str] = None
     severity: str = "MODERATE"
+    # ≥1 IMAGE is mandatory (user direction 2026-05-27). 0-1 AUDIO
+    # optional. VIDEO accepted for forward compatibility but the PWA
+    # doesn't ship the picker in V1.
+    media: list[QueryMediaItem] = []
 
 
 @router.post("/farmer/queries", status_code=201)
@@ -546,8 +598,68 @@ async def submit_query(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """BL-12a: Submit query. Routes to default expert via round-robin."""
-    expires_at = datetime.now(timezone.utc) + timedelta(days=QUERY_EXPIRE_DAYS)
+    """BL-12a: Submit query. Routes to default expert via round-robin.
+
+    Rules (locked 2026-05-27):
+      - `query_type_cosh_id` must resolve to an ACTIVE `query_types`
+        Cosh core; refused with `query_type_invalid` (422) otherwise.
+      - At least one IMAGE media item is mandatory
+        (`image_required`, 422). 0-1 AUDIO is optional. VIDEO accepted
+        but the PWA hides the picker in V1.
+      - `title` is auto-set from the resolved Cosh translation; the
+        farmer no longer types it.
+      - Expiry = end-of-Day-2 in IST.
+    """
+    from app.modules.sync.models import CoshCoreItem
+
+    # Resolve Nature of Query → friendly English name (becomes title).
+    qt = (await db.execute(
+        select(CoshCoreItem).where(
+            CoshCoreItem.cosh_id == request.query_type_cosh_id,
+            CoshCoreItem.core_type == "query_types",
+            CoshCoreItem.status == "active",
+        )
+    )).scalar_one_or_none()
+    if qt is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "query_type_invalid",
+                "message": "Nature of Query must be one of the active query_types.",
+            },
+        )
+    title = (qt.translations or {}).get("en") or "Query"
+
+    # Mandatory ≥1 image.
+    image_count = sum(1 for m in request.media if m.media_type == "IMAGE")
+    if image_count < 1:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "image_required",
+                "message": "At least one photograph is required.",
+            },
+        )
+    if image_count > 4:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "too_many_images",
+                "message": "At most 4 photographs are allowed.",
+            },
+        )
+    audio_count = sum(1 for m in request.media if m.media_type == "AUDIO")
+    if audio_count > 1:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "too_many_audios",
+                "message": "At most 1 audio is allowed.",
+            },
+        )
+
+    now_utc = datetime.now(timezone.utc)
+    expires_at = _compute_query_expiry(now_utc)
 
     query = Query(
         farmer_user_id=current_user.id,
@@ -555,7 +667,8 @@ async def submit_query(
         client_id=request.client_id,
         crop_cosh_id=request.crop_cosh_id,
         crop_age=request.crop_age,
-        title=request.title,
+        query_type_cosh_id=request.query_type_cosh_id,
+        title=title,
         description=request.description,
         severity=request.severity,
         status=QueryStatus.NEW,
@@ -563,6 +676,9 @@ async def submit_query(
     )
     db.add(query)
     await db.flush()
+
+    for m in request.media:
+        db.add(QueryMedia(query_id=query.id, media_type=m.media_type, url=m.url))
 
     # BL-12a: Full priority routing (preference → Promoter-Pundit → round-robin)
     next_pundit = await _get_next_pundit_for_query(db, request.client_id, request.subscription_id)
@@ -577,6 +693,62 @@ async def submit_query(
     await db.commit()
     await db.refresh(query)
     return {"id": query.id, "status": query.status, "expires_at": query.expires_at}
+
+
+@router.get("/cosh/query-types")
+async def cosh_query_types(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cosh `query_types` options for the Ask Expert form.
+
+    Same one-allowlisted-slug shape as `/cosh/pundit-options`. Kept
+    on its own route (no `?slug=` param) since query_types is the
+    only slug the form needs.
+    """
+    from app.modules.sync.models import CoshCoreItem
+    rows = (await db.execute(
+        select(CoshCoreItem.cosh_id, CoshCoreItem.translations).where(
+            CoshCoreItem.core_type == "query_types",
+            CoshCoreItem.status == "active",
+        )
+    )).all()
+    out = []
+    for cosh_id, translations in rows:
+        name = (translations or {}).get("en") if isinstance(translations, dict) else None
+        if name:
+            out.append({"cosh_id": cosh_id, "name": name})
+    out.sort(key=lambda x: x["name"].casefold())
+    return out
+
+
+@router.get("/farmer/queries/quota")
+async def get_query_quota(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """How many free queries the farmer has left for this company.
+
+    Free quota is per (farmer, client). Every Query row counts —
+    even expired or rejected ones consumed the free slot. The 7th+
+    query requires payment (₹20 to RootsTALK.in for software
+    infrastructure, NOT to the company).
+    """
+    used = (await db.execute(
+        select(func.count()).select_from(Query).where(
+            Query.farmer_user_id == current_user.id,
+            Query.client_id == client_id,
+        )
+    )).scalar_one()
+    free_remaining = max(0, FREE_QUERIES_PER_COMPANY - used)
+    return {
+        "used": used,
+        "free_limit": FREE_QUERIES_PER_COMPANY,
+        "free_remaining": free_remaining,
+        "price_paise": QUERY_PAID_PRICE_PAISE,
+        "next_query_is_paid": free_remaining == 0,
+    }
 
 
 @router.get("/farmer/queries")

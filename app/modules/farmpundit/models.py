@@ -202,6 +202,12 @@ class Query(Base):
     client_id: Mapped[str] = mapped_column(String(36), ForeignKey("clients.id"), nullable=False)
     crop_cosh_id: Mapped[str] = mapped_column(String(100), nullable=True)
     crop_age: Mapped[str] = mapped_column(String(100), nullable=True)
+    # Mandatory at the API layer (2026-05-27). Nullable in DB so old
+    # queries submitted under the pre-Cosh free-text shape still load.
+    query_type_cosh_id: Mapped[str] = mapped_column(String(100), nullable=True)
+    # Auto-derived from `query_type_cosh_id` (resolved Cosh translation)
+    # at submit time so existing list views keep working without
+    # rewiring. The farmer no longer types a title.
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=True)
     severity: Mapped[str] = mapped_column(String(20), nullable=False)

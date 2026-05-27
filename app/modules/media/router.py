@@ -19,11 +19,24 @@ AUDIO_CONTENT_TYPES = {
     "audio/wav", "audio/x-wav", "audio/wave",
     "audio/webm",
 }
+# 2026-05-27: video provisioned but the PWA doesn't ship the picker
+# in V1 — the back-end column QueryMedia.media_type accepts "VIDEO"
+# and the upload endpoint will accept these MIME types once the
+# front-end exposes a Video button. Keeping the set narrow to common
+# capture formats; widen on demand.
+VIDEO_CONTENT_TYPES = {
+    "video/mp4", "video/quicktime",
+    "video/webm", "video/x-matroska",
+    "video/3gpp",
+}
 # 2026-05-21: dealer shop-registration certs are commonly PDFs.
 # Added at module scope so any document upload (not just the cert)
 # can include PDFs without each caller having to widen the set.
 DOCUMENT_CONTENT_TYPES = {"application/pdf"}
-ALLOWED_CONTENT_TYPES = IMAGE_CONTENT_TYPES | AUDIO_CONTENT_TYPES | DOCUMENT_CONTENT_TYPES
+ALLOWED_CONTENT_TYPES = (
+    IMAGE_CONTENT_TYPES | AUDIO_CONTENT_TYPES
+    | VIDEO_CONTENT_TYPES | DOCUMENT_CONTENT_TYPES
+)
 # Audio voice-notes need more room than logos. 25 MB covers ~25 min
 # at 128 kbps mp3 — enough for a long advisory tip.
 MAX_SIZE_BYTES = 25 * 1024 * 1024
