@@ -5556,11 +5556,16 @@ async def cosh_maturity_indices(
 @router.get("/cosh/options/organization-types")
 async def cosh_organization_types(
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     """Live Cosh list for the client-onboarding org-type checklist
     (2026-05-22). Replaces the hardcoded ORG_TYPES constants the
-    SA + CA portals shipped before this Core synced."""
+    SA + CA portals shipped before this Core synced.
+
+    Public endpoint — the onboarding page is on the public domain
+    (no auth before the CA submits org details), so auth would
+    break the dropdown. Sibling /cosh/options/* endpoints stay
+    auth-gated; only the org-type list is consumed by the public
+    onboarding form."""
     from app.services.cosh_options_view import list_organization_types
     return await list_organization_types(db)
 
