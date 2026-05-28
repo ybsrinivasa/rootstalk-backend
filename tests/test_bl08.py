@@ -297,8 +297,9 @@ def test_bl08_13_demotion_is_permanent():
 # ── TC-BL08-14: 1-2-2 ties — YES on either rank-1 keeps; YES on rank-2 demotes ─
 
 def test_bl08_14_priority_1_1_2_ties():
-    """A 1-1-2 problem: YES on either rank-1 row keeps it; YES on the rank-2
-    row demotes."""
+    """A 1-1-2 problem: YES on either rank-1 row keeps it; YES on the
+    rank-2 row demotes ONLY when an alternative survives (per the
+    2026-05-28 demotion-into-emptiness guard). Two sub-cases."""
     rank_1_1_2 = [
         PSR("P1", "LEAF", "Spots", priority_rank=1),
         PSR("P1", "LEAF", "Colour_Change", priority_rank=1),
@@ -312,13 +313,29 @@ def test_bl08_14_priority_1_1_2_ties():
     )
     assert "P1" in keep_step.remaining_problem_ids
 
-    # YES on the rank-2 symptom → P1 demoted; pool empty.
+    # YES on the rank-2 symptom WHEN AN ALTERNATIVE EXISTS → P1 demoted.
+    # The alternative (P_sibling) is unranked, so it isn't subject to
+    # Option A; it stays and the demotion fires cleanly.
+    rank_1_1_2_with_alt = rank_1_1_2 + [PSR("P_sibling", "STEM", "Lesions")]
     demote_step = run_diagnosis_step(
-        rank_1_1_2, initial_plant_part="LEAF",
+        rank_1_1_2_with_alt, initial_plant_part="STEM",
         answers=[DA("STEM", "Lesions", None, None, "YES")],
         random_seed=42,
     )
     assert "P1" not in demote_step.remaining_problem_ids
+    assert "P_sibling" in demote_step.remaining_problem_ids
+
+    # YES on the rank-2 symptom WHEN P1 IS ALONE → demotion would empty
+    # the pool, so the 2026-05-28 guard skips it. P1 stays and surfaces
+    # via §8 CONFIRMATION. The farmer literally said YES to a P1
+    # symptom; OUTSIDE_LIST would be the wrong answer.
+    alone_step = run_diagnosis_step(
+        rank_1_1_2, initial_plant_part="STEM",
+        answers=[DA("STEM", "Lesions", None, None, "YES")],
+        random_seed=42,
+    )
+    assert alone_step.status == "CONFIRMATION"
+    assert alone_step.diagnosed_problem_cosh_id == "P1"
 
 
 # ── TC-BL08-15: Single-symptom ranked problem — rank meaningless, no demotion ─
@@ -465,3 +482,52 @@ def test_bl08_20_disambiguate_step_c_respects_lock():
             "Disambiguation step (c) must stay on locked LC, "
             f"got plant_part={step.question.plant_part_cosh_id!r}"
         )
+
+
+# ── TC-BL08-21: Demotion-into-emptiness guard (2026-05-28 Chilli case) ──────
+
+def test_bl08_21_demotion_skipped_when_it_would_empty_pool():
+    """Faithful reproduction of the Chilli → Reproductive → Fruit →
+    NO(Rot) → YES(Surface_Growth) bug: Phytophthora Blight was the
+    only Surface-Growth carrier in the pool. Its primary Rot row had
+    been NO'd out. Option A then wanted to demote PB (because its
+    Surface_Growth row is rank 2, not its top rank of 1) — but that
+    would have left an empty pool and surfaced OUTSIDE_LIST despite
+    the farmer literally having said YES to a PB symptom.
+
+    With the guard: the demotion is skipped, PB stays, the algorithm
+    converges to a 1-candidate state and the §8 CONFIRMATION prompt
+    asks the farmer to verify — honest UX, no false OUTSIDE_LIST."""
+    rows = [
+        PSR("PB", "FRUIT", "Rot", priority_rank=1),
+        PSR("PB", "FRUIT", "Surface_Growth", priority_rank=2),
+        # A sibling pest whose only Fruit row is Rot. NO on Rot removes
+        # it from active; it can't keep PB company.
+        PSR("BSR", "FRUIT", "Rot", priority_rank=1),
+    ]
+    answers = [
+        DA("FRUIT", "Rot", None, None, "NO"),
+        DA("FRUIT", "Surface_Growth", None, None, "YES"),
+    ]
+    step = run_diagnosis_step(rows, initial_plant_part="FRUIT", answers=answers, random_seed=42)
+    assert step.status == "CONFIRMATION"
+    assert step.diagnosed_problem_cosh_id == "PB"
+
+
+def test_bl08_22_demotion_still_fires_when_an_alternative_survives():
+    """Regression guard: the demotion-into-emptiness check must NOT
+    block demotion when there's an undemoted alternative left. Option
+    A's intent ("prefer primary-symptom matches over secondary") still
+    fires whenever it can. This is the test_bl08_12 scenario re-stated
+    explicitly against the new code path."""
+    rows = [
+        PSR("P_ranked", "LEAF", "Spots", priority_rank=1),
+        PSR("P_ranked", "LEAF", "Colour_Change", priority_rank=2),
+        PSR("P_unranked", "LEAF", "Colour_Change"),
+    ]
+    answers = [DA("LEAF", "Colour_Change", None, None, "YES")]
+    step = run_diagnosis_step(rows, initial_plant_part="LEAF", answers=answers, random_seed=42)
+    # P_ranked demoted (Colour_Change is rank 2, top is 1). P_unranked
+    # unaffected. Pool reduces to {P_unranked} → CONFIRMATION.
+    assert step.status == "CONFIRMATION"
+    assert step.diagnosed_problem_cosh_id == "P_unranked"

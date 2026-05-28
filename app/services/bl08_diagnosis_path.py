@@ -244,10 +244,23 @@ def _apply_answers(rows: list[ProblemSymptomRow], answers: list[DiagnosisAnswer]
     NO: remove all rows matching (part, symptom, [sub_part], [sub_symptom]) from the active set.
         Problems with zero remaining rows are effectively eliminated.
 
-    Priority Ranking (Option A): on a YES, any problem whose matched row is
-    not at the problem's top rank is permanently demoted out of the pool —
-    even a later YES on its rank-1 row will not bring it back. Problems with
-    no ranked rows are unaffected by this rule.
+    Priority Ranking (Option A, 2026-05-05): on a YES, any problem whose
+    matched row is not at the problem's top rank is permanently demoted
+    out of the pool — even a later YES on its rank-1 row will not bring
+    it back. Problems with no ranked rows are unaffected by this rule.
+
+    Demotion-into-emptiness guard (2026-05-28): the demotion is skipped
+    for a given answer if applying it would leave NO matching problems
+    in the pool. The intent of Option A is "prefer primary-symptom
+    matches over secondary-symptom matches when both exist"; when only
+    secondary matches exist, demoting them into emptiness lies to the
+    farmer (returns OUTSIDE_LIST when the pest actually IS in the
+    catalogue, just expressed via the secondary symptom). Surfaced on
+    Chilli → Reproductive → Fruit → NO(Rot) → YES(Surface Growth):
+    Phytophthora Blight was the only Surface-Growth carrier, its
+    primary Rot row had been NO'd out, and Option A demoted it into
+    the empty pool. With the guard, PB stays and surfaces via the §8
+    CONFIRMATION prompt so the farmer can decide.
     """
     # Pre-compute each problem's top (minimum) rank from the unchanging
     # master set. Absence from this dict ⇒ ranks not in play for that problem.
@@ -268,8 +281,9 @@ def _apply_answers(rows: list[ProblemSymptomRow], answers: list[DiagnosisAnswer]
                 r.problem_cosh_id for r in active
                 if _row_matches(r, answer)
             }
-            active = [r for r in active if r.problem_cosh_id in matching_problems]
 
+            # Tentatively compute new demotions from this answer.
+            new_demotions: set[str] = set()
             for p in matching_problems:
                 if p in demoted or p not in problem_min_rank:
                     continue
@@ -286,10 +300,22 @@ def _apply_answers(rows: list[ProblemSymptomRow], answers: list[DiagnosisAnswer]
                 # No ranked match (only unranked rows of a ranked problem
                 # matched this answer) ⇒ treat as below top priority.
                 if not matching_ranks or min(matching_ranks) > top:
-                    demoted.add(p)
+                    new_demotions.add(p)
 
-            if demoted:
-                active = [r for r in active if r.problem_cosh_id not in demoted]
+            # Demotion-into-emptiness guard: only commit the new
+            # demotions if AT LEAST ONE matching problem survives them
+            # (counting previously-demoted ones too). If applying the
+            # demotions would leave the pool empty, skip them — the
+            # candidate(s) stay and surface via §8 CONFIRMATION so the
+            # farmer can confirm or reject honestly.
+            if matching_problems - (demoted | new_demotions):
+                demoted.update(new_demotions)
+
+            active = [
+                r for r in active
+                if r.problem_cosh_id in matching_problems
+                and r.problem_cosh_id not in demoted
+            ]
 
         elif answer.answer == "NO":
             active = [r for r in active if not _row_matches(r, answer)]
