@@ -128,25 +128,21 @@ def test_bl08_04_disambiguation_via_sub_symptom():
     assert step.question.sub_symptom_cosh_id in ("Circular", "Irregular")
 
 
-# ── TC-BL08-05: Pool reduces to 1 — diagnosis complete ───────────────────────
+# ── TC-BL08-05: Pool reduces to 1 — confirmation prompt ──────────────────────
 
-def test_bl08_05_pool_reduces_to_one_diagnosed():
-    """After specific answers, only P4 (neck_rot) remains."""
-    rows = make_dataset()
-    answers = [
-        DA("LEAF", "Spots", None, None, "NO"),      # Removes P6-type, narrows
-        DA("LEAF", "Colour_Change", None, None, "NO"), # Removes P1, P3 (if they required it)
-        DA("LEAF", "Yellowing", None, None, "NO"),   # Removes P5
-        DA("LEAF", "Spots", None, None, "NO"),       # Already answered, no new effect
-    ]
-    # After: leaf-based problems narrowed
-    # Force diagnosis: add very specific set
+def test_bl08_05_pool_reduces_to_one_emits_confirmation():
+    """Per BL-08 §8 amended 2026-05-28: when the pool reduces to exactly
+    one candidate, the algorithm returns status="CONFIRMATION" with the
+    candidate's id in `diagnosed_problem_cosh_id`. The router then asks
+    the farmer to confirm before flipping the session to DIAGNOSED."""
     specific_rows = [
-        PSR("P4", "STEM", "Lesions"),  # P4 only — should diagnose immediately
+        PSR("P4", "STEM", "Lesions"),
     ]
     step = run_diagnosis_step(specific_rows, initial_plant_part="STEM", answers=[], random_seed=42)
-    assert step.status == "DIAGNOSED"
+    assert step.status == "CONFIRMATION"
     assert step.diagnosed_problem_cosh_id == "P4"
+    assert step.question is not None
+    assert step.question.question_type == "CONFIRMATION"
     assert step.remaining_count == 1
 
 
@@ -226,7 +222,7 @@ def test_bl08_09_yes_then_no_narrows_correctly():
         DA("LEAF", "Colour_Change", None, None, "YES"),  # Only P1 has (LEAF, Colour_Change)
     ]
     step2 = run_diagnosis_step(rows, initial_plant_part="LEAF", answers=answers2, random_seed=42)
-    assert step2.status == "DIAGNOSED"
+    assert step2.status == "CONFIRMATION"
     assert step2.diagnosed_problem_cosh_id == "P1"
 
 
@@ -273,7 +269,7 @@ def test_bl08_12_priority_rank2_yes_demotes_problem():
     ]
     answers = [DA("LEAF", "Colour_Change", None, None, "YES")]
     step = run_diagnosis_step(rows, initial_plant_part="LEAF", answers=answers, random_seed=42)
-    assert step.status == "DIAGNOSED"
+    assert step.status == "CONFIRMATION"
     assert step.diagnosed_problem_cosh_id == "P_unranked"
 
 
@@ -294,7 +290,7 @@ def test_bl08_13_demotion_is_permanent():
         DA("LEAF", "Spots", None, None, "YES"),          # P1 must stay out
     ]
     step = run_diagnosis_step(rows, initial_plant_part="LEAF", answers=answers, random_seed=42)
-    assert step.status == "DIAGNOSED"
+    assert step.status == "CONFIRMATION"
     assert step.diagnosed_problem_cosh_id == "P2"
 
 
@@ -336,7 +332,7 @@ def test_bl08_15_single_symptom_rank_does_not_demote():
         answers=[DA("LEAF", "Spots", None, None, "YES")],
         random_seed=42,
     )
-    assert step.status == "DIAGNOSED"
+    assert step.status == "CONFIRMATION"
     assert step.diagnosed_problem_cosh_id == "P1"
 
 

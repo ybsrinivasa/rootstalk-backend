@@ -54,7 +54,10 @@ async def _seed_pair(db):
 
 
 async def _start_and_diagnose(db, farmer, sub):
-    """Walk start → first YES so the session lands in DIAGNOSED."""
+    """Walk start → first YES → confirmation YES so the session lands
+    in DIAGNOSED. Two answer calls are needed since BL-08 §8 (amended
+    2026-05-28) now asks the farmer to confirm before declaring the
+    diagnosis."""
     started = await start_diagnosis(
         request=StartDiagnosisRequest(
             subscription_id=sub.id, crop_cosh_id=CROP,
@@ -63,12 +66,23 @@ async def _start_and_diagnose(db, farmer, sub):
         db=db, current_user=farmer,
     )
     q = started["question"]
-    out = await answer_question(
+    narrowed = await answer_question(
         session_id=started["session_id"],
         request=AnswerRequest(
             plant_part_cosh_id=q["plant_part_cosh_id"],
             symptom_cosh_id=q["symptom_cosh_id"],
             answer="YES",
+        ),
+        db=db, current_user=farmer,
+    )
+    assert narrowed["status"] == "CONFIRMATION"
+    out = await answer_question(
+        session_id=started["session_id"],
+        request=AnswerRequest(
+            plant_part_cosh_id=q["plant_part_cosh_id"],
+            symptom_cosh_id="",
+            answer="YES",
+            is_confirmation=True,
         ),
         db=db, current_user=farmer,
     )

@@ -71,7 +71,23 @@ class DiagnosisQuestion:
 
 @dataclass
 class DiagnosisStep:
-    status: str                            # "QUESTION" | "DIAGNOSED" | "INCONCLUSIVE"
+    status: str
+    # Status values:
+    #   "QUESTION"     — algorithm needs more information; show `question`.
+    #   "CONFIRMATION" — pool reduced to exactly 1 candidate. The PWA
+    #                    asks the farmer "Looks like the problem is X.
+    #                    Does this match what you're seeing?". A YES
+    #                    flips the session to DIAGNOSED at the router;
+    #                    a NO flips it to OUTSIDE_LIST. Added 2026-05-28
+    #                    per the BL-08 §8 amendment — the algorithm no
+    #                    longer auto-declares diagnosis without the
+    #                    farmer's explicit confirmation.
+    #   "DIAGNOSED"    — set by the router after a CONFIRMATION YES, or
+    #                    by the §7(d) random tie-break when multiple
+    #                    candidates can't be narrowed further.
+    #   "INCONCLUSIVE" — pool emptied (rare; a NO that eliminated 2+
+    #                    candidates simultaneously). Router translates
+    #                    this to OUTSIDE_LIST in the response payload.
     question: Optional[DiagnosisQuestion] = None
     diagnosed_problem_cosh_id: Optional[str] = None
     remaining_count: int = 0
@@ -140,9 +156,23 @@ def run_diagnosis_step(
         )
 
     if len(remaining_ids) == 1:
+        # BL-08 §8 (amended 2026-05-28): the algorithm no longer auto-
+        # declares diagnosis on convergence to 1. The PWA renders a
+        # confirmation card asking the farmer to verify; YES at the
+        # router becomes DIAGNOSED, NO becomes OUTSIDE_LIST. We carry
+        # the candidate's id in `diagnosed_problem_cosh_id` so the
+        # router can resolve the problem name for the confirmation
+        # prompt. The `question` is a minimal sentinel — the PWA
+        # branches on `status == "CONFIRMATION"` to render its own
+        # confirmation card, not a regular Q.
         return DiagnosisStep(
-            status="DIAGNOSED",
+            status="CONFIRMATION",
             diagnosed_problem_cosh_id=remaining_ids[0],
+            question=DiagnosisQuestion(
+                plant_part_cosh_id=initial_plant_part,
+                symptom_cosh_id="",
+                question_type="CONFIRMATION",
+            ),
             remaining_count=1,
             remaining_problem_ids=remaining_ids,
             has_yes_answer=has_yes,

@@ -25,6 +25,13 @@ class AnswerRequest(BaseModel):
     sub_part_cosh_id: Optional[str] = None
     sub_symptom_cosh_id: Optional[str] = None
     answer: str  # "YES" | "NO"
+    # Set to True by the PWA when answering a CONFIRMATION question
+    # (BL-08 §8, amended 2026-05-28). The router branches early on
+    # this flag: YES flips the session to DIAGNOSED on the candidate;
+    # NO flips it to OUTSIDE_LIST. Server-side check: True is only
+    # honoured when the session's remaining pool actually has 1
+    # candidate, so a stray flag can't shortcut the algorithm.
+    is_confirmation: bool = False
 
 
 class ImageAnalysisRequest(BaseModel):

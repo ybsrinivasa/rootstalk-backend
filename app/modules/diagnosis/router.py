@@ -293,6 +293,12 @@ def _build_question_text(question, names: dict[str, str]) -> str:
     """Compose the farmer-facing question string from resolved Cosh
     names. If any required term can't be resolved we fall back to
     generic copy — never echo a raw cosh_id."""
+    # CONFIRMATION questions don't carry a symptom — the PWA renders
+    # its own "Looks like the problem is X. Does this match what you're
+    # seeing?" card using `problem_info`. We emit a clean fallback
+    # string here for debug/logging; the PWA doesn't read it.
+    if getattr(question, "question_type", None) == "CONFIRMATION":
+        return "Does this match what you're seeing?"
     part = _safe_name(question.plant_part_cosh_id, names) or "this plant part"
     symptom = _safe_name(question.symptom_cosh_id, names) or "this symptom"
     sub_part = _safe_name(question.sub_part_cosh_id, names)
@@ -540,6 +546,27 @@ async def start_diagnosis(
         }
 
     step = run_diagnosis_step(rows, request.plant_part_cosh_id, answers=[])
+
+    response_status = step.status
+    session_status = "ACTIVE"
+    problem_info = None
+    if step.status == "CONFIRMATION":
+        # The pool resolved to exactly 1 candidate without any narrowing
+        # answers — resolve its name so the PWA can render the
+        # confirmation prompt. Session remains ACTIVE until the farmer
+        # answers the confirmation.
+        problem_info = await _get_problem_info(db, step.diagnosed_problem_cosh_id)
+        crop_name = await _resolve_name_for_cosh_id(
+            db, request.crop_cosh_id, current_user.language_code or "en",
+        ) or request.crop_cosh_id
+        problem_info = await enrich_problem_with_description(problem_info, crop_name)
+    elif step.status == "INCONCLUSIVE":
+        # Pool empty at start: no problems mapped to this crop + stage
+        # + plant_part. Surface as OUTSIDE_LIST so the PWA shows the
+        # honest "not in our catalogue" screen and routes to expert.
+        session_status = "OUTSIDE_LIST"
+        response_status = "OUTSIDE_LIST"
+
     session = DiagnosisSession(
         subscription_id=request.subscription_id,
         farmer_user_id=current_user.id,
@@ -549,19 +576,20 @@ async def start_diagnosis(
         remaining_problem_ids=step.remaining_problem_ids,
         answers=[],
         has_yes_answer=False,
-        status="ACTIVE",
+        status=session_status,
     )
     db.add(session)
     await db.commit()
     await db.refresh(session)
     return {
         "session_id": session.id,
-        "status": step.status,
+        "status": response_status,
         "remaining_count": step.remaining_count,
         "question": await _format_question(
             step.question, db, current_user.language_code or "en",
         ),
         "diagnosed_problem_cosh_id": step.diagnosed_problem_cosh_id,
+        "problem_info": problem_info,
     }
 
 
@@ -587,6 +615,53 @@ async def answer_question(
         )
     if request.answer not in ("YES", "NO"):
         raise HTTPException(status_code=422, detail="answer must be 'YES' or 'NO'")
+
+    # ── Confirmation branch (BL-08 §8, amended 2026-05-28) ──────────────
+    # When the previous step narrowed the pool to a single candidate,
+    # the PWA shows a confirmation card and sets `is_confirmation=True`
+    # on the answer. YES flips the session to DIAGNOSED; NO flips it to
+    # OUTSIDE_LIST (the system honestly admits the farmer's problem
+    # isn't in the catalogue and points them to an expert).
+    # Defence-in-depth: only honour the flag when the session actually
+    # has 1 candidate stored — a stray flag on a regular answer can't
+    # shortcut the algorithm.
+    if request.is_confirmation:
+        if len(session.remaining_problem_ids or []) != 1:
+            raise HTTPException(
+                status_code=409,
+                detail="is_confirmation set but session has no single candidate to confirm",
+            )
+        candidate_cosh_id = session.remaining_problem_ids[0]
+        if request.answer == "YES":
+            session.status = "DIAGNOSED"
+            session.diagnosed_problem_cosh_id = candidate_cosh_id
+            problem_info = await _get_problem_info(db, candidate_cosh_id)
+            crop_name = await _resolve_name_for_cosh_id(
+                db, session.crop_cosh_id, current_user.language_code or "en",
+            ) or session.crop_cosh_id
+            problem_info = await enrich_problem_with_description(problem_info, crop_name)
+            await db.commit()
+            return {
+                "session_id": session_id,
+                "status": "DIAGNOSED",
+                "remaining_count": 1,
+                "question": None,
+                "diagnosed_problem_cosh_id": candidate_cosh_id,
+                "problem_info": problem_info,
+                "committed_to_advisory": session.committed_at is not None,
+            }
+        # request.answer == "NO" — farmer rejects the candidate.
+        session.status = "OUTSIDE_LIST"
+        await db.commit()
+        return {
+            "session_id": session_id,
+            "status": "OUTSIDE_LIST",
+            "remaining_count": 0,
+            "question": None,
+            "diagnosed_problem_cosh_id": None,
+            "problem_info": None,
+            "committed_to_advisory": False,
+        }
 
     rows = await _load_problem_symptom_rows(
         db, session.crop_cosh_id, session.crop_stage_cosh_id,
@@ -616,7 +691,11 @@ async def answer_question(
     session.remaining_problem_ids = step.remaining_problem_ids
     session.has_yes_answer = step.has_yes_answer
 
+    response_status = step.status
     if step.status == "DIAGNOSED":
+        # Reached only via §7(d) random tie-break — multiple candidates
+        # could not be narrowed further. (Convergence to 1 now returns
+        # CONFIRMATION instead, per the BL-08 §8 amendment.)
         session.status = "DIAGNOSED"
         session.diagnosed_problem_cosh_id = step.diagnosed_problem_cosh_id
         problem_info = await _get_problem_info(db, step.diagnosed_problem_cosh_id)
@@ -627,8 +706,23 @@ async def answer_question(
         # NB: CHA trigger is no longer fired here. The farmer commits
         # the diagnosis to their advisory explicitly via the
         # /diagnosis/{session_id}/commit-to-advisory endpoint.
+    elif step.status == "CONFIRMATION":
+        # Pool reduced to exactly 1. Resolve problem_info so the PWA
+        # can render the confirmation prompt ("Looks like the problem
+        # is X. Does this match what you're seeing?"). Session stays
+        # ACTIVE — terminal transition fires when the farmer answers
+        # the confirmation via the is_confirmation branch above.
+        problem_info = await _get_problem_info(db, step.diagnosed_problem_cosh_id)
+        crop_name = await _resolve_name_for_cosh_id(
+            db, session.crop_cosh_id, current_user.language_code or "en",
+        ) or session.crop_cosh_id
+        problem_info = await enrich_problem_with_description(problem_info, crop_name)
     elif step.status == "INCONCLUSIVE":
-        session.status = "ABORTED"
+        # Rare: a NO that eliminated the last 2+ candidates at once.
+        # Surface to the farmer as OUTSIDE_LIST — same UX as a NO on a
+        # CONFIRMATION prompt. The session is terminal.
+        session.status = "OUTSIDE_LIST"
+        response_status = "OUTSIDE_LIST"
         problem_info = None
     else:
         problem_info = None
@@ -636,7 +730,7 @@ async def answer_question(
     await db.commit()
     return {
         "session_id": session_id,
-        "status": step.status,
+        "status": response_status,
         "remaining_count": step.remaining_count,
         "question": await _format_question(
             step.question, db, current_user.language_code or "en",

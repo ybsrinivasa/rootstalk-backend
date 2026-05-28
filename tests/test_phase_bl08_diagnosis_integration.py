@@ -206,11 +206,25 @@ async def test_yes_answer_diagnoses_when_pool_collapses_to_one(db):
         ),
         db=db, current_user=farmer,
     )
-    # YES on a unique-per-problem (part, symptom) → exactly one problem left.
-    assert out["status"] == "DIAGNOSED"
+    # YES on a unique-per-problem (part, symptom) → exactly one
+    # problem left → CONFIRMATION prompt (BL-08 §8, amended 2026-05-28).
+    assert out["status"] == "CONFIRMATION"
     assert out["diagnosed_problem_cosh_id"] in (
         "pest:leaf-blight", "pest:nutrient-deficiency",
     )
+    # Farmer confirms → session flips to DIAGNOSED.
+    confirmed = await answer_question(
+        session_id=started["session_id"],
+        request=AnswerRequest(
+            plant_part_cosh_id=q["plant_part_cosh_id"],
+            symptom_cosh_id="",
+            answer="YES",
+            is_confirmation=True,
+        ),
+        db=db, current_user=farmer,
+    )
+    assert confirmed["status"] == "DIAGNOSED"
+    assert confirmed["diagnosed_problem_cosh_id"] == out["diagnosed_problem_cosh_id"]
 
 
 @requires_docker
@@ -303,7 +317,8 @@ async def test_priority_rank_demotes_problem_through_live_router(db):
         ),
         db=db, current_user=farmer,
     )
-    assert out["status"] == "DIAGNOSED"
+    # YES demotes the ranked sibling → one candidate left → CONFIRMATION.
+    assert out["status"] == "CONFIRMATION"
     assert out["diagnosed_problem_cosh_id"] == "pest:unranked"
 
 
@@ -394,3 +409,168 @@ async def test_answer_rejects_invalid_value(db):
             db=db, current_user=farmer,
         )
     assert exc.value.status_code == 422
+
+
+# ── BL-08 §8 amendment (2026-05-28): CONFIRMATION + OUTSIDE_LIST ────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_confirmation_yes_flips_session_to_diagnosed(db):
+    """When the pool reduces to 1, the algorithm returns CONFIRMATION.
+    The farmer's YES on the confirmation prompt flips the session to
+    DIAGNOSED and the candidate becomes the locked diagnosis."""
+    farmer = await make_user(db)
+    sub = await _seed_subscription(db, farmer)
+    await _seed_diagnosis_data(db)
+
+    started = await start_diagnosis(
+        request=StartDiagnosisRequest(
+            subscription_id=sub.id, crop_cosh_id=CROP,
+            crop_stage_cosh_id=STAGE, plant_part_cosh_id="part:leaf",
+        ),
+        db=db, current_user=farmer,
+    )
+    q = started["question"]
+    narrowed = await answer_question(
+        session_id=started["session_id"],
+        request=AnswerRequest(
+            plant_part_cosh_id=q["plant_part_cosh_id"],
+            symptom_cosh_id=q["symptom_cosh_id"],
+            answer="YES",
+        ),
+        db=db, current_user=farmer,
+    )
+    assert narrowed["status"] == "CONFIRMATION"
+    candidate = narrowed["diagnosed_problem_cosh_id"]
+
+    confirmed = await answer_question(
+        session_id=started["session_id"],
+        request=AnswerRequest(
+            plant_part_cosh_id="part:leaf", symptom_cosh_id="",
+            answer="YES", is_confirmation=True,
+        ),
+        db=db, current_user=farmer,
+    )
+    assert confirmed["status"] == "DIAGNOSED"
+    assert confirmed["diagnosed_problem_cosh_id"] == candidate
+
+    # Session row is terminal — further answers refuse with 404.
+    session = (await db.execute(
+        select(DiagnosisSession).where(DiagnosisSession.id == started["session_id"])
+    )).scalar_one()
+    assert session.status == "DIAGNOSED"
+    assert session.diagnosed_problem_cosh_id == candidate
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_confirmation_no_flips_session_to_outside_list(db):
+    """A NO on the CONFIRMATION prompt routes the farmer to the
+    'outside our list' state. Session is terminal — no diagnosis
+    recorded, no committed_at."""
+    farmer = await make_user(db)
+    sub = await _seed_subscription(db, farmer)
+    await _seed_diagnosis_data(db)
+
+    started = await start_diagnosis(
+        request=StartDiagnosisRequest(
+            subscription_id=sub.id, crop_cosh_id=CROP,
+            crop_stage_cosh_id=STAGE, plant_part_cosh_id="part:leaf",
+        ),
+        db=db, current_user=farmer,
+    )
+    q = started["question"]
+    narrowed = await answer_question(
+        session_id=started["session_id"],
+        request=AnswerRequest(
+            plant_part_cosh_id=q["plant_part_cosh_id"],
+            symptom_cosh_id=q["symptom_cosh_id"],
+            answer="YES",
+        ),
+        db=db, current_user=farmer,
+    )
+    assert narrowed["status"] == "CONFIRMATION"
+
+    rejected = await answer_question(
+        session_id=started["session_id"],
+        request=AnswerRequest(
+            plant_part_cosh_id="part:leaf", symptom_cosh_id="",
+            answer="NO", is_confirmation=True,
+        ),
+        db=db, current_user=farmer,
+    )
+    assert rejected["status"] == "OUTSIDE_LIST"
+    assert rejected["problem_info"] is None
+    assert rejected["diagnosed_problem_cosh_id"] is None
+
+    session = (await db.execute(
+        select(DiagnosisSession).where(DiagnosisSession.id == started["session_id"])
+    )).scalar_one()
+    assert session.status == "OUTSIDE_LIST"
+    assert session.diagnosed_problem_cosh_id is None
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_confirmation_flag_rejected_when_pool_has_more_than_one(db):
+    """A stray is_confirmation=True on a session whose pool isn't down
+    to exactly 1 must be refused — otherwise a misbehaving client could
+    shortcut the algorithm and ratify whatever happens to be at index 0."""
+    farmer = await make_user(db)
+    sub = await _seed_subscription(db, farmer)
+    await _seed_diagnosis_data(db)
+
+    started = await start_diagnosis(
+        request=StartDiagnosisRequest(
+            subscription_id=sub.id, crop_cosh_id=CROP,
+            crop_stage_cosh_id=STAGE, plant_part_cosh_id="part:leaf",
+        ),
+        db=db, current_user=farmer,
+    )
+    assert started["status"] == "QUESTION"   # 2 candidates → asking, not confirming
+    with pytest.raises(HTTPException) as exc:
+        await answer_question(
+            session_id=started["session_id"],
+            request=AnswerRequest(
+                plant_part_cosh_id="part:leaf", symptom_cosh_id="",
+                answer="YES", is_confirmation=True,
+            ),
+            db=db, current_user=farmer,
+        )
+    assert exc.value.status_code == 409
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_start_with_empty_pool_returns_outside_list(db):
+    """When no problems are mapped to this crop+stage+plant_part at all,
+    the algorithm's INCONCLUSIVE result is surfaced to the PWA as
+    OUTSIDE_LIST so the farmer sees the same 'not in our catalogue'
+    UX as the NO-on-confirmation path."""
+    farmer = await make_user(db)
+    sub = await _seed_subscription(db, farmer)
+    # Seed only STEM-pest data — farmer picks LEAF, so pool is empty.
+    db.add(_pd_row(
+        "pdc:stem-only",
+        crop=CROP, crop_stage=STAGE,
+        pest="pest:stem-borer", part="part:stem", symptom="symptom:hole",
+    ))
+    await db.commit()
+
+    # _load_problem_symptom_rows returns at least one row (the STEM one),
+    # so start_diagnosis runs the algorithm — which then returns
+    # INCONCLUSIVE because no rows match part:leaf.
+    started = await start_diagnosis(
+        request=StartDiagnosisRequest(
+            subscription_id=sub.id, crop_cosh_id=CROP,
+            crop_stage_cosh_id=STAGE, plant_part_cosh_id="part:leaf",
+        ),
+        db=db, current_user=farmer,
+    )
+    assert started["status"] == "OUTSIDE_LIST"
+    assert started["diagnosed_problem_cosh_id"] is None
+
+    session = (await db.execute(
+        select(DiagnosisSession).where(DiagnosisSession.id == started["session_id"])
+    )).scalar_one()
+    assert session.status == "OUTSIDE_LIST"
