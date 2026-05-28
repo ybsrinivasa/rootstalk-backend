@@ -46,14 +46,19 @@ def make_dataset() -> list[PSR]:
 # ── TC-BL08-01: First question uses farmer's selected plant part ──────────────
 
 def test_bl08_01_first_question_uses_selected_plant_part():
-    """First question must be for farmer's selected plant_part (LEAF), not STEM."""
+    """First question must be for farmer's selected plant_part (LEAF), not STEM.
+
+    Per BL-08 §2 ("mapped to this crop + stage + plant_part"), the initial
+    pool excludes problems with no LEAF data — P4 (STEM-only) drops out.
+    Only P1, P2, P3, P5 carry LEAF rows."""
     rows = make_dataset()
     step = run_diagnosis_step(rows, initial_plant_part="LEAF", answers=[], random_seed=42)
 
     assert step.status == "QUESTION"
     assert step.question is not None
     assert step.question.plant_part_cosh_id == "LEAF"   # Must use farmer's chosen part
-    assert step.remaining_count == 5
+    assert step.remaining_count == 4
+    assert "P4" not in step.remaining_problem_ids   # STEM-only — not in LEAF pool
 
 
 # ── TC-BL08-02: After NO — stays on same plant part, pool narrows ─────────────
@@ -333,3 +338,134 @@ def test_bl08_15_single_symptom_rank_does_not_demote():
     )
     assert step.status == "DIAGNOSED"
     assert step.diagnosed_problem_cosh_id == "P1"
+
+
+# ── TC-BL08-16: Locked part — initial pool excludes other-part-only problems ──
+
+def test_bl08_16_initial_pool_scoped_to_locked_part():
+    """BL-08 §2: pool is "problems mapped to this crop+stage+plant_part".
+    A problem with NO rows on the farmer's selected part must not enter
+    the pool — even though it exists in the raw row set."""
+    rows = [
+        PSR("P_leaf", "LEAF", "Spots"),
+        PSR("P_leaf", "LEAF", "Yellowing"),
+        PSR("P_stem_only", "STEM", "Lesions"),    # No LEAF row at all
+    ]
+    step = run_diagnosis_step(rows, initial_plant_part="LEAF", answers=[], random_seed=42)
+    assert "P_stem_only" not in step.remaining_problem_ids
+    assert "P_leaf" in step.remaining_problem_ids
+
+
+# ── TC-BL08-17: Locked part — NO that exhausts a problem's part rows drops it ─
+
+def test_bl08_17_no_exhausting_locked_part_drops_problem():
+    """BL-08 §6: a NO that leaves a problem with no surviving rows on the
+    LOCKED part removes that problem — even if the problem has rows on
+    other parts. Before the 2026-05-28 fix the problem silently survived
+    on its other-part rows, and the random tie-break in step (d) could
+    later pick it as the diagnosis (the "we went somewhere else" bug)."""
+    rows = [
+        PSR("P_keeps_leaf", "LEAF", "Spots"),
+        PSR("P_keeps_leaf", "LEAF", "Wilting"),
+        PSR("P_loses_leaf", "LEAF", "Spots"),         # Only LEAF row
+        PSR("P_loses_leaf", "STEM", "Lesions"),       # Survives on STEM if we ignore lock
+    ]
+    answers = [DA("LEAF", "Spots", None, None, "NO")]
+    step = run_diagnosis_step(rows, initial_plant_part="LEAF", answers=answers, random_seed=42)
+
+    # P_keeps_leaf still has (LEAF, Wilting) — stays.
+    assert "P_keeps_leaf" in step.remaining_problem_ids
+    # P_loses_leaf's only LEAF row was Spots — gone. STEM row should NOT
+    # rescue it while the farmer is still locked on LEAF.
+    assert "P_loses_leaf" not in step.remaining_problem_ids
+
+
+# ── TC-BL08-18: After YES, the lock releases (existing §5 behaviour preserved) ─
+
+def test_bl08_18_yes_releases_part_lock():
+    """A YES unlocks the part filter so the YES path can find rows on
+    other parts (BL-08 §5). The remaining_ids after YES is no longer
+    constrained to initial_plant_part."""
+    rows = [
+        PSR("P_cross", "LEAF", "Spots"),
+        PSR("P_cross", "STEM", "Lesions"),    # Other-part row for the YES'd problem
+    ]
+    answers = [DA("LEAF", "Spots", None, None, "YES")]
+    step = run_diagnosis_step(rows, initial_plant_part="LEAF", answers=answers, random_seed=42)
+
+    # Single problem remains, but it diagnosed only because YES narrowed
+    # to {P_cross} — the STEM row would have been visible for a follow-up
+    # question if more problems were in the YES set.
+    assert step.has_yes_answer is True
+    assert "P_cross" in step.remaining_problem_ids
+
+
+# ── TC-BL08-19: Lower-Canopy scenario — random pick stays on locked part ──────
+
+def test_bl08_19_random_pick_stays_on_locked_part():
+    """Faithful reproduction of the farmer-reported bug (2026-05-28):
+    Tomato → Vegetative → Lower Canopy → NO → NO → NO.
+
+    Setup: 4 problems with Lower Canopy rows, plus 1 "stowaway" with
+    only Upper Canopy rows. After 3 NOs that exhaust the discriminating
+    LC symptoms, two LC problems remain that share an LC symptom we've
+    already covered → algorithm has nothing more to ask on LC.
+
+    Per BL-08 §7(d) the random tie-break MAY fire. After the fix, the
+    pick must come from the LC pool only — never the stowaway."""
+    rows = [
+        # 4 problems mapped to Lower Canopy
+        PSR("LC_problem_1", "LC", "Yellowing"),
+        PSR("LC_problem_1", "LC", "Curling"),
+        PSR("LC_problem_2", "LC", "Yellowing"),
+        PSR("LC_problem_2", "LC", "Spotting"),
+        PSR("LC_problem_3", "LC", "Wilting"),
+        PSR("LC_problem_4", "LC", "Wilting"),
+        # Stowaway — never mapped to LC, but in the same crop+stage
+        PSR("UC_stowaway", "UC", "Browning"),
+    ]
+    # 3 NOs that drop everyone except LC_problem_3 + LC_problem_4
+    # (both share Wilting on LC — undifferentiated).
+    answers = [
+        DA("LC", "Yellowing", None, None, "NO"),
+        DA("LC", "Curling", None, None, "NO"),
+        DA("LC", "Spotting", None, None, "NO"),
+    ]
+    step = run_diagnosis_step(rows, initial_plant_part="LC", answers=answers, random_seed=42)
+
+    # The stowaway must never reach the diagnosis screen.
+    assert "UC_stowaway" not in step.remaining_problem_ids
+    # If status is DIAGNOSED (random pick), it must be one of the two LC
+    # problems — never the stowaway.
+    if step.status == "DIAGNOSED":
+        assert step.diagnosed_problem_cosh_id in {"LC_problem_3", "LC_problem_4"}
+
+
+# ── TC-BL08-20: Disambiguate (c) honours the lock when no YES given ───────────
+
+def test_bl08_20_disambiguate_step_c_respects_lock():
+    """The 'all four combined' branch of disambiguation must stay on the
+    locked plant_part while has_yes is False. Pre-fix this branch
+    explicitly looked across ALL parts (per the old comment "look across
+    ALL parts (not just current_part)") which silently moved the farmer
+    off their selected part."""
+    rows = [
+        # Two LC problems both share (LC, Spotting) — no plain LC differentiator.
+        PSR("PA", "LC", "Spotting"),
+        PSR("PB", "LC", "Spotting"),
+        # Each has a fully-qualified row on a DIFFERENT part. Pre-fix,
+        # step (c) would happily return a question on UC or STEM.
+        PSR("PA", "UC", "Browning", sub_part_cosh_id="upper_left", sub_symptom_cosh_id="dark"),
+        PSR("PB", "STEM", "Cracking", sub_part_cosh_id="lower_node", sub_symptom_cosh_id="dry"),
+    ]
+    answers = [DA("LC", "Spotting", None, None, "NO")]   # Eliminates the shared LC row
+    step = run_diagnosis_step(rows, initial_plant_part="LC", answers=answers, random_seed=42)
+
+    # Both problems lost their only LC row → the lock removes them from
+    # remaining_ids → pool empties → INCONCLUSIVE. The IMPORTANT point
+    # is the algorithm does NOT return a QUESTION on UC or STEM via (c).
+    if step.status == "QUESTION":
+        assert step.question.plant_part_cosh_id == "LC", (
+            "Disambiguation step (c) must stay on locked LC, "
+            f"got plant_part={step.question.plant_part_cosh_id!r}"
+        )

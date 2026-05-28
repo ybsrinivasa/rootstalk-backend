@@ -104,8 +104,31 @@ def run_diagnosis_step(
     active_rows = _apply_answers(all_rows, answers)
     has_yes = any(a.answer == "YES" for a in answers)
 
-    # Remaining problem pool = unique problem IDs still in active_rows
-    remaining_ids = list(dict.fromkeys(r.problem_cosh_id for r in active_rows))
+    # Remaining problem pool = unique problem IDs still in active_rows.
+    #
+    # BL-08 §2: "Load initial problem pool: all specific problems and
+    # problem groups mapped to this crop + stage + plant_part." §6:
+    # "Farmer answers NO: stay on the same plant_part." Until the
+    # farmer gives a YES (§5 then explicitly grants permission to switch
+    # parts), the pool MUST stay scoped to problems that still have at
+    # least one active row on the locked plant_part. Without this
+    # constraint, a problem whose only locked-part row was eliminated
+    # by a NO silently survives on its other-part rows, and the random
+    # tie-break in step (d) could end up offering a diagnosis the farmer
+    # never selected the part for. Surfaced 2026-05-28 — farmer reported
+    # "we have gone somewhere else" after a Lower Canopy → NO → NO → NO
+    # path produced answers from non-Lower-Canopy problems.
+    if has_yes:
+        remaining_ids = list(dict.fromkeys(r.problem_cosh_id for r in active_rows))
+    else:
+        on_locked_part = {
+            r.problem_cosh_id for r in active_rows
+            if r.plant_part_cosh_id == initial_plant_part
+        }
+        remaining_ids = list(dict.fromkeys(
+            r.problem_cosh_id for r in active_rows
+            if r.problem_cosh_id in on_locked_part
+        ))
 
     if len(remaining_ids) == 0:
         # This should not happen by BL-08 design (dead ends impossible)
@@ -151,8 +174,15 @@ def run_diagnosis_step(
             has_yes_answer=has_yes,
         )
 
-    # No plain symptom distinguishes further — try disambiguation
-    disambiguation = _disambiguate(active_rows, remaining_ids, current_part, answered_combos)
+    # No plain symptom distinguishes further — try disambiguation.
+    # When the part is still locked (no YES given), step (c) must stay
+    # on the same plant_part too; see §6 and the BL-08 §7(c) clause that
+    # combines part+sub_part+symptom+sub_symptom — "Part" there refers
+    # to the currently-locked part, not any part.
+    disambiguation = _disambiguate(
+        active_rows, remaining_ids, current_part, answered_combos,
+        locked_to_part=not has_yes,
+    )
     if disambiguation:
         return DiagnosisStep(
             status="QUESTION",
@@ -316,12 +346,19 @@ def _disambiguate(
     problem_ids: list[str],
     plant_part: str,
     answered: set,
+    locked_to_part: bool = False,
 ) -> Optional[DiagnosisQuestion]:
     """
     Disambiguation priority (AGR §8.3, BL-08 step 7):
     (a) Sub-symptom: problems differ by sub_symptom on the same part+symptom
     (b) Sub-part: problems differ by sub_part on the same part
-    (c) All four combined (part + sub_part + symptom + sub_symptom)
+    (c) All four combined (part + sub_part + symptom + sub_symptom).
+        When `locked_to_part=True` (farmer hasn't given a YES yet),
+        the combined question stays on the locked plant_part —
+        BL-08 §6 says NO answers keep the farmer on the same part,
+        and that lock persists through disambiguation until §5's
+        YES-frees-the-part rule fires. When False (a YES has been
+        given), step (c) is free to cross parts.
     Returns a question using the first differentiator found.
     """
     relevant = [r for r in rows if r.problem_cosh_id in set(problem_ids) and r.plant_part_cosh_id == plant_part]
@@ -364,8 +401,17 @@ def _disambiguate(
             question_type="SUB_PART",
         )
 
-    # (c) All four combined — look across ALL parts (not just current_part)
-    all_relevant = [r for r in rows if r.problem_cosh_id in set(problem_ids)]
+    # (c) All four combined. Cross-part when YES has unlocked the
+    # algorithm (§5); stay on current_part while the lock is still in
+    # effect (§6).
+    if locked_to_part:
+        all_relevant = [
+            r for r in rows
+            if r.problem_cosh_id in set(problem_ids)
+            and r.plant_part_cosh_id == plant_part
+        ]
+    else:
+        all_relevant = [r for r in rows if r.problem_cosh_id in set(problem_ids)]
     for r in all_relevant:
         if r.sub_part_cosh_id and r.sub_symptom_cosh_id:
             combo = (r.plant_part_cosh_id, r.symptom_cosh_id, r.sub_part_cosh_id, r.sub_symptom_cosh_id)
