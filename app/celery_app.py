@@ -15,6 +15,7 @@ celery_app = Celery(
         "app.tasks.snapshot_sweep",
         "app.tasks.payment_request_expiry",
         "app.tasks.share_link_reconciler",
+        "app.tasks.assignment_expiry",
     ],
 )
 
@@ -60,6 +61,14 @@ celery_app.conf.beat_schedule = {
     "share-link-reconcile-check": {
         "task": "app.tasks.share_link_reconciler.reconcile_share_link_payments",
         "schedule": crontab(minute=15),
+    },
+    # F-P B3 (2026-05-29): auto-expire PromoterAssignments older than
+    # 72h. Scheduled at :30 to keep the per-minute event log readable
+    # (payment-request expiry at :00, share-link reconciler at :15).
+    # See app/tasks/assignment_expiry.py.
+    "assignment-expiry-check": {
+        "task": "app.tasks.assignment_expiry.expire_assignments",
+        "schedule": crontab(minute=30),
     },
 }
 

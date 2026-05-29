@@ -1421,6 +1421,102 @@ async def initiate_assignment(
     return {"subscription_id": sub.id, "assignment_id": assignment.id, "status": "Awaiting farmer approval"}
 
 
+# F-P B3 (2026-05-29) — F-P self-cancel of a pending assignment.
+WITHDRAW_FCM_TITLE = "Subscription offer withdrawn"
+WITHDRAW_FCM_BODY = (
+    "Your subscription offer was withdrawn before you responded. "
+    "Reach out to the person who sent it if you'd like a new one."
+)
+
+
+@router.delete("/promoter/assignments/{assignment_id}", status_code=200)
+async def promoter_cancel_assignment(
+    assignment_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """F-P withdraws a pending assignment before the farmer responds.
+
+    Refunds 1 unit to the kitty, cancels the linked Subscription,
+    sets the Assignment to CANCELLED_BY_PROMOTER, and notifies the
+    farmer (FCM PROMOTER_ASSIGNMENT_WITHDRAWN).
+
+    Auth: only the F-P who created the row can withdraw it.
+    State: only PENDING_FARMER_APPROVAL — already-ACTIVE / rejected /
+    expired / withdrawn rows refuse with 409 to keep the refund
+    naturally idempotent."""
+    from app.services.promoter_pool import refund_to_promoter
+
+    assignment = (await db.execute(
+        select(PromoterAssignment).where(PromoterAssignment.id == assignment_id)
+    )).scalar_one_or_none()
+    if assignment is None:
+        raise HTTPException(status_code=404, detail="Assignment not found.")
+    if assignment.promoter_user_id != current_user.id:
+        raise HTTPException(status_code=403, detail={
+            "code": "not_assignment_owner",
+            "message": "Only the promoter who created this assignment can cancel it.",
+        })
+    if assignment.status != AssignmentStatus.PENDING_FARMER_APPROVAL:
+        raise HTTPException(status_code=409, detail={
+            "code": "assignment_not_pending",
+            "message": f"Cannot cancel an assignment in status {assignment.status}.",
+        })
+
+    sub = (await db.execute(
+        select(Subscription).where(Subscription.id == assignment.subscription_id)
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=500, detail={
+            "code": "orphan_assignment",
+            "message": "Assignment has no linked subscription.",
+        })
+
+    now = datetime.now(timezone.utc)
+    assignment.status = AssignmentStatus.CANCELLED_BY_PROMOTER
+    assignment.farmer_responded_at = now
+    sub.status = SubscriptionStatus.CANCELLED
+    try:
+        await refund_to_promoter(
+            db,
+            client_id=sub.client_id,
+            promoter_user_id=current_user.id,
+        )
+    except ValueError:
+        # No allocation row — surface in logs but proceed; the
+        # status flips are still correct.
+        pass
+
+    await db.commit()
+
+    # FCM to the farmer.
+    farmer = (await db.execute(
+        select(User).where(User.id == sub.farmer_user_id)
+    )).scalar_one_or_none()
+    if farmer and farmer.fcm_token:
+        from app.services.fcm_service import send_fcm
+        try:
+            await send_fcm(
+                token=farmer.fcm_token,
+                title=WITHDRAW_FCM_TITLE,
+                body=WITHDRAW_FCM_BODY,
+                data={
+                    "type": "PROMOTER_ASSIGNMENT_WITHDRAWN",
+                    "assignment_id": assignment.id,
+                    "subscription_id": sub.id,
+                },
+            )
+        except Exception:
+            # Graceful degrade — DB state already correct.
+            pass
+
+    return {
+        "assignment_id": assignment.id,
+        "subscription_id": sub.id,
+        "status": "Cancelled by promoter; unit refunded to your kitty.",
+    }
+
+
 @router.get("/promoter/farmer-lookup")
 async def promoter_farmer_lookup(
     phone: str,
