@@ -7,10 +7,14 @@ subscription to a farmer; the CA can reclaim unconsumed units back to
 the company unallocated balance at any time.
 
 Invariant (asserted at write time, not enforced by the schema):
-    units_balance == allocated_total - reclaimed_total - consumed_total
+    units_balance == allocated_total
+                   - reclaimed_total
+                   - consumed_total
+                   + refunded_total
 
 Spec: BL-11 (Subscription State Machine — per-promoter allocation,
-2026-05-04).
+2026-05-04). F-P B2 refunds (2026-05-29) added refunded_total to
+keep consumed_total as the historical "ever-consumed" count.
 """
 from datetime import datetime
 from sqlalchemy import Integer, String, DateTime, ForeignKey, UniqueConstraint
@@ -43,6 +47,11 @@ class PromoterAllocation(Base):
     allocated_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     reclaimed_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     consumed_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # F-P B2 (2026-05-29) — running total of units refunded back to the
+    # promoter's kitty when an assignment is rejected by the farmer,
+    # auto-expires at 72h, or the F-P withdraws. consumed_total stays
+    # as "ever-consumed"; refunded_total cancels it on the balance side.
+    refunded_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow,

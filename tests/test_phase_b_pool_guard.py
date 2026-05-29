@@ -107,6 +107,7 @@ async def test_initiate_blocked_when_promoter_has_no_allocation(db):
         package_id=package.id,
         client_id=client.id,
         promoter_type="DEALER",
+        farm_area_acres=1.0,   # F-P B2: measure now required
     )
     with pytest.raises(HTTPException) as exc:
         await initiate_assignment(
@@ -145,6 +146,7 @@ async def test_initiate_succeeds_when_promoter_has_allocation(db):
         package_id=package.id,
         client_id=client.id,
         promoter_type="DEALER",
+        farm_area_acres=1.0,   # F-P B2: measure now required
     )
     out = await initiate_assignment(
         request=payload, db=db, current_user=promoter,
@@ -180,6 +182,7 @@ async def test_initiate_404_when_farmer_unregistered(db):
         package_id=package.id,
         client_id=client.id,
         promoter_type="DEALER",
+        farm_area_acres=1.0,   # F-P B2: measure now required
     )
     with pytest.raises(HTTPException) as exc:
         await initiate_assignment(

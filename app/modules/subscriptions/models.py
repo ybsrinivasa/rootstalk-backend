@@ -36,6 +36,10 @@ class AssignmentStatus(str, enum.Enum):
     PENDING_FARMER_APPROVAL = "PENDING_FARMER_APPROVAL"
     ACTIVE = "ACTIVE"
     REJECTED_BY_FARMER = "REJECTED_BY_FARMER"
+    # F-P B2 (2026-05-29) — auto-expire after 72h of no farmer response.
+    EXPIRED = "EXPIRED"
+    # F-P B2 — F-P withdraws their own PENDING_FARMER_APPROVAL.
+    CANCELLED_BY_PROMOTER = "CANCELLED_BY_PROMOTER"
 
 
 class AlertType(str, enum.Enum):

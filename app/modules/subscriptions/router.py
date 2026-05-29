@@ -1271,8 +1271,22 @@ async def get_next_advisory_date(
 class PromoterAssignRequest(BaseModel):
     farmer_phone: str
     package_id: str
-    client_id: str
     promoter_type: str = "DEALER"
+    # `client_id` is required for Dealer-Promoters (multi-client), and
+    # optional-or-absent for Facilitator-Promoters where the server
+    # derives it from the F-P's locked binding (spec §11.2). When sent
+    # by an F-P, the value must match the locked binding — mismatch is
+    # a 403, not silent overwrite.
+    client_id: Optional[str] = None
+    # F-P B2 (2026-05-29) — P-V answers captured on the F-P side and
+    # persisted on the new Subscription so the volume calc has the
+    # measure context immediately, not on a later farmer touch. Exactly
+    # one branch must be supplied:
+    #   AREA_WISE  → farm_area_acres
+    #   PLANT_WISE → number_of_plants + planting_year
+    farm_area_acres: Optional[float] = None
+    number_of_plants: Optional[int] = None
+    planting_year: Optional[int] = None
 
 
 @router.post("/promoter/assignments/initiate", status_code=201)
@@ -1283,26 +1297,79 @@ async def initiate_assignment(
 ):
     """Promoter assigns advisory to farmer. Farmer must approve.
 
-    Policy (Phase C, 2026-05-04): the gate is now the **promoter's
-    personal allocation balance** for this company, not the company-
-    wide pool. Each company allocates units to specific promoters; a
-    promoter who has exhausted their share is blocked from assigning
-    further until the CA reallocates. This is consumed atomically at
-    initiate time — if the farmer rejects later, the unit is *not*
-    refunded (CA can manually reallocate to compensate). Farmer self-
-    subscribe is unchanged and remains independent of the company pool.
+    Policy (Phase C, 2026-05-04): the gate is the **promoter's personal
+    allocation balance** for this company, not the company-wide pool.
+    A promoter who has exhausted their share is blocked from assigning
+    further until the CA reallocates. The unit is consumed atomically
+    at initiate time. Farmer self-subscribe is unchanged and remains
+    independent of the company pool.
+
+    F-P B2 (2026-05-29):
+      • For `promoter_type=FACILITATOR`, `client_id` is derived
+        server-side from the F-P's locked binding (spec §11.2 — one
+        Client at a time). If the request also carries client_id, it
+        must match — mismatch is a 403 to prevent silent overwrite.
+      • P-V answers are persisted on the new Subscription: exactly one
+        of {farm_area_acres} or {number_of_plants + planting_year}
+        must be supplied. The corresponding *_confirmed_at column is
+        stamped now since the F-P explicitly answered.
+      • Rejection no longer leaves the unit consumed — the
+        farmer-respond path calls `refund_to_promoter` (see B2 wiring).
     """
     from app.modules.auth.service import get_user_by_phone
     from app.services.promoter_pool import (
         consume_for_assignment, get_promoter_balance,
     )
 
+    # ── Resolve client_id (server-derived for F-P, request-supplied
+    #    for Dealer-Promoters). ─────────────────────────────────────
+    if request.promoter_type == "FACILITATOR":
+        locked = await _resolve_promoter_locked_client(db, current_user)
+        if request.client_id and request.client_id != locked.id:
+            raise HTTPException(status_code=403, detail={
+                "code": "client_id_mismatch",
+                "message": (
+                    "Facilitator-Promoter cannot assign for a Client other "
+                    "than their locked binding."
+                ),
+            })
+        effective_client_id = locked.id
+    else:
+        if not request.client_id:
+            raise HTTPException(status_code=422, detail={
+                "code": "client_id_required",
+                "message": "client_id is required for Dealer-Promoter assignments.",
+            })
+        effective_client_id = request.client_id
+
+    # ── Validate P-V answers: exactly one branch. ─────────────────
+    area_given = request.farm_area_acres is not None
+    plant_given = (
+        request.number_of_plants is not None
+        or request.planting_year is not None
+    )
+    if not (area_given ^ plant_given):
+        raise HTTPException(status_code=422, detail={
+            "code": "measure_required",
+            "message": (
+                "Supply exactly one of {farm_area_acres} OR "
+                "{number_of_plants + planting_year}."
+            ),
+        })
+    if plant_given and (
+        request.number_of_plants is None or request.planting_year is None
+    ):
+        raise HTTPException(status_code=422, detail={
+            "code": "plant_wise_incomplete",
+            "message": "Plant-wise assignments need both number_of_plants and planting_year.",
+        })
+
     farmer = await get_user_by_phone(db, request.farmer_phone)
     if not farmer:
         raise HTTPException(status_code=404, detail="Farmer not found. They must be registered in the PWA first.")
 
     promoter_balance = await get_promoter_balance(
-        db, request.client_id, current_user.id,
+        db, effective_client_id, current_user.id,
     )
     if promoter_balance <= 0:
         raise HTTPException(
@@ -1319,19 +1386,27 @@ async def initiate_assignment(
     # over-spend their balance.
     try:
         await consume_for_assignment(
-            db, client_id=request.client_id, promoter_user_id=current_user.id,
+            db, client_id=effective_client_id, promoter_user_id=current_user.id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
+    now = datetime.now(timezone.utc)
     sub = Subscription(
         farmer_user_id=farmer.id,
-        client_id=request.client_id,
+        client_id=effective_client_id,
         package_id=request.package_id,
         promoter_user_id=current_user.id,
         subscription_type=SubscriptionType.ASSIGNED,
         status=SubscriptionStatus.WAITLISTED,
     )
+    if area_given:
+        sub.farm_area_acres = request.farm_area_acres
+        sub.farm_area_confirmed_at = now
+    else:
+        sub.number_of_plants = request.number_of_plants
+        sub.planting_year = request.planting_year
+        sub.plant_count_confirmed_at = now
     db.add(sub)
     await db.flush()
 
@@ -1510,6 +1585,12 @@ async def respond_to_assignment(
     sub would silently reset subscription_date and re-issue the
     reference_number, and hitting it on a CANCELLED sub could
     un-cancel a rejection.
+
+    F-P B2 (2026-05-29): on reject, auto-refund the unit to the
+    promoter's kitty via `refund_to_promoter` (was previously left
+    consumed, CA had to reallocate manually). The BL-11 transition
+    guard above prevents re-processing a row already past WAITLISTED,
+    so the refund is naturally idempotent — second-call short-circuits.
     """
     sub = await _get_subscription(db, subscription_id, current_user.id)
     approved = data.get("approved", False)
@@ -1537,8 +1618,23 @@ async def respond_to_assignment(
         sub.reference_number = await _generate_reference_for_sub(db, sub.client_id)
     else:
         sub.status = SubscriptionStatus.CANCELLED
-        # Note: rejected unit is NOT refunded to the promoter's
-        # allocation. The CA can manually reallocate if appropriate.
+        # F-P B2 — auto-refund the unit back to the promoter's kitty.
+        # `assignment` is guaranteed non-None on the ASSIGNED-sub
+        # rejection path (initiate creates both in the same txn). The
+        # try/except keeps us defensive against legacy ASSIGNED rows
+        # that somehow lack a PromoterAssignment companion.
+        if assignment is not None:
+            from app.services.promoter_pool import refund_to_promoter
+            try:
+                await refund_to_promoter(
+                    db,
+                    client_id=sub.client_id,
+                    promoter_user_id=assignment.promoter_user_id,
+                )
+            except ValueError:
+                # No allocation row to refund into — leave consumed_total
+                # and skip. CA can investigate via the audit totals.
+                pass
 
     await db.commit()
     return {"status": sub.status, "reference_number": sub.reference_number}
