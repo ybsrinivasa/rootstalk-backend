@@ -41,6 +41,9 @@ class SubscriptionView:
     farmer_user_id: str
     promoter_user_id: Optional[str]
     crop_start_date: Optional[date]   # None ⇒ START_DATE alert candidate
+    # Alerts A + C (2026-05-29) — farmer's saved override + opt-out.
+    extra_alert_user_id: Optional[str] = None
+    alerts_extra_disabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -72,34 +75,38 @@ class AlertRecipientSpec:
 
 def resolve_alert_recipients(
     sub: SubscriptionView,
-    configured: list[ConfiguredRecipient],
+    configured: list[ConfiguredRecipient] | None = None,
 ) -> list[AlertRecipientSpec]:
     """Resolve who should be alerted for this subscription.
 
-    Rule: if the farmer has explicit `configured` rows, those win
-    verbatim (farmer's stated preference; includes opting out of self
-    by simply not having a FARMER row). Otherwise apply defaults:
-    farmer + promoter (skipping the promoter slot if there is none, e.g.
-    self-subscribed without a configured local person).
+    Rules (rewritten Alerts A+C, 2026-05-29):
+      1. Farmer always receives — they are the subscription owner.
+      2. If `alerts_extra_disabled` is True, the farmer has explicitly
+         opted out of any extra recipient (including the auto-promoter
+         fallback). Stop after the farmer.
+      3. If `extra_alert_user_id` is set, that User is the extra
+         recipient (farmer's override of the default).
+      4. Otherwise, default to the assigning promoter — `promoter_user_id`
+         on the subscription. NULL on SELF subs, so the default is
+         "farmer only" for direct-subscribe.
 
-    The 'PROMOTER' role from `alert_recipients` is normalised to
-    'LOCAL_PERSON' on output — they are the same slot from BL-09's
-    perspective; the table just predates the renaming.
+    The legacy `configured: list[ConfiguredRecipient]` parameter is
+    kept for back-compat with any caller that still passes it, but the
+    new write path (POST /alert-preferences) no longer writes to the
+    `alert_recipients` table — `extra_alert_user_id` is the source of
+    truth. The parameter is now ignored.
     """
-    if configured:
-        seen: dict[str, str] = {}
-        for r in configured:
-            normalised = "LOCAL_PERSON" if r.role == "PROMOTER" else r.role
-            seen.setdefault(r.user_id, normalised)
-        return [AlertRecipientSpec(user_id=u, role=role) for u, role in seen.items()]
+    _ = configured  # legacy, retained for back-compat
 
     out: list[AlertRecipientSpec] = [
         AlertRecipientSpec(user_id=sub.farmer_user_id, role="FARMER"),
     ]
-    if sub.promoter_user_id and sub.promoter_user_id != sub.farmer_user_id:
-        out.append(AlertRecipientSpec(
-            user_id=sub.promoter_user_id, role="LOCAL_PERSON",
-        ))
+    if sub.alerts_extra_disabled:
+        return out
+
+    extra_id = sub.extra_alert_user_id or sub.promoter_user_id
+    if extra_id and extra_id != sub.farmer_user_id:
+        out.append(AlertRecipientSpec(user_id=extra_id, role="LOCAL_PERSON"))
     return out
 
 

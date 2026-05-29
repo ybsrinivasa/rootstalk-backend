@@ -118,15 +118,13 @@ async def test_self_subscribed_start_date_alert_goes_to_farmer_only(db, sms_reco
 @requires_docker
 @pytest.mark.asyncio
 async def test_configured_local_person_overrides_default_promoter(db, sms_recorder):
-    """The farmer has chosen a different dealer in the PWA — that dealer
-    is the only local person alerted, regardless of who originally
-    assigned the subscription."""
+    """The farmer's chosen dealer (via /alert-preferences) receives the
+    alert in place of the auto-promoter; the farmer still receives —
+    Alerts A (2026-05-29): the override replaces the auto-promoter
+    slot, not the FARMER slot."""
     sub, farmer, promoter, _ = await _seed_assigned_active_sub(db)
     chosen_dealer = await make_user(db, name="Chosen Dealer")
-    db.add(AlertRecipient(
-        subscription_id=sub.id, recipient_user_id=chosen_dealer.id,
-        recipient_type="LOCAL_PERSON", status="ACTIVE",
-    ))
+    sub.extra_alert_user_id = chosen_dealer.id
     await db.commit()
 
     await _run_daily_alerts_with_session(db)
@@ -136,9 +134,9 @@ async def test_configured_local_person_overrides_default_promoter(db, sms_record
             select(Alert).where(Alert.subscription_id == sub.id)
         )).scalars().all()
     }
-    assert recipient_ids == {chosen_dealer.id}
+    assert chosen_dealer.id in recipient_ids
+    assert farmer.id in recipient_ids
     assert promoter.id not in recipient_ids
-    assert farmer.id not in recipient_ids
 
 
 @requires_docker

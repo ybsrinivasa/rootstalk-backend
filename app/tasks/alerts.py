@@ -186,10 +186,18 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
         farmer_user_id=sub.farmer_user_id,
         promoter_user_id=sub.promoter_user_id,
         crop_start_date=crop_start,
+        extra_alert_user_id=sub.extra_alert_user_id,
+        alerts_extra_disabled=sub.alerts_extra_disabled,
     )
 
-    configured = await _load_configured_recipients(db, sub.id)
-    recipients = resolve_alert_recipients(sub_view, configured)
+    # Alerts A (2026-05-29): the resolver now reads farmer's override
+    # straight off the Subscription columns; the legacy `alert_recipients`
+    # table was being read before but never written to — nothing reached
+    # the sender. _load_configured_recipients is kept for now (called
+    # below with no callers reading the result) so the legacy table
+    # writes from any straggler code path still gather visibility in
+    # logs; the resolver ignores them.
+    recipients = resolve_alert_recipients(sub_view)
     if not recipients:
         return
 

@@ -2457,21 +2457,84 @@ async def set_alert_preferences(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Save the farmer's chosen extra alert recipient.
+    """Save the farmer's alert recipient choice.
 
-    Schema (2026-05-20 rewire — was multi-row FARMER+PROMOTER):
-      { extra_phone: str | null, extra_name: str | null }
+    Schema (Alerts A+B+C, 2026-05-29):
+      { extra_phone: str | null, disabled: bool | null }
 
-    The farmer always receives alerts via push notifications — that
-    is not configurable here. `extra_phone` captures one optional
-    second recipient (a dealer / facilitator / anyone the farmer
-    chooses). Empty string is normalised to NULL.
+    Three intents:
+      - `disabled=true` → opt out of every extra recipient (even the
+        auto-promoter fallback). The farmer still gets all alerts on
+        their own push channel. Returns 200 with the cleared state.
+      - `extra_phone` provided → look the phone up in `users`; refuse
+        with 422 if no User exists, or if the User isn't a registered
+        Dealer / Facilitator. Otherwise store user_id + the resolved
+        User row's denormalised phone/name.
+      - `extra_phone` empty/None and `disabled` falsy → clear the
+        override and the opt-out flag. Defaults take over (auto-
+        promoter for ASSIGNED, no extra for SELF).
+
+    The 'extra_name' field that earlier schemas accepted is ignored —
+    the name is taken from the resolved User row so the chip always
+    reflects the truth (no stale name lingering after the recipient
+    changed theirs).
     """
+    from app.modules.platform.models import UserRole, RoleType, StatusEnum
+
     sub = await _get_subscription(db, subscription_id, current_user.id)
+    disabled = bool(data.get("disabled"))
     phone_raw = (data.get("extra_phone") or "").strip()
-    name_raw = (data.get("extra_name") or "").strip()
-    sub.extra_alert_phone = phone_raw or None
-    sub.extra_alert_name = name_raw or None
+
+    if disabled:
+        sub.alerts_extra_disabled = True
+        sub.extra_alert_user_id = None
+        sub.extra_alert_phone = None
+        sub.extra_alert_name = None
+        await db.commit()
+        return {"detail": "Alert preferences updated"}
+
+    sub.alerts_extra_disabled = False
+
+    if not phone_raw:
+        sub.extra_alert_user_id = None
+        sub.extra_alert_phone = None
+        sub.extra_alert_name = None
+        await db.commit()
+        return {"detail": "Alert preferences updated"}
+
+    # Look up the typed phone. Refuse if it doesn't belong to a
+    # registered Dealer / Facilitator User.
+    target = (await db.execute(
+        select(User).where(User.phone == phone_raw)
+    )).scalar_one_or_none()
+    if target is None:
+        raise HTTPException(status_code=422, detail={
+            "code": "user_not_found",
+            "message": (
+                "No RootsTalk user is registered with this number. "
+                "Ask them to register first."
+            ),
+        })
+
+    has_role = (await db.execute(
+        select(UserRole).where(
+            UserRole.user_id == target.id,
+            UserRole.role_type.in_((RoleType.DEALER, RoleType.FACILITATOR)),
+            UserRole.status == StatusEnum.ACTIVE,
+        )
+    )).scalar_one_or_none() is not None
+    if not has_role:
+        raise HTTPException(status_code=422, detail={
+            "code": "not_a_dealer_or_facilitator",
+            "message": (
+                "This person isn't registered as a Dealer or Facilitator "
+                "on RootsTalk. Pick a number that belongs to one."
+            ),
+        })
+
+    sub.extra_alert_user_id = target.id
+    sub.extra_alert_phone = target.phone
+    sub.extra_alert_name = target.name
     await db.commit()
     return {"detail": "Alert preferences updated"}
 
@@ -2482,23 +2545,36 @@ async def get_alert_preferences(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Return the farmer's chosen extra alert recipient.
+    """Return the farmer's effective extra alert recipient.
 
-    Response: { extra_phone, extra_name, source }
+    Response: { extra_phone, extra_name, source, disabled }
 
     `source` values:
-      - 'override'      — farmer typed a number (sub.extra_alert_phone set)
-      - 'auto_promoter' — ASSIGNED sub, no override, promoter has a phone
-      - 'none'          — SELF sub with no override, OR ASSIGNED with no
-                          reachable promoter
+      - 'disabled'      — farmer explicitly opted out of any extra
+                          recipient (alerts_extra_disabled is True).
+      - 'override'      — farmer typed a number that resolved to a
+                          Dealer / Facilitator User.
+      - 'auto_promoter' — ASSIGNED sub, no override, no opt-out;
+                          promoter is the default extra recipient.
+      - 'none'          — SELF sub with no override, OR ASSIGNED with
+                          no reachable promoter.
     """
     sub = await _get_subscription(db, subscription_id, current_user.id)
+
+    if sub.alerts_extra_disabled:
+        return {
+            "extra_phone": None,
+            "extra_name": None,
+            "source": "disabled",
+            "disabled": True,
+        }
 
     if sub.extra_alert_phone:
         return {
             "extra_phone": sub.extra_alert_phone,
             "extra_name": sub.extra_alert_name,
             "source": "override",
+            "disabled": False,
         }
 
     is_assigned = (
@@ -2515,9 +2591,13 @@ async def get_alert_preferences(
                 "extra_phone": promoter.phone,
                 "extra_name": promoter.name,
                 "source": "auto_promoter",
+                "disabled": False,
             }
 
-    return {"extra_phone": None, "extra_name": None, "source": "none"}
+    return {
+        "extra_phone": None, "extra_name": None,
+        "source": "none", "disabled": False,
+    }
 
 
 # ── Dealer/Facilitator: Payment on behalf of farmer ───────────────────────────

@@ -92,9 +92,25 @@ class Subscription(Base):
     # FARMER+PROMOTER pattern in alert_recipients). Farmer always gets
     # push notifications regardless of this field. For ASSIGNED subs,
     # GET /alert-preferences falls back to the promoter's phone when
-    # this is NULL.
+    # this is NULL and `alerts_extra_disabled` is False.
+    #
+    # `extra_alert_phone` + `extra_alert_name` are denormalised from the
+    # resolved User row so the chip can render without an extra join.
+    # `extra_alert_user_id` is the FK that drives delivery — the alerts
+    # task uses that row's `phone` and `fcm_token` for SMS + FCM.
     extra_alert_phone: Mapped[str] = mapped_column(String(20), nullable=True)
     extra_alert_name: Mapped[str] = mapped_column(String(100), nullable=True)
+    extra_alert_user_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # Alerts C (2026-05-29) — when TRUE, the farmer has explicitly
+    # opted out of any extra recipient (including the auto-promoter
+    # fallback for ASSIGNED subs). The resolver returns farmer-only.
+    alerts_extra_disabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False,
+    )
     subscription_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     lapsed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

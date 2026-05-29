@@ -24,7 +24,7 @@ def test_resolve_recipients_defaults_to_farmer_plus_promoter_when_unconfigured()
         farmer_user_id="farmer", promoter_user_id="promoter",
         crop_start_date=None,
     )
-    out = resolve_alert_recipients(sub, configured=[])
+    out = resolve_alert_recipients(sub)
     assert out == [
         AlertRecipientSpec(user_id="farmer", role="FARMER"),
         AlertRecipientSpec(user_id="promoter", role="LOCAL_PERSON"),
@@ -39,7 +39,7 @@ def test_resolve_recipients_self_subscribed_defaults_to_farmer_only():
         farmer_user_id="farmer", promoter_user_id=None,
         crop_start_date=None,
     )
-    out = resolve_alert_recipients(sub, configured=[])
+    out = resolve_alert_recipients(sub)
     assert out == [AlertRecipientSpec(user_id="farmer", role="FARMER")]
 
 
@@ -51,62 +51,103 @@ def test_resolve_recipients_skips_promoter_if_same_as_farmer():
         farmer_user_id="farmer", promoter_user_id="farmer",
         crop_start_date=None,
     )
-    out = resolve_alert_recipients(sub, configured=[])
+    out = resolve_alert_recipients(sub)
     assert out == [AlertRecipientSpec(user_id="farmer", role="FARMER")]
 
 
-def test_resolve_recipients_uses_configured_rows_when_present():
-    """Once the farmer has saved alert preferences, those rows are
-    authoritative. Default farmer+promoter behaviour is overridden —
-    even an empty FARMER row (i.e. opted out) is respected."""
+# ── Alerts A+C (2026-05-29) — override + opt-out ─────────────────────────────
+
+
+def test_resolve_recipients_extra_user_overrides_auto_promoter():
+    """The farmer's typed Dealer/Facilitator wins over the assigning
+    promoter on ASSIGNED subs (the farmer's stated preference)."""
     sub = SubscriptionView(
         subscription_id="s1", subscription_type="ASSIGNED",
         farmer_user_id="farmer", promoter_user_id="promoter_default",
         crop_start_date=None,
+        extra_alert_user_id="dealer_chosen_by_farmer",
     )
-    configured = [
-        ConfiguredRecipient(user_id="dealer_chosen_by_farmer", role="LOCAL_PERSON"),
-    ]
-    out = resolve_alert_recipients(sub, configured=configured)
-    # Farmer's chosen dealer wins over the assigning promoter; farmer
-    # not in the list because the farmer chose to opt out (no FARMER
-    # row in the configured list).
+    out = resolve_alert_recipients(sub)
     assert out == [
+        AlertRecipientSpec(user_id="farmer", role="FARMER"),
         AlertRecipientSpec(user_id="dealer_chosen_by_farmer", role="LOCAL_PERSON"),
     ]
 
 
-def test_resolve_recipients_normalises_legacy_promoter_role():
-    """The `alert_recipients` table stores 'PROMOTER' historically; the
-    BL-09 spec says 'local person'. Output uses the BL-09 vocabulary."""
+def test_resolve_recipients_extra_user_on_self_sub_replaces_blank_slot():
+    """A SELF-subscribed farmer can fill the blank slot with a dealer/
+    facilitator's user_id — they get added as LOCAL_PERSON."""
+    sub = SubscriptionView(
+        subscription_id="s1", subscription_type="SELF",
+        farmer_user_id="farmer", promoter_user_id=None,
+        crop_start_date=None,
+        extra_alert_user_id="local_dealer",
+    )
+    out = resolve_alert_recipients(sub)
+    assert out == [
+        AlertRecipientSpec(user_id="farmer", role="FARMER"),
+        AlertRecipientSpec(user_id="local_dealer", role="LOCAL_PERSON"),
+    ]
+
+
+def test_resolve_recipients_disabled_flag_kills_auto_promoter():
+    """When the farmer opts out, even an ASSIGNED sub's auto-promoter
+    fallback is suppressed. Farmer-only."""
+    sub = SubscriptionView(
+        subscription_id="s1", subscription_type="ASSIGNED",
+        farmer_user_id="farmer", promoter_user_id="promoter",
+        crop_start_date=None,
+        alerts_extra_disabled=True,
+    )
+    out = resolve_alert_recipients(sub)
+    assert out == [AlertRecipientSpec(user_id="farmer", role="FARMER")]
+
+
+def test_resolve_recipients_disabled_flag_kills_explicit_override_too():
+    """Defensive: if both `extra_alert_user_id` and `alerts_extra_disabled`
+    are set (data drift / partial update), the explicit opt-out wins."""
+    sub = SubscriptionView(
+        subscription_id="s1", subscription_type="ASSIGNED",
+        farmer_user_id="farmer", promoter_user_id="promoter",
+        crop_start_date=None,
+        extra_alert_user_id="dealer",
+        alerts_extra_disabled=True,
+    )
+    out = resolve_alert_recipients(sub)
+    assert out == [AlertRecipientSpec(user_id="farmer", role="FARMER")]
+
+
+def test_resolve_recipients_skips_extra_user_if_same_as_farmer():
+    """Defensive — never double-alert the farmer because their own
+    user_id ends up in extra_alert_user_id (shouldn't happen, but the
+    guard makes the invariant explicit)."""
+    sub = SubscriptionView(
+        subscription_id="s1", subscription_type="ASSIGNED",
+        farmer_user_id="farmer", promoter_user_id="promoter",
+        crop_start_date=None,
+        extra_alert_user_id="farmer",
+    )
+    out = resolve_alert_recipients(sub)
+    assert out == [AlertRecipientSpec(user_id="farmer", role="FARMER")]
+
+
+def test_resolve_recipients_legacy_configured_param_is_ignored():
+    """Back-compat shim: callers that still pass a `configured` list
+    don't blow up, but the list has no effect — `extra_alert_user_id`
+    is the source of truth now."""
     sub = SubscriptionView(
         subscription_id="s1", subscription_type="ASSIGNED",
         farmer_user_id="farmer", promoter_user_id="promoter",
         crop_start_date=None,
     )
-    configured = [
-        ConfiguredRecipient(user_id="farmer", role="FARMER"),
-        ConfiguredRecipient(user_id="promoter", role="PROMOTER"),
+    out = resolve_alert_recipients(sub, configured=[
+        ConfiguredRecipient(user_id="legacy_dealer", role="LOCAL_PERSON"),
+    ])
+    # Default farmer+promoter — the legacy ConfiguredRecipient is ignored.
+    assert out == [
+        AlertRecipientSpec(user_id="farmer", role="FARMER"),
+        AlertRecipientSpec(user_id="promoter", role="LOCAL_PERSON"),
     ]
-    out = resolve_alert_recipients(sub, configured=configured)
-    assert AlertRecipientSpec(user_id="promoter", role="LOCAL_PERSON") in out
-    assert all(r.role != "PROMOTER" for r in out)
-
-
-def test_resolve_recipients_dedupes_by_user_id():
-    """Misconfigured rows shouldn't cause duplicate SMS fan-out."""
-    sub = SubscriptionView(
-        subscription_id="s1", subscription_type="ASSIGNED",
-        farmer_user_id="farmer", promoter_user_id="p",
-        crop_start_date=None,
-    )
-    configured = [
-        ConfiguredRecipient(user_id="dealer", role="LOCAL_PERSON"),
-        ConfiguredRecipient(user_id="dealer", role="PROMOTER"),  # duplicate
-    ]
-    out = resolve_alert_recipients(sub, configured=configured)
-    assert len(out) == 1
-    assert out[0].user_id == "dealer"
 
 
 # ── START_DATE alert ──────────────────────────────────────────────────────────
