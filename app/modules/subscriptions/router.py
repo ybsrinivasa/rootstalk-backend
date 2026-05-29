@@ -37,7 +37,7 @@ from app.services.bl15_reference import (
 router = APIRouter(tags=["Subscriptions"])
 
 WAITLIST_EXPIRY_DAYS = 3
-PAYMENT_REQUEST_EXPIRY_HOURS = 72
+PAYMENT_REQUEST_EXPIRY_HOURS = 24   # 2026-05-29: tightened from 72h per the cancel-and-route spec
 
 
 def _raise_sub_transition(res, status_code: int = 400) -> None:
@@ -1424,6 +1424,24 @@ async def delegate_payment(
     if not resolved_user_id:
         raise HTTPException(status_code=422, detail="Provide either requested_from_user_id or delegate_phone.")
 
+    # Guard: only one PENDING request per subscription at a time. If
+    # the farmer already has one outstanding, they must cancel it
+    # first (per the 2026-05-29 cancel-and-route rule).
+    existing_pending = (await db.execute(
+        select(SubscriptionPaymentRequest).where(
+            SubscriptionPaymentRequest.subscription_id == subscription_id,
+            SubscriptionPaymentRequest.status == "PENDING",
+        )
+    )).scalar_one_or_none()
+    if existing_pending:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "payment_request_already_pending",
+                "message": "A payment request is already pending for this subscription. Cancel it first to send a new one.",
+            },
+        )
+
     expires_at = datetime.now(timezone.utc) + timedelta(hours=PAYMENT_REQUEST_EXPIRY_HOURS)
     pr = SubscriptionPaymentRequest(
         subscription_id=subscription_id,
@@ -1433,6 +1451,29 @@ async def delegate_payment(
     )
     db.add(pr)
     await db.commit()
+
+    # Notify the delegate via FCM so they see the request before the
+    # next time they happen to open the Payments tab.
+    from app.modules.platform.models import User as PlatformUser
+    from app.services.fcm_service import send_fcm
+    delegate = (await db.execute(
+        select(PlatformUser).where(PlatformUser.id == resolved_user_id)
+    )).scalar_one_or_none()
+    if delegate and delegate.fcm_token:
+        try:
+            await send_fcm(
+                token=delegate.fcm_token,
+                title="Payment request received",
+                body=f"{current_user.name or 'A farmer'} has asked you to pay ₹{int(pr.amount)} for their subscription. You have 24 hours to complete the payment.",
+                data={
+                    "type": "PAYMENT_REQUEST_RECEIVED",
+                    "payment_request_id": pr.id,
+                    "subscription_id": subscription_id,
+                },
+            )
+        except Exception:
+            pass
+
     return {"detail": "Payment request sent", "expires_at": expires_at}
 
 
@@ -1442,8 +1483,13 @@ async def cancel_delegation(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Farmer cancels a pending payment delegation. They can then choose someone else
-    or pay themselves."""
+    """Farmer cancels a pending payment delegation. They can then
+    choose someone else or pay themselves. The current delegate is
+    notified via FCM so they don't continue waiting (or worse, try
+    to pay after the request is cancelled)."""
+    from app.modules.platform.models import User as PlatformUser
+    from app.services.fcm_service import send_fcm
+
     sub = await _get_subscription(db, subscription_id, current_user.id)
     pending = (await db.execute(
         select(SubscriptionPaymentRequest).where(
@@ -1451,9 +1497,32 @@ async def cancel_delegation(
             SubscriptionPaymentRequest.status == "PENDING",
         )
     )).scalars().all()
+    notified_user_ids: set[str] = set()
     for pr in pending:
         pr.status = "CANCELLED"
+        notified_user_ids.add(pr.requested_from_user_id)
     await db.commit()
+
+    if notified_user_ids:
+        delegates = (await db.execute(
+            select(PlatformUser).where(PlatformUser.id.in_(notified_user_ids))
+        )).scalars().all()
+        for d in delegates:
+            if not d.fcm_token:
+                continue
+            try:
+                await send_fcm(
+                    token=d.fcm_token,
+                    title="Payment request cancelled",
+                    body=f"{current_user.name or 'The farmer'} cancelled their payment request. No action needed.",
+                    data={
+                        "type": "PAYMENT_REQUEST_CANCELLED_BY_FARMER",
+                        "subscription_id": sub.id,
+                    },
+                )
+            except Exception:
+                pass
+
     return {"detail": f"{len(pending)} pending request(s) cancelled"}
 
 
@@ -1889,6 +1958,28 @@ async def dealer_verify_payment(
             sub.reference_number = await _generate_reference_for_sub(db, sub.client_id)
 
     await db.commit()
+
+    # Notify the farmer that their subscription is now active.
+    from app.modules.platform.models import User as PlatformUser
+    from app.services.fcm_service import send_fcm
+    farmer = (await db.execute(
+        select(PlatformUser).where(PlatformUser.id == pr.farmer_user_id)
+    )).scalar_one_or_none()
+    if farmer and farmer.fcm_token:
+        try:
+            await send_fcm(
+                token=farmer.fcm_token,
+                title="Subscription active",
+                body=f"{current_user.name or 'Your contact'} paid for your subscription. Open the app to see your crop advisory.",
+                data={
+                    "type": "SUBSCRIPTION_ACTIVATED",
+                    "subscription_id": pr.subscription_id,
+                    "reference_number": sub.reference_number if sub else "",
+                },
+            )
+        except Exception:
+            pass
+
     return {
         "status": "PAID",
         "subscription_status": sub.status if sub else None,
@@ -2003,10 +2094,11 @@ async def my_subscriptions(
             delegate_ids = list({pr.requested_from_user_id for pr in latest})
             # Resolve names.
             user_rows = (await db.execute(
-                select(UserModel.id, UserModel.name)
+                select(UserModel.id, UserModel.name, UserModel.phone)
                 .where(UserModel.id.in_(delegate_ids))
             )).all()
-            name_by_user_id: dict[str, str | None] = {uid: n for uid, n in user_rows}
+            name_by_user_id: dict[str, str | None] = {uid: n for uid, n, _ in user_rows}
+            phone_by_user_id: dict[str, str | None] = {uid: p for uid, _, p in user_rows}
             # Resolve role — prefer ClientPromoter (most specific
             # for delegation context); fall back to UserRole. If
             # both exist, ClientPromoter wins.
@@ -2033,12 +2125,18 @@ async def my_subscriptions(
                     role_by_user_id.setdefault(
                         uid, rt.value if hasattr(rt, "value") else str(rt),
                     )
+            now_utc = datetime.now(timezone.utc)
             for pr in latest:
+                delta = pr.expires_at - now_utc
+                hours_remaining = max(0, int(delta.total_seconds() // 3600))
                 pending_delegate_by_sub_id[pr.subscription_id] = {
+                    "payment_request_id": pr.id,
                     "user_id": pr.requested_from_user_id,
                     "name": name_by_user_id.get(pr.requested_from_user_id),
+                    "phone": phone_by_user_id.get(pr.requested_from_user_id),
                     "role": role_by_user_id.get(pr.requested_from_user_id, "OTHER"),
                     "expires_at": pr.expires_at,
+                    "hours_remaining": hours_remaining,
                 }
 
     # ── Compose response. ─────────────────────────────────────────
@@ -2744,6 +2842,26 @@ async def unsubscribe(
             status_code=400,
             detail="Company-assigned subscriptions cannot be cancelled by the farmer. Please contact your company.",
         )
+
+    # Cancel-and-route rule (2026-05-29): if a payment request is
+    # currently PENDING with someone else, the farmer must cancel
+    # that first. Prevents the awkward state where the subscription
+    # is cancelled while a delegate is mid-Razorpay flow.
+    pending_pay = (await db.execute(
+        select(SubscriptionPaymentRequest).where(
+            SubscriptionPaymentRequest.subscription_id == sub.id,
+            SubscriptionPaymentRequest.status == "PENDING",
+        )
+    )).scalar_one_or_none()
+    if pending_pay:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "pending_payment_blocks_unsubscribe",
+                "message": "A payment request is currently pending. Cancel that first, then cancel the subscription.",
+            },
+        )
+
     was_waitlisted = sub.status == SubscriptionStatus.WAITLISTED
     sub.status = SubscriptionStatus.CANCELLED
     await db.commit()

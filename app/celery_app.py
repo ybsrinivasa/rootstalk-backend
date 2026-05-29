@@ -13,6 +13,7 @@ celery_app = Celery(
         "app.tasks.order_expiry",
         "app.tasks.account_deletion",
         "app.tasks.snapshot_sweep",
+        "app.tasks.payment_request_expiry",
     ],
 )
 
@@ -42,6 +43,12 @@ celery_app.conf.beat_schedule = {
     "snapshot-sweep": {
         "task": "app.tasks.snapshot_sweep.take_missing_snapshots",
         "schedule": crontab(hour=2, minute=0),
+    },
+    # 2026-05-29: hourly auto-cancel of payment requests past their
+    # 24-hour expires_at. Notifies the farmer via FCM.
+    "payment-request-expiry-check": {
+        "task": "app.tasks.payment_request_expiry.expire_payment_requests",
+        "schedule": crontab(minute=0),   # every hour on the hour
     },
 }
 

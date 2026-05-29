@@ -2744,16 +2744,66 @@ async def facilitator_payment_requests(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    await _assert_active_facilitator(db, current_user.id)
-    result = await db.execute(
-        select(SubscriptionPaymentRequest).where(
-            SubscriptionPaymentRequest.requested_from_user_id == current_user.id,
-        ).order_by(SubscriptionPaymentRequest.created_at.desc())
+    """List pending payment requests for this Facilitator.
+
+    Decorated 2026-05-29 with the context the Facilitator needs to
+    decide whether to pay without an extra round-trip: farmer name +
+    phone (for tap-to-call), package name + crop name, exact amount,
+    and `hours_remaining` (computed from `expires_at`) so the UI can
+    show a countdown. Only PENDING rows are surfaced; PAID, DECLINED,
+    CANCELLED rows are historical and drop off the active list."""
+    from app.modules.subscriptions.models import (
+        Subscription, SubscriptionPaymentRequest,
     )
-    rows = result.scalars().all()
-    return [{"id": r.id, "subscription_id": r.subscription_id, "farmer_user_id": r.farmer_user_id,
-             "amount": float(r.amount), "status": r.status, "expires_at": r.expires_at,
-             "created_at": r.created_at} for r in rows]
+    from app.modules.advisory.models import Package
+    from app.modules.platform.models import User as PlatformUser
+    from app.modules.sync.models import CoshCoreItem
+
+    await _assert_active_facilitator(db, current_user.id)
+    rows = (await db.execute(
+        select(SubscriptionPaymentRequest, Subscription, Package, PlatformUser)
+        .join(Subscription, Subscription.id == SubscriptionPaymentRequest.subscription_id)
+        .join(Package, Package.id == Subscription.package_id)
+        .join(PlatformUser, PlatformUser.id == SubscriptionPaymentRequest.farmer_user_id)
+        .where(
+            SubscriptionPaymentRequest.requested_from_user_id == current_user.id,
+            SubscriptionPaymentRequest.status == "PENDING",
+        )
+        .order_by(SubscriptionPaymentRequest.created_at.desc())
+    )).all()
+
+    # Bulk-resolve crop English names so we never echo a raw cosh_id.
+    crop_ids = {pkg.crop_cosh_id for _, _, pkg, _ in rows if pkg.crop_cosh_id}
+    crop_name_by_id: dict[str, str] = {}
+    if crop_ids:
+        for r in (await db.execute(
+            select(CoshCoreItem).where(CoshCoreItem.cosh_id.in_(crop_ids))
+        )).scalars().all():
+            tr = r.translations or {}
+            crop_name_by_id[r.cosh_id] = tr.get("en") or tr.get("hi") or r.cosh_id
+
+    now = datetime.now(timezone.utc)
+    out = []
+    for req, sub, pkg, farmer in rows:
+        delta = req.expires_at - now
+        hours_remaining = max(0, int(delta.total_seconds() // 3600))
+        out.append({
+            "id": req.id,
+            "subscription_id": req.subscription_id,
+            "farmer_user_id": req.farmer_user_id,
+            "farmer_name": farmer.name,
+            "farmer_phone": farmer.phone,
+            "package_id": pkg.id,
+            "package_name": pkg.name,
+            "crop_cosh_id": pkg.crop_cosh_id,
+            "crop_name": crop_name_by_id.get(pkg.crop_cosh_id) if pkg.crop_cosh_id else None,
+            "amount": float(req.amount),
+            "status": req.status,
+            "expires_at": req.expires_at,
+            "hours_remaining": hours_remaining,
+            "created_at": req.created_at,
+        })
+    return out
 
 
 @router.put("/facilitator/payment-requests/{request_id}/decline")
@@ -2762,17 +2812,44 @@ async def facilitator_decline_payment(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Facilitator declines a payment request at the outset. Notifies
+    the farmer via FCM so they know to delegate to someone else (or
+    pay themselves) without waiting out the 24-hour expiry."""
+    from app.modules.subscriptions.models import SubscriptionPaymentRequest
+    from app.modules.platform.models import User as PlatformUser
+    from app.services.fcm_service import send_fcm
+
     await _assert_active_facilitator(db, current_user.id)
     req = (await db.execute(
         select(SubscriptionPaymentRequest).where(
             SubscriptionPaymentRequest.id == request_id,
             SubscriptionPaymentRequest.requested_from_user_id == current_user.id,
+            SubscriptionPaymentRequest.status == "PENDING",
         )
     )).scalar_one_or_none()
     if not req:
-        raise HTTPException(status_code=404)
+        raise HTTPException(status_code=404, detail="Payment request not found or no longer pending")
     req.status = "DECLINED"
     await db.commit()
+
+    farmer = (await db.execute(
+        select(PlatformUser).where(PlatformUser.id == req.farmer_user_id)
+    )).scalar_one_or_none()
+    if farmer and farmer.fcm_token:
+        try:
+            await send_fcm(
+                token=farmer.fcm_token,
+                title="Payment request declined",
+                body=f"{current_user.name or 'Your contact'} declined to pay for your subscription. You can choose someone else or pay yourself.",
+                data={
+                    "type": "PAYMENT_REQUEST_DECLINED",
+                    "subscription_id": req.subscription_id,
+                    "payment_request_id": req.id,
+                },
+            )
+        except Exception:
+            pass   # FCM failure must not break the API response.
+
     return {"id": request_id, "status": "DECLINED"}
 
 
