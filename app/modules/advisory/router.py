@@ -1730,10 +1730,20 @@ async def list_parameters(
     Deliberately EXCLUDES Global-Custom (client_id IS NULL AND
     source = CUSTOM) — those are an SA-Portal-only authoring artefact
     that should never bleed into CA. Also excludes other clients'
-    Customs — per-client isolation."""
+    Customs — per-client isolation.
+
+    2026-05-29 — auto-ensure on first read for this crop. Prior to
+    this, the Cosh mirror was only populated by the SA-portal endpoint
+    `/advisory/global/parameters`; CAs that browsed straight to a
+    crop's P-V saw an empty list until SA pre-warmed it (every fresh
+    crop on prod was unmirrored). The auto-ensure is idempotent and
+    cheap on warm crops; first read per crop pays the ~1s Connect
+    walk + insert."""
     await _assert_can_view_client_advisory(db, current_user.id, client_id)
     from sqlalchemy import and_, or_
     from app.modules.advisory.models import ParameterSource
+    from app.services.cosh_pv_view import ensure_local_parameters_for_crop
+    await ensure_local_parameters_for_crop(db, crop_cosh_id)
     result = await db.execute(
         select(Parameter).where(
             Parameter.crop_cosh_id == crop_cosh_id,
