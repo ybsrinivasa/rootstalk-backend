@@ -1488,6 +1488,81 @@ async def initiate_assignment(
     return {"subscription_id": sub.id, "assignment_id": assignment.id, "status": "Awaiting farmer approval"}
 
 
+# F-P View Packages (2026-05-29) — F-P-side read-only advisory view.
+
+@router.get("/promoter/assignments/{subscription_id}/today")
+async def promoter_assignment_today(
+    subscription_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """F-P read-only view of a farmer's assigned advisory.
+
+    Mirrors `/farmer/advisory/today` but scoped to ONE subscription
+    that the F-P assigned and is still ACTIVE. Strips conditional-
+    question fields (`has_pending_question`, `pending_conditional_question`,
+    `blank_path_questions`) before returning — those are the farmer's
+    interactive prompts and the F-P shouldn't see / answer them.
+
+    Auth: PromoterAssignment.promoter_user_id == current_user.id AND
+    status == ACTIVE. 404 if the assignment doesn't exist or isn't
+    owned by this user; 409 if the assignment isn't ACTIVE yet.
+    Returns a single AdvisoryDay dict (the farmer endpoint's list
+    element shape), or 404 if the sub has no crop_start_date /
+    is not yet renderable."""
+    assignment = (await db.execute(
+        select(PromoterAssignment).where(
+            PromoterAssignment.subscription_id == subscription_id,
+        )
+    )).scalar_one_or_none()
+    if assignment is None or assignment.promoter_user_id != current_user.id:
+        # Conflate not-found and not-owner to avoid leaking
+        # subscription_ids to a wrong-promoter probe.
+        raise HTTPException(status_code=404, detail="Assignment not found.")
+    if assignment.status != AssignmentStatus.ACTIVE:
+        raise HTTPException(status_code=409, detail={
+            "code": "assignment_not_active",
+            "message": (
+                f"Assignment is {assignment.status} — read-only advisory "
+                "only renders for ACTIVE assignments."
+            ),
+        })
+
+    sub = (await db.execute(
+        select(Subscription).where(Subscription.id == subscription_id)
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found.")
+
+    days = await _today_advisory_for_user(
+        db,
+        farmer_user_id=sub.farmer_user_id,
+        only_subscription_id=subscription_id,
+    )
+    if not days:
+        # Active assignment but no rendered window yet (e.g. farmer
+        # hasn't set crop_start_date). Surface a 404 so the PWA can
+        # render an "Awaiting farmer to set the start date" empty
+        # state rather than a half-empty advisory.
+        raise HTTPException(status_code=404, detail={
+            "code": "no_advisory_yet",
+            "message": (
+                "The farmer hasn't started the crop yet — advisory will "
+                "appear once they set the start date."
+            ),
+        })
+
+    day = days[0]
+    # Strip CQ fields per the F-P design: F-P shouldn't see the
+    # interactive prompts the farmer is being asked.
+    for tl in day.get("timelines", []):
+        tl.pop("pending_conditional_question", None)
+        tl.pop("blank_path_questions", None)
+        if "has_pending_question" in tl:
+            tl["has_pending_question"] = False
+    return day
+
+
 # F-P B3 (2026-05-29) — F-P self-cancel of a pending assignment.
 WITHDRAW_FCM_TITLE = "Subscription offer withdrawn"
 WITHDRAW_FCM_BODY = (
@@ -3106,16 +3181,39 @@ async def get_today_advisory(
     Applies BL-04 (DAS/DBS window) + BL-02 (conditional filtering) +
     BL-03 (deduplication across CCA + triggered CHA timelines).
     """
+    return await _today_advisory_for_user(
+        db, farmer_user_id=current_user.id, only_subscription_id=None,
+    )
+
+
+async def _today_advisory_for_user(
+    db: AsyncSession,
+    *,
+    farmer_user_id: str,
+    only_subscription_id: Optional[str] = None,
+):
+    """Shared kernel for the today-advisory view.
+
+    Extracted (F-P View Packages, 2026-05-29) so the F-P read-only
+    viewer can render the same BL-02/03/04 + snapshot machinery for
+    one assigned subscription without duplicating the 400-line body.
+    When `only_subscription_id` is set, the query narrows to that
+    single sub (still gated on farmer_user_id + ACTIVE + crop_start)
+    and the result is the one-element list — caller is expected to
+    pick out [0] and handle the empty case.
+    """
     today = date.today()
 
-    # All ACTIVE subscriptions with a crop_start_date
-    subs_result = await db.execute(
-        select(Subscription).where(
-            Subscription.farmer_user_id == current_user.id,
-            Subscription.status == SubscriptionStatus.ACTIVE,
-            Subscription.crop_start_date != None,  # noqa: E711
-        )
+    # All ACTIVE subscriptions with a crop_start_date — narrowed if
+    # the caller asked for one specific assignment.
+    q = select(Subscription).where(
+        Subscription.farmer_user_id == farmer_user_id,
+        Subscription.status == SubscriptionStatus.ACTIVE,
+        Subscription.crop_start_date != None,  # noqa: E711
     )
+    if only_subscription_id is not None:
+        q = q.where(Subscription.id == only_subscription_id)
+    subs_result = await db.execute(q)
     subs = subs_result.scalars().all()
     if not subs:
         return []
