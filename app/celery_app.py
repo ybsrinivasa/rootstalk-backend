@@ -14,6 +14,7 @@ celery_app = Celery(
         "app.tasks.account_deletion",
         "app.tasks.snapshot_sweep",
         "app.tasks.payment_request_expiry",
+        "app.tasks.share_link_reconciler",
     ],
 )
 
@@ -49,6 +50,16 @@ celery_app.conf.beat_schedule = {
     "payment-request-expiry-check": {
         "task": "app.tasks.payment_request_expiry.expire_payment_requests",
         "schedule": crontab(minute=0),   # every hour on the hour
+    },
+    # 2026-05-29: share-link reconciliation safety net. Razorpay's
+    # webhook is the primary path; this catches misses. Scheduled at
+    # :15 so it runs AFTER the expire sweep at :00 — that way the
+    # reconciler can resurrect any SHARE_LINK row the expire sweep
+    # just cancelled while Razorpay's payment_link.paid was still in
+    # transit. See app/tasks/share_link_reconciler.py.
+    "share-link-reconcile-check": {
+        "task": "app.tasks.share_link_reconciler.reconcile_share_link_payments",
+        "schedule": crontab(minute=15),
     },
 }
 
