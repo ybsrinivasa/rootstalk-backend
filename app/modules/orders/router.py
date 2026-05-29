@@ -2461,6 +2461,7 @@ async def facilitator_onboarding_clients(
 
     return [
         {
+            "client_promoter_id": cp.id,
             "client_id": c.id,
             "client_name": c.display_name or c.full_name,
             "short_name": c.short_name,
