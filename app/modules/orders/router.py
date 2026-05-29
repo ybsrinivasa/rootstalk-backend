@@ -2210,6 +2210,48 @@ async def facilitator_promoted_farmers(
     return await _promoted_farmers(db, current_user.id)
 
 
+@router.get("/facilitator/onboarding-clients")
+async def facilitator_onboarding_clients(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List of Clients that have onboarded the caller as a Facilitator.
+
+    Deliberately *not* gated on `_assert_active_facilitator` — a
+    Facilitator who has been deactivated (or never been onboarded)
+    should see an empty list, not a 403. The PWA renders the empty
+    state with a "Ask a Field Manager to onboard you" prompt.
+
+    Includes `is_promoter` so the UI can mark which Client (if any)
+    currently has the caller as their Promoter — at most one per the
+    Facilitator-Promoter exclusivity rule (spec §11.2)."""
+    from app.modules.clients.models import Client, ClientPromoter
+
+    rows = (await db.execute(
+        select(ClientPromoter, Client)
+        .join(Client, Client.id == ClientPromoter.client_id)
+        .where(
+            ClientPromoter.user_id == current_user.id,
+            ClientPromoter.promoter_type == "FACILITATOR",
+            ClientPromoter.status == "ACTIVE",
+        )
+        .order_by(ClientPromoter.registered_at.desc())
+    )).all()
+
+    return [
+        {
+            "client_id": c.id,
+            "client_name": c.display_name or c.full_name,
+            "short_name": c.short_name,
+            "logo_url": c.logo_url,
+            "primary_colour": c.primary_colour,
+            "is_promoter": cp.is_promoter,
+            "onboarded_at": cp.registered_at,
+        }
+        for cp, c in rows
+    ]
+
+
 async def _promoted_farmers(db, promoter_user_id: str):
     result = await db.execute(
         select(PromoterAssignment).where(

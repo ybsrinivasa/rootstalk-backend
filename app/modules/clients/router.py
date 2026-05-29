@@ -1910,6 +1910,14 @@ async def deactivate_promoter(
     if not cp:
         raise HTTPException(status_code=404, detail="Promoter not found")
     cp.status = "INACTIVE"
+    # R12 (2026-05-29): cascade-clear the Promoter flag. Leaving
+    # is_promoter=True on an INACTIVE row is logically dead (every
+    # gate filters on status='ACTIVE') but it stales the row and
+    # would silently re-grant Promoter status if the Client later
+    # reactivates the same row. A re-onboarded Facilitator should
+    # be re-assigned as Promoter explicitly, not via a hidden
+    # side-effect of reactivation.
+    cp.is_promoter = False
     await db.commit()
     return {"status": "INACTIVE"}
 
