@@ -307,7 +307,20 @@ class ClientPromoter(Base):
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
     promoter_type: Mapped[str] = mapped_column(String(20), nullable=False)  # DEALER / FACILITATOR
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
-    is_promoter: Mapped[bool] = mapped_column(default=True, nullable=False)
+    is_promoter: Mapped[bool] = mapped_column(default=False, nullable=False)
+    # R9 (2026-05-29): Promoter-invitation lifecycle on the same row.
+    # NONE → PENDING → (ACCEPTED | DECLINED). NONE again after either
+    # side revokes / steps down. See migration bf27c207ed07 for the
+    # full transition table.
+    promoter_request_status: Mapped[str] = mapped_column(
+        String(20), default="NONE", nullable=False,
+    )
+    promoter_request_sent_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    promoter_request_responded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
     territory_notes: Mapped[str] = mapped_column(Text, nullable=True)
     registered_by: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
     registered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

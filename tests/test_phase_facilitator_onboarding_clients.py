@@ -159,7 +159,8 @@ async def test_is_promoter_flag_reflected(db):
     """Two FACILITATOR onboardings; one marked Promoter, the other not.
     `is_promoter` on each row mirrors the ClientPromoter flag — lets
     the PWA show a "Promoter" badge on the right card."""
-    from app.modules.clients.router import toggle_promoter_flag
+    from app.modules.clients.router import request_promoter
+    from app.modules.orders.router import facilitator_accept_promoter_invitation
 
     sa = await make_user(db, name="SA")
     client_a = await make_client(db)
@@ -177,10 +178,12 @@ async def test_is_promoter_flag_reflected(db):
         client_id=client_b.id, request=_payload(phone="+919900000014"),
         db=db, current_user=sa,
     )
-    await toggle_promoter_flag(
-        client_id=client_a.id, promoter_id=out_a["id"],
-        request={"is_promoter": True},
-        db=db, current_user=sa,
+    # A invites; Facilitator accepts.
+    await request_promoter(
+        client_id=client_a.id, promoter_id=out_a["id"], db=db, current_user=sa,
+    )
+    await facilitator_accept_promoter_invitation(
+        client_promoter_id=out_a["id"], db=db, current_user=facilitator,
     )
 
     out = await facilitator_onboarding_clients(db=db, current_user=facilitator)
@@ -200,9 +203,8 @@ async def test_deactivate_promoter_clears_is_promoter_flag(db):
     on status='ACTIVE' so the live behaviour is correct, but a future
     `reactivate_promoter` would silently re-grant Promoter status
     without an explicit re-assignment."""
-    from app.modules.clients.router import (
-        deactivate_promoter, toggle_promoter_flag,
-    )
+    from app.modules.clients.router import deactivate_promoter, request_promoter
+    from app.modules.orders.router import facilitator_accept_promoter_invitation
 
     sa = await make_user(db, name="SA")
     client = await make_client(db)
@@ -215,10 +217,11 @@ async def test_deactivate_promoter_clears_is_promoter_flag(db):
         client_id=client.id, request=_payload(phone="+919900000015"),
         db=db, current_user=sa,
     )
-    await toggle_promoter_flag(
-        client_id=client.id, promoter_id=out["id"],
-        request={"is_promoter": True},
-        db=db, current_user=sa,
+    await request_promoter(
+        client_id=client.id, promoter_id=out["id"], db=db, current_user=sa,
+    )
+    await facilitator_accept_promoter_invitation(
+        client_promoter_id=out["id"], db=db, current_user=facilitator,
     )
 
     # Sanity: flag is set before deactivation.

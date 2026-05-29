@@ -195,9 +195,13 @@ async def test_pp_toggle_succeeds_with_facilitator_promoter(db):
     user, profile = await _seed_pundit(db)
     cp = await _enrol_pundit(db, client=client, profile=profile)
     # The pundit is also registered as a Facilitator-Promoter.
+    # After R9 (2026-05-29) `is_promoter` defaults to False on new
+    # rows — set it explicitly here to mirror the post-accept state.
     db.add(ClientPromoter(
         client_id=client.id, user_id=user.id,
         promoter_type="FACILITATOR", status="ACTIVE",
+        is_promoter=True,
+        promoter_request_status="ACCEPTED",
         registered_by=member.id,
     ))
     await db.commit()
@@ -300,6 +304,8 @@ async def test_pp_toggle_idempotent_when_already_on(db):
     db.add(ClientPromoter(
         client_id=client.id, user_id=user.id,
         promoter_type="FACILITATOR", status="ACTIVE",
+        is_promoter=True,
+        promoter_request_status="ACCEPTED",
         registered_by=member.id,
     ))
     await db.commit()

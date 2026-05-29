@@ -2210,6 +2210,227 @@ async def facilitator_promoted_farmers(
     return await _promoted_farmers(db, current_user.id)
 
 
+@router.get("/facilitator/promoter-invitations")
+async def facilitator_promoter_invitations(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """R9 (2026-05-29): list this Facilitator's outstanding Promoter
+    invitations — ClientPromoter rows in `PENDING` state — with
+    enough Client branding to render an accept/decline card per
+    invitation.
+
+    Like /facilitator/onboarding-clients this is NOT gated on
+    `_assert_active_facilitator` — an empty list is a valid render
+    (no pending invitations). The Facilitator can still see the
+    history of past invites later via state-extended versions of
+    this endpoint if we add them."""
+    from app.modules.clients.models import Client, ClientPromoter
+
+    rows = (await db.execute(
+        select(ClientPromoter, Client)
+        .join(Client, Client.id == ClientPromoter.client_id)
+        .where(
+            ClientPromoter.user_id == current_user.id,
+            ClientPromoter.promoter_type == "FACILITATOR",
+            ClientPromoter.status == "ACTIVE",
+            ClientPromoter.promoter_request_status == "PENDING",
+        )
+        .order_by(ClientPromoter.promoter_request_sent_at.desc())
+    )).all()
+
+    return [
+        {
+            "client_promoter_id": cp.id,
+            "client_id": c.id,
+            "client_name": c.display_name or c.full_name,
+            "short_name": c.short_name,
+            "logo_url": c.logo_url,
+            "primary_colour": c.primary_colour,
+            "sent_at": cp.promoter_request_sent_at,
+        }
+        for cp, c in rows
+    ]
+
+
+@router.put("/facilitator/promoter-invitations/{client_promoter_id}/accept")
+async def facilitator_accept_promoter_invitation(
+    client_promoter_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """R9 (2026-05-29) Facilitator side: accept a Promoter invitation.
+
+    Transitions PENDING → ACCEPTED, sets `is_promoter=True`, stamps
+    `promoter_request_responded_at`.
+
+    §11.2 race guard: at the moment of accept, refuse if the same
+    Facilitator is already ACCEPTED elsewhere (e.g., a parallel
+    accept won the race). Auth: the row must belong to the caller.
+
+    Other PENDING invitations for this Facilitator are NOT
+    auto-declined — the Facilitator may want to keep them around
+    in case they later step down from this one. Per §11.2 only
+    one ACCEPTED at a time, so those PENDING become future
+    options, not active obligations."""
+    from app.modules.clients.models import ClientPromoter
+
+    cp = (await db.execute(
+        select(ClientPromoter).where(
+            ClientPromoter.id == client_promoter_id,
+            ClientPromoter.user_id == current_user.id,
+            ClientPromoter.promoter_type == "FACILITATOR",
+            ClientPromoter.status == "ACTIVE",
+        )
+    )).scalar_one_or_none()
+    if not cp:
+        raise HTTPException(status_code=404, detail="Promoter invitation not found")
+    if cp.promoter_request_status != "PENDING":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "invitation_not_pending",
+                "message": (
+                    f"This invitation is in state "
+                    f"'{cp.promoter_request_status}', not 'PENDING'. "
+                    "It may have been revoked, declined earlier, or "
+                    "already accepted."
+                ),
+            },
+        )
+
+    accepted_elsewhere = (await db.execute(
+        select(ClientPromoter).where(
+            ClientPromoter.user_id == current_user.id,
+            ClientPromoter.promoter_type == "FACILITATOR",
+            ClientPromoter.status == "ACTIVE",
+            ClientPromoter.is_promoter == True,  # noqa: E712
+            ClientPromoter.id != cp.id,
+        )
+    )).scalar_one_or_none()
+    if accepted_elsewhere:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "already_promoter_elsewhere",
+                "message": (
+                    "You're already a Promoter at another company. "
+                    "Step down from that role first to accept this one."
+                ),
+            },
+        )
+
+    from datetime import datetime, timezone
+    cp.is_promoter = True
+    cp.promoter_request_status = "ACCEPTED"
+    cp.promoter_request_responded_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(cp)
+    return {
+        "id": cp.id,
+        "client_id": cp.client_id,
+        "is_promoter": cp.is_promoter,
+        "promoter_request_status": cp.promoter_request_status,
+        "promoter_request_responded_at": cp.promoter_request_responded_at,
+    }
+
+
+@router.put("/facilitator/promoter-invitations/{client_promoter_id}/decline")
+async def facilitator_decline_promoter_invitation(
+    client_promoter_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """R9 (2026-05-29) Facilitator side: decline a pending Promoter
+    invitation. Transitions PENDING → DECLINED. `is_promoter` stays
+    False. The FM can re-invite later (which will transition
+    DECLINED → PENDING)."""
+    from app.modules.clients.models import ClientPromoter
+
+    cp = (await db.execute(
+        select(ClientPromoter).where(
+            ClientPromoter.id == client_promoter_id,
+            ClientPromoter.user_id == current_user.id,
+            ClientPromoter.promoter_type == "FACILITATOR",
+            ClientPromoter.status == "ACTIVE",
+        )
+    )).scalar_one_or_none()
+    if not cp:
+        raise HTTPException(status_code=404, detail="Promoter invitation not found")
+    if cp.promoter_request_status != "PENDING":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "invitation_not_pending",
+                "message": (
+                    "Only pending invitations can be declined. To leave "
+                    "an accepted Promoter role, use the step-down endpoint."
+                ),
+            },
+        )
+
+    from datetime import datetime, timezone
+    cp.promoter_request_status = "DECLINED"
+    cp.promoter_request_responded_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(cp)
+    return {
+        "id": cp.id,
+        "promoter_request_status": cp.promoter_request_status,
+        "promoter_request_responded_at": cp.promoter_request_responded_at,
+    }
+
+
+@router.put("/facilitator/promoter-status/{client_promoter_id}/step-down")
+async def facilitator_step_down_promoter(
+    client_promoter_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """R10 (2026-05-29) Facilitator side: step down from an accepted
+    Promoter role. Transitions ACCEPTED → NONE, clears `is_promoter`.
+
+    Symmetric to the Client-side `revoke-promoter` — either side can
+    end the Promoter relationship. The Facilitator-onboarding row
+    itself is untouched (still ACTIVE for normal Facilitator work)."""
+    from app.modules.clients.models import ClientPromoter
+
+    cp = (await db.execute(
+        select(ClientPromoter).where(
+            ClientPromoter.id == client_promoter_id,
+            ClientPromoter.user_id == current_user.id,
+            ClientPromoter.promoter_type == "FACILITATOR",
+            ClientPromoter.status == "ACTIVE",
+        )
+    )).scalar_one_or_none()
+    if not cp:
+        raise HTTPException(status_code=404, detail="Promoter row not found")
+    if not cp.is_promoter:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "not_currently_promoter",
+                "message": (
+                    "You are not currently a Promoter at this company. "
+                    "Nothing to step down from."
+                ),
+            },
+        )
+
+    from datetime import datetime, timezone
+    cp.is_promoter = False
+    cp.promoter_request_status = "NONE"
+    cp.promoter_request_responded_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(cp)
+    return {
+        "id": cp.id,
+        "is_promoter": cp.is_promoter,
+        "promoter_request_status": cp.promoter_request_status,
+        "promoter_request_responded_at": cp.promoter_request_responded_at,
+    }
+
+
 @router.get("/facilitator/onboarding-clients")
 async def facilitator_onboarding_clients(
     db: AsyncSession = Depends(get_db),

@@ -1,9 +1,18 @@
-"""Mark-as-Promoter toggle — V1.1 Item 4 (2026-05-09).
+"""Promoter designation via request_promoter / revoke_promoter.
 
-Onboarding (register_promoter) creates a ClientPromoter row with
-is_promoter=False; the FM flips the flag explicitly via this
-endpoint. Spec §11.2 Facilitator-Promoter exclusivity now lives
-here too.
+Rewritten 2026-05-29 for R9. Pre-R9 this file exercised
+`toggle_promoter_flag` (FM unilaterally flipped `is_promoter`).
+R9 split the Promoter sub-role into a two-sided handshake for
+Facilitators (request → Facilitator accept) while keeping Dealer-
+Promoters one-sided (auto-accept on request). Endpoint surface:
+
+  Client side:
+    PUT .../request-promoter  — DEALER: NONE → ACCEPTED (auto)
+                                FACILITATOR: NONE → PENDING
+    PUT .../revoke-promoter   — any state → NONE (FM teardown)
+
+The Facilitator-side accept/decline/step-down lives in
+`tests/test_phase_facilitator_promoter_invitation.py`.
 """
 from __future__ import annotations
 
@@ -12,7 +21,7 @@ from fastapi import HTTPException
 
 from app.modules.clients.models import ClientPromoter
 from app.modules.clients.router import (
-    register_promoter, toggle_promoter_flag,
+    register_promoter, request_promoter, revoke_promoter,
 )
 from tests.conftest import requires_docker
 from tests.factories import (
@@ -28,55 +37,59 @@ async def _onboard(db, *, sa, client, phone, promoter_type="FACILITATOR"):
     )
 
 
-# ── Basic toggle behaviour ──────────────────────────────────────────────────
+# ── Dealer: request auto-accepts (no handshake needed) ───────────────────────
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_mark_as_promoter_flips_flag(db):
+async def test_dealer_request_auto_accepts(db):
+    """Per spec §11.2 Dealers are multi-company and don't need
+    farmer-side consent. request_promoter on a Dealer flips
+    `is_promoter=True` immediately."""
     sa = await make_user(db, name="SA")
     client = await make_client(db)
     await make_self_registered_user(db, phone="+919900200001", role="DEALER")
     await db.commit()
 
     cp = await _onboard(db, sa=sa, client=client, phone="+919900200001", promoter_type="DEALER")
-    assert cp["is_promoter"] is False  # default after Item 4
+    assert cp["is_promoter"] is False   # default after V1.1 Item 4
 
-    out = await toggle_promoter_flag(
+    out = await request_promoter(
         client_id=client.id, promoter_id=cp["id"],
-        request={"is_promoter": True},
         db=db, current_user=sa,
     )
     assert out["is_promoter"] is True
+    assert out["promoter_request_status"] == "ACCEPTED"
 
+
+# ── Dealer: revoke returns the row to NONE ───────────────────────────────────
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_unmark_promoter_flips_flag_back(db):
+async def test_dealer_revoke_flips_flag_back(db):
     sa = await make_user(db, name="SA")
     client = await make_client(db)
     await make_self_registered_user(db, phone="+919900200002", role="DEALER")
     await db.commit()
 
     cp = await _onboard(db, sa=sa, client=client, phone="+919900200002", promoter_type="DEALER")
-    await toggle_promoter_flag(
-        client_id=client.id, promoter_id=cp["id"],
-        request={"is_promoter": True}, db=db, current_user=sa,
+    await request_promoter(
+        client_id=client.id, promoter_id=cp["id"], db=db, current_user=sa,
     )
 
-    out = await toggle_promoter_flag(
+    out = await revoke_promoter(
         client_id=client.id, promoter_id=cp["id"],
-        request={"is_promoter": False},
         db=db, current_user=sa,
     )
     assert out["is_promoter"] is False
+    assert out["promoter_request_status"] == "NONE"
 
+
+# ── Dealer-Promoter at multiple clients is allowed ───────────────────────────
 
 @requires_docker
 @pytest.mark.asyncio
 async def test_dealer_promoter_at_multiple_clients_allowed(db):
-    """Dealers are exempt from the §11.2 Facilitator exclusivity
-    rule — they can be Promoters at multiple companies. This is an
-    explicit spec carve-out."""
+    """§11.2 Dealer-Promoter carve-out — multi-company by spec."""
     sa = await make_user(db, name="SA")
     client_a = await make_client(db)
     client_b = await make_client(db)
@@ -85,46 +98,39 @@ async def test_dealer_promoter_at_multiple_clients_allowed(db):
 
     cp_a = await _onboard(db, sa=sa, client=client_a, phone="+919900200003", promoter_type="DEALER")
     cp_b = await _onboard(db, sa=sa, client=client_b, phone="+919900200003", promoter_type="DEALER")
-    await toggle_promoter_flag(
-        client_id=client_a.id, promoter_id=cp_a["id"],
-        request={"is_promoter": True}, db=db, current_user=sa,
+    await request_promoter(
+        client_id=client_a.id, promoter_id=cp_a["id"], db=db, current_user=sa,
     )
-    out = await toggle_promoter_flag(
-        client_id=client_b.id, promoter_id=cp_b["id"],
-        request={"is_promoter": True}, db=db, current_user=sa,
+    out = await request_promoter(
+        client_id=client_b.id, promoter_id=cp_b["id"], db=db, current_user=sa,
     )
     assert out["is_promoter"] is True
+    assert out["promoter_request_status"] == "ACCEPTED"
 
 
-# ── Status + cross-client guards ────────────────────────────────────────────
+# ── Status + cross-client guards (shared between dealer + facilitator) ──────
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_toggle_blocked_when_row_inactive(db):
-    """Can't toggle the flag on an INACTIVE row — reactivate first.
-    Otherwise we'd silently flip a defunct attachment."""
+async def test_request_blocked_when_row_inactive(db):
+    """Can't request Promoter on an INACTIVE row — reactivate first."""
     sa = await make_user(db, name="SA")
     client = await make_client(db)
     await make_self_registered_user(db, phone="+919900200004", role="FACILITATOR")
     await db.commit()
 
-    cp_resp = await _onboard(db, sa=sa, client=client, phone="+919900200004")
-    cp = (await db.execute(
-        ClientPromoter.__table__.select().where(ClientPromoter.id == cp_resp["id"])
-    )).first()
-    # Direct flip to INACTIVE for the test setup.
+    cp = await _onboard(db, sa=sa, client=client, phone="+919900200004")
     from sqlalchemy import update
     await db.execute(
         update(ClientPromoter)
-        .where(ClientPromoter.id == cp_resp["id"])
+        .where(ClientPromoter.id == cp["id"])
         .values(status="INACTIVE")
     )
     await db.commit()
 
     with pytest.raises(HTTPException) as ei:
-        await toggle_promoter_flag(
-            client_id=client.id, promoter_id=cp_resp["id"],
-            request={"is_promoter": True},
+        await request_promoter(
+            client_id=client.id, promoter_id=cp["id"],
             db=db, current_user=sa,
         )
     assert ei.value.status_code == 409
@@ -132,7 +138,7 @@ async def test_toggle_blocked_when_row_inactive(db):
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_toggle_404_when_row_belongs_to_other_client(db):
+async def test_request_404_when_row_belongs_to_other_client(db):
     """Cross-client URL tampering returns 404 — same shape as
     'not found' so the existence of other clients' rows isn't leaked."""
     sa = await make_user(db, name="SA")
@@ -144,36 +150,32 @@ async def test_toggle_404_when_row_belongs_to_other_client(db):
     cp_a = await _onboard(db, sa=sa, client=client_a, phone="+919900200005", promoter_type="DEALER")
 
     with pytest.raises(HTTPException) as ei:
-        await toggle_promoter_flag(
+        await request_promoter(
             client_id=client_b.id, promoter_id=cp_a["id"],
-            request={"is_promoter": True},
             db=db, current_user=sa,
         )
     assert ei.value.status_code == 404
 
 
-# ── Already-promoter idempotence ────────────────────────────────────────────
+# ── Double-request guard ────────────────────────────────────────────────────
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_marking_already_promoter_is_idempotent(db):
-    """Re-marking a row that's already is_promoter=True is a 200
-    no-op — pages can fire-and-forget on a button click."""
+async def test_double_request_is_rejected(db):
+    """An outstanding PENDING or ACCEPTED request blocks a second
+    request from the same Client — revoke first to send anew."""
     sa = await make_user(db, name="SA")
     client = await make_client(db)
     await make_self_registered_user(db, phone="+919900200006", role="DEALER")
     await db.commit()
 
     cp = await _onboard(db, sa=sa, client=client, phone="+919900200006", promoter_type="DEALER")
-    await toggle_promoter_flag(
-        client_id=client.id, promoter_id=cp["id"],
-        request={"is_promoter": True}, db=db, current_user=sa,
+    await request_promoter(
+        client_id=client.id, promoter_id=cp["id"], db=db, current_user=sa,
     )
-
-    # Second call — no exclusivity check fires for the same row,
-    # since the existence-elsewhere predicate excludes self-id.
-    out = await toggle_promoter_flag(
-        client_id=client.id, promoter_id=cp["id"],
-        request={"is_promoter": True}, db=db, current_user=sa,
-    )
-    assert out["is_promoter"] is True
+    with pytest.raises(HTTPException) as ei:
+        await request_promoter(
+            client_id=client.id, promoter_id=cp["id"], db=db, current_user=sa,
+        )
+    assert ei.value.status_code == 409
+    assert ei.value.detail["code"] == "promoter_already_outstanding"

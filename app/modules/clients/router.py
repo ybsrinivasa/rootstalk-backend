@@ -1950,32 +1950,37 @@ async def reactivate_promoter(
     return {"status": "ACTIVE"}
 
 
-@router.put("/client/{client_id}/field-manager/promoters/{promoter_id}/promoter-flag")
-async def toggle_promoter_flag(
+@router.put("/client/{client_id}/field-manager/promoters/{promoter_id}/request-promoter")
+async def request_promoter(
     client_id: str,
     promoter_id: str,
-    request: dict,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Mark or unmark this onboarded Dealer / Facilitator as a
-    Promoter — V1.1 Item 4 (2026-05-09).
+    """R9 (2026-05-29): Client's Field Manager designates this
+    onboarded user as a Promoter.
 
-    Per spec §11.2, "Onboarding and Promoter designation are
-    separate steps." Onboarding (register_promoter) creates the
-    row with `is_promoter=False`. This endpoint flips the flag
-    and is the single place the spec §11.2 Facilitator-Promoter
-    exclusivity rule lives now.
+    Two paths, branching on `promoter_type`:
 
-      - Marking a Dealer as Promoter: always allowed.
-      - Marking a Facilitator as Promoter: refused (409) if the
-        same user is already an active Facilitator-Promoter at any
-        OTHER client. Privacy: never names the other client.
-      - Unmarking is unconditional and releases the M9 lock for
-        the same user at other clients.
+      DEALER      → auto-accept (status: NONE → ACCEPTED, is_promoter
+                    → True). Dealers are multi-company by spec §11.2;
+                    no exclusivity check and no farmer-side consent
+                    needed.
+
+      FACILITATOR → two-sided handshake (status: NONE | DECLINED →
+                    PENDING). The Facilitator must accept via
+                    /facilitator/promoter-invitations/{id}/accept
+                    before `is_promoter` flips True. §11.2 splits the
+                    exclusivity check across request-time (here) and
+                    accept-time:
+                      • request-time: refuse if the Facilitator is
+                        already ACCEPTED at another Client.
+                      • accept-time: final racy check the moment they
+                        accept.
+                    Multiple PENDING invitations are allowed — the
+                    Facilitator can pick one, the others survive as
+                    options.
     """
-    is_promoter = bool(request.get("is_promoter", True))
-
     cp = (await db.execute(
         select(ClientPromoter).where(
             ClientPromoter.id == promoter_id,
@@ -1987,46 +1992,107 @@ async def toggle_promoter_flag(
     if cp.status != "ACTIVE":
         raise HTTPException(
             status_code=409,
-            detail="Reactivate this person before changing their Promoter status.",
+            detail="Reactivate this person before designating them as a Promoter.",
+        )
+    if cp.promoter_request_status in ("PENDING", "ACCEPTED"):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "promoter_already_outstanding",
+                "message": (
+                    "A Promoter designation is already outstanding for "
+                    "this person at this company. Revoke it first to "
+                    "send a new one."
+                ),
+            },
         )
 
-    if is_promoter and not cp.is_promoter:
-        # Spec §11.2 Facilitator-Promoter exclusivity. Dealer-Promoters
-        # are explicitly multi-company per spec; Dealers skip the gate.
-        if cp.promoter_type == "FACILITATOR":
-            active_elsewhere = (await db.execute(
-                select(ClientPromoter).where(
-                    ClientPromoter.user_id == cp.user_id,
-                    ClientPromoter.promoter_type == "FACILITATOR",
-                    ClientPromoter.status == "ACTIVE",
-                    ClientPromoter.is_promoter == True,  # noqa: E712
-                    ClientPromoter.client_id != client_id,
-                )
-            )).scalar_one_or_none()
-            if active_elsewhere:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "facilitator_already_active_elsewhere",
-                        "message": (
-                            "This person is already an active Facilitator-"
-                            "Promoter at another company. Per spec §11.2, a "
-                            "Facilitator-Promoter can only be active at one "
-                            "company at a time. They must be unmarked as a "
-                            "Promoter (or deactivated) at the previous "
-                            "company before being marked as a Promoter here."
-                        ),
-                    },
-                )
+    now = datetime.now(timezone.utc)
 
-    cp.is_promoter = is_promoter
+    if cp.promoter_type == "FACILITATOR":
+        # §11.2 request-time gate.
+        accepted_elsewhere = (await db.execute(
+            select(ClientPromoter).where(
+                ClientPromoter.user_id == cp.user_id,
+                ClientPromoter.promoter_type == "FACILITATOR",
+                ClientPromoter.status == "ACTIVE",
+                ClientPromoter.is_promoter == True,  # noqa: E712
+                ClientPromoter.client_id != client_id,
+            )
+        )).scalar_one_or_none()
+        if accepted_elsewhere:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "facilitator_already_active_elsewhere",
+                    "message": (
+                        "This person is already an active Facilitator-"
+                        "Promoter at another company. Per spec §11.2, a "
+                        "Facilitator-Promoter can only be active at one "
+                        "company at a time. They must step down (or be "
+                        "revoked) at the previous company before being "
+                        "invited here."
+                    ),
+                },
+            )
+        cp.promoter_request_status = "PENDING"
+        cp.promoter_request_sent_at = now
+        cp.promoter_request_responded_at = None
+    else:
+        # DEALER (or other): auto-accept, no Promoter-side consent.
+        cp.is_promoter = True
+        cp.promoter_request_status = "ACCEPTED"
+        cp.promoter_request_sent_at = now
+        cp.promoter_request_responded_at = now
+
     await db.commit()
     await db.refresh(cp)
     return {
         "id": cp.id,
-        "is_promoter": cp.is_promoter,
         "promoter_type": cp.promoter_type,
         "status": cp.status,
+        "is_promoter": cp.is_promoter,
+        "promoter_request_status": cp.promoter_request_status,
+        "promoter_request_sent_at": cp.promoter_request_sent_at,
+    }
+
+
+@router.put("/client/{client_id}/field-manager/promoters/{promoter_id}/revoke-promoter")
+async def revoke_promoter(
+    client_id: str,
+    promoter_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """R9 / R10 Client side (2026-05-29): unconditional teardown of
+    the Promoter sub-role. Works regardless of current invitation
+    state (PENDING / ACCEPTED / DECLINED): clears `is_promoter`,
+    resets `promoter_request_status` to 'NONE'. Releases the §11.2
+    lock so the Facilitator can be invited elsewhere.
+
+    The Facilitator-onboarding link itself (the row's existence and
+    its `status='ACTIVE'`) is NOT touched. To end the onboarding
+    relationship, use the `deactivate_promoter` endpoint."""
+    cp = (await db.execute(
+        select(ClientPromoter).where(
+            ClientPromoter.id == promoter_id,
+            ClientPromoter.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if not cp:
+        raise HTTPException(status_code=404, detail="Promoter row not found")
+
+    cp.is_promoter = False
+    cp.promoter_request_status = "NONE"
+    cp.promoter_request_responded_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(cp)
+    return {
+        "id": cp.id,
+        "promoter_type": cp.promoter_type,
+        "status": cp.status,
+        "is_promoter": cp.is_promoter,
+        "promoter_request_status": cp.promoter_request_status,
     }
 
 

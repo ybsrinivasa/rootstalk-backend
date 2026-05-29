@@ -62,7 +62,8 @@ async def test_facilitator_marked_promoter_blocks_marking_at_second_client(db):
     being MARKED as a Promoter at more than one. Structured 409
     detail so the frontend can pin the message + display
     'unmark at the other company first'."""
-    from app.modules.clients.router import toggle_promoter_flag
+    from app.modules.clients.router import request_promoter
+    from app.modules.orders.router import facilitator_accept_promoter_invitation
 
     sa = await make_user(db, name="SA")
     client_a = await make_client(db)
@@ -80,18 +81,26 @@ async def test_facilitator_marked_promoter_blocks_marking_at_second_client(db):
         db=db, current_user=sa,
     )
 
-    # A marks them as Promoter — fine.
-    await toggle_promoter_flag(
+    # Fetch the Facilitator user to drive the accept side.
+    from app.modules.platform.models import User as PlatformUser
+    facilitator = (await db.execute(
+        select(PlatformUser).where(PlatformUser.phone == "+919900000002")
+    )).scalar_one()
+
+    # FM at A invites; Facilitator accepts.
+    await request_promoter(
         client_id=client_a.id, promoter_id=out_a["id"],
-        request={"is_promoter": True},
         db=db, current_user=sa,
     )
+    await facilitator_accept_promoter_invitation(
+        client_promoter_id=out_a["id"],
+        db=db, current_user=facilitator,
+    )
 
-    # B tries to mark them as Promoter — refused.
+    # FM at B tries to invite — refused at request-time (§11.2).
     with pytest.raises(HTTPException) as ei:
-        await toggle_promoter_flag(
+        await request_promoter(
             client_id=client_b.id, promoter_id=out_b["id"],
-            request={"is_promoter": True},
             db=db, current_user=sa,
         )
     assert ei.value.status_code == 409
@@ -136,7 +145,8 @@ async def test_facilitator_promoter_can_move_after_deactivation(db):
     Facilitator-Promoter at a deactivated A row no longer blocks
     marking the same user as Promoter at B. Supports the
     move-between-companies flow."""
-    from app.modules.clients.router import toggle_promoter_flag
+    from app.modules.clients.router import request_promoter
+    from app.modules.orders.router import facilitator_accept_promoter_invitation
 
     sa = await make_user(db, name="SA")
     client_a = await make_client(db)
@@ -144,7 +154,8 @@ async def test_facilitator_promoter_can_move_after_deactivation(db):
     await make_self_registered_user(db, phone="+919900000004", role="FACILITATOR")
     await db.commit()
 
-    # Onboard at both, mark Promoter at A.
+    # Onboard at both; FM at A invites + Facilitator accepts.
+    from app.modules.platform.models import User as PlatformUser
     out_a = await register_promoter(
         client_id=client_a.id, request=_payload(phone="+919900000004"),
         db=db, current_user=sa,
@@ -153,9 +164,14 @@ async def test_facilitator_promoter_can_move_after_deactivation(db):
         client_id=client_b.id, request=_payload(phone="+919900000004"),
         db=db, current_user=sa,
     )
-    await toggle_promoter_flag(
-        client_id=client_a.id, promoter_id=out_a["id"],
-        request={"is_promoter": True}, db=db, current_user=sa,
+    facilitator = (await db.execute(
+        select(PlatformUser).where(PlatformUser.phone == "+919900000004")
+    )).scalar_one()
+    await request_promoter(
+        client_id=client_a.id, promoter_id=out_a["id"], db=db, current_user=sa,
+    )
+    await facilitator_accept_promoter_invitation(
+        client_promoter_id=out_a["id"], db=db, current_user=facilitator,
     )
 
     # Deactivate the A row → exclusivity lock releases.
@@ -165,10 +181,12 @@ async def test_facilitator_promoter_can_move_after_deactivation(db):
     cp_a.status = "INACTIVE"
     await db.commit()
 
-    # B can now mark Promoter.
-    out = await toggle_promoter_flag(
-        client_id=client_b.id, promoter_id=out_b["id"],
-        request={"is_promoter": True}, db=db, current_user=sa,
+    # B can now request + Facilitator can accept.
+    await request_promoter(
+        client_id=client_b.id, promoter_id=out_b["id"], db=db, current_user=sa,
+    )
+    out = await facilitator_accept_promoter_invitation(
+        client_promoter_id=out_b["id"], db=db, current_user=facilitator,
     )
     assert out["is_promoter"] is True
 

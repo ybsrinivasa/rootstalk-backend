@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import select
 
 from app.modules.clients.models import ClientPromoter
 from app.modules.clients.router import register_promoter
@@ -71,9 +72,9 @@ async def test_facilitator_non_promoter_at_other_client_does_not_block(db):
     a Promoter (is_promoter=False) doesn't block onboarding OR
     promoter-marking at client B. Only the Facilitator-PROMOTER
     combination is exclusive per spec §11.2."""
-    from app.modules.clients.router import (
-        register_promoter, toggle_promoter_flag,
-    )
+    from app.modules.clients.router import register_promoter, request_promoter
+    from app.modules.orders.router import facilitator_accept_promoter_invitation
+    from app.modules.platform.models import User as PlatformUser
 
     sa = await make_user(db, name="SA")
     client_a = await make_client(db)
@@ -96,14 +97,18 @@ async def test_facilitator_non_promoter_at_other_client_does_not_block(db):
     )
     assert out_b["is_promoter"] is False
 
-    # Mark Promoter at B — A has is_promoter=False so the gate
-    # doesn't fire. B becomes the sole Facilitator-Promoter.
-    toggled = await toggle_promoter_flag(
-        client_id=client_b.id, promoter_id=out_b["id"],
-        request={"is_promoter": True},
-        db=db, current_user=sa,
+    # Mark Promoter at B — A has is_promoter=False so the §11.2 gate
+    # doesn't fire. B invites + Facilitator accepts → sole Promoter.
+    facilitator = (await db.execute(
+        select(PlatformUser).where(PlatformUser.phone == "+919900111101")
+    )).scalar_one()
+    await request_promoter(
+        client_id=client_b.id, promoter_id=out_b["id"], db=db, current_user=sa,
     )
-    assert toggled["is_promoter"] is True
+    accepted = await facilitator_accept_promoter_invitation(
+        client_promoter_id=out_b["id"], db=db, current_user=facilitator,
+    )
+    assert accepted["is_promoter"] is True
 
 
 @requires_docker
@@ -113,8 +118,10 @@ async def test_facilitator_promoter_at_other_client_blocks_toggle(db):
     marking the same user as Promoter at B is refused — the spec
     §11.2 exclusivity gate now lives on the toggle endpoint."""
     from app.modules.clients.router import (
-        register_promoter, toggle_promoter_flag,
+        register_promoter, request_promoter, revoke_promoter,
     )
+    from app.modules.orders.router import facilitator_accept_promoter_invitation
+    from app.modules.platform.models import User as PlatformUser
 
     sa = await make_user(db, name="SA")
     client_a = await make_client(db)
@@ -132,34 +139,36 @@ async def test_facilitator_promoter_at_other_client_blocks_toggle(db):
         request={"phone": "+919900111102", "promoter_type": "FACILITATOR"},
         db=db, current_user=sa,
     )
+    facilitator = (await db.execute(
+        select(PlatformUser).where(PlatformUser.phone == "+919900111102")
+    )).scalar_one()
 
-    # A marks them as Promoter — fine.
-    await toggle_promoter_flag(
-        client_id=client_a.id, promoter_id=out_a["id"],
-        request={"is_promoter": True},
-        db=db, current_user=sa,
+    # FM at A invites + Facilitator accepts.
+    await request_promoter(
+        client_id=client_a.id, promoter_id=out_a["id"], db=db, current_user=sa,
+    )
+    await facilitator_accept_promoter_invitation(
+        client_promoter_id=out_a["id"], db=db, current_user=facilitator,
     )
 
-    # B tries to mark them as Promoter — refused.
+    # FM at B tries to invite — refused at request-time (§11.2).
     with pytest.raises(HTTPException) as ei:
-        await toggle_promoter_flag(
+        await request_promoter(
             client_id=client_b.id, promoter_id=out_b["id"],
-            request={"is_promoter": True},
             db=db, current_user=sa,
         )
     assert ei.value.status_code == 409
     assert ei.value.detail["code"] == "facilitator_already_active_elsewhere"
 
-    # After A unmarks, B can mark — exclusivity releases.
-    await toggle_promoter_flag(
-        client_id=client_a.id, promoter_id=out_a["id"],
-        request={"is_promoter": False},
-        db=db, current_user=sa,
+    # FM at A revokes → exclusivity releases. B can now invite + accept.
+    await revoke_promoter(
+        client_id=client_a.id, promoter_id=out_a["id"], db=db, current_user=sa,
     )
-    out = await toggle_promoter_flag(
-        client_id=client_b.id, promoter_id=out_b["id"],
-        request={"is_promoter": True},
-        db=db, current_user=sa,
+    await request_promoter(
+        client_id=client_b.id, promoter_id=out_b["id"], db=db, current_user=sa,
+    )
+    out = await facilitator_accept_promoter_invitation(
+        client_promoter_id=out_b["id"], db=db, current_user=facilitator,
     )
     assert out["is_promoter"] is True
 
