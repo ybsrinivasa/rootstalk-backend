@@ -299,6 +299,154 @@ async def my_promoter_allocations(
     ]
 
 
+# ── F-P Assign-Package-to-Farmer: B1 read-side ────────────────────────────────
+# 2026-05-29. Powers the PWA flow where a Facilitator-Promoter locked to one
+# Client assigns a Package to a farmer from their kitty. Design lock in
+# memory/project_rootstalk_fp_assign_package_design.md.
+
+async def _resolve_promoter_locked_client(db: AsyncSession, user: User) -> Client:
+    """Resolve the F-P's unique ACTIVE Facilitator-Promoter binding.
+
+    A Facilitator with `is_promoter=True` is exclusive per spec §11.2 —
+    one Client at a time. This helper enforces that invariant on every
+    F-P-side read so the rest of the flow can derive `client_id`
+    server-side instead of trusting the frontend.
+    """
+    from app.modules.clients.models import ClientPromoter, ClientStatus
+    rows = (await db.execute(
+        select(ClientPromoter, Client)
+        .join(Client, Client.id == ClientPromoter.client_id)
+        .where(
+            ClientPromoter.user_id == user.id,
+            ClientPromoter.promoter_type == "FACILITATOR",
+            ClientPromoter.is_promoter.is_(True),
+            ClientPromoter.status == "ACTIVE",
+            Client.status == ClientStatus.ACTIVE,
+        )
+    )).all()
+    if not rows:
+        raise HTTPException(status_code=403, detail={
+            "code": "not_a_promoter",
+            "message": "You are not currently a Promoter for any company.",
+        })
+    if len(rows) > 1:
+        raise HTTPException(status_code=500, detail={
+            "code": "multiple_promoter_links",
+            "message": "Data integrity: more than one ACTIVE Facilitator-Promoter link.",
+        })
+    return rows[0][1]
+
+
+@router.get("/promoter/me/kitty")
+async def my_kitty(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """F-P assignment-flow gate. Returns the F-P's locked Client +
+    available `units_balance`. The PWA calls this on tap-into-flow and
+    after every assignment; balance=0 is the signal to show the
+    'no subscriptions available' empty state and block phone entry."""
+    from app.services.promoter_pool import get_promoter_balance
+    client = await _resolve_promoter_locked_client(db, current_user)
+    balance = await get_promoter_balance(db, client.id, current_user.id)
+    return {
+        "client_id": client.id,
+        "client_short_name": client.short_name,
+        "client_display_name": client.display_name or client.full_name,
+        "units_balance": balance,
+    }
+
+
+@router.get("/promoter/farmers/{phone}/locations")
+async def promoter_farmer_locations(
+    phone: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List a farmer's locations for an F-P about to assign a package.
+
+    V1: each User has one primary location (state + district +
+    sub_district on the User row); returned as a one-element list so
+    the PWA can treat the response uniformly when real multi-location
+    support lands. Refuses if the farmer hasn't registered."""
+    await _resolve_promoter_locked_client(db, current_user)  # gate
+    from app.modules.auth.service import get_user_by_phone
+    farmer = await get_user_by_phone(db, phone)
+    if not farmer:
+        raise HTTPException(
+            status_code=404,
+            detail="Farmer not registered. Ask them to install the RootsTalk app first.",
+        )
+    return [{
+        "label": "primary",
+        "state_cosh_id": farmer.state_cosh_id,
+        "district_cosh_id": farmer.district_cosh_id,
+        "sub_district_cosh_id": farmer.sub_district_cosh_id,
+    }]
+
+
+@router.get("/promoter/crops")
+async def promoter_crops(
+    district_cosh_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Crops served by the F-P's locked Client in the given District.
+
+    Mirrors `/farmer/discover/crops` with two deltas: client is
+    server-derived (single locked Client per F-P), and no
+    `payment_model` filter — F-P assignment works for both FARMER_PAYS
+    and COMPANY_PAYS clients (only farmer-side discovery hides
+    COMPANY_PAYS)."""
+    from app.modules.advisory.models import PackageLocation, PackageStatus
+    from app.modules.sync.models import CoshCoreItem
+    client = await _resolve_promoter_locked_client(db, current_user)
+    result = await db.execute(
+        select(Package.crop_cosh_id)
+        .join(PackageLocation, PackageLocation.package_id == Package.id)
+        .where(
+            Package.client_id == client.id,
+            Package.status == PackageStatus.ACTIVE,
+            PackageLocation.district_cosh_id == district_cosh_id,
+        )
+        .distinct()
+    )
+    crop_ids = list(result.scalars().all())
+    if not crop_ids:
+        return []
+    name_rows = (await db.execute(
+        select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
+        .where(CoshCoreItem.cosh_id.in_(crop_ids))
+    )).all()
+    name_by_id: dict[str, str | None] = {}
+    for cosh_id, translations in name_rows:
+        name = (translations or {}).get("en") if isinstance(translations, dict) else None
+        name_by_id[cosh_id] = name
+    return [{"crop_cosh_id": c, "name": name_by_id.get(c)} for c in crop_ids]
+
+
+@router.get("/promoter/packages/guided-step")
+async def promoter_guided_step(
+    crop_cosh_id: str,
+    district_cosh_id: str,
+    answers: str = "",
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """F-P-side P-V resolver. Delegates to the same BL-01 elimination
+    engine as `/farmer/packages/guided-step` with `client_id` derived
+    from the F-P's locked Client."""
+    client = await _resolve_promoter_locked_client(db, current_user)
+    return await guided_elimination_step(
+        crop_cosh_id=crop_cosh_id,
+        district_cosh_id=district_cosh_id,
+        client_id=client.id,
+        answers=answers,
+        db=db,
+        current_user=current_user,
+    )
+
+
 # ── Phase B: Razorpay-backed pool top-up ───────────────────────────────────────
 
 class PoolPaymentCreateOrder(BaseModel):
