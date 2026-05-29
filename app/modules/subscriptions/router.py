@@ -357,6 +357,73 @@ async def my_kitty(
     }
 
 
+@router.get("/promoter/me/pending-assignments")
+async def my_pending_assignments(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """F-P B4 (2026-05-29) — list this promoter's own PENDING sends.
+
+    Powers the Pending-sent list in the PWA. Each row is decorated with
+    farmer name + phone + crop + package name + assigned_at +
+    hours_remaining_for_farmer (72h from assigned_at, per the B3
+    auto-expire window). Cancel happens via
+    DELETE /promoter/assignments/{id}; the PWA refreshes this list
+    afterwards.
+
+    Returns only PENDING_FARMER_APPROVAL rows for the current user —
+    not gated on the F-P binding (a Dealer-Promoter or a former F-P
+    can still see what they have outstanding)."""
+    from app.tasks.assignment_expiry import EXPIRY_HOURS
+
+    rows = (await db.execute(
+        select(PromoterAssignment, Subscription, Package)
+        .join(Subscription, Subscription.id == PromoterAssignment.subscription_id)
+        .join(Package, Package.id == Subscription.package_id)
+        .where(
+            PromoterAssignment.promoter_user_id == current_user.id,
+            PromoterAssignment.status == AssignmentStatus.PENDING_FARMER_APPROVAL,
+        )
+        .order_by(PromoterAssignment.assigned_at.desc())
+    )).all()
+
+    if not rows:
+        return []
+
+    farmer_ids = {sub.farmer_user_id for _, sub, _ in rows}
+    farmers_by_id = {
+        u.id: u for u in (await db.execute(
+            select(User).where(User.id.in_(farmer_ids))
+        )).scalars().all()
+    }
+
+    now = datetime.now(timezone.utc)
+    out = []
+    for assignment, sub, pkg in rows:
+        farmer = farmers_by_id.get(sub.farmer_user_id)
+        # `assigned_at` is timezone-aware on insert; defensive .replace
+        # keeps the math safe if a legacy row lacks tzinfo.
+        aa = assignment.assigned_at
+        if aa.tzinfo is None:
+            aa = aa.replace(tzinfo=timezone.utc)
+        hours_elapsed = (now - aa).total_seconds() / 3600.0
+        hours_remaining = max(0.0, EXPIRY_HOURS - hours_elapsed)
+        out.append({
+            "assignment_id": assignment.id,
+            "subscription_id": sub.id,
+            "client_id": sub.client_id,
+            "package_id": pkg.id,
+            "package_name": pkg.name,
+            "crop_cosh_id": pkg.crop_cosh_id,
+            "farmer_user_id": sub.farmer_user_id,
+            "farmer_name": farmer.name if farmer else None,
+            "farmer_phone": farmer.phone if farmer else None,
+            "assigned_at": assignment.assigned_at,
+            "hours_remaining": round(hours_remaining, 1),
+        })
+    return out
+
+
 @router.get("/promoter/farmers/{phone}/locations")
 async def promoter_farmer_locations(
     phone: str,

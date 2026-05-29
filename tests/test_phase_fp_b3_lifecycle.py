@@ -32,6 +32,7 @@ from app.modules.subscriptions.promoter_allocation_models import (
 from app.modules.subscriptions.router import (
     PromoterAssignRequest,
     initiate_assignment,
+    my_pending_assignments,
     promoter_cancel_assignment,
 )
 from app.tasks.assignment_expiry import (
@@ -273,6 +274,66 @@ async def test_self_cancel_idempotent_via_409(db):
             assignment_id=assignment_id, db=db, current_user=fac,
         )
     assert ei.value.status_code == 409
+
+
+# ── /promoter/me/pending-assignments (B4 backend addition) ─────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_pending_assignments_lists_only_own_pending(db):
+    """The endpoint surfaces this F-P's PENDING sends with decoration
+    (farmer + package + hours_remaining) and excludes other promoters'
+    rows and non-PENDING statuses."""
+    _, fac, farmer, assignment_id, _ = await _fp_with_assignment(db)
+
+    # Inject a row for a different promoter — must NOT appear.
+    other_promoter = await make_user(db, name="Other Promoter")
+    other_sub = (await db.execute(
+        select(Subscription)
+    )).scalars().first()  # any sub will do for the shape
+    db.add(PromoterAssignment(
+        subscription_id=other_sub.id,
+        promoter_user_id=other_promoter.id,
+        promoter_type="FACILITATOR",
+        status=AssignmentStatus.PENDING_FARMER_APPROVAL,
+    ))
+    await db.flush()
+
+    out = await my_pending_assignments(db=db, current_user=fac)
+    assert len(out) == 1
+    row = out[0]
+    assert row["assignment_id"] == assignment_id
+    assert row["farmer_name"] == farmer.name
+    assert row["farmer_phone"] == farmer.phone
+    assert row["package_name"] is not None
+    assert row["hours_remaining"] > 0
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_pending_assignments_excludes_already_cancelled(db):
+    """An assignment cancelled by the F-P (self-cancel) should drop
+    out of the pending list immediately."""
+    _, fac, _, assignment_id, _ = await _fp_with_assignment(db)
+
+    out_before = await my_pending_assignments(db=db, current_user=fac)
+    assert len(out_before) == 1
+
+    await promoter_cancel_assignment(
+        assignment_id=assignment_id, db=db, current_user=fac,
+    )
+
+    out_after = await my_pending_assignments(db=db, current_user=fac)
+    assert out_after == []
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_pending_assignments_hours_remaining_within_window(db):
+    """hours_remaining must be in (0, 72] for a fresh assignment."""
+    _, fac, _, _, _ = await _fp_with_assignment(db)
+    out = await my_pending_assignments(db=db, current_user=fac)
+    assert 0 < out[0]["hours_remaining"] <= EXPIRY_HOURS
 
 
 @requires_docker
