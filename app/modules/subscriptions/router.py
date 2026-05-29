@@ -1488,6 +1488,86 @@ async def initiate_assignment(
     return {"subscription_id": sub.id, "assignment_id": assignment.id, "status": "Awaiting farmer approval"}
 
 
+# Alerts E (2026-05-29) — F-P dashboard of subscriptions where they
+# are the effective alert recipient. Covers both the explicit override
+# (`extra_alert_user_id == current_user.id`) and the auto-promoter
+# default for ASSIGNED subs (`promoter_user_id == current_user.id`
+# AND no override AND not opted out).
+
+@router.get("/promoter/me/alert-subscriptions")
+async def my_alert_subscriptions(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Subscriptions where the current user is the effective extra
+    alert recipient — covers both explicit overrides (the farmer typed
+    your number) and auto-promoter defaults (ASSIGNED sub, you're the
+    assigning promoter, farmer hasn't customised).
+
+    Returns one row per subscription with the farmer + crop + package
+    info the PWA needs to render the list, plus `source` so the F-P
+    can see which path made them the recipient."""
+    from app.modules.subscriptions.models import SubscriptionType
+
+    explicit = (await db.execute(
+        select(Subscription, Package, User)
+        .join(Package, Package.id == Subscription.package_id)
+        .join(User, User.id == Subscription.farmer_user_id)
+        .where(
+            Subscription.extra_alert_user_id == current_user.id,
+            Subscription.alerts_extra_disabled.is_(False),
+            Subscription.status == SubscriptionStatus.ACTIVE,
+        )
+    )).all()
+
+    auto = (await db.execute(
+        select(Subscription, Package, User)
+        .join(Package, Package.id == Subscription.package_id)
+        .join(User, User.id == Subscription.farmer_user_id)
+        .where(
+            Subscription.promoter_user_id == current_user.id,
+            Subscription.subscription_type == SubscriptionType.ASSIGNED,
+            Subscription.extra_alert_user_id.is_(None),
+            Subscription.alerts_extra_disabled.is_(False),
+            Subscription.status == SubscriptionStatus.ACTIVE,
+        )
+    )).all()
+
+    seen: set[str] = set()
+    out: list[dict] = []
+    for sub, pkg, farmer in explicit:
+        seen.add(sub.id)
+        out.append({
+            "subscription_id": sub.id,
+            "client_id": sub.client_id,
+            "package_id": pkg.id,
+            "package_name": pkg.name,
+            "crop_cosh_id": pkg.crop_cosh_id,
+            "farmer_user_id": farmer.id,
+            "farmer_name": farmer.name,
+            "farmer_phone": farmer.phone,
+            "reference_number": sub.reference_number,
+            "source": "override",
+        })
+    for sub, pkg, farmer in auto:
+        if sub.id in seen:
+            continue   # explicit beats auto if data drift gave us both
+        out.append({
+            "subscription_id": sub.id,
+            "client_id": sub.client_id,
+            "package_id": pkg.id,
+            "package_name": pkg.name,
+            "crop_cosh_id": pkg.crop_cosh_id,
+            "farmer_user_id": farmer.id,
+            "farmer_name": farmer.name,
+            "farmer_phone": farmer.phone,
+            "reference_number": sub.reference_number,
+            "source": "auto_promoter",
+        })
+    out.sort(key=lambda r: (r["source"] != "override", (r["farmer_name"] or "").lower()))
+    return out
+
+
 # F-P View Packages (2026-05-29) — F-P-side read-only advisory view.
 
 @router.get("/promoter/assignments/{subscription_id}/today")

@@ -125,15 +125,20 @@ def should_send_start_date_alert(
 def find_input_practices_due_today(
     timelines: list[TimelineWindow],
     day_offset: int,
+    today_date: Optional[date] = None,
 ) -> list[str]:
     """Return the IDs of all INPUT practices whose timeline window is
-    active for `day_offset` (= today_date − crop_start_date).
+    active today.
 
-    Delegates DAS/DBS arithmetic to `cca_window_active` (single source
-    of truth, BL-04 fix: DBS uses -from <= offset <= -to with the
-    production from > to convention). CALENDAR is intentionally not
-    handled here — `cca_window_active` defers it, matching the BL-04
-    today route. CALENDAR alert support is a separate spec gap.
+    DAS / DBS use `day_offset` (= today_date − crop_start_date) via
+    `cca_window_active` (single source of truth, BL-04 fix: DBS uses
+    -from <= offset <= -to with the production from > to convention).
+
+    Alerts D (2026-05-29): CALENDAR is now supported. `today_date` is
+    optional — pass it so PERENNIAL packages with CALENDAR timelines
+    fire INPUT alerts when today's day-of-year falls in the
+    [from_value, to_value] window. Pre-D callers that omit `today_date`
+    keep the legacy behaviour: CALENDAR rows skip.
     """
     out: list[str] = []
     for tl in timelines:
@@ -142,7 +147,7 @@ def find_input_practices_due_today(
             from_value=tl.from_value,
             to_value=tl.to_value,
         )
-        if cca_window_active(meta, day_offset):
+        if cca_window_active(meta, day_offset, today_date=today_date):
             out.extend(tl.input_practice_ids)
     return out
 

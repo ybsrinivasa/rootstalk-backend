@@ -70,7 +70,10 @@ def metadata_from_master_cca(tl) -> TimelineMetadata:
     )
 
 
-def cca_window_active(meta: TimelineMetadata, day_offset: int) -> bool:
+def cca_window_active(
+    meta: TimelineMetadata, day_offset: int,
+    today_date: Optional[date] = None,
+) -> bool:
     """Mirrors the BL-04 check in `/farmer/advisory/today` for CCA timelines.
 
     DAS: from_value <= day_offset <= to_value (positive offsets, from < to).
@@ -78,12 +81,24 @@ def cca_window_active(meta: TimelineMetadata, day_offset: int) -> bool:
          `from_value > to_value` for DBS rows (e.g. from=15, to=8 means
          "active 15 to 8 days before sowing"). day_offset is negative
          pre-sowing; today is in window when -from <= day_offset <= -to.
-    CALENDAR / unknown: False (today route also defers it).
+    CALENDAR (Alerts D, 2026-05-29): PERENNIAL packages anchor to the
+         calendar year — `from_value` / `to_value` are day-of-year
+         bounds (1-365/366). Active when today's day-of-year falls in
+         [from_value, to_value]. Requires `today_date`; callers
+         without a calendar context (e.g. snapshot resolution) get
+         False, matching the pre-2026-05-29 defer-CALENDAR behaviour
+         so the snapshot reads continue to no-op CALENDAR rows.
+    Unknown: False.
     """
     if meta.from_type == "DAS":
         return meta.from_value <= day_offset <= meta.to_value
     if meta.from_type == "DBS":
         return -meta.from_value <= day_offset <= -meta.to_value
+    if meta.from_type == "CALENDAR":
+        if today_date is None:
+            return False
+        doy = today_date.timetuple().tm_yday
+        return meta.from_value <= doy <= meta.to_value
     return False
 
 

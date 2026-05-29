@@ -208,9 +208,15 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
     )).scalars().all()
     user_by_id = {u.id: u for u in users}
 
+    # PERENNIAL packages are calendar-driven — they don't have a sowing
+    # date, so START_DATE alerts don't apply. INPUT alerts on CALENDAR
+    # timelines fire purely off today's day-of-year (Alerts D, 2026-05-29).
+    pkg_type = pkg.package_type.value if hasattr(pkg.package_type, "value") else str(pkg.package_type)
+    is_perennial = pkg_type == "PERENNIAL"
+
     # ── START_DATE alert ──────────────────────────────────────────────
     sd_sent_today = await _alert_sent_today(db, sub.id, AlertType.START_DATE, today)
-    if should_send_start_date_alert(sub_view, sent_today=sd_sent_today):
+    if not is_perennial and should_send_start_date_alert(sub_view, sent_today=sd_sent_today):
         for recipient in recipients:
             user = user_by_id.get(recipient.user_id)
             if not user:
@@ -228,12 +234,24 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
         return  # no INPUT alerts before the farmer has set their start date
 
     # ── INPUT alert ───────────────────────────────────────────────────
-    if crop_start is None:
-        return
-    day_offset = (today - crop_start).days
-
     timelines = await _load_timeline_windows(db, sub.package_id)
-    due_practice_ids = find_input_practices_due_today(timelines, day_offset)
+    if crop_start is not None:
+        # Annual / typed sub — pass everything through. DAS/DBS use
+        # day_offset; CALENDAR uses today_date inside cca_window_active.
+        day_offset = (today - crop_start).days
+        due_practice_ids = find_input_practices_due_today(
+            timelines, day_offset, today_date=today,
+        )
+    else:
+        # No sowing date — only CALENDAR timelines are meaningful.
+        # Filter then evaluate so DAS/DBS rows with `from_value <= 0`
+        # don't accidentally match a sentinel day_offset.
+        cal_only = [tl for tl in timelines if tl.from_type == "CALENDAR"]
+        if not cal_only:
+            return
+        due_practice_ids = find_input_practices_due_today(
+            cal_only, day_offset=0, today_date=today,
+        )
     if not due_practice_ids:
         return
 

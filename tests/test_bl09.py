@@ -210,9 +210,11 @@ def test_find_input_practices_due_today_handles_dbs_with_production_convention()
     assert find_input_practices_due_today(timelines, day_offset=-20) == []
 
 
-def test_find_input_practices_due_today_skips_calendar_timelines():
-    """CALENDAR is deferred by `cca_window_active` to match the BL-04
-    today route; this test pins the behaviour so it's not re-broken."""
+def test_find_input_practices_due_today_skips_calendar_when_today_date_omitted():
+    """Legacy behaviour: callers that don't pass `today_date` (snapshot
+    resolution, anything that doesn't have a calendar context) still get
+    CALENDAR-deferred. Alerts D added the `today_date` opt-in; pre-D
+    callers keep working unchanged."""
     timelines = [
         TimelineWindow(
             timeline_id="t1", from_type="CALENDAR",
@@ -220,6 +222,79 @@ def test_find_input_practices_due_today_skips_calendar_timelines():
         ),
     ]
     assert find_input_practices_due_today(timelines, day_offset=0) == []
+
+
+def test_find_input_practices_due_today_fires_calendar_when_in_window():
+    """Alerts D (2026-05-29): CALENDAR `from_value` / `to_value` are
+    days of the calendar year (1-365/366). PERENNIAL packages fire INPUT
+    alerts when today's day-of-year falls in [from_value, to_value]."""
+    from datetime import date as _date
+    timelines = [
+        TimelineWindow(
+            timeline_id="t1", from_type="CALENDAR",
+            from_value=100, to_value=120, input_practice_ids=("nutrient_drench",),
+        ),
+    ]
+    # day-of-year 110 (April 20 in a non-leap year) → in window.
+    assert find_input_practices_due_today(
+        timelines, day_offset=0, today_date=_date(2026, 4, 20),
+    ) == ["nutrient_drench"]
+    # day 99 → just before window.
+    assert find_input_practices_due_today(
+        timelines, day_offset=0, today_date=_date(2026, 4, 9),
+    ) == []
+    # day 121 → just after window.
+    assert find_input_practices_due_today(
+        timelines, day_offset=0, today_date=_date(2026, 5, 1),
+    ) == []
+
+
+def test_find_input_practices_due_today_calendar_boundary_inclusive():
+    """The window is closed on both ends: from_value and to_value are
+    both 'in'. Same semantics as DAS/DBS so authors don't have to
+    second-guess the convention."""
+    from datetime import date as _date
+    timelines = [
+        TimelineWindow(
+            timeline_id="t1", from_type="CALENDAR",
+            from_value=200, to_value=210, input_practice_ids=("p",),
+        ),
+    ]
+    # Day 200 (= 2026-07-19, non-leap) → boundary, inclusive.
+    assert find_input_practices_due_today(
+        timelines, day_offset=0, today_date=_date(2026, 7, 19),
+    ) == ["p"]
+    # Day 210 (= 2026-07-29, non-leap) → boundary, inclusive.
+    assert find_input_practices_due_today(
+        timelines, day_offset=0, today_date=_date(2026, 7, 29),
+    ) == ["p"]
+
+
+def test_find_input_practices_due_today_mixes_calendar_and_das():
+    """A single package may have both DAS (sowing-anchored) and CALENDAR
+    (year-anchored) timelines. The helper must evaluate each by its own
+    convention without crosstalk."""
+    from datetime import date as _date
+    timelines = [
+        TimelineWindow(
+            timeline_id="das", from_type="DAS", from_value=10, to_value=20,
+            input_practice_ids=("urea",),
+        ),
+        TimelineWindow(
+            timeline_id="cal", from_type="CALENDAR", from_value=100, to_value=120,
+            input_practice_ids=("micronutrients",),
+        ),
+    ]
+    # day_offset 15 → DAS active. day-of-year 50 (Feb 19) → CALENDAR not active.
+    out = find_input_practices_due_today(
+        timelines, day_offset=15, today_date=_date(2026, 2, 19),
+    )
+    assert out == ["urea"]
+    # day_offset 5 → DAS not active. day-of-year 110 → CALENDAR active.
+    out = find_input_practices_due_today(
+        timelines, day_offset=5, today_date=_date(2026, 4, 20),
+    )
+    assert out == ["micronutrients"]
 
 
 # ── INPUT alert decision (incl. order suppression) ────────────────────────────
