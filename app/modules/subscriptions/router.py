@@ -1,7 +1,7 @@
 import re
 from datetime import datetime, timedelta, timezone, date
 from math import radians, cos, sin, asin, sqrt
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1477,6 +1477,148 @@ async def delegate_payment(
     return {"detail": "Payment request sent", "expires_at": expires_at}
 
 
+# ── V1.1 share-payment-link (2026-05-29) ─────────────────────────────────────
+
+@router.get("/farmer/payment-requests/{request_id}")
+async def get_my_payment_request(
+    request_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Fetch a payment request the caller owns (any state). Used by
+    the PWA's `/share-link/[id]` page to render the QR + short URL.
+    Auth gate: `farmer_user_id == current_user.id`.
+
+    Returns subscription context (package/crop names) too so the
+    share page can confirm "for your Tomato · Demo Pack subscription"
+    without a second hop."""
+    from app.modules.advisory.models import Package
+    from app.modules.sync.models import CoshCoreItem
+
+    pr = (await db.execute(
+        select(SubscriptionPaymentRequest).where(
+            SubscriptionPaymentRequest.id == request_id,
+            SubscriptionPaymentRequest.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not pr:
+        raise HTTPException(status_code=404, detail="Payment request not found")
+
+    sub = (await db.execute(
+        select(Subscription).where(Subscription.id == pr.subscription_id)
+    )).scalar_one_or_none()
+    pkg = (await db.execute(
+        select(Package).where(Package.id == sub.package_id)
+    )).scalar_one_or_none() if sub else None
+
+    crop_name = None
+    if pkg and pkg.crop_cosh_id:
+        item = (await db.execute(
+            select(CoshCoreItem).where(CoshCoreItem.cosh_id == pkg.crop_cosh_id)
+        )).scalar_one_or_none()
+        if item:
+            tr = item.translations or {}
+            crop_name = tr.get("en") or tr.get("hi") or pkg.crop_cosh_id
+
+    now_utc = datetime.now(timezone.utc)
+    hours_remaining = max(0, int((pr.expires_at - now_utc).total_seconds() // 3600))
+
+    return {
+        "id": pr.id,
+        "subscription_id": pr.subscription_id,
+        "method": pr.method,
+        "status": pr.status,
+        "amount": float(pr.amount),
+        "short_url": pr.payment_link_short_url,
+        "razorpay_payment_link_id": pr.razorpay_payment_link_id,
+        "expires_at": pr.expires_at,
+        "hours_remaining": hours_remaining,
+        "paid_by_vpa": pr.paid_by_vpa,
+        "package_name": pkg.name if pkg else None,
+        "crop_name": crop_name,
+    }
+
+
+@router.post("/farmer/subscriptions/{subscription_id}/payment-link")
+async def create_payment_share_link(
+    subscription_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Generate a Razorpay Payment Link / QR the farmer can share
+    with anyone (relatives, friends, etc.). The link is fixed at
+    ₹199, single-payment, and `expire_by` is aligned with the
+    SubscriptionPaymentRequest's `expires_at` so both sides time
+    out together.
+
+    Same single-PENDING guard as `delegate_payment`: the farmer
+    must cancel an existing PENDING request before generating a
+    new payment link.
+
+    On success, returns the short URL the PWA renders as a QR.
+    Recipient pays via any UPI app; Razorpay webhook reconciles
+    via `notes.payment_request_id`.
+    """
+    from app.services.payment_service import create_subscription_payment_link
+
+    sub = await _get_subscription(db, subscription_id, current_user.id)
+
+    existing_pending = (await db.execute(
+        select(SubscriptionPaymentRequest).where(
+            SubscriptionPaymentRequest.subscription_id == subscription_id,
+            SubscriptionPaymentRequest.status == "PENDING",
+        )
+    )).scalar_one_or_none()
+    if existing_pending:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "payment_request_already_pending",
+                "message": "A payment request is already pending for this subscription. Cancel it first to generate a new link.",
+            },
+        )
+
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=PAYMENT_REQUEST_EXPIRY_HOURS)
+    pr = SubscriptionPaymentRequest(
+        subscription_id=subscription_id,
+        farmer_user_id=current_user.id,
+        requested_from_user_id=None,
+        method="SHARE_LINK",
+        expires_at=expires_at,
+    )
+    db.add(pr)
+    await db.flush()   # need pr.id for the Razorpay notes
+
+    try:
+        link = create_subscription_payment_link(
+            payment_request_id=pr.id,
+            farmer_name=current_user.name,
+            expire_in_seconds=PAYMENT_REQUEST_EXPIRY_HOURS * 3600,
+        )
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "payment_link_create_failed",
+                "message": "Could not generate the payment link. Please try again.",
+                "upstream": str(e),
+            },
+        )
+
+    pr.razorpay_payment_link_id = link["razorpay_payment_link_id"]
+    pr.payment_link_short_url = link["short_url"]
+    await db.commit()
+    await db.refresh(pr)
+
+    return {
+        "payment_request_id": pr.id,
+        "short_url": pr.payment_link_short_url,
+        "expires_at": pr.expires_at,
+        "amount": float(pr.amount),
+    }
+
+
 @router.delete("/farmer/subscriptions/{subscription_id}/delegate-payment")
 async def cancel_delegation(
     subscription_id: str,
@@ -1490,6 +1632,8 @@ async def cancel_delegation(
     from app.modules.platform.models import User as PlatformUser
     from app.services.fcm_service import send_fcm
 
+    from app.services.payment_service import cancel_payment_link
+
     sub = await _get_subscription(db, subscription_id, current_user.id)
     pending = (await db.execute(
         select(SubscriptionPaymentRequest).where(
@@ -1500,7 +1644,15 @@ async def cancel_delegation(
     notified_user_ids: set[str] = set()
     for pr in pending:
         pr.status = "CANCELLED"
-        notified_user_ids.add(pr.requested_from_user_id)
+        # SHARE_LINK rows: also revoke the Razorpay link so the URL
+        # / QR stop accepting payment immediately. Best-effort —
+        # network or already-cancelled errors don't fail our cancel.
+        if pr.method == "SHARE_LINK" and pr.razorpay_payment_link_id:
+            cancel_payment_link(pr.razorpay_payment_link_id)
+        # SHARE_LINK rows have no requested_from_user_id, so skip
+        # FCM-to-delegate for those.
+        if pr.requested_from_user_id:
+            notified_user_ids.add(pr.requested_from_user_id)
     await db.commit()
 
     if notified_user_ids:
@@ -1987,6 +2139,158 @@ async def dealer_verify_payment(
     }
 
 
+# ── Razorpay webhook handler — V1.1 share-payment-link (2026-05-29) ──────────
+
+@router.post("/payment/webhook")
+async def razorpay_webhook(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Razorpay server-to-server webhook for SHARE_LINK payments.
+
+    Authentication: HMAC-SHA256 of the raw request body using the
+    configured `razorpay_active_webhook_secret`, compared against
+    the `X-Razorpay-Signature` header in constant time. No user
+    session is involved — anyone can hit this URL but only Razorpay
+    can produce a valid signature.
+
+    Events handled (Razorpay event ID conventions):
+      • `payment_link.paid`      — flip PENDING → PAID + activate
+                                    subscription + FCM the farmer.
+      • `payment_link.cancelled` — flip PENDING → CANCELLED.
+      • `payment_link.expired`   — flip PENDING → CANCELLED.
+      • anything else            — 200 ack with no state change
+                                    (Razorpay's retry policy
+                                    expects 2xx; a 4xx would
+                                    cause it to keep firing).
+
+    Reconciliation: each Payment Link carries our row id in
+    `notes.payment_request_id`, so the lookup is one-shot. We also
+    sanity-check the embedded amount matches `SUBSCRIPTION_AMOUNT_PAISE`
+    and fail (with 400 to skip activation) on mismatch — defends
+    against signed payloads that don't match our pricing.
+    """
+    from app.services.payment_service import verify_webhook_signature
+    from app.services.payment_service import SUBSCRIPTION_AMOUNT_PAISE
+    from app.modules.platform.models import User as PlatformUser
+    from app.services.fcm_service import send_fcm
+
+    body_bytes = await request.body()
+    signature = request.headers.get("x-razorpay-signature", "")
+    if not verify_webhook_signature(body_bytes, signature):
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    import json
+    try:
+        payload = json.loads(body_bytes)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    event = payload.get("event")
+    entity = (
+        payload.get("payload", {}).get("payment_link", {}).get("entity", {})
+    )
+    payment_request_id = (entity.get("notes") or {}).get("payment_request_id")
+    if not payment_request_id:
+        # Not one of ours; ack and ignore so Razorpay doesn't retry.
+        return {"ok": True, "ignored": "no payment_request_id in notes"}
+
+    pr = (await db.execute(
+        select(SubscriptionPaymentRequest).where(
+            SubscriptionPaymentRequest.id == payment_request_id,
+        )
+    )).scalar_one_or_none()
+    if not pr:
+        return {"ok": True, "ignored": "payment_request_id not found"}
+
+    # Idempotency: if we've already moved on from PENDING, ack and
+    # bail. A duplicate payment_link.paid (Razorpay retries on 5xx)
+    # mustn't double-activate or fire a second FCM.
+    if pr.status != "PENDING":
+        return {"ok": True, "ignored": f"already {pr.status}"}
+
+    if event == "payment_link.paid":
+        # Defence: amount sanity check.
+        link_amount = int(entity.get("amount", 0))
+        if link_amount != SUBSCRIPTION_AMOUNT_PAISE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Amount mismatch: expected {SUBSCRIPTION_AMOUNT_PAISE}, got {link_amount}",
+            )
+
+        payment_entity = (
+            payload.get("payload", {}).get("payment", {}).get("entity", {})
+        )
+        pr.status = "PAID"
+        pr.razorpay_payment_id = payment_entity.get("id")
+        # Razorpay's UPI payments carry the payer's VPA in `vpa`.
+        # Cards / netbanking won't have it; leave NULL in that case.
+        pr.paid_by_vpa = payment_entity.get("vpa")
+
+        sub = (await db.execute(
+            select(Subscription).where(Subscription.id == pr.subscription_id)
+        )).scalar_one_or_none()
+        if sub:
+            res = validate_sub_transition(
+                sub.status, SubscriptionStatus.ACTIVE.value, BL11_DEALER,
+            )
+            if res.allowed:
+                sub.status = SubscriptionStatus.ACTIVE
+                sub.subscription_date = datetime.now(timezone.utc)
+                if not sub.reference_number:
+                    sub.reference_number = await _generate_reference_for_sub(db, sub.client_id)
+        await db.commit()
+
+        # Notify farmer.
+        farmer = (await db.execute(
+            select(PlatformUser).where(PlatformUser.id == pr.farmer_user_id)
+        )).scalar_one_or_none()
+        if farmer and farmer.fcm_token:
+            try:
+                payer = pr.paid_by_vpa or "Your contact"
+                await send_fcm(
+                    token=farmer.fcm_token,
+                    title="Subscription active",
+                    body=f"{payer} paid for your subscription. Open the app to see your crop advisory.",
+                    data={
+                        "type": "SUBSCRIPTION_ACTIVATED",
+                        "subscription_id": pr.subscription_id,
+                        "reference_number": sub.reference_number if sub else "",
+                    },
+                )
+            except Exception:
+                pass
+
+        return {"ok": True, "status": "PAID"}
+
+    if event in ("payment_link.cancelled", "payment_link.expired"):
+        pr.status = "CANCELLED"
+        await db.commit()
+
+        farmer = (await db.execute(
+            select(PlatformUser).where(PlatformUser.id == pr.farmer_user_id)
+        )).scalar_one_or_none()
+        if farmer and farmer.fcm_token:
+            try:
+                await send_fcm(
+                    token=farmer.fcm_token,
+                    title="Payment link expired",
+                    body="Your payment link has expired or been cancelled. Generate a new one or pay yourself.",
+                    data={
+                        "type": "PAYMENT_REQUEST_AUTO_EXPIRED",
+                        "subscription_id": pr.subscription_id,
+                        "payment_request_id": pr.id,
+                    },
+                )
+            except Exception:
+                pass
+
+        return {"ok": True, "status": "CANCELLED", "reason": event}
+
+    # Unknown event — ack so Razorpay doesn't retry.
+    return {"ok": True, "ignored": f"unhandled event: {event}"}
+
+
 # ── Farmer: My subscriptions alias (used by PWA home page) ────────────────────
 
 @router.get("/farmer/my-subscriptions")
@@ -2091,50 +2395,62 @@ async def my_subscriptions(
             seen.add(pr.subscription_id)
             latest.append(pr)
         if latest:
-            delegate_ids = list({pr.requested_from_user_id for pr in latest})
-            # Resolve names.
-            user_rows = (await db.execute(
-                select(UserModel.id, UserModel.name, UserModel.phone)
-                .where(UserModel.id.in_(delegate_ids))
-            )).all()
-            name_by_user_id: dict[str, str | None] = {uid: n for uid, n, _ in user_rows}
-            phone_by_user_id: dict[str, str | None] = {uid: p for uid, _, p in user_rows}
-            # Resolve role — prefer ClientPromoter (most specific
-            # for delegation context); fall back to UserRole. If
-            # both exist, ClientPromoter wins.
-            promoter_rows = (await db.execute(
-                select(ClientPromoter.user_id, ClientPromoter.promoter_type)
-                .where(
-                    ClientPromoter.user_id.in_(delegate_ids),
-                    ClientPromoter.status == "ACTIVE",
-                )
-            )).all()
+            # SHARE_LINK rows have requested_from_user_id=None — drop
+            # those before the IN-query so we don't ask Postgres for
+            # a user with id=NULL.
+            delegate_ids = list({
+                pr.requested_from_user_id for pr in latest
+                if pr.requested_from_user_id
+            })
+            name_by_user_id: dict[str, str | None] = {}
+            phone_by_user_id: dict[str, str | None] = {}
             role_by_user_id: dict[str, str] = {}
-            for uid, ptype in promoter_rows:
-                role_by_user_id[uid] = str(ptype).upper()
-            # Fallback to UserRole for any not covered.
-            missing = [uid for uid in delegate_ids if uid not in role_by_user_id]
-            if missing:
-                ur_rows = (await db.execute(
-                    select(UserRole.user_id, UserRole.role_type).where(
-                        UserRole.user_id.in_(missing),
-                        UserRole.role_type.in_([RoleType.DEALER, RoleType.FACILITATOR]),
+            if delegate_ids:
+                user_rows = (await db.execute(
+                    select(UserModel.id, UserModel.name, UserModel.phone)
+                    .where(UserModel.id.in_(delegate_ids))
+                )).all()
+                name_by_user_id = {uid: n for uid, n, _ in user_rows}
+                phone_by_user_id = {uid: p for uid, _, p in user_rows}
+                # Resolve role — prefer ClientPromoter (most specific
+                # for delegation context); fall back to UserRole. If
+                # both exist, ClientPromoter wins.
+                promoter_rows = (await db.execute(
+                    select(ClientPromoter.user_id, ClientPromoter.promoter_type)
+                    .where(
+                        ClientPromoter.user_id.in_(delegate_ids),
+                        ClientPromoter.status == "ACTIVE",
                     )
                 )).all()
-                for uid, rt in ur_rows:
-                    role_by_user_id.setdefault(
-                        uid, rt.value if hasattr(rt, "value") else str(rt),
-                    )
+                for uid, ptype in promoter_rows:
+                    role_by_user_id[uid] = str(ptype).upper()
+                # Fallback to UserRole for any not covered.
+                missing = [uid for uid in delegate_ids if uid not in role_by_user_id]
+                if missing:
+                    ur_rows = (await db.execute(
+                        select(UserRole.user_id, UserRole.role_type).where(
+                            UserRole.user_id.in_(missing),
+                            UserRole.role_type.in_([RoleType.DEALER, RoleType.FACILITATOR]),
+                        )
+                    )).all()
+                    for uid, rt in ur_rows:
+                        role_by_user_id.setdefault(
+                            uid, rt.value if hasattr(rt, "value") else str(rt),
+                        )
             now_utc = datetime.now(timezone.utc)
             for pr in latest:
                 delta = pr.expires_at - now_utc
                 hours_remaining = max(0, int(delta.total_seconds() // 3600))
                 pending_delegate_by_sub_id[pr.subscription_id] = {
                     "payment_request_id": pr.id,
+                    # 2026-05-29 share-link: 'DELEGATE' | 'SHARE_LINK'
+                    # so the home card can render the right variant.
+                    "method": pr.method,
                     "user_id": pr.requested_from_user_id,
                     "name": name_by_user_id.get(pr.requested_from_user_id),
                     "phone": phone_by_user_id.get(pr.requested_from_user_id),
                     "role": role_by_user_id.get(pr.requested_from_user_id, "OTHER"),
+                    "short_url": pr.payment_link_short_url,
                     "expires_at": pr.expires_at,
                     "hours_remaining": hours_remaining,
                 }

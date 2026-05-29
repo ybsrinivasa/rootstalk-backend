@@ -97,3 +97,79 @@ def verify_payment_signature(razorpay_order_id: str, razorpay_payment_id: str, r
         hashlib.sha256,
     ).hexdigest()
     return hmac.compare_digest(expected, razorpay_signature)
+
+
+# ── V1.1 share-payment-link (2026-05-29) ────────────────────────────────────
+
+def create_subscription_payment_link(
+    *, payment_request_id: str, farmer_name: str | None,
+    expire_in_seconds: int,
+) -> dict:
+    """Create a Razorpay Payment Link the farmer can share with
+    anyone (e.g., a relative in a city). Returns the link's
+    `id` (e.g., 'plink_xxx') and `short_url` (e.g.,
+    'https://rzp.io/i/xxx').
+
+    Constraints encoded in the request:
+      • fixed amount of ₹199 (paise = SUBSCRIPTION_AMOUNT_PAISE)
+      • accept_partial=false (no part-pays)
+      • expire_by = now + expire_in_seconds (matches our
+        SubscriptionPaymentRequest.expires_at so both sides time
+        out together)
+      • `notes.payment_request_id` carries our row id so the webhook
+        handler can reconcile back without ambiguity.
+    """
+    import time
+    client = _client()
+    body = {
+        "amount": SUBSCRIPTION_AMOUNT_PAISE,
+        "currency": "INR",
+        "accept_partial": False,
+        "description": "RootsTalk Subscription",
+        "expire_by": int(time.time()) + int(expire_in_seconds),
+        "reminder_enable": True,
+        "notes": {
+            "purpose": "RootsTalk Subscription",
+            "payment_request_id": payment_request_id,
+        },
+        "callback_url": "",
+    }
+    if farmer_name:
+        body["customer"] = {"name": farmer_name}
+    link = client.payment_link.create(body)
+    return {
+        "razorpay_payment_link_id": link["id"],
+        "short_url": link["short_url"],
+    }
+
+
+def cancel_payment_link(payment_link_id: str) -> bool:
+    """Cancel a Razorpay Payment Link. Idempotent — already-paid
+    or already-cancelled links return their current state without
+    error. Wrapped so callers don't need to import razorpay
+    exceptions themselves. Returns True if the cancel call
+    succeeded (or no-op'd cleanly), False on a real error."""
+    try:
+        _client().payment_link.cancel(payment_link_id)
+        return True
+    except Exception:
+        return False
+
+
+def verify_webhook_signature(payload_bytes: bytes, signature_header: str) -> bool:
+    """Verify a Razorpay webhook signature against the configured
+    webhook secret. Razorpay computes HMAC-SHA256 of the raw payload
+    bytes using the webhook secret; we compute the same and
+    constant-time compare. Per Razorpay docs the signature header
+    is `X-Razorpay-Signature`."""
+    if not signature_header:
+        return False
+    secret = settings.razorpay_active_webhook_secret
+    if not secret:
+        return False
+    expected = hmac.new(
+        secret.encode("utf-8"),
+        payload_bytes,
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature_header)

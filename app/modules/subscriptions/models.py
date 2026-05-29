@@ -182,16 +182,37 @@ class FarmerSubscriptionHistory(Base):
 
 
 class SubscriptionPaymentRequest(Base):
-    """Farmer asks dealer/facilitator to pay Rs. 199."""
+    """Farmer asks someone to pay Rs. 199 — two flavours:
+
+      DELEGATE   — specific user (Dealer/Facilitator); pays via the
+                   PWA's Razorpay checkout. `requested_from_user_id`
+                   is set; `razorpay_payment_link_id` is None.
+      SHARE_LINK — anyone with the Razorpay Payment Link / QR
+                   (e.g., farmer's son in a city). Payer is not a
+                   registered RootsTalk user; `requested_from_user_id`
+                   is None; `razorpay_payment_link_id` +
+                   `payment_link_short_url` are set; webhook
+                   activates the subscription.
+    """
     __tablename__ = "subscription_payment_requests"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     subscription_id: Mapped[str] = mapped_column(String(36), ForeignKey("subscriptions.id"), nullable=False)
     farmer_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
-    requested_from_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
+    # Nullable post-2026-05-29 migration 7e2270ba25aa: SHARE_LINK
+    # rows have no designated payer.
+    requested_from_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
     amount: Mapped[float] = mapped_column(DECIMAL(10, 2), default=199.00)
     status: Mapped[str] = mapped_column(String(20), default="PENDING")
+    # 'DELEGATE' | 'SHARE_LINK'.
+    method: Mapped[str] = mapped_column(String(20), default="DELEGATE", nullable=False)
     razorpay_payment_id: Mapped[str] = mapped_column(String(200), nullable=True)
+    # SHARE_LINK fields — set when method='SHARE_LINK'.
+    razorpay_payment_link_id: Mapped[str] = mapped_column(String(50), nullable=True)
+    payment_link_short_url: Mapped[str] = mapped_column(String(500), nullable=True)
+    # Masked UPI VPA of whoever paid (from Razorpay webhook payload).
+    # Surfaces in the farmer's "paid by" line on the receipt.
+    paid_by_vpa: Mapped[str] = mapped_column(String(100), nullable=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
