@@ -1490,6 +1490,24 @@ async def set_start_date(
             order.date_from = order.date_from + timedelta(days=delta_days)
             order.date_to = order.date_to + timedelta(days=delta_days)
 
+    # Defensive: also clear any lingering SENT START_DATE alerts on
+    # the update path. Should be a no-op (first-set already flipped
+    # them) but covers test scenarios + races where an old SENT row
+    # exists from before the flip-on-set was added (2026-05-31).
+    from app.modules.subscriptions.models import (
+        Alert, AlertStatus, AlertType,
+    )
+    from sqlalchemy import update as sa_update
+    await db.execute(
+        sa_update(Alert)
+        .where(
+            Alert.subscription_id == sub.id,
+            Alert.alert_type == AlertType.START_DATE,
+            Alert.status == AlertStatus.SENT,
+        )
+        .values(status=AlertStatus.READ)
+    )
+
     await db.commit()
     return {
         "detail": "Start date updated",
