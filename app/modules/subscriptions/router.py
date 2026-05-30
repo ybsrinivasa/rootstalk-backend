@@ -2061,7 +2061,11 @@ async def farmer_pending_assignments(
             "package_id": sub.package_id,
             "promoter": promoters.get(assignment.promoter_user_id, {}),
             "promoter_type": assignment.promoter_type,
-            "created_at": assignment.created_at,
+            # PromoterAssignment uses `assigned_at`, not `created_at`.
+            # The previous line crashed the endpoint with
+            # AttributeError → 500 → PWA load() swallowed it → farmer
+            # never saw the pending-approval card.
+            "created_at": assignment.assigned_at,
         }
         for sub, assignment in rows
     ]
