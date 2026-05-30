@@ -174,6 +174,13 @@ class ClientFarmPundit(Base):
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
     round_robin_sequence: Mapped[int] = mapped_column(Integer, nullable=True)
     is_promoter_pundit: Mapped[bool] = mapped_column(Boolean, default=False)
+    # PP V1 (2026-05-30): phantom-pundit Option A. When the CA toggles
+    # PP ON for a Facilitator-Promoter without a FarmPundit profile, we
+    # auto-provision a row with `searchable=False` so the farmer never
+    # sees them in any pundit picker. Real FarmPundit onboardings keep
+    # the default True. Per-(client, pundit) flag — a person can be
+    # searchable at one company and a phantom-only PP at another.
+    searchable: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     onboarded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     pundit: Mapped["FarmPunditProfile"] = relationship("FarmPunditProfile", back_populates="company_pundits")

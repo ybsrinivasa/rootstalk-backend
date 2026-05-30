@@ -66,9 +66,16 @@ def route_query(
         if match:
             return RoutingResult(pundit_id=promoter_pundit_id, reason="PROMOTER_PUNDIT")
 
-    # Priority 3: Round-robin among PRIMARY ACTIVE experts
+    # Priority 3: Round-robin among PRIMARY ACTIVE experts.
+    # PP V1 (2026-05-30): Promoter-Pundits are explicitly excluded from
+    # the pool — they receive queries only when a farmer has typed their
+    # phone number into the expert field (P1 path) or when they were the
+    # assigning F-P (P2 path). The pool is FarmPundits-only.
     primaries = sorted(
-        [e for e in experts if e.role == "PRIMARY" and e.status == "ACTIVE"],
+        [e for e in experts
+         if e.role == "PRIMARY"
+         and e.status == "ACTIVE"
+         and not e.is_promoter_pundit],
         key=lambda e: (e.onboarded_at, e.round_robin_sequence or 0),
     )
 

@@ -2269,6 +2269,129 @@ async def toggle_promoter_pundit(
     return {"is_promoter_pundit": cp.is_promoter_pundit}
 
 
+# ── Promoter-Pundit auto-provision (V1, 2026-05-30) ──────────────────────────
+# Designate a Facilitator-Promoter at this client as a Promoter-Pundit
+# without forcing them through the /pundit/register flow. Auto-creates
+# a phantom FarmPunditProfile + ClientFarmPundit (searchable=False) so
+# they exist in the routing tables but never appear in the farmer's
+# expert picker. The existing PUT toggle endpoint covers the case
+# where a real FarmPundit (someone who DID register) gets promoted to
+# PP — and also covers un-designating either kind.
+
+class PromoterPunditAddRequest(BaseModel):
+    phone: str
+
+
+@router.post("/client/{client_id}/promoter-pundits", status_code=201)
+async def add_promoter_pundit(
+    client_id: str,
+    request: PromoterPunditAddRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CA designates a Facilitator-Promoter at this client as a P-P.
+
+    Identifies the target by phone (the CA knows the F-P's number);
+    enforces §14.2 (must be ACTIVE FACILITATOR + is_promoter=True at
+    this client); auto-provisions the FarmPunditProfile and the
+    ClientFarmPundit row (searchable=False) on first add. Idempotent
+    when re-called for an already-designated PP.
+    """
+    from app.modules.clients.models import ClientPromoter
+
+    await _assert_portal_member(db, current_user.id, client_id)
+
+    phone = (request.phone or "").strip()
+    if not phone:
+        raise HTTPException(status_code=422, detail={
+            "code": "phone_required",
+            "message": "phone is required.",
+        })
+
+    target = (await db.execute(
+        select(User).where(User.phone == phone)
+    )).scalar_one_or_none()
+    if target is None:
+        raise HTTPException(status_code=422, detail={
+            "code": "user_not_found",
+            "message": (
+                "No RootsTalk user is registered with this number. "
+                "Ask them to register first."
+            ),
+        })
+
+    # §14.2: must already be a Facilitator-Promoter at this client.
+    is_fp = (await db.execute(
+        select(ClientPromoter).where(
+            ClientPromoter.client_id == client_id,
+            ClientPromoter.user_id == target.id,
+            ClientPromoter.promoter_type == "FACILITATOR",
+            ClientPromoter.is_promoter == True,  # noqa: E712
+            ClientPromoter.status == "ACTIVE",
+        )
+    )).scalar_one_or_none() is not None
+    if not is_fp:
+        raise HTTPException(status_code=409, detail={
+            "code": "promoter_pundit_requires_facilitator_promoter",
+            "message": (
+                "Per §14.2, a Promoter-Pundit must already be an ACTIVE "
+                "Facilitator-Promoter at this company. Promote them on "
+                "the Field Manager page first."
+            ),
+        })
+
+    # Phantom FarmPunditProfile — created lazily so the F-P doesn't
+    # need to go through /pundit/register.
+    profile = (await db.execute(
+        select(FarmPunditProfile).where(FarmPunditProfile.user_id == target.id)
+    )).scalar_one_or_none()
+    if profile is None:
+        profile = FarmPunditProfile(user_id=target.id)
+        db.add(profile)
+        await db.flush()
+
+    cfp = (await db.execute(
+        select(ClientFarmPundit).where(
+            ClientFarmPundit.client_id == client_id,
+            ClientFarmPundit.pundit_id == profile.id,
+        )
+    )).scalar_one_or_none()
+    if cfp is None:
+        cfp = ClientFarmPundit(
+            client_id=client_id,
+            pundit_id=profile.id,
+            role=PunditRole.PANEL,
+            status="ACTIVE",
+            is_promoter_pundit=True,
+            # Phantom PP rows are hidden from any farmer-facing list —
+            # the farmer can only reach them by typing the phone.
+            searchable=False,
+        )
+        db.add(cfp)
+    else:
+        # Re-add idempotent: flip flags + reactivate if needed. We
+        # deliberately do NOT toggle `searchable` back to False if the
+        # row pre-existed as a real FarmPundit — that would erase the
+        # CA's earlier decision to onboard them as a searchable pundit.
+        cfp.is_promoter_pundit = True
+        cfp.status = "ACTIVE"
+
+    await db.commit()
+    await db.refresh(cfp)
+    return {
+        "id": cfp.id,
+        "client_id": cfp.client_id,
+        "pundit_id": cfp.pundit_id,
+        "user_id": target.id,
+        "name": target.name,
+        "phone": target.phone,
+        "role": cfp.role.value if hasattr(cfp.role, "value") else cfp.role,
+        "status": cfp.status,
+        "is_promoter_pundit": True,
+        "searchable": cfp.searchable,
+    }
+
+
 # ── Query Detail Routes ────────────────────────────────────────────────────────
 
 @router.get("/pundit/queries/{query_id}")
@@ -2524,15 +2647,29 @@ async def set_pundit_preference(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Farmer sets their preferred FarmPundit for this subscription.
+    """Farmer sets their preferred expert for this subscription.
 
     BL-12 audit (2026-05-06): added subscription ownership check.
-    Pre-fix any farmer could set preferences on any subscription by
-    guessing the ID — same family of bug as BL-08 / BL-10.
+
+    PP V1 (2026-05-30): the contract is **phone-based** — the farmer
+    types a phone number (informed by their promoter or RM), and the
+    server validates that it belongs to an ACTIVE Promoter-Pundit at
+    this subscription's Client. The legacy `pundit_id` path stays
+    accepted for back-compat callers but the canonical input now is
+    `{phone}`. Refuses with:
+      - 422 phone_or_pundit_id_required  → neither given
+      - 422 user_not_found               → no User has that phone
+      - 422 not_a_promoter_pundit        → exists but no ACTIVE PP at
+                                           this Client (the farmer
+                                           was told the wrong number)
     """
+    phone = (data.get("phone") or "").strip() if isinstance(data.get("phone"), str) else None
     pundit_id = data.get("pundit_id")
-    if not pundit_id:
-        raise HTTPException(status_code=422, detail="pundit_id required")
+    if not phone and not pundit_id:
+        raise HTTPException(status_code=422, detail={
+            "code": "phone_or_pundit_id_required",
+            "message": "phone (or legacy pundit_id) required.",
+        })
 
     sub = (await db.execute(
         select(Subscription).where(
@@ -2542,6 +2679,62 @@ async def set_pundit_preference(
     )).scalar_one_or_none()
     if sub is None:
         raise HTTPException(status_code=404, detail="Subscription not found")
+
+    # PP V1: resolve a typed phone to a Promoter-Pundit pundit_id at
+    # this sub's Client. Same idiom as alerts B — refuse early with a
+    # clear code so the PWA can surface the right message inline.
+    if phone:
+        from app.modules.clients.models import ClientPromoter
+        target = (await db.execute(
+            select(User).where(User.phone == phone)
+        )).scalar_one_or_none()
+        if target is None:
+            raise HTTPException(status_code=422, detail={
+                "code": "user_not_found",
+                "message": (
+                    "No RootsTalk user is registered with this number. "
+                    "Check the digits with your promoter or RM."
+                ),
+            })
+
+        pp_profile = (await db.execute(
+            select(FarmPunditProfile).where(FarmPunditProfile.user_id == target.id)
+        )).scalar_one_or_none()
+        cfp = None
+        if pp_profile is not None:
+            cfp = (await db.execute(
+                select(ClientFarmPundit).where(
+                    ClientFarmPundit.client_id == sub.client_id,
+                    ClientFarmPundit.pundit_id == pp_profile.id,
+                    ClientFarmPundit.is_promoter_pundit == True,  # noqa: E712
+                    ClientFarmPundit.status == "ACTIVE",
+                )
+            )).scalar_one_or_none()
+        # Read-time eligibility — even if the ClientFarmPundit says
+        # PP, the underlying ClientPromoter must still be ACTIVE +
+        # is_promoter=True. Catches the "F-P stepped down but stale
+        # PP row exists" case.
+        is_fp_promoter = (await db.execute(
+            select(ClientPromoter).where(
+                ClientPromoter.client_id == sub.client_id,
+                ClientPromoter.user_id == target.id,
+                ClientPromoter.promoter_type == "FACILITATOR",
+                ClientPromoter.is_promoter == True,  # noqa: E712
+                ClientPromoter.status == "ACTIVE",
+            )
+        )).scalar_one_or_none() is not None
+
+        if not (cfp and is_fp_promoter):
+            raise HTTPException(status_code=422, detail={
+                "code": "not_a_promoter_pundit",
+                "message": (
+                    "This number doesn't belong to a Promoter-Pundit for "
+                    "this company. Your queries will go to the company's "
+                    "expert team. Ask your promoter or RM for the correct "
+                    "number."
+                ),
+            })
+        pundit_id = pp_profile.id
 
     existing = (await db.execute(
         select(FarmPunditPreference).where(FarmPunditPreference.subscription_id == subscription_id)

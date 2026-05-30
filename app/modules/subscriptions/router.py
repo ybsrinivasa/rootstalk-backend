@@ -4150,24 +4150,59 @@ async def get_expert_setting(
     sub = await _get_subscription(db, subscription_id, current_user.id)
 
     # 1) Current preference (farmer's specific choice for this subscription)
+    # PP V1 (2026-05-30): silent stale-override hiding. If the saved
+    # preference no longer resolves to an ACTIVE Promoter-Pundit at
+    # this Client (CA revoked PP, or F-P stepped down, or invitation
+    # was withdrawn), the slot appears empty to the farmer and the
+    # subscription quietly falls through to the pool. The farmer can
+    # always type a new number. Re-typing the now-stale number returns
+    # the 422 not_a_promoter_pundit message from set_pundit_preference.
     pref = (await db.execute(
         select(FarmPunditPreference).where(FarmPunditPreference.subscription_id == subscription_id)
     )).scalar_one_or_none()
 
     preferred_pundit = None
     if pref:
-        row = (await db.execute(
-            select(FarmPunditProfile, User)
-            .join(User, User.id == FarmPunditProfile.user_id)
-            .where(FarmPunditProfile.id == pref.pundit_id)
-        )).first()
-        if row:
-            profile, user_obj = row
-            preferred_pundit = {
-                "pundit_id": profile.id,
-                "name": user_obj.name,
-                "phone": user_obj.phone,
-            }
+        # Eligibility gate — same shape as set_pundit_preference.
+        from app.modules.farmpundit.models import ClientFarmPundit as _CFP
+        from app.modules.clients.models import ClientPromoter as _CP
+        eligible = (await db.execute(
+            select(_CFP)
+            .join(FarmPunditProfile, FarmPunditProfile.id == _CFP.pundit_id)
+            .where(
+                _CFP.pundit_id == pref.pundit_id,
+                _CFP.client_id == sub.client_id,
+                _CFP.is_promoter_pundit == True,  # noqa: E712
+                _CFP.status == "ACTIVE",
+            )
+        )).scalar_one_or_none()
+        if eligible is not None:
+            row = (await db.execute(
+                select(FarmPunditProfile, User)
+                .join(User, User.id == FarmPunditProfile.user_id)
+                .where(FarmPunditProfile.id == pref.pundit_id)
+            )).first()
+            if row:
+                profile, user_obj = row
+                # Also gate on the upstream ClientPromoter binding —
+                # if the F-P stepped down / was deactivated, the
+                # ClientFarmPundit row may still exist but the
+                # eligibility is gone.
+                fp_still_active = (await db.execute(
+                    select(_CP).where(
+                        _CP.client_id == sub.client_id,
+                        _CP.user_id == user_obj.id,
+                        _CP.promoter_type == "FACILITATOR",
+                        _CP.is_promoter == True,  # noqa: E712
+                        _CP.status == "ACTIVE",
+                    )
+                )).scalar_one_or_none() is not None
+                if fp_still_active:
+                    preferred_pundit = {
+                        "pundit_id": profile.id,
+                        "name": user_obj.name,
+                        "phone": user_obj.phone,
+                    }
 
     # 2) Promoter-Pundit (active promoter who is also marked as Promoter-Pundit on this client)
     promoter_pundit = None
@@ -4214,6 +4249,10 @@ async def get_expert_setting(
         promoter_pundit = None
 
     # 3) Company's available experts (FarmPundits onboarded by this client)
+    # PP V1 (2026-05-30): phantom-pundit rows (searchable=False) are
+    # excluded so the farmer never sees a Promoter-Pundit in the
+    # picker. The only way to reach a P-P is by typing the phone
+    # directly into the expert field (validated in set_pundit_preference).
     company_experts = []
     try:
         rows = (await db.execute(
@@ -4223,6 +4262,7 @@ async def get_expert_setting(
             .where(
                 ClientFarmPundit.client_id == sub.client_id,
                 ClientFarmPundit.status == "ACTIVE",
+                ClientFarmPundit.searchable.is_(True),
             )
         )).all()
         company_experts = [
