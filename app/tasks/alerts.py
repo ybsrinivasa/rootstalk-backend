@@ -71,7 +71,17 @@ _SUPPRESSING_ORDER_STATUSES = (
 
 
 def _start_of_today_utc(today: date) -> datetime:
-    return datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc)
+    """Given an IST date, return the corresponding UTC timestamp at IST
+    midnight. Pairs with the IST-date `today` chosen in
+    `_run_daily_alerts_with_session` (2026-05-31 change). Used by the
+    per-day idempotency check on Alert.sent_at — without this
+    conversion, a manual trigger between IST midnight and UTC midnight
+    would see "no alert today" against UTC-stamped sent_at rows and
+    fire duplicate alerts."""
+    from datetime import timedelta as _td
+    ist_offset = _td(hours=5, minutes=30)
+    ist_midnight_naive = datetime.combine(today, datetime.min.time())
+    return (ist_midnight_naive - ist_offset).replace(tzinfo=timezone.utc)
 
 
 async def _alert_sent_today(db, subscription_id: str, alert_type: AlertType, today: date) -> bool:
@@ -294,7 +304,17 @@ async def _run_daily_alerts_with_session(db, today: date | None = None) -> int:
     from app.modules.subscriptions.models import (
         AssignmentStatus, PromoterAssignment,
     )
-    today = today or datetime.now(timezone.utc).date()
+    # 2026-05-31 — "today" is IST-local, not UTC. RootsTalk operates in
+    # India; farmers set their crop start date in IST. Using UTC for the
+    # day-offset comparison breaks 5h30m a day (between IST midnight and
+    # UTC midnight) where a freshly-set "today" crop has day_offset=-1
+    # under UTC reckoning. The scheduled beat runs at 06:00 UTC = 11:30
+    # IST so UTC date == IST date at the scheduled hour; this change
+    # only affects the off-hours manual triggers + matches farmer-side
+    # date perception.
+    from datetime import timedelta as _td
+    IST_OFFSET = _td(hours=5, minutes=30)
+    today = today or (datetime.now(timezone.utc) + IST_OFFSET).date()
     pending_assignment_sub_ids = (await db.execute(
         select(PromoterAssignment.subscription_id).where(
             PromoterAssignment.status == AssignmentStatus.PENDING_FARMER_APPROVAL,
