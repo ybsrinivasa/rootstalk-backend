@@ -1801,6 +1801,79 @@ async def my_alert_subscriptions(
     return out
 
 
+@router.get("/promoter/me/incoming-alerts")
+async def my_incoming_alerts(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Actual unread alerts addressed to this promoter.
+
+    Returns one row per Alert with status=SENT (i.e. the farmer
+    hasn't marked it read yet — once the farmer reads it, it
+    disappears from the promoter's list, matching the spec rule
+    "alerts vanish once the task is over from the farmer's end").
+
+    Decorated with the farmer's name + phone for tap-to-call, the
+    crop's English name from Cosh, and the alert type label
+    (START_DATE / INPUT) so the PWA can render a typed chip.
+
+    No package_name in the response — the promoter doesn't need it.
+    """
+    from app.modules.subscriptions.models import (
+        Alert, AlertStatus, AlertType,
+    )
+    from app.modules.sync.models import CoshCoreItem
+
+    rows = (await db.execute(
+        select(Alert, Subscription, Package, User)
+        .join(Subscription, Subscription.id == Alert.subscription_id)
+        .join(Package, Package.id == Subscription.package_id)
+        .join(User, User.id == Subscription.farmer_user_id)
+        .where(
+            Alert.recipient_user_id == current_user.id,
+            Alert.status == AlertStatus.SENT,
+            Subscription.status == SubscriptionStatus.ACTIVE,
+        )
+        .order_by(Alert.sent_at.desc())
+    )).all()
+
+    if not rows:
+        return []
+
+    # Resolve crop English names in one batch.
+    crop_ids = {pkg.crop_cosh_id for _, _, pkg, _ in rows if pkg.crop_cosh_id}
+    crop_name_by_id: dict[str, str | None] = {}
+    if crop_ids:
+        for r in (await db.execute(
+            select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
+            .where(CoshCoreItem.cosh_id.in_(crop_ids))
+        )).all():
+            tr = r.translations or {}
+            crop_name_by_id[r.cosh_id] = (
+                tr.get("en") if isinstance(tr, dict) else None
+            )
+
+    out = []
+    for alert, sub, pkg, farmer in rows:
+        out.append({
+            "alert_id": alert.id,
+            "alert_type": (
+                alert.alert_type.value
+                if hasattr(alert.alert_type, "value")
+                else alert.alert_type
+            ),
+            "sent_at": alert.sent_at,
+            "subscription_id": sub.id,
+            "client_id": sub.client_id,
+            "farmer_user_id": farmer.id,
+            "farmer_name": farmer.name,
+            "farmer_phone": farmer.phone,
+            "crop_cosh_id": pkg.crop_cosh_id,
+            "crop_name": crop_name_by_id.get(pkg.crop_cosh_id) if pkg.crop_cosh_id else None,
+        })
+    return out
+
+
 # F-P View Packages (2026-05-29) — F-P-side read-only advisory view.
 
 @router.get("/promoter/assignments/{subscription_id}/today")
