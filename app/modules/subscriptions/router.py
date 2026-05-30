@@ -1689,6 +1689,35 @@ async def initiate_assignment(
     )
     db.add(assignment)
     await db.commit()
+
+    # 2026-05-31 — notify the farmer that a Promoter has assigned a
+    # package and is awaiting their approval. Without this, the
+    # farmer only finds out by chance the next time they open the
+    # PWA Home. Silently best-effort — a missing FCM token or
+    # network blip mustn't fail the assignment itself.
+    if farmer.fcm_token:
+        try:
+            from app.services.fcm_service import send_fcm
+            promoter_label = (
+                "Dealer" if request.promoter_type == "DEALER" else "Facilitator"
+            )
+            await send_fcm(
+                token=farmer.fcm_token,
+                title="Advisory assignment request",
+                body=(
+                    f"{promoter_label} {current_user.name or 'a promoter'} "
+                    f"has sent you an advisory subscription. Open the app to "
+                    f"approve or decline."
+                ),
+                data={
+                    "type": "PROMOTER_ASSIGNMENT_RECEIVED",
+                    "subscription_id": sub.id,
+                    "assignment_id": assignment.id,
+                },
+            )
+        except Exception:
+            pass
+
     return {"subscription_id": sub.id, "assignment_id": assignment.id, "status": "Awaiting farmer approval"}
 
 
@@ -3588,11 +3617,15 @@ async def my_subscriptions(
         for cid in primary_rows:
             has_primary_by_client[cid] = True
 
-    # 2026-05-30 — pending_approval flag for ASSIGNED subs whose
-    # PromoterAssignment is still PENDING_FARMER_APPROVAL. Surfaced
-    # so the PWA home suppresses these from the ACTIVE-tiles grid
-    # (the same row is already rendered as a "Pending approval"
-    # card from /farmer/assignments/pending). One batched query.
+    # 2026-05-31 — Promoter-assigned subs awaiting the farmer's
+    # explicit approval are OMITTED from /farmer/my-subscriptions
+    # entirely. The farmer interacts with them only via the
+    # pending-approval card from /farmer/assignments/pending. Once
+    # they accept, the assignment flips to ACTIVE and the sub
+    # appears in this list as a normal active subscription. Without
+    # this filter, a Promoter-assigned sub was visible to the farmer
+    # as an active crop tile from the moment the Promoter initiated —
+    # effectively treating it as approved without the farmer's nod.
     pending_approval_sub_ids: set[str] = set()
     sub_ids_assigned = [s.id for s in subs if s.subscription_type == SubscriptionType.ASSIGNED]
     if sub_ids_assigned:
@@ -3603,6 +3636,9 @@ async def my_subscriptions(
             )
         )).scalars().all()
         pending_approval_sub_ids = set(rows)
+    subs = [s for s in subs if s.id not in pending_approval_sub_ids]
+    if not subs:
+        return []
 
     for s in subs:
         pkg_name, crop_cosh_id = pkg_by_id.get(s.package_id, (None, None))
@@ -3613,9 +3649,6 @@ async def my_subscriptions(
             "status": s.status, "crop_start_date": s.crop_start_date,
             "crop_start_date_first_set_at": s.crop_start_date_first_set_at,
             "reference_number": s.reference_number, "subscription_type": s.subscription_type,
-            # True when this is an ASSIGNED sub still awaiting the
-            # farmer's accept/decline on the PromoterAssignment row.
-            "pending_approval": s.id in pending_approval_sub_ids,
             # Area-wise context
             "farm_area_acres": float(s.farm_area_acres) if s.farm_area_acres is not None else None,
             "area_unit": s.area_unit,
