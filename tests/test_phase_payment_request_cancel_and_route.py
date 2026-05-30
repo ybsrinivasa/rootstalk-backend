@@ -275,3 +275,83 @@ async def test_facilitator_decline_flips_only_pending_row(db):
             request_id=pr_id, db=db, current_user=delegate,
         )
     assert ei.value.status_code == 404
+
+
+# ── 2026-05-30: target-must-be-facilitator-or-dealer validation ───────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_delegate_refused_when_target_not_facilitator_or_dealer(db):
+    """User report 2026-05-30: rows were getting created with a
+    non-onboarded target; the target's PWA Payments tab then 403'd
+    on _assert_active_facilitator so they never saw the request.
+    The farmer thought they had successfully asked someone. Add a
+    create-time guard so the failure surfaces immediately on the
+    farmer's screen with an actionable 422.
+    """
+    sa = await make_user(db, name="SA")
+    client = await make_client(db)
+    pkg = await make_package(db, client)
+    farmer = await make_user(db, name="Farmer")
+    # Bystander — a real user but with NO ClientPromoter row of any
+    # kind. The farmer enters their phone, the lookup succeeds, but
+    # the new guard refuses.
+    bystander = await make_self_registered_user(
+        db, phone="+919812341234", role="FACILITATOR", name="Bystander",
+    )
+    sub = await make_subscription(db, farmer=farmer, client=client, package=pkg)
+    sub.status = SubscriptionStatus.WAITLISTED
+    await db.commit()
+    await db.refresh(sub)
+
+    with pytest.raises(HTTPException) as ei:
+        await delegate_payment(
+            subscription_id=sub.id,
+            request=PaymentDelegateRequest(delegate_phone="+919812341234"),
+            db=db, current_user=farmer,
+        )
+    assert ei.value.status_code == 422
+    assert ei.value.detail["code"] == "target_not_facilitator_or_dealer"
+
+    # And no row was created.
+    rows = (await db.execute(
+        select(SubscriptionPaymentRequest).where(
+            SubscriptionPaymentRequest.subscription_id == sub.id,
+        )
+    )).scalars().all()
+    assert rows == []
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_delegate_succeeds_when_target_is_facilitator_at_any_client(db):
+    """Per user 2026-05-30: a Facilitator onboarding at any company
+    is sufficient; the target doesn't need to also be designated as
+    a Promoter. The existing _seed helper already onboards via
+    `register_promoter` which writes status=ACTIVE — the create
+    succeeds even though `is_promoter` defaults to False post-R9."""
+    _, _, farmer, _, sub = await _seed(db)
+    out = await delegate_payment(
+        subscription_id=sub.id,
+        request=PaymentDelegateRequest(delegate_phone="+919900400099"),
+        db=db, current_user=farmer,
+    )
+    assert out["detail"] == "Payment request sent"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_delegate_refused_when_target_is_self(db):
+    """Self-delegation guard. The PWA blocks before submit but the
+    backend has its own guard so a direct API call can't bypass."""
+    _, _, farmer, _, sub = await _seed(db)
+    farmer.phone = "+919811112222"
+    await db.commit()
+    with pytest.raises(HTTPException) as ei:
+        await delegate_payment(
+            subscription_id=sub.id,
+            request=PaymentDelegateRequest(delegate_phone="+919811112222"),
+            db=db, current_user=farmer,
+        )
+    assert ei.value.status_code == 422
+    assert ei.value.detail["code"] == "delegate_is_self"

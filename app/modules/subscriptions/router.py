@@ -2158,6 +2158,47 @@ async def delegate_payment(
         resolved_user_id = delegate_user.id
     if not resolved_user_id:
         raise HTTPException(status_code=422, detail="Provide either requested_from_user_id or delegate_phone.")
+    if resolved_user_id == current_user.id:
+        # Self-delegation shouldn't be possible from the PWA — frontend
+        # blocks it before submit — but guard the backend too so a
+        # direct API call can't create a self-targeted row.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "delegate_is_self",
+                "message": "You cannot ask yourself to pay. Choose someone else.",
+            },
+        )
+
+    # 2026-05-30 — refuse at create time when the target isn't an
+    # ACTIVE Facilitator or Dealer at any company. Without this guard
+    # the row gets created silently and the target user, when they
+    # open their PWA Payments tab, hits the role gate on the GET
+    # endpoint and never sees the request — the farmer thinks the
+    # request was delivered. Per user 2026-05-30: a Facilitator
+    # onboarding at any company is sufficient (Promoter designation
+    # NOT required); same for Dealer.
+    from app.modules.clients.models import ClientPromoter
+    has_role = (await db.execute(
+        select(ClientPromoter.id).where(
+            ClientPromoter.user_id == resolved_user_id,
+            ClientPromoter.promoter_type.in_(("FACILITATOR", "DEALER")),
+            ClientPromoter.status == "ACTIVE",
+        ).limit(1)
+    )).scalar_one_or_none()
+    if has_role is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "target_not_facilitator_or_dealer",
+                "message": (
+                    "This person isn't registered as a Facilitator or "
+                    "Dealer with any company. Ask them to register "
+                    "via 'Become a Facilitator' or 'Become a Dealer' "
+                    "in their app, then try again."
+                ),
+            },
+        )
 
     # Guard: only one PENDING request per subscription at a time. If
     # the farmer already has one outstanding, they must cancel it

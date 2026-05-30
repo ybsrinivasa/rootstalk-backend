@@ -40,6 +40,7 @@ from sqlalchemy import select
 from app.modules.subscriptions.models import (
     Subscription, SubscriptionPaymentRequest, SubscriptionStatus,
 )
+from app.modules.clients.router import register_promoter
 from app.modules.subscriptions.router import (
     PaymentDelegateRequest,
     cancel_delegation, create_payment_share_link, delegate_payment,
@@ -75,6 +76,23 @@ async def _seed_waitlisted(db):
     await db.commit()
     await db.refresh(sub)
     return farmer, sub
+
+
+async def _seed_facilitator(db, *, phone="+919900600099"):
+    """Onboarded Facilitator that can legitimately receive delegate
+    requests. Helper exists because the 2026-05-30 create-time
+    target-validation guard refuses non-onboarded targets."""
+    sa = await make_user(db, name="SA")
+    client = await make_client(db)
+    await make_self_registered_user(
+        db, phone=phone, role="FACILITATOR", name="Delegate",
+    )
+    await register_promoter(
+        client_id=client.id,
+        request={"phone": phone, "promoter_type": "FACILITATOR"},
+        db=db, current_user=sa,
+    )
+    return client
 
 
 def _sign(body: bytes, secret: str) -> str:
@@ -119,10 +137,10 @@ async def test_create_share_link_persists_method_and_link(db, monkeypatch):
 @pytest.mark.asyncio
 async def test_share_link_blocked_when_delegate_pending(db, monkeypatch):
     farmer, sub = await _seed_waitlisted(db)
-    await make_self_registered_user(
-        db, phone="+919900600099", role="FACILITATOR", name="D",
-    )
-    await db.commit()
+    # Onboarded Facilitator — the 2026-05-30 target-validation guard
+    # refuses non-onboarded targets, so the test setup needs a real
+    # Facilitator-Promoter row.
+    await _seed_facilitator(db, phone="+919900600099")
     await delegate_payment(
         subscription_id=sub.id,
         request=PaymentDelegateRequest(delegate_phone="+919900600099"),
