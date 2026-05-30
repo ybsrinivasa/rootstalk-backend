@@ -1,7 +1,14 @@
 """Celery application instance and beat schedule."""
+import asyncio
+import logging
+
 from celery import Celery
 from celery.schedules import crontab
+from celery.signals import task_postrun, worker_process_init
+
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 celery_app = Celery(
     "rootstalk",
@@ -19,6 +26,46 @@ celery_app = Celery(
         "app.tasks.enterprise_license_lifecycle",
     ],
 )
+
+
+# ── asyncpg + asyncio.run() per-task connection-pool race ────────────────
+#
+# Each celery task wraps its body in `asyncio.run(_inner())`. That creates
+# a fresh event loop per task. But `app.database.engine` is module-level
+# — its asyncpg connection pool is bound to the FIRST event loop that
+# checked out a connection (typically the worker's boot-time init). The
+# next task reuses a connection from the pool, asyncpg detects the loop
+# mismatch, and raises "cannot perform operation: another operation is
+# in progress" on the very first query of every task.
+#
+# Fix: dispose the engine's connection pool after every task so the next
+# task's `asyncio.run()` gets fresh connections. Cheap — at low task
+# rates this is essentially a per-task connection open/close, the same
+# cost NullPool would impose. Doesn't affect the API server's engine
+# (different process, never receives this signal).
+
+def _dispose_engine_sync() -> None:
+    try:
+        from app.database import engine
+    except Exception:
+        return
+    try:
+        asyncio.run(engine.dispose())
+    except Exception:
+        logger.exception("celery: engine.dispose() failed (non-fatal)")
+
+
+@worker_process_init.connect
+def _dispose_engine_on_worker_init(**_kwargs):
+    """Dispose any inherited engine state in each prefork child."""
+    _dispose_engine_sync()
+
+
+@task_postrun.connect
+def _dispose_engine_after_task(**_kwargs):
+    """Dispose the pool after every task so the next task's asyncio.run()
+    gets a fresh connection bound to its own event loop."""
+    _dispose_engine_sync()
 
 celery_app.conf.beat_schedule = {
     # BL-09: Daily advisory alerts at 06:00 UTC (11:30 IST)
