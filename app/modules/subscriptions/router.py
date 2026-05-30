@@ -2139,6 +2139,94 @@ class PaymentDelegateRequest(BaseModel):
     role: Optional[str] = None  # DEALER or FACILITATOR (informational)
 
 
+@router.get("/farmer/delegate-lookup")
+async def delegate_lookup(
+    phone: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Two-step delegate-payment helper (2026-05-30).
+
+    Returns the resolved user's name, roles, and the companies that
+    have onboarded them as a Facilitator / Dealer. The PWA calls this
+    when the farmer hits "Check" on the phone-entry screen, then
+    renders a confirmation card before letting them submit.
+
+    Mirrors the validation rules in `delegate_payment`:
+      - 404 `phone_not_registered` — no user with this phone
+      - 422 `delegate_is_self`     — looked-up user is the caller
+      - 422 `target_not_facilitator_or_dealer` — user exists but has
+        no ACTIVE FACILITATOR/DEALER ClientPromoter row anywhere
+
+    Side-effect-free; safe to call repeatedly as the farmer types.
+    """
+    from app.modules.auth.service import get_user_by_phone
+    from app.modules.clients.models import Client, ClientPromoter
+
+    target = await get_user_by_phone(db, phone)
+    if target is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "phone_not_registered",
+                "message": "No user found with this phone number.",
+            },
+        )
+    if target.id == current_user.id:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "delegate_is_self",
+                "message": "You cannot ask yourself to pay. Choose someone else.",
+            },
+        )
+
+    # Join across ClientPromoter + Client so we can surface the
+    # company names alongside the role badges. One row per
+    # (client, promoter_type) so the farmer can see e.g. "Facilitator
+    # at Acme; Dealer at Beta".
+    rows = (await db.execute(
+        select(ClientPromoter, Client)
+        .join(Client, Client.id == ClientPromoter.client_id)
+        .where(
+            ClientPromoter.user_id == target.id,
+            ClientPromoter.promoter_type.in_(("FACILITATOR", "DEALER")),
+            ClientPromoter.status == "ACTIVE",
+        )
+    )).all()
+    if not rows:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "target_not_facilitator_or_dealer",
+                "message": (
+                    "This person isn't registered as a Facilitator or "
+                    "Dealer with any company. Ask them to register "
+                    "via 'Become a Facilitator' or 'Become a Dealer' "
+                    "in their app, then try again."
+                ),
+            },
+        )
+
+    affiliations = [
+        {
+            "role": cp.promoter_type,                          # FACILITATOR / DEALER
+            "company_name": client.display_name or client.full_name,
+            "client_id": client.id,
+        }
+        for cp, client in rows
+    ]
+    roles = sorted({a["role"] for a in affiliations})
+
+    return {
+        "user_id": target.id,
+        "name": target.name,
+        "phone": target.phone,
+        "roles": roles,                                        # ["FACILITATOR"], ["DEALER"], or both
+        "affiliations": affiliations,
+    }
+
+
 @router.post("/farmer/subscriptions/{subscription_id}/delegate-payment")
 async def delegate_payment(
     subscription_id: str,

@@ -355,3 +355,74 @@ async def test_delegate_refused_when_target_is_self(db):
         )
     assert ei.value.status_code == 422
     assert ei.value.detail["code"] == "delegate_is_self"
+
+
+# ── 2026-05-30: delegate-lookup (two-step Check → Send) ────────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_delegate_lookup_returns_name_roles_affiliations(db):
+    """Happy path: phone resolves to an onboarded Facilitator; the
+    response carries name, phone, roles list, and per-company
+    affiliations so the PWA can render 'Ravi · Facilitator at <Co>'."""
+    from app.modules.subscriptions.router import delegate_lookup
+    _, _, farmer, _, _ = await _seed(db)
+
+    out = await delegate_lookup(
+        phone="+919900400099", db=db, current_user=farmer,
+    )
+    assert out["phone"] == "+919900400099"
+    assert "FACILITATOR" in out["roles"]
+    assert len(out["affiliations"]) >= 1
+    assert out["affiliations"][0]["role"] == "FACILITATOR"
+    assert out["affiliations"][0]["company_name"]
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_delegate_lookup_404s_for_unregistered_phone(db):
+    from app.modules.subscriptions.router import delegate_lookup
+    _, _, farmer, _, _ = await _seed(db)
+    with pytest.raises(HTTPException) as ei:
+        await delegate_lookup(
+            phone="+919999999999", db=db, current_user=farmer,
+        )
+    assert ei.value.status_code == 404
+    assert ei.value.detail["code"] == "phone_not_registered"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_delegate_lookup_422s_when_not_facilitator_or_dealer(db):
+    """Phone resolves to a real user but they have no ACTIVE
+    Facilitator/Dealer ClientPromoter row anywhere — same code the
+    POST endpoint uses, so the PWA can branch identically."""
+    from app.modules.subscriptions.router import delegate_lookup
+    _, _, farmer, _, _ = await _seed(db)
+    # Bystander — real user, no promoter row.
+    await make_self_registered_user(
+        db, phone="+919812341234", role="FACILITATOR", name="Bystander",
+    )
+    await db.commit()
+
+    with pytest.raises(HTTPException) as ei:
+        await delegate_lookup(
+            phone="+919812341234", db=db, current_user=farmer,
+        )
+    assert ei.value.status_code == 422
+    assert ei.value.detail["code"] == "target_not_facilitator_or_dealer"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_delegate_lookup_422s_when_target_is_self(db):
+    from app.modules.subscriptions.router import delegate_lookup
+    _, _, farmer, _, _ = await _seed(db)
+    farmer.phone = "+919811112222"
+    await db.commit()
+    with pytest.raises(HTTPException) as ei:
+        await delegate_lookup(
+            phone="+919811112222", db=db, current_user=farmer,
+        )
+    assert ei.value.status_code == 422
+    assert ei.value.detail["code"] == "delegate_is_self"
