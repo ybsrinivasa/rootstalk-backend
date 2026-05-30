@@ -2368,13 +2368,24 @@ async def pay_subscription(
     machine table only allows WAITLISTED → ACTIVE; anything else
     raises NO_OP_TRANSITION or ILLEGAL_TRANSITION before we touch
     the allocation.
+
+    Lifecycle audit follow-up (2026-05-30): added ownership +
+    PENDING-only gate to the lookup, mirroring what the sibling
+    endpoints (create-order, verify) already do. Pre-fix, any user
+    with an allocation at the request's client could pay someone
+    else's payment request — silent privilege misuse + the wrong
+    promoter_user_id stamped on the resulting Subscription.
     """
     result = await db.execute(
-        select(SubscriptionPaymentRequest).where(SubscriptionPaymentRequest.id == request_id)
+        select(SubscriptionPaymentRequest).where(
+            SubscriptionPaymentRequest.id == request_id,
+            SubscriptionPaymentRequest.requested_from_user_id == current_user.id,
+            SubscriptionPaymentRequest.status == "PENDING",
+        )
     )
     pr = result.scalar_one_or_none()
     if not pr:
-        raise HTTPException(status_code=404, detail="Payment request not found")
+        raise HTTPException(status_code=404, detail="Payment request not found or no longer pending")
 
     sub = (await db.execute(select(Subscription).where(Subscription.id == pr.subscription_id))).scalar_one()
 

@@ -23,7 +23,7 @@ from app.modules.subscriptions.models import (
     Subscription, SubscriptionPaymentRequest, SubscriptionStatus,
 )
 from app.modules.subscriptions.router import (
-    decline_payment, list_payment_requests,
+    decline_payment, list_payment_requests, pay_subscription,
 )
 from tests.conftest import requires_docker
 from tests.factories import (
@@ -177,6 +177,43 @@ async def test_decline_404_when_not_owner(db):
     with pytest.raises(HTTPException) as ei:
         await decline_payment(
             request_id=pr.id, db=db, current_user=intruder,
+        )
+    assert ei.value.status_code == 404
+
+
+# ── /pay ownership + PENDING gate (2026-05-30 follow-up) ──────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_pay_404_when_not_addressed_to_caller(db):
+    """Pre-fix: any user with an allocation at the request's client
+    could pay someone else's payment request. The lookup now joins on
+    requested_from_user_id so only the designated payer matches."""
+    client, _, _, _, _, pr = await _seed(db)
+    intruder_client = await make_client(db)
+    intruder_client.status = ClientStatus.ACTIVE
+    intruder = await make_onboarded_dealer(db, client=intruder_client, name="Intruder")
+
+    with pytest.raises(HTTPException) as ei:
+        await pay_subscription(
+            request_id=pr.id, db=db, current_user=intruder,
+        )
+    assert ei.value.status_code == 404
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_pay_404_when_already_terminal(db):
+    """Replaying /pay on a PAID or DECLINED row 404s instead of
+    silently re-flipping. Same family of replay-safety bug as the
+    decline endpoint."""
+    _, dealer, _, _, _, pr = await _seed(db)
+    pr.status = "PAID"
+    await db.commit()
+
+    with pytest.raises(HTTPException) as ei:
+        await pay_subscription(
+            request_id=pr.id, db=db, current_user=dealer,
         )
     assert ei.value.status_code == 404
 
