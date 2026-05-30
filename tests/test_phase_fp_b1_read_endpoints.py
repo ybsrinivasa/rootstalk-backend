@@ -198,6 +198,13 @@ async def test_promoter_crops_returns_locked_client_district_intersection(db):
     )
     crop_ids = [r["crop_cosh_id"] for r in res]
     assert "crop:paddy" in crop_ids
+    # 2026-05-30 — every row carries the `measure` field so the
+    # Promoter PWA can auto-route to acres-vs-plants without
+    # showing a picker. Value is None for crops whose Cosh
+    # classification isn't seeded; that's fine — the PWA defaults
+    # to AREA_WISE in that case.
+    for row in res:
+        assert "measure" in row
 
 
 @requires_docker

@@ -629,6 +629,7 @@ async def promoter_crops(
     """
     from app.modules.advisory.models import PackageLocation, PackageStatus
     from app.modules.sync.models import CoshCoreItem
+    from app.services.cosh_crop_view import get_measure_for_biological_name
     if client_id is None:
         client = await _resolve_promoter_locked_client(db, current_user)
     else:
@@ -654,7 +655,21 @@ async def promoter_crops(
     for cosh_id, translations in name_rows:
         name = (translations or {}).get("en") if isinstance(translations, dict) else None
         name_by_id[cosh_id] = name
-    return [{"crop_cosh_id": c, "name": name_by_id.get(c)} for c in crop_ids]
+    # 2026-05-30 — surface the per-crop AREA_WISE / PLANT_WISE measure
+    # so the Promoter PWA can render the right input (acres vs plants
+    # + planting year) automatically instead of asking the Promoter
+    # to choose. The measure is intrinsic to the crop in Cosh.
+    measure_by_id: dict[str, str | None] = {}
+    for cid in crop_ids:
+        measure_by_id[cid] = await get_measure_for_biological_name(db, cid)
+    return [
+        {
+            "crop_cosh_id": c,
+            "name": name_by_id.get(c),
+            "measure": measure_by_id.get(c),
+        }
+        for c in crop_ids
+    ]
 
 
 @router.get("/promoter/packages/guided-step")
