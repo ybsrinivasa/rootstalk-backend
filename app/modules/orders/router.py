@@ -208,6 +208,19 @@ async def create_order(
 
     await db.commit()
     await db.refresh(order)
+
+    # Clear any lingering SENT INPUT alerts for this sub if the new
+    # order covers the last outstanding due-today practice. Matches
+    # the rule "alert disappears once the order has been placed"
+    # (2026-05-31). Best-effort — if it errors, the daily-alerts
+    # sweep will catch up on the next run.
+    try:
+        from app.tasks.alerts import clear_input_alerts_if_no_due_remaining
+        await clear_input_alerts_if_no_due_remaining(db, order.subscription_id)
+        await db.commit()
+    except Exception:
+        pass
+
     return {"id": order.id, "status": order.status}
 
 

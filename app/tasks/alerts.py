@@ -24,7 +24,8 @@ from app.modules.advisory.models import Package, Practice, PracticeL0, Timeline
 from app.modules.orders.models import Order, OrderItem, OrderStatus
 from app.modules.platform.models import User
 from app.modules.subscriptions.models import (
-    Alert, AlertRecipient, AlertType, Subscription, SubscriptionStatus,
+    Alert, AlertRecipient, AlertStatus, AlertType,
+    Subscription, SubscriptionStatus,
 )
 from app.services.bl09_alerts import (
     AlertRecipientSpec, ConfiguredRecipient, SubscriptionView, TimelineWindow,
@@ -145,6 +146,59 @@ async def _load_active_order_practice_ids(db, subscription_id: str) -> set[str]:
     return set(rows)
 
 
+async def clear_input_alerts_if_no_due_remaining(
+    db, subscription_id: str, today_date: date | None = None,
+) -> int:
+    """Flip SENT INPUT alerts on this subscription to READ when no
+    INPUT practice is still both due-today AND not-yet-ordered.
+
+    The promoter's `/promoter/me/incoming-alerts` filters status=SENT,
+    so once we flip, the row vanishes from their list immediately.
+    Called from two places:
+      • The daily-alerts task — handles "timeline window closed today"
+        (a practice that was due yesterday no longer matches).
+      • The order-create endpoint — handles "farmer placed the order"
+        (the practice is now suppressed by _SUPPRESSING_ORDER_STATUSES).
+
+    Returns the number of alert rows flipped. Safe to call repeatedly —
+    only acts on SENT rows so a second call is a no-op."""
+    from sqlalchemy import update as sa_update
+    from datetime import timedelta as _td
+    from app.modules.subscriptions.models import Subscription
+
+    if today_date is None:
+        ist_offset = _td(hours=5, minutes=30)
+        today_date = (datetime.now(timezone.utc) + ist_offset).date()
+
+    sub = (await db.execute(
+        select(Subscription).where(Subscription.id == subscription_id)
+    )).scalar_one_or_none()
+    if sub is None or sub.crop_start_date is None:
+        # No start date → INPUT alerts can't have been fired by the
+        # daily task (gated on crop_start_date). Nothing to do.
+        return 0
+
+    timelines = await _load_timeline_windows(db, sub.package_id)
+    crop_start = sub.crop_start_date.date()
+    day_offset = (today_date - crop_start).days
+    due_pids = find_input_practices_due_today(
+        timelines, day_offset, today_date=today_date,
+    )
+    ordered_pids = await _load_active_order_practice_ids(db, subscription_id)
+    still_outstanding = [p for p in due_pids if p not in ordered_pids]
+    if still_outstanding:
+        return 0
+
+    res = await db.execute(
+        sa_update(Alert).where(
+            Alert.subscription_id == subscription_id,
+            Alert.alert_type == AlertType.INPUT,
+            Alert.status == AlertStatus.SENT,
+        ).values(status=AlertStatus.READ)
+    )
+    return res.rowcount or 0
+
+
 async def _send_to_recipient(
     db, sub_id: str, alert_type: AlertType, recipient: AlertRecipientSpec,
     user: User, sms_body: str, fcm_title: str, fcm_body: str,
@@ -263,9 +317,19 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
             cal_only, day_offset=0, today_date=today,
         )
     if not due_practice_ids:
+        # No INPUT practice is due today — the window has closed for
+        # every previously-due practice. Clear any lingering SENT
+        # INPUT alerts on this sub so they vanish from the promoter's
+        # list. Matches the rule "alert disappears when the timeline
+        # is over" (2026-05-31).
+        await clear_input_alerts_if_no_due_remaining(db, sub.id, today)
         return
 
     ordered_pids = await _load_active_order_practice_ids(db, sub.id)
+    # Even when due practices exist, if every one of them has been
+    # ordered, clear stale SENT alerts before deciding whether to
+    # send today.
+    await clear_input_alerts_if_no_due_remaining(db, sub.id, today)
     in_sent_today = await _alert_sent_today(db, sub.id, AlertType.INPUT, today)
     if not should_send_input_alert(
         sub_view, due_practice_ids, ordered_pids, sent_today=in_sent_today,
