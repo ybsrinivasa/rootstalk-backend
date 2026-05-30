@@ -109,26 +109,29 @@ QUERY_OPTION_SLUGS: frozenset[str] = frozenset({"query_types"})
 async def _assert_portal_member(
     db: AsyncSession, user_id: str, client_id: str,
 ) -> None:
-    """V1 minimum membership gate on FarmPundit-management endpoints.
+    """Membership gate on FarmPundit-management endpoints — also
+    used by SR list, queries list, and Pundit roster CRUD.
 
-    Caller must have an active ClientUser row at this client (any
-    role: CA, Subject Expert, Field Manager, etc). Without this, a
-    JWT-authed portal user of one client could call FarmPundit-
-    management endpoints on another client by guessing the URL —
-    the M7 finding from the 2026-05-08 audit.
+    Accepts (either is sufficient):
+      1. ACTIVE ClientUser of this client (any role: CA, SE, FM, etc).
+      2. ACTIVE CMClientAssignment with EDIT rights on this client.
 
-    Pre-fix scope was on V2 backlog (broader `_require_client_role`
-    audit, ~30 advisory mutating endpoints). This is a focused V1
-    patch on the FarmPundit module specifically. Stable error code
-    `client_membership_required` mirrors the CM-side
-    `cm_assignment_required` shape used by the Global → Local pipe.
+    The CM-EDIT path was added 2026-05-30 after a tester reported
+    the QA pages 403'd on the strict-membership gate. Per the
+    documented rule "the CM has all the privileges inside the
+    Client — that of the CA, Subject Experts, and all other roles",
+    the membership check is now CM-EDIT-permissive. The Global →
+    Local pipe still uses its own `cm_assignment_required` shape
+    upstream; this only relaxes the CA-portal-facing endpoints in
+    this module.
+
+    Stable error code `client_membership_required` unchanged.
     """
-    from app.modules.clients.models import ClientUser
+    from app.modules.clients.models import (
+        CMClientAssignment, CMRights, ClientUser,
+    )
     from app.modules.platform.models import StatusEnum
 
-    # Existence check; DB allows multiple roles per (user, client) so
-    # use `.limit(1)` to avoid MultipleResultsFound on legitimate
-    # multi-role users.
     enrolled = (await db.execute(
         select(ClientUser.id).where(
             ClientUser.user_id == user_id,
@@ -136,17 +139,30 @@ async def _assert_portal_member(
             ClientUser.status == StatusEnum.ACTIVE,
         ).limit(1)
     )).scalar_one_or_none()
-    if enrolled is None:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "client_membership_required",
-                "message": (
-                    "Only portal users enrolled at this client may "
-                    "perform this action."
-                ),
-            },
-        )
+    if enrolled is not None:
+        return
+
+    cm_edit = (await db.execute(
+        select(CMClientAssignment.id).where(
+            CMClientAssignment.cm_user_id == user_id,
+            CMClientAssignment.client_id == client_id,
+            CMClientAssignment.status == StatusEnum.ACTIVE,
+            CMClientAssignment.rights == CMRights.EDIT,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if cm_edit is not None:
+        return
+
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "code": "client_membership_required",
+            "message": (
+                "Only portal users enrolled at this client may "
+                "perform this action."
+            ),
+        },
+    )
 
 
 # ── FarmPundit Profile ─────────────────────────────────────────────────────────

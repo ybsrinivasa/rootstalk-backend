@@ -339,3 +339,62 @@ async def test_invite_pundit_rejects_non_member(db):
             db=db, current_user=outsider,
         )
     assert ei.value.status_code == 403
+
+
+# ── 2026-05-30: CM-EDIT relaxation on the membership gate ──────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_cm_edit_passes_membership_gate_without_clientuser(db):
+    """Tester report 2026-05-30: a CM logged into the CA portal via
+    `/cm-login` got `client_membership_required` on the QA list page
+    because the membership gate didn't check the CMClientAssignment
+    path. Per the documented "CM = full CA-equivalent access" rule,
+    a CM with EDIT rights now passes."""
+    from app.modules.clients.models import (
+        CMClientAssignment, CMRights,
+    )
+    from app.modules.farmpundit.router import list_standard_responses
+    from app.modules.platform.models import StatusEnum
+
+    client = await make_client(db)
+    cm = await make_user(db, name="Ram-CM-QA", skip_auto_link=True)
+    db.add(CMClientAssignment(
+        cm_user_id=cm.id, client_id=client.id,
+        rights=CMRights.EDIT, status=StatusEnum.ACTIVE,
+    ))
+    await db.commit()
+
+    # No raise = success.
+    out = await list_standard_responses(
+        client_id=client.id, db=db, current_user=cm,
+    )
+    assert isinstance(out, list)
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_cm_view_assignment_still_refused(db):
+    """A CM whose assignment is VIEW (not EDIT) still gets 403 —
+    the relaxation is strict-EDIT-only. VIEW-only CMs read via the
+    SA Portal client-detail page, not by SSO'ing into CA portal."""
+    from app.modules.clients.models import (
+        CMClientAssignment, CMRights,
+    )
+    from app.modules.farmpundit.router import list_standard_responses
+    from app.modules.platform.models import StatusEnum
+
+    client = await make_client(db)
+    cm = await make_user(db, name="View-Only-CM", skip_auto_link=True)
+    db.add(CMClientAssignment(
+        cm_user_id=cm.id, client_id=client.id,
+        rights=CMRights.VIEW, status=StatusEnum.ACTIVE,
+    ))
+    await db.commit()
+
+    with pytest.raises(HTTPException) as ei:
+        await list_standard_responses(
+            client_id=client.id, db=db, current_user=cm,
+        )
+    assert ei.value.status_code == 403
+    assert ei.value.detail["code"] == "client_membership_required"
