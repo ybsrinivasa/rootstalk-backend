@@ -1595,23 +1595,29 @@ async def initiate_assignment(
             })
         effective_client_id = request.client_id
 
-    # ── Validate P-V answers: exactly one branch. ─────────────────
+    # ── Validate optional measure inputs. ─────────────────────────
+    # User direction 2026-05-30: the Promoter no longer enters the
+    # farmer's farm area / plant count at assign time. Both are the
+    # farmer's data — they set + confirm them on the Crop Dashboard
+    # post-accept via `/farmer/subscriptions/{sid}/farm-area` (or
+    # `/plant-count`). The PWA Promoter flow drops the measure stage
+    # entirely. The backend still ACCEPTS the fields if supplied
+    # (legacy / direct API callers) but no longer requires them.
+    # XOR + partial-plant-wise validation stays — if someone DOES
+    # supply, they have to supply consistently.
     area_given = request.farm_area_acres is not None
-    plant_given = (
-        request.number_of_plants is not None
-        or request.planting_year is not None
-    )
-    if not (area_given ^ plant_given):
+    plant_n_given = request.number_of_plants is not None
+    plant_y_given = request.planting_year is not None
+    plant_given = plant_n_given or plant_y_given
+    if area_given and plant_given:
         raise HTTPException(status_code=422, detail={
-            "code": "measure_required",
+            "code": "measure_conflict",
             "message": (
-                "Supply exactly one of {farm_area_acres} OR "
-                "{number_of_plants + planting_year}."
+                "Supply at most one of {farm_area_acres} OR "
+                "{number_of_plants + planting_year}, not both."
             ),
         })
-    if plant_given and (
-        request.number_of_plants is None or request.planting_year is None
-    ):
+    if plant_given and not (plant_n_given and plant_y_given):
         raise HTTPException(status_code=422, detail={
             "code": "plant_wise_incomplete",
             "message": "Plant-wise assignments need both number_of_plants and planting_year.",
@@ -1653,10 +1659,13 @@ async def initiate_assignment(
         subscription_type=SubscriptionType.ASSIGNED,
         status=SubscriptionStatus.WAITLISTED,
     )
+    # Only persist + stamp _confirmed_at when the caller actually
+    # provided the measure. Neither branch is the new default — the
+    # farmer fills them in on the Crop Dashboard after accept.
     if area_given:
         sub.farm_area_acres = request.farm_area_acres
         sub.farm_area_confirmed_at = now
-    else:
+    elif plant_n_given and plant_y_given:
         sub.number_of_plants = request.number_of_plants
         sub.planting_year = request.planting_year
         sub.plant_count_confirmed_at = now

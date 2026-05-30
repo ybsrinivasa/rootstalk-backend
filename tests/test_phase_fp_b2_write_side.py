@@ -142,25 +142,43 @@ async def test_initiate_persists_area_wise_answers(db):
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_initiate_rejects_when_no_measure_given(db):
-    _, fac, farmer, pkg = await _fp_with_kitty(db)
+async def test_initiate_succeeds_without_measure(db):
+    """2026-05-30 — the Promoter no longer enters acres/plants at
+    assign time. The farmer sets + confirms them post-accept via
+    /farmer/subscriptions/{sid}/farm-area or /plant-count. So an
+    initiate call with NEITHER measure now succeeds; the sub is
+    created with farm_area_acres / number_of_plants / planting_year
+    all NULL and the _confirmed_at columns unset."""
+    client, fac, farmer, pkg = await _fp_with_kitty(db)
 
-    with pytest.raises(HTTPException) as ei:
-        await initiate_assignment(
-            request=PromoterAssignRequest(
-                farmer_phone=farmer.phone,
-                package_id=pkg.id,
-                promoter_type="FACILITATOR",
-            ),
-            db=db, current_user=fac,
-        )
-    assert ei.value.status_code == 422
-    assert ei.value.detail["code"] == "measure_required"
+    res = await initiate_assignment(
+        request=PromoterAssignRequest(
+            farmer_phone=farmer.phone,
+            package_id=pkg.id,
+            promoter_type="FACILITATOR",
+        ),
+        db=db, current_user=fac,
+    )
+    sub = (await db.execute(
+        select(Subscription).where(Subscription.id == res["subscription_id"])
+    )).scalar_one()
+    assert sub.subscription_type == SubscriptionType.ASSIGNED
+    assert sub.status == SubscriptionStatus.WAITLISTED
+    assert sub.client_id == client.id
+    assert sub.farm_area_acres is None
+    assert sub.farm_area_confirmed_at is None
+    assert sub.number_of_plants is None
+    assert sub.planting_year is None
+    assert sub.plant_count_confirmed_at is None
 
 
 @requires_docker
 @pytest.mark.asyncio
 async def test_initiate_rejects_when_both_measures_given(db):
+    """Supplying both area + plant data is still inconsistent —
+    error code changes from `measure_required` to `measure_conflict`
+    to reflect the rewrite. Real callers shouldn't hit this; the
+    PWA flow doesn't send either field at all post-fix."""
     _, fac, farmer, pkg = await _fp_with_kitty(db)
 
     with pytest.raises(HTTPException) as ei:
@@ -176,7 +194,7 @@ async def test_initiate_rejects_when_both_measures_given(db):
             db=db, current_user=fac,
         )
     assert ei.value.status_code == 422
-    assert ei.value.detail["code"] == "measure_required"
+    assert ei.value.detail["code"] == "measure_conflict"
 
 
 @requires_docker
