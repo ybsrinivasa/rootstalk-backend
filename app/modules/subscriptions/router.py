@@ -2228,8 +2228,11 @@ async def delegate_payment(
     db.add(pr)
     await db.commit()
 
-    # Notify the delegate via FCM so they see the request before the
-    # next time they happen to open the Payments tab.
+    # Look up the delegate. Needed for the FCM body AND for the
+    # success-screen copy on the farmer's PWA — surface the name and
+    # phone so the "Payment request sent" screen can be specific
+    # ("Sent to Ravi · +91 99004 00099") instead of a generic green
+    # tick.
     from app.modules.platform.models import User as PlatformUser
     from app.services.fcm_service import send_fcm
     delegate = (await db.execute(
@@ -2250,7 +2253,12 @@ async def delegate_payment(
         except Exception:
             pass
 
-    return {"detail": "Payment request sent", "expires_at": expires_at}
+    return {
+        "detail": "Payment request sent",
+        "expires_at": expires_at,
+        "requested_from_name": delegate.name if delegate else None,
+        "requested_from_phone": delegate.phone if delegate else None,
+    }
 
 
 # ── V1.1 share-payment-link (2026-05-29) ─────────────────────────────────────
