@@ -23,7 +23,10 @@ from app.services.bl12_query_state import (
     validate_transition as validate_query_transition,
 )
 from app.modules.subscriptions.models import Subscription, SubscriptionStatus
-from app.modules.advisory.router import _assert_can_edit_client_advisory
+from app.modules.advisory.router import (
+    _assert_can_edit_client_advisory,
+    _assert_can_publish_client_advisory,
+)
 
 router = APIRouter(tags=["FarmPundit"])
 
@@ -1440,7 +1443,7 @@ async def publish_standard_response(
 ):
     """DRAFT → ACTIVE. One-time gate; CA-side renders a confirmation
     card before calling this. Refuses if not DRAFT."""
-    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    await _assert_can_publish_client_advisory(db, current_user.id, client_id)
     sr = await _load_sr_for_transition(db, sr_id, client_id)
     if sr.status != "DRAFT":
         raise _sr_state_error(sr, "DRAFT", "sr_not_draft", "publish")

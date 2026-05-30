@@ -210,6 +210,40 @@ async def test_l2_elements_endpoint_unclassified_crop_omits_extras(db):
 
 @requires_docker
 @pytest.mark.asyncio
+async def test_l2_elements_endpoint_area_or_plant_hint_appends_extras(db):
+    """Bug fix 2026-05-30: PG / CHA-SP recommendations aren't bound
+    to a crop, so callers can't supply crop_cosh_id. They pass
+    `area_or_plant=PLANT_WISE` directly. The endpoint honours that
+    hint and appends the plant-wise extras."""
+    user = await make_user(db, name="x")
+    out = await get_l2_element_spec(
+        l2_type="CHEMICAL_PESTICIDES",
+        area_or_plant="PLANT_WISE",
+        db=db, current_user=user,
+    )
+    assert out["crop_measure"] == "PLANT_WISE"
+    names = {e["name"] for e in out["elements"]}
+    assert "VOLUME_PER_PLANT" in names
+    assert "VOLUME_PER_PLANT_UNIT" in names
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_l2_elements_endpoint_area_or_plant_AREA_WISE_omits(db):
+    """AREA_WISE hint never gets the extras (matches the AREA_WISE
+    crop case)."""
+    user = await make_user(db, name="x")
+    out = await get_l2_element_spec(
+        l2_type="CHEMICAL_PESTICIDES",
+        area_or_plant="AREA_WISE",
+        db=db, current_user=user,
+    )
+    assert out["crop_measure"] == "AREA_WISE"
+    assert "VOLUME_PER_PLANT" not in {e["name"] for e in out["elements"]}
+
+
+@requires_docker
+@pytest.mark.asyncio
 async def test_l2_elements_endpoint_404_for_unknown(db):
     user = await make_user(db, name="x")
     with pytest.raises(HTTPException) as exc:

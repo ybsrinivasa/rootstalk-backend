@@ -130,23 +130,23 @@ async def _assert_can_edit_client_advisory(
     """Authorisation gate for CA-side advisory writes — covers all
     four pipes: CCA, CHA-PG, CHA-SP, QA.
 
-    Batch J (2026-05-18) tightens from "any ACTIVE ClientUser" to
-    "ACTIVE SUBJECT_EXPERT only". Per user 2026-05-17: "Only the
-    Subject Experts have the right to manage CCA, PG, SP, and QA.
-    No other role can do this, not even the CA."
-
-    Accepts:
+    Accepts (either is sufficient):
       1. ACTIVE ClientUser of this client with role SUBJECT_EXPERT.
       2. ACTIVE CMClientAssignment with EDIT rights — per the
          documented Ram-direct-edit pattern the CM may edit a
          client's Local advisory content directly without going
          through pull.
 
-    Refused (with distinct codes for clearer UX):
-      - Non-SE ClientUser (CA / FIELD_MANAGER / REPORT_USER) →
-        403 `subject_expert_only`. They retain View access via
-        unchanged GET endpoints.
-      - Not a member + not a CM-EDIT assignee → 403 `ca_edit_forbidden`.
+    Refusal:
+      - Not an SE on this client AND not a CM-EDIT assignee →
+        403 `subject_expert_only` (when the user is a ClientUser of
+        this client but not SE), else `ca_edit_forbidden`.
+
+    Trap fix (2026-05-30): the CM-EDIT path is checked BEFORE the
+    non-SE ClientUser raise. Pre-fix a user who happened to be both
+    a non-SE ClientUser (e.g. CA / FIELD_MANAGER) AND a CM-EDIT
+    assignee was refused at the early `subject_expert_only` block,
+    contradicting the documented "SE OR CM-EDIT" spec.
 
     Cross-tenant access is already refused at the request boundary
     by `get_current_user` (cross_client_forbidden); this gate runs
@@ -164,23 +164,8 @@ async def _assert_can_edit_client_advisory(
             ClientUser.status == StatusEnum.ACTIVE,
         ).limit(1)
     )).scalar_one_or_none()
-    if cu is not None:
-        if cu.role == ClientUserRole.SUBJECT_EXPERT:
-            return
-        # Member but wrong role — surface a specific error so the UI
-        # can render a helpful "ask your Subject Expert to do this"
-        # message instead of a generic 403.
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "subject_expert_only",
-                "message": (
-                    "Only Subject Experts can edit advisory content. "
-                    "Your role can view but not modify CCA / PG / SP / QA."
-                ),
-                "your_role": cu.role.value,
-            },
-        )
+    if cu is not None and cu.role == ClientUserRole.SUBJECT_EXPERT:
+        return
 
     cm = (await db.execute(
         select(CMClientAssignment.id).where(
@@ -193,6 +178,22 @@ async def _assert_can_edit_client_advisory(
     if cm is not None:
         return
 
+    if cu is not None:
+        # Member of this client but neither SE nor CM-EDIT. Surface
+        # a role-specific error so the UI can render a helpful "ask
+        # your Subject Expert to do this" instead of a generic 403.
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "subject_expert_only",
+                "message": (
+                    "Only Subject Experts can edit advisory content. "
+                    "Your role can view but not modify CCA / PG / SP / QA."
+                ),
+                "your_role": cu.role.value,
+            },
+        )
+
     raise HTTPException(
         status_code=403,
         detail={
@@ -201,6 +202,53 @@ async def _assert_can_edit_client_advisory(
                 "Editing advisory content requires either an active "
                 "Subject Expert role on this client, or an active Content "
                 "Manager assignment with EDIT rights."
+            ),
+        },
+    )
+
+
+async def _assert_can_publish_client_advisory(
+    db: AsyncSession, user_id: str, client_id: str,
+) -> None:
+    """Tighter publish-only gate (2026-05-30). Accepts ACTIVE
+    SUBJECT_EXPERT ClientUser of this client; refuses everyone
+    else including CM-EDIT.
+
+    User rule: the CM can edit a client's advisory content (so that
+    Ram-style direct edits remain possible) but cannot push content
+    LIVE to farmers. The publish step belongs to the company's own
+    Subject Expert. The 403 carries the stable code
+    `publish_subject_expert_only` so the CA portal can render a
+    "Ask your Subject Expert to publish" UI hint.
+
+    Applied to all four CA-side publish endpoints (Package / PG /
+    SP / SR) by way of swapping out `_assert_can_edit_client_advisory`
+    at those four call sites.
+    """
+    from app.modules.clients.models import (
+        ClientUser, ClientUserRole,
+    )
+    from app.modules.platform.models import StatusEnum
+
+    is_se = (await db.execute(
+        select(ClientUser.id).where(
+            ClientUser.user_id == user_id,
+            ClientUser.client_id == client_id,
+            ClientUser.status == StatusEnum.ACTIVE,
+            ClientUser.role == ClientUserRole.SUBJECT_EXPERT,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if is_se is not None:
+        return
+
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "code": "publish_subject_expert_only",
+            "message": (
+                "Publishing a recommendation requires the Subject "
+                "Expert role on this company. Content Managers can "
+                "edit content but cannot publish."
             ),
         },
     )
@@ -1406,7 +1454,7 @@ async def publish_package(
     Pre-fix the unconditional `version + 1` produced v=2 on first
     publish for a default-version-1 row.
     """
-    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    await _assert_can_publish_client_advisory(db, current_user.id, client_id)
     pkg = await _get_package(db, package_id, client_id)
 
     # CCA Step 1 membership gate (Batch 1C): publish requires the
@@ -5350,14 +5398,24 @@ async def get_practice_taxonomy_endpoint(
 async def get_l2_element_spec(
     l2_type: str,
     crop_cosh_id: Optional[str] = None,
+    area_or_plant: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Return element spec for an L2. When `crop_cosh_id` is
-    supplied, the plant-wise extras (VOLUME_PER_PLANT + UNIT)
-    are appended only if the crop is classified PLANT_WISE in
-    Cosh. AREA_WISE / unclassified crops, or callers that omit
-    the param, never see those fields.
+    """Return element spec for an L2.
+
+    Plant-wise extras (VOLUME_PER_PLANT + UNIT) are appended when
+    EITHER:
+      - `crop_cosh_id` is supplied and that crop is PLANT_WISE in
+        Cosh (CCA-style call — practice attached to a specific crop),
+      - or `area_or_plant=PLANT_WISE` is passed explicitly. PG and
+        CHA-SP recommendations aren't bound to a specific crop but
+        each row carries `area_or_plant`; callers pass that field
+        through verbatim so plant-wise PG practices get the same
+        extras as CCA PoPs on plant-wise crops.
+
+    AREA_WISE rows / unclassified crops / callers that pass neither
+    signal never see the plant-wise extras (2026-05-30).
     """
     from app.services.cosh_crop_view import get_measure_for_biological_name
     from app.services.practice_taxonomy import get_l2_meta, list_l2_elements
@@ -5365,6 +5423,10 @@ async def get_l2_element_spec(
     measure = None
     if crop_cosh_id:
         measure = await get_measure_for_biological_name(db, crop_cosh_id)
+    # Explicit area_or_plant hint wins when supplied — used by PG
+    # and CHA-SP authoring where the practice isn't crop-bound.
+    if area_or_plant in ("PLANT_WISE", "AREA_WISE"):
+        measure = area_or_plant
 
     elements = list_l2_elements(l2_type, crop_measure=measure)
     if elements is None:
@@ -8032,7 +8094,7 @@ async def publish_client_pg(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    await _assert_can_publish_client_advisory(db, current_user.id, client_id)
     pg = (await db.execute(
         select(PGRecommendation).where(PGRecommendation.id == pg_id, PGRecommendation.client_id == client_id)
     )).scalar_one_or_none()
@@ -9630,7 +9692,7 @@ async def publish_sp(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    await _assert_can_publish_client_advisory(db, current_user.id, client_id)
     sp = (await db.execute(
         select(SPRecommendation).where(SPRecommendation.id == sp_id, SPRecommendation.client_id == client_id)
     )).scalar_one_or_none()
