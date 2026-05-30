@@ -90,8 +90,33 @@ async def get_pool_balance(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    from app.services.promoter_pool import is_enterprise_licensed
+    from app.modules.subscriptions.models import EnterpriseLicense
+
     balance = await _get_pool_balance(db, client_id)
-    return {"client_id": client_id, "available_units": balance}
+    el_active = await is_enterprise_licensed(db, client_id)
+    enterprise_to_date = None
+    if el_active:
+        lic = (await db.execute(
+            select(EnterpriseLicense).where(
+                EnterpriseLicense.client_id == client_id,
+                EnterpriseLicense.status == "ACTIVE",
+            )
+        )).scalar_one_or_none()
+        if lic is not None:
+            enterprise_to_date = lic.to_date
+    return {
+        "client_id": client_id,
+        "available_units": balance,
+        # `balance` alias kept for the historical Client Portal shape;
+        # the page reads `r.data.balance`. Both keys now mean the same
+        # raw on-pool number (purchased - consumed), unaffected by the
+        # EL flag. The frontend should branch on `unlimited` for what
+        # to display.
+        "balance": balance,
+        "unlimited": el_active,
+        "enterprise_to_date": enterprise_to_date,
+    }
 
 
 @router.get("/client/{client_id}/subscription-pool/can-assign")
@@ -173,7 +198,10 @@ async def list_promoter_allocations(
     """CA-side — list every promoter who has an allocation row for
     this company along with their current balance and audit totals."""
     from app.modules.subscriptions.promoter_allocation_models import PromoterAllocation
-    from app.services.promoter_pool import get_company_unallocated_balance
+    from app.modules.subscriptions.models import EnterpriseLicense
+    from app.services.promoter_pool import (
+        get_company_unallocated_balance, is_enterprise_licensed,
+    )
 
     rows = (await db.execute(
         select(PromoterAllocation, User)
@@ -183,10 +211,23 @@ async def list_promoter_allocations(
     )).all()
 
     company_unallocated = await get_company_unallocated_balance(db, client_id)
+    el_active = await is_enterprise_licensed(db, client_id)
+    enterprise_to_date = None
+    if el_active:
+        lic = (await db.execute(
+            select(EnterpriseLicense).where(
+                EnterpriseLicense.client_id == client_id,
+                EnterpriseLicense.status == "ACTIVE",
+            )
+        )).scalar_one_or_none()
+        if lic is not None:
+            enterprise_to_date = lic.to_date
 
     return {
         "client_id": client_id,
         "company_unallocated_balance": company_unallocated,
+        "unlimited": el_active,
+        "enterprise_to_date": enterprise_to_date,
         "promoters": [
             {
                 "promoter_user_id": user.id,

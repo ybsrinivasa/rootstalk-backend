@@ -37,8 +37,8 @@ from app.modules.subscriptions.promoter_allocation_models import (
     PromoterAllocation,
 )
 from app.modules.subscriptions.router import (
-    PromoterAssignRequest, initiate_assignment, my_kitty,
-    my_promoter_allocations,
+    PromoterAssignRequest, get_pool_balance, initiate_assignment,
+    list_promoter_allocations, my_kitty, my_promoter_allocations,
 )
 from app.modules.platform.models import User
 from app.services.promoter_pool import (
@@ -455,6 +455,61 @@ async def test_sweep_fires_reminder_on_each_trigger_day(db, monkeypatch, days_ou
     assert counts["closures"] == 0
     assert counts["reminders"] == 1
     assert any(f"{days_out} days" in s for s in sent)
+
+
+# ── E. CA-portal endpoint EL surfacing ────────────────────────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_ca_pool_balance_endpoint_surfaces_unlimited(db):
+    """The CA portal's Subscription Pool page reads this endpoint;
+    when EL active it should see `unlimited` + `enterprise_to_date`
+    so the page can switch from a number to the 'Unlimited · closes X'
+    treatment."""
+    client, lic = await _make_active_el_client(db, days_remaining=21)
+    user = await make_user(db, name="CA")
+    await db.commit()
+
+    out = await get_pool_balance(
+        client_id=client.id, db=db, current_user=user,
+    )
+    assert out["unlimited"] is True
+    assert out["enterprise_to_date"] == lic.to_date
+    # `balance` alias for the historical PoolBalance shape.
+    assert out["balance"] == out["available_units"]
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_ca_promoter_allocations_endpoint_surfaces_unlimited(db):
+    """The CA portal's Promoter Allocations section reads this; when
+    EL active the same flags are surfaced so the page can hide
+    allocate/reclaim affordances (they're no-ops during EL)."""
+    client, lic = await _make_active_el_client(db, days_remaining=10)
+    user = await make_user(db, name="CA")
+    await db.commit()
+
+    out = await list_promoter_allocations(
+        client_id=client.id, db=db, current_user=user,
+    )
+    assert out["unlimited"] is True
+    assert out["enterprise_to_date"] == lic.to_date
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_ca_pool_balance_no_el_returns_flags_false(db):
+    """Negative case — endpoint always returns the EL flags so the
+    frontend can rely on their presence."""
+    client = await make_client(db)
+    user = await make_user(db, name="CA")
+    await db.commit()
+
+    out = await get_pool_balance(
+        client_id=client.id, db=db, current_user=user,
+    )
+    assert out["unlimited"] is False
+    assert out["enterprise_to_date"] is None
 
 
 @requires_docker
