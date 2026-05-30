@@ -44,6 +44,30 @@ def _require_sa(current_user: User):
         raise HTTPException(status_code=403, detail="Super Admin access required")
 
 
+@router.post("/admin/tasks/run-daily-alerts")
+async def admin_run_daily_alerts(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SA-only manual trigger for the daily-alerts task.
+
+    Useful for testing the alerts pipeline without waiting for the
+    06:00 UTC beat schedule — and as a workaround on testing where
+    no celery worker / beat is running. Calls
+    `_run_daily_alerts_with_session` directly (no celery hop), so
+    it returns synchronously with the number of ACTIVE subscriptions
+    processed.
+
+    Idempotent per `(subscription, alert_type, day)` — the inner
+    loop checks `_alert_sent_today` before sending. Hitting this
+    twice on the same day is safe.
+    """
+    _require_sa(current_user)
+    from app.tasks.alerts import _run_daily_alerts_with_session
+    n = await _run_daily_alerts_with_session(db)
+    return {"subscriptions_processed": n}
+
+
 async def _require_sa_or_cm_assigned(
     db: AsyncSession, current_user: User, client_id: str,
 ) -> None:
