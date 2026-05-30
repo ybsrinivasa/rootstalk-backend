@@ -107,7 +107,13 @@ async def test_initiate_persists_plant_wise_answers(db):
         select(Subscription).where(Subscription.id == res["subscription_id"])
     )).scalar_one()
     assert sub.subscription_type == SubscriptionType.ASSIGNED
-    assert sub.status == SubscriptionStatus.WAITLISTED
+    # Option A (2026-05-30) — Promoter-assigned subs go straight to
+    # ACTIVE since the kitty unit was already consumed at initiate
+    # time. The "awaiting farmer approval" state lives on the
+    # PromoterAssignment row, not Subscription.status.
+    assert sub.status == SubscriptionStatus.ACTIVE
+    assert sub.subscription_date is not None
+    assert sub.reference_number is not None
     assert sub.client_id == client.id   # server-derived
     assert sub.number_of_plants == 120
     assert sub.planting_year == 2024
@@ -163,7 +169,7 @@ async def test_initiate_succeeds_without_measure(db):
         select(Subscription).where(Subscription.id == res["subscription_id"])
     )).scalar_one()
     assert sub.subscription_type == SubscriptionType.ASSIGNED
-    assert sub.status == SubscriptionStatus.WAITLISTED
+    assert sub.status == SubscriptionStatus.ACTIVE   # Option A
     assert sub.client_id == client.id
     assert sub.farm_area_acres is None
     assert sub.farm_area_confirmed_at is None

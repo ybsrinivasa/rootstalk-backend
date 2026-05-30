@@ -1651,13 +1651,21 @@ async def initiate_assignment(
         raise HTTPException(status_code=422, detail=str(exc))
 
     now = datetime.now(timezone.utc)
+    # 2026-05-30 — Promoter-assigned subs go straight to ACTIVE on
+    # initiate. The kitty check above + `consume_for_assignment`
+    # mean the unit is already paid for, so a separate WAITLISTED
+    # state was misleading (it conflated "awaiting payment" with
+    # "awaiting farmer's nod"). Per user direction: drop WAITLISTED
+    # from the Promoter path; the "awaiting farmer approval" state
+    # lives only on the PromoterAssignment row.
     sub = Subscription(
         farmer_user_id=farmer.id,
         client_id=effective_client_id,
         package_id=request.package_id,
         promoter_user_id=current_user.id,
         subscription_type=SubscriptionType.ASSIGNED,
-        status=SubscriptionStatus.WAITLISTED,
+        status=SubscriptionStatus.ACTIVE,
+        subscription_date=now,
     )
     # Only persist + stamp _confirmed_at when the caller actually
     # provided the measure. Neither branch is the new default — the
@@ -1671,6 +1679,7 @@ async def initiate_assignment(
         sub.plant_count_confirmed_at = now
     db.add(sub)
     await db.flush()
+    sub.reference_number = await _generate_reference_for_sub(db, sub.client_id)
 
     assignment = PromoterAssignment(
         subscription_id=sub.id,
@@ -2094,62 +2103,75 @@ async def respond_to_assignment(
 ):
     """Farmer approves or rejects Promoter assignment.
 
-    BL-11 audit (2026-05-06): added transition guard so a stale or
-    duplicated request can't re-write status on a sub that's already
-    moved past WAITLISTED. Pre-fix, hitting respond again on an ACTIVE
-    sub would silently reset subscription_date and re-issue the
-    reference_number, and hitting it on a CANCELLED sub could
-    un-cancel a rejection.
+    Option A (2026-05-30): the Sub is created ACTIVE at initiate
+    time — kitty unit already paid for, no WAITLISTED intermediate.
+    Approve here is a no-op on the Sub (it's already ACTIVE);
+    the work is on the PromoterAssignment row, which flips from
+    PENDING_FARMER_APPROVAL → ACTIVE and unblocks advisory delivery
+    (the daily-alerts task filters out subs whose Assignment is
+    still PENDING). Reject transitions the Sub ACTIVE → CANCELLED
+    (BL11_FARMER allows this) and refunds the unit to the promoter.
 
-    F-P B2 (2026-05-29): on reject, auto-refund the unit to the
-    promoter's kitty via `refund_to_promoter` (was previously left
-    consumed, CA had to reallocate manually). The BL-11 transition
-    guard above prevents re-processing a row already past WAITLISTED,
-    so the refund is naturally idempotent — second-call short-circuits.
+    Idempotency is anchored on assignment.status — second-call on
+    an already-resolved assignment 404s, so neither
+    `farmer_responded_at` nor the refund fires twice.
     """
     sub = await _get_subscription(db, subscription_id, current_user.id)
     approved = data.get("approved", False)
-    target = SubscriptionStatus.ACTIVE if approved else SubscriptionStatus.CANCELLED
-    res = validate_sub_transition(sub.status, target.value, BL11_FARMER)
-    if not res.allowed:
-        _raise_sub_transition(res)
 
     assignment_result = await db.execute(
         select(PromoterAssignment).where(PromoterAssignment.subscription_id == subscription_id)
     )
     assignment = assignment_result.scalar_one_or_none()
+    if assignment is None:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+    if assignment.status != AssignmentStatus.PENDING_FARMER_APPROVAL:
+        # Already responded — second call is a no-op refusal.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "assignment_already_resolved",
+                "message": (
+                    f"This assignment is already "
+                    f"{assignment.status.value if hasattr(assignment.status, 'value') else assignment.status}."
+                ),
+            },
+        )
 
     now = datetime.now(timezone.utc)
-    if assignment:
-        assignment.status = AssignmentStatus.ACTIVE if approved else AssignmentStatus.REJECTED_BY_FARMER
-        assignment.farmer_responded_at = now
+    assignment.status = AssignmentStatus.ACTIVE if approved else AssignmentStatus.REJECTED_BY_FARMER
+    assignment.farmer_responded_at = now
 
     if approved:
-        # Phase C: the unit was already consumed from the promoter's
-        # allocation at initiate time, so we just flip status here.
-        # No pool check, no consumption.
-        sub.status = SubscriptionStatus.ACTIVE
-        sub.subscription_date = now
-        sub.reference_number = await _generate_reference_for_sub(db, sub.client_id)
+        # No Subscription transition — it's already ACTIVE since
+        # initiate. Just unblocking advisory delivery via the
+        # assignment flip above. subscription_date + reference_number
+        # were stamped at initiate time, so nothing to do here.
+        pass
     else:
+        # Reject — transition Sub ACTIVE → CANCELLED via BL11. The
+        # transition table allows this for the FARMER role.
+        res = validate_sub_transition(
+            sub.status, SubscriptionStatus.CANCELLED.value, BL11_FARMER,
+        )
+        if not res.allowed:
+            _raise_sub_transition(res)
         sub.status = SubscriptionStatus.CANCELLED
-        # F-P B2 — auto-refund the unit back to the promoter's kitty.
-        # `assignment` is guaranteed non-None on the ASSIGNED-sub
-        # rejection path (initiate creates both in the same txn). The
-        # try/except keeps us defensive against legacy ASSIGNED rows
-        # that somehow lack a PromoterAssignment companion.
-        if assignment is not None:
-            from app.services.promoter_pool import refund_to_promoter
-            try:
-                await refund_to_promoter(
-                    db,
-                    client_id=sub.client_id,
-                    promoter_user_id=assignment.promoter_user_id,
-                )
-            except ValueError:
-                # No allocation row to refund into — leave consumed_total
-                # and skip. CA can investigate via the audit totals.
-                pass
+        # F-P B2 — refund the unit back to the promoter's kitty.
+        # The assignment-already-resolved gate above means this can
+        # only run once per assignment, so refunds are naturally
+        # idempotent.
+        from app.services.promoter_pool import refund_to_promoter
+        try:
+            await refund_to_promoter(
+                db,
+                client_id=sub.client_id,
+                promoter_user_id=assignment.promoter_user_id,
+            )
+        except ValueError:
+            # No allocation row to refund into — leave consumed_total
+            # and skip. CA can investigate via the audit totals.
+            pass
 
     await db.commit()
     return {"status": sub.status, "reference_number": sub.reference_number}
@@ -3566,6 +3588,22 @@ async def my_subscriptions(
         for cid in primary_rows:
             has_primary_by_client[cid] = True
 
+    # 2026-05-30 — pending_approval flag for ASSIGNED subs whose
+    # PromoterAssignment is still PENDING_FARMER_APPROVAL. Surfaced
+    # so the PWA home suppresses these from the ACTIVE-tiles grid
+    # (the same row is already rendered as a "Pending approval"
+    # card from /farmer/assignments/pending). One batched query.
+    pending_approval_sub_ids: set[str] = set()
+    sub_ids_assigned = [s.id for s in subs if s.subscription_type == SubscriptionType.ASSIGNED]
+    if sub_ids_assigned:
+        rows = (await db.execute(
+            select(PromoterAssignment.subscription_id).where(
+                PromoterAssignment.subscription_id.in_(sub_ids_assigned),
+                PromoterAssignment.status == AssignmentStatus.PENDING_FARMER_APPROVAL,
+            )
+        )).scalars().all()
+        pending_approval_sub_ids = set(rows)
+
     for s in subs:
         pkg_name, crop_cosh_id = pkg_by_id.get(s.package_id, (None, None))
         client = client_info_by_id.get(s.client_id, {})
@@ -3575,6 +3613,9 @@ async def my_subscriptions(
             "status": s.status, "crop_start_date": s.crop_start_date,
             "crop_start_date_first_set_at": s.crop_start_date_first_set_at,
             "reference_number": s.reference_number, "subscription_type": s.subscription_type,
+            # True when this is an ASSIGNED sub still awaiting the
+            # farmer's accept/decline on the PromoterAssignment row.
+            "pending_approval": s.id in pending_approval_sub_ids,
             # Area-wise context
             "farm_area_acres": float(s.farm_area_acres) if s.farm_area_acres is not None else None,
             "area_unit": s.area_unit,

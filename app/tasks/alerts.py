@@ -281,11 +281,29 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
 async def _run_daily_alerts_with_session(db, today: date | None = None) -> int:
     """Inner loop: takes a session, processes every ACTIVE subscription,
     commits. Split out so integration tests can inject the testcontainer
-    session and assert on Alert rows it commits."""
+    session and assert on Alert rows it commits.
+
+    2026-05-30 — Promoter-assigned subs are ACTIVE from initiate (no
+    WAITLISTED hop), so we filter out any whose PromoterAssignment
+    is still PENDING_FARMER_APPROVAL. Without this gate, daily
+    advisory would start firing the moment the Promoter assigns —
+    before the farmer has seen the approval card. The gate
+    naturally lifts as soon as the farmer accepts (PromoterAssignment
+    flips to ACTIVE).
+    """
+    from app.modules.subscriptions.models import (
+        AssignmentStatus, PromoterAssignment,
+    )
     today = today or datetime.now(timezone.utc).date()
-    subs = (await db.execute(
-        select(Subscription).where(Subscription.status == SubscriptionStatus.ACTIVE)
+    pending_assignment_sub_ids = (await db.execute(
+        select(PromoterAssignment.subscription_id).where(
+            PromoterAssignment.status == AssignmentStatus.PENDING_FARMER_APPROVAL,
+        )
     )).scalars().all()
+    q = select(Subscription).where(Subscription.status == SubscriptionStatus.ACTIVE)
+    if pending_assignment_sub_ids:
+        q = q.where(Subscription.id.notin_(pending_assignment_sub_ids))
+    subs = (await db.execute(q)).scalars().all()
     for sub in subs:
         await _process_subscription(db, sub, today)
     await db.commit()

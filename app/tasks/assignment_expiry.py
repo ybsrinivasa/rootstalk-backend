@@ -54,7 +54,8 @@ async def _expire_assignments_with_session(db, now=None) -> int:
 
     Per row:
       - Assignment → EXPIRED, farmer_responded_at stays NULL
-      - Subscription (linked, WAITLISTED) → CANCELLED
+      - Subscription (linked, ACTIVE since 2026-05-30 Option A) →
+        CANCELLED
       - refund_to_promoter (kitty +1, refunded_total +1)
     The status filter is the idempotency gate — a second sweep over
     an already-EXPIRED row leaves it untouched."""
@@ -99,9 +100,13 @@ async def _expire_assignments_with_session(db, now=None) -> int:
             )
             continue
 
-        # Defensive: refund only if the Sub is still WAITLISTED.
-        # If the Sub already moved (rare race), don't double-process.
-        if sub.status != SubscriptionStatus.WAITLISTED:
+        # Defensive: only refund + cancel if the Sub is still ACTIVE
+        # and ASSIGNED. Option A (2026-05-30) created these subs
+        # ACTIVE from the start; the assignment.status filter above
+        # guarantees the farmer hasn't accepted yet (which would
+        # have flipped assignment to ACTIVE). If the Sub already
+        # moved (rare race, e.g. CA-side cancel), don't double-process.
+        if sub.status != SubscriptionStatus.ACTIVE:
             logger.info(
                 "assignment_expiry: sub %s already %s; flipping "
                 "assignment to EXPIRED without refund",

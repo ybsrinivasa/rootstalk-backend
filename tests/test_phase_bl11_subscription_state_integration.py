@@ -163,11 +163,34 @@ async def test_verify_payment_blocks_replay_on_already_active_sub(db, monkeypatc
 @pytest.mark.asyncio
 async def test_respond_to_assignment_blocks_revival_of_cancelled_sub(db):
     """A stale or duplicated respond request must not un-cancel a
-    rejection by re-approving. CANCELLED is terminal."""
+    rejection by re-approving. CANCELLED is terminal.
+
+    Option A semantics (2026-05-30): the idempotency gate moved
+    from `Subscription.status` to `PromoterAssignment.status`. In
+    the real flow, rejecting flips both — the assignment to
+    REJECTED_BY_FARMER and the sub to CANCELLED in the same commit
+    — so the artificial "CANCELLED sub + PENDING assignment"
+    state used pre-fix can't occur. This test mirrors the real
+    post-reject state and asserts the second respond call is
+    refused via the new assignment_already_resolved code."""
+    from app.modules.subscriptions.models import (
+        AssignmentStatus, PromoterAssignment,
+    )
+    from sqlalchemy import select
     sub, _, farmer, _ = await _seed_waitlisted_assigned_sub_with_payment_request(
         db, allocation_units=1,
     )
-    sub.status = SubscriptionStatus.CANCELLED  # farmer rejected previously
+    sub.status = SubscriptionStatus.CANCELLED
+    # Add the assignment row (seed helper doesn't include one) and
+    # flip it to REJECTED_BY_FARMER, mirroring the real post-reject
+    # state.
+    pa = PromoterAssignment(
+        subscription_id=sub.id,
+        promoter_user_id=sub.promoter_user_id,
+        promoter_type="DEALER",
+        status=AssignmentStatus.REJECTED_BY_FARMER,
+    )
+    db.add(pa)
     await db.commit()
 
     with pytest.raises(HTTPException) as exc:
@@ -175,20 +198,36 @@ async def test_respond_to_assignment_blocks_revival_of_cancelled_sub(db):
             subscription_id=sub.id, data={"approved": True},
             db=db, current_user=farmer,
         )
-    assert exc.value.status_code == 400
-    assert exc.value.detail["error_code"] == "ILLEGAL_TRANSITION"
+    assert exc.value.status_code == 422
+    assert exc.value.detail["code"] == "assignment_already_resolved"
 
 
 @requires_docker
 @pytest.mark.asyncio
 async def test_respond_to_assignment_blocks_re_approving_an_active_sub(db):
-    """A duplicate approval on an already-ACTIVE sub used to silently
-    reset subscription_date. Now blocked with NO_OP_TRANSITION."""
+    """A duplicate approval on an already-resolved assignment is
+    refused.
+
+    Option A: hitting respond twice is caught by the assignment
+    status gate — the second call sees assignment in ACTIVE
+    (post-accept) state and refuses with assignment_already_resolved.
+    Pre-fix this test exercised an artificial WAITLISTED → ACTIVE
+    NO_OP transition that's no longer reachable."""
+    from app.modules.subscriptions.models import (
+        AssignmentStatus, PromoterAssignment,
+    )
     sub, _, farmer, _ = await _seed_waitlisted_assigned_sub_with_payment_request(
         db, allocation_units=1,
     )
     sub.status = SubscriptionStatus.ACTIVE
     sub.subscription_date = datetime.now(timezone.utc) - timedelta(days=1)
+    pa = PromoterAssignment(
+        subscription_id=sub.id,
+        promoter_user_id=sub.promoter_user_id,
+        promoter_type="DEALER",
+        status=AssignmentStatus.ACTIVE,
+    )
+    db.add(pa)
     await db.commit()
 
     with pytest.raises(HTTPException) as exc:
@@ -196,8 +235,8 @@ async def test_respond_to_assignment_blocks_re_approving_an_active_sub(db):
             subscription_id=sub.id, data={"approved": True},
             db=db, current_user=farmer,
         )
-    assert exc.value.status_code == 400
-    assert exc.value.detail["error_code"] == "NO_OP_TRANSITION"
+    assert exc.value.status_code == 422
+    assert exc.value.detail["code"] == "assignment_already_resolved"
 
 
 # ── unsubscribe respects SELF-vs-ASSIGNED ────────────────────────────────────
