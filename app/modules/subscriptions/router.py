@@ -2106,6 +2106,20 @@ async def get_assignment_details(
         select(User).where(User.id == assignment.promoter_user_id)
     )).scalar_one_or_none()
 
+    # Resolve the crop's English display name from Cosh so the PWA's
+    # review screen renders "Coconut" instead of a raw UUID. Falls
+    # back to None if the crop isn't in `cosh_core_items` yet.
+    crop_name: str | None = None
+    if package and package.crop_cosh_id:
+        from app.modules.sync.models import CoshCoreItem
+        row = (await db.execute(
+            select(CoshCoreItem.translations).where(
+                CoshCoreItem.cosh_id == package.crop_cosh_id,
+            )
+        )).scalar_one_or_none()
+        if isinstance(row, dict):
+            crop_name = row.get("en") or row.get("hi") or None
+
     return {
         "subscription_id": sub.id,
         "company": {
@@ -2116,6 +2130,8 @@ async def get_assignment_details(
             "tagline": client.tagline,
         } if client else None,
         "crop_cosh_id": package.crop_cosh_id if package else None,
+        "crop_name": crop_name,
+        "package_name": package.name if package else None,
         "package_description": package.description if package else None,
         "duration_days": package.duration_days if package else None,
         "package_type": package.package_type.value if package and package.package_type else None,
