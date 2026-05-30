@@ -1349,6 +1349,25 @@ async def set_start_date(
         from datetime import datetime as _dt, timezone as _tz
         sub.crop_start_date = new_start_dt
         sub.crop_start_date_first_set_at = _dt.now(_tz.utc)
+        # Flip every SENT START_DATE alert for this sub to READ —
+        # the farmer has done what those alerts were asking for, so
+        # they should vanish from any recipient's incoming list
+        # (Promoter / Facilitator / farmer-added LOCAL_PERSON).
+        # Without this, the alerts stay SENT forever and the
+        # Promoter keeps seeing them on /promoter/me/incoming-alerts.
+        from app.modules.subscriptions.models import (
+            Alert, AlertStatus, AlertType,
+        )
+        from sqlalchemy import update as sa_update
+        await db.execute(
+            sa_update(Alert)
+            .where(
+                Alert.subscription_id == sub.id,
+                Alert.alert_type == AlertType.START_DATE,
+                Alert.status == AlertStatus.SENT,
+            )
+            .values(status=AlertStatus.READ)
+        )
         await db.commit()
         return {"detail": "Start date set", "crop_start_date": sub.crop_start_date}
 
