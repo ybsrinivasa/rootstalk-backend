@@ -337,6 +337,39 @@ async def _resolve_promoter_locked_client(db: AsyncSession, user: User) -> Clien
     return rows[0][1]
 
 
+async def _resolve_promoter_at_client(
+    db: AsyncSession, user: User, client_id: str,
+) -> Client:
+    """Dealer parity helper (2026-05-30). Verify the user has an ACTIVE
+    ClientPromoter binding (any role) at the supplied client_id and
+    the client itself is ACTIVE; return the Client.
+
+    Dealer-Promoters are multi-client by design — they can carry kitties
+    at several companies simultaneously, so the F-P §11.2 exclusivity
+    check doesn't apply. F-Ps trying to use a client_id other than
+    their locked binding naturally fail this check (no ACTIVE
+    ClientPromoter at the wrong client), so the same endpoint can
+    safely serve both roles when client_id is supplied.
+    """
+    from app.modules.clients.models import ClientPromoter, ClientStatus
+    row = (await db.execute(
+        select(ClientPromoter, Client)
+        .join(Client, Client.id == ClientPromoter.client_id)
+        .where(
+            ClientPromoter.user_id == user.id,
+            ClientPromoter.client_id == client_id,
+            ClientPromoter.status == "ACTIVE",
+            Client.status == ClientStatus.ACTIVE,
+        )
+    )).first()
+    if row is None:
+        raise HTTPException(status_code=403, detail={
+            "code": "not_a_promoter_at_client",
+            "message": "You don't have an active Promoter binding at this company.",
+        })
+    return row[1]
+
+
 @router.get("/promoter/me/kitty")
 async def my_kitty(
     db: AsyncSession = Depends(get_db),
@@ -455,19 +488,25 @@ async def promoter_farmer_locations(
 @router.get("/promoter/crops")
 async def promoter_crops(
     district_cosh_id: str,
+    client_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Crops served by the F-P's locked Client in the given District.
+    """Crops served by the promoter's Client in the given District.
 
-    Mirrors `/farmer/discover/crops` with two deltas: client is
-    server-derived (single locked Client per F-P), and no
-    `payment_model` filter — F-P assignment works for both FARMER_PAYS
-    and COMPANY_PAYS clients (only farmer-side discovery hides
-    COMPANY_PAYS)."""
+    F-P (no `client_id`): server-derived from the locked binding.
+    Dealer (with `client_id`): caller chooses among the companies they
+    have an ACTIVE ClientPromoter binding at. Either way, no
+    `payment_model` filter — promoter assignment works for both
+    FARMER_PAYS and COMPANY_PAYS clients (only farmer-side discovery
+    hides COMPANY_PAYS).
+    """
     from app.modules.advisory.models import PackageLocation, PackageStatus
     from app.modules.sync.models import CoshCoreItem
-    client = await _resolve_promoter_locked_client(db, current_user)
+    if client_id is None:
+        client = await _resolve_promoter_locked_client(db, current_user)
+    else:
+        client = await _resolve_promoter_at_client(db, current_user, client_id)
     result = await db.execute(
         select(Package.crop_cosh_id)
         .join(PackageLocation, PackageLocation.package_id == Package.id)
@@ -497,13 +536,19 @@ async def promoter_guided_step(
     crop_cosh_id: str,
     district_cosh_id: str,
     answers: str = "",
+    client_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """F-P-side P-V resolver. Delegates to the same BL-01 elimination
-    engine as `/farmer/packages/guided-step` with `client_id` derived
-    from the F-P's locked Client."""
-    client = await _resolve_promoter_locked_client(db, current_user)
+    """Promoter-side P-V resolver. Delegates to the same BL-01
+    elimination engine as `/farmer/packages/guided-step`. F-P (no
+    `client_id`): derived from the locked binding. Dealer (with
+    `client_id`): caller supplies and the ACTIVE-binding gate
+    enforces they're a promoter at that company."""
+    if client_id is None:
+        client = await _resolve_promoter_locked_client(db, current_user)
+    else:
+        client = await _resolve_promoter_at_client(db, current_user, client_id)
     return await guided_elimination_step(
         crop_cosh_id=crop_cosh_id,
         district_cosh_id=district_cosh_id,
