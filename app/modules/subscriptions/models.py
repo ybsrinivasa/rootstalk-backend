@@ -150,6 +150,11 @@ class SubscriptionPool(Base):
     purchased_by_user_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True,
     )
+    # EL module (2026-05-30) — invoice / PO reference for SA-grant
+    # rows (clients paid us via invoice). Razorpay top-ups leave
+    # this NULL; the SA pastes the invoice number / PO reference
+    # here when adding pool units manually.
+    note: Mapped[str] = mapped_column(Text, nullable=True)
 
 
 class AlertRecipient(Base):
@@ -279,3 +284,43 @@ class TriggeredCHAEntry(Base):
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
     problem_name: Mapped[str] = mapped_column(String(500), nullable=True)    # display name; CHA: problem; QA: question text
     parent_pg_cosh_id: Mapped[str] = mapped_column(String(200), nullable=True)  # resolved parent PG (CHA only)
+
+
+class EnterpriseLicense(Base):
+    """EL module (2026-05-30) — SA-granted flat-fee bulk arrangement
+    for clients that prefer enterprise licensing over per-farmer
+    subscription purchase (govt depts, NGOs, large co-ops).
+
+    Lifecycle:
+      ACTIVE   — today's date is within [from_date, to_date]. Bypasses
+                 the per-promoter kitty machinery entirely: F-Ps and
+                 Dealers can assign without consuming an allocation
+                 unit, the company's pool reads as "unlimited", and
+                 the CA's allocate-to-promoter step is suppressed.
+      EXPIRED  — daily Celery sweep flipped on the to_date; the
+                 linked Client's status flipped to INACTIVE in the
+                 same transaction. New subscriptions blocked; existing
+                 farmer subscriptions continue to their natural close.
+      REVOKED  — SA killed the licence early (renewal didn't come
+                 through, etc.). Same INACTIVE flip as EXPIRED.
+
+    Pool units purchased by Razorpay or SA-grant before/during the
+    licence window carry through after expiry — pool consumption is
+    paused, not cleared, while the licence is active.
+    """
+    __tablename__ = "enterprise_licenses"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    client_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("clients.id", ondelete="CASCADE"), nullable=False,
+    )
+    from_date: Mapped[date_type] = mapped_column(Date, nullable=False)
+    to_date: Mapped[date_type] = mapped_column(Date, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="ACTIVE")
+    granted_by_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True,
+    )
+    note: Mapped[str] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow,
+    )

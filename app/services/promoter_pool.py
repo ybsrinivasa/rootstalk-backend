@@ -32,11 +32,42 @@ don't drift the running totals.
 """
 from __future__ import annotations
 
+from datetime import date as _date
+
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.subscriptions.models import SubscriptionPool
+from app.modules.subscriptions.models import EnterpriseLicense, SubscriptionPool
 from app.modules.subscriptions.promoter_allocation_models import PromoterAllocation
+
+
+# EL module (2026-05-30) — sentinel returned in place of a numeric
+# balance whenever an active Enterprise Licence covers the client.
+# Big enough to render comfortably as "Unlimited" in chips and not
+# get truncated, small enough to stay an Int (≤ Postgres INT4 max).
+ENTERPRISE_UNLIMITED_BALANCE = 999_999
+
+
+async def is_enterprise_licensed(
+    db: AsyncSession, client_id: str, today: _date | None = None,
+) -> bool:
+    """True iff `client_id` has an ACTIVE Enterprise Licence whose
+    [from_date, to_date] window covers today.
+
+    Single source of truth used by every kitty / consume / allocate
+    decision so the bypass is consistent across endpoints. Cheap —
+    one indexed point read on (client_id, status).
+    """
+    today = today or _date.today()
+    lic = (await db.execute(
+        select(EnterpriseLicense).where(
+            EnterpriseLicense.client_id == client_id,
+            EnterpriseLicense.status == "ACTIVE",
+            EnterpriseLicense.from_date <= today,
+            EnterpriseLicense.to_date >= today,
+        ).limit(1)
+    )).scalar_one_or_none()
+    return lic is not None
 
 
 # ── Read accessors ──────────────────────────────────────────────────────────
@@ -44,7 +75,15 @@ from app.modules.subscriptions.promoter_allocation_models import PromoterAllocat
 async def get_promoter_balance(
     db: AsyncSession, client_id: str, promoter_user_id: str,
 ) -> int:
-    """Return the promoter's currently-available units (0 if no row exists)."""
+    """Return the promoter's currently-available units (0 if no row exists).
+
+    EL bypass (2026-05-30): when the Client has an active Enterprise
+    Licence, returns `ENTERPRISE_UNLIMITED_BALANCE`. The PWA renders
+    this as "Unlimited" via the same chip; the assign flow's >0 gate
+    naturally lets every initiate through.
+    """
+    if await is_enterprise_licensed(db, client_id):
+        return ENTERPRISE_UNLIMITED_BALANCE
     row = (await db.execute(
         select(PromoterAllocation).where(
             PromoterAllocation.client_id == client_id,
@@ -59,7 +98,13 @@ async def get_company_unallocated_balance(
 ) -> int:
     """Return the units the CA can still spend on allocations.
 
-    Formula:
+    EL bypass (2026-05-30): when the Client has an active Enterprise
+    Licence, returns `ENTERPRISE_UNLIMITED_BALANCE` — the per-promoter
+    allocation step is operationally suppressed for licensed clients,
+    but the helper still answers cleanly so any UI that surfaces "what
+    can I spend" reads as "Unlimited".
+
+    Formula (regular path):
         unallocated = total_purchased
                     − sum(promoter_allocations.units_balance)
                     − sum(promoter_allocations.consumed_total)
@@ -81,6 +126,8 @@ async def get_company_unallocated_balance(
         and once in consumed_total (where it stays as a historical
         record).
     """
+    if await is_enterprise_licensed(db, client_id):
+        return ENTERPRISE_UNLIMITED_BALANCE
     total_purchased = (await db.execute(
         select(func.coalesce(func.sum(SubscriptionPool.units_purchased), 0))
         .where(SubscriptionPool.client_id == client_id)
@@ -194,14 +241,25 @@ async def reclaim_from_promoter(
 
 async def consume_for_assignment(
     db: AsyncSession, *, client_id: str, promoter_user_id: str,
-) -> PromoterAllocation:
+):
     """Promoter action — draw down 1 unit when an assignment is created.
 
-    Raises ValueError if the promoter has no balance (the route should
-    have already short-circuited via `get_promoter_balance` before
-    reaching this point, but the guard here makes the invariant
-    explicit and prevents silent over-consumption).
+    EL bypass (2026-05-30): when the Client has an active Enterprise
+    Licence, this is a no-op. No PromoterAllocation row is touched;
+    no balance check; returns None. The Subscription / Assignment
+    rows still get created upstream — only the kitty side-effect is
+    suppressed (per user spec "avoid assigning subscriptions to
+    promoters for EL").
+
+    Otherwise raises ValueError if the promoter has no balance (the
+    route should have already short-circuited via
+    `get_promoter_balance` before reaching this point, but the guard
+    here makes the invariant explicit and prevents silent
+    over-consumption).
     """
+    if await is_enterprise_licensed(db, client_id):
+        return None
+
     row = (await db.execute(
         select(PromoterAllocation)
         .where(
@@ -224,7 +282,7 @@ async def consume_for_assignment(
 
 async def refund_to_promoter(
     db: AsyncSession, *, client_id: str, promoter_user_id: str,
-) -> PromoterAllocation:
+):
     """F-P B2 (2026-05-29) — credit 1 unit back to the promoter's kitty.
 
     Called when a PromoterAssignment terminates without producing an
@@ -238,6 +296,12 @@ async def refund_to_promoter(
                        - consumed_total
                        + refunded_total
 
+    EL bypass (2026-05-30): when the Client has an active Enterprise
+    Licence, this is a no-op. No PromoterAllocation row is touched
+    (none was decremented at consume time). Pre-existing rows from
+    pre-EL allocations stay untouched. Same idempotency story as
+    consume — the upstream transition guard prevents double-calls.
+
     Idempotency is the caller's responsibility: refund should only be
     invoked exactly once per terminating transition. The BL-11
     transition guard on the farmer-respond path already prevents
@@ -245,6 +309,9 @@ async def refund_to_promoter(
     (auto-expire sweep, self-cancel endpoint) must replicate that
     check before calling.
     """
+    if await is_enterprise_licensed(db, client_id):
+        return None
+
     row = (await db.execute(
         select(PromoterAllocation)
         .where(

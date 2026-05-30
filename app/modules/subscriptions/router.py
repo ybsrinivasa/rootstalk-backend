@@ -275,28 +275,92 @@ async def my_promoter_allocations(
     current_user: User = Depends(get_current_user),
 ):
     """Promoter-side — current_user sees their own allocation rows
-    across all companies that have allocated to them."""
-    from app.modules.subscriptions.promoter_allocation_models import PromoterAllocation
-    from app.modules.clients.models import Client
+    across all companies that have allocated to them.
 
-    rows = (await db.execute(
+    EL surfacing (2026-05-30): also includes clients where the
+    current user has an ACTIVE Dealer/Facilitator binding AND the
+    client has an active Enterprise Licence — even if no
+    PromoterAllocation row exists. Such rows return
+    `unlimited: true`, `enterprise_to_date: <date>`, and a sentinel
+    units_balance (`ENTERPRISE_UNLIMITED_BALANCE`) so the existing
+    Dealer picker's `units_balance > 0` filter naturally includes
+    them.
+    """
+    from app.modules.subscriptions.promoter_allocation_models import PromoterAllocation
+    from app.modules.subscriptions.models import EnterpriseLicense
+    from app.modules.clients.models import Client, ClientPromoter
+    from app.services.promoter_pool import ENTERPRISE_UNLIMITED_BALANCE
+    from datetime import date as _date
+
+    today = _date.today()
+
+    alloc_rows = (await db.execute(
         select(PromoterAllocation, Client)
         .join(Client, Client.id == PromoterAllocation.client_id)
         .where(PromoterAllocation.promoter_user_id == current_user.id)
         .order_by(Client.display_name)
     )).all()
 
-    return [
-        {
+    # Also pull EL clients the user is bound to but has no allocation
+    # row for. We union by client_id to avoid double-counting.
+    seen_client_ids = {client.id for _, client in alloc_rows}
+    el_rows = (await db.execute(
+        select(EnterpriseLicense, Client)
+        .join(Client, Client.id == EnterpriseLicense.client_id)
+        .join(ClientPromoter, ClientPromoter.client_id == Client.id)
+        .where(
+            EnterpriseLicense.status == "ACTIVE",
+            EnterpriseLicense.from_date <= today,
+            EnterpriseLicense.to_date >= today,
+            ClientPromoter.user_id == current_user.id,
+            ClientPromoter.status == "ACTIVE",
+        )
+        .order_by(Client.display_name)
+    )).all()
+    el_by_client = {client.id: lic for lic, client in el_rows}
+
+    out = []
+    for alloc, client in alloc_rows:
+        lic = el_by_client.get(client.id)
+        if lic is not None:
+            out.append({
+                "client_id": client.id,
+                "client_name": client.display_name or client.full_name,
+                "units_balance": ENTERPRISE_UNLIMITED_BALANCE,
+                "allocated_total": int(alloc.allocated_total),
+                "reclaimed_total": int(alloc.reclaimed_total),
+                "consumed_total": int(alloc.consumed_total),
+                "unlimited": True,
+                "enterprise_to_date": lic.to_date,
+            })
+        else:
+            out.append({
+                "client_id": client.id,
+                "client_name": client.display_name or client.full_name,
+                "units_balance": int(alloc.units_balance),
+                "allocated_total": int(alloc.allocated_total),
+                "reclaimed_total": int(alloc.reclaimed_total),
+                "consumed_total": int(alloc.consumed_total),
+                "unlimited": False,
+                "enterprise_to_date": None,
+            })
+
+    for lic, client in el_rows:
+        if client.id in seen_client_ids:
+            continue   # already merged above
+        out.append({
             "client_id": client.id,
             "client_name": client.display_name or client.full_name,
-            "units_balance": int(alloc.units_balance),
-            "allocated_total": int(alloc.allocated_total),
-            "reclaimed_total": int(alloc.reclaimed_total),
-            "consumed_total": int(alloc.consumed_total),
-        }
-        for alloc, client in rows
-    ]
+            "units_balance": ENTERPRISE_UNLIMITED_BALANCE,
+            "allocated_total": 0,
+            "reclaimed_total": 0,
+            "consumed_total": 0,
+            "unlimited": True,
+            "enterprise_to_date": lic.to_date,
+        })
+
+    out.sort(key=lambda r: (r["client_name"] or "").lower())
+    return out
 
 
 # ── F-P Assign-Package-to-Farmer: B1 read-side ────────────────────────────────
@@ -378,15 +442,36 @@ async def my_kitty(
     """F-P assignment-flow gate. Returns the F-P's locked Client +
     available `units_balance`. The PWA calls this on tap-into-flow and
     after every assignment; balance=0 is the signal to show the
-    'no subscriptions available' empty state and block phone entry."""
-    from app.services.promoter_pool import get_promoter_balance
+    'no subscriptions available' empty state and block phone entry.
+
+    EL flag (2026-05-30): when the locked Client has an active
+    Enterprise Licence, `unlimited` is True and `enterprise_to_date`
+    carries the closure date so the PWA can render "Unlimited ·
+    closes 15 Jan" instead of a number."""
+    from app.services.promoter_pool import (
+        ENTERPRISE_UNLIMITED_BALANCE, get_promoter_balance, is_enterprise_licensed,
+    )
+    from app.modules.subscriptions.models import EnterpriseLicense
     client = await _resolve_promoter_locked_client(db, current_user)
     balance = await get_promoter_balance(db, client.id, current_user.id)
+    unlimited = balance == ENTERPRISE_UNLIMITED_BALANCE and await is_enterprise_licensed(db, client.id)
+    enterprise_to_date = None
+    if unlimited:
+        lic = (await db.execute(
+            select(EnterpriseLicense).where(
+                EnterpriseLicense.client_id == client.id,
+                EnterpriseLicense.status == "ACTIVE",
+            )
+        )).scalar_one_or_none()
+        if lic:
+            enterprise_to_date = lic.to_date
     return {
         "client_id": client.id,
         "client_short_name": client.short_name,
         "client_display_name": client.display_name or client.full_name,
         "units_balance": balance,
+        "unlimited": unlimited,
+        "enterprise_to_date": enterprise_to_date,
     }
 
 

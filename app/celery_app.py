@@ -16,6 +16,7 @@ celery_app = Celery(
         "app.tasks.payment_request_expiry",
         "app.tasks.share_link_reconciler",
         "app.tasks.assignment_expiry",
+        "app.tasks.enterprise_license_lifecycle",
     ],
 )
 
@@ -69,6 +70,15 @@ celery_app.conf.beat_schedule = {
     "assignment-expiry-check": {
         "task": "app.tasks.assignment_expiry.expire_assignments",
         "schedule": crontab(minute=30),
+    },
+    # EL module (2026-05-30): daily sweep that fires expiry reminders
+    # (30/23/16/9/2 days out) and flips ACTIVE → EXPIRED + Client
+    # status → INACTIVE on the closure day. Scheduled at 01:30 UTC
+    # (07:00 IST) so the closure email lands at the start of the
+    # working day. See app/tasks/enterprise_license_lifecycle.py.
+    "enterprise-license-lifecycle": {
+        "task": "app.tasks.enterprise_license_lifecycle.sweep",
+        "schedule": crontab(hour=1, minute=30),
     },
 }
 

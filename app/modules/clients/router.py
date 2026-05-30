@@ -1,5 +1,7 @@
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from pydantic import BaseModel
+from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -2445,4 +2447,320 @@ async def cm_login_as(
         "access_token": token,
         "client_short_name": client.short_name,
         "ca_portal_url": _base_url().rstrip("/"),
+    }
+
+
+# ── EL Subscription Management Module (2026-05-30) ────────────────────────────
+# SA-managed surface for clients that don't pay via Razorpay top-ups —
+# either invoice-paid pool grants or flat-fee Enterprise Licences.
+
+class SubscriptionGrantRequest(BaseModel):
+    units: int                       # may go up to 6 digits
+    note: Optional[str] = None       # invoice / PO reference
+
+
+class EnterpriseLicenseRequest(BaseModel):
+    from_date: date
+    to_date: date
+    note: Optional[str] = None
+
+
+def _validate_units(units: int) -> None:
+    if not isinstance(units, int) or isinstance(units, bool):
+        raise HTTPException(status_code=422, detail={
+            "code": "units_invalid",
+            "message": "units must be a positive integer.",
+        })
+    if units <= 0:
+        raise HTTPException(status_code=422, detail={
+            "code": "units_invalid",
+            "message": "units must be greater than 0.",
+        })
+    if units > 999_999:
+        raise HTTPException(status_code=422, detail={
+            "code": "units_too_large",
+            "message": "units must be at most 999999.",
+        })
+
+
+@router.post("/admin/clients/{client_id}/subscription-grants", status_code=201)
+async def sa_grant_subscriptions(
+    client_id: str,
+    request: SubscriptionGrantRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SA grants invoice-paid pool units to a client.
+
+    Writes a SubscriptionPool row with Razorpay columns NULL,
+    `purchased_by_user_id` = SA, and the request's `note` as the
+    invoice / PO reference. Adds to the company's unallocated balance
+    immediately — CA can allocate to promoter kitties right away.
+    """
+    from app.modules.subscriptions.models import SubscriptionPool
+
+    _require_sa(current_user)
+    _validate_units(request.units)
+    client = (await db.execute(
+        select(Client).where(Client.id == client_id)
+    )).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    pool = SubscriptionPool(
+        client_id=client_id,
+        units_purchased=request.units,
+        units_consumed=0,
+        purchased_by_user_id=current_user.id,
+        note=(request.note or "").strip() or None,
+    )
+    db.add(pool)
+    await db.commit()
+    await db.refresh(pool)
+    return {
+        "id": pool.id,
+        "client_id": client_id,
+        "units": pool.units_purchased,
+        "note": pool.note,
+        "purchased_at": pool.purchased_at,
+        "purchased_by_user_id": pool.purchased_by_user_id,
+    }
+
+
+@router.post("/admin/clients/{client_id}/enterprise-licenses", status_code=201)
+async def sa_grant_enterprise_license(
+    client_id: str,
+    request: EnterpriseLicenseRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SA grants an Enterprise Licence to a client.
+
+    Refuses (409) if another ACTIVE licence already exists for the
+    same client — there's only ever one active licence per client at
+    a time. Old EXPIRED / REVOKED rows are retained for the audit
+    trail.
+
+    Date validation:
+      - to_date strictly after from_date
+      - to_date not in the past (so the daily sweep doesn't auto-
+        expire on the same day it's granted)
+    """
+    from app.modules.subscriptions.models import EnterpriseLicense
+
+    _require_sa(current_user)
+    client = (await db.execute(
+        select(Client).where(Client.id == client_id)
+    )).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status_code=404, detail="Client not found")
+    if request.to_date <= request.from_date:
+        raise HTTPException(status_code=422, detail={
+            "code": "to_date_must_follow_from_date",
+            "message": "to_date must be strictly after from_date.",
+        })
+    if request.to_date < date.today():
+        raise HTTPException(status_code=422, detail={
+            "code": "to_date_in_past",
+            "message": "to_date cannot be in the past.",
+        })
+
+    existing = (await db.execute(
+        select(EnterpriseLicense).where(
+            EnterpriseLicense.client_id == client_id,
+            EnterpriseLicense.status == "ACTIVE",
+        )
+    )).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(status_code=409, detail={
+            "code": "active_license_exists",
+            "message": (
+                "This client already has an active Enterprise Licence. "
+                "Revoke or wait for it to expire before granting another."
+            ),
+        })
+
+    lic = EnterpriseLicense(
+        client_id=client_id,
+        from_date=request.from_date,
+        to_date=request.to_date,
+        status="ACTIVE",
+        granted_by_user_id=current_user.id,
+        note=(request.note or "").strip() or None,
+    )
+    db.add(lic)
+    await db.commit()
+    await db.refresh(lic)
+    return {
+        "id": lic.id,
+        "client_id": client_id,
+        "from_date": lic.from_date,
+        "to_date": lic.to_date,
+        "status": lic.status,
+        "note": lic.note,
+        "granted_by_user_id": lic.granted_by_user_id,
+        "created_at": lic.created_at,
+    }
+
+
+@router.put("/admin/clients/{client_id}/enterprise-licenses/{license_id}/revoke")
+async def sa_revoke_enterprise_license(
+    client_id: str,
+    license_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SA kills an active Enterprise Licence early (e.g. renewal didn't
+    come through). Same client-INACTIVE flip as natural expiry.
+
+    Existing farmer subscriptions assigned during the active window
+    continue to their natural close — same rule as natural expiry.
+    Only new subscriptions and portal logins are blocked.
+    """
+    from app.modules.subscriptions.models import EnterpriseLicense
+
+    _require_sa(current_user)
+    lic = (await db.execute(
+        select(EnterpriseLicense).where(
+            EnterpriseLicense.id == license_id,
+            EnterpriseLicense.client_id == client_id,
+            EnterpriseLicense.status == "ACTIVE",
+        )
+    )).scalar_one_or_none()
+    if lic is None:
+        raise HTTPException(status_code=404, detail="Active licence not found")
+
+    lic.status = "REVOKED"
+    client = (await db.execute(
+        select(Client).where(Client.id == client_id)
+    )).scalar_one_or_none()
+    if client is not None:
+        client.status = ClientStatus.INACTIVE
+    await db.commit()
+    await db.refresh(lic)
+    return {
+        "id": lic.id,
+        "status": lic.status,
+        "client_status": (
+            client.status.value if client and hasattr(client.status, "value")
+            else str(client.status) if client else None
+        ),
+    }
+
+
+@router.get("/admin/clients/{client_id}/subscription-mgmt")
+async def sa_subscription_mgmt_view(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SA-side detail view: totals + active licence + grants history.
+
+    Powers the SA Portal's "Subscriptions" section on a client detail
+    page. Returns:
+      - `pool_totals`: aggregates from SubscriptionPool (purchased,
+        consumed, unallocated_balance).
+      - `active_license`: the current ACTIVE EnterpriseLicense if
+        any, plus `days_remaining`.
+      - `grants_history`: every SubscriptionPool row, newest first,
+        with source ("RAZORPAY" or "INVOICE"/"SA_GRANT") tagged.
+      - `licenses_history`: every EnterpriseLicense row, newest first.
+    """
+    from app.modules.subscriptions.models import (
+        EnterpriseLicense, SubscriptionPool,
+    )
+    from app.services.promoter_pool import (
+        get_company_unallocated_balance, is_enterprise_licensed,
+    )
+    from sqlalchemy import func as sa_func
+
+    _require_sa(current_user)
+    client = (await db.execute(
+        select(Client).where(Client.id == client_id)
+    )).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    purchased_total = (await db.execute(
+        select(sa_func.coalesce(sa_func.sum(SubscriptionPool.units_purchased), 0))
+        .where(SubscriptionPool.client_id == client_id)
+    )).scalar() or 0
+    consumed_total = (await db.execute(
+        select(sa_func.coalesce(sa_func.sum(SubscriptionPool.units_consumed), 0))
+        .where(SubscriptionPool.client_id == client_id)
+    )).scalar() or 0
+    unallocated = await get_company_unallocated_balance(db, client_id)
+    el_active = await is_enterprise_licensed(db, client_id)
+
+    active_license = None
+    today = date.today()
+    if el_active:
+        lic_row = (await db.execute(
+            select(EnterpriseLicense).where(
+                EnterpriseLicense.client_id == client_id,
+                EnterpriseLicense.status == "ACTIVE",
+            )
+        )).scalar_one_or_none()
+        if lic_row:
+            active_license = {
+                "id": lic_row.id,
+                "from_date": lic_row.from_date,
+                "to_date": lic_row.to_date,
+                "days_remaining": (lic_row.to_date - today).days,
+                "note": lic_row.note,
+                "granted_by_user_id": lic_row.granted_by_user_id,
+                "created_at": lic_row.created_at,
+            }
+
+    grants_rows = (await db.execute(
+        select(SubscriptionPool)
+        .where(SubscriptionPool.client_id == client_id)
+        .order_by(SubscriptionPool.purchased_at.desc())
+    )).scalars().all()
+    grants_history = [
+        {
+            "id": g.id,
+            "units": int(g.units_purchased),
+            "consumed": int(g.units_consumed),
+            "purchased_at": g.purchased_at,
+            "source": "RAZORPAY" if g.razorpay_payment_id else "SA_GRANT",
+            "note": g.note,
+            "amount_paid_paise": g.amount_paid_paise,
+        }
+        for g in grants_rows
+    ]
+
+    lic_rows = (await db.execute(
+        select(EnterpriseLicense)
+        .where(EnterpriseLicense.client_id == client_id)
+        .order_by(EnterpriseLicense.created_at.desc())
+    )).scalars().all()
+    licenses_history = [
+        {
+            "id": l.id,
+            "from_date": l.from_date,
+            "to_date": l.to_date,
+            "status": l.status,
+            "note": l.note,
+            "granted_by_user_id": l.granted_by_user_id,
+            "created_at": l.created_at,
+        }
+        for l in lic_rows
+    ]
+
+    return {
+        "client_id": client_id,
+        "client_status": (
+            client.status.value if hasattr(client.status, "value")
+            else str(client.status)
+        ),
+        "pool_totals": {
+            "purchased_total": int(purchased_total),
+            "consumed_total": int(consumed_total),
+            "unallocated_balance": int(unallocated),
+            "unlimited": el_active,
+        },
+        "active_license": active_license,
+        "grants_history": grants_history,
+        "licenses_history": licenses_history,
     }
