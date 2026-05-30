@@ -2290,13 +2290,65 @@ async def list_payment_requests(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    result = await db.execute(
-        select(SubscriptionPaymentRequest).where(
+    """List pending payment requests for this Dealer.
+
+    Decorated 2026-05-30 to match `/facilitator/payment-requests`:
+    farmer name + phone (tap-to-call), package + crop name, exact
+    amount, and `hours_remaining` (computed from `expires_at`) so the
+    UI can show a countdown. Only PENDING rows; PAID / DECLINED /
+    CANCELLED rows are historical and drop off the active list.
+
+    Active-dealer gate: must be onboarded as a Dealer at ≥1 client.
+    """
+    from app.modules.advisory.models import Package
+    from app.modules.platform.models import User as PlatformUser
+    from app.modules.sync.models import CoshCoreItem
+    from app.modules.orders.router import _assert_active_dealer
+
+    await _assert_active_dealer(db, current_user.id)
+    rows = (await db.execute(
+        select(SubscriptionPaymentRequest, Subscription, Package, PlatformUser)
+        .join(Subscription, Subscription.id == SubscriptionPaymentRequest.subscription_id)
+        .join(Package, Package.id == Subscription.package_id)
+        .join(PlatformUser, PlatformUser.id == SubscriptionPaymentRequest.farmer_user_id)
+        .where(
             SubscriptionPaymentRequest.requested_from_user_id == current_user.id,
             SubscriptionPaymentRequest.status == "PENDING",
         )
-    )
-    return result.scalars().all()
+        .order_by(SubscriptionPaymentRequest.created_at.desc())
+    )).all()
+
+    crop_ids = {pkg.crop_cosh_id for _, _, pkg, _ in rows if pkg.crop_cosh_id}
+    crop_name_by_id: dict[str, str] = {}
+    if crop_ids:
+        for r in (await db.execute(
+            select(CoshCoreItem).where(CoshCoreItem.cosh_id.in_(crop_ids))
+        )).scalars().all():
+            tr = r.translations or {}
+            crop_name_by_id[r.cosh_id] = tr.get("en") or tr.get("hi") or r.cosh_id
+
+    now = datetime.now(timezone.utc)
+    out = []
+    for req, _sub, pkg, farmer in rows:
+        delta = req.expires_at - now
+        hours_remaining = max(0, int(delta.total_seconds() // 3600))
+        out.append({
+            "id": req.id,
+            "subscription_id": req.subscription_id,
+            "farmer_user_id": req.farmer_user_id,
+            "farmer_name": farmer.name,
+            "farmer_phone": farmer.phone,
+            "package_id": pkg.id,
+            "package_name": pkg.name,
+            "crop_cosh_id": pkg.crop_cosh_id,
+            "crop_name": crop_name_by_id.get(pkg.crop_cosh_id) if pkg.crop_cosh_id else None,
+            "amount": float(req.amount),
+            "status": req.status,
+            "expires_at": req.expires_at,
+            "hours_remaining": hours_remaining,
+            "created_at": req.created_at,
+        })
+    return out
 
 
 @router.put("/dealer/payment-requests/{request_id}/pay")
@@ -2372,15 +2424,53 @@ async def decline_payment(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    result = await db.execute(
-        select(SubscriptionPaymentRequest).where(SubscriptionPaymentRequest.id == request_id)
-    )
-    pr = result.scalar_one_or_none()
+    """Dealer declines a payment request at the outset.
+
+    Brought to parity with `/facilitator/payment-requests/{id}/decline`
+    on 2026-05-30. Three gates added:
+      - active-dealer (onboarded by ≥1 client),
+      - ownership (the request is addressed to *this* dealer),
+      - PENDING-only (replay on a terminal row 404s instead of
+        silently re-flipping status).
+    Plus an FCM notify to the farmer so they know the request was
+    declined without waiting out the 24-hour expiry.
+    """
+    from app.modules.platform.models import User as PlatformUser
+    from app.modules.orders.router import _assert_active_dealer
+    from app.services.fcm_service import send_fcm
+
+    await _assert_active_dealer(db, current_user.id)
+    pr = (await db.execute(
+        select(SubscriptionPaymentRequest).where(
+            SubscriptionPaymentRequest.id == request_id,
+            SubscriptionPaymentRequest.requested_from_user_id == current_user.id,
+            SubscriptionPaymentRequest.status == "PENDING",
+        )
+    )).scalar_one_or_none()
     if not pr:
-        raise HTTPException(status_code=404, detail="Not found")
+        raise HTTPException(status_code=404, detail="Payment request not found or no longer pending")
     pr.status = "DECLINED"
     await db.commit()
-    return {"detail": "Declined"}
+
+    farmer = (await db.execute(
+        select(PlatformUser).where(PlatformUser.id == pr.farmer_user_id)
+    )).scalar_one_or_none()
+    if farmer and farmer.fcm_token:
+        try:
+            await send_fcm(
+                token=farmer.fcm_token,
+                title="Payment request declined",
+                body=f"{current_user.name or 'Your contact'} declined to pay for your subscription. You can choose someone else or pay yourself.",
+                data={
+                    "type": "PAYMENT_REQUEST_DECLINED",
+                    "subscription_id": pr.subscription_id,
+                    "payment_request_id": pr.id,
+                },
+            )
+        except Exception:
+            pass   # FCM failure must not break the API response.
+
+    return {"id": request_id, "status": "DECLINED"}
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
