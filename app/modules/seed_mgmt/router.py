@@ -623,6 +623,8 @@ async def list_dealer_seed_orders(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    from app.modules.orders.router import _assert_active_dealer
+    await _assert_active_dealer(db, current_user.id)
     result = await db.execute(
         select(SeedOrderFull).where(
             SeedOrderFull.dealer_user_id == current_user.id,
@@ -655,6 +657,8 @@ async def accept_seed_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    from app.modules.orders.router import _assert_active_dealer
+    await _assert_active_dealer(db, current_user.id)
     order = await _get_seed_order(db, order_id, current_user.id, farmer=False)
     if order.status != SeedOrderStatus.SENT:
         raise HTTPException(status_code=400, detail="Order can only be accepted from SENT status")
@@ -671,6 +675,8 @@ async def seed_submit_for_approval(
     current_user: User = Depends(get_current_user),
 ):
     """Dealer enters unit, quantity, and total price → sends to farmer."""
+    from app.modules.orders.router import _assert_active_dealer
+    await _assert_active_dealer(db, current_user.id)
     order = await _get_seed_order(db, order_id, current_user.id, farmer=False)
     if order.status not in [SeedOrderStatus.SENT, SeedOrderStatus.ACCEPTED]:
         raise HTTPException(status_code=400, detail="Cannot submit in current status")
@@ -690,6 +696,8 @@ async def abort_seed_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    from app.modules.orders.router import _assert_active_dealer
+    await _assert_active_dealer(db, current_user.id)
     order = await _get_seed_order(db, order_id, current_user.id, farmer=False)
     order.status = SeedOrderStatus.SENT
     order.unit = None

@@ -1811,7 +1811,9 @@ async def dealer_district_advisories(
 ):
     """Returns active packages in the dealer's registered district — helps dealer understand what farmers are being advised to buy."""
     from app.modules.advisory.models import PackageLocation, PackageStatus
+    from app.modules.orders.router import _assert_active_dealer
 
+    await _assert_active_dealer(db, current_user.id)
     if not current_user.district_cosh_id:
         return []
 

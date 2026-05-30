@@ -3,7 +3,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.dependencies import get_current_user
@@ -582,6 +582,7 @@ async def mark_item_available(
     from app.services.relations import decode_role
     from app.modules.sync.models import CoshCoreItem
 
+    await _assert_active_dealer(db, current_user.id)
     await _get_dealer_order(db, order_id, current_user.id)
     item = await _get_order_item(db, item_id, order_id)
     res = validate_item_transition(item.status, OrderItemStatus.AVAILABLE.value, DEALER)
@@ -894,6 +895,7 @@ async def postpone_item(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_active_dealer(db, current_user.id)
     await _get_dealer_order(db, order_id, current_user.id)
     item = await _get_order_item(db, item_id, order_id)
     res = validate_item_transition(item.status, OrderItemStatus.POSTPONED.value, DEALER)
@@ -911,6 +913,7 @@ async def mark_item_unavailable(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_active_dealer(db, current_user.id)
     await _get_dealer_order(db, order_id, current_user.id)
     item = await _get_order_item(db, item_id, order_id)
     res = validate_item_transition(item.status, OrderItemStatus.NOT_AVAILABLE.value, DEALER)
@@ -929,6 +932,7 @@ async def submit_for_approval(
     current_user: User = Depends(get_current_user),
 ):
     """BL-14: Sends all AVAILABLE items to farmer for approval."""
+    await _assert_active_dealer(db, current_user.id)
     order = await _get_dealer_order(db, order_id, current_user.id)
     res = validate_order_transition(order.status, OrderStatus.SENT_FOR_APPROVAL.value, DEALER)
     if not res.allowed:
@@ -1012,6 +1016,7 @@ async def abort_order(
       volume_unit, price, postponed_until, scan_verified — were
       stale on the resulting PENDING item).
     """
+    await _assert_active_dealer(db, current_user.id)
     order = await _get_dealer_order(db, order_id, current_user.id)
     if not is_order_abortable(order.status):
         raise HTTPException(
@@ -2188,6 +2193,41 @@ async def delete_dealer_order(
     order.dealer_user_id = None
     await db.commit()
     return {"detail": "Order removed from your queue"}
+
+
+# ── Dealer: lifecycle status (PWA gate signal, 2026-05-30) ────────────────────
+
+@router.get("/dealer/me/onboarding-status")
+async def dealer_onboarding_status(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """V1.1 Item 5 (2026-05-09 spec) PWA signal.
+
+    Returns whether the current user is *functionally* a Dealer —
+    i.e. has at least one ACTIVE `ClientPromoter` row of
+    `promoter_type=DEALER`. Used by `/dealer/home` to decide whether
+    to render the quick-actions grid or the "ask a Field Manager to
+    onboard you" empty state.
+
+    Deliberately not gated on `_assert_active_dealer` — the whole
+    point of this endpoint is to *tell* the PWA whether that gate
+    would pass. Returning 403 here would defeat the purpose. The
+    auth dependency still requires a logged-in user.
+    """
+    from app.modules.clients.models import ClientPromoter
+
+    count = (await db.execute(
+        select(func.count(ClientPromoter.id)).where(
+            ClientPromoter.user_id == current_user.id,
+            ClientPromoter.promoter_type == "DEALER",
+            ClientPromoter.status == "ACTIVE",
+        )
+    )).scalar() or 0
+    return {
+        "onboarded": count > 0,
+        "client_count": int(count),
+    }
 
 
 # ── Dealer / Facilitator: Promoted farmers ────────────────────────────────────
