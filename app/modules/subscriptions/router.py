@@ -23,7 +23,7 @@ from app.modules.advisory.models import (
 from app.modules.clients.models import Client
 from app.modules.advisory.models import PGRecommendation, SPRecommendation, Timeline
 from app.modules.platform.models import UserRole, RoleType
-from app.modules.orders.models import DealerProfile
+from app.modules.orders.models import DealerProfile, OrderItem, OrderItemStatus
 from app.modules.clients.models import Client, ClientLocation, ClientStatus
 from app.services.bl11_subscription_state import (
     DEALER as BL11_DEALER, FARMER as BL11_FARMER,
@@ -1484,11 +1484,33 @@ async def set_start_date(
     # Update start date (use the parsed datetime, not the raw string)
     sub.crop_start_date = new_start_dt
 
-    # Shift active orders by delta
+    # Shift active orders by delta (BL-05b step 6: order.date_from /
+    # date_to shift universally so they remain consistent with the new
+    # timeline windows).
     for order in orders:
         if hasattr(order.date_from, 'date'):
             order.date_from = order.date_from + timedelta(days=delta_days)
             order.date_to = order.date_to + timedelta(days=delta_days)
+
+    # BL-05b step 7: for dealer-postponed items whose timeline shifted,
+    # the dealer's `postponed_until` must also shift by `delta_days`.
+    # CHA / SP / PG / QA timelines are anchored to triggered_at and do
+    # NOT shift on crop_start_date change — so only CCA timelines on
+    # this package qualify. OrderItem.timeline_id points at the
+    # package's `timelines` table directly; that's the right filter.
+    if delta_days != 0:
+        package_tl_ids = {tl.id for tl in timelines}
+        if package_tl_ids:
+            postponed_items = (await db.execute(
+                select(OrderItem).where(
+                    OrderItem.order_id.in_([o.id for o in orders]),
+                    OrderItem.status == OrderItemStatus.POSTPONED,
+                    OrderItem.postponed_until.isnot(None),
+                    OrderItem.timeline_id.in_(package_tl_ids),
+                )
+            )).scalars().all()
+            for item in postponed_items:
+                item.postponed_until = item.postponed_until + timedelta(days=delta_days)
 
     # Defensive: also clear any lingering SENT START_DATE alerts on
     # the update path. Should be a no-op (first-set already flipped

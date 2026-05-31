@@ -40,7 +40,18 @@ class LockResult:
     po_locked: bool = False
 
 
-ACTIVE_ORDER_STATUSES = {"AVAILABLE", "POSTPONED", "SENT_FOR_APPROVAL", "APPROVED"}
+# BL-05a deviation locked 2026-05-31 (user call). Spec says the PO LOCK
+# triggers only on AVAILABLE / POSTPONED / SENT_FOR_APPROVAL / APPROVED —
+# PENDING items don't lock. We deviate: once an order is SENT (so its
+# items become PENDING under a real recipient), neither the advisory nor
+# the order's content should change for that farmer. PENDING in the set
+# extends the protection to the moment of order send, not the moment of
+# dealer first action. The OrderItem.snapshot_id mechanism already
+# protects the dealer's fulfilment view; this makes the farmer's
+# advisory view match.
+ACTIVE_ORDER_STATUSES = {
+    "PENDING", "AVAILABLE", "POSTPONED", "SENT_FOR_APPROVAL", "APPROVED",
+}
 
 
 def detect_lock(
