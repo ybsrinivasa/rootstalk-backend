@@ -35,8 +35,11 @@ async def _seed_brand_locked_order(db):
     dealer user so the dealer-side endpoints can be called.
     """
     farmer = await make_user(db, name="Farmer")
-    dealer = await make_onboarded_dealer(db, name="Dealer")
     client = await make_client(db)
+    # Orders V2 Batch 9: brand-locked orders gate on the dealer being
+    # onboarded by the client. Pin the dealer accordingly so this
+    # helper's order-create succeeds.
+    dealer = await make_onboarded_dealer(db, client=client, name="Dealer")
     package = await make_package(db, client)
     sub = await make_subscription(
         db, farmer=farmer, client=client, package=package,
@@ -170,8 +173,12 @@ async def test_dealer_order_detail_locked_brand_uses_snapshot(db):
     """In the dealer order detail, has_locked_brand on relation Options must
     come from the snapshot, not master."""
     farmer = await make_user(db, name="Farmer")
-    dealer = await make_onboarded_dealer(db, name="Dealer")
     client = await make_client(db)
+    # Orders V2 Batch 9: create_order now enforces the locked-brand
+    # rule (a brand-locked item can only be sent to a dealer onboarded
+    # by the client). Pin the dealer to this client so the gate
+    # passes; this test cares about the snapshot, not the gate.
+    dealer = await make_onboarded_dealer(db, client=client, name="Dealer")
     package = await make_package(db, client)
     sub = await make_subscription(
         db, farmer=farmer, client=client, package=package,
