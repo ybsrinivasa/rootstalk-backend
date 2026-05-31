@@ -18,6 +18,7 @@ celery_app = Celery(
         "app.tasks.assignment_expiry",
         "app.tasks.enterprise_license_lifecycle",
         "app.tasks.postpone_expiry",
+        "app.tasks.timeline_archive",
     ],
 )
 
@@ -94,6 +95,14 @@ celery_app.conf.beat_schedule = {
     "postpone-expiry-check": {
         "task": "app.tasks.postpone_expiry.sweep_expired_postpones",
         "schedule": crontab(minute=45),
+    },
+    # Orders V2 Batch 8: hourly tandem-archive of OrderItems whose
+    # timeline window has closed. Mirrors the advisory's hidden-past
+    # behaviour on the order side. :50 keeps it adjacent to the
+    # postpone sweep without colliding.
+    "timeline-archive-check": {
+        "task": "app.tasks.timeline_archive.archive_expired_timeline_items",
+        "schedule": crontab(minute=50),
     },
 }
 

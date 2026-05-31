@@ -116,6 +116,12 @@ class OrderItem(Base):
     # inherits the same lineage_id. Reports group by this to
     # reconstruct the full dealer-by-dealer history.
     lineage_id: Mapped[str] = mapped_column(String(36), nullable=False, default=new_uuid)
+    # Tandem-archive marker (Orders V2 Batch 8). Stamped when the
+    # item's timeline window closes. Active surfaces filter
+    # `archived_at IS NULL`; History views show archived rows too.
+    archived_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 

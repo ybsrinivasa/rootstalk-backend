@@ -327,7 +327,14 @@ async def list_farmer_orders(
     orders = result.scalars().all()
     out = []
     for o in orders:
-        items_result = await db.execute(select(OrderItem).where(OrderItem.order_id == o.id))
+        # Active items only — archived (timeline-expired) rows are
+        # off the live order surface; they live in History.
+        items_result = await db.execute(
+            select(OrderItem).where(
+                OrderItem.order_id == o.id,
+                OrderItem.archived_at.is_(None),
+            )
+        )
         items = items_result.scalars().all()
 
         # Group items by relation_id; standalone = no relation or missing role
@@ -396,7 +403,14 @@ async def get_farmer_order_detail(
     current_user: User = Depends(get_current_user),
 ):
     order = await _get_farmer_order(db, order_id, current_user.id)
-    items_result = await db.execute(select(OrderItem).where(OrderItem.order_id == order.id))
+    # Batch 8: only the active (non-timeline-archived) items belong
+    # on the farmer's live order detail. History lives elsewhere.
+    items_result = await db.execute(
+        select(OrderItem).where(
+            OrderItem.order_id == order.id,
+            OrderItem.archived_at.is_(None),
+        )
+    )
     items = items_result.scalars().all()
     return {
         "id": order.id, "status": order.status,
@@ -477,7 +491,14 @@ async def cancel_order(
     # fresh DRAFT order. REROUTED rows stay behind as historical
     # pointers on the husk.
     skip_statuses = {OrderItemStatus.REROUTED, OrderItemStatus.REMOVED}
-    items_q = await db.execute(select(OrderItem).where(OrderItem.order_id == order.id))
+    # Don't migrate timeline-archived items either — their advisory
+    # context is gone, re-routing them would just leak ghost rows.
+    items_q = await db.execute(
+        select(OrderItem).where(
+            OrderItem.order_id == order.id,
+            OrderItem.archived_at.is_(None),
+        )
+    )
     items_to_migrate = [it for it in items_q.scalars().all() if it.status not in skip_statuses]
 
     new_draft = Order(
@@ -1757,7 +1778,13 @@ async def list_facilitator_orders(
     orders = result.scalars().all()
     out = []
     for o in orders:
-        items_result = await db.execute(select(OrderItem).where(OrderItem.order_id == o.id))
+        # Active items only (Batch 8 — exclude timeline-archived).
+        items_result = await db.execute(
+            select(OrderItem).where(
+                OrderItem.order_id == o.id,
+                OrderItem.archived_at.is_(None),
+            )
+        )
         items = items_result.scalars().all()
         out.append({
             "id": o.id, "status": o.status,
@@ -1814,7 +1841,12 @@ async def get_facilitator_order(
     )).scalar_one_or_none()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-    items_result = await db.execute(select(OrderItem).where(OrderItem.order_id == order.id))
+    items_result = await db.execute(
+        select(OrderItem).where(
+            OrderItem.order_id == order.id,
+            OrderItem.archived_at.is_(None),
+        )
+    )
     items = items_result.scalars().all()
     return {
         "id": order.id, "status": order.status,
@@ -1887,7 +1919,12 @@ async def get_dealer_order(
     )).scalar_one_or_none()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-    items_result = await db.execute(select(OrderItem).where(OrderItem.order_id == order.id))
+    items_result = await db.execute(
+        select(OrderItem).where(
+            OrderItem.order_id == order.id,
+            OrderItem.archived_at.is_(None),
+        )
+    )
     items = items_result.scalars().all()
 
     # Helper for the flat item shape
@@ -3635,6 +3672,9 @@ async def _order_has_locked_brand_items(db: AsyncSession, order_id: str) -> bool
             OrderItem.order_id == order_id,
             Practice.is_brand_locked.is_(True),
             OrderItem.status.notin_(excluded),
+            # Batch 8: archived items don't constrain the order's
+            # routing — they're already off the active surface.
+            OrderItem.archived_at.is_(None),
         )
     )
     return bool((result.scalar() or 0) > 0)
