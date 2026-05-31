@@ -60,31 +60,53 @@ def l2_exclude_for_category(category: str) -> set[str]:
 
 
 def _timeline_window(
-    tl: Timeline, crop_start: date,
+    tl: Timeline,
+    crop_start: date | None,
+    today: date | None = None,
 ) -> tuple[date, date] | None:
-    """Convert a Timeline's relative DAS/DBS offsets into absolute
-    calendar dates, given the subscription's crop_start_date.
+    """Convert a Timeline's offsets into absolute calendar dates.
+
+    DAS / DBS: anchor to `crop_start` (required for both; returns
+    None if absent).
+    CALENDAR (Perennial, Batch 21): `from_value` / `to_value` are
+    day-of-year (1..365/366). Window resolves to the current
+    subscription year (`today.year`). When `today` is omitted we
+    default to `date.today()`. Wrap-around ranges
+    (from_value > to_value, e.g. 350 → 10) aren't supported in V1
+    — the bundle returns None for those rows, matching the
+    advisory walk's current behaviour.
 
     Returns None for:
-      - CALENDAR (no anchor — calendar-based timelines store absolute
-        dates elsewhere; bundle path doesn't need them for V1)
-      - DAYS_AFTER_DETECTION / DAYS_AFTER_RESPONSE — CHA-pipe
-        timelines anchored to a triggered event, not crop_start.
-        Handled by the diagnosis flow, not the order bundle.
-      - Any unexpected from_type / NULL offsets — defensive.
+      - DAYS_AFTER_DETECTION / DAYS_AFTER_RESPONSE (handled by the
+        diagnosis flow, not the order bundle).
+      - NULL offsets — defensive.
     """
     if tl.from_value is None or tl.to_value is None:
         return None
     ftype = tl.from_type.value if hasattr(tl.from_type, "value") else str(tl.from_type)
     if ftype == "DAS":
+        if crop_start is None:
+            return None
         return (
             crop_start + timedelta(days=int(tl.from_value)),
             crop_start + timedelta(days=int(tl.to_value)),
         )
     if ftype == "DBS":
+        if crop_start is None:
+            return None
         return (
             crop_start - timedelta(days=int(tl.from_value)),
             crop_start - timedelta(days=int(tl.to_value)),
+        )
+    if ftype == "CALENDAR":
+        if today is None:
+            today = date.today()
+        if tl.from_value > tl.to_value:
+            return None  # wrap-around unsupported in V1
+        year_start = date(today.year, 1, 1)
+        return (
+            year_start + timedelta(days=int(tl.from_value) - 1),
+            year_start + timedelta(days=int(tl.to_value) - 1),
         )
     return None
 
@@ -127,13 +149,14 @@ async def _build_timeline_windows_for_dedup(
     )
     from app.modules.subscriptions.models import TriggeredCHAEntry
 
-    if subscription.crop_start_date is None:
-        return []
+    # Batch 21: Perennial allowed — `crop_start_date` may be None.
+    # CALENDAR timelines resolve via today.year; DAS/DBS rows just
+    # get skipped without an anchor.
     crop_start = (
         subscription.crop_start_date.date()
         if hasattr(subscription.crop_start_date, "date")
         else subscription.crop_start_date
-    )
+    ) if subscription.crop_start_date is not None else None
 
     candidate_tls: dict[str, tuple[date, date, str]] = {}
     """tl_id -> (from_date, to_date, source). source: CCA | CHA"""
@@ -144,7 +167,7 @@ async def _build_timeline_windows_for_dedup(
     )).scalars().all()
     pkg_tl_by_id: dict[str, Timeline] = {tl.id: tl for tl in pkg_tls}
     for tl in pkg_tls:
-        w = _timeline_window(tl, crop_start)
+        w = _timeline_window(tl, crop_start, today)
         if w and windows_overlap(w[0], w[1], today, to_date):
             candidate_tls[tl.id] = (w[0], w[1], "CCA")
 
@@ -208,20 +231,13 @@ async def _build_timeline_windows_for_dedup(
             select(Timeline).where(Timeline.id.in_(context_tl_ids))
         )).scalars().all()
         for ctx_tl in ctx_rows:
-            if ctx_tl.from_value is None or ctx_tl.to_value is None:
+            # Use the shared `_timeline_window` so CALENDAR context
+            # timelines also resolve correctly. Anchor for DAS/DBS is
+            # crop_start; CALENDAR uses today.year (Batch 21).
+            cw = _timeline_window(ctx_tl, crop_start, today)
+            if cw is None:
                 continue
-            anchor = crop_start
-            source = "CCA"
-            ftype = ctx_tl.from_type.value if hasattr(ctx_tl.from_type, "value") else str(ctx_tl.from_type)
-            if ftype == "DAS":
-                ctx_from = anchor + timedelta(days=int(ctx_tl.from_value))
-                ctx_to = anchor + timedelta(days=int(ctx_tl.to_value))
-            elif ftype == "DBS":
-                ctx_from = anchor - timedelta(days=int(ctx_tl.from_value))
-                ctx_to = anchor - timedelta(days=int(ctx_tl.to_value))
-            else:
-                continue
-            candidate_tls[ctx_tl.id] = (ctx_from, ctx_to, source)
+            candidate_tls[ctx_tl.id] = (cw[0], cw[1], "CCA")
             pkg_tl_by_id[ctx_tl.id] = ctx_tl
 
     if not candidate_tls:
@@ -458,13 +474,15 @@ async def compute_bundle(
     (GET /order-preview) or to bind these practice_ids onto a new
     Order (POST /farmer/orders).
     """
-    if subscription.crop_start_date is None:
-        return {"practices": [], "excluded_already_ordered": 0}
+    # Batch 21: Perennial packages may have no `crop_start_date` —
+    # their timelines are CALENDAR only. We still resolve the bundle;
+    # DAS/DBS rows return None from `_timeline_window` without an
+    # anchor and get skipped naturally.
     crop_start = (
         subscription.crop_start_date.date()
         if hasattr(subscription.crop_start_date, "date")
         else subscription.crop_start_date
-    )
+    ) if subscription.crop_start_date is not None else None
 
     l1_set = l1_set_for_category(category)
     l2_exclude = l2_exclude_for_category(category)
@@ -477,7 +495,7 @@ async def compute_bundle(
 
     eligible_tl_windows: dict[str, tuple[date, date]] = {}
     for tl in timelines:
-        w = _timeline_window(tl, crop_start)
+        w = _timeline_window(tl, crop_start, today)
         if w is None:
             continue
         if windows_overlap(w[0], w[1], today, to_date):
