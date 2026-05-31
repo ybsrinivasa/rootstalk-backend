@@ -17,6 +17,7 @@ celery_app = Celery(
         "app.tasks.share_link_reconciler",
         "app.tasks.assignment_expiry",
         "app.tasks.enterprise_license_lifecycle",
+        "app.tasks.postpone_expiry",
     ],
 )
 
@@ -85,6 +86,14 @@ celery_app.conf.beat_schedule = {
     "enterprise-license-lifecycle": {
         "task": "app.tasks.enterprise_license_lifecycle.sweep",
         "schedule": crontab(hour=1, minute=30),
+    },
+    # Orders V2 Batch 7: hourly auto-flip of POSTPONED items past
+    # their postponed_until → NOT_AVAILABLE, so the farmer sees them
+    # as Returned-needs-rerouting promptly. :45 keeps the per-minute
+    # event log readable alongside the other hourly sweeps.
+    "postpone-expiry-check": {
+        "task": "app.tasks.postpone_expiry.sweep_expired_postpones",
+        "schedule": crontab(minute=45),
     },
 }
 

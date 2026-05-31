@@ -1396,6 +1396,87 @@ async def mark_option_not_available(
     return {"part_index": part_index, "option_index": option_index, "not_available": affected}
 
 
+def _timeline_end_date(timeline, sub_crop_start):
+    """Date the timeline's window closes.
+
+    DAS: crop_start_date + to_value
+    DBS: crop_start_date - to_value (pre-sowing window — end is the
+         smaller-magnitude offset, which mathematically is `start - to`)
+    CALENDAR: not date-anchored — caller has to fall back on `date_to`
+              from the order itself.
+    """
+    from datetime import timedelta
+    if not sub_crop_start:
+        return None
+    start = sub_crop_start.date() if hasattr(sub_crop_start, "date") else sub_crop_start
+    ft = timeline.from_type.value if hasattr(timeline.from_type, "value") else str(timeline.from_type)
+    if ft == "DAS":
+        return start + timedelta(days=int(timeline.to_value or 0))
+    if ft == "DBS":
+        return start - timedelta(days=int(timeline.to_value or 0))
+    return None
+
+
+async def _postpone_window_for_item(
+    db: AsyncSession, order: Order, item: OrderItem,
+) -> dict:
+    """Compute max postpone days for an item per the 2026-05-31
+    narrative: max = (timeline_end - today) - 1.
+
+    The -1 guarantees the farmer ≥1 clear day to re-route after a
+    postpone elapses naturally. Returns a dict the endpoint can
+    serialise without further work.
+    """
+    from datetime import date as _date, timedelta as _timedelta
+    sub = (await db.execute(
+        select(Subscription).where(Subscription.id == order.subscription_id)
+    )).scalar_one_or_none()
+    tl = (await db.execute(
+        select(Timeline).where(Timeline.id == item.timeline_id)
+    )).scalar_one_or_none()
+
+    # IST today — matches the alerts pipeline (memory:
+    # feedback_ist_for_scheduled_tasks). UTC midnight would let the
+    # window slip a day for postpones taken during IST-evening.
+    ist_today = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).date()
+
+    window_end = _timeline_end_date(tl, sub.crop_start_date) if (tl and sub) else None
+    if window_end is None:
+        # Fall back to order.date_to for CALENDAR timelines / unset
+        # crop_start_date. Lets the dealer still postpone, just bounded
+        # by the order's own range.
+        window_end = order.date_to.date() if hasattr(order.date_to, "date") else order.date_to
+
+    remaining_days = (window_end - ist_today).days if window_end else 0
+    max_days = max(0, remaining_days - 1)
+    return {
+        "today": ist_today.isoformat(),
+        "timeline_end": window_end.isoformat() if window_end else None,
+        "remaining_days": remaining_days,
+        "max_days": max_days,
+        "can_postpone": max_days >= 1,
+    }
+
+
+@router.get("/dealer/orders/{order_id}/items/{item_id}/postpone-window")
+async def get_postpone_window(
+    order_id: str, item_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """How many days can the dealer push this item by?
+
+    Per the 2026-05-31 narrative, the picker on the dealer's PWA
+    shows options 1 … max_days where max_days = remaining timeline
+    days - 1. This endpoint computes that number authoritatively so
+    the picker doesn't have to know about timelines or crop dates.
+    """
+    await _assert_active_dealer(db, current_user.id)
+    order = await _get_dealer_order(db, order_id, current_user.id)
+    item = await _get_order_item(db, item_id, order_id)
+    return await _postpone_window_for_item(db, order, item)
+
+
 @router.put("/dealer/orders/{order_id}/items/{item_id}/postpone")
 async def postpone_item(
     order_id: str, item_id: str,
@@ -1403,15 +1484,57 @@ async def postpone_item(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Dealer postpones an item.
+
+    Body shape (Batch 7):
+      `days`: int — preferred. Server computes
+        `postponed_until = IST today + days` and validates against
+        the window.
+      `postponed_until`: ISO timestamp — legacy / system path.
+        No window validation; used by tests + migrations.
+
+    Picking neither is fine for back-compat with the pre-Batch-7
+    PWA but the new picker always sends `days`.
+    """
+    from datetime import date as _date, timedelta as _timedelta
+
     await _assert_active_dealer(db, current_user.id)
-    await _get_dealer_order(db, order_id, current_user.id)
+    order = await _get_dealer_order(db, order_id, current_user.id)
     item = await _get_order_item(db, item_id, order_id)
     res = validate_item_transition(item.status, OrderItemStatus.POSTPONED.value, DEALER)
     if not res.allowed:
         _raise_transition(res)
     prev = item.status.value if hasattr(item.status, "value") else item.status
+
+    days = data.get("days")
+    if days is not None:
+        if not isinstance(days, int) or days < 1:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "postpone_days_invalid", "message": "days must be a positive integer."},
+            )
+        window = await _postpone_window_for_item(db, order, item)
+        if days > window["max_days"]:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "postpone_days_out_of_range",
+                    "message": f"Pick between 1 and {window['max_days']} day(s).",
+                    "max_days": window["max_days"],
+                },
+            )
+        # IST today + days, expressed at IST midnight in UTC.
+        ist_today = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).date()
+        target = ist_today + _timedelta(days=days)
+        # Convert IST midnight → UTC = target 00:00 IST = target -5h30m UTC
+        item.postponed_until = datetime(
+            target.year, target.month, target.day, 0, 0,
+            tzinfo=timezone.utc,
+        ) - timedelta(hours=5, minutes=30)
+    else:
+        item.postponed_until = data.get("postponed_until")
+
     item.status = OrderItemStatus.POSTPONED
-    item.postponed_until = data.get("postponed_until")
     await _record_event(
         db, lineage_id=item.lineage_id,
         event_type="MARKED_POSTPONED",
@@ -1420,7 +1543,7 @@ async def postpone_item(
         prev_status=prev, new_status=OrderItemStatus.POSTPONED.value,
         metadata={
             "postponed_until": item.postponed_until.isoformat() if item.postponed_until else None,
-            "days": data.get("days"),
+            "days": days,
         },
     )
     await db.commit()
