@@ -1572,6 +1572,16 @@ async def mark_item_available(
         for sibling in fb_result.scalars().all():
             sibling.status = OrderItemStatus.NOT_AVAILABLE
 
+    # Batch 28 — drop the draft entry now that the item is committed.
+    # Whole-dict reassignment so SQLAlchemy detects the JSON change.
+    order_row = (await db.execute(
+        select(Order).where(Order.id == order_id)
+    )).scalar_one()
+    if order_row.dealer_draft and item_id in order_row.dealer_draft:
+        new_draft = dict(order_row.dealer_draft)
+        new_draft.pop(item_id, None)
+        order_row.dealer_draft = new_draft
+
     await db.commit()
     return {"item_id": item_id, "status": item.status}
 
@@ -2071,6 +2081,10 @@ async def abort_order(
         item.postponed_until = None
         item.scan_verified = False
 
+    # Batch 28 — abort wipes the per-item draft map too. A different
+    # dealer picking the order up later starts from a clean slate.
+    order.dealer_draft = {}
+
     order.status = OrderStatus.SENT
     await db.commit()
     return {"order_id": order_id, "status": order.status}
@@ -2248,6 +2262,62 @@ async def dealer_heartbeat(
         "viewing_until": order.dealer_viewing_until.isoformat(),
         "lease_seconds": _DEALER_VIEWING_LEASE_SECONDS,
     }
+
+
+# ── Dealer: Partial-edit draft (Batch 28) ──────────────────────────────────────
+#
+# The dealer screen debounces in-flight edits (brand, volume, unit,
+# price) and PUTs the per-item bundle here every ~3 s. The PWA also
+# mirrors the same payload into IndexedDB so a power-off, network
+# drop, or screen change can't lose the work. When the item moves
+# to AVAILABLE, /items/{id}/available removes the entry server-side
+# and the client drops it from IndexedDB too.
+
+_ALLOWED_DRAFT_KEYS = {
+    "brand_cosh_id", "brand_name",
+    "given_volume", "volume_unit", "price",
+}
+
+
+@router.put("/dealer/orders/{order_id}/draft/{item_id}")
+async def upsert_dealer_draft(
+    order_id: str, item_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Per-item draft upsert. Whole entry is replaced on every call;
+    the client computes the merged shape from its in-memory state
+    so the server doesn't have to."""
+    await _assert_active_dealer(db, current_user.id)
+    order = await _get_dealer_order(db, order_id, current_user.id)
+    # Confirm item belongs to this order — guards against the dealer
+    # PUTing to an item from a sibling order they don't own.
+    await _get_order_item(db, item_id, order_id)
+    entry = {k: data[k] for k in _ALLOWED_DRAFT_KEYS if k in data}
+    new_draft = dict(order.dealer_draft or {})
+    if entry:
+        new_draft[item_id] = entry
+    else:
+        new_draft.pop(item_id, None)
+    order.dealer_draft = new_draft
+    await db.commit()
+    return {"draft": order.dealer_draft, "item_id": item_id}
+
+
+@router.delete("/dealer/orders/{order_id}/draft/{item_id}")
+async def clear_dealer_draft(
+    order_id: str, item_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await _assert_active_dealer(db, current_user.id)
+    order = await _get_dealer_order(db, order_id, current_user.id)
+    new_draft = dict(order.dealer_draft or {})
+    new_draft.pop(item_id, None)
+    order.dealer_draft = new_draft
+    await db.commit()
+    return {"draft": order.dealer_draft}
 
 
 # ── Dealer: Get order detail with items ────────────────────────────────────────
@@ -2548,6 +2618,11 @@ async def get_dealer_order(
         # New: Part-aware relation structure
         "relations": relations_payload,
         "standalone_items": [item_brief(i) for i in standalone],
+        # Batch 28 — server-authoritative copy of the dealer's
+        # in-flight per-item edits. The PWA hydrates its IndexedDB
+        # mirror from this on mount so a different device picks up
+        # exactly where the last one left off.
+        "dealer_draft": order.dealer_draft or {},
     }
 
 

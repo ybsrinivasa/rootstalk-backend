@@ -78,6 +78,13 @@ class Order(Base):
     dealer_viewing_until: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )
+    # Batch 28 — partial dealer edits captured between brand pick and
+    # Mark Available. Map of item_id → {brand_cosh_id, brand_name,
+    # given_volume, volume_unit, price}. Server clears an entry when
+    # its item flips to AVAILABLE. Default `{}` so reads never NULL.
+    dealer_draft: Mapped[dict] = mapped_column(
+        JSON, nullable=False, default=dict, server_default="{}",
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
