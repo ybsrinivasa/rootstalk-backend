@@ -38,6 +38,18 @@ class OrderItemStatus(str, enum.Enum):
     REMOVED = "REMOVED"
 
 
+class OrderCategory(str, enum.Enum):
+    """Hard category on Order — set at create-time, immutable.
+
+    SEED orders live on SeedOrder (single-variety, no items list).
+    The Order table only ever sees PESTICIDE / FERTILIZER.
+    Storing it discretely avoids re-deriving from items on every
+    licence-match / locked-brand check.
+    """
+    PESTICIDE = "PESTICIDE"
+    FERTILIZER = "FERTILIZER"
+
+
 class Order(Base):
     __tablename__ = "orders"
 
@@ -49,6 +61,9 @@ class Order(Base):
     facilitator_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
     date_from: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     date_to: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # PESTICIDE or FERTILIZER. Nullable on legacy orders; required
+    # for new orders (Batch 2 will enforce this in the create gate).
+    category: Mapped[str] = mapped_column(String(20), nullable=True)
     status: Mapped[OrderStatus] = mapped_column(String(30), default=OrderStatus.DRAFT)
     locked_timelines: Mapped[list] = mapped_column(JSON, nullable=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -85,6 +100,11 @@ class OrderItem(Base):
         ForeignKey("locked_timeline_snapshots.id", ondelete="SET NULL"),
         nullable=True,
     )
+    # Journey ID across re-routes. When the farmer cancels and the
+    # items get migrated to a fresh DRAFT, the new OrderItem row
+    # inherits the same lineage_id. Reports group by this to
+    # reconstruct the full dealer-by-dealer history.
+    lineage_id: Mapped[str] = mapped_column(String(36), nullable=False, default=new_uuid)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -104,8 +124,59 @@ class SeedOrder(Base):
     quantity: Mapped[float] = mapped_column(DECIMAL(10, 3), nullable=True)
     total_price: Mapped[float] = mapped_column(DECIMAL(10, 2), nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="SENT")
+    # Journey ID — seeds share the lineage vocabulary even though
+    # they don't share OrderItem. Each SeedOrder is its own item
+    # for re-route accounting.
+    lineage_id: Mapped[str] = mapped_column(String(36), nullable=False, default=new_uuid)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class OrderItemEvent(Base):
+    """Append-only audit trail for an item's journey across orders.
+
+    One row per state change — every accept, postpone, return,
+    re-route, cancel, expire. Reports group by `lineage_id` to
+    reconstruct the full story: "Pesticide P1 went to Dealer D1,
+    came back Not Available, went to Facilitator F1 → Dealer D2,
+    got postponed 3 days, ended Available, bought".
+
+    Either `order_item_id` or `seed_order_id` is set (mutually
+    exclusive) — `order_id` is set when the event has an order
+    context but no item (e.g. CANCELLED_BY_FARMER on an empty
+    husk after the items already migrated to a fresh DRAFT).
+    """
+    __tablename__ = "order_item_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    # Index lives in the migration as `ix_order_item_events_lineage`;
+    # don't pass index=True here or alembic will keep proposing a
+    # second auto-named index for the same column.
+    lineage_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    order_item_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("order_items.id", ondelete="SET NULL"), nullable=True,
+    )
+    seed_order_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("seed_orders.id", ondelete="SET NULL"), nullable=True,
+    )
+    order_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("orders.id", ondelete="SET NULL"), nullable=True,
+    )
+    actor_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True,
+    )
+    actor_role: Mapped[str] = mapped_column(String(20), nullable=True)
+    # Free-form to allow new event types without migrations. Values
+    # in use: CREATED, SENT, ACCEPTED, MARKED_AVAILABLE,
+    # MARKED_POSTPONED, MARKED_NOT_AVAILABLE, POSTPONE_EXPIRED,
+    # REROUTED_FROM, REROUTED_TO, CANCELLED_BY_FARMER,
+    # TIMELINE_EXPIRED, PURCHASE_RECORDED.
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    prev_status: Mapped[str] = mapped_column(String(30), nullable=True)
+    new_status: Mapped[str] = mapped_column(String(30), nullable=True)
+    # SQLAlchemy reserves `metadata` on Base; keep this name.
+    event_metadata: Mapped[dict] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class PackingList(Base):
