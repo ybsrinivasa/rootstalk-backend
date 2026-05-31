@@ -4278,6 +4278,55 @@ async def _today_advisory_for_user(
         approved_items = approved_items_q.scalars().all()
         approved_ids: set[str] = {it.practice_id for it in approved_items}
 
+        # ── Orders V2 Batch 11: tappable per-practice fulfilment ──
+        # For each practice the farmer sees on the advisory, surface
+        # the latest live OrderItem status so the card can render a
+        # status badge ("Returned — tap to send elsewhere",
+        # "Postponed 3 days", "Ready for approval", etc.). We pick
+        # the most recently-touched non-terminal item per practice;
+        # REROUTED / REMOVED / archived rows are ignored — they're
+        # off the active surface by design.
+        active_items_q = await db.execute(
+            select(OrderItem, Order)
+            .join(Order, Order.id == OrderItem.order_id)
+            .where(
+                Order.subscription_id == sub.id,
+                Order.status.notin_(["CANCELLED", "EXPIRED"]),
+                OrderItem.status.notin_(["REROUTED", "REMOVED"]),
+                OrderItem.archived_at.is_(None),
+            )
+            .order_by(OrderItem.updated_at.desc())
+        )
+        # Take the first (most recent) row per practice_id.
+        fulfilment_by_practice: dict[str, dict] = {}
+        for it, ord_row in active_items_q.all():
+            if it.practice_id in fulfilment_by_practice:
+                continue
+            status_str = it.status.value if hasattr(it.status, "value") else it.status
+            # Brand/volume/price stay hidden until APPROVED — same
+            # rule as the farmer order detail; surfacing them
+            # earlier would break the dealer-mediation invariant.
+            show_money = status_str == "APPROVED"
+            days_remaining = None
+            if it.postponed_until:
+                from datetime import datetime as _dt, timezone as _tz
+                delta = it.postponed_until - _dt.now(_tz.utc)
+                days_remaining = max(0, delta.days)
+            fulfilment_by_practice[it.practice_id] = {
+                "status": status_str,
+                "order_id": ord_row.id,
+                "order_item_id": it.id,
+                "order_status": ord_row.status.value if hasattr(ord_row.status, "value") else ord_row.status,
+                "dealer_user_id": ord_row.dealer_user_id,
+                "facilitator_user_id": ord_row.facilitator_user_id,
+                "brand_name": it.brand_name if show_money else None,
+                "given_volume": float(it.given_volume) if (show_money and it.given_volume) else None,
+                "volume_unit": it.volume_unit if show_money else None,
+                "price": float(it.price) if (show_money and it.price) else None,
+                "postponed_until": it.postponed_until.isoformat() if it.postponed_until else None,
+                "postpone_days_remaining": days_remaining,
+            }
+
         active_tl_ids = {tl.id for tl, _, _ in active_timelines}
         context_tl_ids: set[str] = {
             it.timeline_id for it in approved_items
@@ -4381,6 +4430,12 @@ async def _today_advisory_for_user(
                         # all L0 types; PWA only acts on it for
                         # INPUT practices.
                         "is_purchased": p.id in approved_ids,
+                        # Orders V2 Batch 11 — tappable status. Null
+                        # when the practice has no live order item;
+                        # otherwise the latest active row's status +
+                        # the bits the farmer needs to decide what
+                        # to do next.
+                        "fulfilment": fulfilment_by_practice.get(p.id),
                         "elements": [{
                             "element_type": el.element_type,
                             "cosh_ref": _resolve(el.cosh_ref),
