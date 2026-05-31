@@ -802,7 +802,7 @@ async def dbs_bulk_preview(
         }
 
     all_dbs = await resolve_dbs_practices_for_category(
-        db, package_id=sub.package_id, category=category,
+        db, subscription=sub, category=category,
     )
     already = await already_ordered_practice_ids(db, sub.id)
     remaining = [pid for pid in all_dbs if pid not in already]
@@ -897,7 +897,7 @@ async def create_dbs_bulk_order(
 
     # Resolve practices. Drop the ones already in non-terminal orders.
     all_dbs = await resolve_dbs_practices_for_category(
-        db, package_id=sub.package_id, category=category,
+        db, subscription=sub, category=category,
     )
     if not all_dbs:
         raise HTTPException(
