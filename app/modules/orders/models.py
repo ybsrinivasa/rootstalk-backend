@@ -67,6 +67,12 @@ class Order(Base):
     status: Mapped[OrderStatus] = mapped_column(String(30), default=OrderStatus.DRAFT)
     locked_timelines: Mapped[list] = mapped_column(JSON, nullable=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Heartbeat lease — set by the dealer's app while they're on the
+    # order detail screen. Farmer cancel refuses while this is in the
+    # future. Each heartbeat extends by 30 s. NULL = not viewing.
+    dealer_viewing_until: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 

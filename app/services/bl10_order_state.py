@@ -50,17 +50,27 @@ _ORDER_TRANSITIONS: dict[tuple[str, str], frozenset[str]] = {
     ("SENT", "EXPIRED"):                  frozenset({SYSTEM}),
 
     ("ACCEPTED", "PROCESSING"):           frozenset({DEALER, FACILITATOR}),
+    ("ACCEPTED", "CANCELLED"):            frozenset({FARMER}),
     ("ACCEPTED", "EXPIRED"):              frozenset({SYSTEM}),
 
     # Dealer abort: reset to SENT so a different dealer can pick it up.
     ("PROCESSING", "SENT"):               frozenset({DEALER, FACILITATOR}),
     ("PROCESSING", "SENT_FOR_APPROVAL"):  frozenset({DEALER}),
+    ("PROCESSING", "CANCELLED"):          frozenset({FARMER}),
     ("PROCESSING", "EXPIRED"):            frozenset({SYSTEM}),
 
     # After farmer-side approvals; live router writes both edges from
     # `_update_order_status` based on the items' approval ratio.
     ("SENT_FOR_APPROVAL", "COMPLETED"):           frozenset({SYSTEM, FARMER}),
     ("SENT_FOR_APPROVAL", "PARTIALLY_APPROVED"):  frozenset({SYSTEM, FARMER}),
+    ("SENT_FOR_APPROVAL", "CANCELLED"):           frozenset({FARMER}),
+
+    # Orders V2 (2026-05-31): farmer keeps cancel rights through any
+    # non-terminal status. The live-presence lease on the Order row
+    # (dealer_viewing_until) is the only thing that blocks cancel at
+    # runtime; the state machine just records that the *edge* itself
+    # is the farmer's to take.
+    ("PARTIALLY_APPROVED", "CANCELLED"):          frozenset({FARMER}),
 
     # Edge cases observed in the live router that the table must allow:
     # - try_another_dealer can land back in PROCESSING from a partially

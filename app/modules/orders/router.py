@@ -423,9 +423,37 @@ async def cancel_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Farmer cancels an order.
+
+    Allowed at any non-terminal status (DRAFT, SENT, ACCEPTED,
+    PROCESSING, SENT_FOR_APPROVAL, PARTIALLY_APPROVED). The narrative
+    is explicit (2026-05-31): "It can be cancelled even if the dealer
+    has accepted it. The farmer cannot be left at the dealer's mercy."
+
+    The only block is a *live* presence lease: if the dealer's app is
+    heartbeating against this order right now (dealer_viewing_until in
+    the future), we 409. The dealer's lease extends ~30 s past their
+    last heartbeat, so a closed screen frees the lock quickly.
+    """
     order = await _get_farmer_order(db, order_id, current_user.id)
-    if order.status not in [OrderStatus.SENT, OrderStatus.DRAFT]:
-        raise HTTPException(status_code=400, detail="Can only cancel orders that have not been accepted by dealer")
+
+    terminal = {OrderStatus.COMPLETED, OrderStatus.CANCELLED, OrderStatus.EXPIRED}
+    if order.status in terminal:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Order is already {order.status.value if hasattr(order.status, 'value') else order.status}; nothing to cancel.",
+        )
+
+    now = datetime.now(timezone.utc)
+    if order.dealer_viewing_until and order.dealer_viewing_until > now:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "dealer_currently_viewing",
+                "message": "The dealer is reviewing this order right now. Try again in a minute.",
+            },
+        )
+
     order.status = OrderStatus.CANCELLED
     await db.commit()
     return {"status": order.status}
@@ -1184,6 +1212,37 @@ async def get_facilitator_order(
             }
             for i in items
         ],
+    }
+
+
+# ── Dealer: presence heartbeat (Orders V2 Batch 2) ─────────────────────────────
+#
+# The dealer's app calls this every ~20 s while the order detail
+# screen is mounted. Each call extends `dealer_viewing_until` by
+# ~30 s. The farmer's cancel endpoint refuses while that lease is
+# in the future — implementing the "farmer can't cancel while the
+# dealer is actively working with the order" rule from the
+# 2026-05-31 narrative. A closed screen frees the lease within 30 s.
+#
+# No FCM, no notification — silent on both sides; this is a backend
+# coordination signal only.
+
+_DEALER_VIEWING_LEASE_SECONDS = 30
+
+@router.put("/dealer/orders/{order_id}/heartbeat")
+async def dealer_heartbeat(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    order = await _get_dealer_order(db, order_id, current_user.id)
+    order.dealer_viewing_until = (
+        datetime.now(timezone.utc) + timedelta(seconds=_DEALER_VIEWING_LEASE_SECONDS)
+    )
+    await db.commit()
+    return {
+        "viewing_until": order.dealer_viewing_until.isoformat(),
+        "lease_seconds": _DEALER_VIEWING_LEASE_SECONDS,
     }
 
 
