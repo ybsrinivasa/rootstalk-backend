@@ -730,6 +730,244 @@ class OrderSend(BaseModel):
     facilitator_user_id: Optional[str] = None
 
 
+class DBSBulkCreate(BaseModel):
+    """DBS bulk order — the farmer doesn't pick items or a date
+    range. Server resolves every DBS practice of the chosen category
+    in the package, filters out already-ordered ones, and creates
+    the order under a synthesised date window the farmer never sees."""
+    subscription_id: str
+    client_id: str
+    category: str  # PESTICIDE | FERTILIZER
+    dealer_user_id: Optional[str] = None
+    facilitator_user_id: Optional[str] = None
+    farm_area_acres: Optional[float] = None
+    area_unit: Optional[str] = None
+
+
+@router.post("/farmer/orders/dbs-bulk", status_code=201)
+async def create_dbs_bulk_order(
+    request: DBSBulkCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Farmer places a DBS bulk order — pre-sowing pesticides or
+    fertilizers, no date range, no item selection.
+
+    Per the DBS V1 carve-out (2026-05-31):
+      - Annual packages only (Perennial has no DBS units).
+      - `crop_start_date IS NULL OR crop_start_date > today`
+        (today/past closes DBS — BL-04a step 5).
+      - One bulk order per category unless the package has DBS
+        practices not yet covered by an existing non-terminal
+        order on this subscription.
+      - Synthesised date range: today → (crop_start − 1) if start
+        is set, else today + 365 days. Not surfaced anywhere.
+      - Reuses every other piece — locked-brand gate, CREATED
+        events, snapshots, lock cascades — same as
+        `create_order`.
+    """
+    from datetime import date as _date
+    from app.services.order_bundle import (
+        resolve_dbs_practices_for_category, already_ordered_practice_ids,
+    )
+
+    if request.category.upper() not in ("PESTICIDE", "FERTILIZER"):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown category {request.category!r}. Use PESTICIDE or FERTILIZER.",
+        )
+    category = request.category.upper()
+
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == request.subscription_id,
+            Subscription.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    # Annual-only gate.
+    package = (await db.execute(
+        select(Package).where(Package.id == sub.package_id)
+    )).scalar_one_or_none()
+    if not package:
+        raise HTTPException(status_code=404, detail="Package not found")
+    pkg_type = package.package_type.value if hasattr(package.package_type, "value") else str(package.package_type)
+    if pkg_type != "ANNUAL":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "dbs_not_supported_for_perennial",
+                "message": "Pre-sowing inputs are only available for Annual packages.",
+            },
+        )
+
+    # DBS window check — BL-04a step 5.
+    today = _date.today()
+    if sub.crop_start_date is not None:
+        crop_start_d = sub.crop_start_date.date() if hasattr(sub.crop_start_date, "date") else sub.crop_start_date
+        if crop_start_d <= today:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "dbs_window_closed",
+                    "message": "Pre-sowing input ordering closes on the crop start date.",
+                },
+            )
+
+    # Resolve practices. Drop the ones already in non-terminal orders.
+    all_dbs = await resolve_dbs_practices_for_category(
+        db, package_id=sub.package_id, category=category,
+    )
+    if not all_dbs:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "no_dbs_practices_in_package",
+                "message": f"This package has no pre-sowing {category.lower()} practices.",
+            },
+        )
+    already = await already_ordered_practice_ids(db, sub.id)
+    practice_ids = [pid for pid in all_dbs if pid not in already]
+    if not practice_ids:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "nothing_to_order",
+                "message": "All pre-sowing inputs in this category are already in another order.",
+            },
+        )
+
+    # Locked-brand gate.
+    has_locked = await _practice_ids_have_locked_brand(db, practice_ids)
+    if has_locked:
+        if request.facilitator_user_id:
+            # User's 2026-05-31 correction: farmer CAN send locked-brand
+            # to a facilitator (farmer can't see what's locked anyway).
+            # The facilitator's onward picker enforces the onboarded-
+            # dealer rule. So this branch stays permissive.
+            pass
+        elif request.dealer_user_id and not await _is_dealer_onboarded_by_client(
+            db, request.dealer_user_id, request.client_id,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "locked_brand_requires_onboarded_dealer",
+                    "message": "This order has a brand-locked item. It can only be sent to a dealer onboarded by the company.",
+                },
+            )
+
+    # Acreage hard-lock on first DAS order doesn't apply here —
+    # DBS doesn't depend on area for volume calc. But we still
+    # honour an incoming acreage value when supplied.
+    if request.farm_area_acres and not sub.farm_area_acres:
+        sub.farm_area_acres = request.farm_area_acres
+        sub.area_unit = request.area_unit or sub.area_unit or "acres"
+
+    # Synthesised date range. Hidden from the farmer + facilitator;
+    # the dealer eventually sees it as a fallback window. See memory
+    # `project_rootstalk_dbs_v1.md` for the carve-out rationale.
+    synth_from = datetime.now(timezone.utc)
+    if sub.crop_start_date is not None:
+        crop_start_d = sub.crop_start_date.date() if hasattr(sub.crop_start_date, "date") else sub.crop_start_date
+        synth_to = datetime.combine(
+            crop_start_d - timedelta(days=1),
+            datetime.min.time(),
+            tzinfo=timezone.utc,
+        )
+    else:
+        synth_to = synth_from + timedelta(days=365)
+
+    order = Order(
+        subscription_id=request.subscription_id,
+        farmer_user_id=current_user.id,
+        client_id=request.client_id,
+        category=category,
+        dealer_user_id=request.dealer_user_id,
+        facilitator_user_id=request.facilitator_user_id,
+        date_from=synth_from,
+        date_to=synth_to,
+        status=OrderStatus.SENT,
+        expires_at=datetime.now(timezone.utc) + timedelta(days=14),
+    )
+    db.add(order)
+    await db.flush()
+
+    # Snapshot the DBS practices' timelines so SE edits after order
+    # placement don't leak into the dealer's view (same Phase 3.2
+    # contract as create_order).
+    practice_rows = (await db.execute(
+        select(Practice).where(Practice.id.in_(practice_ids))
+    )).scalars().all()
+    tl_ids = {p.timeline_id for p in practice_rows if p.timeline_id}
+
+    from app.services.snapshot import take_snapshot
+    snap_id_by_tl: dict[str, Optional[str]] = {}
+    for tl_id in tl_ids:
+        try:
+            snap = await take_snapshot(
+                db, request.subscription_id, tl_id, "PURCHASE_ORDER", source="CCA",
+            )
+            snap_id_by_tl[tl_id] = snap.id
+        except Exception:
+            snap_id_by_tl[tl_id] = None
+
+    practice_by_id = {p.id: p for p in practice_rows}
+    new_items: list[OrderItem] = []
+    for pid in practice_ids:
+        p = practice_by_id.get(pid)
+        if not p:
+            continue
+        relation_type = None
+        if p.relation_id:
+            from app.modules.advisory.models import Relation
+            rel = (await db.execute(
+                select(Relation).where(Relation.id == p.relation_id)
+            )).scalar_one_or_none()
+            if rel:
+                relation_type = rel.relation_type.value if hasattr(rel.relation_type, "value") else str(rel.relation_type)
+        new_item = OrderItem(
+            order_id=order.id,
+            practice_id=pid,
+            timeline_id=p.timeline_id,
+            relation_id=p.relation_id,
+            relation_type=relation_type,
+            relation_role=p.relation_role,
+            snapshot_id=snap_id_by_tl.get(p.timeline_id),
+            status=OrderItemStatus.PENDING,
+        )
+        db.add(new_item)
+        new_items.append(new_item)
+    await db.flush()
+
+    for it in new_items:
+        await _record_event(
+            db,
+            lineage_id=it.lineage_id,
+            event_type="CREATED",
+            actor_user_id=current_user.id, actor_role="FARMER",
+            order_id=order.id, order_item_id=it.id,
+            prev_status=None, new_status=OrderItemStatus.PENDING.value,
+            metadata={
+                "practice_id": it.practice_id,
+                "category": category,
+                "dbs_bulk": True,
+            },
+        )
+
+    await db.commit()
+    await db.refresh(order)
+    return {
+        "id": order.id,
+        "status": order.status,
+        "item_count": len(new_items),
+        "category": category,
+        "is_dbs_bulk": True,
+    }
+
+
 @router.put("/farmer/orders/{order_id}/send")
 async def send_draft_order(
     order_id: str,

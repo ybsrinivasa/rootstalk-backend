@@ -100,6 +100,52 @@ def windows_overlap(
     return a_lo <= b_hi and b_lo <= a_hi
 
 
+async def resolve_dbs_practices_for_category(
+    db: AsyncSession, *, package_id: str, category: str,
+) -> list[str]:
+    """Return all DBS practice IDs in this package that match the
+    category's L1 set and survive the L2 exclude list. Used by the
+    DBS bulk-order endpoint where the farmer doesn't pick items —
+    the server resolves them from the package's DBS timelines.
+
+    BL-04a context: DBS practices live on timelines with
+    `from_type == DBS`. We don't filter by date window here — the
+    bulk order takes EVERY DBS practice of this category that
+    isn't already in another order. The caller layers the
+    "already-ordered" filter on top.
+    """
+    from app.modules.advisory.models import Practice, Timeline
+
+    l1_allowed = l1_set_for_category(category)
+    l2_excluded = l2_exclude_for_category(category)
+    if not l1_allowed:
+        return []
+
+    rows = (await db.execute(
+        select(Practice.id)
+        .join(Timeline, Timeline.id == Practice.timeline_id)
+        .where(
+            Timeline.package_id == package_id,
+            Timeline.from_type == "DBS",
+            Practice.l0_type == "INPUT",
+            Practice.l1_type.in_(list(l1_allowed)),
+        )
+    )).all()
+
+    practice_ids = [r[0] for r in rows]
+    if not l2_excluded:
+        return practice_ids
+    # Apply the L2 exclude in a follow-up filter so the SQL stays
+    # portable across the IN ([...]) shape above.
+    filt = (await db.execute(
+        select(Practice.id).where(
+            Practice.id.in_(practice_ids),
+            Practice.l2_type.notin_(list(l2_excluded)),
+        )
+    )).all()
+    return [r[0] for r in filt]
+
+
 async def already_ordered_practice_ids(
     db: AsyncSession, subscription_id: str,
 ) -> set[str]:

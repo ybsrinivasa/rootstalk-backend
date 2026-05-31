@@ -1492,6 +1492,50 @@ async def set_start_date(
             order.date_from = order.date_from + timedelta(days=delta_days)
             order.date_to = order.date_to + timedelta(days=delta_days)
 
+    # DBS V1 sync-close: when the new start_date is today or in the
+    # past, BL-04a step 5 says all DBS practices are removed at
+    # midnight UTC of crop_start_date. The hourly timeline-archive
+    # sweep catches this naturally, but the farmer expects the order
+    # to "end immediately" on a start-date advance — so we mirror
+    # the archive synchronously here. See memory
+    # `project_rootstalk_dbs_v1.md`.
+    if new_start <= today:
+        from app.services.order_events import record_event as _record_event
+        dbs_tl_ids = {
+            tl.id for tl in timelines
+            if (tl.from_type.value if hasattr(tl.from_type, 'value') else str(tl.from_type)) == "DBS"
+        }
+        if dbs_tl_ids and orders:
+            close_statuses = [
+                OrderItemStatus.PENDING,
+                OrderItemStatus.POSTPONED,
+                OrderItemStatus.NOT_AVAILABLE,
+            ]
+            dbs_items = (await db.execute(
+                select(OrderItem).where(
+                    OrderItem.order_id.in_([o.id for o in orders]),
+                    OrderItem.timeline_id.in_(dbs_tl_ids),
+                    OrderItem.archived_at.is_(None),
+                    OrderItem.status.in_(close_statuses),
+                )
+            )).scalars().all()
+            from datetime import datetime as _dt2, timezone as _tz2
+            now_ts = _dt2.now(_tz2.utc)
+            for item in dbs_items:
+                item.archived_at = now_ts
+                prev = item.status.value if hasattr(item.status, "value") else item.status
+                await _record_event(
+                    db,
+                    lineage_id=item.lineage_id,
+                    event_type="TIMELINE_EXPIRED",
+                    actor_role="SYSTEM",
+                    order_id=item.order_id,
+                    order_item_id=item.id,
+                    prev_status=prev,
+                    new_status=None,
+                    metadata={"reason": "dbs_start_date_advanced"},
+                )
+
     # BL-05b step 7: for dealer-postponed items whose timeline shifted,
     # the dealer's `postponed_until` must also shift by `delta_days`.
     # CHA / SP / PG / QA timelines are anchored to triggered_at and do
