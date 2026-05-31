@@ -108,6 +108,18 @@ _ITEM_TRANSITIONS: dict[tuple[str, str], frozenset[str]] = {
     ("NOT_AVAILABLE", "SKIPPED"):            frozenset({FARMER}),
     ("REJECTED", "PENDING"):                 frozenset({FARMER}),
 
+    # Orders V2 (2026-05-31): the bundled re-route and cancel-migrate
+    # flows stamp items REROUTED on the source order while creating
+    # fresh rows on a new DRAFT. The handlers don't currently route
+    # through validate_item_transition, but listing the edges keeps
+    # the table honest for any future state-machine-routed caller.
+    ("PENDING", "REROUTED"):                 frozenset({FARMER}),
+    ("AVAILABLE", "REROUTED"):               frozenset({FARMER}),
+    ("POSTPONED", "REROUTED"):               frozenset({FARMER}),
+    ("NOT_AVAILABLE", "REROUTED"):           frozenset({FARMER}),
+    ("SENT_FOR_APPROVAL", "REROUTED"):       frozenset({FARMER}),
+    ("REJECTED", "REROUTED"):                frozenset({FARMER}),
+
     # Pre-approval housekeeping.
     ("PENDING", "REMOVED"):                  frozenset({FARMER}),
     ("AVAILABLE", "REMOVED"):                frozenset({FARMER}),

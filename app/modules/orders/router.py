@@ -2220,6 +2220,140 @@ async def remove_order_item(
     return {"item_id": item_id, "status": item.status}
 
 
+@router.post("/farmer/orders/{order_id}/reroute-returned", status_code=201)
+async def reroute_returned_items(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Orders V2 Batch 10 — bundled re-route of Returned/Rejected/
+    Postponed items into a fresh DRAFT.
+
+    The 2026-05-31 narrative (FU-9): farmer doesn't see item names,
+    only the dealer does. Three returned items = ONE re-route
+    action, not three. The picker on the DRAFT lets the farmer
+    pick a new recipient and ship them all together.
+
+    Eligible item statuses:
+      - NOT_AVAILABLE (dealer said no, including postpone-expiry
+        auto-flips)
+      - REJECTED (farmer rejected the dealer's brand/price)
+      - POSTPONED (farmer can pull the plug early — narrative:
+        "Postponed items can also be cancelled and forwarded")
+
+    Each migrated item keeps its `lineage_id` so the audit trail is
+    a single thread through the dealer hops. Original rows stay on
+    the source order as REROUTED so reports still see what each
+    leg's dealer did. The source order's status recomputes via
+    `_update_order_status` so a fully-fulfilled-minus-returns order
+    can move on cleanly.
+    """
+    order = await _get_farmer_order(db, order_id, current_user.id)
+
+    reroutable = {
+        OrderItemStatus.NOT_AVAILABLE,
+        OrderItemStatus.REJECTED,
+        OrderItemStatus.POSTPONED,
+    }
+    items_q = await db.execute(
+        select(OrderItem).where(
+            OrderItem.order_id == order.id,
+            OrderItem.archived_at.is_(None),
+        )
+    )
+    items_to_reroute = [it for it in items_q.scalars().all() if it.status in reroutable]
+    if not items_to_reroute:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "nothing_to_reroute",
+                "message": "No items in this order need re-routing.",
+            },
+        )
+
+    new_draft = Order(
+        subscription_id=order.subscription_id,
+        farmer_user_id=order.farmer_user_id,
+        client_id=order.client_id,
+        category=order.category,
+        date_from=order.date_from,
+        date_to=order.date_to,
+        status=OrderStatus.DRAFT,
+        dealer_user_id=None,
+        facilitator_user_id=None,
+        locked_timelines=order.locked_timelines,
+        expires_at=order.expires_at,
+    )
+    db.add(new_draft)
+    await db.flush()
+
+    for it in items_to_reroute:
+        prev_status = it.status.value if hasattr(it.status, "value") else it.status
+
+        # Reset brand/volume/price — the next dealer will fill these
+        # afresh. Keep timeline/snapshot/relation so the advisory
+        # context survives the leg.
+        new_item = OrderItem(
+            order_id=new_draft.id,
+            practice_id=it.practice_id,
+            timeline_id=it.timeline_id,
+            brand_cosh_id=None,
+            brand_name=None,
+            given_volume=None,
+            volume_unit=it.volume_unit,
+            price=None,
+            estimated_volume=it.estimated_volume,
+            relation_id=it.relation_id,
+            relation_type=it.relation_type,
+            relation_role=it.relation_role,
+            scan_verified=False,
+            status=OrderItemStatus.PENDING,
+            snapshot_id=it.snapshot_id,
+            lineage_id=it.lineage_id,
+        )
+        db.add(new_item)
+        await db.flush()
+
+        await _record_event(
+            db, lineage_id=it.lineage_id,
+            event_type="REROUTED_FROM",
+            actor_user_id=current_user.id, actor_role="FARMER",
+            order_id=order.id, order_item_id=it.id,
+            prev_status=prev_status,
+            new_status=OrderItemStatus.REROUTED.value,
+            metadata={
+                "to_order_id": new_draft.id,
+                "to_order_item_id": new_item.id,
+                "reason": "bundled_reroute",
+            },
+        )
+        await _record_event(
+            db, lineage_id=it.lineage_id,
+            event_type="REROUTED_TO",
+            actor_user_id=current_user.id, actor_role="FARMER",
+            order_id=new_draft.id, order_item_id=new_item.id,
+            prev_status=OrderItemStatus.REROUTED.value,
+            new_status=OrderItemStatus.PENDING.value,
+            metadata={
+                "from_order_id": order.id,
+                "from_order_item_id": it.id,
+                "reason": "bundled_reroute",
+            },
+        )
+
+        it.status = OrderItemStatus.REROUTED
+
+    # Source order's status may now be e.g. COMPLETED if every
+    # remaining (non-REROUTED) item is APPROVED.
+    await _update_order_status(db, order.id)
+
+    await db.commit()
+    return {
+        "new_draft_order_id": new_draft.id,
+        "rerouted_count": len(items_to_reroute),
+    }
+
+
 @router.put("/farmer/orders/{order_id}/items/{item_id}/try-another-dealer")
 async def try_another_dealer(
     order_id: str, item_id: str,
