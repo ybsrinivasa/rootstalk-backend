@@ -404,6 +404,11 @@ async def get_farmer_order_detail(
         "created_at": order.created_at,
         "dealer_user_id": order.dealer_user_id,
         "facilitator_user_id": order.facilitator_user_id,
+        # Surface subscription_id + category so the DRAFT picker on
+        # /orders/[orderId] can fetch eligible recipients without an
+        # extra round-trip.
+        "subscription_id": order.subscription_id,
+        "category": order.category,
         "items": [
             {
                 "id": i.id, "practice_id": i.practice_id, "status": i.status,
@@ -628,6 +633,132 @@ async def delete_cancelled_order(
     await db.delete(order)
     await db.commit()
     return {"deleted": True}
+
+
+class OrderSend(BaseModel):
+    dealer_user_id: Optional[str] = None
+    facilitator_user_id: Optional[str] = None
+
+
+@router.put("/farmer/orders/{order_id}/send")
+async def send_draft_order(
+    order_id: str,
+    body: OrderSend,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Farmer assigns a recipient to a DRAFT order and sends it.
+
+    The Orders V2 (2026-05-31) cancel flow leaves the farmer holding
+    a DRAFT with no recipient — the migrated items keep their
+    `lineage_id`, the farmer picks a new dealer or facilitator here,
+    and the order flips DRAFT → SENT.
+
+    Validation (Batch 4 — locked-brand gate lands in Batch 5):
+      - Order must be DRAFT.
+      - Exactly one of `dealer_user_id` / `facilitator_user_id`.
+      - Dealer: ACTIVE + sell_categories includes order.category.
+      - Facilitator: ACTIVE. No category check (they only route).
+
+    Emits a SENT event per item plus an order-level SENT event so
+    reports can date the leg without joining item events.
+    """
+    order = await _get_farmer_order(db, order_id, current_user.id)
+    if order.status != OrderStatus.DRAFT:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "not_a_draft",
+                "message": "Only DRAFT orders can be sent. Cancel the order first if you want to re-route it.",
+            },
+        )
+
+    if bool(body.dealer_user_id) == bool(body.facilitator_user_id):
+        raise HTTPException(
+            status_code=422,
+            detail="Pick exactly one — dealer or facilitator.",
+        )
+
+    # ── Recipient gates ──────────────────────────────────────────
+    if body.dealer_user_id:
+        await _assert_active_dealer(db, body.dealer_user_id)
+        profile = (await db.execute(
+            select(DealerProfile).where(DealerProfile.user_id == body.dealer_user_id)
+        )).scalar_one_or_none()
+        if not profile:
+            raise HTTPException(status_code=404, detail="Dealer profile not found")
+        # Category match. sell_categories stores PLURALS
+        # (PESTICIDES / FERTILISERS / SEEDS) per legacy convention.
+        cat_to_plural = {"PESTICIDE": "PESTICIDES", "FERTILIZER": "FERTILISERS"}
+        required = cat_to_plural.get(order.category or "")
+        if required and required not in (profile.sell_categories or []):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "dealer_licence_mismatch",
+                    "message": f"This dealer doesn't hold a {order.category} licence.",
+                },
+            )
+        order.dealer_user_id = body.dealer_user_id
+        order.facilitator_user_id = None
+    else:
+        await _assert_active_facilitator(db, body.facilitator_user_id)
+        order.facilitator_user_id = body.facilitator_user_id
+        order.dealer_user_id = None
+
+    # ── Flip + audit ─────────────────────────────────────────────
+    order.status = OrderStatus.SENT
+    # Refresh the 14-day expiry from the moment of send — the
+    # original draft's clock isn't fair to a recipient who only
+    # just got the order.
+    order.expires_at = datetime.now(timezone.utc) + timedelta(days=14)
+
+    items_q = await db.execute(
+        select(OrderItem).where(
+            OrderItem.order_id == order.id,
+            OrderItem.status == OrderItemStatus.PENDING,
+        )
+    )
+    items = items_q.scalars().all()
+    for it in items:
+        await _record_event(
+            db,
+            lineage_id=it.lineage_id,
+            event_type="SENT",
+            actor_user_id=current_user.id,
+            actor_role="FARMER",
+            order_id=order.id,
+            order_item_id=it.id,
+            prev_status=OrderItemStatus.PENDING.value,
+            new_status=OrderItemStatus.PENDING.value,
+            metadata={
+                "dealer_user_id": order.dealer_user_id,
+                "facilitator_user_id": order.facilitator_user_id,
+            },
+        )
+
+    await _record_event(
+        db,
+        lineage_id=order.id,
+        event_type="SENT",
+        actor_user_id=current_user.id,
+        actor_role="FARMER",
+        order_id=order.id,
+        prev_status=OrderStatus.DRAFT.value,
+        new_status=OrderStatus.SENT.value,
+        metadata={
+            "dealer_user_id": order.dealer_user_id,
+            "facilitator_user_id": order.facilitator_user_id,
+            "item_count": len(items),
+        },
+    )
+
+    await db.commit()
+    return {
+        "status": order.status,
+        "dealer_user_id": order.dealer_user_id,
+        "facilitator_user_id": order.facilitator_user_id,
+    }
 
 
 @router.put("/farmer/orders/{order_id}/items/{item_id}/approve")

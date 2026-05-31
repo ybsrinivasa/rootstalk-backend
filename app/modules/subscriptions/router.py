@@ -4575,8 +4575,16 @@ async def nearby_dealers_for_farmer(
 
     promoter_user_id = await _get_promoter(db, subscription_id, PromoterType.DEALER)
 
-    category_map = {"PESTICIDE": "PESTICIDES", "FERTILISER": "FERTILISERS", "SEED": "SEEDS"}
-    required_cat = category_map.get(order_type or "") if order_type else None
+    # Accept both spellings (FERTILISER, FERTILIZER) — the rest of the
+    # platform is mixed and the Orders V2 redesign standardises on
+    # FERTILIZER, but legacy callers still send FERTILISER.
+    category_map = {
+        "PESTICIDE": "PESTICIDES",
+        "FERTILISER": "FERTILISERS",
+        "FERTILIZER": "FERTILISERS",
+        "SEED": "SEEDS",
+    }
+    required_cat = category_map.get((order_type or "").upper()) if order_type else None
 
     profiles = (await db.execute(select(DealerProfile))).scalars().all()
     results = []

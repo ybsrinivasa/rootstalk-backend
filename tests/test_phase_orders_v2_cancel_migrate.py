@@ -27,10 +27,14 @@ from app.modules.orders.models import (
     Order, OrderItem, OrderItemEvent,
     OrderItemStatus, OrderStatus,
 )
-from app.modules.orders.router import cancel_order, delete_cancelled_order
+from app.modules.orders.router import (
+    cancel_order, delete_cancelled_order, send_draft_order, OrderSend,
+)
+from app.modules.orders.models import DealerProfile
 from tests.conftest import requires_docker
 from tests.factories import (
-    make_client, make_package, make_practice, make_subscription,
+    make_client, make_onboarded_dealer, make_onboarded_facilitator,
+    make_package, make_practice, make_subscription,
     make_timeline, make_user,
 )
 
@@ -179,3 +183,130 @@ async def test_delete_non_cancelled_order_refused(db):
     assert exc.value.status_code == 400
     detail = exc.value.detail
     assert isinstance(detail, dict) and detail["code"] == "must_cancel_first"
+
+
+# ── Batch 4: send DRAFT to a new recipient ──────────────────────────────────
+
+
+async def _draft_with_recipient_setup(db):
+    """Setup helper — farmer, SENT order, cancel → DRAFT, plus an
+    eligible dealer (with PESTICIDES licence) and a facilitator."""
+    user, order, item = await _make_sent_order_with_item(db)
+    cancel_result = await cancel_order(order_id=order.id, db=db, current_user=user)
+    draft_id = cancel_result["new_draft_order_id"]
+    draft = (await db.execute(select(Order).where(Order.id == draft_id))).scalar_one()
+
+    dealer = await make_onboarded_dealer(db, name="Eligible Dealer")
+    # DealerProfile is what sell_categories lives on.
+    db.add(DealerProfile(
+        user_id=dealer.id, shop_name="ShopA",
+        sell_categories=["PESTICIDES"],
+        shop_gps_lat=12.0, shop_gps_lng=77.0,
+    ))
+    fac = await make_onboarded_facilitator(db, name="Eligible Facilitator")
+    await db.commit()
+
+    return user, draft, dealer, fac
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_send_draft_to_eligible_dealer(db):
+    user, draft, dealer, _ = await _draft_with_recipient_setup(db)
+
+    result = await send_draft_order(
+        order_id=draft.id,
+        body=OrderSend(dealer_user_id=dealer.id),
+        db=db, current_user=user,
+    )
+
+    assert result["status"] == OrderStatus.SENT
+    assert result["dealer_user_id"] == dealer.id
+    assert result["facilitator_user_id"] is None
+
+    await db.refresh(draft)
+    assert draft.status == OrderStatus.SENT
+    assert draft.dealer_user_id == dealer.id
+
+    # SENT events: one per item + one order-level.
+    events = (await db.execute(
+        select(OrderItemEvent).where(OrderItemEvent.event_type == "SENT")
+    )).scalars().all()
+    assert len([e for e in events if e.order_id == draft.id]) >= 2
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_send_draft_to_facilitator(db):
+    user, draft, _, fac = await _draft_with_recipient_setup(db)
+
+    result = await send_draft_order(
+        order_id=draft.id,
+        body=OrderSend(facilitator_user_id=fac.id),
+        db=db, current_user=user,
+    )
+
+    assert result["status"] == OrderStatus.SENT
+    assert result["facilitator_user_id"] == fac.id
+    assert result["dealer_user_id"] is None
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_send_refuses_dealer_without_matching_licence(db):
+    user, draft, _, _ = await _draft_with_recipient_setup(db)
+    # A fresh dealer with FERTILISERS only — no PESTICIDES on file.
+    wrong_dealer = await make_onboarded_dealer(db, name="Wrong Cat")
+    db.add(DealerProfile(
+        user_id=wrong_dealer.id, shop_name="ShopB",
+        sell_categories=["FERTILISERS"],
+        shop_gps_lat=12.0, shop_gps_lng=77.0,
+    ))
+    await db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await send_draft_order(
+            order_id=draft.id,
+            body=OrderSend(dealer_user_id=wrong_dealer.id),
+            db=db, current_user=user,
+        )
+    assert exc.value.status_code == 409
+    detail = exc.value.detail
+    assert isinstance(detail, dict) and detail["code"] == "dealer_licence_mismatch"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_send_refuses_when_both_recipients_set(db):
+    user, draft, dealer, fac = await _draft_with_recipient_setup(db)
+
+    with pytest.raises(HTTPException) as exc:
+        await send_draft_order(
+            order_id=draft.id,
+            body=OrderSend(dealer_user_id=dealer.id, facilitator_user_id=fac.id),
+            db=db, current_user=user,
+        )
+    assert exc.value.status_code == 422
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_send_refuses_non_draft_order(db):
+    user, sent_order, _ = await _make_sent_order_with_item(db)
+    dealer = await make_onboarded_dealer(db, name="Late Dealer")
+    db.add(DealerProfile(
+        user_id=dealer.id, shop_name="ShopC",
+        sell_categories=["PESTICIDES"],
+        shop_gps_lat=12.0, shop_gps_lng=77.0,
+    ))
+    await db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await send_draft_order(
+            order_id=sent_order.id,
+            body=OrderSend(dealer_user_id=dealer.id),
+            db=db, current_user=user,
+        )
+    assert exc.value.status_code == 400
+    detail = exc.value.detail
+    assert isinstance(detail, dict) and detail["code"] == "not_a_draft"
