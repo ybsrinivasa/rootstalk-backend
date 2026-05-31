@@ -173,9 +173,11 @@ class OrderItemEvent(Base):
     order_item_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("order_items.id", ondelete="SET NULL"), nullable=True,
     )
-    seed_order_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("seed_orders.id", ondelete="SET NULL"), nullable=True,
-    )
+    # Batch 12 (f1c4d7b25e88) dropped the FK: the live seed flow uses
+    # `seed_orders_full`, not `seed_orders` — pointing at one or the
+    # other would lock us out of the other. Plain UUID; lineage_id
+    # is the primary lookup anyway.
+    seed_order_id: Mapped[str] = mapped_column(String(36), nullable=True)
     order_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("orders.id", ondelete="SET NULL"), nullable=True,
     )

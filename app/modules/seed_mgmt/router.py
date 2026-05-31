@@ -1,5 +1,7 @@
 from typing import Optional
+from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -602,18 +604,187 @@ async def reject_seed_order(
     return {"id": order_id, "status": order.status}
 
 
+_SEED_POSTPONE_MAX_DAYS = 14
+"""Hard cap on dealer-postpone days for seed orders.
+
+Seeds aren't on a timeline so we can't compute "remaining window − 1"
+the way pesticide / fertiliser items do. 14 days keeps a dealer
+from sitting on a seed order indefinitely while giving them a
+realistic restock window. (2026-05-31 narrative, Batch 12 carve-out.)
+"""
+
+
 @router.put("/farmer/seed-orders/{order_id}/cancel")
 async def cancel_seed_order(
     order_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Farmer cancels a seed order and migrates it to a fresh DRAFT.
+
+    Orders V2 (2026-05-31) parity: seeds get the same cancel-and-
+    migrate flow as pesticide / fertiliser items. The husk goes
+    CANCELLED + REROUTED; a new DRAFT row inherits the same
+    `lineage_id`, the variety, quantity and unit, and waits for the
+    farmer to pick a new recipient via `/farmer/seed-orders/{id}/send`.
+    """
+    from app.services.order_events import record_event as _record_event
+
     order = await _get_seed_order(db, order_id, current_user.id, farmer=True)
-    if order.status not in [SeedOrderStatus.SENT, SeedOrderStatus.ACCEPTED]:
-        raise HTTPException(status_code=400, detail="Cannot cancel order in current status")
+    terminal = {
+        SeedOrderStatus.CANCELLED, SeedOrderStatus.PURCHASED,
+        SeedOrderStatus.REROUTED,
+    }
+    if order.status in terminal:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Order is already {order.status}; nothing to cancel.",
+        )
+
+    prev_status = order.status
+
+    new_draft = SeedOrderFull(
+        subscription_id=order.subscription_id,
+        farmer_user_id=order.farmer_user_id,
+        variety_id=order.variety_id,
+        client_id=order.client_id,
+        dealer_user_id=None,
+        facilitator_user_id=None,
+        unit=order.unit,
+        quantity=order.quantity,
+        total_price=None,  # reset — next dealer prices afresh
+        status=SeedOrderStatus.DRAFT,
+        lineage_id=order.lineage_id,
+    )
+    db.add(new_draft)
+    await db.flush()
+
+    await _record_event(
+        db, lineage_id=order.lineage_id,
+        event_type="REROUTED_FROM",
+        actor_user_id=current_user.id, actor_role="FARMER",
+        seed_order_id=order.id,
+        prev_status=prev_status,
+        new_status=SeedOrderStatus.REROUTED.value,
+        metadata={
+            "to_seed_order_id": new_draft.id,
+            "reason": "seed_cancel_migrate",
+        },
+    )
+    await _record_event(
+        db, lineage_id=order.lineage_id,
+        event_type="REROUTED_TO",
+        actor_user_id=current_user.id, actor_role="FARMER",
+        seed_order_id=new_draft.id,
+        prev_status=SeedOrderStatus.REROUTED.value,
+        new_status=SeedOrderStatus.DRAFT.value,
+        metadata={
+            "from_seed_order_id": order.id,
+            "reason": "seed_cancel_migrate",
+        },
+    )
+    await _record_event(
+        db, lineage_id=order.id,  # husk-level event keyed on husk.id
+        event_type="CANCELLED_BY_FARMER",
+        actor_user_id=current_user.id, actor_role="FARMER",
+        seed_order_id=order.id,
+        prev_status=prev_status,
+        new_status=SeedOrderStatus.CANCELLED.value,
+        metadata={"new_draft_seed_order_id": new_draft.id},
+    )
+
     order.status = SeedOrderStatus.CANCELLED
     await db.commit()
-    return {"id": order_id, "status": order.status}
+    return {
+        "id": order_id,
+        "status": order.status,
+        "new_draft_seed_order_id": new_draft.id,
+    }
+
+
+@router.delete("/farmer/seed-orders/{order_id}")
+async def delete_cancelled_seed_order(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Drop a CANCELLED seed-order husk. Mirrors the pesticide /
+    fertiliser DELETE on `/farmer/orders/{id}`."""
+    order = await _get_seed_order(db, order_id, current_user.id, farmer=True)
+    if order.status != SeedOrderStatus.CANCELLED:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "must_cancel_first",
+                "message": "Only cancelled seed orders can be deleted.",
+            },
+        )
+    await db.delete(order)
+    await db.commit()
+    return {"deleted": True}
+
+
+class SeedOrderSend(BaseModel):
+    dealer_user_id: Optional[str] = None
+    facilitator_user_id: Optional[str] = None
+
+
+@router.put("/farmer/seed-orders/{order_id}/send")
+async def send_draft_seed_order(
+    order_id: str,
+    body: SeedOrderSend,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Assign a recipient to a DRAFT seed order and send it."""
+    from app.modules.orders.router import (
+        _assert_active_dealer, _assert_active_facilitator,
+    )
+    from app.services.order_events import record_event as _record_event
+
+    order = await _get_seed_order(db, order_id, current_user.id, farmer=True)
+    if order.status != SeedOrderStatus.DRAFT:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "not_a_draft",
+                "message": "Only DRAFT seed orders can be sent.",
+            },
+        )
+    if bool(body.dealer_user_id) == bool(body.facilitator_user_id):
+        raise HTTPException(
+            status_code=422,
+            detail="Pick exactly one — dealer or facilitator.",
+        )
+
+    if body.dealer_user_id:
+        await _assert_active_dealer(db, body.dealer_user_id)
+        order.dealer_user_id = body.dealer_user_id
+        order.facilitator_user_id = None
+    else:
+        await _assert_active_facilitator(db, body.facilitator_user_id)
+        order.facilitator_user_id = body.facilitator_user_id
+        order.dealer_user_id = None
+
+    order.status = SeedOrderStatus.SENT
+    await _record_event(
+        db, lineage_id=order.lineage_id,
+        event_type="SENT",
+        actor_user_id=current_user.id, actor_role="FARMER",
+        seed_order_id=order.id,
+        prev_status=SeedOrderStatus.DRAFT.value,
+        new_status=SeedOrderStatus.SENT.value,
+        metadata={
+            "dealer_user_id": order.dealer_user_id,
+            "facilitator_user_id": order.facilitator_user_id,
+        },
+    )
+    await db.commit()
+    return {
+        "id": order.id, "status": order.status,
+        "dealer_user_id": order.dealer_user_id,
+        "facilitator_user_id": order.facilitator_user_id,
+    }
 
 
 # ── Dealer: Seed orders ────────────────────────────────────────────────────────
@@ -649,6 +820,121 @@ async def list_dealer_seed_orders(
             "created_at": o.created_at,
         })
     return out
+
+
+@router.get("/dealer/seed-orders/{order_id}/postpone-window")
+async def seed_postpone_window(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Authoritative `max_days` for the dealer's postpone picker.
+
+    Seeds aren't timeline-anchored so we use a fixed cap
+    (`_SEED_POSTPONE_MAX_DAYS`) instead of "remaining window − 1".
+    """
+    from app.modules.orders.router import _assert_active_dealer
+    await _assert_active_dealer(db, current_user.id)
+    order = await _get_seed_order(db, order_id, current_user.id, farmer=False)
+    return {
+        "max_days": _SEED_POSTPONE_MAX_DAYS,
+        "can_postpone": True,
+    }
+
+
+@router.put("/dealer/seed-orders/{order_id}/postpone")
+async def postpone_seed_order(
+    order_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Dealer postpones a seed order by N days.
+
+    Body: `{ "days": int }` in [1, _SEED_POSTPONE_MAX_DAYS].
+    Server stamps `postponed_until = IST today + days`.
+    """
+    from app.modules.orders.router import _assert_active_dealer
+    from app.services.order_events import record_event as _record_event
+
+    await _assert_active_dealer(db, current_user.id)
+    order = await _get_seed_order(db, order_id, current_user.id, farmer=False)
+    if order.status not in [SeedOrderStatus.SENT, SeedOrderStatus.ACCEPTED]:
+        raise HTTPException(
+            status_code=400,
+            detail="Order can only be postponed from SENT or ACCEPTED status",
+        )
+
+    days = data.get("days")
+    if not isinstance(days, int) or days < 1 or days > _SEED_POSTPONE_MAX_DAYS:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "postpone_days_out_of_range",
+                "message": f"Pick between 1 and {_SEED_POSTPONE_MAX_DAYS} day(s).",
+                "max_days": _SEED_POSTPONE_MAX_DAYS,
+            },
+        )
+
+    ist_today = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).date()
+    target = ist_today + timedelta(days=days)
+    order.postponed_until = datetime(
+        target.year, target.month, target.day, 0, 0, tzinfo=timezone.utc,
+    ) - timedelta(hours=5, minutes=30)
+
+    prev_status = order.status
+    order.status = SeedOrderStatus.POSTPONED
+    await _record_event(
+        db, lineage_id=order.lineage_id,
+        event_type="MARKED_POSTPONED",
+        actor_user_id=current_user.id, actor_role="DEALER",
+        seed_order_id=order.id,
+        prev_status=prev_status,
+        new_status=SeedOrderStatus.POSTPONED.value,
+        metadata={
+            "days": days,
+            "postponed_until": order.postponed_until.isoformat(),
+        },
+    )
+    await db.commit()
+    return {
+        "id": order_id, "status": order.status,
+        "postponed_until": order.postponed_until,
+    }
+
+
+@router.put("/dealer/seed-orders/{order_id}/not-available")
+async def mark_seed_order_not_available(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Dealer marks a seed order as NOT_AVAILABLE — bounces to the
+    farmer for a re-route (cancel → new DRAFT → pick someone else)."""
+    from app.modules.orders.router import _assert_active_dealer
+    from app.services.order_events import record_event as _record_event
+
+    await _assert_active_dealer(db, current_user.id)
+    order = await _get_seed_order(db, order_id, current_user.id, farmer=False)
+    if order.status not in [
+        SeedOrderStatus.SENT, SeedOrderStatus.ACCEPTED, SeedOrderStatus.POSTPONED,
+    ]:
+        raise HTTPException(
+            status_code=400,
+            detail="Order cannot be marked Not Available in current status",
+        )
+    prev_status = order.status
+    order.status = SeedOrderStatus.NOT_AVAILABLE
+    await _record_event(
+        db, lineage_id=order.lineage_id,
+        event_type="MARKED_NOT_AVAILABLE",
+        actor_user_id=current_user.id, actor_role="DEALER",
+        seed_order_id=order.id,
+        prev_status=prev_status,
+        new_status=SeedOrderStatus.NOT_AVAILABLE.value,
+    )
+    await db.commit()
+    return {"id": order_id, "status": order.status}
 
 
 @router.put("/dealer/seed-orders/{order_id}/accept")

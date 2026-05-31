@@ -51,12 +51,20 @@ class VarietyPoP(Base):
 
 
 class SeedOrderStatus(str, enum.Enum):
+    # Orders V2 (2026-05-31) — seeds share the OrderItem vocabulary.
+    # DRAFT exists so cancel can migrate the order to a fresh row
+    # the farmer then sends to a new recipient.
+    DRAFT = "DRAFT"
     SENT = "SENT"
     ACCEPTED = "ACCEPTED"
+    AVAILABLE = "AVAILABLE"
+    POSTPONED = "POSTPONED"
+    NOT_AVAILABLE = "NOT_AVAILABLE"
     SENT_FOR_APPROVAL = "SENT_FOR_APPROVAL"
     PURCHASED = "PURCHASED"
-    CANCELLED = "CANCELLED"
     REJECTED = "REJECTED"
+    CANCELLED = "CANCELLED"
+    REROUTED = "REROUTED"
 
 
 class SeedOrderFull(Base):
@@ -74,5 +82,13 @@ class SeedOrderFull(Base):
     quantity: Mapped[float] = mapped_column(DECIMAL(10, 3), nullable=True)
     total_price: Mapped[float] = mapped_column(DECIMAL(10, 2), nullable=True)
     status: Mapped[str] = mapped_column(String(30), default=SeedOrderStatus.SENT)
+    # Orders V2 Batch 12 — postpone-with-days surface for seeds.
+    postponed_until: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    # Journey identifier across cancel-migrate. Each fresh DRAFT
+    # inherits the same lineage_id so reports can trace a seed
+    # order across dealer hops.
+    lineage_id: Mapped[str] = mapped_column(String(36), nullable=False, default=new_uuid)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

@@ -29,6 +29,7 @@ from app.database import AsyncSessionLocal
 from app.modules.orders.models import (
     OrderItem, OrderItemEvent, OrderItemStatus,
 )
+from app.modules.seed_mgmt.models import SeedOrderFull, SeedOrderStatus
 from app.services.order_events import record_event
 
 logger = logging.getLogger(__name__)
@@ -36,10 +37,17 @@ logger = logging.getLogger(__name__)
 
 async def _sweep_expired_postpones_with_session(db, now=None) -> int:
     """Inner sweep — split out so integration tests can pass the
-    testcontainer session and assert on the rows the task commits."""
-    now = now or datetime.now(timezone.utc)
+    testcontainer session and assert on the rows the task commits.
 
-    rows = (await db.execute(
+    Handles BOTH OrderItem and SeedOrderFull postpones (Batch 12).
+    Same rule on both: postponed_until <= now → flip to
+    NOT_AVAILABLE + write POSTPONE_EXPIRED event keyed on lineage.
+    """
+    now = now or datetime.now(timezone.utc)
+    flipped = 0
+
+    # ── OrderItem (pesticide / fertiliser) ────────────────────────
+    items = (await db.execute(
         select(OrderItem).where(
             OrderItem.status == OrderItemStatus.POSTPONED,
             OrderItem.postponed_until.isnot(None),
@@ -47,10 +55,7 @@ async def _sweep_expired_postpones_with_session(db, now=None) -> int:
         )
     )).scalars().all()
 
-    if not rows:
-        return 0
-
-    for item in rows:
+    for item in items:
         prev_until = item.postponed_until
         item.status = OrderItemStatus.NOT_AVAILABLE
         await record_event(
@@ -66,10 +71,38 @@ async def _sweep_expired_postpones_with_session(db, now=None) -> int:
                 "postponed_until": prev_until.isoformat() if prev_until else None,
             },
         )
+        flipped += 1
 
-    await db.commit()
-    logger.info(f"Orders V2: flipped {len(rows)} expired postpones to NOT_AVAILABLE")
-    return len(rows)
+    # ── SeedOrderFull (Batch 12 — seeds share the lifecycle) ──────
+    seed_rows = (await db.execute(
+        select(SeedOrderFull).where(
+            SeedOrderFull.status == SeedOrderStatus.POSTPONED,
+            SeedOrderFull.postponed_until.isnot(None),
+            SeedOrderFull.postponed_until <= now,
+        )
+    )).scalars().all()
+
+    for so in seed_rows:
+        prev_until = so.postponed_until
+        so.status = SeedOrderStatus.NOT_AVAILABLE
+        await record_event(
+            db,
+            lineage_id=so.lineage_id,
+            event_type="POSTPONE_EXPIRED",
+            actor_role="SYSTEM",
+            seed_order_id=so.id,
+            prev_status=SeedOrderStatus.POSTPONED.value,
+            new_status=SeedOrderStatus.NOT_AVAILABLE.value,
+            metadata={
+                "postponed_until": prev_until.isoformat() if prev_until else None,
+            },
+        )
+        flipped += 1
+
+    if flipped:
+        await db.commit()
+        logger.info(f"Orders V2: flipped {flipped} expired postpones to NOT_AVAILABLE")
+    return flipped
 
 
 async def _sweep_expired_postpones():
