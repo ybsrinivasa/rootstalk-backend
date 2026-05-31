@@ -569,6 +569,12 @@ async def compute_bundle(
     if not l1_set:
         return {"practices": [], "excluded_already_ordered": 0}
 
+    # Batch 23: load CCA (package) timelines + active triggered CHA
+    # (PG / SP / QA) timelines for this subscription. CHA-derived
+    # practices recommended by diagnosis pipes must be orderable
+    # alongside CCA practices — without this, the farmer's "Order"
+    # button on a CHA recommendation card silently does nothing
+    # because the preview bundle excludes the practice.
     timelines = (await db.execute(
         select(Timeline).where(Timeline.package_id == subscription.package_id)
     )).scalars().all()
@@ -580,6 +586,39 @@ async def compute_bundle(
             continue
         if windows_overlap(w[0], w[1], today, to_date):
             eligible_tl_windows[tl.id] = w
+
+    # CHA-pipe triggered timelines (anchored to `triggered_at`, not
+    # crop_start). Same Timeline model — only the anchor logic differs.
+    from app.modules.subscriptions.models import TriggeredCHAEntry
+    cha_entries = (await db.execute(
+        select(TriggeredCHAEntry).where(
+            TriggeredCHAEntry.subscription_id == subscription.id,
+            TriggeredCHAEntry.status == "ACTIVE",
+        )
+    )).scalars().all()
+    for cha in cha_entries:
+        triggered_d = cha.triggered_at.date() if hasattr(cha.triggered_at, "date") else cha.triggered_at
+        cha_tls = []
+        if cha.recommendation_type == "SP":
+            cha_tls = (await db.execute(
+                select(Timeline).where(Timeline.sp_recommendation_id == cha.recommendation_id)
+            )).scalars().all()
+        elif cha.recommendation_type == "PG":
+            cha_tls = (await db.execute(
+                select(Timeline).where(Timeline.pg_recommendation_id == cha.recommendation_id)
+            )).scalars().all()
+        elif cha.recommendation_type == "QA":
+            cha_tls = (await db.execute(
+                select(Timeline).where(Timeline.standard_response_id == cha.recommendation_id)
+            )).scalars().all()
+        for cha_tl in cha_tls:
+            if cha_tl.from_value is None or cha_tl.to_value is None:
+                continue
+            cha_from = triggered_d + timedelta(days=int(cha_tl.from_value))
+            cha_to = triggered_d + timedelta(days=int(cha_tl.to_value))
+            if windows_overlap(cha_from, cha_to, today, to_date):
+                eligible_tl_windows[cha_tl.id] = (cha_from, cha_to)
+
     if not eligible_tl_windows:
         return {"practices": [], "excluded_already_ordered": 0}
 
