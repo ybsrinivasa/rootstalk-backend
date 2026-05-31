@@ -324,5 +324,16 @@ class ClientPromoter(Base):
     territory_notes: Mapped[str] = mapped_column(Text, nullable=True)
     registered_by: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
     registered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # 2026-05-31 — Promoter-as-Pundit (P-P) designation. Mirrors the
+    # historical `ClientFarmPundit.is_promoter_pundit` flag so a
+    # Promoter (Facilitator or Dealer) can answer farmer queries
+    # without first having to register as a FarmPundit. Toggled by
+    # the Field Manager on their Promoter list. Mutually exclusive
+    # with `ClientFarmPundit.is_promoter_pundit` per (user, client)
+    # for V1 — write-time guard refuses if the same user is already
+    # a P-P via the FarmPundit path on this client.
+    is_promoter_pundit: Mapped[bool] = mapped_column(
+        default=False, nullable=False,
+    )
 
     __table_args__ = (UniqueConstraint("client_id", "user_id", "promoter_type"),)

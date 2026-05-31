@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from pydantic import BaseModel
 from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.config import settings
@@ -1627,6 +1627,12 @@ async def list_promoters(
             "name": user.name, "phone": user.phone, "email": user.email,
             "promoter_type": cp.promoter_type, "status": cp.status,
             "is_promoter": cp.is_promoter,
+            # 2026-05-31 — FM-side P-P designation. Drives the
+            # "Promoter-Pundit" toggle on each row in the FM Promoter
+            # list. Defaults to False (existing rows pre-migration);
+            # mutually exclusive (per user, client) with the
+            # FarmPundit-path P-P flag on real registered Pundits.
+            "is_promoter_pundit": cp.is_promoter_pundit,
             "promoter_request_status": cp.promoter_request_status,
             "promoter_request_sent_at": cp.promoter_request_sent_at,
             "promoter_request_responded_at": cp.promoter_request_responded_at,
@@ -1977,6 +1983,165 @@ async def reactivate_promoter(
     cp.status = "ACTIVE"
     await db.commit()
     return {"status": "ACTIVE"}
+
+
+@router.put("/client/{client_id}/field-manager/promoters/{promoter_id}/promoter-pundit")
+async def fm_toggle_promoter_pundit(
+    client_id: str,
+    promoter_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Field Manager designates one of this client's Promoters
+    (Facilitator or Dealer) as a Promoter-Pundit.
+
+    Per V1 user direction 2026-05-31: P-P designation belongs in the
+    FM's Promoter-management surface, NOT the CA's FarmPundits tab.
+    Sanjay can be a P-P without first registering as a regular
+    FarmPundit.
+
+    On toggle-ON the endpoint auto-provisions a shadow
+    `FarmPunditProfile` + `ClientFarmPundit` row (searchable=False,
+    role=PANEL, is_promoter_pundit=True) so the existing query
+    routing chain works unmodified — it already knows how to pick a
+    P-P from the CFP table. On toggle-OFF it flips both flags off in
+    the same transaction so the routing stops picking them.
+
+    Mutual exclusion (per (user, client)): refuses with
+    `pp_via_real_farmpundit_exists` if the user is already
+    designated as a P-P via a *real* (searchable=True)
+    ClientFarmPundit row at this client — that means the CA has
+    already named them as a P-P through the registered-pundit path,
+    and V1 keeps the two non-overlapping. Toggle-off is
+    unconditional.
+    """
+    from app.modules.farmpundit.models import (
+        ClientFarmPundit, FarmPunditProfile, PunditRole,
+    )
+    from app.modules.platform.models import User as PlatformUser
+
+    cp = (await db.execute(
+        select(ClientPromoter).where(
+            ClientPromoter.id == promoter_id,
+            ClientPromoter.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if not cp:
+        raise HTTPException(status_code=404, detail="Promoter not found")
+    if cp.status != "ACTIVE":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "promoter_not_active",
+                "message": (
+                    "Reactivate this promoter before designating "
+                    "them as a Promoter-Pundit."
+                ),
+            },
+        )
+
+    new_value = bool(data.get("is_promoter_pundit", not cp.is_promoter_pundit))
+
+    if new_value and not cp.is_promoter_pundit:
+        # Mutual-exclusion guard — only refuse against a REAL CFP P-P
+        # row (searchable=True). Phantom rows (searchable=False) are
+        # bookkeeping under our own control and can be safely
+        # re-created or updated. The user's V1 rule is "no overlap
+        # between FarmPundit and P-P paths"; the phantom is part of
+        # the P-P path, not the FarmPundit path.
+        real_cfp_pp = (await db.execute(
+            select(ClientFarmPundit.id)
+            .join(
+                FarmPunditProfile,
+                FarmPunditProfile.id == ClientFarmPundit.pundit_id,
+            )
+            .where(
+                ClientFarmPundit.client_id == client_id,
+                ClientFarmPundit.is_promoter_pundit == True,  # noqa: E712
+                ClientFarmPundit.searchable == True,  # noqa: E712
+                FarmPunditProfile.user_id == cp.user_id,
+            )
+            .limit(1)
+        )).scalar_one_or_none()
+        if real_cfp_pp is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "pp_via_real_farmpundit_exists",
+                    "message": (
+                        "This user is already a Promoter-Pundit via the "
+                        "FarmPundit path at this client. V1 keeps the "
+                        "two paths non-overlapping — remove the "
+                        "FarmPundit-side P-P designation before "
+                        "switching to the Promoter-side designation."
+                    ),
+                },
+            )
+
+    cp.is_promoter_pundit = new_value
+
+    # Auto-provision / clear the shadow CFP row so the query routing
+    # chain (which reads from ClientFarmPundit) sees the change.
+    profile = (await db.execute(
+        select(FarmPunditProfile).where(FarmPunditProfile.user_id == cp.user_id)
+    )).scalar_one_or_none()
+
+    if new_value:
+        if profile is None:
+            profile = FarmPunditProfile(user_id=cp.user_id)
+            db.add(profile)
+            await db.flush()
+        cfp = (await db.execute(
+            select(ClientFarmPundit).where(
+                ClientFarmPundit.client_id == client_id,
+                ClientFarmPundit.pundit_id == profile.id,
+            )
+        )).scalar_one_or_none()
+        if cfp is None:
+            cfp = ClientFarmPundit(
+                client_id=client_id,
+                pundit_id=profile.id,
+                role=PunditRole.PANEL,
+                status="ACTIVE",
+                is_promoter_pundit=True,
+                # Phantom: hidden from any farmer-facing pundit picker.
+                # The CA's read-only P-P sub-tab still surfaces it
+                # because that view filters on `is_promoter_pundit=True`
+                # not `searchable=True`.
+                searchable=False,
+            )
+            db.add(cfp)
+        else:
+            cfp.is_promoter_pundit = True
+            cfp.status = "ACTIVE"
+    else:
+        # Toggle OFF — flip the shadow row's PP flag (if any) so the
+        # routing chain stops picking this user. Leave the row in
+        # place; it's harmless and re-toggling ON later is cheaper.
+        if profile is not None:
+            await db.execute(
+                update(ClientFarmPundit)
+                .where(
+                    ClientFarmPundit.client_id == client_id,
+                    ClientFarmPundit.pundit_id == profile.id,
+                    ClientFarmPundit.searchable == False,  # noqa: E712
+                )
+                .values(is_promoter_pundit=False)
+            )
+
+    await db.commit()
+    target = (await db.execute(
+        select(PlatformUser).where(PlatformUser.id == cp.user_id)
+    )).scalar_one_or_none()
+    return {
+        "id": cp.id,
+        "user_id": cp.user_id,
+        "name": target.name if target else None,
+        "phone": target.phone if target else None,
+        "promoter_type": cp.promoter_type,
+        "is_promoter_pundit": cp.is_promoter_pundit,
+    }
 
 
 @router.put("/client/{client_id}/field-manager/promoters/{promoter_id}/request-promoter")

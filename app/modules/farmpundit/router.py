@@ -1829,6 +1829,15 @@ async def list_company_pundits(
             "can_be_promoter_pundit": (
                 user is not None and user.id in pp_eligible_user_ids
             ),
+            # 2026-05-31 — distinguishes the two P-P paths so the
+            # CA's read-only Promoter-Pundits sub-tab can label rows
+            # correctly. `REGISTERED_PUNDIT` = real FarmPundit who
+            # was designated; `FM_PROMOTER` = phantom row backing an
+            # FM-side ClientPromoter.is_promoter_pundit=True flag.
+            # `searchable` is the underlying bit.
+            "source": (
+                "REGISTERED_PUNDIT" if cp.searchable else "FM_PROMOTER"
+            ),
             "round_robin_sequence": cp.round_robin_sequence,
             "active_query_count": active_query_count,
             "onboarded_at": cp.onboarded_at,
@@ -2279,6 +2288,33 @@ async def toggle_promoter_pundit(
                         "must be onboarded as a Facilitator AND marked as a "
                         "Promoter on the Field Manager page before being "
                         "designated as a Promoter-Pundit."
+                    ),
+                },
+            )
+
+        # Mutual-exclusion guard (V1, 2026-05-31): refuse if the same
+        # user is already a P-P via the ClientPromoter path at this
+        # client. Mirror of the FM-side guard in clients/router.py's
+        # fm_toggle_promoter_pundit.
+        pp_via_promoter = (await db.execute(
+            select(ClientPromoter.id).where(
+                ClientPromoter.client_id == client_id,
+                ClientPromoter.user_id == profile.user_id,
+                ClientPromoter.is_promoter_pundit == True,  # noqa: E712
+            ).limit(1)
+        )).scalar_one_or_none()
+        if pp_via_promoter is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "pp_via_promoter_exists",
+                    "message": (
+                        "This user is already a Promoter-Pundit via the "
+                        "Promoter (Field Manager) path at this client. "
+                        "For V1, the two paths are kept mutually "
+                        "exclusive — remove the Promoter-side P-P "
+                        "designation before switching to the "
+                        "FarmPundit-side designation."
                     ),
                 },
             )
