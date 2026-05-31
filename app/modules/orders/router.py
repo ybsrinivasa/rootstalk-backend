@@ -2280,7 +2280,9 @@ async def get_dealer_order(
     )
     items = items_result.scalars().all()
 
-    # Helper for the flat item shape
+    # Helper for the flat item shape. NOTE: relies on
+    # `element_block_for_item` being defined further down — items
+    # are iterated only after the element batch-resolution pass.
     def item_brief(i: OrderItem) -> dict:
         return {
             "id": i.id, "practice_id": i.practice_id,
@@ -2294,6 +2296,10 @@ async def get_dealer_order(
             "relation_id": i.relation_id,
             "relation_type": i.relation_type,
             "relation_role": i.relation_role,
+            # Batch 26 — SE's authored guidance the dealer reads after
+            # picking a brand: recommended dosage + unit, application
+            # method, volume per plant (plant-wise only).
+            "element_block": element_block_for_item(i.id),
         }
 
     # Group items by relation
@@ -2349,6 +2355,82 @@ async def get_dealer_order(
             if snap_els is not None:
                 return snap_els
         return elements_by_practice.get(it.practice_id, [])
+
+    # ── Batch 26 — Post-brand-selection element block ──────────────
+    # User narrative (2026-05-31): "After he selects the brand he
+    # wishes to give, then we need to show him the Recommended
+    # Dosage+Unit, Application Method, Volume per Plant+Unit (if it
+    # is Plant-wise)."  These come straight from the SE's practice
+    # elements; the dealer reads them as guidance for the volume
+    # entry below.
+    from app.modules.sync.models import CoshCoreItem as _CoshCore
+
+    def _el_get(el, name):
+        return getattr(el, name) if hasattr(el, name) else (el.get(name) if isinstance(el, dict) else None)
+
+    # First pass — collect all cosh refs we need to resolve in one
+    # round so we don't fan out into N lookups.
+    cosh_refs_needed: set[str] = set()
+    item_element_specs: dict[str, dict] = {}
+    for it in items:
+        els = _elements_for_item(it)
+        spec = {
+            "dosage_value": None,
+            "dosage_unit_ref": None,
+            "application_method_ref": None,
+            "vol_per_plant_value": None,
+            "vol_per_plant_unit_ref": None,
+        }
+        for el in els:
+            et = (_el_get(el, "element_type") or "").upper()
+            if et == "DOSAGE":
+                v = _el_get(el, "value")
+                try:
+                    spec["dosage_value"] = float(v) if v is not None else None
+                except (TypeError, ValueError):
+                    spec["dosage_value"] = None
+            elif et == "DOSAGE_UNIT":
+                spec["dosage_unit_ref"] = _el_get(el, "cosh_ref")
+            elif et == "APPLICATION_METHOD":
+                spec["application_method_ref"] = _el_get(el, "cosh_ref")
+            elif et == "VOLUME_PER_PLANT":
+                v = _el_get(el, "value")
+                try:
+                    spec["vol_per_plant_value"] = float(v) if v is not None else None
+                except (TypeError, ValueError):
+                    spec["vol_per_plant_value"] = None
+            elif et == "VOLUME_PER_PLANT_UNIT":
+                spec["vol_per_plant_unit_ref"] = _el_get(el, "cosh_ref")
+        item_element_specs[it.id] = spec
+        for k in ("dosage_unit_ref", "application_method_ref", "vol_per_plant_unit_ref"):
+            if spec[k]:
+                cosh_refs_needed.add(spec[k])
+
+    cosh_name_by_id: dict[str, str] = {}
+    if cosh_refs_needed:
+        cosh_rows = (await db.execute(
+            select(_CoshCore).where(_CoshCore.cosh_id.in_(cosh_refs_needed))
+        )).scalars().all()
+        for cc in cosh_rows:
+            tr = cc.translations or {}
+            if isinstance(tr, dict):
+                cosh_name_by_id[cc.cosh_id] = tr.get("en") or cc.cosh_id
+
+    def _resolve_name(ref):
+        return cosh_name_by_id.get(ref) if ref else None
+
+    def element_block_for_item(item_id: str) -> dict:
+        s = item_element_specs.get(item_id, {})
+        return {
+            "dosage_value": s.get("dosage_value"),
+            "dosage_unit_cosh_id": s.get("dosage_unit_ref"),
+            "dosage_unit_name": _resolve_name(s.get("dosage_unit_ref")),
+            "application_method_cosh_id": s.get("application_method_ref"),
+            "application_method_name": _resolve_name(s.get("application_method_ref")),
+            "vol_per_plant_value": s.get("vol_per_plant_value"),
+            "vol_per_plant_unit_cosh_id": s.get("vol_per_plant_unit_ref"),
+            "vol_per_plant_unit_name": _resolve_name(s.get("vol_per_plant_unit_ref")),
+        }
 
     def has_locked_brand_item(it: OrderItem) -> bool:
         # Batch 39I-b (2026-05-16) — read the authoritative
