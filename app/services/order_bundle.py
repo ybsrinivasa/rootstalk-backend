@@ -312,6 +312,75 @@ async def _build_timeline_windows_for_dedup(
     return out
 
 
+async def filter_by_conditional_answers(
+    db: AsyncSession, *,
+    subscription: Subscription,
+    today: date,
+    candidate_practice_ids: set[str],
+) -> set[str]:
+    """BL-02 step 9: filter candidate practices by the farmer's
+    conditional answers for `today`.
+
+    A practice passes if:
+      (a) it has no `PracticeConditional` row (always included), OR
+      (b) the farmer's answer to the linked question matches the
+          conditional's `answer` value, OR
+      (c) the conditional's `answer` is `BOTH` (always included).
+
+    A practice is filtered OUT when its conditional question was
+    not yet answered (blank path — BL-02 step 12) or the answer
+    doesn't match.
+
+    Used by `compute_bundle` and `resolve_dbs_practices_for_category`
+    so the order side matches what the farmer sees on
+    `/farmer/advisory/today` — without this, practices the farmer
+    answered "NO" to would still flow into the bundle.
+    """
+    if not candidate_practice_ids:
+        return set()
+
+    from app.modules.advisory.models import PracticeConditional
+    from app.modules.subscriptions.models import (
+        ConditionalAnswer as _ConditionalAnswer,
+    )
+
+    pc_rows = (await db.execute(
+        select(PracticeConditional).where(
+            PracticeConditional.practice_id.in_(list(candidate_practice_ids))
+        )
+    )).scalars().all()
+    if not pc_rows:
+        return set(candidate_practice_ids)  # nothing to filter
+
+    pc_by_practice: dict[str, PracticeConditional] = {pc.practice_id: pc for pc in pc_rows}
+
+    cond_rows = (await db.execute(
+        select(_ConditionalAnswer).where(
+            _ConditionalAnswer.subscription_id == subscription.id,
+            _ConditionalAnswer.answer_date == today,
+        )
+    )).scalars().all()
+    today_answers: dict[str, str] = {
+        r.question_id: (r.answer.value if hasattr(r.answer, "value") else str(r.answer))
+        for r in cond_rows
+    }
+
+    survivors: set[str] = set()
+    for pid in candidate_practice_ids:
+        pc = pc_by_practice.get(pid)
+        if pc is None:
+            survivors.add(pid)
+            continue
+        required = pc.answer.value if hasattr(pc.answer, "value") else str(pc.answer)
+        if required == "BOTH":
+            survivors.add(pid)
+            continue
+        farmer_answer = today_answers.get(pc.question_id)
+        if farmer_answer is not None and farmer_answer == required:
+            survivors.add(pid)
+    return survivors
+
+
 async def dedup_filter_practice_ids(
     db: AsyncSession, *,
     subscription: Subscription,
@@ -413,13 +482,24 @@ async def resolve_dbs_practices_for_category(
     if not practice_ids:
         return []
 
+    # BL-02 step 9: drop practices the farmer answered "NO" to (or
+    # hasn't answered yet). Runs unconditionally — applies even
+    # pre-start-date.
+    today = date.today()
+    cond_survivors = await filter_by_conditional_answers(
+        db, subscription=subscription, today=today,
+        candidate_practice_ids=set(practice_ids),
+    )
+    practice_ids = [pid for pid in practice_ids if pid in cond_survivors]
+    if not practice_ids:
+        return []
+
     # BL-03 dedup needs an anchor to compute windows. Pre-start-date
     # carve-out: no crop_start → skip dedup, return as-is. Matches the
     # advisory walk's deferral of DBS rendering pre-start.
     if subscription.crop_start_date is None:
         return practice_ids
 
-    today = date.today()
     crop_start = (
         subscription.crop_start_date.date()
         if hasattr(subscription.crop_start_date, "date")
@@ -514,6 +594,17 @@ async def compute_bundle(
         if (p.l1_type or "").upper() in l1_set
         and (p.l2_type or "").upper() not in l2_exclude
     ]
+
+    # BL-02 step 9: drop practices whose conditional question was
+    # answered "NO" (or not answered yet — blank path) by the farmer.
+    # The advisory walk runs this filter; the bundle needs to match
+    # so practices the farmer rejected don't slip into the order.
+    if practices:
+        cond_survivors = await filter_by_conditional_answers(
+            db, subscription=subscription, today=today,
+            candidate_practice_ids={p.id for p in practices},
+        )
+        practices = [p for p in practices if p.id in cond_survivors]
 
     # BL-03: drop practices suppressed by deduplication across CCA +
     # CHA sources. The farmer sees the deduped list in /farmer/
