@@ -744,6 +744,85 @@ class DBSBulkCreate(BaseModel):
     area_unit: Optional[str] = None
 
 
+@router.get("/farmer/subscriptions/{subscription_id}/dbs-bulk-preview")
+async def dbs_bulk_preview(
+    subscription_id: str,
+    category: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Tells the PWA whether a DBS bulk order for this category is
+    available right now + how many items it would contain. Drives
+    the "Pre-sowing pesticides / fertilizers" buttons on the
+    advisory strip — disable when count is 0; show locked-brand
+    explainer when applicable.
+
+    Mirrors the validation in create_dbs_bulk_order so the PWA
+    doesn't surface a button the server would 400 on.
+    """
+    from datetime import date as _date
+    from app.services.order_bundle import (
+        resolve_dbs_practices_for_category, already_ordered_practice_ids,
+    )
+
+    if category.upper() not in ("PESTICIDE", "FERTILIZER"):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown category {category!r}. Use PESTICIDE or FERTILIZER.",
+        )
+    category = category.upper()
+
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    package = (await db.execute(
+        select(Package).where(Package.id == sub.package_id)
+    )).scalar_one_or_none()
+    pkg_type = (package.package_type.value if (package and hasattr(package.package_type, "value"))
+                else str(package.package_type) if package else None)
+
+    today = _date.today()
+    window_open = sub.crop_start_date is None or (
+        (sub.crop_start_date.date() if hasattr(sub.crop_start_date, "date") else sub.crop_start_date) > today
+    )
+
+    if pkg_type != "ANNUAL" or not window_open:
+        return {
+            "category": category,
+            "count": 0,
+            "available": False,
+            "reason": "not_annual" if pkg_type != "ANNUAL" else "window_closed",
+            "has_locked_brand": False,
+        }
+
+    all_dbs = await resolve_dbs_practices_for_category(
+        db, package_id=sub.package_id, category=category,
+    )
+    already = await already_ordered_practice_ids(db, sub.id)
+    remaining = [pid for pid in all_dbs if pid not in already]
+    has_locked = await _practice_ids_have_locked_brand(db, remaining) if remaining else False
+    return {
+        "category": category,
+        "count": len(remaining),
+        "available": bool(remaining),
+        "reason": "nothing_to_order" if not remaining else None,
+        "has_locked_brand": has_locked,
+        # Practice IDs are returned so the PWA can pipe them straight
+        # into the existing /eligible-recipients-for-new-order endpoint
+        # without us building a parallel DBS picker. The farmer never
+        # sees these — they're opaque identifiers used only in URL
+        # params on the next request.
+        "practice_ids": remaining,
+        "client_id": sub.client_id,
+    }
+
+
 @router.post("/farmer/orders/dbs-bulk", status_code=201)
 async def create_dbs_bulk_order(
     request: DBSBulkCreate,
