@@ -36,6 +36,11 @@ class OrderItemStatus(str, enum.Enum):
     NOT_NEEDED = "NOT_NEEDED"
     SKIPPED = "SKIPPED"
     REMOVED = "REMOVED"
+    # Orders V2 (2026-05-31): the original row stays on the CANCELLED
+    # husk after the items have been migrated to a fresh DRAFT. The
+    # UI hides REROUTED items from "active item" lists; reports can
+    # still walk them via lineage_id to reconstruct the journey.
+    REROUTED = "REROUTED"
 
 
 class OrderCategory(str, enum.Enum):

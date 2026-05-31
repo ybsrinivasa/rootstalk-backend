@@ -11,8 +11,10 @@ from app.modules.platform.models import User
 from app.modules.orders.models import (
     Order, OrderItem, SeedOrder, PackingList, MissingBrandReport,
     DealerProfile, DealerRelationship, DealerManufacturerCatalog,
+    OrderItemEvent,
     OrderStatus, OrderItemStatus,
 )
+from app.services.order_events import record_event as _record_event
 from app.modules.subscriptions.models import Subscription
 from app.modules.sync.models import VolumeFormula
 from app.modules.advisory.models import Package, Practice, Element, Timeline
@@ -434,6 +436,15 @@ async def cancel_order(
     heartbeating against this order right now (dealer_viewing_until in
     the future), we 409. The dealer's lease extends ~30 s past their
     last heartbeat, so a closed screen frees the lock quickly.
+
+    Cancel-and-migrate semantics (Orders V2 Batch 3):
+    On a successful cancel, every active OrderItem on this order is
+    *migrated* to a fresh DRAFT order — new OrderItem rows, same
+    `lineage_id`, dealer/facilitator cleared so the farmer picks a new
+    recipient before re-sending. The original rows stay in place with
+    status REROUTED so the husk still tells the historical story.
+    The cancelled order is returned alongside the new draft's id;
+    the PWA navigates the farmer to the draft to pick a new dealer.
     """
     order = await _get_farmer_order(db, order_id, current_user.id)
 
@@ -454,9 +465,169 @@ async def cancel_order(
             },
         )
 
+    prev_order_status = order.status.value if hasattr(order.status, "value") else order.status
+
+    # Snapshot the live items (i.e. anything that isn't already
+    # archived from a prior partial flow) and migrate them onto a
+    # fresh DRAFT order. REROUTED rows stay behind as historical
+    # pointers on the husk.
+    skip_statuses = {OrderItemStatus.REROUTED, OrderItemStatus.REMOVED}
+    items_q = await db.execute(select(OrderItem).where(OrderItem.order_id == order.id))
+    items_to_migrate = [it for it in items_q.scalars().all() if it.status not in skip_statuses]
+
+    new_draft = Order(
+        subscription_id=order.subscription_id,
+        farmer_user_id=order.farmer_user_id,
+        client_id=order.client_id,
+        category=order.category,
+        date_from=order.date_from,
+        date_to=order.date_to,
+        status=OrderStatus.DRAFT,
+        dealer_user_id=None,
+        facilitator_user_id=None,
+        locked_timelines=order.locked_timelines,
+        # Inherit the original 14-day expiry; the farmer needs to
+        # actually send this draft before then.
+        expires_at=order.expires_at,
+    )
+    db.add(new_draft)
+    await db.flush()
+
+    for it in items_to_migrate:
+        prev_item_status = it.status.value if hasattr(it.status, "value") else it.status
+
+        new_item = OrderItem(
+            order_id=new_draft.id,
+            practice_id=it.practice_id,
+            timeline_id=it.timeline_id,
+            brand_cosh_id=it.brand_cosh_id,
+            brand_name=it.brand_name,
+            given_volume=it.given_volume,
+            volume_unit=it.volume_unit,
+            price=it.price,
+            estimated_volume=it.estimated_volume,
+            relation_id=it.relation_id,
+            relation_type=it.relation_type,
+            relation_role=it.relation_role,
+            scan_verified=False,  # reset for the new leg
+            status=OrderItemStatus.PENDING,
+            snapshot_id=it.snapshot_id,
+            lineage_id=it.lineage_id,  # ← key: preserves the journey
+        )
+        db.add(new_item)
+        await db.flush()
+
+        # Audit pair: leg-out on the husk, leg-in on the draft.
+        # Recorded before we flip the old row so its FK is still valid.
+        await _record_event(
+            db,
+            lineage_id=it.lineage_id,
+            event_type="REROUTED_FROM",
+            actor_user_id=current_user.id,
+            actor_role="FARMER",
+            order_id=order.id,
+            order_item_id=it.id,
+            prev_status=prev_item_status,
+            new_status=OrderItemStatus.REROUTED.value,
+            metadata={"to_order_id": new_draft.id, "to_order_item_id": new_item.id},
+        )
+        await _record_event(
+            db,
+            lineage_id=it.lineage_id,
+            event_type="REROUTED_TO",
+            actor_user_id=current_user.id,
+            actor_role="FARMER",
+            order_id=new_draft.id,
+            order_item_id=new_item.id,
+            prev_status=OrderItemStatus.REROUTED.value,
+            new_status=OrderItemStatus.PENDING.value,
+            metadata={"from_order_id": order.id, "from_order_item_id": it.id},
+        )
+
+        it.status = OrderItemStatus.REROUTED
+
+    # Husk goes terminal.
     order.status = OrderStatus.CANCELLED
+
+    # Order-level audit. `lineage_id = order.id` keeps the schema
+    # happy; order ids and item lineage ids share the UUID namespace
+    # so this can't collide with an item lineage in practice.
+    await _record_event(
+        db,
+        lineage_id=order.id,
+        event_type="CANCELLED_BY_FARMER",
+        actor_user_id=current_user.id,
+        actor_role="FARMER",
+        order_id=order.id,
+        prev_status=prev_order_status,
+        new_status=OrderStatus.CANCELLED.value,
+        metadata={
+            "new_draft_order_id": new_draft.id,
+            "migrated_item_count": len(items_to_migrate),
+        },
+    )
+
     await db.commit()
-    return {"status": order.status}
+    return {
+        "status": order.status,
+        "new_draft_order_id": new_draft.id,
+        "migrated_item_count": len(items_to_migrate),
+    }
+
+
+@router.delete("/farmer/orders/{order_id}")
+async def delete_cancelled_order(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Farmer deletes a CANCELLED order husk.
+
+    Only allowed once the order is in CANCELLED status — i.e. the
+    server has acknowledged the cancel and the farmer has chosen to
+    discard the husk instead of (or in addition to) re-sending the
+    migrated draft.
+
+    Items already migrated under their REROUTED status; they sit on
+    this order as historical pointers and get removed here. The
+    `order_item_events` rows that referenced them keep their
+    `lineage_id` populated; their `order_id` / `order_item_id` FKs
+    SET NULL via the migration so the trail survives row deletion.
+
+    Deleting a DRAFT or any non-terminal status is refused — the
+    farmer must cancel first.
+    """
+    order = await _get_farmer_order(db, order_id, current_user.id)
+    if order.status != OrderStatus.CANCELLED:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "must_cancel_first",
+                "message": "Only cancelled orders can be deleted. Cancel this order first.",
+            },
+        )
+
+    # Wipe the REROUTED husk-items so the Order row can drop without
+    # tripping the order_items.order_id FK. The events table keeps
+    # the lineage trail via SET NULL.
+    from sqlalchemy import delete as sa_delete
+    await db.execute(sa_delete(OrderItem).where(OrderItem.order_id == order.id))
+
+    await _record_event(
+        db,
+        lineage_id=order.id,
+        event_type="HUSK_DELETED_BY_FARMER",
+        actor_user_id=current_user.id,
+        actor_role="FARMER",
+        order_id=None,  # set NULL since we're about to delete the order row
+        prev_status=OrderStatus.CANCELLED.value,
+        new_status=None,
+        metadata={"deleted_order_id": order.id},
+    )
+
+    await db.delete(order)
+    await db.commit()
+    return {"deleted": True}
 
 
 @router.put("/farmer/orders/{order_id}/items/{item_id}/approve")
