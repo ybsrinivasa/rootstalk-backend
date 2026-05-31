@@ -2442,17 +2442,93 @@ async def get_dealer_order(
             "parts": parts_out,
         })
 
+    # Batch 24 — farmer-context block. Per the user's narrative
+    # (2026-05-31): "The dealer needs to know the farmer name, be
+    # able to make a call, crop name, crop age (if it is area-wise
+    # you will derive it from the difference between the Start date
+    # and Today's date, if it is plant-wise you will derive it from
+    # the difference between the Planting year and current year),
+    # Number of acres/Number of plants (as the case may be)."
+    farmer_context = await _build_farmer_context(db, order)
+
     return {
         "id": order.id, "status": order.status,
         "farmer_user_id": order.farmer_user_id, "client_id": order.client_id,
         "facilitator_user_id": order.facilitator_user_id,
         "date_from": order.date_from, "date_to": order.date_to,
         "created_at": order.created_at,
+        # Batch 24 — context the dealer needs to make a call about
+        # the order. Hidden from the farmer's view by living on a
+        # dealer-side endpoint only.
+        "farmer_context": farmer_context,
         # Flat list (unchanged shape for backward compat)
         "items": [item_brief(i) for i in items],
         # New: Part-aware relation structure
         "relations": relations_payload,
         "standalone_items": [item_brief(i) for i in standalone],
+    }
+
+
+async def _build_farmer_context(db: AsyncSession, order: Order) -> dict:
+    """Resolve farmer + crop + measure context for the dealer order
+    detail. Returns the block the dealer screen renders at the top.
+
+    Crop-age semantics:
+      - Plant-wise (subscription.planting_year set): age in YEARS =
+        today.year - planting_year.
+      - Area-wise (subscription.crop_start_date set, planting_year
+        NULL): age in DAYS = today - crop_start_date.
+      - Both NULL: no age — farmer hasn't entered the required data
+        before placing the order (shouldn't happen given the
+        acreage hard-lock on first order; surface as null).
+    """
+    from datetime import date as _date
+
+    farmer = (await db.execute(
+        select(User).where(User.id == order.farmer_user_id)
+    )).scalar_one_or_none()
+    sub = (await db.execute(
+        select(Subscription).where(Subscription.id == order.subscription_id)
+    )).scalar_one_or_none()
+
+    crop_name: str | None = None
+    if sub is not None:
+        package = (await db.execute(
+            select(Package).where(Package.id == sub.package_id)
+        )).scalar_one_or_none()
+        if package is not None:
+            from app.modules.sync.models import CoshCoreItem
+            crop_row = (await db.execute(
+                select(CoshCoreItem).where(CoshCoreItem.cosh_id == package.crop_cosh_id)
+            )).scalar_one_or_none()
+            if crop_row is not None:
+                tr = crop_row.translations or {}
+                crop_name = tr.get("en") if isinstance(tr, dict) else None
+
+    measure: str | None = None
+    age_value: int | None = None
+    age_unit: str | None = None
+    today = _date.today()
+    if sub is not None:
+        if sub.planting_year is not None:
+            measure = "PLANT_WISE"
+            age_value = today.year - int(sub.planting_year)
+            age_unit = "years"
+        elif sub.crop_start_date is not None:
+            measure = "AREA_WISE"
+            cs = sub.crop_start_date.date() if hasattr(sub.crop_start_date, "date") else sub.crop_start_date
+            age_value = (today - cs).days
+            age_unit = "days"
+
+    return {
+        "farmer_name": farmer.name if farmer else None,
+        "farmer_phone": farmer.phone if farmer else None,
+        "crop_name": crop_name,
+        "measure": measure,
+        "age_value": age_value,
+        "age_unit": age_unit,
+        "farm_area_acres": float(sub.farm_area_acres) if (sub and sub.farm_area_acres) else None,
+        "number_of_plants": int(sub.number_of_plants) if (sub and sub.number_of_plants) else None,
     }
 
 
