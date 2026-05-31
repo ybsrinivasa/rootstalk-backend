@@ -241,8 +241,14 @@ async def create_order(
             snap_id_by_tl[tl_id] = None
 
     # ── Pass 3: create OrderItems with snapshot_id pointer ───────────────
+    # Batch 15 — also emit a CREATED event per item so a brand-new
+    # order shows up in the lineage report immediately. Without this
+    # the journey only becomes visible to reports once the dealer
+    # acts on it, which is too late for "what was just placed today?"
+    # dashboards.
+    new_items: list[OrderItem] = []
     for spec in item_specs:
-        db.add(OrderItem(
+        new_item = OrderItem(
             order_id=order.id,
             practice_id=spec["practice_id"],
             timeline_id=spec["timeline_id"],
@@ -251,7 +257,25 @@ async def create_order(
             relation_role=spec["relation_role"],
             snapshot_id=snap_id_by_tl.get(spec["timeline_id"]),
             status=OrderItemStatus.PENDING,
-        ))
+        )
+        db.add(new_item)
+        new_items.append(new_item)
+    await db.flush()
+    for it in new_items:
+        await _record_event(
+            db,
+            lineage_id=it.lineage_id,
+            event_type="CREATED",
+            actor_user_id=current_user.id, actor_role="FARMER",
+            order_id=order.id,
+            order_item_id=it.id,
+            prev_status=None,
+            new_status=OrderItemStatus.PENDING.value,
+            metadata={
+                "practice_id": it.practice_id,
+                "category": order.category,
+            },
+        )
 
     await db.commit()
     await db.refresh(order)
@@ -2135,6 +2159,253 @@ async def report_missing_brand(
     db.add(report)
     await db.commit()
     return {"id": report.id, "status": report.status}
+
+
+# ── Orders V2 Batch 15 — lineage reporting ─────────────────────────────────
+#
+# The audit table populated by Batches 3-12 is finally readable. Two
+# endpoints power client reports — "show me the full journey of this
+# item" and "show me lineages that match these filters". Auth is the
+# same SA-or-privileged-CM gate the missing-brand reports use, so the
+# CA portal can drop a lineage browser onto its dashboard without a
+# new privilege.
+
+
+def _outcome_from_status(status: str | None) -> str:
+    """Coarse-grained categorisation for report dashboards. The
+    granular status stays in the events / current.status fields."""
+    if status == "APPROVED":
+        return "PURCHASED"
+    if status in ("NOT_AVAILABLE", "REJECTED"):
+        return "RETURNED"
+    if status == "POSTPONED":
+        return "POSTPONED"
+    if status in ("REMOVED", "SKIPPED", "NOT_NEEDED"):
+        return "DROPPED"
+    if status in ("REROUTED",):
+        return "REROUTED"
+    if status is None:
+        return "UNKNOWN"
+    return "IN_FLIGHT"
+
+
+@router.get("/admin/order-lineage/{lineage_id}")
+async def admin_order_lineage(
+    lineage_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Full journey of one item across dealer hops.
+
+    Returns every event in chronological order + the latest active
+    item snapshot + a summary block reports can graph against.
+    Item-level events for both OrderItem (pesticide / fertiliser)
+    and SeedOrderFull (seed) share the lineage_id namespace; events
+    keyed on `order.id` for husk-level transitions (CANCELLED,
+    HUSK_DELETED) are folded in automatically when the lineage_id
+    happens to equal an order id.
+    """
+    from app.modules.advisory.router import _assert_sa_or_privileged_cm
+    await _assert_sa_or_privileged_cm(db, current_user, "BRAND_HANDLING")
+
+    events = (await db.execute(
+        select(OrderItemEvent)
+        .where(OrderItemEvent.lineage_id == lineage_id)
+        .order_by(OrderItemEvent.created_at.asc())
+    )).scalars().all()
+
+    if not events:
+        raise HTTPException(status_code=404, detail="Lineage not found")
+
+    # Walk events to derive the current OrderItem (most recent
+    # order_item_id with a non-NULL FK). REROUTED rows on a cancelled
+    # husk are skipped — the live row is on the latest DRAFT/SENT
+    # order downstream of the last REROUTED_TO.
+    current_item: OrderItem | None = None
+    last_item_id = None
+    for ev in events:
+        if ev.order_item_id:
+            last_item_id = ev.order_item_id
+    if last_item_id:
+        current_item = (await db.execute(
+            select(OrderItem).where(OrderItem.id == last_item_id)
+        )).scalar_one_or_none()
+
+    # Dealer hops = distinct order_ids that ever held a non-REROUTED
+    # event_type. Each migration creates a new order; counting these
+    # gives a useful "how many dealers did this item see?" figure.
+    dealer_hop_orders: set[str] = set()
+    for ev in events:
+        if ev.event_type in ("REROUTED_FROM", "REROUTED_TO"):
+            continue
+        if ev.order_id:
+            dealer_hop_orders.add(ev.order_id)
+
+    current_status = None
+    current_payload = None
+    if current_item:
+        current_status = current_item.status.value if hasattr(current_item.status, "value") else current_item.status
+        current_payload = {
+            "order_id": current_item.order_id,
+            "order_item_id": current_item.id,
+            "status": current_status,
+            "brand_name": current_item.brand_name,
+            "given_volume": float(current_item.given_volume) if current_item.given_volume else None,
+            "volume_unit": current_item.volume_unit,
+            "price": float(current_item.price) if current_item.price else None,
+            "is_archived": current_item.archived_at is not None,
+            "archived_at": current_item.archived_at,
+        }
+    else:
+        # Seed lineage — try the seed table.
+        from app.modules.seed_mgmt.models import SeedOrderFull
+        # Find the latest seed_order_id on the chain.
+        last_seed_id = None
+        for ev in events:
+            if ev.seed_order_id:
+                last_seed_id = ev.seed_order_id
+        if last_seed_id:
+            so = (await db.execute(
+                select(SeedOrderFull).where(SeedOrderFull.id == last_seed_id)
+            )).scalar_one_or_none()
+            if so:
+                current_status = so.status
+                current_payload = {
+                    "seed_order_id": so.id,
+                    "status": so.status,
+                    "variety_id": so.variety_id,
+                    "unit": so.unit,
+                    "quantity": float(so.quantity) if so.quantity else None,
+                    "total_price": float(so.total_price) if so.total_price else None,
+                }
+
+    return {
+        "lineage_id": lineage_id,
+        "events": [
+            {
+                "event_type": ev.event_type,
+                "actor_role": ev.actor_role,
+                "actor_user_id": ev.actor_user_id,
+                "order_id": ev.order_id,
+                "order_item_id": ev.order_item_id,
+                "seed_order_id": ev.seed_order_id,
+                "prev_status": ev.prev_status,
+                "new_status": ev.new_status,
+                "metadata": ev.event_metadata,
+                "created_at": ev.created_at,
+            }
+            for ev in events
+        ],
+        "current": current_payload,
+        "summary": {
+            "dealer_hops": len(dealer_hop_orders),
+            "total_events": len(events),
+            "first_event_at": events[0].created_at,
+            "latest_event_at": events[-1].created_at,
+            "outcome": _outcome_from_status(current_status),
+        },
+    }
+
+
+@router.get("/admin/orders/lineages")
+async def admin_list_lineages(
+    client_id: str | None = None,
+    outcome: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List lineages — one row per distinct lineage_id seen across
+    `order_item_events`. Filterable by:
+      - `client_id` — joins through the order/seed chain.
+      - `outcome` — PURCHASED / RETURNED / POSTPONED / IN_FLIGHT /
+        REROUTED / DROPPED — categorisation of the current status.
+    Sorted by most-recent event first. Pagination is offset/limit.
+
+    Designed for the CA-portal dashboard's "recent journeys" table.
+    """
+    from app.modules.advisory.router import _assert_sa_or_privileged_cm
+    await _assert_sa_or_privileged_cm(db, current_user, "BRAND_HANDLING")
+
+    if limit < 1 or limit > 200:
+        raise HTTPException(status_code=422, detail="limit must be 1..200")
+
+    # One row per lineage with the latest-event timestamp. The
+    # current_status / outcome are computed via a follow-up join on
+    # OrderItem (most lineages live there). Seed lineages are folded
+    # in via a second pass.
+    from sqlalchemy import func as _func
+    lineage_rows = (await db.execute(
+        select(
+            OrderItemEvent.lineage_id,
+            _func.max(OrderItemEvent.created_at).label("latest_at"),
+        )
+        .group_by(OrderItemEvent.lineage_id)
+        .order_by(_func.max(OrderItemEvent.created_at).desc())
+        .limit(limit * 4)  # over-fetch — filtering happens in Python
+        .offset(offset)
+    )).all()
+
+    out: list[dict] = []
+    from app.modules.seed_mgmt.models import SeedOrderFull
+    for lid, latest_at in lineage_rows:
+        # Resolve current state via latest OrderItem (preferred) or
+        # latest SeedOrderFull on the lineage.
+        item = (await db.execute(
+            select(OrderItem)
+            .where(OrderItem.lineage_id == lid)
+            .order_by(OrderItem.updated_at.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+        so = None
+        if item is None:
+            so = (await db.execute(
+                select(SeedOrderFull)
+                .where(SeedOrderFull.lineage_id == lid)
+                .order_by(SeedOrderFull.updated_at.desc())
+                .limit(1)
+            )).scalar_one_or_none()
+
+        if item is None and so is None:
+            # lineage_id keyed only on an order's own id (husk-level
+            # events) — skip; these aren't journeys, they're
+            # bookkeeping.
+            continue
+
+        # Resolve the parent order to filter by client_id.
+        order_client_id = None
+        if item:
+            ord_row = (await db.execute(
+                select(Order).where(Order.id == item.order_id)
+            )).scalar_one_or_none()
+            if ord_row:
+                order_client_id = ord_row.client_id
+        elif so:
+            order_client_id = so.client_id
+
+        if client_id and order_client_id != client_id:
+            continue
+
+        status = (item.status.value if (item and hasattr(item.status, "value")) else
+                  (item.status if item else (so.status if so else None)))
+        out_outcome = _outcome_from_status(status)
+        if outcome and out_outcome != outcome:
+            continue
+
+        out.append({
+            "lineage_id": lid,
+            "latest_event_at": latest_at,
+            "current_status": status,
+            "outcome": out_outcome,
+            "client_id": order_client_id,
+            "kind": "seed" if so is not None else "input_item",
+        })
+
+        if len(out) >= limit:
+            break
+
+    return out
 
 
 @router.get("/admin/missing-brand-reports")
