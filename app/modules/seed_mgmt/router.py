@@ -571,11 +571,51 @@ async def list_farmer_seed_orders(
         out.append({
             "id": o.id, "status": o.status,
             "variety_name": variety.name if variety else None,
+            "crop_cosh_id": variety.crop_cosh_id if variety else None,
             "unit": o.unit, "quantity": float(o.quantity) if o.quantity else None,
             "total_price": float(o.total_price) if o.total_price else None,
             "created_at": o.created_at,
+            # Batch 14 additions for the farmer-side list page —
+            # the recipient ids drive "Sent to X" hints + downstream
+            # picker pre-population for DRAFT orders.
+            "dealer_user_id": o.dealer_user_id,
+            "facilitator_user_id": o.facilitator_user_id,
+            "subscription_id": o.subscription_id,
         })
     return out
+
+
+@router.get("/farmer/seed-orders/{order_id}")
+async def get_farmer_seed_order(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Detail for one seed order — drives /seed-orders/{id} on the
+    farmer PWA. Surfaces enough to render the status badge, the
+    qty/price when the dealer's submitted them, plus
+    `subscription_id` so the DRAFT picker can fetch nearby
+    recipients."""
+    order = await _get_seed_order(db, order_id, current_user.id, farmer=True)
+    variety = (await db.execute(
+        select(SeedVariety).where(SeedVariety.id == order.variety_id)
+    )).scalar_one_or_none()
+    return {
+        "id": order.id,
+        "status": order.status,
+        "variety_id": order.variety_id,
+        "variety_name": variety.name if variety else None,
+        "crop_cosh_id": variety.crop_cosh_id if variety else None,
+        "unit": order.unit,
+        "quantity": float(order.quantity) if order.quantity else None,
+        "total_price": float(order.total_price) if order.total_price else None,
+        "dealer_user_id": order.dealer_user_id,
+        "facilitator_user_id": order.facilitator_user_id,
+        "subscription_id": order.subscription_id,
+        "client_id": order.client_id,
+        "postponed_until": order.postponed_until,
+        "created_at": order.created_at,
+    }
 
 
 @router.put("/farmer/seed-orders/{order_id}/approve")
