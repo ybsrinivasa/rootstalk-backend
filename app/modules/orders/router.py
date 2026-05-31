@@ -901,7 +901,21 @@ async def approve_order_item(
     res = validate_item_transition(item.status, OrderItemStatus.APPROVED.value, FARMER)
     if not res.allowed:
         _raise_transition(res)
+    prev = item.status.value if hasattr(item.status, "value") else item.status
     item.status = OrderItemStatus.APPROVED
+    await _record_event(
+        db, lineage_id=item.lineage_id,
+        event_type="PURCHASE_RECORDED",
+        actor_user_id=current_user.id, actor_role="FARMER",
+        order_id=order_id, order_item_id=item.id,
+        prev_status=prev, new_status=OrderItemStatus.APPROVED.value,
+        metadata={
+            "brand_name": item.brand_name,
+            "price": float(item.price) if item.price else None,
+            "given_volume": float(item.given_volume) if item.given_volume else None,
+            "volume_unit": item.volume_unit,
+        },
+    )
     await _update_order_status(db, order_id)
     await db.commit()
     return {"item_id": item_id, "status": item.status}
@@ -918,7 +932,15 @@ async def reject_order_item(
     res = validate_item_transition(item.status, OrderItemStatus.REJECTED.value, FARMER)
     if not res.allowed:
         _raise_transition(res)
+    prev = item.status.value if hasattr(item.status, "value") else item.status
     item.status = OrderItemStatus.REJECTED
+    await _record_event(
+        db, lineage_id=item.lineage_id,
+        event_type="REJECTED",
+        actor_user_id=current_user.id, actor_role="FARMER",
+        order_id=order_id, order_item_id=item.id,
+        prev_status=prev, new_status=OrderItemStatus.REJECTED.value,
+    )
     await db.commit()
     return {"item_id": item_id, "status": item.status}
 
@@ -1106,7 +1128,22 @@ async def mark_item_available(
         item.volume_unit = data.get("volume_unit", "")
     if data.get("price") is not None:
         item.price = data["price"]
+    prev_status = item.status.value if hasattr(item.status, "value") else item.status
     item.status = OrderItemStatus.AVAILABLE
+    await _record_event(
+        db, lineage_id=item.lineage_id,
+        event_type="MARKED_AVAILABLE",
+        actor_user_id=current_user.id, actor_role="DEALER",
+        order_id=order_id, order_item_id=item.id,
+        prev_status=prev_status, new_status=OrderItemStatus.AVAILABLE.value,
+        metadata={
+            "brand_cosh_id": brand_cosh_id,
+            "brand_name": canonical_name,
+            "given_volume": float(item.given_volume) if item.given_volume else None,
+            "volume_unit": item.volume_unit,
+            "price": float(item.price) if item.price else None,
+        },
+    )
 
     # Part-aware sibling handling
     if item.relation_id and item.relation_role:
@@ -1372,8 +1409,20 @@ async def postpone_item(
     res = validate_item_transition(item.status, OrderItemStatus.POSTPONED.value, DEALER)
     if not res.allowed:
         _raise_transition(res)
+    prev = item.status.value if hasattr(item.status, "value") else item.status
     item.status = OrderItemStatus.POSTPONED
     item.postponed_until = data.get("postponed_until")
+    await _record_event(
+        db, lineage_id=item.lineage_id,
+        event_type="MARKED_POSTPONED",
+        actor_user_id=current_user.id, actor_role="DEALER",
+        order_id=order_id, order_item_id=item.id,
+        prev_status=prev, new_status=OrderItemStatus.POSTPONED.value,
+        metadata={
+            "postponed_until": item.postponed_until.isoformat() if item.postponed_until else None,
+            "days": data.get("days"),
+        },
+    )
     await db.commit()
     return {"item_id": item_id, "status": item.status, "postponed_until": item.postponed_until}
 
@@ -1390,7 +1439,15 @@ async def mark_item_unavailable(
     res = validate_item_transition(item.status, OrderItemStatus.NOT_AVAILABLE.value, DEALER)
     if not res.allowed:
         _raise_transition(res)
+    prev = item.status.value if hasattr(item.status, "value") else item.status
     item.status = OrderItemStatus.NOT_AVAILABLE
+    await _record_event(
+        db, lineage_id=item.lineage_id,
+        event_type="MARKED_NOT_AVAILABLE",
+        actor_user_id=current_user.id, actor_role="DEALER",
+        order_id=order_id, order_item_id=item.id,
+        prev_status=prev, new_status=OrderItemStatus.NOT_AVAILABLE.value,
+    )
     await db.commit()
     return {"item_id": item_id, "status": item.status}
 
@@ -1607,8 +1664,17 @@ async def route_order_to_dealer(
         raise HTTPException(status_code=404, detail="Order not found or not assigned to you")
     if order.status not in [OrderStatus.SENT, OrderStatus.ACCEPTED]:
         raise HTTPException(status_code=400, detail="Order cannot be routed in current status")
+    prev_status = order.status.value if hasattr(order.status, "value") else order.status
     order.dealer_user_id = data["dealer_user_id"]
     order.status = OrderStatus.PROCESSING
+    await _record_event(
+        db, lineage_id=order.id,
+        event_type="ROUTED_TO_DEALER",
+        actor_user_id=current_user.id, actor_role="FACILITATOR",
+        order_id=order.id,
+        prev_status=prev_status, new_status=OrderStatus.PROCESSING.value,
+        metadata={"dealer_user_id": order.dealer_user_id},
+    )
     await db.commit()
     return {"id": order.id, "status": order.status, "dealer_user_id": order.dealer_user_id}
 
@@ -2077,6 +2143,14 @@ async def accept_order(
     if order.status != OrderStatus.SENT:
         raise HTTPException(status_code=400, detail="Order can only be accepted when in SENT status")
     order.status = OrderStatus.PROCESSING
+    await _record_event(
+        db, lineage_id=order.id,
+        event_type="ACCEPTED",
+        actor_user_id=current_user.id, actor_role="DEALER",
+        order_id=order.id,
+        prev_status=OrderStatus.SENT.value,
+        new_status=OrderStatus.PROCESSING.value,
+    )
     await db.commit()
     return {"order_id": order_id, "status": order.status}
 
