@@ -29,6 +29,7 @@ from app.modules.orders.models import (
 )
 from app.modules.orders.router import (
     cancel_order, delete_cancelled_order, send_draft_order, OrderSend,
+    list_eligible_recipients,
 )
 from app.modules.orders.models import DealerProfile
 from tests.conftest import requires_docker
@@ -287,6 +288,157 @@ async def test_send_refuses_when_both_recipients_set(db):
             db=db, current_user=user,
         )
     assert exc.value.status_code == 422
+
+
+# ── Batch 5: locked-brand gate ──────────────────────────────────────────────
+
+
+async def _draft_with_locked_brand_setup(db):
+    """Setup helper — farmer, DRAFT with one item whose Practice is
+    brand-locked. Also returns the client_id so tests can wire
+    onboarded vs non-onboarded dealers."""
+    user = await make_user(db, name="Farmer Locked")
+    client = await make_client(db)
+    pkg = await make_package(db, client)
+    sub = await make_subscription(db, farmer=user, client=client, package=pkg)
+    sub.crop_start_date = datetime.now(timezone.utc)
+    await db.commit()
+
+    tl = await make_timeline(
+        db, pkg, name="TL_locked",
+        from_type=TimelineFromType.DAS, from_value=0, to_value=30,
+    )
+    pest = await make_practice(
+        db, tl, l0=PracticeL0.INPUT, l1="PESTICIDE", l2="CHEMICAL_PESTICIDES",
+    )
+    pest.is_brand_locked = True
+    await db.commit()
+
+    # Create the DRAFT directly — we're testing send, not cancel.
+    draft = Order(
+        subscription_id=sub.id, farmer_user_id=user.id, client_id=client.id,
+        category="PESTICIDE",
+        date_from=datetime.now(timezone.utc),
+        date_to=datetime.now(timezone.utc) + timedelta(days=10),
+        status=OrderStatus.DRAFT,
+    )
+    db.add(draft)
+    await db.flush()
+    db.add(OrderItem(
+        order_id=draft.id, practice_id=pest.id, timeline_id=tl.id,
+        status=OrderItemStatus.PENDING,
+    ))
+    await db.commit()
+    await db.refresh(draft)
+    return user, client, draft
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_send_locked_brand_to_onboarded_dealer_succeeds(db):
+    user, client, draft = await _draft_with_locked_brand_setup(db)
+    # Dealer is onboarded by THIS client (make_onboarded_dealer).
+    dealer = await make_onboarded_dealer(db, client=client, name="Onboarded D")
+    db.add(DealerProfile(
+        user_id=dealer.id, shop_name="OnboardedShop",
+        sell_categories=["PESTICIDES"],
+        shop_gps_lat=12.0, shop_gps_lng=77.0,
+    ))
+    await db.commit()
+
+    result = await send_draft_order(
+        order_id=draft.id,
+        body=OrderSend(dealer_user_id=dealer.id),
+        db=db, current_user=user,
+    )
+    assert result["status"] == OrderStatus.SENT
+    assert result["dealer_user_id"] == dealer.id
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_send_locked_brand_to_non_onboarded_dealer_refused(db):
+    user, _, draft = await _draft_with_locked_brand_setup(db)
+    # Dealer is onboarded by a DIFFERENT client (default factory behaviour).
+    stranger = await make_onboarded_dealer(db, name="Stranger D")
+    db.add(DealerProfile(
+        user_id=stranger.id, shop_name="StrangerShop",
+        sell_categories=["PESTICIDES"],
+        shop_gps_lat=12.0, shop_gps_lng=77.0,
+    ))
+    await db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await send_draft_order(
+            order_id=draft.id,
+            body=OrderSend(dealer_user_id=stranger.id),
+            db=db, current_user=user,
+        )
+    assert exc.value.status_code == 409
+    detail = exc.value.detail
+    assert isinstance(detail, dict)
+    assert detail["code"] == "locked_brand_requires_onboarded_dealer"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_send_locked_brand_to_facilitator_refused(db):
+    user, _, draft = await _draft_with_locked_brand_setup(db)
+    fac = await make_onboarded_facilitator(db, name="F")
+    await db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await send_draft_order(
+            order_id=draft.id,
+            body=OrderSend(facilitator_user_id=fac.id),
+            db=db, current_user=user,
+        )
+    assert exc.value.status_code == 409
+    detail = exc.value.detail
+    assert isinstance(detail, dict)
+    assert detail["code"] == "locked_brand_requires_onboarded_dealer"
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_eligible_recipients_filters_to_onboarded_when_locked(db):
+    user, client, draft = await _draft_with_locked_brand_setup(db)
+    # Onboarded — should appear.
+    in_dealer = await make_onboarded_dealer(db, client=client, name="In")
+    db.add(DealerProfile(
+        user_id=in_dealer.id, shop_name="In", sell_categories=["PESTICIDES"],
+        shop_gps_lat=12.0, shop_gps_lng=77.0,
+    ))
+    # Different client — should be hidden by the locked-brand filter.
+    out_dealer = await make_onboarded_dealer(db, name="Out")
+    db.add(DealerProfile(
+        user_id=out_dealer.id, shop_name="Out", sell_categories=["PESTICIDES"],
+        shop_gps_lat=12.1, shop_gps_lng=77.1,
+    ))
+    # Facilitator — should be hidden (locked brands can't go via facilitator).
+    fac = await make_onboarded_facilitator(db, name="FacL")
+    await db.commit()
+
+    result = await list_eligible_recipients(
+        order_id=draft.id, db=db, current_user=user,
+    )
+    assert result["has_locked_brand"] is True
+    dealer_ids = {d["user_id"] for d in result["dealers"]}
+    assert in_dealer.id in dealer_ids
+    assert out_dealer.id not in dealer_ids
+    assert result["facilitators"] == []
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_eligible_recipients_unlocked_includes_facilitators(db):
+    user, draft, dealer, fac = await _draft_with_recipient_setup(db)
+    result = await list_eligible_recipients(
+        order_id=draft.id, db=db, current_user=user,
+    )
+    assert result["has_locked_brand"] is False
+    assert any(d["user_id"] == dealer.id for d in result["dealers"])
+    assert any(f["user_id"] == fac.id for f in result["facilitators"])
 
 
 @requires_docker

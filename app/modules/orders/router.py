@@ -679,6 +679,33 @@ async def send_draft_order(
             detail="Pick exactly one — dealer or facilitator.",
         )
 
+    # ── Locked-brand gate (Orders V2 Batch 5) ────────────────────
+    # If even one item is brand-locked, the order must go to a
+    # dealer onboarded by this client — no facilitators, no
+    # non-onboarded dealers. Phrased as one rule (rather than two
+    # separate gates) so the picker can also refuse cleanly with
+    # one error code.
+    has_locked = await _order_has_locked_brand_items(db, order.id)
+    if has_locked:
+        if body.facilitator_user_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "locked_brand_requires_onboarded_dealer",
+                    "message": "This order has a brand-locked item. It can only be sent to a dealer onboarded by the company.",
+                },
+            )
+        if not await _is_dealer_onboarded_by_client(
+            db, body.dealer_user_id, order.client_id,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "locked_brand_requires_onboarded_dealer",
+                    "message": "This order has a brand-locked item. It can only be sent to a dealer onboarded by the company.",
+                },
+            )
+
     # ── Recipient gates ──────────────────────────────────────────
     if body.dealer_user_id:
         await _assert_active_dealer(db, body.dealer_user_id)
@@ -758,6 +785,107 @@ async def send_draft_order(
         "status": order.status,
         "dealer_user_id": order.dealer_user_id,
         "facilitator_user_id": order.facilitator_user_id,
+    }
+
+
+@router.get("/farmer/orders/{order_id}/eligible-recipients")
+async def list_eligible_recipients(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Pre-filtered picker payload for the farmer's DRAFT page.
+
+    Server-side filtering enforces:
+      - Dealer licence-category match (`sell_categories` includes
+        the order's category, mapped to its plural form).
+      - Locked-brand: if any item is brand-locked, only dealers
+        onboarded by the order's client appear and the facilitators
+        list is empty.
+      - Active status for both roles.
+
+    Ranked by haversine distance from the farmer's saved GPS, cap
+    at 10 each. Promoter pinning is left to the existing
+    `nearby-*` endpoints; this surface is about *eligibility*,
+    not ranking.
+    """
+    order = await _get_farmer_order(db, order_id, current_user.id)
+    has_locked = await _order_has_locked_brand_items(db, order.id)
+
+    # sell_categories stores plurals on DealerProfile; map the
+    # order's category to the matching plural for the contains-check.
+    cat_to_plural = {"PESTICIDE": "PESTICIDES", "FERTILIZER": "FERTILISERS"}
+    required_plural = cat_to_plural.get(order.category or "")
+
+    onboarded_dealer_ids: set[str] = set()
+    if has_locked:
+        from app.modules.clients.models import ClientPromoter
+        rows = (await db.execute(
+            select(ClientPromoter.user_id).where(
+                ClientPromoter.client_id == order.client_id,
+                ClientPromoter.promoter_type == "DEALER",
+                ClientPromoter.status == "ACTIVE",
+            )
+        )).all()
+        onboarded_dealer_ids = {r[0] for r in rows}
+
+    farmer_lat = float(current_user.gps_lat) if current_user.gps_lat else 0.0
+    farmer_lng = float(current_user.gps_lng) if current_user.gps_lng else 0.0
+
+    profiles = (await db.execute(select(DealerProfile))).scalars().all()
+    dealers: list[dict] = []
+    for profile in profiles:
+        if required_plural and required_plural not in (profile.sell_categories or []):
+            continue
+        if has_locked and profile.user_id not in onboarded_dealer_ids:
+            continue
+        if not profile.shop_gps_lat or not profile.shop_gps_lng:
+            continue
+        dealer = (await db.execute(select(User).where(User.id == profile.user_id))).scalar_one_or_none()
+        if not dealer:
+            continue
+        # Inline haversine — `_haversine_sub` lives in subscriptions/.
+        from math import radians, sin, cos, asin, sqrt
+        lat1, lon1, lat2, lon2 = map(radians, [
+            farmer_lat, farmer_lng,
+            float(profile.shop_gps_lat), float(profile.shop_gps_lng),
+        ])
+        a = sin((lat2 - lat1) / 2) ** 2 + cos(lat1) * cos(lat2) * sin((lon2 - lon1) / 2) ** 2
+        dist = 2 * 6371 * asin(sqrt(a))
+        dealers.append({
+            "user_id": dealer.id,
+            "name": dealer.name,
+            "phone": dealer.phone,
+            "shop_name": profile.shop_name,
+            "shop_address": profile.shop_address,
+            "sell_categories": profile.sell_categories or [],
+            "distance_km": round(dist, 1),
+        })
+    dealers.sort(key=lambda x: x["distance_km"])
+
+    facilitators: list[dict] = []
+    if not has_locked:
+        from app.modules.platform.models import RoleType, UserRole
+        fac_users = (await db.execute(
+            select(User).join(UserRole, UserRole.user_id == User.id)
+            .where(UserRole.role_type == RoleType.FACILITATOR)
+        )).scalars().all()
+        for fac in fac_users:
+            facilitators.append({
+                "user_id": fac.id,
+                "name": fac.name,
+                "phone": fac.phone,
+            })
+
+    return {
+        "category": order.category,
+        "has_locked_brand": has_locked,
+        "locked_brand_explainer": (
+            "This order has a brand-locked item — only the company's "
+            "onboarded dealers can fulfil it."
+        ) if has_locked else None,
+        "dealers": dealers[:10],
+        "facilitators": facilitators[:10],
     }
 
 
@@ -3291,6 +3419,46 @@ async def set_farm_area(
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
+
+async def _order_has_locked_brand_items(db: AsyncSession, order_id: str) -> bool:
+    """Whether this order contains at least one item whose Practice
+    is brand-locked. Drives the Orders V2 (2026-05-31) rule:
+    locked-brand orders can only be sent to dealers onboarded by
+    the client (no facilitators, no non-onboarded dealers).
+
+    REROUTED / REMOVED items are excluded — historical husk-rows
+    shouldn't keep the order constrained.
+    """
+    excluded = [OrderItemStatus.REROUTED, OrderItemStatus.REMOVED]
+    result = await db.execute(
+        select(func.count()).select_from(OrderItem)
+        .join(Practice, Practice.id == OrderItem.practice_id)
+        .where(
+            OrderItem.order_id == order_id,
+            Practice.is_brand_locked.is_(True),
+            OrderItem.status.notin_(excluded),
+        )
+    )
+    return bool((result.scalar() or 0) > 0)
+
+
+async def _is_dealer_onboarded_by_client(
+    db: AsyncSession, dealer_user_id: str, client_id: str,
+) -> bool:
+    """Active onboarding row in client_promoters? Matches what
+    `make_onboarded_dealer` writes."""
+    from app.modules.clients.models import ClientPromoter
+    row = (await db.execute(
+        select(ClientPromoter).where(
+            ClientPromoter.client_id == client_id,
+            ClientPromoter.user_id == dealer_user_id,
+            ClientPromoter.promoter_type == "DEALER",
+            ClientPromoter.status == "ACTIVE",
+        )
+    )).scalar_one_or_none()
+    return row is not None
+
 
 async def _get_farmer_order(db: AsyncSession, order_id: str, farmer_user_id: str) -> Order:
     result = await db.execute(
