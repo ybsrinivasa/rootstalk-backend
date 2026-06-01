@@ -104,6 +104,22 @@ COSH_TRADENAME_AI_CONNECT = "tradename_ai"
 # valid for it. Two endpoints per row: role=formulations + role=l2_data.
 COSH_FORMULATIONS_L2_NPK_CONNECT = "formulations_L2_npk"
 
+# ── NPK fertiliser concentration (synced 2026-06-01) ─────────────────────
+#
+# Drives the Batch-30 NPK ranking. A 4-endpoint Connect ties each
+# fertiliser common name to one nutrient (N/P/K) and one numeric
+# concentration value. Straight fertilisers have ONE row; Complex
+# (Mixed) fertilisers have TWO or THREE.
+#
+# Concentration values live in the `fert_nutrient_concentration_core`
+# Core's translations.en field as bare numeric strings ("8", "46",
+# "16.5"); the loader parses them to float.
+
+COSH_FERT_NUTRIENTS_CORE = "fert_nutrients"
+COSH_STRAIGHT_COMPLEX_CORE = "straight_complex"
+COSH_FERT_NUTRIENT_CONCENTRATION_CORE = "fert_nutrient_concentration_core"
+COSH_FERT_NUTRIENT_CONCENTRATION_CONNECT = "fert_nutrient_concentration"
+
 # Bridge from our L2 enum string to the `l2_data` Core's English
 # translation, used to resolve the NPK L2 → l2_data cosh_id.
 # Cosh ships no slug field on `l2_data`, so we match by translation.

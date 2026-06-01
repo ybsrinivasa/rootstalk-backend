@@ -21,6 +21,13 @@ from app.modules.advisory.models import Package, Practice, Element, Timeline
 from app.services.bl06_volume_calc import calculate_volume
 from math import radians, cos, sin, asin, sqrt
 from app.services.bl07_brand_options import get_brand_options
+from app.services.npk_candidates import load_fertiliser_candidates
+from app.services.npk_ranking import (
+    Candidate as NPKCandidate, Dose,
+    classify_fertiliser, compute_gap_after_mixed,
+    enabled_straights as npk_enabled_straights,
+    rank_mixed,
+)
 from app.services.bl10_order_state import (
     DEALER, FARMER,
     is_item_abortable, is_order_abortable,
@@ -3330,6 +3337,142 @@ async def get_packing_list(
             for i in items
         ],
         "total_amount": sum(float(i.price) for i in items if i.price),
+    }
+
+
+# ── Dealer: NPK options (Batch 30, RootsTalk_NPK_Handling.pdf) ────────────────
+#
+# Returns the ranked Mixed list + enabled Straight list for a single
+# NPK practice. The dealer screen posts back the picked Mixed (or
+# none) and an optional `gap` override; the second call re-ranks
+# Straights against the gap.
+#
+# Practice elements consumed:
+#   N_DOSAGE, P_DOSAGE, K_DOSAGE — the SE's required nutrient kg
+#   (UNIT, FORMULATION, APPLICATION_METHOD are advisory only here)
+
+_NPK_L2_TYPES = {
+    "CHEMICAL_FERTILIZERS_NPK_DOSAGES",
+    "FERTIGATION_NPK_DOSAGES",
+}
+
+
+def _candidate_to_dict(
+    cand: NPKCandidate,
+) -> dict:
+    return {
+        "cosh_id": cand.cosh_id,
+        "name": cand.name,
+        "n": cand.concentration.n,
+        "p": cand.concentration.p,
+        "k": cand.concentration.k,
+        "class": classify_fertiliser(cand.concentration),
+        "water_soluble": cand.water_soluble,
+    }
+
+
+@router.get("/dealer/orders/{order_id}/items/{item_id}/npk-options")
+async def get_item_npk_options(
+    order_id: str, item_id: str,
+    picked_mixed_cosh_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Spec §2 — ranked Mixed list + (after Mixed pick) enabled Straights.
+
+    Query params:
+      picked_mixed_cosh_id  Optional; pass the dealer's Mixed selection
+                            on the second call to get the Straight list
+                            filtered by remaining gap.
+
+    Response shape:
+      {
+        "is_npk_practice": bool,
+        "fertigation": bool,
+        "required_dose": {"n": ..., "p": ..., "k": ...},
+        "ranked_mixed": [{"cosh_id", "name", "kg_product", "delivered":
+                          {"n","p","k"}, "match_target"} ...],
+        "enabled_straights": [_candidate_to_dict ...],
+        "gap": {"n", "p", "k"},
+        "cosh_skipped_count": int   # diagnostic; common_names lacking npk metadata
+      }
+    """
+    await _assert_active_dealer(db, current_user.id)
+    item = await _get_order_item(db, item_id, order_id)
+    practice = (await db.execute(
+        select(Practice).where(Practice.id == item.practice_id)
+    )).scalar_one_or_none()
+    if practice is None or practice.l2_type not in _NPK_L2_TYPES:
+        return {
+            "is_npk_practice": False,
+            "fertigation": False,
+            "required_dose": None,
+            "ranked_mixed": [], "enabled_straights": [],
+            "gap": None, "cosh_skipped_count": 0,
+        }
+
+    elements = (await db.execute(
+        select(Element).where(Element.practice_id == practice.id)
+    )).scalars().all()
+    by_type = {e.element_type: e for e in elements}
+
+    def _val(et: str) -> float:
+        e = by_type.get(et) or by_type.get(et.upper()) or by_type.get(et.lower())
+        if e is None or e.value is None:
+            return 0.0
+        try:
+            return float(e.value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    dose = Dose(n=_val("N_DOSAGE"), p=_val("P_DOSAGE"), k=_val("K_DOSAGE"))
+    fertigation = practice.l2_type == "FERTIGATION_NPK_DOSAGES"
+
+    candidates, skipped = await load_fertiliser_candidates(db)
+
+    ranked = rank_mixed(
+        candidates, dose, water_soluble_only=fertigation,
+    )
+    # Resolve the dealer's pick (if any) against the ranked list so the
+    # gap is computed from the SAME MatchOutcome the dealer saw.
+    picked = None
+    if picked_mixed_cosh_id:
+        for r in ranked:
+            if r.candidate.cosh_id == picked_mixed_cosh_id:
+                picked = r
+                break
+
+    gap = compute_gap_after_mixed(dose, picked)
+    straights = npk_enabled_straights(
+        gap, candidates, water_soluble_only=fertigation,
+    )
+    straights.sort(key=lambda c: c.name.lower())  # alphabetical per spec §3.1
+
+    return {
+        "is_npk_practice": True,
+        "fertigation": fertigation,
+        "required_dose": {"n": dose.n, "p": dose.p, "k": dose.k},
+        "ranked_mixed": [
+            {
+                "cosh_id": r.candidate.cosh_id,
+                "name": r.candidate.name,
+                "n": r.candidate.concentration.n,
+                "p": r.candidate.concentration.p,
+                "k": r.candidate.concentration.k,
+                "kg_product": round(r.kg_product, 2),
+                "delivered": {
+                    "n": round(r.best.n_delivered, 2),
+                    "p": round(r.best.p_delivered, 2),
+                    "k": round(r.best.k_delivered, 2),
+                },
+                "match_target": r.best.target,
+                "total_delivered": round(r.total_delivered, 2),
+            }
+            for r in ranked
+        ],
+        "enabled_straights": [_candidate_to_dict(c) for c in straights],
+        "gap": {"n": gap.n, "p": gap.p, "k": gap.k},
+        "cosh_skipped_count": skipped,
     }
 
 
