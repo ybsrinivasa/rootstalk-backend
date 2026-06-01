@@ -757,6 +757,66 @@ class DBSBulkCreate(BaseModel):
     area_unit: Optional[str] = None
 
 
+@router.get("/farmer/pre-sowing-available")
+async def farmer_pre_sowing_available(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """True iff at least one of the farmer's subscriptions has unbooked
+    DBS Pre-sowing items available right now. Drives the visibility of
+    the Pre-sowing button on /orders so the farmer isn't routed to a
+    page that wouldn't have anything actionable.
+
+    Aggregates the same shape `/farmer/subscriptions/{id}/dbs-bulk-
+    preview` returns — ANNUAL package + start-date window open + at
+    least one remaining DBS practice for PESTICIDE or FERTILIZER.
+    Short-circuits on the first match.
+    """
+    from datetime import date as _date
+    from app.services.order_bundle import (
+        resolve_dbs_practices_for_category, already_ordered_practice_ids,
+    )
+
+    subs = (await db.execute(
+        select(Subscription).where(
+            Subscription.farmer_user_id == current_user.id,
+        )
+    )).scalars().all()
+    if not subs:
+        return {"available": False, "reason": "no_subscriptions"}
+
+    today = _date.today()
+    for sub in subs:
+        package = (await db.execute(
+            select(Package).where(Package.id == sub.package_id)
+        )).scalar_one_or_none()
+        if package is None:
+            continue
+        pkg_type = (
+            package.package_type.value
+            if hasattr(package.package_type, "value")
+            else str(package.package_type)
+        )
+        if pkg_type != "ANNUAL":
+            continue
+        window_open = sub.crop_start_date is None or (
+            (sub.crop_start_date.date()
+             if hasattr(sub.crop_start_date, "date")
+             else sub.crop_start_date) > today
+        )
+        if not window_open:
+            continue
+        already = await already_ordered_practice_ids(db, sub.id)
+        for category in ("PESTICIDE", "FERTILIZER"):
+            all_dbs = await resolve_dbs_practices_for_category(
+                db, subscription=sub, category=category,
+            )
+            remaining = [pid for pid in all_dbs if pid not in already]
+            if remaining:
+                return {"available": True}
+    return {"available": False, "reason": "nothing_remaining"}
+
+
 @router.get("/farmer/subscriptions/{subscription_id}/dbs-bulk-preview")
 async def dbs_bulk_preview(
     subscription_id: str,
