@@ -17,7 +17,8 @@ from app.modules.clients.models import (
 )
 from app.modules.sync.models import CoshSyncLog, CoshCoreItem, CoshConnectRow, VolumeFormula, CropHealthCrop, CropMeasure
 from app.modules.orders.models import (
-    Order, OrderItem, SeedOrder, PackingList, MissingBrandReport
+    Order, OrderItem, SeedOrder, PackingList, MissingBrandReport,
+    BrandLookupCache,
 )
 from app.modules.subscriptions.models import (
     Subscription, SubscriptionWaitlist, SubscriptionPool,

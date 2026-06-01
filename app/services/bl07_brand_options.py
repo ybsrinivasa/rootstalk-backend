@@ -283,15 +283,14 @@ async def get_brand_options(
     )
     recommended_cosh_id = _el_field(recommended_el, "cosh_ref") if recommended_el else None
 
+    # Fix 2026-06-01: brands are NOT stored as Core rows with
+    # parent_cosh_id pointing at the common name. They live in the
+    # `trade_names` Core + `tradename_commonname` Connect chain. We
+    # read them from `brand_lookup_cache` (materialised view of that
+    # walk, 13k+ trade-name dataset). See app/services/brand_cache.py.
     if common_name_cosh_id:
-        brands_result = await db.execute(
-            select(CoshCoreItem).where(
-                CoshCoreItem.core_type == "brand",
-                CoshCoreItem.parent_cosh_id == common_name_cosh_id,
-                CoshCoreItem.status == "active",
-            ).order_by(CoshCoreItem.cosh_id)
-        )
-        all_brands = brands_result.scalars().all()
+        from app.services.brand_cache import get_brands_for_common_name
+        all_brands = await get_brands_for_common_name(db, common_name_cosh_id)
     else:
         all_brands = []
 
@@ -306,25 +305,8 @@ async def get_brand_options(
     preferred_client_ids = {r.manufacturer_client_id for r in dealer_rels if r.manufacturer_client_id}
     preferred_names = {r.manufacturer_name.lower() for r in dealer_rels}
 
-    # Batch 25 — batch-load formulations for all brands in one round so
-    # the per-brand metadata lookup doesn't fan out into N queries.
-    formulation_ids = {
-        (b.metadata_ or {}).get("formulation_cosh_id")
-        for b in all_brands
-    }
-    formulation_ids = {fid for fid in formulation_ids if fid}
-    formulation_names: dict[str, str] = {}
-    if formulation_ids:
-        fmt_rows = (await db.execute(
-            select(CoshCoreItem).where(
-                CoshCoreItem.cosh_id.in_(formulation_ids),
-                CoshCoreItem.core_type == "formulation",
-            )
-        )).scalars().all()
-        for f in fmt_rows:
-            tr = f.translations or {}
-            if isinstance(tr, dict):
-                formulation_names[f.cosh_id] = tr.get("en") or ""
+    # Formulation names already materialised on each cache row — no
+    # additional Core lookup needed.
 
     group_recommended: list[BrandOption] = []
     group_my: list[BrandOption] = []
@@ -332,26 +314,27 @@ async def get_brand_options(
     brand_unit_family: dict[str, str] = {}
 
     for b in all_brands:
-        name = (b.translations or {}).get("en") or b.cosh_id
-        manufacturer = (b.metadata_ or {}).get("manufacturer_name")
-        manufacturer_client_id = (b.metadata_ or {}).get("manufacturer_client_id")
-        is_preferred = (
-            manufacturer_client_id in preferred_client_ids or
-            (manufacturer and manufacturer.lower() in preferred_names)
+        # Fix 2026-06-01: BrandLookupCache shape — trade_name_cosh_id +
+        # trade_name + manufacturer_name + formulation_name.
+        cosh_id = b.trade_name_cosh_id
+        name = b.trade_name or cosh_id
+        manufacturer = b.manufacturer_name
+        is_preferred = bool(
+            manufacturer and manufacturer.lower() in preferred_names
         )
         option = BrandOption(
-            cosh_id=b.cosh_id, name=name, manufacturer=manufacturer,
+            cosh_id=cosh_id, name=name, manufacturer=manufacturer,
             preferred=is_preferred,
         )
 
-        # Unit family — derived from formulation, not maintained per brand.
-        fid = (b.metadata_ or {}).get("formulation_cosh_id")
-        family = _classify_formulation_to_unit_family(formulation_names.get(fid))
-        brand_unit_family[b.cosh_id] = family
+        # Unit family — derived from formulation name (the cache row
+        # already carries the EN translation).
+        family = _classify_formulation_to_unit_family(b.formulation_name)
+        brand_unit_family[cosh_id] = family
 
         # User spec 2026-05-31: same brand never repeated across groups —
         # appears in highest-priority group only. Recommended > My > Other.
-        if b.cosh_id == recommended_cosh_id:
+        if cosh_id == recommended_cosh_id:
             group_recommended.append(option)
         elif is_preferred:
             group_my.append(option)

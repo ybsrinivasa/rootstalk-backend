@@ -4376,6 +4376,25 @@ async def admin_refresh_manufacturer_catalog(
     return {"rows_written": total, "category": category or "ALL"}
 
 
+@router.post("/admin/brand-cache/refresh")
+async def admin_refresh_brand_cache(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Force-rebuild `brand_lookup_cache` from Cosh.
+
+    Call after a Cosh sync that adds, renames, or retires trade names
+    / manufacturers / formulations. Cache is also lazy-bootstrapped on
+    first read for a common name when the cache is entirely empty, so
+    a fresh deploy works without an explicit refresh. SA-or-CM only.
+    """
+    from app.modules.advisory.router import _assert_sa_or_cm
+    from app.services.brand_cache import rebuild_brand_cache
+    await _assert_sa_or_cm(db, current_user)
+    written = await rebuild_brand_cache(db)
+    return {"rows_written": written}
+
+
 @router.get("/dealer/dealerships")
 async def list_dealerships(
     category: str | None = None,

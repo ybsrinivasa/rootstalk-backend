@@ -1,7 +1,7 @@
 import uuid
 import enum
 from datetime import datetime, timezone
-from sqlalchemy import String, Text, Boolean, Integer, DateTime, ForeignKey, DECIMAL, JSON
+from sqlalchemy import String, Text, Boolean, Integer, DateTime, ForeignKey, DECIMAL, JSON, Index
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database import Base
 
@@ -272,6 +272,39 @@ class DealerManufacturerCatalog(Base):
     manufacturer_name: Mapped[str] = mapped_column(String(500), nullable=False)
     refreshed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow,
+    )
+
+
+class BrandLookupCache(Base):
+    """Materialised brand catalog. Walks Cosh's
+    `tradename_commonname` × `tradename_manufacturer` ×
+    `tradename_formulation` Connects once and lands one row per
+    (common_name, trade_name) pair so BL-07's brand picker stays
+    sub-second over the 13k+ trade-name dataset.
+
+    Fix 2026-06-01 — BL-07 was looking for `core_type='brand'` Core
+    rows; Cosh stores brands as `trade_names` + Connects instead, so
+    the search returned empty. This cache materialises the Connect
+    walk for the dealer surface.
+
+    Truncate-and-reload is the only write path. Refresh is SA-
+    triggered via /admin/brand-cache/refresh (or lazy on first read).
+    """
+    __tablename__ = "brand_lookup_cache"
+
+    common_name_cosh_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    trade_name_cosh_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    trade_name: Mapped[str] = mapped_column(String(500), nullable=False)
+    manufacturer_cosh_id: Mapped[str] = mapped_column(String(100), nullable=True)
+    manufacturer_name: Mapped[str] = mapped_column(String(500), nullable=True)
+    formulation_cosh_id: Mapped[str] = mapped_column(String(100), nullable=True)
+    formulation_name: Mapped[str] = mapped_column(String(500), nullable=True)
+    refreshed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow,
+    )
+
+    __table_args__ = (
+        Index("idx_brand_cache_cn", "common_name_cosh_id"),
     )
 
 

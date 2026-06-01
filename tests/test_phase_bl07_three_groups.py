@@ -66,26 +66,38 @@ async def _seed_practice_with_brands(db, *, recommended_cosh_id=None):
         parent_cosh_id=None, translations={"en": "Wettable Powder"},
         status="active",
     ))
-    db.add(CoshCoreItem(
-        cosh_id="cosh:brand-acme",
-        core_type="brand", parent_cosh_id=common_cosh,
-        translations={"en": "Acme Mancozeb"},
-        metadata_={"manufacturer_name": "AcmeCo", "formulation_cosh_id": fmt_cosh},
-        status="active",
+    # Fix 2026-06-01 — brands now live in the brand_lookup_cache,
+    # populated from `trade_names` Core + tradename_commonname /
+    # tradename_manufacturer / tradename_formulation Connects. Seed
+    # the cache directly here so the test stays focused on grouping
+    # logic; rebuild_brand_cache is exercised in its own test.
+    from app.modules.orders.models import BrandLookupCache
+    db.add(BrandLookupCache(
+        common_name_cosh_id=common_cosh,
+        trade_name_cosh_id="cosh:brand-acme",
+        trade_name="Acme Mancozeb",
+        manufacturer_cosh_id="cosh:mfr-acme",
+        manufacturer_name="AcmeCo",
+        formulation_cosh_id=fmt_cosh,
+        formulation_name="Wettable Powder",
     ))
-    db.add(CoshCoreItem(
-        cosh_id="cosh:brand-zeta",
-        core_type="brand", parent_cosh_id=common_cosh,
-        translations={"en": "Zeta Mancozeb"},
-        metadata_={"manufacturer_name": "AcmeCo", "formulation_cosh_id": fmt_cosh},
-        status="active",
+    db.add(BrandLookupCache(
+        common_name_cosh_id=common_cosh,
+        trade_name_cosh_id="cosh:brand-zeta",
+        trade_name="Zeta Mancozeb",
+        manufacturer_cosh_id="cosh:mfr-acme",
+        manufacturer_name="AcmeCo",
+        formulation_cosh_id=fmt_cosh,
+        formulation_name="Wettable Powder",
     ))
-    db.add(CoshCoreItem(
-        cosh_id="cosh:brand-other",
-        core_type="brand", parent_cosh_id=common_cosh,
-        translations={"en": "Other Mancozeb"},
-        metadata_={"manufacturer_name": "OtherCo", "formulation_cosh_id": fmt_cosh},
-        status="active",
+    db.add(BrandLookupCache(
+        common_name_cosh_id=common_cosh,
+        trade_name_cosh_id="cosh:brand-other",
+        trade_name="Other Mancozeb",
+        manufacturer_cosh_id="cosh:mfr-other",
+        manufacturer_name="OtherCo",
+        formulation_cosh_id=fmt_cosh,
+        formulation_name="Wettable Powder",
     ))
     await db.commit()
 
