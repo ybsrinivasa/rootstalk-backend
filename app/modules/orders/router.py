@@ -2108,21 +2108,22 @@ async def abort_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """BL-10: Dealer aborts an in-flight order — items in dealer-owned
-    states revert to PENDING with their fulfilment fields cleared, and
-    the order goes back to SENT so a different dealer can pick it up.
+    """Dealer-side "Reset items" — clears the dealer's in-flight
+    selections so they can start over, WITHOUT reversing the order's
+    acceptance.
 
-    Audit fixes (2026-05-05):
-    - dealer ownership check (was missing — any dealer could abort
-      anyone's order)
-    - is_order_abortable guard so CANCELLED / COMPLETED / EXPIRED
-      orders cannot be resurrected
-    - per-item is_item_abortable guard so APPROVED / REJECTED /
-      REMOVED / SKIPPED items survive the abort (was wiping prior
-      farmer approvals)
-    - clears all fulfilment fields, not just brand (given_volume,
-      volume_unit, price, postponed_until, scan_verified — were
-      stale on the resulting PENDING item).
+    Spec correction 2026-06-01: the endpoint used to flip
+    `order.status = SENT` and effectively un-accept the order. The
+    dealer's acceptance shouldn't be reversed — only their item picks
+    are. The screen behaves like Refresh + Go Back: items reset to
+    PENDING, draft map wiped, but the order stays PROCESSING (or
+    whatever non-terminal status it was in).
+
+    Item-level reset (unchanged from BL-10):
+    - is_item_abortable guard preserves APPROVED / REJECTED /
+      REMOVED / SKIPPED items (the farmer already acted on those).
+    - All fulfilment fields cleared on resettable items so a re-pick
+      starts from a clean slate.
     """
     await _assert_active_dealer(db, current_user.id)
     order = await _get_dealer_order(db, order_id, current_user.id)
@@ -2132,8 +2133,8 @@ async def abort_order(
             detail={
                 "error_code": "ORDER_NOT_ABORTABLE",
                 "message": (
-                    f"Order in status '{order.status}' cannot be aborted. "
-                    "Abort is only valid for PROCESSING / SENT_FOR_APPROVAL / "
+                    f"Order in status '{order.status}' cannot be reset. "
+                    "Reset is only valid for PROCESSING / SENT_FOR_APPROVAL / "
                     "PARTIALLY_APPROVED orders."
                 ),
             },
@@ -2154,11 +2155,12 @@ async def abort_order(
         item.postponed_until = None
         item.scan_verified = False
 
-    # Batch 28 — abort wipes the per-item draft map too. A different
-    # dealer picking the order up later starts from a clean slate.
+    # Wipe the per-item draft map too — re-opening the screen should
+    # show a clean form.
     order.dealer_draft = {}
 
-    order.status = OrderStatus.SENT
+    # Order status intentionally unchanged: the dealer's acceptance
+    # stands. Only their item-level work is rolled back.
     await db.commit()
     return {"order_id": order_id, "status": order.status}
 
@@ -2447,6 +2449,8 @@ async def get_dealer_order(
             display_name = common_name or (
                 l2.replace("_", " ").title() if l2 else "Practice"
             )
+        # Fix 2026-06-01: per-item application window.
+        item_df, item_dt = _per_item_dates(i)
         return {
             "id": i.id, "practice_id": i.practice_id,
             "status": i.status.value if hasattr(i.status, "value") else i.status,
@@ -2466,6 +2470,8 @@ async def get_dealer_order(
             # picking a brand: recommended dosage + unit, application
             # method, volume per plant (plant-wise only).
             "element_block": element_block_for_item(i.id),
+            "application_date_from": item_df,
+            "application_date_to": item_dt,
         }
 
     # Group items by relation
@@ -2491,6 +2497,52 @@ async def get_dealer_order(
         )).scalars().all()
         for e in elements:
             elements_by_practice.setdefault(e.practice_id, []).append(e)
+
+    # Fix 2026-06-01 (per-item date range): an order can span multiple
+    # timelines, each with its own application window. Batch-load
+    # Timelines + the subscription's crop_start_date so item_brief can
+    # surface a per-item window instead of just the order-level one.
+    all_timeline_ids = list({i.timeline_id for i in items if i.timeline_id})
+    timeline_map: dict[str, Timeline] = {}
+    if all_timeline_ids:
+        tl_rows = (await db.execute(
+            select(Timeline).where(Timeline.id.in_(all_timeline_ids))
+        )).scalars().all()
+        timeline_map = {t.id: t for t in tl_rows}
+    sub_for_dates = (await db.execute(
+        select(Subscription).where(Subscription.id == order.subscription_id)
+    )).scalar_one_or_none()
+    crop_start_date = sub_for_dates.crop_start_date if sub_for_dates else None
+    crop_start_d = None
+    if crop_start_date is not None:
+        crop_start_d = (
+            crop_start_date.date()
+            if hasattr(crop_start_date, "date") else crop_start_date
+        )
+
+    def _per_item_dates(it: OrderItem) -> tuple[str | None, str | None]:
+        """Resolve (date_from, date_to) ISO strings for a single item.
+        Returns (None, None) when the window isn't computable (no
+        crop_start_date for DAS/DBS, or CALENDAR not yet wired)."""
+        tl = timeline_map.get(it.timeline_id) if it.timeline_id else None
+        if tl is None or crop_start_d is None:
+            return (None, None)
+        from app.services.snapshot_render import (
+            TimelineMetadata, cca_calendar_dates,
+        )
+        from_type_value = (
+            tl.from_type.value if hasattr(tl.from_type, "value")
+            else str(tl.from_type)
+        )
+        if from_type_value not in ("DAS", "DBS"):
+            return (None, None)
+        meta = TimelineMetadata(
+            from_type=from_type_value,
+            from_value=int(tl.from_value),
+            to_value=int(tl.to_value),
+        )
+        df, dt_ = cca_calendar_dates(meta, crop_start_d)
+        return (df.isoformat(), dt_.isoformat())
 
     # ── Phase 3.3: per-item snapshot resolution ──────────────────────────
     # Each item that was created post-Phase-3.2 carries a permanent pointer

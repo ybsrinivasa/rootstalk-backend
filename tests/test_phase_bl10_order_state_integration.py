@@ -250,7 +250,10 @@ async def test_abort_preserves_approved_items_and_clears_stale_fields(db):
     out = await abort_order(
         order_id=order.id, db=db, current_user=dealer,
     )
-    assert out["status"] == OrderStatus.SENT
+    # Spec correction 2026-06-01: Abort no longer reverses the
+    # dealer's acceptance. Order status stays as it was; only the
+    # dealer-actionable item picks are rolled back.
+    assert out["status"] == OrderStatus.PARTIALLY_APPROVED
 
     # Refresh from DB.
     refreshed_avail = (await db.execute(

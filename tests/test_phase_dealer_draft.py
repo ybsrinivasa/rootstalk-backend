@@ -176,6 +176,21 @@ async def test_abort_wipes_draft(db):
 
 @requires_docker
 @pytest.mark.asyncio
+async def test_abort_preserves_dealer_acceptance(db):
+    """Spec correction 2026-06-01: Abort is now Reset items; it must
+    NOT reverse the dealer's acceptance. Status stays as it was."""
+    dealer, order, item = await _seed_order(db)
+    # _seed_order leaves the order in PROCESSING.
+    assert order.status == OrderStatus.PROCESSING
+
+    await abort_order(order_id=order.id, db=db, current_user=dealer)
+
+    res = await get_dealer_order(order_id=order.id, db=db, current_user=dealer)
+    assert res["status"] == OrderStatus.PROCESSING
+
+
+@requires_docker
+@pytest.mark.asyncio
 async def test_unknown_keys_ignored(db):
     """Server only persists whitelisted fields — a client sending
     garbage can't poison the draft store."""
