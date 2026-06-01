@@ -4051,8 +4051,22 @@ async def get_volume_estimate(
     dosage_el = elements_by_type.get("dosage")
     dosage = float(dosage_el.value) if dosage_el and dosage_el.value else None
 
+    # Fix 2026-06-01 — in the modern Cosh authoring, application_method
+    # is stored as a cosh_ref to a Core row, not a free-text value. The
+    # 304 BL-06 formulas key on the English name ("Foliar Spray"), so
+    # resolve the cosh_ref via translations.en. Same for dosage_unit.
+    from app.modules.sync.models import CoshCoreItem as _BL06CoshCore
     method_el = elements_by_type.get("application_method")
-    application_method = method_el.value if method_el and method_el.value else None
+    application_method: Optional[str] = None
+    if method_el:
+        if method_el.value:
+            application_method = method_el.value
+        elif method_el.cosh_ref:
+            core = (await db.execute(
+                select(_BL06CoshCore).where(_BL06CoshCore.cosh_id == method_el.cosh_ref)
+            )).scalar_one_or_none()
+            if core:
+                application_method = (core.translations or {}).get("en")
     if not application_method:
         return {
             "estimated_volume": None, "volume_unit": None,
@@ -4079,8 +4093,33 @@ async def get_volume_estimate(
     # dosage element's unit_cosh_id for dosage_unit.
     if not brand_unit:
         brand_unit = item.volume_unit or None
-    if not dosage_unit and dosage_el and dosage_el.unit_cosh_id:
-        dosage_unit = dosage_el.unit_cosh_id
+    if not dosage_unit:
+        # Dosage unit lives on a separate DOSAGE_UNIT element in the
+        # modern Cosh-driven authoring (cosh_ref → dosage_unit Core),
+        # not on dosage_el.unit_cosh_id. Resolve via the same EN-name
+        # path application_method uses above so the formula lookup
+        # gets "ml/L", not a UUID.
+        dosage_unit_el = elements_by_type.get("dosage_unit")
+        if dosage_unit_el:
+            if dosage_unit_el.cosh_ref:
+                core = (await db.execute(
+                    select(_BL06CoshCore).where(_BL06CoshCore.cosh_id == dosage_unit_el.cosh_ref)
+                )).scalar_one_or_none()
+                if core:
+                    dosage_unit = (core.translations or {}).get("en")
+            if not dosage_unit and dosage_unit_el.value:
+                dosage_unit = dosage_unit_el.value
+        if not dosage_unit and dosage_el and dosage_el.unit_cosh_id:
+            # Legacy fallback — dosage element's own unit_cosh_id may
+            # hold either a cosh_id (resolve to EN) or free text (use
+            # directly).
+            legacy_core = (await db.execute(
+                select(_BL06CoshCore).where(_BL06CoshCore.cosh_id == dosage_el.unit_cosh_id)
+            )).scalar_one_or_none()
+            dosage_unit = (
+                (legacy_core.translations or {}).get("en")
+                if legacy_core else dosage_el.unit_cosh_id
+            )
 
     if not brand_unit:
         return {
