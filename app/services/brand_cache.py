@@ -31,7 +31,9 @@ from app.services.cosh_constants import (
     COSH_TRADENAME_COMMONNAME_CONNECT,
     COSH_TRADENAME_FORMULATION_CONNECT,
     COSH_TRADENAME_MANUFACTURER_CONNECT,
+    COSH_TRADENAMES_UNITS_CONNECT,
     COSH_TRADE_NAMES_CORE,
+    COSH_UNITS_DATA_CORE,
 )
 
 
@@ -82,6 +84,22 @@ async def rebuild_brand_cache(db: AsyncSession) -> int:
         if tn and fmt:
             tn_to_formulation.setdefault(tn, fmt)
 
+    # tradename → [unit cosh_ids]. One or more units per trade name
+    # (e.g. Captaf sold in both 100 g and 1 kg packs).
+    tnu_rows = (await db.execute(
+        select(CoshConnectRow).where(
+            CoshConnectRow.connect_type == COSH_TRADENAMES_UNITS_CONNECT,
+            CoshConnectRow.status == "active",
+        )
+    )).scalars().all()
+    tn_to_unit_ids: dict[str, list[str]] = {}
+    for r in tnu_rows:
+        ep = {e.get("role"): e.get("cosh_id") for e in (r.endpoints or [])}
+        tn = ep.get(COSH_TRADE_NAMES_CORE)
+        unit = ep.get(COSH_UNITS_DATA_CORE)
+        if tn and unit:
+            tn_to_unit_ids.setdefault(tn, []).append(unit)
+
     # Bulk-resolve core names. One IN-query covers all four core types
     # we need translations for.
     needed_cosh_ids: set[str] = set()
@@ -92,6 +110,8 @@ async def rebuild_brand_cache(db: AsyncSession) -> int:
                 needed_cosh_ids.add(cid)
     needed_cosh_ids.update(tn_to_mfr.values())
     needed_cosh_ids.update(tn_to_formulation.values())
+    for unit_list in tn_to_unit_ids.values():
+        needed_cosh_ids.update(unit_list)
 
     cores = (await db.execute(
         select(CoshCoreItem).where(
@@ -127,6 +147,20 @@ async def rebuild_brand_cache(db: AsyncSession) -> int:
         seen.add(key)
         mfr_id = tn_to_mfr.get(tn)
         fmt_id = tn_to_formulation.get(tn)
+        # Build the unit list once; the cache row mirrors what the
+        # /brand-options endpoint surfaces straight to the PWA dropdown.
+        units: list[dict] = []
+        seen_unit_ids: set[str] = set()
+        for unit_id in tn_to_unit_ids.get(tn, []):
+            if unit_id in seen_unit_ids:
+                continue
+            seen_unit_ids.add(unit_id)
+            units.append({
+                "cosh_id": unit_id,
+                "name": en_name.get(unit_id, unit_id),
+            })
+        # Alphabetical so the dropdown order is stable.
+        units.sort(key=lambda u: u["name"].lower())
         db.add(BrandLookupCache(
             common_name_cosh_id=cn,
             trade_name_cosh_id=tn,
@@ -135,6 +169,7 @@ async def rebuild_brand_cache(db: AsyncSession) -> int:
             manufacturer_name=en_name.get(mfr_id) if mfr_id else None,
             formulation_cosh_id=fmt_id,
             formulation_name=en_name.get(fmt_id) if fmt_id else None,
+            units=units,
             refreshed_at=now,
         ))
         written += 1

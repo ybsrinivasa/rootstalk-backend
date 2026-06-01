@@ -137,6 +137,16 @@ COSH_FERT_NUTRIENT_CONCENTRATION_CONNECT = "fert_nutrient_concentration"
 # 238 rows / 81 distinct common names on first prod sync.
 
 COSH_NPK_FERTIGATION_PRODUCTS_CONNECT = "npk_fertigation_products"
+
+# ── Trade-name allowed brand units (synced 2026-06-01) ──────────────────
+#
+# 2-endpoint Connect pairing each trade_name with one or more units the
+# brand is actually sold in (e.g. Captaf comes in kg AND g packs). 16k+
+# rows on first prod sync. Replaces the formulation-class inference for
+# the dealer's Unit dropdown — the materialised brand_lookup_cache picks
+# these up at refresh time.
+
+COSH_TRADENAMES_UNITS_CONNECT = "tradenames_units"
 COSH_NPK_FERT_POS_COMMONNAMES_L2_ID = 1
 COSH_NPK_FERT_POS_TRADENAME_MFR_ID = 2
 COSH_NPK_FERT_POS_FORMULATION = 3

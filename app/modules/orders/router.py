@@ -4046,7 +4046,13 @@ async def get_volume_estimate(
     elements_rows = (await db.execute(
         select(Element).where(Element.practice_id == item.practice_id)
     )).scalars().all()
-    elements_by_type = {e.element_type: e for e in elements_rows}
+    # Fix 2026-06-01 — modern authoring stores element_type as
+    # APPLICATION_METHOD (uppercase) while the legacy path was
+    # "application_method". Index by lowercase so a single .get works
+    # regardless of which authoring shape produced the row.
+    elements_by_type = {
+        (e.element_type or "").lower(): e for e in elements_rows
+    }
 
     dosage_el = elements_by_type.get("dosage")
     dosage = float(dosage_el.value) if dosage_el and dosage_el.value else None

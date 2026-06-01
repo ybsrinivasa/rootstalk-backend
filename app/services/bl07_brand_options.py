@@ -118,6 +118,12 @@ class BrandOptionsResult:
     # Given-Volume unit dropdown to what physically makes sense for
     # the brand the dealer picks.
     brand_unit_family: dict[str, str] = None
+    # Fix 2026-06-01 — `tradenames_units` Connect lands per-brand
+    # allowed pack units (e.g. Captaf comes in both kg and g packs).
+    # Map of brand cosh_id → [{cosh_id, name}, …]. Empty list means
+    # the brand has no tradenames_units rows; PWA can then fall back
+    # to brand_unit_family/UNIT_OPTIONS_BY_FAMILY.
+    units_by_brand: dict[str, list] = None
 
     def __post_init__(self):
         if self.group_recommended is None:
@@ -128,6 +134,8 @@ class BrandOptionsResult:
             self.group_other = []
         if self.brand_unit_family is None:
             self.brand_unit_family = {}
+        if self.units_by_brand is None:
+            self.units_by_brand = {}
 
     def to_dict(self) -> dict:
         if self.is_locked:
@@ -139,6 +147,7 @@ class BrandOptionsResult:
                 "groups": [],
                 "brand_unit_family": self.brand_unit_family,
                 "unit_options_by_family": UNIT_OPTIONS_BY_FAMILY,
+                "units_by_brand": self.units_by_brand,
             }
         # Hide empty groups per user spec (2026-05-31).
         groups = []
@@ -168,6 +177,7 @@ class BrandOptionsResult:
             "groups": groups,
             "brand_unit_family": self.brand_unit_family,
             "unit_options_by_family": UNIT_OPTIONS_BY_FAMILY,
+            "units_by_brand": self.units_by_brand,
         }
 
 
@@ -312,6 +322,7 @@ async def get_brand_options(
     group_my: list[BrandOption] = []
     group_other: list[BrandOption] = []
     brand_unit_family: dict[str, str] = {}
+    units_by_brand: dict[str, list] = {}
 
     for b in all_brands:
         # Fix 2026-06-01: BrandLookupCache shape — trade_name_cosh_id +
@@ -328,9 +339,13 @@ async def get_brand_options(
         )
 
         # Unit family — derived from formulation name (the cache row
-        # already carries the EN translation).
+        # already carries the EN translation). Retained as a fallback
+        # for the PWA when units_by_brand is empty.
         family = _classify_formulation_to_unit_family(b.formulation_name)
         brand_unit_family[cosh_id] = family
+        # Fix 2026-06-01 — per-brand pack units from tradenames_units.
+        # Empty list signals "no Cosh data" → PWA falls back to family.
+        units_by_brand[cosh_id] = list(b.units or [])
 
         # User spec 2026-05-31: same brand never repeated across groups —
         # appears in highest-priority group only. Recommended > My > Other.
@@ -352,4 +367,5 @@ async def get_brand_options(
         group_my=group_my,
         group_other=group_other,
         brand_unit_family=brand_unit_family,
+        units_by_brand=units_by_brand,
     )

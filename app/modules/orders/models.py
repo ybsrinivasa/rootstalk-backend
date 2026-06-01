@@ -299,6 +299,12 @@ class BrandLookupCache(Base):
     manufacturer_name: Mapped[str] = mapped_column(String(500), nullable=True)
     formulation_cosh_id: Mapped[str] = mapped_column(String(100), nullable=True)
     formulation_name: Mapped[str] = mapped_column(String(500), nullable=True)
+    # Fix 2026-06-01 — sourced from Cosh's tradenames_units Connect.
+    # Each trade name has 1-2 allowed pack units (e.g. {"cosh_id":...,
+    # "name":"kg"}). Replaces the formulation-class inference for the
+    # dealer's Unit dropdown so the dropdown only shows units this
+    # brand is actually sold in.
+    units: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     refreshed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow,
     )
