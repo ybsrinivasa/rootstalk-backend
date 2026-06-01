@@ -136,6 +136,69 @@ async def trade_names_for_fertigation_npk(
     return [(tn_id, name, mfr_by_tn.get(tn_id, mfr)) for tn_id, name, mfr in rows]
 
 
+async def group_trade_names_for_dealer(
+    db: AsyncSession,
+    rows: list[tuple[str, str, Optional[str]]],
+    dealer_user_id: str,
+) -> dict:
+    """Spec §3.1 — three-group brand picker. For NPK there's no SE-
+    recommended brand (no BRAND_NAME element on the practice), so
+    Recommended is always empty here. Grouping reduces to:
+      My Brands     — trade names whose manufacturer matches one of
+                       the dealer's ACTIVE DealerRelationship entries.
+      Other Brands  — everyone else.
+    Each group is sorted alphabetically. Empty groups are returned as
+    empty lists (the PWA hides those sections).
+    """
+    from app.modules.orders.models import DealerRelationship
+    from app.modules.sync.models import CoshCoreItem
+
+    # Resolve manufacturer cosh_ids → English names so we can compare
+    # against the dealer's onboarded `manufacturer_name` set.
+    mfr_ids = {mfr for _, _, mfr in rows if mfr}
+    mfr_name_by_id: dict[str, str] = {}
+    if mfr_ids:
+        mfr_cores = (await db.execute(
+            select(CoshCoreItem).where(
+                CoshCoreItem.cosh_id.in_(mfr_ids),
+                CoshCoreItem.status == "active",
+            )
+        )).scalars().all()
+        for c in mfr_cores:
+            name = (c.translations or {}).get("en") or c.cosh_id
+            mfr_name_by_id[c.cosh_id] = name.lower()
+
+    # Dealer's onboarded manufacturer names (lowercase for matching).
+    dealer_rels = (await db.execute(
+        select(DealerRelationship).where(
+            DealerRelationship.dealer_user_id == dealer_user_id,
+            DealerRelationship.status == "ACTIVE",
+        )
+    )).scalars().all()
+    preferred_names = {
+        r.manufacturer_name.lower() for r in dealer_rels if r.manufacturer_name
+    }
+
+    group_my: list[dict] = []
+    group_other: list[dict] = []
+    for tn_id, name, mfr in rows:
+        entry = {
+            "cosh_id": tn_id, "name": name,
+            "manufacturer_cosh_id": mfr,
+        }
+        mfr_name = mfr_name_by_id.get(mfr or "", "")
+        if mfr_name and mfr_name in preferred_names:
+            group_my.append(entry)
+        else:
+            group_other.append(entry)
+
+    return {
+        "group_recommended": [],  # see docstring
+        "group_my": group_my,
+        "group_other": group_other,
+    }
+
+
 async def _materialize_trade_names(
     db: AsyncSession, tn_ids: set[str],
 ) -> list[tuple[str, str, Optional[str]]]:

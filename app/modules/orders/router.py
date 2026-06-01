@@ -29,6 +29,7 @@ from app.services.npk_ranking import (
     rank_mixed, straight_kg_for_gap,
 )
 from app.services.npk_trade_names import (
+    group_trade_names_for_dealer,
     trade_names_for_chemical_npk,
     trade_names_for_fertigation_npk,
 )
@@ -2635,7 +2636,54 @@ async def get_dealer_order(
         # mirror from this on mount so a different device picks up
         # exactly where the last one left off.
         "dealer_draft": order.dealer_draft or {},
+        # Batch 30C — spec §4.2. Same brand appearing across multiple
+        # NPK practices on this order is summed into one consolidated
+        # line so the dealer enters Given Volume once. Per-timeline
+        # quantities still go to the farmer untouched.
+        "consolidated_brands": _consolidate_brands_across_items(items),
     }
+
+
+def _consolidate_brands_across_items(items: list[OrderItem]) -> list[dict]:
+    """Spec §4.2 — brand consolidation. NPK practices can produce many
+    OrderItems for the same trade name across timelines (e.g. Urea in
+    basal + top dressing). The dealer cares about the total to procure;
+    the farmer still sees per-timeline lines. We sum `given_volume` per
+    `brand_cosh_id` across active items and surface a small list the
+    PWA can render as a Volume/Price summary card.
+
+    Only counts items with a brand committed and a volume set; status
+    is restricted to dealer-actionable states so already-skipped or
+    farmer-rejected items don't pollute the total.
+    """
+    actionable = {
+        OrderItemStatus.AVAILABLE,
+        OrderItemStatus.PENDING,
+        OrderItemStatus.SENT_FOR_APPROVAL,
+        OrderItemStatus.APPROVED,
+    }
+    totals: dict[str, dict] = {}
+    for it in items:
+        if it.brand_cosh_id is None or it.given_volume is None:
+            continue
+        if it.status not in actionable:
+            continue
+        bucket = totals.setdefault(it.brand_cosh_id, {
+            "brand_cosh_id": it.brand_cosh_id,
+            "brand_name": it.brand_name,
+            "volume_unit": it.volume_unit,
+            "total_volume": 0.0,
+            "line_count": 0,
+        })
+        bucket["total_volume"] += float(it.given_volume)
+        bucket["line_count"] += 1
+    # Stable sort by brand name for the PWA — easier to read than by
+    # cosh_id and easier for the dealer to scan a packing list against.
+    out = list(totals.values())
+    out.sort(key=lambda b: (b.get("brand_name") or "").lower())
+    for b in out:
+        b["total_volume"] = round(b["total_volume"], 2)
+    return out
 
 
 async def _build_farmer_context(db: AsyncSession, order: Order) -> dict:
@@ -3433,6 +3481,20 @@ async def get_item_npk_options(
     dose = Dose(n=_val("N_DOSAGE"), p=_val("P_DOSAGE"), k=_val("K_DOSAGE"))
     fertigation = practice.l2_type == "FERTIGATION_NPK_DOSAGES"
 
+    # Spec §5.2 fertigation multiplier — surfaces alongside the ranking
+    # so the PWA can render "per app × N apps = total kg" without a
+    # second round-trip. Same source the npk-select endpoint uses.
+    applications_multiplier = 1
+    if fertigation:
+        apps_el = by_type.get("applications")
+        if apps_el and apps_el.value:
+            try:
+                n = int(apps_el.value)
+                if n >= 1:
+                    applications_multiplier = n
+            except (TypeError, ValueError):
+                pass
+
     # Fertigation gate happens in the candidate loader (filters common
     # names down to those with a trade name in `npk_fertigation_products`).
     # `rank_mixed`'s `water_soluble_only` is then a no-op for this flow
@@ -3462,6 +3524,7 @@ async def get_item_npk_options(
     return {
         "is_npk_practice": True,
         "fertigation": fertigation,
+        "applications_multiplier": applications_multiplier,
         "required_dose": {"n": dose.n, "p": dose.p, "k": dose.k},
         "ranked_mixed": [
             {
@@ -3470,7 +3533,10 @@ async def get_item_npk_options(
                 "n": r.candidate.concentration.n,
                 "p": r.candidate.concentration.p,
                 "k": r.candidate.concentration.k,
+                # `kg_product` is per-application for the ranking display.
+                # `kg_product_total` is what the dealer actually buys.
                 "kg_product": round(r.kg_product, 2),
+                "kg_product_total": round(r.kg_product * applications_multiplier, 2),
                 "delivered": {
                     "n": round(r.best.n_delivered, 2),
                     "p": round(r.best.p_delivered, 2),
@@ -3522,15 +3588,19 @@ async def get_npk_trade_names(
     else:
         rows = await trade_names_for_chemical_npk(db, common_name_cosh_id)
 
+    # Spec §3.1 — three-group layout (Recommended / My Brands / Other Brands).
+    # NPK has no SE-recommended brand so Recommended is always empty; the PWA
+    # hides empty sections. `trade_names` kept for backwards compatibility
+    # (Batch 30B used it before grouping landed).
+    grouped = await group_trade_names_for_dealer(db, rows, current_user.id)
     return {
         "common_name_cosh_id": common_name_cosh_id,
         "fertigation": fertigation,
-        # Flat alphabetical list; the PWA renders three-group
-        # (Recommended / My Brands / Other Brands) over this in Batch 30B.
         "trade_names": [
             {"cosh_id": tn_id, "name": name, "manufacturer_cosh_id": mfr}
             for tn_id, name, mfr in rows
         ],
+        **grouped,
     }
 
 
@@ -3603,6 +3673,22 @@ async def npk_select(
 
     dose = Dose(n=_val("N_DOSAGE"), p=_val("P_DOSAGE"), k=_val("K_DOSAGE"))
     fertigation = practice.l2_type == "FERTIGATION_NPK_DOSAGES"
+
+    # Spec §5.2 — for Fertigation, total purchase = per-application
+    # dose × number of remaining applications. The SE pins the count
+    # via the `applications` element (Phase D.3 of BL-06). Default 1
+    # if unset, matching the same fallback BL-06 already uses.
+    applications_multiplier = 1
+    if fertigation:
+        apps_el = by_type.get("applications")
+        if apps_el and apps_el.value:
+            try:
+                n = int(apps_el.value)
+                if n >= 1:
+                    applications_multiplier = n
+            except (TypeError, ValueError):
+                pass
+
     candidates, _ = await load_fertiliser_candidates(db, fertigation=fertigation)
     by_cn = {c.cosh_id: c for c in candidates}
     ranked = rank_mixed(candidates, dose, water_soluble_only=fertigation)
@@ -3627,7 +3713,7 @@ async def npk_select(
                 detail={"error_code": "NPK_MIXED_NOT_RANKED",
                         "message": f"Mixed {cn_id} not in the ranked list."},
             )
-        picks.append((cn_id, tn_id, round(r.kg_product, 2)))
+        picks.append((cn_id, tn_id, round(r.kg_product * applications_multiplier, 2)))
 
     # Gap after Mixed (if any). Straights are sized against this gap.
     picked_mixed_ranking = ranked_by_cn.get(mixed["common_name_cosh_id"]) if mixed else None
@@ -3657,7 +3743,7 @@ async def npk_select(
                 detail={"error_code": "NPK_STRAIGHT_NO_GAP",
                         "message": f"No remaining gap for {target} — Straight {cn_id} not needed."},
             )
-        picks.append((cn_id, tn_id, round(kg, 2)))
+        picks.append((cn_id, tn_id, round(kg * applications_multiplier, 2)))
 
     # Validate each picked trade name actually belongs to its common name
     # (chemical chain or fertigation chain, depending on L2). Stops bogus
