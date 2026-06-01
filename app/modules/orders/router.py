@@ -2427,9 +2427,32 @@ async def get_dealer_order(
     # `element_block_for_item` being defined further down — items
     # are iterated only after the element batch-resolution pass.
     def item_brief(i: OrderItem) -> dict:
+        # Fix 2026-06-01: dealer card was rendering a practice UUID
+        # as the title. Resolve the SE's COMMON_NAME for non-NPK
+        # practices; NPK practices have no common name (system-discovered)
+        # so we label by L2 type so the dealer reads "Chemical NPK
+        # Dosage" / "Fertigation NPK" instead of a UUID.
+        spec = item_element_specs.get(i.id, {})
+        common_name = (
+            cosh_name_by_id.get(spec.get("common_name_ref"))
+            if spec.get("common_name_ref") else None
+        )
+        practice = practice_map.get(i.practice_id) if i.practice_id else None
+        l2 = practice.l2_type if practice else None
+        if l2 == "FERTIGATION_NPK_DOSAGES":
+            display_name = "Fertigation NPK Dosage"
+        elif l2 == "CHEMICAL_FERTILIZERS_NPK_DOSAGES":
+            display_name = "Chemical Fertiliser NPK Dosage"
+        else:
+            display_name = common_name or (
+                l2.replace("_", " ").title() if l2 else "Practice"
+            )
         return {
             "id": i.id, "practice_id": i.practice_id,
             "status": i.status.value if hasattr(i.status, "value") else i.status,
+            "common_name": common_name,
+            "l2_type": l2,
+            "display_name": display_name,
             "brand_cosh_id": i.brand_cosh_id,
             "brand_name": i.brand_name,
             "given_volume": float(i.given_volume) if i.given_volume else None,
@@ -2523,6 +2546,9 @@ async def get_dealer_order(
             "application_method_ref": None,
             "vol_per_plant_value": None,
             "vol_per_plant_unit_ref": None,
+            # Fix 2026-06-01: surface the SE's COMMON_NAME so the
+            # dealer card shows "Mancozeb" instead of a practice UUID.
+            "common_name_ref": None,
         }
         for el in els:
             et = (_el_get(el, "element_type") or "").upper()
@@ -2544,8 +2570,11 @@ async def get_dealer_order(
                     spec["vol_per_plant_value"] = None
             elif et == "VOLUME_PER_PLANT_UNIT":
                 spec["vol_per_plant_unit_ref"] = _el_get(el, "cosh_ref")
+            elif et == "COMMON_NAME":
+                spec["common_name_ref"] = _el_get(el, "cosh_ref")
         item_element_specs[it.id] = spec
-        for k in ("dosage_unit_ref", "application_method_ref", "vol_per_plant_unit_ref"):
+        for k in ("dosage_unit_ref", "application_method_ref",
+                  "vol_per_plant_unit_ref", "common_name_ref"):
             if spec[k]:
                 cosh_refs_needed.add(spec[k])
 
