@@ -1562,6 +1562,7 @@ async def reject_order_item(
 
 @router.get("/farmer/purchased-items")
 async def list_purchased_items(
+    subscription_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1579,7 +1580,7 @@ async def list_purchased_items(
         TimelineMetadata, cca_calendar_dates,
     )
 
-    rows = (await db.execute(
+    q = (
         select(OrderItem, Order, Timeline, AdvPractice, Subscription)
         .join(Order, Order.id == OrderItem.order_id)
         .join(Timeline, Timeline.id == OrderItem.timeline_id)
@@ -1590,7 +1591,10 @@ async def list_purchased_items(
             OrderItem.status == OrderItemStatus.APPROVED,
         )
         .order_by(Order.date_from.desc())
-    )).all()
+    )
+    if subscription_id:
+        q = q.where(Order.subscription_id == subscription_id)
+    rows = (await db.execute(q)).all()
 
     out: list[dict] = []
     for item, order, tl, practice, sub in rows:
