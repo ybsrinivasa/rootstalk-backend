@@ -4141,18 +4141,57 @@ async def get_volume_estimate(
         }
 
     # ── 5-key lookup ───────────────────────────────────────────────
+    # Fix 2026-06-01: " of water" is descriptive ("ml/L of water" ==
+    # "ml/L" for formula purposes). Cosh's units_data Core ships both
+    # forms; the SE picks whichever read naturally. Try the verbatim
+    # match first, fall back to the suffix-stripped form.
+    dosage_unit_alt = dosage_unit
+    if " of water" in dosage_unit:
+        dosage_unit_alt = dosage_unit.replace(" of water", "")
+
     formulas = (await db.execute(
         select(VolumeFormula).where(
             VolumeFormula.measure == measure,
             VolumeFormula.l2_practice == practice.l2_type,
             VolumeFormula.application_method == application_method,
             VolumeFormula.brand_unit == brand_unit,
-            VolumeFormula.dosage_unit == dosage_unit,
+            VolumeFormula.dosage_unit.in_([dosage_unit, dosage_unit_alt]),
             VolumeFormula.status == "ACTIVE",
         )
     )).scalars().all()
 
     if not formulas:
+        # Heuristic: pair-mismatch detection. If brand_unit is solid (g/kg)
+        # but dosage_unit is volumetric (ml/L, ppm/L, mg/L), the SE's
+        # dosage doesn't make physical sense for this brand. Same in
+        # reverse. We surface a targeted message so the diagnosis is
+        # obvious — the formula table doesn't carry rows for
+        # incompatible pairs, and silently saying "no formula" leaves
+        # the dealer guessing.
+        bu = (brand_unit or "").lower()
+        du_norm = (dosage_unit_alt or "").lower()
+        solid_brand = bu in ("g", "kg")
+        liquid_brand = bu in ("ml", "l")
+        volumetric_dose = "/l" in du_norm and not du_norm.startswith("g/") and not du_norm.startswith("mg")
+        mass_dose = du_norm.startswith("g/") or du_norm.startswith("mg/")
+        pair_mismatch = (
+            (solid_brand and volumetric_dose) or (liquid_brand and mass_dose)
+        )
+        if pair_mismatch:
+            return {
+                "estimated_volume": None, "volume_unit": None,
+                "message": (
+                    f"Brand unit '{brand_unit}' and dosage unit "
+                    f"'{dosage_unit}' don't match — check the practice "
+                    "or pick a different brand."
+                ),
+                "error_code": "UNIT_PAIR_MISMATCH",
+                "lookup_key": {
+                    "measure": measure, "l2_practice": practice.l2_type,
+                    "application_method": application_method,
+                    "brand_unit": brand_unit, "dosage_unit": dosage_unit,
+                },
+            }
         return {
             "estimated_volume": None, "volume_unit": None,
             "message": (
@@ -4161,6 +4200,11 @@ async def get_volume_estimate(
                 f"dosage_unit={dosage_unit}. (DATA_CONFIG_ERROR)"
             ),
             "error_code": "FORMULA_NOT_FOUND",
+            "lookup_key": {
+                "measure": measure, "l2_practice": practice.l2_type,
+                "application_method": application_method,
+                "brand_unit": brand_unit, "dosage_unit": dosage_unit,
+            },
         }
     if len(formulas) > 1:
         return {
