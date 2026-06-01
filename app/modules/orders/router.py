@@ -496,6 +496,156 @@ async def list_farmer_orders(
     return out
 
 
+@router.get("/farmer/subscriptions/{subscription_id}/orders")
+async def list_subscription_orders(
+    subscription_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Phase 2 of the farmer Orders restructure (2026-06-02): all
+    orders (regular + seed) for ONE subscription, so the package
+    detail screen can show its own Orders section. Ordered newest
+    first.
+
+    Auth: subscription must be the current farmer's. Items are
+    counted only when active (archived rows live in History
+    elsewhere). Seed-order rows interleave via `kind="SEED"` so the
+    PWA can render both shapes in one chronological list.
+    """
+    from app.modules.advisory.models import Relation
+    from app.modules.seed_mgmt.models import SeedOrderFull, SeedVariety
+    from app.modules.subscriptions.models import Subscription
+    from app.services.order_meta import load_meta_for_subscription_ids
+    from app.services.relations import (
+        PracticeRef, build_structure, compute_count_display,
+    )
+
+    # Auth check: the subscription must belong to the caller.
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    meta_by_sub = await load_meta_for_subscription_ids(db, [subscription_id])
+    meta_dict = meta_by_sub.get(subscription_id).to_dict() if meta_by_sub.get(subscription_id) else {}
+
+    # ── Regular orders ────────────────────────────────────────────────
+    regular_rows = (await db.execute(
+        select(Order).where(
+            Order.subscription_id == subscription_id,
+            Order.farmer_user_id == current_user.id,
+        ).order_by(Order.created_at.desc())
+    )).scalars().all()
+
+    regular_out: list[dict] = []
+    for o in regular_rows:
+        items = (await db.execute(
+            select(OrderItem).where(
+                OrderItem.order_id == o.id,
+                OrderItem.archived_at.is_(None),
+            )
+        )).scalars().all()
+
+        by_relation: dict[str, list[OrderItem]] = {}
+        standalone_items: list[OrderItem] = []
+        for it in items:
+            if it.relation_id and it.relation_role:
+                by_relation.setdefault(it.relation_id, []).append(it)
+            else:
+                standalone_items.append(it)
+
+        structures = []
+        if by_relation:
+            practice_ids = list({
+                i.practice_id for rel_items in by_relation.values()
+                for i in rel_items
+            })
+            practices = (await db.execute(
+                select(Practice).where(Practice.id.in_(practice_ids))
+            )).scalars().all()
+            practice_map = {p.id: p for p in practices}
+            relations = (await db.execute(
+                select(Relation).where(Relation.id.in_(list(by_relation.keys())))
+            )).scalars().all()
+            rel_type_map = {
+                r.id: (r.relation_type.value if hasattr(r.relation_type, "value")
+                       else str(r.relation_type))
+                for r in relations
+            }
+            for rel_id, rel_items in by_relation.items():
+                practice_refs = []
+                for it in rel_items:
+                    prac = practice_map.get(it.practice_id)
+                    if prac and it.relation_role:
+                        practice_refs.append(PracticeRef(
+                            practice_id=it.practice_id,
+                            common_name_cosh_id=prac.common_name_cosh_id,
+                            is_special_input=prac.is_special_input,
+                            role=it.relation_role,
+                        ))
+                if not practice_refs:
+                    continue
+                rel_type = rel_type_map.get(rel_id, "OR")
+                try:
+                    structures.append(build_structure(practice_refs, rel_id, rel_type))
+                except ValueError:
+                    standalone_items.extend(rel_items)
+
+        cd = compute_count_display(structures, len(standalone_items))
+        regular_out.append({
+            "kind": "REGULAR",
+            "id": o.id,
+            "status": o.status,
+            "date_from": o.date_from,
+            "date_to": o.date_to,
+            "dealer_user_id": o.dealer_user_id,
+            "created_at": o.created_at,
+            "item_count": cd.count,
+            "is_max_count": cd.is_max,
+            "subscription_id": o.subscription_id,
+            "category": o.category,
+            **meta_dict,
+        })
+
+    # ── Seed orders ───────────────────────────────────────────────────
+    seed_rows = (await db.execute(
+        select(SeedOrderFull).where(
+            SeedOrderFull.subscription_id == subscription_id,
+            SeedOrderFull.farmer_user_id == current_user.id,
+        ).order_by(SeedOrderFull.created_at.desc())
+    )).scalars().all()
+
+    seed_out: list[dict] = []
+    for so in seed_rows:
+        variety = (await db.execute(
+            select(SeedVariety).where(SeedVariety.id == so.variety_id)
+        )).scalar_one_or_none()
+        seed_out.append({
+            "kind": "SEED",
+            "id": so.id,
+            "status": so.status,
+            "variety_name": variety.name if variety else None,
+            "crop_cosh_id": variety.crop_cosh_id if variety else None,
+            "unit": so.unit,
+            "quantity": float(so.quantity) if so.quantity else None,
+            "total_price": float(so.total_price) if so.total_price else None,
+            "created_at": so.created_at,
+            "dealer_user_id": so.dealer_user_id,
+            "facilitator_user_id": so.facilitator_user_id,
+            "subscription_id": so.subscription_id,
+            **meta_dict,
+        })
+
+    # Merge + chronological (newest first).
+    merged = regular_out + seed_out
+    merged.sort(key=lambda x: x["created_at"], reverse=True)
+    return {"orders": merged, "package_meta": meta_dict}
+
+
 @router.get("/farmer/orders/{order_id}")
 async def get_farmer_order_detail(
     order_id: str,
