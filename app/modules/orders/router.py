@@ -23,11 +23,16 @@ from math import radians, cos, sin, asin, sqrt
 from app.services.bl07_brand_options import get_brand_options
 from app.services.npk_candidates import load_fertiliser_candidates
 from app.services.npk_ranking import (
-    Candidate as NPKCandidate, Dose,
+    Candidate as NPKCandidate, Concentration as NPKConcentration, Dose,
     classify_fertiliser, compute_gap_after_mixed,
     enabled_straights as npk_enabled_straights,
-    rank_mixed,
+    rank_mixed, straight_kg_for_gap,
 )
+from app.services.npk_trade_names import (
+    trade_names_for_chemical_npk,
+    trade_names_for_fertigation_npk,
+)
+from app.modules.sync.models import CoshCoreItem as _NPKCoshCoreItem
 from app.services.bl10_order_state import (
     DEALER, FARMER,
     is_item_abortable, is_order_abortable,
@@ -3479,6 +3484,260 @@ async def get_item_npk_options(
         "enabled_straights": [_candidate_to_dict(c) for c in straights],
         "gap": {"n": gap.n, "p": gap.p, "k": gap.k},
         "cosh_skipped_count": skipped,
+    }
+
+
+# ── Dealer: NPK trade-name picker (Batch 30B) ─────────────────────────────────
+
+
+@router.get("/dealer/orders/{order_id}/items/{item_id}/npk-trade-names")
+async def get_npk_trade_names(
+    order_id: str, item_id: str,
+    common_name_cosh_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Trade names available for a picked NPK common name.
+
+    Chemical NPK    → walks tradename_commonname directly.
+    Fertigation NPK → walks npk_fertigation_products (water-soluble pool).
+    """
+    await _assert_active_dealer(db, current_user.id)
+    item = await _get_order_item(db, item_id, order_id)
+    practice = (await db.execute(
+        select(Practice).where(Practice.id == item.practice_id)
+    )).scalar_one_or_none()
+    if practice is None or practice.l2_type not in _NPK_L2_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_code": "NOT_AN_NPK_PRACTICE",
+                "message": "This item is not an NPK dosage practice.",
+            },
+        )
+
+    fertigation = practice.l2_type == "FERTIGATION_NPK_DOSAGES"
+    if fertigation:
+        rows = await trade_names_for_fertigation_npk(db, common_name_cosh_id)
+    else:
+        rows = await trade_names_for_chemical_npk(db, common_name_cosh_id)
+
+    return {
+        "common_name_cosh_id": common_name_cosh_id,
+        "fertigation": fertigation,
+        # Flat alphabetical list; the PWA renders three-group
+        # (Recommended / My Brands / Other Brands) over this in Batch 30B.
+        "trade_names": [
+            {"cosh_id": tn_id, "name": name, "manufacturer_cosh_id": mfr}
+            for tn_id, name, mfr in rows
+        ],
+    }
+
+
+# ── Dealer: NPK select — commit Mixed + Straight picks (Batch 30B) ────────────
+#
+# Spec §3: after the dealer picks a Mixed (optional) and up to 2
+# Straights (per remaining gap), the brand selections are committed.
+# Each pick becomes one OrderItem. All siblings share a synthesised
+# `relation_id` with relation_type='AND' (spec §3.2: AND by default,
+# no expert intervention). The original PENDING item is reused for
+# the first pick; subsequent picks insert new OrderItem rows.
+
+import uuid as _uuid_npk  # local alias — keep the top-of-file imports tidy
+
+
+@router.post("/dealer/orders/{order_id}/items/{item_id}/npk-select")
+async def npk_select(
+    order_id: str, item_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Body shape:
+      {
+        "mixed":   null | {"common_name_cosh_id", "trade_name_cosh_id"},
+        "straights": [
+          {"target_nutrient": "N"|"P"|"K",
+           "common_name_cosh_id", "trade_name_cosh_id"},
+          ...
+        ]
+      }
+    """
+    await _assert_active_dealer(db, current_user.id)
+    item = await _get_order_item(db, item_id, order_id)
+    practice = (await db.execute(
+        select(Practice).where(Practice.id == item.practice_id)
+    )).scalar_one_or_none()
+    if practice is None or practice.l2_type not in _NPK_L2_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail={"error_code": "NOT_AN_NPK_PRACTICE",
+                    "message": "This item is not an NPK dosage practice."},
+        )
+
+    mixed = data.get("mixed")
+    straights = data.get("straights") or []
+    if not mixed and not straights:
+        raise HTTPException(
+            status_code=422,
+            detail={"error_code": "NPK_NO_SELECTION",
+                    "message": "Provide a Mixed selection or at least one Straight."},
+        )
+
+    # Re-rank against the SE's dose so we compute kg_product exactly
+    # the same way the dealer saw it. Refusing to trust client-supplied
+    # kg keeps the math one place.
+    elements = (await db.execute(
+        select(Element).where(Element.practice_id == practice.id)
+    )).scalars().all()
+    by_type = {e.element_type: e for e in elements}
+
+    def _val(et: str) -> float:
+        e = by_type.get(et) or by_type.get(et.upper()) or by_type.get(et.lower())
+        if e is None or e.value is None:
+            return 0.0
+        try:
+            return float(e.value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    dose = Dose(n=_val("N_DOSAGE"), p=_val("P_DOSAGE"), k=_val("K_DOSAGE"))
+    fertigation = practice.l2_type == "FERTIGATION_NPK_DOSAGES"
+    candidates, _ = await load_fertiliser_candidates(db, fertigation=fertigation)
+    by_cn = {c.cosh_id: c for c in candidates}
+    ranked = rank_mixed(candidates, dose, water_soluble_only=fertigation)
+    ranked_by_cn = {r.candidate.cosh_id: r for r in ranked}
+
+    # Build (common_name_cosh_id, trade_name_cosh_id, kg_product) tuples
+    # for every pick, in fixed order: Mixed first, then Straights N, P, K.
+    picks: list[tuple[str, str, float]] = []
+    if mixed:
+        cn_id = mixed.get("common_name_cosh_id")
+        tn_id = mixed.get("trade_name_cosh_id")
+        if not cn_id or not tn_id:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "NPK_INVALID_MIXED",
+                        "message": "mixed needs common_name_cosh_id + trade_name_cosh_id"},
+            )
+        r = ranked_by_cn.get(cn_id)
+        if r is None:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "NPK_MIXED_NOT_RANKED",
+                        "message": f"Mixed {cn_id} not in the ranked list."},
+            )
+        picks.append((cn_id, tn_id, round(r.kg_product, 2)))
+
+    # Gap after Mixed (if any). Straights are sized against this gap.
+    picked_mixed_ranking = ranked_by_cn.get(mixed["common_name_cosh_id"]) if mixed else None
+    gap = compute_gap_after_mixed(dose, picked_mixed_ranking)
+
+    for s in straights:
+        cn_id = s.get("common_name_cosh_id")
+        tn_id = s.get("trade_name_cosh_id")
+        target = s.get("target_nutrient")
+        if not (cn_id and tn_id and target in ("N", "P", "K")):
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "NPK_INVALID_STRAIGHT",
+                        "message": "straight needs common_name + trade_name + target_nutrient"},
+            )
+        cand = by_cn.get(cn_id)
+        if cand is None:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "NPK_STRAIGHT_NOT_IN_POOL",
+                        "message": f"Straight {cn_id} not in the candidate pool."},
+            )
+        kg = straight_kg_for_gap(cand.concentration, gap)
+        if kg is None or kg <= 0:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "NPK_STRAIGHT_NO_GAP",
+                        "message": f"No remaining gap for {target} — Straight {cn_id} not needed."},
+            )
+        picks.append((cn_id, tn_id, round(kg, 2)))
+
+    # Validate each picked trade name actually belongs to its common name
+    # (chemical chain or fertigation chain, depending on L2). Stops bogus
+    # client-supplied trade_name_cosh_ids slipping through.
+    for cn_id, tn_id, _ in picks:
+        rows = (
+            await trade_names_for_fertigation_npk(db, cn_id)
+            if fertigation
+            else await trade_names_for_chemical_npk(db, cn_id)
+        )
+        allowed = {t for t, _, _ in rows}
+        if tn_id not in allowed:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "NPK_TRADE_NAME_NOT_IN_POOL",
+                        "message": f"Trade name {tn_id} not approved for common name {cn_id}."},
+            )
+
+    # AND-relation glue. The synthesised relation_id ties all picks
+    # together; per spec §3.2 it's automatic — no expert involvement.
+    relation_id = str(_uuid_npk.uuid4())
+    created_items: list[str] = []
+    for i, (cn_id, tn_id, kg) in enumerate(picks):
+        # First pick reuses the original PENDING item; subsequent picks
+        # spawn new OrderItem rows on the same practice_id.
+        target_item = item if i == 0 else OrderItem(
+            order_id=order_id,
+            practice_id=item.practice_id,
+            timeline_id=item.timeline_id,
+        )
+        target_item.brand_cosh_id = tn_id
+        # The brand_name field carries the EN trade name; resolve quickly
+        # from the cores table so the dealer order detail renders it.
+        tn_core = (await db.execute(
+            select(_NPKCoshCoreItem).where(_NPKCoshCoreItem.cosh_id == tn_id)
+        )).scalar_one_or_none()
+        if tn_core is not None:
+            target_item.brand_name = (tn_core.translations or {}).get("en") or tn_id
+        target_item.given_volume = kg
+        target_item.estimated_volume = kg
+        # NPK quantities are kg of product per spec §1.1; pin the unit.
+        target_item.volume_unit = "kg"
+        target_item.status = OrderItemStatus.AVAILABLE
+        target_item.relation_id = relation_id
+        target_item.relation_type = "AND"
+        # All picks in a single Part/Option (compound AND), positions 1..N.
+        target_item.relation_role = f"PART_1__OPT_1__POS_{i + 1}"
+        if i > 0:
+            db.add(target_item)
+        await db.flush()
+        created_items.append(target_item.id)
+
+        await _record_event(
+            db, lineage_id=target_item.lineage_id,
+            event_type="MARKED_AVAILABLE",
+            actor_user_id=current_user.id, actor_role="DEALER",
+            order_id=order_id, order_item_id=target_item.id,
+            prev_status=OrderItemStatus.PENDING.value,
+            new_status=OrderItemStatus.AVAILABLE.value,
+            metadata={
+                "brand_cosh_id": tn_id,
+                "common_name_cosh_id": cn_id,
+                "given_volume": kg,
+                "volume_unit": "kg",
+                "npk_relation_id": relation_id,
+            },
+        )
+
+    await db.commit()
+    return {
+        "relation_id": relation_id,
+        "item_ids": created_items,
+        "picks": [
+            {
+                "common_name_cosh_id": cn_id,
+                "trade_name_cosh_id": tn_id,
+                "kg_product": kg,
+            }
+            for cn_id, tn_id, kg in picks
+        ],
     }
 
 
