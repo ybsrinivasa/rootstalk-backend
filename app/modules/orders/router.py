@@ -3428,8 +3428,14 @@ async def get_item_npk_options(
     dose = Dose(n=_val("N_DOSAGE"), p=_val("P_DOSAGE"), k=_val("K_DOSAGE"))
     fertigation = practice.l2_type == "FERTIGATION_NPK_DOSAGES"
 
-    candidates, skipped = await load_fertiliser_candidates(db)
-
+    # Fertigation gate happens in the candidate loader (filters common
+    # names down to those with a trade name in `npk_fertigation_products`).
+    # `rank_mixed`'s `water_soluble_only` is then a no-op for this flow
+    # since every candidate is already approved — but we keep it on for
+    # belt-and-braces if a future loader stops gating.
+    candidates, skipped = await load_fertiliser_candidates(
+        db, fertigation=fertigation,
+    )
     ranked = rank_mixed(
         candidates, dose, water_soluble_only=fertigation,
     )

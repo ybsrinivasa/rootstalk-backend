@@ -10,24 +10,27 @@ Cosh contract (synced 2026-06-01 — confirmed against testing payload):
                                         carries the numeric percentage as text
                                         ("8", "10", "16.5", "46", etc.).
 
-  Connect (4-endpoint)
-    fert_nutrient_concentration
+  Connects
+    fert_nutrient_concentration (4-endpoint)
       role=common_names_of_inputs            position 1
       role=straight_complex                  position 2
       role=fert_nutrients                    position 3
       role=fert_nutrient_concentration_core  position 4
+
+    npk_fertigation_products (3-endpoint, Connect-references-Connect)
+      position 1 → commonnames_l2 connect_id
+      position 2 → tradename_manufacturer connect_id
+      position 3 → formulations Core
 
 A Straight fertiliser has ONE Connect row (one nutrient). A Complex
 (Mixed) fertiliser has TWO or THREE Connect rows — one per nutrient
 it carries. We group by common_name and assemble a {N, P, K} tuple
 per fertiliser.
 
-Water-soluble filtering (spec §5.1, Fertigation flow) — DEFERRED.
-This dataset has no water-soluble flag; for now every candidate is
-treated as water_soluble=True. The Fertigation flow runs over the
-full pool until Cosh ships a flag (or we read it from formulation
-via tradename_commonname / tradename_formulation chain). Tracked
-in project memory.
+Fertigation filtering (spec §5.1) — IMPLEMENTED via `npk_fertigation_
+products`. Common names absent from that Connect's reachable set are
+dropped when `fertigation=True`. The auto-generated role names at
+positions 1 and 2 are unstable, so we identify endpoints by POSITION.
 """
 from __future__ import annotations
 
@@ -40,9 +43,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.modules.sync.models import CoshConnectRow, CoshCoreItem
 from app.services.cosh_constants import (
     COSH_COMMON_NAMES_CORE,
+    COSH_COMMONNAMES_L2_CONNECT,
     COSH_FERT_NUTRIENT_CONCENTRATION_CONNECT,
     COSH_FERT_NUTRIENT_CONCENTRATION_CORE,
     COSH_FERT_NUTRIENTS_CORE,
+    COSH_NPK_FERT_POS_COMMONNAMES_L2_ID,
+    COSH_NPK_FERTIGATION_PRODUCTS_CONNECT,
 )
 from app.services.npk_ranking import Candidate, Concentration
 
@@ -57,15 +63,66 @@ _NUTRIENT_NAME_TO_LETTER = {
 }
 
 
+async def load_fertigation_approved_common_name_ids(
+    db: AsyncSession,
+) -> set[str]:
+    """Resolve the set of common-name cosh_ids that have at least one
+    Fertigation-approved trade name (per `npk_fertigation_products`).
+
+    Two-hop walk:
+      npk_fertigation_products row → position-1 cosh_id =
+        connect_id of a commonnames_l2 row → THAT row's position-1
+        endpoint cosh_id = the common_name.
+    """
+    fert_rows = (await db.execute(
+        select(CoshConnectRow).where(
+            CoshConnectRow.connect_type == COSH_NPK_FERTIGATION_PRODUCTS_CONNECT,
+            CoshConnectRow.status == "active",
+        )
+    )).scalars().all()
+    if not fert_rows:
+        return set()
+
+    commonnames_l2_ids: set[str] = set()
+    for r in fert_rows:
+        for ep in r.endpoints or []:
+            pos = ep.get("position")
+            if pos == COSH_NPK_FERT_POS_COMMONNAMES_L2_ID and ep.get("cosh_id"):
+                commonnames_l2_ids.add(ep["cosh_id"])
+    if not commonnames_l2_ids:
+        return set()
+
+    cnl2_rows = (await db.execute(
+        select(CoshConnectRow).where(
+            CoshConnectRow.connect_type == COSH_COMMONNAMES_L2_CONNECT,
+            CoshConnectRow.connect_id.in_(commonnames_l2_ids),
+            CoshConnectRow.status == "active",
+        )
+    )).scalars().all()
+
+    approved: set[str] = set()
+    for r in cnl2_rows:
+        for ep in r.endpoints or []:
+            if (
+                ep.get("role") == COSH_COMMON_NAMES_CORE
+                and ep.get("cosh_id")
+            ):
+                approved.add(ep["cosh_id"])
+    return approved
+
+
 async def load_fertiliser_candidates(
     db: AsyncSession,
+    *,
+    fertigation: bool = False,
 ) -> tuple[list[Candidate], int]:
     """Return (candidates, skipped_count).
 
-    `skipped_count` counts common_name rows referenced by the Connect
-    that could not be fully resolved (missing concentration, unknown
-    nutrient name, all-zero NPK, etc.) — surfaced by the endpoint so
-    a CM can spot Cosh-side gaps.
+    When `fertigation=True`, only common names approved via
+    `npk_fertigation_products` are returned (spec §5.1 water-soluble
+    filter). The skipped count counts both Cosh-side gaps and rows
+    filtered out by the fertigation gate, so the endpoint can show a
+    single diagnostic to the CM.
     """
     # Pull everything we need in three queries — cheaper than per-row
     # lookups inside the loop.
@@ -138,6 +195,12 @@ async def load_fertiliser_candidates(
             continue
         acc[cn_id][letter] = pct
 
+    # Fertigation gate (spec §5.1). Only common names with at least one
+    # approved trade name in `npk_fertigation_products` survive.
+    fertigation_pool: Optional[set[str]] = None
+    if fertigation:
+        fertigation_pool = await load_fertigation_approved_common_name_ids(db)
+
     candidates: list[Candidate] = []
     skipped_common_names = 0
     for cn_id in common_name_seen:
@@ -149,13 +212,22 @@ async def load_fertiliser_candidates(
         if cn_core is None:
             skipped_common_names += 1
             continue
+        if fertigation_pool is not None and cn_id not in fertigation_pool:
+            # Not a Cosh gap — intentional water-soluble filter. Don't
+            # count toward skipped (the diagnostic is about missing data,
+            # not about the spec's filter).
+            continue
         name = (cn_core.translations or {}).get("en") or cn_id
         candidates.append(Candidate(
             cosh_id=cn_id, name=name,
             concentration=Concentration(
                 n=vals["N"], p=vals["P"], k=vals["K"],
             ),
-            water_soluble=True,  # see module docstring — deferred filter
+            # water_soluble is now a derived attribute on Candidate that
+            # mirrors the filter we just applied. Kept for downstream
+            # surfaces (e.g. PWA chip) until the broader brand-side
+            # water-soluble flag arrives.
+            water_soluble=fertigation_pool is None or cn_id in fertigation_pool,
         ))
 
     return candidates, skipped + skipped_common_names

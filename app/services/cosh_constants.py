@@ -120,6 +120,27 @@ COSH_STRAIGHT_COMPLEX_CORE = "straight_complex"
 COSH_FERT_NUTRIENT_CONCENTRATION_CORE = "fert_nutrient_concentration_core"
 COSH_FERT_NUTRIENT_CONCENTRATION_CONNECT = "fert_nutrient_concentration"
 
+# ── NPK Fertigation approved products (synced 2026-06-01) ─────────────────
+#
+# 3-endpoint Connect-references-Connect. Each row certifies one
+# (common_name, trade_name) pair as valid for the Fertigation NPK
+# flow, with the brand's formulation pinned at position 3.
+#
+#   pos 1  role=connect_8695043c  → commonnames_l2 connect_id
+#                                   (chain to: common_name × l2_data)
+#   pos 2  role=connect_f26fbec8  → tradename_manufacturer connect_id
+#                                   (chain to: trade_name × manufacturer)
+#   pos 3  role=formulations      → formulation Core directly
+#
+# Role names at positions 1 and 2 are Cosh auto-generated and may
+# evolve; we identify endpoints by POSITION not role to stay safe.
+# 238 rows / 81 distinct common names on first prod sync.
+
+COSH_NPK_FERTIGATION_PRODUCTS_CONNECT = "npk_fertigation_products"
+COSH_NPK_FERT_POS_COMMONNAMES_L2_ID = 1
+COSH_NPK_FERT_POS_TRADENAME_MFR_ID = 2
+COSH_NPK_FERT_POS_FORMULATION = 3
+
 # Bridge from our L2 enum string to the `l2_data` Core's English
 # translation, used to resolve the NPK L2 → l2_data cosh_id.
 # Cosh ships no slug field on `l2_data`, so we match by translation.

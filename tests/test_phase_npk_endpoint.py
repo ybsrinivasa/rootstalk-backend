@@ -258,12 +258,60 @@ async def test_picked_mixed_narrows_straights_to_gap(db):
     assert straight_ids == {"cosh:cn-urea", "cosh:cn-ssp"}
 
 
+async def _approve_for_fertigation(db, common_name_cosh_id: str):
+    """Seed the Connect chain that certifies a common-name for
+    Fertigation. Mirrors prod shape:
+      npk_fertigation_products row (pos 1 = commonnames_l2 connect_id)
+      commonnames_l2 row whose pos 1 endpoint = the common_name.
+    """
+    cnl2_connect_id = f"connect:cnl2:{common_name_cosh_id}"
+    db.add(CoshConnectRow(
+        connect_id=cnl2_connect_id, connect_type="commonnames_l2",
+        endpoints=[
+            {"role": "common_names_of_inputs", "cosh_id": common_name_cosh_id, "position": 1},
+            {"role": "l2_data", "cosh_id": "cosh:l2-fert", "position": 2},
+        ],
+        status="active",
+    ))
+    db.add(CoshConnectRow(
+        connect_id=f"connect:fert:{common_name_cosh_id}",
+        connect_type="npk_fertigation_products",
+        endpoints=[
+            {"role": "connect_8695043c", "cosh_id": cnl2_connect_id, "position": 1},
+            {"role": "connect_f26fbec8", "cosh_id": f"cosh:tnm:{common_name_cosh_id}", "position": 2},
+            {"role": "formulations", "cosh_id": "cosh:fmt-solid", "position": 3},
+        ],
+        status="active",
+    ))
+
+
 @requires_docker
 @pytest.mark.asyncio
-async def test_fertigation_runs_same_ranking_pending_water_soluble_flag(db):
-    """Until Cosh ships a water-soluble flag, fertigation runs over the
-    full pool. This test pins the current (defer-filtered) behaviour so
-    we notice when the flag arrives and the test needs updating."""
+async def test_fertigation_drops_common_names_not_in_approved_set(db):
+    """Spec §5.1 — only common names with an approved fertigation
+    product are surfaced. Here we approve Urea + 10:26:26 but not
+    SSP/MOP, so the Mixed survives, Urea survives, and SSP/MOP are
+    silently dropped."""
+    dealer, order, item = await _seed_npk_order(
+        db, l2_type="FERTIGATION_NPK_DOSAGES", dose=(50, 80, 30),
+    )
+    await _approve_for_fertigation(db, "cosh:cn-10-26-26")
+    await _approve_for_fertigation(db, "cosh:cn-urea")
+    await db.commit()
+
+    res = await get_item_npk_options(
+        order_id=order.id, item_id=item.id,
+        db=db, current_user=dealer,
+    )
+    assert res["fertigation"] is True
+    assert [r["cosh_id"] for r in res["ranked_mixed"]] == ["cosh:cn-10-26-26"]
+    assert {s["cosh_id"] for s in res["enabled_straights"]} == {"cosh:cn-urea"}
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_fertigation_empty_when_no_common_names_approved(db):
+    """Defensive: with the fertigation pool empty, both lists empty."""
     dealer, order, item = await _seed_npk_order(
         db, l2_type="FERTIGATION_NPK_DOSAGES", dose=(50, 80, 30),
     )
@@ -272,8 +320,5 @@ async def test_fertigation_runs_same_ranking_pending_water_soluble_flag(db):
         db=db, current_user=dealer,
     )
     assert res["fertigation"] is True
-    # Same Mixeds + Straights as the chemical flow above.
-    assert "cosh:cn-10-26-26" in [r["cosh_id"] for r in res["ranked_mixed"]]
-    assert {s["cosh_id"] for s in res["enabled_straights"]} == {
-        "cosh:cn-urea", "cosh:cn-ssp", "cosh:cn-mop",
-    }
+    assert res["ranked_mixed"] == []
+    assert res["enabled_straights"] == []
