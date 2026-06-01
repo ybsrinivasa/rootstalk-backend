@@ -596,6 +596,20 @@ async def list_subscription_orders(
                     standalone_items.extend(rel_items)
 
         cd = compute_count_display(structures, len(standalone_items))
+        # Per-status item breakdown so the PWA's Manage tab can
+        # surface only the counts that matter — without ever
+        # exposing item names. Names stay hidden from the farmer
+        # for anti-manipulation reasons; the count is what they
+        # need to act on (approve N, send N returned to another
+        # dealer).
+        AWAITING = {OrderItemStatus.SENT_FOR_APPROVAL}
+        RETURNED = {
+            OrderItemStatus.NOT_AVAILABLE,
+            OrderItemStatus.REJECTED,
+            OrderItemStatus.POSTPONED,
+        }
+        awaiting_count = sum(1 for i in items if i.status in AWAITING)
+        returned_count = sum(1 for i in items if i.status in RETURNED)
         regular_out.append({
             "kind": "REGULAR",
             "id": o.id,
@@ -606,6 +620,8 @@ async def list_subscription_orders(
             "created_at": o.created_at,
             "item_count": cd.count,
             "is_max_count": cd.is_max,
+            "awaiting_approval_count": awaiting_count,
+            "returned_count": returned_count,
             "subscription_id": o.subscription_id,
             "category": o.category,
             **meta_dict,
