@@ -559,15 +559,26 @@ async def list_farmer_seed_orders(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    from app.services.order_meta import load_meta_for_subscription_ids
+
     result = await db.execute(
         select(SeedOrderFull).where(
             SeedOrderFull.farmer_user_id == current_user.id
         ).order_by(SeedOrderFull.created_at.desc())
     )
     orders = result.scalars().all()
+
+    # Phase 1 of the farmer Orders restructure (2026-06-02): seed
+    # cards get the same crop / company / start-date header rest of
+    # the order surface uses, so the farmer reads them consistently.
+    meta_by_sub = await load_meta_for_subscription_ids(
+        db, [o.subscription_id for o in orders],
+    )
+
     out = []
     for o in orders:
         variety = (await db.execute(select(SeedVariety).where(SeedVariety.id == o.variety_id))).scalar_one_or_none()
+        meta = meta_by_sub.get(o.subscription_id)
         out.append({
             "id": o.id, "status": o.status,
             "variety_name": variety.name if variety else None,
@@ -581,6 +592,7 @@ async def list_farmer_seed_orders(
             "dealer_user_id": o.dealer_user_id,
             "facilitator_user_id": o.facilitator_user_id,
             "subscription_id": o.subscription_id,
+            **(meta.to_dict() if meta else {}),
         })
     return out
 

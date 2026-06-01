@@ -402,11 +402,22 @@ async def list_farmer_orders(
         PracticeRef, build_structure, compute_count_display,
     )
 
+    from app.services.order_meta import load_meta_for_subscription_ids
+
     q = select(Order).where(Order.farmer_user_id == current_user.id).order_by(Order.created_at.desc())
     if status_filter:
         q = q.where(Order.status == status_filter)
     result = await db.execute(q)
     orders = result.scalars().all()
+
+    # Phase 1 of the farmer-side Orders restructure (2026-06-02) —
+    # each card needs crop name, company, start date so the farmer can
+    # tell at a glance which subscription an order belongs to. Batch-
+    # loads all the join chain in one round.
+    meta_by_sub = await load_meta_for_subscription_ids(
+        db, [o.subscription_id for o in orders],
+    )
+
     out = []
     for o in orders:
         # Active items only — archived (timeline-expired) rows are
@@ -465,6 +476,7 @@ async def list_farmer_orders(
 
         cd = compute_count_display(structures, len(standalone_items))
 
+        meta = meta_by_sub.get(o.subscription_id)
         out.append({
             "id": o.id,
             "status": o.status,
@@ -474,6 +486,12 @@ async def list_farmer_orders(
             "created_at": o.created_at,
             "item_count": cd.count,
             "is_max_count": cd.is_max,
+            # Package-anchor metadata (Phase 1, 2026-06-02). All
+            # nullable so a stray subscription-less order doesn't 500
+            # the whole list — the PWA renders what's available.
+            "subscription_id": o.subscription_id,
+            "category": o.category,
+            **(meta.to_dict() if meta else {}),
         })
     return out
 
