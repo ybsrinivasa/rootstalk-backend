@@ -156,7 +156,10 @@ def cca_window_active(
     if from_type == "DAS":
         return from_value <= day_offset <= to_value
     if from_type == "DBS":
-        return -from_value <= day_offset <= -to_value
+        # BL-17: DBS closes at midnight of (crop_start - 1) even when
+        # to_value == 0. `max(to_value, 1)` keeps DBS strictly pre-
+        # sowing so it never overlaps DAS day 0.
+        return -from_value <= day_offset <= -max(to_value, 1)
     return False
 
 

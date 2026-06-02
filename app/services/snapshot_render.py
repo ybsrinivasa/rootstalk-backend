@@ -77,10 +77,17 @@ def cca_window_active(
     """Mirrors the BL-04 check in `/farmer/advisory/today` for CCA timelines.
 
     DAS: from_value <= day_offset <= to_value (positive offsets, from < to).
-    DBS: -from_value <= day_offset <= -to_value. Production convention has
-         `from_value > to_value` for DBS rows (e.g. from=15, to=8 means
-         "active 15 to 8 days before sowing"). day_offset is negative
-         pre-sowing; today is in window when -from <= day_offset <= -to.
+    DBS: -from_value <= day_offset <= -max(to_value, 1).
+         Production convention has `from_value > to_value` for DBS rows
+         (e.g. from=15, to=8 means "active 15 to 8 days before sowing").
+         day_offset is negative pre-sowing.
+         BL-17 boundary rule (2026-06-02): DBS closes at midnight of
+         (crop_start - 1) — i.e. DBS never covers crop_start itself even
+         when to_value == 0. Without `max(to_value, 1)`, to=0 would let
+         day_offset=0 pass through and overlap a DAS 0→N timeline on
+         the sowing day. Fixed across all four call sites
+         (cca_window_active here + in snapshot_sweep,
+         cca_calendar_dates below, bl17.compute_window, bl17.to_day_offset_range).
     CALENDAR (Alerts D, 2026-05-29): PERENNIAL packages anchor to the
          calendar year — `from_value` / `to_value` are day-of-year
          bounds (1-365/366). Active when today's day-of-year falls in
@@ -93,7 +100,7 @@ def cca_window_active(
     if meta.from_type == "DAS":
         return meta.from_value <= day_offset <= meta.to_value
     if meta.from_type == "DBS":
-        return -meta.from_value <= day_offset <= -meta.to_value
+        return -meta.from_value <= day_offset <= -max(meta.to_value, 1)
     if meta.from_type == "CALENDAR":
         if today_date is None:
             return False
@@ -112,9 +119,11 @@ def cca_calendar_dates(
             crop_start + timedelta(days=meta.to_value),
         )
     if meta.from_type == "DBS":
+        # BL-17 boundary rule: DBS closes the day BEFORE crop_start
+        # when to_value == 0. Otherwise closes to_value days before.
         return (
             crop_start - timedelta(days=meta.from_value),
-            crop_start - timedelta(days=meta.to_value),
+            crop_start - timedelta(days=max(meta.to_value, 1)),
         )
     return (crop_start, crop_start)
 
