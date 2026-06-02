@@ -1423,8 +1423,9 @@ async def set_start_date(
             from_d = old_start + timedelta(days=tl.from_value)
             to_d = old_start + timedelta(days=tl.to_value)
         elif tl.from_type.value == "DBS":
+            # BL-17: DBS to=0 closes day BEFORE sowing — clamp upper bound.
             from_d = old_start - timedelta(days=tl.from_value)
-            to_d = old_start - timedelta(days=tl.to_value)
+            to_d = old_start - timedelta(days=max(tl.to_value, 1))
         else:
             continue
         tl_ranges.append(TimelineDateRange(id=tl.id, from_date=from_d, to_date=to_d))
@@ -4872,9 +4873,11 @@ async def get_missed_items(
                 is_missed = True
                 window_end = crop_start + timedelta(days=tl.to_value)
         elif tl.from_type.value == "DBS":
-            if day_offset > -tl.to_value:
+            # BL-17: DBS to=0 closes day BEFORE sowing — clamp upper bound.
+            _tl_to = max(tl.to_value, 1)
+            if day_offset > -_tl_to:
                 is_missed = True
-                window_end = crop_start - timedelta(days=tl.to_value)
+                window_end = crop_start - timedelta(days=_tl_to)
 
         if is_missed:
             practices = (await db.execute(

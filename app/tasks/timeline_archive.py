@@ -56,7 +56,8 @@ def _timeline_end_for(timeline: Timeline, sub_crop_start) -> "datetime | None":
     if ft == "DAS":
         return start + timedelta(days=int(timeline.to_value or 0))
     if ft == "DBS":
-        return start - timedelta(days=int(timeline.to_value or 0))
+        # BL-17: DBS to=0 closes day BEFORE sowing — clamp upper bound.
+        return start - timedelta(days=max(int(timeline.to_value or 0), 1))
     return None
 
 

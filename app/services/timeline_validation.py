@@ -12,9 +12,14 @@ Three rules from spec §5 enforced together at create / update / import:
    single Timeline isn't representable. The remaining gap is the
    *sign* of the values inside one type:
    - DBS: from_value strictly positive (days BEFORE start),
-     to_value non-negative. `to_value=0` is allowed and means
-     "ends at the moment of sowing" — the closing boundary that
-     dovetails with DAS `from_value=0` (no overlap, no gap).
+     to_value non-negative. `to_value=0` is allowed and per the
+     2026-06-02 BL-17 amendment means "closes at midnight of
+     (crop_start - 1)" — DBS never covers the sowing day itself.
+     The dovetail with DAS `from_value=0` (no overlap, no gap) is
+     enforced by the `max(to_value, 1)` clamp in
+     bl17_timeline_boundary, snapshot_render, snapshot_sweep,
+     order_bundle, and the various _timeline_end_date helpers.
+     Behaviour for `to_value >= 1` is unchanged.
      Batch 39F (2026-05-15) per user spec.
    - DAS: both values non-negative (start day onwards; from=0 is
      the start day).

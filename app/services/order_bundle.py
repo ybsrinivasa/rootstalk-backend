@@ -94,9 +94,15 @@ def _timeline_window(
     if ftype == "DBS":
         if crop_start is None:
             return None
+        # BL-17 boundary rule: DBS closes the day BEFORE crop_start
+        # when to_value == 0. `max(to_value, 1)` clamp keeps DBS
+        # strictly pre-sowing so it doesn't bleed into a DAS-only
+        # date-range order and trip the timing-type mix guard in
+        # POST /farmer/orders. Mirrors the same clamp in
+        # snapshot_render, snapshot_sweep, and bl17_timeline_boundary.
         return (
             crop_start - timedelta(days=int(tl.from_value)),
-            crop_start - timedelta(days=int(tl.to_value)),
+            crop_start - timedelta(days=max(int(tl.to_value), 1)),
         )
     if ftype == "CALENDAR":
         if today is None:
