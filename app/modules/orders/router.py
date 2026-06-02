@@ -1728,17 +1728,22 @@ async def mark_item_available(
 ):
     """BL-07: Dealer selects brand and enters volume/price before marking available.
 
-    Brand discipline (BL-07 audit, 2026-05-05):
+    Brand discipline (BL-07 audit, 2026-05-05; core_type fix 2026-06-02):
       `brand_cosh_id` is REQUIRED and MUST refer to an active row in
-      `cosh_core_items` with core_type='brand'. Free-text or unknown
-      identifiers are rejected with stable error codes
-      (BRAND_REQUIRED / BRAND_NOT_IN_SYSTEM) so downstream analytics —
-      brand comparisons, sale tracking, manufacturer reports, spelling
-      consistency — stay reliable. The dealer's typed `brand_name` is
-      ignored; the canonical English name from cosh translations is
-      stored on the row instead. If a real brand truly isn't in the
-      system, the dealer should use POST /dealer/missing-brand-reports
-      to flag it for the CM.
+      `cosh_core_items` with `core_type = COSH_TRADE_NAMES_CORE`
+      (= "trade_names"). The original audit hard-coded the literal
+      "brand" which never existed in the Cosh schema — Cosh 2.0
+      represents brand-equivalent rows as `trade_names`, matching
+      what `brand_cache` and `npk_trade_names` already use. With the
+      wrong literal, every dealer Save tap returned BRAND_NOT_IN_SYSTEM.
+      Free-text or unknown identifiers are rejected with stable error
+      codes (BRAND_REQUIRED / BRAND_NOT_IN_SYSTEM) so downstream
+      analytics — brand comparisons, sale tracking, manufacturer
+      reports, spelling consistency — stay reliable. The dealer's
+      typed `brand_name` is ignored; the canonical English name from
+      cosh translations is stored on the row instead. If a real brand
+      truly isn't in the system, the dealer should use POST
+      /dealer/missing-brand-reports to flag it for the CM.
 
     Part-aware sibling handling (Build C):
       Same Part, different Option  -> mark sibling NOT_AVAILABLE (returned to farmer)
@@ -1749,6 +1754,7 @@ async def mark_item_available(
     """
     from app.services.relations import decode_role
     from app.modules.sync.models import CoshCoreItem
+    from app.services.cosh_constants import COSH_TRADE_NAMES_CORE
 
     await _assert_active_dealer(db, current_user.id)
     await _get_dealer_order(db, order_id, current_user.id)
@@ -1775,7 +1781,7 @@ async def mark_item_available(
     brand_row = (await db.execute(
         select(CoshCoreItem).where(
             CoshCoreItem.cosh_id == brand_cosh_id,
-            CoshCoreItem.core_type == "brand",
+            CoshCoreItem.core_type == COSH_TRADE_NAMES_CORE,
             CoshCoreItem.status == "active",
         )
     )).scalar_one_or_none()
