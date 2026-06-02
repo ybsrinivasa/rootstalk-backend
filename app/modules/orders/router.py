@@ -402,7 +402,9 @@ async def list_farmer_orders(
         PracticeRef, build_structure, compute_count_display,
     )
 
-    from app.services.order_meta import load_meta_for_subscription_ids
+    from app.services.order_meta import (
+        load_meta_for_subscription_ids, load_recipients,
+    )
 
     q = select(Order).where(Order.farmer_user_id == current_user.id).order_by(Order.created_at.desc())
     if status_filter:
@@ -416,6 +418,14 @@ async def list_farmer_orders(
     # loads all the join chain in one round.
     meta_by_sub = await load_meta_for_subscription_ids(
         db, [o.subscription_id for o in orders],
+    )
+    # 2026-06-02 — surface recipient (dealer / facilitator) name +
+    # shop + phone on every card so tracking an order doesn't
+    # require drilling into the detail page.
+    recipients = await load_recipients(
+        db,
+        [o.dealer_user_id for o in orders],
+        [o.facilitator_user_id for o in orders],
     )
 
     out = []
@@ -477,12 +487,14 @@ async def list_farmer_orders(
         cd = compute_count_display(structures, len(standalone_items))
 
         meta = meta_by_sub.get(o.subscription_id)
+        rcp = recipients.get(o.dealer_user_id) or recipients.get(o.facilitator_user_id)
         out.append({
             "id": o.id,
             "status": o.status,
             "date_from": o.date_from,
             "date_to": o.date_to,
             "dealer_user_id": o.dealer_user_id,
+            "facilitator_user_id": o.facilitator_user_id,
             "created_at": o.created_at,
             "item_count": cd.count,
             "is_max_count": cd.is_max,
@@ -492,6 +504,7 @@ async def list_farmer_orders(
             "subscription_id": o.subscription_id,
             "category": o.category,
             **(meta.to_dict() if meta else {}),
+            **(rcp.to_dict() if rcp else {}),
         })
     return out
 
@@ -515,7 +528,9 @@ async def list_subscription_orders(
     from app.modules.advisory.models import Relation
     from app.modules.seed_mgmt.models import SeedOrderFull, SeedVariety
     from app.modules.subscriptions.models import Subscription
-    from app.services.order_meta import load_meta_for_subscription_ids
+    from app.services.order_meta import (
+        load_meta_for_subscription_ids, load_recipients,
+    )
     from app.services.relations import (
         PracticeRef, build_structure, compute_count_display,
     )
@@ -540,6 +555,15 @@ async def list_subscription_orders(
             Order.farmer_user_id == current_user.id,
         ).order_by(Order.created_at.desc())
     )).scalars().all()
+
+    # 2026-06-02 — recipient info batch-loaded once for the whole
+    # list so cards can show dealer / facilitator name + shop +
+    # phone without per-row lookups.
+    recipients = await load_recipients(
+        db,
+        [o.dealer_user_id for o in regular_rows],
+        [o.facilitator_user_id for o in regular_rows],
+    )
 
     regular_out: list[dict] = []
     for o in regular_rows:
@@ -610,6 +634,7 @@ async def list_subscription_orders(
         }
         awaiting_count = sum(1 for i in items if i.status in AWAITING)
         returned_count = sum(1 for i in items if i.status in RETURNED)
+        rcp = recipients.get(o.dealer_user_id) or recipients.get(o.facilitator_user_id)
         regular_out.append({
             "kind": "REGULAR",
             "id": o.id,
@@ -617,6 +642,7 @@ async def list_subscription_orders(
             "date_from": o.date_from,
             "date_to": o.date_to,
             "dealer_user_id": o.dealer_user_id,
+            "facilitator_user_id": o.facilitator_user_id,
             "created_at": o.created_at,
             "item_count": cd.count,
             "is_max_count": cd.is_max,
@@ -625,6 +651,7 @@ async def list_subscription_orders(
             "subscription_id": o.subscription_id,
             "category": o.category,
             **meta_dict,
+            **(rcp.to_dict() if rcp else {}),
         })
 
     # ── Seed orders ───────────────────────────────────────────────────
@@ -635,11 +662,19 @@ async def list_subscription_orders(
         ).order_by(SeedOrderFull.created_at.desc())
     )).scalars().all()
 
+    # Seed recipients fetched after the rows are known.
+    seed_recipients = await load_recipients(
+        db,
+        [so.dealer_user_id for so in seed_rows],
+        [so.facilitator_user_id for so in seed_rows],
+    )
+
     seed_out: list[dict] = []
     for so in seed_rows:
         variety = (await db.execute(
             select(SeedVariety).where(SeedVariety.id == so.variety_id)
         )).scalar_one_or_none()
+        rcp = seed_recipients.get(so.dealer_user_id) or seed_recipients.get(so.facilitator_user_id)
         seed_out.append({
             "kind": "SEED",
             "id": so.id,
@@ -654,6 +689,7 @@ async def list_subscription_orders(
             "facilitator_user_id": so.facilitator_user_id,
             "subscription_id": so.subscription_id,
             **meta_dict,
+            **(rcp.to_dict() if rcp else {}),
         })
 
     # Merge + chronological (newest first).

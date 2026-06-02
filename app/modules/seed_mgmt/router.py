@@ -559,7 +559,9 @@ async def list_farmer_seed_orders(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    from app.services.order_meta import load_meta_for_subscription_ids
+    from app.services.order_meta import (
+        load_meta_for_subscription_ids, load_recipients,
+    )
 
     result = await db.execute(
         select(SeedOrderFull).where(
@@ -574,11 +576,17 @@ async def list_farmer_seed_orders(
     meta_by_sub = await load_meta_for_subscription_ids(
         db, [o.subscription_id for o in orders],
     )
+    recipients = await load_recipients(
+        db,
+        [o.dealer_user_id for o in orders],
+        [o.facilitator_user_id for o in orders],
+    )
 
     out = []
     for o in orders:
         variety = (await db.execute(select(SeedVariety).where(SeedVariety.id == o.variety_id))).scalar_one_or_none()
         meta = meta_by_sub.get(o.subscription_id)
+        rcp = recipients.get(o.dealer_user_id) or recipients.get(o.facilitator_user_id)
         out.append({
             "id": o.id, "status": o.status,
             "variety_name": variety.name if variety else None,
@@ -593,6 +601,7 @@ async def list_farmer_seed_orders(
             "facilitator_user_id": o.facilitator_user_id,
             "subscription_id": o.subscription_id,
             **(meta.to_dict() if meta else {}),
+            **(rcp.to_dict() if rcp else {}),
         })
     return out
 

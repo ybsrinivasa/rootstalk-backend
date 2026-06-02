@@ -59,6 +59,78 @@ class OrderPackageMeta:
         }
 
 
+@dataclass(frozen=True)
+class RecipientInfo:
+    """Dealer / Facilitator surface fields the farmer's Order cards
+    need: who's holding the order right now + how to reach them."""
+    user_id: str
+    name: Optional[str]
+    phone: Optional[str]
+    shop_name: Optional[str]  # dealer-only — facilitator stays None
+    role: str                  # "DEALER" | "FACILITATOR"
+
+    def to_dict(self) -> dict:
+        return {
+            "recipient_user_id": self.user_id,
+            "recipient_name": self.name,
+            "recipient_phone": self.phone,
+            "recipient_shop_name": self.shop_name,
+            "recipient_role": self.role,
+        }
+
+
+async def load_recipients(
+    db: AsyncSession,
+    dealer_user_ids: Iterable[str],
+    facilitator_user_ids: Iterable[str],
+) -> dict[str, RecipientInfo]:
+    """Batch-load recipient info by user_id. Two ID lists in (dealer
+    + facilitator) because the same user_id never plays both roles
+    for a given order, and the join shape differs (shop_name only
+    applies to dealers via DealerProfile)."""
+    from app.modules.orders.models import DealerProfile
+    from app.modules.platform.models import User
+
+    dealer_ids = {d for d in dealer_user_ids if d}
+    facil_ids = {f for f in facilitator_user_ids if f}
+    all_ids = dealer_ids | facil_ids
+    if not all_ids:
+        return {}
+
+    users = (await db.execute(
+        select(User).where(User.id.in_(all_ids))
+    )).scalars().all()
+    user_by_id = {u.id: u for u in users}
+
+    shop_by_id: dict[str, str] = {}
+    if dealer_ids:
+        profiles = (await db.execute(
+            select(DealerProfile).where(
+                DealerProfile.user_id.in_(dealer_ids),
+            )
+        )).scalars().all()
+        shop_by_id = {p.user_id: p.shop_name for p in profiles if p.shop_name}
+
+    out: dict[str, RecipientInfo] = {}
+    for uid in dealer_ids:
+        u = user_by_id.get(uid)
+        if u is None:
+            continue
+        out[uid] = RecipientInfo(
+            user_id=uid, name=u.name, phone=u.phone,
+            shop_name=shop_by_id.get(uid), role="DEALER",
+        )
+    for uid in facil_ids:
+        u = user_by_id.get(uid)
+        if u is None:
+            continue
+        out[uid] = RecipientInfo(
+            user_id=uid, name=u.name, phone=u.phone,
+            shop_name=None, role="FACILITATOR",
+        )
+    return out
+
+
 async def load_meta_for_subscription_ids(
     db: AsyncSession, subscription_ids: Iterable[str],
 ) -> dict[str, OrderPackageMeta]:
