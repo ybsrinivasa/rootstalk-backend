@@ -526,7 +526,7 @@ async def list_subscription_orders(
     PWA can render both shapes in one chronological list.
     """
     from app.modules.advisory.models import Relation
-    from app.modules.seed_mgmt.models import SeedOrderFull, SeedVariety
+    from app.modules.seed_mgmt.models import SeedOrderFull, SeedOrderStatus, SeedVariety
     from app.modules.subscriptions.models import Subscription
     from app.services.order_meta import (
         load_meta_for_subscription_ids, load_recipients,
@@ -688,6 +688,10 @@ async def list_subscription_orders(
             "dealer_user_id": so.dealer_user_id,
             "facilitator_user_id": so.facilitator_user_id,
             "subscription_id": so.subscription_id,
+            # SEED has no item-level table; expose a 1/0 awaiting flag
+            # so the Manage tab can render the same Approve-all action
+            # using the order-level PUT /farmer/seed-orders/{id}/approve.
+            "awaiting_approval_count": 1 if so.status == SeedOrderStatus.SENT_FOR_APPROVAL.value else 0,
             **meta_dict,
             **(rcp.to_dict() if rcp else {}),
         })
