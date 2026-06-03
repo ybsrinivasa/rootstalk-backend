@@ -1896,16 +1896,39 @@ async def list_dealer_orders(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Dealer's orders feed. 2026-06-03 — enriched with farmer +
+    client info so the order list cards can render the human
+    context the dealer needs to scan their feed (farmer name +
+    photo, company name, category, status, date received) without
+    drilling in.
+    """
+    from app.modules.clients.models import Client
+
     await _assert_active_dealer(db, current_user.id)
-    result = await db.execute(
-        select(Order).where(
+    rows = (await db.execute(
+        select(Order, User, Client)
+        .join(User, User.id == Order.farmer_user_id)
+        .join(Client, Client.id == Order.client_id)
+        .where(
             Order.dealer_user_id == current_user.id,
             Order.status.notin_([OrderStatus.CANCELLED, OrderStatus.EXPIRED]),
-        ).order_by(Order.created_at.desc())
-    )
-    orders = result.scalars().all()
-    return [{"id": o.id, "status": o.status, "farmer_user_id": o.farmer_user_id,
-             "date_from": o.date_from, "date_to": o.date_to} for o in orders]
+        )
+        .order_by(Order.created_at.desc())
+    )).all()
+    return [
+        {
+            "id": o.id, "status": o.status,
+            "farmer_user_id": o.farmer_user_id,
+            "farmer_name": u.name,
+            "farmer_photo_url": u.photo_url,
+            "client_id": o.client_id,
+            "client_name": c.display_name or c.short_name,
+            "category": o.category,
+            "date_from": o.date_from, "date_to": o.date_to,
+            "created_at": o.created_at,
+        }
+        for o, u, c in rows
+    ]
 
 
 @router.get("/dealer/postponed-items")
