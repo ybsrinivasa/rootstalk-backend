@@ -1908,6 +1908,70 @@ async def list_dealer_orders(
              "date_from": o.date_from, "date_to": o.date_to} for o in orders]
 
 
+@router.get("/dealer/postponed-items")
+async def list_dealer_postponed_items(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cross-order list of POSTPONED items the dealer still owes a
+    decision on. Dedicated surface so the dealer doesn't have to
+    open each order one-by-one to find their own deferred work.
+
+    Returns one row per item with the minimum the dealer needs to
+    act: practice display name, farmer + crop context, order date
+    range, postponed_until + how many days remain. Tapping a row in
+    the PWA navigates to /dealer/orders/{order_id}?focus_item={item_id}
+    which renders the order detail with everything else hidden.
+    """
+    from app.modules.advisory.models import Practice as AdvPractice
+    from app.modules.subscriptions.models import Subscription
+
+    await _assert_active_dealer(db, current_user.id)
+
+    rows = (await db.execute(
+        select(OrderItem, Order, AdvPractice, User, Subscription)
+        .join(Order, Order.id == OrderItem.order_id)
+        .join(AdvPractice, AdvPractice.id == OrderItem.practice_id, isouter=True)
+        .join(User, User.id == Order.farmer_user_id)
+        .join(Subscription, Subscription.id == Order.subscription_id)
+        .where(
+            Order.dealer_user_id == current_user.id,
+            OrderItem.status == OrderItemStatus.POSTPONED,
+            OrderItem.archived_at.is_(None),
+            Order.status.notin_([OrderStatus.CANCELLED, OrderStatus.EXPIRED]),
+        )
+        .order_by(OrderItem.postponed_until.asc().nullslast(), Order.created_at.desc())
+    )).all()
+
+    out = []
+    for item, order, practice, farmer, sub in rows:
+        l2 = practice.l2_type if practice else None
+        display_name = (
+            l2.replace("_", " ").title() if l2 else "Practice"
+        )
+        days_remaining = None
+        if item.postponed_until:
+            from datetime import datetime, timezone
+            now_utc = datetime.now(timezone.utc)
+            delta = item.postponed_until - now_utc
+            days_remaining = max(0, delta.days)
+        out.append({
+            "item_id": item.id,
+            "order_id": order.id,
+            "subscription_id": order.subscription_id,
+            "display_name": display_name,
+            "farmer_name": farmer.name,
+            "farmer_phone": farmer.phone,
+            "category": order.category,
+            "date_from": order.date_from.isoformat() if order.date_from else None,
+            "date_to": order.date_to.isoformat() if order.date_to else None,
+            "postponed_until": item.postponed_until.isoformat() if item.postponed_until else None,
+            "days_remaining": days_remaining,
+            "order_status": order.status.value if hasattr(order.status, "value") else order.status,
+        })
+    return out
+
+
 @router.put("/dealer/orders/{order_id}/items/{item_id}/available")
 async def mark_item_available(
     order_id: str, item_id: str,
