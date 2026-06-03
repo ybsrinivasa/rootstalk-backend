@@ -708,9 +708,35 @@ async def get_farmer_order_detail(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Farmer's review page for a single order.
+
+    2026-06-03 — Reshaped to bucket items by what the farmer needs to
+    act on:
+      - approval_items    : SENT_FOR_APPROVAL — brand + manufacturer +
+                            qty + price visible; per-item Approve/Reject.
+      - postponed_items   : POSTPONED — postponed_until visible; farmer
+                            can Cancel (→ NOT_AVAILABLE, joins Returned).
+      - returned_items    : NOT_AVAILABLE + REJECTED — farmer can
+                            re-route to another dealer or skip.
+      - approved_items    : APPROVED — already received; shown for
+                            completeness.
+
+    Approval + Approved items are consolidated by (brand_cosh_id,
+    volume_unit) per the cross-timeline brand-merge rule (yesterday's
+    task 4). Postponed + Returned items are NOT consolidated — each
+    underlying timeline keeps its own row so the farmer can act on
+    each one independently.
+
+    Anti-manipulation carve-out (2026-06-03): brand+qty+price ARE
+    surfaced on this review page for SENT_FOR_APPROVAL items so the
+    farmer can make an informed approve decision. The earlier "only
+    post-approval" rule applied to the Manage tab card list; this
+    review page is the surface where the farmer's decision happens.
+    """
+    from app.modules.orders.models import BrandLookupCache
+    from app.modules.advisory.models import Practice as AdvPractice
+
     order = await _get_farmer_order(db, order_id, current_user.id)
-    # Batch 8: only the active (non-timeline-archived) items belong
-    # on the farmer's live order detail. History lives elsewhere.
     items_result = await db.execute(
         select(OrderItem).where(
             OrderItem.order_id == order.id,
@@ -718,17 +744,84 @@ async def get_farmer_order_detail(
         )
     )
     items = items_result.scalars().all()
+
+    # Batch-load manufacturer names for every distinct brand_cosh_id.
+    brand_ids = sorted({i.brand_cosh_id for i in items if i.brand_cosh_id})
+    manufacturer_by_brand: dict[str, str | None] = {}
+    if brand_ids:
+        rows = (await db.execute(
+            select(
+                BrandLookupCache.trade_name_cosh_id,
+                BrandLookupCache.manufacturer_name,
+            ).where(BrandLookupCache.trade_name_cosh_id.in_(brand_ids))
+        )).all()
+        for tn_id, mfr in rows:
+            # Take the first non-null manufacturer per brand. Some
+            # brands appear under multiple common_names; same trade-
+            # name resolves to same manufacturer in practice.
+            if tn_id not in manufacturer_by_brand and mfr:
+                manufacturer_by_brand[tn_id] = mfr
+
+    # Batch-load practice names for the Returned + Postponed cards
+    # (those rows can't always lean on brand_name since the dealer
+    # may not have picked one).
+    practice_ids = sorted({i.practice_id for i in items if i.practice_id})
+    practice_name_by_id: dict[str, str] = {}
+    if practice_ids:
+        rows = (await db.execute(
+            select(AdvPractice.id, AdvPractice.l2_type)
+            .where(AdvPractice.id.in_(practice_ids))
+        )).all()
+        for p_id, l2 in rows:
+            if l2:
+                practice_name_by_id[p_id] = l2.replace("_", " ").title()
+
+    def base_row(i: OrderItem) -> dict:
+        return {
+            "id": i.id,
+            "practice_id": i.practice_id,
+            "practice_name": practice_name_by_id.get(i.practice_id),
+            "status": i.status,
+            "brand_cosh_id": i.brand_cosh_id,
+            "brand_name": i.brand_name if is_brand_visible_to_farmer(i.status) else None,
+            "manufacturer_name": (
+                manufacturer_by_brand.get(i.brand_cosh_id)
+                if i.brand_cosh_id and is_brand_visible_to_farmer(i.status)
+                else None
+            ),
+            "given_volume": float(i.given_volume) if i.given_volume else None,
+            "volume_unit": i.volume_unit,
+            "price": float(i.price) if i.price else None,
+            "postponed_until": i.postponed_until.isoformat() if i.postponed_until else None,
+        }
+
+    approval_raw = [base_row(i) for i in items if i.status == OrderItemStatus.SENT_FOR_APPROVAL]
+    approved_raw = [base_row(i) for i in items if i.status == OrderItemStatus.APPROVED]
+    postponed_raw = [base_row(i) for i in items if i.status == OrderItemStatus.POSTPONED]
+    returned_raw = [
+        base_row(i) for i in items
+        if i.status in (OrderItemStatus.NOT_AVAILABLE, OrderItemStatus.REJECTED)
+    ]
+
     return {
         "id": order.id, "status": order.status,
         "date_from": order.date_from, "date_to": order.date_to,
         "created_at": order.created_at,
         "dealer_user_id": order.dealer_user_id,
         "facilitator_user_id": order.facilitator_user_id,
-        # Surface subscription_id + category so the DRAFT picker on
-        # /orders/[orderId] can fetch eligible recipients without an
-        # extra round-trip.
         "subscription_id": order.subscription_id,
         "category": order.category,
+        # 2026-06-03 — Bucketed items for the review page. The brand
+        # consolidation helper merges same-brand rows across timelines
+        # for the approval + approved buckets (so the farmer sees one
+        # Agroneem 3.5 L · ₹350 line, not three rows of 1 L / 1 L /
+        # 1.5 L). Postponed + Returned stay per-row so the farmer can
+        # act on each timeline independently.
+        "approval_items": consolidate_purchased_items(approval_raw),
+        "approved_items": consolidate_purchased_items(approved_raw),
+        "postponed_items": postponed_raw,
+        "returned_items": returned_raw,
+        # Legacy flat list kept for any pre-2026-06-03 caller.
         "items": [
             {
                 "id": i.id, "practice_id": i.practice_id, "status": i.status,
@@ -1611,6 +1704,34 @@ async def reject_order_item(
         actor_user_id=current_user.id, actor_role="FARMER",
         order_id=order_id, order_item_id=item.id,
         prev_status=prev, new_status=OrderItemStatus.REJECTED.value,
+    )
+    await db.commit()
+    return {"item_id": item_id, "status": item.status}
+
+
+@router.put("/farmer/orders/{order_id}/items/{item_id}/cancel-postponed")
+async def cancel_postponed_item(
+    order_id: str, item_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Farmer cancels a postponed item ("I don't want to wait"). Flips
+    POSTPONED → NOT_AVAILABLE so the item joins the Returned bucket on
+    the review page, alongside dealer-side not-available items. Farmer
+    can then re-route to another dealer or skip for this cycle."""
+    await _get_farmer_order(db, order_id, current_user.id)
+    item = await _get_order_item(db, item_id, order_id)
+    res = validate_item_transition(item.status, OrderItemStatus.NOT_AVAILABLE.value, FARMER)
+    if not res.allowed:
+        _raise_transition(res)
+    prev = item.status.value if hasattr(item.status, "value") else item.status
+    item.status = OrderItemStatus.NOT_AVAILABLE
+    await _record_event(
+        db, lineage_id=item.lineage_id,
+        event_type="POSTPONED_CANCELLED_BY_FARMER",
+        actor_user_id=current_user.id, actor_role="FARMER",
+        order_id=order_id, order_item_id=item.id,
+        prev_status=prev, new_status=OrderItemStatus.NOT_AVAILABLE.value,
     )
     await db.commit()
     return {"item_id": item_id, "status": item.status}
