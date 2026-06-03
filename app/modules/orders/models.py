@@ -85,6 +85,16 @@ class Order(Base):
     dealer_draft: Mapped[dict] = mapped_column(
         JSON, nullable=False, default=dict, server_default="{}",
     )
+    # 2026-06-03 — Lineage tracking. Every order created via
+    # reroute-returned carries the original order's id here so the
+    # farmer's Manage tab can group sub-orders under one card and
+    # surface "Split N of M" pills. Self-referential FK so the root
+    # order's lineage_root_id may equal its own id (a backfill
+    # convention) or stay null on legacy rows; client code treats
+    # null as "this row IS the root."
+    lineage_root_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("orders.id"), nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 

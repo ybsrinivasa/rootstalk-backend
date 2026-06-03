@@ -630,10 +630,14 @@ async def list_subscription_orders(
         RETURNED = {
             OrderItemStatus.NOT_AVAILABLE,
             OrderItemStatus.REJECTED,
-            OrderItemStatus.POSTPONED,
         }
+        # 2026-06-03 — POSTPONED is no longer counted under "returned".
+        # Surfaced separately so the nudge modal can ask "you also have
+        # N postponed items with this dealer — cancel them and bundle?"
+        POSTPONED = {OrderItemStatus.POSTPONED}
         awaiting_count = sum(1 for i in items if i.status in AWAITING)
         returned_count = sum(1 for i in items if i.status in RETURNED)
+        postponed_count = sum(1 for i in items if i.status in POSTPONED)
         rcp = recipients.get(o.dealer_user_id) or recipients.get(o.facilitator_user_id)
         regular_out.append({
             "kind": "REGULAR",
@@ -648,6 +652,12 @@ async def list_subscription_orders(
             "is_max_count": cd.is_max,
             "awaiting_approval_count": awaiting_count,
             "returned_count": returned_count,
+            "postponed_count": postponed_count,
+            # 2026-06-03 — Lineage so the Manage tab can group sub-
+            # orders under one card per original procurement intent.
+            # When null on a legacy row, client treats the order's
+            # own id as the root.
+            "lineage_root_id": o.lineage_root_id or o.id,
             "subscription_id": o.subscription_id,
             "category": o.category,
             **meta_dict,
@@ -3700,45 +3710,74 @@ async def remove_order_item(
 @router.post("/farmer/orders/{order_id}/reroute-returned", status_code=201)
 async def reroute_returned_items(
     order_id: str,
+    data: Optional[dict] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Orders V2 Batch 10 — bundled re-route of Returned/Rejected/
-    Postponed items into a fresh DRAFT.
+    """Orders V2 Batch 10 + 2026-06-03 lineage/postpone-choice rework —
+    bundled re-route of Returned items into a fresh DRAFT.
 
-    The 2026-05-31 narrative (FU-9): farmer doesn't see item names,
-    only the dealer does. Three returned items = ONE re-route
-    action, not three. The picker on the DRAFT lets the farmer
-    pick a new recipient and ship them all together.
+    Eligible item statuses by default:
+      - NOT_AVAILABLE (dealer said no)
+      - REJECTED (farmer's "Remove" on the approval screen)
 
-    Eligible item statuses:
-      - NOT_AVAILABLE (dealer said no, including postpone-expiry
-        auto-flips)
-      - REJECTED (farmer rejected the dealer's brand/price)
-      - POSTPONED (farmer can pull the plug early — narrative:
-        "Postponed items can also be cancelled and forwarded")
+    POSTPONED items are NOT included by default. The farmer chooses
+    at reroute time via the nudge modal:
+      body = { "include_postponed": true } → POSTPONED items on the
+      same order are first flipped to NOT_AVAILABLE (with a
+      POSTPONED_CANCELLED_BY_FARMER event for audit), then included
+      in the reroute batch.
+
+    Lineage: the new DRAFT order carries `lineage_root_id` = the
+    original order's `lineage_root_id` if set, else the original's
+    id. The farmer's Manage tab groups every order with the same
+    lineage_root under one card.
 
     Each migrated item keeps its `lineage_id` so the audit trail is
     a single thread through the dealer hops. Original rows stay on
     the source order as REROUTED so reports still see what each
-    leg's dealer did. The source order's status recomputes via
-    `_update_order_status` so a fully-fulfilled-minus-returns order
-    can move on cleanly.
+    leg's dealer did.
     """
     order = await _get_farmer_order(db, order_id, current_user.id)
+    payload = data or {}
+    include_postponed = bool(payload.get("include_postponed"))
 
-    reroutable = {
-        OrderItemStatus.NOT_AVAILABLE,
-        OrderItemStatus.REJECTED,
-        OrderItemStatus.POSTPONED,
-    }
     items_q = await db.execute(
         select(OrderItem).where(
             OrderItem.order_id == order.id,
             OrderItem.archived_at.is_(None),
         )
     )
-    items_to_reroute = [it for it in items_q.scalars().all() if it.status in reroutable]
+    all_items = items_q.scalars().all()
+
+    # Returned-by-default set.
+    returned_set = {OrderItemStatus.NOT_AVAILABLE, OrderItemStatus.REJECTED}
+    items_to_reroute = [it for it in all_items if it.status in returned_set]
+    postponed_items = [it for it in all_items if it.status == OrderItemStatus.POSTPONED]
+
+    if include_postponed:
+        # Flip each postponed item to NOT_AVAILABLE before including
+        # in the reroute. Records a POSTPONED_CANCELLED_BY_FARMER
+        # event so the audit shows the farmer's choice, not a
+        # dealer-side abandonment.
+        for pi in postponed_items:
+            prev = pi.status.value if hasattr(pi.status, "value") else pi.status
+            res = validate_item_transition(
+                pi.status, OrderItemStatus.NOT_AVAILABLE.value, FARMER,
+            )
+            if not res.allowed:
+                _raise_transition(res)
+            pi.status = OrderItemStatus.NOT_AVAILABLE
+            await _record_event(
+                db, lineage_id=pi.lineage_id,
+                event_type="POSTPONED_CANCELLED_BY_FARMER",
+                actor_user_id=current_user.id, actor_role="FARMER",
+                order_id=order.id, order_item_id=pi.id,
+                prev_status=prev, new_status=OrderItemStatus.NOT_AVAILABLE.value,
+                metadata={"trigger": "bundled_reroute_include_postponed"},
+            )
+            items_to_reroute.append(pi)
+
     if not items_to_reroute:
         raise HTTPException(
             status_code=400,
@@ -3747,6 +3786,11 @@ async def reroute_returned_items(
                 "message": "No items in this order need re-routing.",
             },
         )
+
+    # Lineage: new draft inherits root from the original order. If
+    # the original is itself a root (lineage_root_id is null), point
+    # the new draft at the original's id.
+    new_lineage_root = order.lineage_root_id or order.id
 
     new_draft = Order(
         subscription_id=order.subscription_id,
@@ -3760,9 +3804,16 @@ async def reroute_returned_items(
         facilitator_user_id=None,
         locked_timelines=order.locked_timelines,
         expires_at=order.expires_at,
+        lineage_root_id=new_lineage_root,
     )
     db.add(new_draft)
     await db.flush()
+
+    # Backfill the original order's lineage_root_id if it's still
+    # null (i.e. this is the first reroute child being created from
+    # it). Keeps the grouping query simple.
+    if order.lineage_root_id is None:
+        order.lineage_root_id = order.id
 
     for it in items_to_reroute:
         prev_status = it.status.value if hasattr(it.status, "value") else it.status

@@ -92,8 +92,11 @@ async def test_bundled_reroute_pulls_returned_into_one_draft(db):
     user, _, order, items = await _order_with_mixed_item_statuses(db)
     not_avail_a, not_avail_b, postponed, rejected, available = items
 
+    # 2026-06-03 — include_postponed=True needed now that POSTPONED
+    # is excluded by default (farmer's nudge-modal choice).
     res = await reroute_returned_items(
-        order_id=order.id, db=db, current_user=user,
+        order_id=order.id, data={"include_postponed": True},
+        db=db, current_user=user,
     )
     assert res["rerouted_count"] == 4  # everything except AVAILABLE
 
@@ -130,7 +133,8 @@ async def test_bundled_reroute_preserves_lineage(db):
     lineages = {it.id: it.lineage_id for it in items[:4]}  # the returned ones
 
     res = await reroute_returned_items(
-        order_id=order.id, db=db, current_user=user,
+        order_id=order.id, data={"include_postponed": True},
+        db=db, current_user=user,
     )
 
     draft_items = (await db.execute(
