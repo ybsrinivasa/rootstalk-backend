@@ -1865,7 +1865,12 @@ async def mark_item_available(
     if data.get("given_volume") is not None:
         item.given_volume = data["given_volume"]
         item.volume_unit = data.get("volume_unit", "")
-    if data.get("price") is not None:
+    # 2026-06-03 — Distinguish "key absent" from "key present with null":
+    #   - "price" not in payload → leave item.price untouched.
+    #   - "price" present as null → clear item.price (dealer removed a
+    #     previously-entered price; this used to silently no-op).
+    #   - "price" present as a number → overwrite.
+    if "price" in data:
         item.price = data["price"]
     prev_status = item.status.value if hasattr(item.status, "value") else item.status
     item.status = OrderItemStatus.AVAILABLE
