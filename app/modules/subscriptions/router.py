@@ -4131,7 +4131,12 @@ async def _today_advisory_for_user(
                 if existing_snap is not None
                 else metadata_from_master_cca(tl)
             )
-            if cca_window_active(meta, day_offset):
+            # 2026-06-03 — pass today_date so CALENDAR (Perennial)
+            # timelines can compute day-of-year. Without it CALENDAR
+            # silently returned False and perennial farmers saw
+            # nothing on /farmer/advisory/today regardless of which
+            # day-of-year their authored window covers.
+            if cca_window_active(meta, day_offset, today_date=today):
                 active_timelines.append((tl, day_offset, meta))
 
         from app.services.bl03_deduplication import (
