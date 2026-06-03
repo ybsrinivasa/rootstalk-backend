@@ -198,13 +198,21 @@ def _validate(
     table: dict[tuple[str, str], frozenset[str]],
     current: str, target: str, role: str, *, kind: str,
 ) -> TransitionResult:
-    if current == target:
+    allowed_roles = table.get((current, target))
+    # 2026-06-03 — only treat current == target as NO_OP_TRANSITION
+    # when the self-edge is NOT registered. Self-edges that authors
+    # explicitly registered (e.g. AVAILABLE→AVAILABLE for an in-place
+    # dealer edit, NOT_AVAILABLE→AVAILABLE for change-of-mind) are
+    # valid transitions and must reach the role check. Pre-fix this
+    # guard ran first and silently rejected every dealer Edit details
+    # tap on an already-AVAILABLE item, with the error rendered as
+    # "item is already in 'AVAILABLE' — nothing to change."
+    if current == target and allowed_roles is None:
         return TransitionResult(
             allowed=False,
             error_code="NO_OP_TRANSITION",
             message=f"{kind} is already in '{current}' — nothing to change.",
         )
-    allowed_roles = table.get((current, target))
     if allowed_roles is None:
         return TransitionResult(
             allowed=False,
