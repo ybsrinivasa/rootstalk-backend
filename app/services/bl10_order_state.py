@@ -116,12 +116,13 @@ _ITEM_TRANSITIONS: dict[tuple[str, str], frozenset[str]] = {
     ("NOT_AVAILABLE", "SKIPPED"):            frozenset({FARMER}),
     ("REJECTED", "PENDING"):                 frozenset({FARMER}),
 
-    # 2026-06-03 — Farmer cancels a postponed item ("I don't want to
-    # wait for this"). Joins the Returned bucket on the review page
-    # so the farmer can decide re-route vs skip alongside the other
-    # not-available items, instead of leaving it dangling on the
-    # dealer side indefinitely.
-    ("POSTPONED", "NOT_AVAILABLE"):          frozenset({FARMER}),
+    # 2026-06-03 — POSTPONED → NOT_AVAILABLE is available to BOTH:
+    #   FARMER  — "I don't want to wait" (review page Cancel sheet).
+    #   DEALER  — postpone-follow-up surface: dealer revisits a
+    #             postponed item and confirms they can't supply it.
+    #             The item joins the farmer's Returned bucket on the
+    #             review page so the farmer can reroute / skip.
+    ("POSTPONED", "NOT_AVAILABLE"):          frozenset({FARMER, DEALER}),
 
     # Orders V2 (2026-05-31): the bundled re-route and cancel-migrate
     # flows stamp items REROUTED on the source order while creating

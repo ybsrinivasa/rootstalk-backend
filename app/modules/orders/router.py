@@ -2083,6 +2083,28 @@ async def mark_item_available(
         new_draft.pop(item_id, None)
         order_row.dealer_draft = new_draft
 
+    # 2026-06-03 — Postponed-resolve auto-submit. When the dealer
+    # marks a previously POSTPONED item available AFTER the order
+    # has been submitted (status past PROCESSING), there's no
+    # separate "Submit for approval" batch coming — the dealer's
+    # intent is to commit AND send it to the farmer. So we flip the
+    # item directly to SENT_FOR_APPROVAL and recompute order status
+    # (typically COMPLETED → PARTIALLY_APPROVED). Order-level state
+    # is updated via _update_order_status which bypasses the
+    # transition table — that's by design for derived-status
+    # re-computation.
+    if prev_status == "POSTPONED" and order_row.status != OrderStatus.PROCESSING:
+        item.status = OrderItemStatus.SENT_FOR_APPROVAL
+        await _record_event(
+            db, lineage_id=item.lineage_id,
+            event_type="POSTPONED_RESOLVED_TO_APPROVAL",
+            actor_user_id=current_user.id, actor_role="DEALER",
+            order_id=order_id, order_item_id=item.id,
+            prev_status=OrderItemStatus.AVAILABLE.value,
+            new_status=OrderItemStatus.SENT_FOR_APPROVAL.value,
+        )
+        await _update_order_status(db, order_id)
+
     await db.commit()
     return {"item_id": item_id, "status": item.status}
 
