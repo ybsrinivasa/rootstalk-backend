@@ -2338,15 +2338,51 @@ async def submit_for_approval(
     res = validate_order_transition(order.status, OrderStatus.SENT_FOR_APPROVAL.value, DEALER)
     if not res.allowed:
         _raise_transition(res)
-    result = await db.execute(
+    # 2026-06-03 — Every active item must have a decision before the
+    # dealer can submit. Any PENDING item blocks the submit (the
+    # dealer hasn't decided yet). The submit succeeds if at least one
+    # item is AVAILABLE OR NOT_AVAILABLE — both are signals to the
+    # farmer (available = approve flow, not_available = returned).
+    # All-POSTPONED means nothing for the farmer to act on; the
+    # dealer just stays in PROCESSING.
+    all_active = (await db.execute(
         select(OrderItem).where(
             OrderItem.order_id == order_id,
-            OrderItem.status == OrderItemStatus.AVAILABLE,
+            OrderItem.archived_at.is_(None),
+            OrderItem.status.in_([
+                OrderItemStatus.PENDING,
+                OrderItemStatus.AVAILABLE,
+                OrderItemStatus.POSTPONED,
+                OrderItemStatus.NOT_AVAILABLE,
+            ]),
         )
-    )
-    available_items = result.scalars().all()
-    if not available_items:
-        raise HTTPException(status_code=400, detail="No available items to submit")
+    )).scalars().all()
+    pending_items = [i for i in all_active if i.status == OrderItemStatus.PENDING]
+    if pending_items:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_code": "UNDECIDED_ITEMS",
+                "message": (
+                    f"{len(pending_items)} item(s) still need a decision "
+                    "(Available / Later / Not available)."
+                ),
+                "pending_count": len(pending_items),
+            },
+        )
+    available_items = [i for i in all_active if i.status == OrderItemStatus.AVAILABLE]
+    not_available_items = [i for i in all_active if i.status == OrderItemStatus.NOT_AVAILABLE]
+    if not available_items and not not_available_items:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_code": "NOTHING_TO_NOTIFY",
+                "message": (
+                    "All items are postponed — nothing to send to the farmer yet. "
+                    "Wait for the postponed items, or change some decisions."
+                ),
+            },
+        )
 
     volumes = data.get("items", {})
     for item in available_items:
