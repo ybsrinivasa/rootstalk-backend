@@ -1680,6 +1680,7 @@ async def list_purchased_items(
         out.append({
             "id": item.id,
             "practice_id": item.practice_id,
+            "brand_cosh_id": item.brand_cosh_id,
             "brand_name": item.brand_name,
             "l1_type": practice.l1_type,
             "l2_type": practice.l2_type,
@@ -1697,7 +1698,64 @@ async def list_purchased_items(
             "application_date_to": date_to_iso,
             "frequency_days": int(practice.frequency_days) if practice.frequency_days else None,
         })
-    return out
+    # 2026-06-03 — Brand consolidation across timelines. A practice
+    # recommended in multiple non-overlapping timelines (e.g. a foliar
+    # spray repeated every 12 days) leads the dealer to commit the
+    # same brand on each row. The farmer reads it as N separate items
+    # of the same brand — confusing. Combine same-brand rows by
+    # (brand_cosh_id || brand_name, volume_unit) into a single row
+    # with summed qty + summed ₹ and the merged application window.
+    # The advisory side stays per-timeline; only Received + packing
+    # see the merged view. See user direction 2026-06-03 task (4).
+    return consolidate_purchased_items(out)
+
+
+def consolidate_purchased_items(rows: list[dict]) -> list[dict]:
+    """Group purchased items by (brand_cosh_id or brand_name, volume_unit).
+
+    Empty brand_name rows (PENDING items the farmer shouldn't see)
+    pass through untouched. Rows with same brand + unit are merged —
+    given_volume and price are summed; application_date_from is the
+    earliest, application_date_to is the latest; underlying item /
+    practice / timeline ids are kept in `merged_item_ids` for the
+    PWA + audit purposes. scan_verified is true only if every merged
+    row was scan-verified."""
+    from collections import OrderedDict
+    groups: OrderedDict[tuple, dict] = OrderedDict()
+    passthrough: list[dict] = []
+    for r in rows:
+        brand_key = r.get("brand_cosh_id") or r.get("brand_name")
+        if not brand_key:
+            passthrough.append(r)
+            continue
+        key = (brand_key, r.get("volume_unit"))
+        existing = groups.get(key)
+        if existing is None:
+            groups[key] = {
+                **r,
+                "merged_item_ids": [r["id"]],
+                "merged_practice_ids": [r.get("practice_id")],
+                "merged_timeline_count": 1,
+            }
+            continue
+        existing["given_volume"] = (existing.get("given_volume") or 0) + (r.get("given_volume") or 0)
+        existing["price"] = (existing.get("price") or 0) + (r.get("price") or 0)
+        # Earliest from, latest to.
+        if r.get("application_date_from") and (
+            existing.get("application_date_from") is None
+            or r["application_date_from"] < existing["application_date_from"]
+        ):
+            existing["application_date_from"] = r["application_date_from"]
+        if r.get("application_date_to") and (
+            existing.get("application_date_to") is None
+            or r["application_date_to"] > existing["application_date_to"]
+        ):
+            existing["application_date_to"] = r["application_date_to"]
+        existing["scan_verified"] = bool(existing.get("scan_verified")) and bool(r.get("scan_verified"))
+        existing["merged_item_ids"].append(r["id"])
+        existing["merged_practice_ids"].append(r.get("practice_id"))
+        existing["merged_timeline_count"] += 1
+    return list(groups.values()) + passthrough
 
 
 # ── Dealer: Process orders ─────────────────────────────────────────────────────
@@ -3746,6 +3804,24 @@ async def get_packing_list(
 
     farmer = (await db.execute(select(User).where(User.id == order.farmer_user_id))).scalar_one_or_none()
 
+    raw_items = [
+        {
+            "id": i.id,
+            "practice_id": i.practice_id,
+            "brand_cosh_id": i.brand_cosh_id,
+            "brand_name": i.brand_name,
+            "given_volume": float(i.given_volume) if i.given_volume else None,
+            "volume_unit": i.volume_unit,
+            "price": float(i.price) if i.price else None,
+            "status": i.status,
+        }
+        for i in items
+    ]
+    # 2026-06-03 — Consolidate same-brand rows so the dealer's packing
+    # list shows one line per brand+unit (summed qty + summed ₹).
+    # Reuses the same helper that drives /farmer/purchased-items so
+    # both farmer and dealer see the order through the same lens.
+    consolidated = consolidate_purchased_items(raw_items)
     return {
         "order_id": order.id,
         "status": order.status,
@@ -3753,19 +3829,8 @@ async def get_packing_list(
         "date_to": order.date_to,
         "farmer_name": farmer.name if farmer else None,
         "farmer_phone": farmer.phone if farmer else None,
-        "items": [
-            {
-                "id": i.id,
-                "practice_id": i.practice_id,
-                "brand_name": i.brand_name,
-                "given_volume": float(i.given_volume) if i.given_volume else None,
-                "volume_unit": i.volume_unit,
-                "price": float(i.price) if i.price else None,
-                "status": i.status,
-            }
-            for i in items
-        ],
-        "total_amount": sum(float(i.price) for i in items if i.price),
+        "items": consolidated,
+        "total_amount": sum((r.get("price") or 0) for r in consolidated),
     }
 
 
