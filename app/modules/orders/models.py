@@ -233,6 +233,12 @@ class PackingList(Base):
     pdf_url: Mapped[str] = mapped_column(Text, nullable=True)
     generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     first_shared_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 2026-06-05 — Voluntary dealer removal from the Packing pill on
+    # /dealer/orders. Tapped after the dealer has handed the inputs
+    # over (or otherwise wants the order off their active surface).
+    # Doesn't delete history; just hides the order from Packing and
+    # qualifies the order for the Completed pill.
+    dealer_removed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class DealerProfile(Base):

@@ -1939,13 +1939,15 @@ async def list_dealer_orders(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Dealer's orders feed. 2026-06-03 — enriched with farmer +
-    client info so the order list cards can render the human
-    context the dealer needs to scan their feed (farmer name +
-    photo, company name, category, status, date received) without
-    drilling in.
+    """Dealer's orders feed.
+
+    2026-06-05 — Enriched with per-status item counts and
+    packing-list state so the PWA can split the feed across pills
+    (Pending / Postponed / With Farmer / Packing / Completed)
+    without a per-order round-trip.
     """
     from app.modules.clients.models import Client
+    from app.modules.orders.models import BrandLookupCache
 
     await _assert_active_dealer(db, current_user.id)
     rows = (await db.execute(
@@ -1958,20 +1960,138 @@ async def list_dealer_orders(
         )
         .order_by(Order.created_at.desc())
     )).all()
-    return [
-        {
+
+    order_ids = [o.id for o, _u, _c in rows]
+    items_by_order: dict[str, list[OrderItem]] = {}
+    if order_ids:
+        item_rows = (await db.execute(
+            select(OrderItem).where(
+                OrderItem.order_id.in_(order_ids),
+                OrderItem.archived_at.is_(None),
+            )
+        )).scalars().all()
+        for it in item_rows:
+            items_by_order.setdefault(it.order_id, []).append(it)
+
+    # Packing list rows for the same orders.
+    pl_by_order: dict[str, PackingList] = {}
+    if order_ids:
+        pl_rows = (await db.execute(
+            select(PackingList).where(PackingList.order_id.in_(order_ids))
+        )).scalars().all()
+        for pl in pl_rows:
+            pl_by_order[pl.order_id] = pl
+
+    # Manufacturer lookup for all approved brand_cosh_ids.
+    approved_brand_ids = {
+        i.brand_cosh_id
+        for items in items_by_order.values()
+        for i in items
+        if i.status == OrderItemStatus.APPROVED and i.brand_cosh_id
+    }
+    manufacturer_by_brand: dict[str, str | None] = {}
+    if approved_brand_ids:
+        mfr_rows = (await db.execute(
+            select(
+                BrandLookupCache.trade_name_cosh_id,
+                BrandLookupCache.manufacturer_name,
+            ).where(BrandLookupCache.trade_name_cosh_id.in_(approved_brand_ids))
+        )).all()
+        for tn_id, mfr in mfr_rows:
+            if tn_id not in manufacturer_by_brand and mfr:
+                manufacturer_by_brand[tn_id] = mfr
+
+    out = []
+    for o, u, c in rows:
+        items = items_by_order.get(o.id, [])
+        counts = {
+            "pending": sum(1 for i in items if i.status == OrderItemStatus.PENDING),
+            "available": sum(1 for i in items if i.status == OrderItemStatus.AVAILABLE),
+            "postponed": sum(1 for i in items if i.status == OrderItemStatus.POSTPONED),
+            "not_available": sum(1 for i in items if i.status == OrderItemStatus.NOT_AVAILABLE),
+            "sent_for_approval": sum(1 for i in items if i.status == OrderItemStatus.SENT_FOR_APPROVAL),
+            "approved": sum(1 for i in items if i.status == OrderItemStatus.APPROVED),
+            "rejected": sum(1 for i in items if i.status == OrderItemStatus.REJECTED),
+        }
+        pl = pl_by_order.get(o.id)
+        # Packing items — only when there are APPROVED items AND the
+        # packing list hasn't been dealer-removed. This is what the
+        # Packing pill on the PWA renders inline.
+        packing_items: list[dict] = []
+        if counts["approved"] > 0 and (not pl or pl.dealer_removed_at is None):
+            for i in items:
+                if i.status != OrderItemStatus.APPROVED:
+                    continue
+                packing_items.append({
+                    "id": i.id,
+                    "brand_name": i.brand_name,
+                    "manufacturer_name": (
+                        manufacturer_by_brand.get(i.brand_cosh_id)
+                        if i.brand_cosh_id else None
+                    ),
+                    "given_volume": float(i.given_volume) if i.given_volume else None,
+                    "volume_unit": i.volume_unit,
+                    "price": float(i.price) if i.price else None,
+                })
+        out.append({
             "id": o.id, "status": o.status,
             "farmer_user_id": o.farmer_user_id,
             "farmer_name": u.name,
+            "farmer_phone": u.phone,
             "farmer_photo_url": u.photo_url,
+            "facilitator_user_id": o.facilitator_user_id,
             "client_id": o.client_id,
             "client_name": c.display_name or c.short_name,
             "category": o.category,
             "date_from": o.date_from, "date_to": o.date_to,
             "created_at": o.created_at,
-        }
-        for o, u, c in rows
-    ]
+            "item_status_counts": counts,
+            "packing_items": packing_items,
+            "packing_list_shared_at": (
+                pl.first_shared_at.isoformat() if pl and pl.first_shared_at else None
+            ),
+            "packing_list_removed_at": (
+                pl.dealer_removed_at.isoformat() if pl and pl.dealer_removed_at else None
+            ),
+        })
+    return out
+
+
+@router.put("/dealer/orders/{order_id}/packing-list/remove")
+async def remove_packing_list_from_dealer_view(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Dealer voluntarily removes the packing card from their
+    /dealer/orders Packing pill. Doesn't delete history — just
+    flips `dealer_removed_at` so subsequent listings skip it from
+    Packing and (if everything else is settled) qualify the order
+    for the Completed pill.
+    """
+    from datetime import datetime, timezone
+
+    await _assert_active_dealer(db, current_user.id)
+    order = (await db.execute(
+        select(Order).where(Order.id == order_id, Order.dealer_user_id == current_user.id)
+    )).scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    # Lazy-create the packing list row if it doesn't exist yet (the
+    # dealer may remove an order from Packing without ever having
+    # called generate first — e.g. when they just hand items over in
+    # person and don't need a list).
+    pl = (await db.execute(
+        select(PackingList).where(PackingList.order_id == order_id)
+    )).scalar_one_or_none()
+    if pl is None:
+        pl = PackingList(order_id=order_id, pdf_url=None)
+        db.add(pl)
+        await db.flush()
+    pl.dealer_removed_at = datetime.now(timezone.utc)
+    await db.commit()
+    return {"order_id": order_id, "dealer_removed_at": pl.dealer_removed_at.isoformat()}
 
 
 @router.get("/dealer/postponed-items")
