@@ -1948,34 +1948,46 @@ async def list_dealer_postponed_items(
     """
     from app.modules.advisory.models import Practice as AdvPractice
     from app.modules.subscriptions.models import Subscription
+    from app.modules.clients.models import Client
+    from datetime import datetime, timezone
 
     await _assert_active_dealer(db, current_user.id)
 
     rows = (await db.execute(
-        select(OrderItem, Order, AdvPractice, User, Subscription)
+        select(OrderItem, Order, AdvPractice, User, Subscription, Client)
         .join(Order, Order.id == OrderItem.order_id)
         .join(AdvPractice, AdvPractice.id == OrderItem.practice_id, isouter=True)
         .join(User, User.id == Order.farmer_user_id)
         .join(Subscription, Subscription.id == Order.subscription_id)
+        .join(Client, Client.id == Order.client_id)
         .where(
             Order.dealer_user_id == current_user.id,
             OrderItem.status == OrderItemStatus.POSTPONED,
             OrderItem.archived_at.is_(None),
             Order.status.notin_([OrderStatus.CANCELLED, OrderStatus.EXPIRED]),
         )
-        .order_by(OrderItem.postponed_until.asc().nullslast(), Order.created_at.desc())
+        .order_by(Order.created_at.asc(), OrderItem.postponed_until.asc().nullslast())
     )).all()
 
+    now_utc = datetime.now(timezone.utc)
     out = []
-    for item, order, practice, farmer, sub in rows:
+    for item, order, practice, farmer, sub, client in rows:
+        # 2026-06-05 — filter out postpones whose window has expired.
+        # The auto-sweep flips them to NOT_AVAILABLE; in the brief
+        # window before that fires we shouldn't ask the dealer to
+        # decide on something the farmer already owns. User direction:
+        # "remove that item if the duration for which it was originally
+        # postponed for is over — it would have assumed the status of
+        # Returned and returned to the farmer without the dealer having
+        # to know about it."
+        if item.postponed_until and item.postponed_until <= now_utc:
+            continue
         l2 = practice.l2_type if practice else None
         display_name = (
             l2.replace("_", " ").title() if l2 else "Practice"
         )
         days_remaining = None
         if item.postponed_until:
-            from datetime import datetime, timezone
-            now_utc = datetime.now(timezone.utc)
             delta = item.postponed_until - now_utc
             days_remaining = max(0, delta.days)
         out.append({
@@ -1985,9 +1997,12 @@ async def list_dealer_postponed_items(
             "display_name": display_name,
             "farmer_name": farmer.name,
             "farmer_phone": farmer.phone,
+            "farmer_photo_url": farmer.photo_url,
+            "client_name": client.display_name or client.short_name,
             "category": order.category,
             "date_from": order.date_from.isoformat() if order.date_from else None,
             "date_to": order.date_to.isoformat() if order.date_to else None,
+            "order_received_at": order.created_at.isoformat() if order.created_at else None,
             "postponed_until": item.postponed_until.isoformat() if item.postponed_until else None,
             "days_remaining": days_remaining,
             "order_status": order.status.value if hasattr(order.status, "value") else order.status,
