@@ -635,9 +635,27 @@ async def list_subscription_orders(
         # Surfaced separately so the nudge modal can ask "you also have
         # N postponed items with this dealer — cancel them and bundle?"
         POSTPONED = {OrderItemStatus.POSTPONED}
-        awaiting_count = sum(1 for i in items if i.status in AWAITING)
+        sfa_items_for_o = [i for i in items if i.status in AWAITING]
+        awaiting_count = len(sfa_items_for_o)
         returned_count = sum(1 for i in items if i.status in RETURNED)
         postponed_count = sum(1 for i in items if i.status in POSTPONED)
+        # 2026-06-05 — Round queueing for the Manage tab card. The PWA
+        # already filters to "earliest awaiting order" globally; this
+        # surfaces "Approval 1 of 2" WITHIN one order when the dealer
+        # has submitted a postpone-resolve while the original batch
+        # is still being decided.
+        current_round_for_o = (
+            min((i.approval_round for i in sfa_items_for_o if i.approval_round is not None),
+                default=None)
+            if sfa_items_for_o else None
+        )
+        queued_rounds_for_o = sorted({
+            i.approval_round for i in sfa_items_for_o if i.approval_round is not None
+        })
+        awaiting_in_current_round = sum(
+            1 for i in sfa_items_for_o
+            if current_round_for_o is None or i.approval_round == current_round_for_o
+        )
         rcp = recipients.get(o.dealer_user_id) or recipients.get(o.facilitator_user_id)
         regular_out.append({
             "kind": "REGULAR",
@@ -650,7 +668,10 @@ async def list_subscription_orders(
             "created_at": o.created_at,
             "item_count": cd.count,
             "is_max_count": cd.is_max,
-            "awaiting_approval_count": awaiting_count,
+            "awaiting_approval_count": awaiting_in_current_round,
+            "awaiting_approval_total": awaiting_count,
+            "approval_round_current": current_round_for_o,
+            "approval_rounds_pending": len(queued_rounds_for_o),
             "returned_count": returned_count,
             "postponed_count": postponed_count,
             # 2026-06-03 — Lineage so the Manage tab can group sub-
@@ -805,13 +826,29 @@ async def get_farmer_order_detail(
             "postponed_until": i.postponed_until.isoformat() if i.postponed_until else None,
         }
 
-    approval_raw = [base_row(i) for i in items if i.status == OrderItemStatus.SENT_FOR_APPROVAL]
+    # 2026-06-05 — Round-based queueing within a single order. The
+    # dealer's bulk submit stamps approval_round=N on every item;
+    # later postpone-resolve auto-submits each get round N+1. The
+    # farmer's review shows only the EARLIEST-still-pending round —
+    # so a second batch (resolved postpone) doesn't appear mixed
+    # into the first batch's review screen.
+    sfa_items = [i for i in items if i.status == OrderItemStatus.SENT_FOR_APPROVAL]
+    current_round = (
+        min((i.approval_round for i in sfa_items if i.approval_round is not None), default=None)
+        if sfa_items else None
+    )
+    approval_raw = [
+        base_row(i) for i in sfa_items
+        if current_round is None or i.approval_round == current_round or i.approval_round is None
+    ]
     approved_raw = [base_row(i) for i in items if i.status == OrderItemStatus.APPROVED]
     postponed_raw = [base_row(i) for i in items if i.status == OrderItemStatus.POSTPONED]
     returned_raw = [
         base_row(i) for i in items
         if i.status in (OrderItemStatus.NOT_AVAILABLE, OrderItemStatus.REJECTED)
     ]
+    # Distinct queued rounds (those with at least one SFA item).
+    queued_rounds = sorted({i.approval_round for i in sfa_items if i.approval_round is not None})
 
     return {
         "id": order.id, "status": order.status,
@@ -831,6 +868,12 @@ async def get_farmer_order_detail(
         "approved_items": consolidate_purchased_items(approved_raw),
         "postponed_items": postponed_raw,
         "returned_items": returned_raw,
+        # 2026-06-05 — Round queueing context for the PWA banner.
+        # approval_round_current: which round the farmer is reviewing.
+        # approval_rounds_pending: how many rounds (including current)
+        # are still SFA, so the page can render "Approval 1 of 2".
+        "approval_round_current": current_round,
+        "approval_rounds_pending": len(queued_rounds),
         # Legacy flat list kept for any pre-2026-06-03 caller.
         "items": [
             {
@@ -2196,6 +2239,17 @@ async def mark_item_available(
     # transition table — that's by design for derived-status
     # re-computation.
     if prev_status == "POSTPONED" and order_row.status != OrderStatus.PROCESSING:
+        # 2026-06-05 — Stamp this resolution with the next approval
+        # round. The farmer's review filters to MIN(approval_round)
+        # among SENT_FOR_APPROVAL items so each batch queues cleanly.
+        existing_rounds = (await db.execute(
+            select(OrderItem.approval_round).where(
+                OrderItem.order_id == order_id,
+                OrderItem.approval_round.isnot(None),
+            )
+        )).scalars().all()
+        next_round = (max(existing_rounds) if existing_rounds else 0) + 1
+        item.approval_round = next_round
         item.status = OrderItemStatus.SENT_FOR_APPROVAL
         await _record_event(
             db, lineage_id=item.lineage_id,
@@ -2204,6 +2258,7 @@ async def mark_item_available(
             order_id=order_id, order_item_id=item.id,
             prev_status=OrderItemStatus.AVAILABLE.value,
             new_status=OrderItemStatus.SENT_FOR_APPROVAL.value,
+            metadata={"approval_round": next_round},
         )
         await _update_order_status(db, order_id)
 
@@ -2644,6 +2699,17 @@ async def submit_for_approval(
             },
         )
 
+    # 2026-06-05 — Round number for the queue. First bulk submit on
+    # an order gets round 1; subsequent postpone-resolves increment
+    # from the max existing round on the order.
+    existing_rounds = (await db.execute(
+        select(OrderItem.approval_round).where(
+            OrderItem.order_id == order_id,
+            OrderItem.approval_round.isnot(None),
+        )
+    )).scalars().all()
+    next_round = (max(existing_rounds) if existing_rounds else 0) + 1
+
     volumes = data.get("items", {})
     for item in available_items:
         item_data = volumes.get(item.id, {})
@@ -2655,6 +2721,7 @@ async def submit_for_approval(
         if not item.given_volume:
             raise HTTPException(status_code=422, detail=f"given_volume missing for item {item.id}")
         item.status = OrderItemStatus.SENT_FOR_APPROVAL
+        item.approval_round = next_round
 
     order.status = OrderStatus.SENT_FOR_APPROVAL
     await db.commit()
@@ -4064,23 +4131,34 @@ async def approve_all_items(
     refactor doesn't drift between the two approval paths.
     """
     await _get_farmer_order(db, order_id, current_user.id)
-    result = await db.execute(
+    sfa = (await db.execute(
         select(OrderItem).where(
             OrderItem.order_id == order_id,
             OrderItem.status == OrderItemStatus.SENT_FOR_APPROVAL,
         )
-    )
-    items = result.scalars().all()
-    if not items:
+    )).scalars().all()
+    if not sfa:
         raise HTTPException(status_code=400, detail="No items awaiting approval")
-    for item in items:
+
+    # 2026-06-05 — Approve only the CURRENT round so per-order queueing
+    # works. A later round (resolved postpone) waits behind. Items with
+    # NULL approval_round (legacy) collapse to the same bucket as the
+    # min-non-null round so the data backfilled by the migration
+    # behaves consistently.
+    rounds_present = sorted({i.approval_round for i in sfa if i.approval_round is not None})
+    current_round = rounds_present[0] if rounds_present else None
+    items_to_approve = [
+        i for i in sfa
+        if current_round is None or i.approval_round is None or i.approval_round == current_round
+    ]
+    for item in items_to_approve:
         res = validate_item_transition(item.status, OrderItemStatus.APPROVED.value, FARMER)
         if not res.allowed:
             _raise_transition(res)
         item.status = OrderItemStatus.APPROVED
     await _update_order_status(db, order_id)
     await db.commit()
-    return {"approved_count": len(items)}
+    return {"approved_count": len(items_to_approve)}
 
 
 # ── Dealer: Accept order ──────────────────────────────────────────────────────

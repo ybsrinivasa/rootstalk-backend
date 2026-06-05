@@ -120,6 +120,15 @@ class OrderItem(Base):
     scan_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[OrderItemStatus] = mapped_column(String(30), default=OrderItemStatus.PENDING)
     postponed_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 2026-06-05 — Approval round number, stamped each time an item
+    # is sent for farmer approval. The dealer's bulk Submit-for-
+    # Approval batch and any subsequent postpone-resolves each take
+    # the next round number (= max(approval_round) over all items on
+    # the order, + 1; starts at 1). Farmer's review page filters to
+    # MIN(approval_round) among SENT_FOR_APPROVAL items so rounds
+    # queue cleanly within the same order card: the original batch
+    # gets decided first, then the resolved postpone, etc.
+    approval_round: Mapped[int] = mapped_column(Integer, nullable=True)
     # Per-subscription versioning Phase 3.2: pointer to the locked snapshot in
     # force at order-create time. Nullable for backwards compatibility — orders
     # placed before Phase 3.2 have NULL and fall back to master at read time.
