@@ -4358,9 +4358,16 @@ async def _today_advisory_for_user(
         # the most recently-touched non-terminal item per practice;
         # REROUTED / REMOVED / archived rows are ignored — they're
         # off the active surface by design.
+        # 2026-06-06 — Outer-join PackingList so the fulfilment payload
+        # can surface farmer_received_at and the order's packing_code.
+        # The advisory then nudges the farmer to confirm pickup at the
+        # exact moment they're reading dosage instructions for that
+        # item (highest-intent moment for confirmation).
+        from app.modules.orders.models import PackingList
         active_items_q = await db.execute(
-            select(OrderItem, Order)
+            select(OrderItem, Order, PackingList)
             .join(Order, Order.id == OrderItem.order_id)
+            .outerjoin(PackingList, PackingList.order_id == Order.id)
             .where(
                 Order.subscription_id == sub.id,
                 Order.status.notin_(["CANCELLED", "EXPIRED"]),
@@ -4371,7 +4378,7 @@ async def _today_advisory_for_user(
         )
         # Take the first (most recent) row per practice_id.
         fulfilment_by_practice: dict[str, dict] = {}
-        for it, ord_row in active_items_q.all():
+        for it, ord_row, pl in active_items_q.all():
             if it.practice_id in fulfilment_by_practice:
                 continue
             status_str = it.status.value if hasattr(it.status, "value") else it.status
@@ -4397,6 +4404,14 @@ async def _today_advisory_for_user(
                 "price": float(it.price) if (show_money and it.price) else None,
                 "postponed_until": it.postponed_until.isoformat() if it.postponed_until else None,
                 "postpone_days_remaining": days_remaining,
+                # 2026-06-06 — Packing receipt state. The PWA reads
+                # farmer_received_at to decide whether to show the
+                # "📦 Tap to confirm pickup" hint on this practice row.
+                "packing_code": pl.packing_code if pl else None,
+                "farmer_received_at": (
+                    pl.farmer_received_at.isoformat()
+                    if pl and pl.farmer_received_at else None
+                ),
             }
 
         active_tl_ids = {tl.id for tl, _, _ in active_timelines}

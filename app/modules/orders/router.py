@@ -1863,15 +1863,22 @@ async def list_purchased_items(
         TimelineMetadata, cca_calendar_dates,
     )
 
+    # 2026-06-06 — Received tab now means "items in hand" — only
+    # surfaces items the farmer has confirmed receipt of. Approved-
+    # but-not-yet-confirmed items live in a "Ready to pick up" strip
+    # on the same tab (driven by pickup_ready_count on the
+    # subscriptions/orders endpoint).
     q = (
         select(OrderItem, Order, Timeline, AdvPractice, Subscription)
         .join(Order, Order.id == OrderItem.order_id)
         .join(Timeline, Timeline.id == OrderItem.timeline_id)
         .join(AdvPractice, AdvPractice.id == OrderItem.practice_id)
         .join(Subscription, Subscription.id == Order.subscription_id)
+        .join(PackingList, PackingList.order_id == Order.id)
         .where(
             Order.farmer_user_id == current_user.id,
             OrderItem.status == OrderItemStatus.APPROVED,
+            PackingList.farmer_received_at.isnot(None),
         )
         .order_by(Order.date_from.desc())
     )
