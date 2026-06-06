@@ -81,73 +81,29 @@ async def test_public_page_lookup_succeeds_at_reference(db):
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_public_payload_omits_privacy_leaking_fields(db):
-    """The most consequential audit fix. Pre-fix the route exposed
-    farmer_district, farmer_state, package_name, subscription_date,
-    status, and company_display_name alongside company_name on this
-    unauthenticated URL. Now strictly limited to the six spec-
-    permitted keys."""
+async def test_public_payload_returns_expanded_record(db):
+    """2026-06-06 — User direction widened the public page spec to
+    include farmer phone + location, crop name, closure date, package
+    name + id, and the package's parameters-options fingerprint. The
+    earlier BL-16 trim is superseded; the farmer themselves prints the
+    QR, so their location + phone are intentionally shared."""
     _, sub, _, _ = await _seed_active_sub_with_reference(db)
     out = await get_crop_public_page(
         reference_number=sub.reference_number, db=db,
     )
-    assert set(out.keys()) == {
-        "reference_number", "farmer_name", "crop", "company",
-        "start_date", "parameter_variable_summary",
-    }
-    # Spot-check the location leak is closed.
-    assert "farmer_district" not in out
-    assert "farmer_state" not in out
-
-
-@requires_docker
-@pytest.mark.asyncio
-async def test_public_payload_uses_company_display_name_and_iso_start_date(db):
-    """The helper prefers display_name over full_name and renders
-    start_date as ISO date (no time component). Pin both via the
-    seeded data."""
-    _, sub, _, _ = await _seed_active_sub_with_reference(db)
-    out = await get_crop_public_page(
-        reference_number=sub.reference_number, db=db,
-    )
+    assert out["reference_number"] == sub.reference_number
     assert out["farmer_name"] == "Ramu Krishnaswamy"
+    # Location keys are present (may be None when farmer didn't set
+    # district/state — pinned here that the keys exist on the shape).
+    assert "farmer_phone" in out
+    assert "farmer_district" in out
+    assert "farmer_state" in out
     assert out["company"] == "Padmashali Seeds"
-    assert out["start_date"] == "2026-05-01"
-
-
-# ── Public-page route: parameter_variable_summary lookup ─────────────────────
-
-@requires_docker
-@pytest.mark.asyncio
-async def test_public_payload_includes_parameter_variable_summary_when_present(db):
-    """When a FarmerSubscriptionHistory row exists with the summary
-    populated, the public page exposes it. Pre-audit the route never
-    queried the history table at all."""
-    _, sub, _, _ = await _seed_active_sub_with_reference(db)
-    db.add(FarmerSubscriptionHistory(
-        subscription_id=sub.id,
-        parameter_variable_summary="Loam soil, NPK every 21 days",
-    ))
-    await db.commit()
-
-    out = await get_crop_public_page(
-        reference_number=sub.reference_number, db=db,
-    )
-    assert out["parameter_variable_summary"] == "Loam soil, NPK every 21 days"
-
-
-@requires_docker
-@pytest.mark.asyncio
-async def test_public_payload_returns_null_summary_when_no_history(db):
-    """No FarmerSubscriptionHistory row → summary is null. Reflects
-    today's reality (the writer for this column isn't wired yet —
-    deferred follow-up). Pinned so the field stays forward-
-    compatible when the writer lands."""
-    _, sub, _, _ = await _seed_active_sub_with_reference(db)
-    out = await get_crop_public_page(
-        reference_number=sub.reference_number, db=db,
-    )
-    assert out["parameter_variable_summary"] is None
+    assert out["package_name"] == "Tomato Pack 2026"
+    assert out["package_id"] == sub.package_id
+    assert out["crop_start_date"] == "2026-05-01"
+    assert "crop_closure_date" in out  # may be None if no duration_days
+    assert isinstance(out["parameters_options"], list)
 
 
 @requires_docker

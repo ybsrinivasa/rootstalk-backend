@@ -703,6 +703,18 @@ async def get_crop_public_page(
     (column exists but is currently never written by the backend —
     deferred follow-up; field will be null until that writer lands).
     """
+    # 2026-06-06 — Spec widened by user direction. Public page now
+    # shows: farmer name + phone, district + state, crop name (resolved
+    # from cosh), company, start date, closure date (start +
+    # package.duration_days), package name + id, and the package's
+    # parameters-options fingerprint (one row per Parameter with the
+    # selected Variable for this package). Earlier BL-16 trim is
+    # superseded — user explicitly wants this info on the
+    # unauthenticated record they themselves print on the QR.
+    from app.modules.advisory.models import Package, Parameter, Variable, PackageVariable
+    from app.modules.sync.models import CoshCoreItem
+    from datetime import timedelta
+
     sub = (await db.execute(
         select(Subscription).where(Subscription.reference_number == reference_number)
     )).scalar_one_or_none()
@@ -711,25 +723,74 @@ async def get_crop_public_page(
 
     farmer = (await db.execute(select(User).where(User.id == sub.farmer_user_id))).scalar_one_or_none()
     client = (await db.execute(select(Client).where(Client.id == sub.client_id))).scalar_one_or_none()
-
-    from app.modules.advisory.models import Package
     package = (await db.execute(select(Package).where(Package.id == sub.package_id))).scalar_one_or_none()
 
-    history = (await db.execute(
-        select(FarmerSubscriptionHistory).where(
-            FarmerSubscriptionHistory.subscription_id == sub.id,
-        )
-    )).scalar_one_or_none()
+    # Resolve cosh-id names (crop, district, state) via translations.
+    cosh_ids = [
+        x for x in (
+            package.crop_cosh_id if package else None,
+            farmer.district_cosh_id if farmer else None,
+            farmer.state_cosh_id if farmer else None,
+        ) if x
+    ]
+    cosh_name_by_id: dict[str, str | None] = {}
+    if cosh_ids:
+        rows = (await db.execute(
+            select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
+            .where(CoshCoreItem.cosh_id.in_(cosh_ids))
+        )).all()
+        for cid, tr in rows:
+            cosh_name_by_id[cid] = (tr or {}).get("en") if isinstance(tr, dict) else None
 
-    return public_record_payload(
-        reference_number=sub.reference_number,
-        farmer_name=farmer.name if farmer else None,
-        crop_cosh_id=package.crop_cosh_id if package else None,
-        company_display_name=client.display_name if client else None,
-        company_full_name=client.full_name if client else None,
-        crop_start_date=sub.crop_start_date,
-        parameter_variable_summary=history.parameter_variable_summary if history else None,
+    # Package fingerprint: one row per Parameter with the selected
+    # Variable for this Package. Surfaces what the package is
+    # configured for (e.g. Soil Type: Black, Irrigation: Drip).
+    parameters_options: list[dict] = []
+    if package:
+        pv_rows = (await db.execute(
+            select(Parameter.name, Variable.name, Parameter.display_order)
+            .join(PackageVariable, PackageVariable.parameter_id == Parameter.id)
+            .join(Variable, Variable.id == PackageVariable.variable_id)
+            .where(PackageVariable.package_id == package.id)
+            .order_by(Parameter.display_order, Parameter.name)
+        )).all()
+        for p_name, v_name, _ord in pv_rows:
+            parameters_options.append({
+                "parameter_name": p_name,
+                "option_name": v_name,
+            })
+
+    # Closure date — start + duration. Both nullable; if either is
+    # absent the page shows "—". Subscription.crop_start_date can be
+    # null when the farmer hasn't set it yet.
+    closure_date = None
+    if sub.crop_start_date and package and package.duration_days:
+        start_d = sub.crop_start_date.date() if hasattr(sub.crop_start_date, "date") else sub.crop_start_date
+        closure_date = (start_d + timedelta(days=package.duration_days)).isoformat()
+
+    crop_name = (
+        cosh_name_by_id.get(package.crop_cosh_id)
+        if package and package.crop_cosh_id else None
     )
+
+    return {
+        "reference_number": sub.reference_number,
+        "farmer_name": farmer.name if farmer else None,
+        "farmer_phone": farmer.phone if farmer else None,
+        "farmer_district": cosh_name_by_id.get(farmer.district_cosh_id) if farmer and farmer.district_cosh_id else None,
+        "farmer_state": cosh_name_by_id.get(farmer.state_cosh_id) if farmer and farmer.state_cosh_id else None,
+        "crop_name": crop_name,
+        "company": client.display_name or client.full_name if client else None,
+        "package_id": sub.package_id,
+        "package_name": package.name if package else None,
+        "crop_start_date": (
+            sub.crop_start_date.date().isoformat()
+            if sub.crop_start_date and hasattr(sub.crop_start_date, "date")
+            else (sub.crop_start_date.isoformat() if sub.crop_start_date else None)
+        ),
+        "crop_closure_date": closure_date,
+        "parameters_options": parameters_options,
+    }
 
 
 @router.get("/public/crop/{reference_number}", include_in_schema=False)
