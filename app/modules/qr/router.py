@@ -56,12 +56,19 @@ router = APIRouter(tags=["QR Codes"])
 
 
 def _public_base_url() -> str:
-    """Env-aware public base URL. Mirrors the `_base_url()` pattern
-    in `clients/router.py`. Spec calls for `rootstalk.in` in prod;
-    dev returns the local PWA host so QR codes printed in dev
-    decode to a working URL on the developer's machine."""
+    """Env-aware public base URL for QR-encoded crop-record links.
+    Mirrors the `_base_url()` pattern in `clients/router.py`.
+
+    Resolution order:
+    1. Dev → `http://localhost:3003` (PWA dev port; project_rootstalk_ports.md).
+    2. `PWA_BASE_URL` env var — testing MUST set this to
+       `https://rstalk-pwa.eywa.farm` so scanned QRs don't land on prod.
+    3. Production fallback `https://rootstalk.in`.
+    """
     if settings.environment == "development":
-        return "http://localhost:3000"
+        return "http://localhost:3003"
+    if settings.pwa_base_url:
+        return settings.pwa_base_url.rstrip("/")
     return "https://rootstalk.in"
 
 

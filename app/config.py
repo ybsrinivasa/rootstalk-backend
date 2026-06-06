@@ -90,6 +90,15 @@ class Settings(BaseSettings):
     # unset, and `_base_url()` falls back to the production value.
     frontend_base_url: str = ""
 
+    # PWA base URL — used to compose the QR-encoded crop-record URL
+    # (`{base}/crop-record/{reference_number}`) printed on share +
+    # save buttons in the History page. Defaults to the production
+    # host `https://rootstalk.in`; testing MUST set this to
+    # `https://rstalk-pwa.eywa.farm` so QR scans don't land on prod.
+    # Dev falls back to `http://localhost:3003` (the PWA dev port —
+    # see project_rootstalk_ports.md).
+    pwa_base_url: str = ""
+
     # SA portal base URL — used by the Neytiri (SA / CM / RM)
     # welcome email. Production tops both portals on the same host
     # (`rootstalk.eywa.farm` serves SA at `/` and CA at `/{short_name}`),
