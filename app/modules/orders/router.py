@@ -4554,6 +4554,126 @@ async def accept_order(
     return {"order_id": order_id, "status": order.status}
 
 
+@router.put("/dealer/orders/{order_id}/decline")
+async def dealer_decline_order(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Dealer rejects a fresh SENT order without ever processing it.
+
+    Mirrors the farmer-side cancel-with-migrate flow: the husk goes
+    CANCELLED with a DECLINED_BY_DEALER event; items duplicate into a
+    new DRAFT (status PENDING, no recipient) carrying the source's
+    lineage_root_id so the farmer's Manage tab groups them under the
+    same procurement intent. The farmer then picks a new dealer or
+    facilitator on the new DRAFT.
+    """
+    await _assert_active_dealer(db, current_user.id)
+    order = (await db.execute(
+        select(Order).where(Order.id == order_id, Order.dealer_user_id == current_user.id)
+    )).scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    res = validate_order_transition(order.status, OrderStatus.CANCELLED.value, DEALER)
+    if not res.allowed:
+        _raise_transition(res)
+
+    items = (await db.execute(
+        select(OrderItem).where(
+            OrderItem.order_id == order.id,
+            OrderItem.archived_at.is_(None),
+        )
+    )).scalars().all()
+
+    new_lineage_root = order.lineage_root_id or order.id
+    new_draft = Order(
+        subscription_id=order.subscription_id,
+        farmer_user_id=order.farmer_user_id,
+        client_id=order.client_id,
+        category=order.category,
+        date_from=order.date_from,
+        date_to=order.date_to,
+        status=OrderStatus.DRAFT,
+        dealer_user_id=None,
+        facilitator_user_id=None,
+        locked_timelines=order.locked_timelines,
+        expires_at=order.expires_at,
+        lineage_root_id=new_lineage_root,
+    )
+    db.add(new_draft)
+    await db.flush()
+    if order.lineage_root_id is None:
+        order.lineage_root_id = order.id
+
+    migrated = 0
+    for it in items:
+        if it.status in {
+            OrderItemStatus.APPROVED, OrderItemStatus.REJECTED,
+            OrderItemStatus.REROUTED, OrderItemStatus.SKIPPED,
+            OrderItemStatus.REMOVED, OrderItemStatus.NOT_NEEDED,
+        }:
+            continue
+        prev_item_status = it.status.value if hasattr(it.status, "value") else it.status
+        new_item = OrderItem(
+            order_id=new_draft.id,
+            practice_id=it.practice_id,
+            timeline_id=it.timeline_id,
+            brand_cosh_id=None, brand_name=None,
+            given_volume=None, volume_unit=it.volume_unit, price=None,
+            estimated_volume=it.estimated_volume,
+            relation_id=it.relation_id, relation_type=it.relation_type,
+            relation_role=it.relation_role,
+            scan_verified=False,
+            status=OrderItemStatus.PENDING,
+            snapshot_id=it.snapshot_id,
+            lineage_id=it.lineage_id,
+        )
+        db.add(new_item)
+        await db.flush()
+        await _record_event(
+            db, lineage_id=it.lineage_id,
+            event_type="REROUTED_FROM",
+            actor_user_id=current_user.id, actor_role="DEALER",
+            order_id=order.id, order_item_id=it.id,
+            prev_status=prev_item_status,
+            new_status=OrderItemStatus.REROUTED.value,
+            metadata={"to_order_id": new_draft.id, "to_order_item_id": new_item.id,
+                      "reason": "dealer_declined"},
+        )
+        await _record_event(
+            db, lineage_id=it.lineage_id,
+            event_type="REROUTED_TO",
+            actor_user_id=current_user.id, actor_role="DEALER",
+            order_id=new_draft.id, order_item_id=new_item.id,
+            prev_status=OrderItemStatus.REROUTED.value,
+            new_status=OrderItemStatus.PENDING.value,
+            metadata={"from_order_id": order.id, "from_order_item_id": it.id,
+                      "reason": "dealer_declined"},
+        )
+        it.status = OrderItemStatus.REROUTED
+        migrated += 1
+
+    order.status = OrderStatus.CANCELLED
+    await _record_event(
+        db, lineage_id=order.id,
+        event_type="DECLINED_BY_DEALER",
+        actor_user_id=current_user.id, actor_role="DEALER",
+        order_id=order.id,
+        prev_status=OrderStatus.SENT.value,
+        new_status=OrderStatus.CANCELLED.value,
+        metadata={"new_draft_order_id": new_draft.id,
+                  "migrated_item_count": migrated},
+    )
+    await db.commit()
+    return {
+        "status": order.status,
+        "new_draft_order_id": new_draft.id,
+        "migrated_item_count": migrated,
+    }
+
+
 # ── Dealer: Packing list structured content ────────────────────────────────────
 
 @router.get("/dealer/orders/{order_id}/packing-list")

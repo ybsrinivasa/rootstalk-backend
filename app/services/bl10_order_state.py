@@ -46,7 +46,10 @@ _ORDER_TRANSITIONS: dict[tuple[str, str], frozenset[str]] = {
 
     ("SENT", "PROCESSING"):               frozenset({DEALER, FACILITATOR}),
     ("SENT", "ACCEPTED"):                 frozenset({DEALER}),
-    ("SENT", "CANCELLED"):                frozenset({FARMER}),
+    # 2026-06-06 — DEALER also takes the SENT → CANCELLED edge via
+    # the new Decline-order flow. Items migrate to a fresh DRAFT for
+    # the farmer to re-route, same mechanic as farmer-side cancel.
+    ("SENT", "CANCELLED"):                frozenset({FARMER, DEALER}),
     ("SENT", "EXPIRED"):                  frozenset({SYSTEM}),
 
     ("ACCEPTED", "PROCESSING"):           frozenset({DEALER, FACILITATOR}),
