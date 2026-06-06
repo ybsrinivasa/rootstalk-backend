@@ -1872,9 +1872,6 @@ async def list_purchased_items(
     q = (
         select(
             OrderItem, Order, Timeline, AdvPractice, Subscription,
-            User.name.label("dealer_name"),
-            User.phone.label("dealer_phone"),
-            DealerProfile.shop_name.label("dealer_shop_name"),
             PackingList.farmer_received_at.label("received_at"),
         )
         .join(Order, Order.id == OrderItem.order_id)
@@ -1882,8 +1879,6 @@ async def list_purchased_items(
         .join(AdvPractice, AdvPractice.id == OrderItem.practice_id)
         .join(Subscription, Subscription.id == Order.subscription_id)
         .join(PackingList, PackingList.order_id == Order.id)
-        .outerjoin(User, User.id == Order.dealer_user_id)
-        .outerjoin(DealerProfile, DealerProfile.user_id == Order.dealer_user_id)
         .where(
             Order.farmer_user_id == current_user.id,
             OrderItem.status == OrderItemStatus.APPROVED,
@@ -1894,6 +1889,33 @@ async def list_purchased_items(
     if subscription_id:
         q = q.where(Order.subscription_id == subscription_id)
     rows = (await db.execute(q)).all()
+
+    # 2026-06-06 — Recipient resolution. An order is sent to EITHER a
+    # dealer OR a facilitator (mutually exclusive — see send_order
+    # ~line 1632). Resolve both in a single batched lookup so the
+    # PWA's Received card can render shop/name + phone regardless of
+    # which role handled the order.
+    recipient_ids: set[str] = set()
+    for r in rows:
+        order = r[1]
+        rid = order.dealer_user_id or order.facilitator_user_id
+        if rid:
+            recipient_ids.add(rid)
+    user_by_id: dict[str, tuple[str | None, str | None]] = {}
+    shop_by_dealer_id: dict[str, str | None] = {}
+    if recipient_ids:
+        urows = (await db.execute(
+            select(User.id, User.name, User.phone)
+            .where(User.id.in_(recipient_ids))
+        )).all()
+        for uid, uname, uphone in urows:
+            user_by_id[uid] = (uname, uphone)
+        srows = (await db.execute(
+            select(DealerProfile.user_id, DealerProfile.shop_name)
+            .where(DealerProfile.user_id.in_(recipient_ids))
+        )).all()
+        for did, sname in srows:
+            shop_by_dealer_id[did] = sname
 
     # Manufacturer lookup batched across all rows.
     brand_ids = {r[0].brand_cosh_id for r in rows if r[0].brand_cosh_id}
@@ -1910,7 +1932,24 @@ async def list_purchased_items(
                 manufacturer_by_brand[tn_id] = mfr
 
     out: list[dict] = []
-    for item, order, tl, practice, sub, dealer_name, dealer_phone, dealer_shop_name, received_at in rows:
+    for item, order, tl, practice, sub, received_at in rows:
+        # Recipient: dealer wins when set; facilitator otherwise.
+        # shop_name only applies to dealers (DealerProfile).
+        recipient_role: str | None = None
+        recipient_name: str | None = None
+        recipient_phone: str | None = None
+        recipient_shop_name: str | None = None
+        if order.dealer_user_id:
+            recipient_role = "DEALER"
+            uname, uphone = user_by_id.get(order.dealer_user_id, (None, None))
+            recipient_name = uname
+            recipient_phone = uphone
+            recipient_shop_name = shop_by_dealer_id.get(order.dealer_user_id)
+        elif order.facilitator_user_id:
+            recipient_role = "FACILITATOR"
+            uname, uphone = user_by_id.get(order.facilitator_user_id, (None, None))
+            recipient_name = uname
+            recipient_phone = uphone
         # BL-17 audit (2026-05-06): replaced inline DAS/DBS date
         # arithmetic with the canonical helper. Pre-audit this branch
         # duplicated cca_calendar_dates' logic — drift risk if BL-17
@@ -1956,11 +1995,15 @@ async def list_purchased_items(
             "application_date_to": date_to_iso,
             "frequency_days": int(practice.frequency_days) if practice.frequency_days else None,
             # 2026-06-06 — Recipient context per item so every Received
-            # card matches the seed-order card shape (dealer name +
-            # shop + phone).
-            "dealer_name": dealer_name,
-            "dealer_phone": dealer_phone,
-            "dealer_shop_name": dealer_shop_name,
+            # card matches the seed-order card shape. Role-aware:
+            # dealer wins when set, facilitator fills in otherwise
+            # (Order.dealer_user_id and facilitator_user_id are
+            # mutually exclusive — see send_order). shop_name only
+            # applies to dealers.
+            "recipient_role": recipient_role,
+            "recipient_name": recipient_name,
+            "recipient_phone": recipient_phone,
+            "recipient_shop_name": recipient_shop_name,
             "received_at": received_at.isoformat() if received_at else None,
         })
     # 2026-06-03 — Brand consolidation across timelines. A practice
