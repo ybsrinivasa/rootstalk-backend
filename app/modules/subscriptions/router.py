@@ -4381,7 +4381,7 @@ async def _today_advisory_for_user(
         # The advisory then nudges the farmer to confirm pickup at the
         # exact moment they're reading dosage instructions for that
         # item (highest-intent moment for confirmation).
-        from app.modules.orders.models import PackingList
+        from app.modules.orders.models import PackingList, BrandLookupCache
         active_items_q = await db.execute(
             select(OrderItem, Order, PackingList)
             .join(Order, Order.id == OrderItem.order_id)
@@ -4394,9 +4394,32 @@ async def _today_advisory_for_user(
             )
             .order_by(OrderItem.updated_at.desc())
         )
+        active_items_rows = active_items_q.all()
+        # 2026-06-06 — Manufacturer lookup batched for the advisory
+        # render so APPROVED practice cards can display "Brand · by
+        # Manufacturer" without per-practice round-trips. Source =
+        # BrandLookupCache.trade_name_cosh_id → manufacturer_name
+        # (same path the order review + Packing card already use).
+        approved_brand_ids = {
+            it.brand_cosh_id for it, _, _ in active_items_rows
+            if it.brand_cosh_id and (
+                it.status.value if hasattr(it.status, "value") else it.status
+            ) == "APPROVED"
+        }
+        manufacturer_by_brand: dict[str, str | None] = {}
+        if approved_brand_ids:
+            mfr_rows = (await db.execute(
+                select(
+                    BrandLookupCache.trade_name_cosh_id,
+                    BrandLookupCache.manufacturer_name,
+                ).where(BrandLookupCache.trade_name_cosh_id.in_(approved_brand_ids))
+            )).all()
+            for tn_id, mfr in mfr_rows:
+                if tn_id not in manufacturer_by_brand and mfr:
+                    manufacturer_by_brand[tn_id] = mfr
         # Take the first (most recent) row per practice_id.
         fulfilment_by_practice: dict[str, dict] = {}
-        for it, ord_row, pl in active_items_q.all():
+        for it, ord_row, pl in active_items_rows:
             if it.practice_id in fulfilment_by_practice:
                 continue
             status_str = it.status.value if hasattr(it.status, "value") else it.status
@@ -4417,6 +4440,10 @@ async def _today_advisory_for_user(
                 "dealer_user_id": ord_row.dealer_user_id,
                 "facilitator_user_id": ord_row.facilitator_user_id,
                 "brand_name": it.brand_name if show_money else None,
+                "manufacturer_name": (
+                    manufacturer_by_brand.get(it.brand_cosh_id)
+                    if (show_money and it.brand_cosh_id) else None
+                ),
                 "given_volume": float(it.given_volume) if (show_money and it.given_volume) else None,
                 "volume_unit": it.volume_unit if show_money else None,
                 "price": float(it.price) if (show_money and it.price) else None,
