@@ -1995,6 +1995,30 @@ async def list_dealer_orders(
         for pl in pl_rows:
             pl_by_order[pl.order_id] = pl
 
+    # 2026-06-06 — Lazy-create the PackingList row (with a fresh
+    # packing_code) for any order that has APPROVED items but no row
+    # yet. Ensures the dealer SEES the Packing ID on the card from the
+    # moment the items land in Packing — not only after their first
+    # Share tap. Done in this GET to avoid bolting onto every approve
+    # endpoint; if perf becomes a concern later, move this trigger to
+    # the approve path instead.
+    created_any = False
+    for o, _u, _c in rows:
+        items = items_by_order.get(o.id, [])
+        has_approved = any(i.status == OrderItemStatus.APPROVED for i in items)
+        if has_approved and o.id not in pl_by_order:
+            pl = PackingList(
+                order_id=o.id,
+                pdf_url=None,
+                packing_code=await _generate_packing_code(db),
+            )
+            db.add(pl)
+            await db.flush()
+            pl_by_order[o.id] = pl
+            created_any = True
+    if created_any:
+        await db.commit()
+
     # Manufacturer lookup for all approved brand_cosh_ids.
     approved_brand_ids = {
         i.brand_cosh_id
