@@ -1973,6 +1973,19 @@ async def list_dealer_orders(
         for it in item_rows:
             items_by_order.setdefault(it.order_id, []).append(it)
 
+    # 2026-06-06 — Facilitator details for the Packing card so the
+    # delivery person can call BOTH parties.
+    facilitator_ids = sorted({
+        o.facilitator_user_id for o, _u, _c in rows if o.facilitator_user_id
+    })
+    facilitator_by_id: dict[str, dict] = {}
+    if facilitator_ids:
+        f_rows = (await db.execute(
+            select(User).where(User.id.in_(facilitator_ids))
+        )).scalars().all()
+        for f in f_rows:
+            facilitator_by_id[f.id] = {"name": f.name, "phone": f.phone}
+
     # Packing list rows for the same orders.
     pl_by_order: dict[str, PackingList] = {}
     if order_ids:
@@ -2033,13 +2046,21 @@ async def list_dealer_orders(
                     "volume_unit": i.volume_unit,
                     "price": float(i.price) if i.price else None,
                 })
+        facilitator = (
+            facilitator_by_id.get(o.facilitator_user_id)
+            if o.facilitator_user_id else None
+        )
         out.append({
             "id": o.id, "status": o.status,
             "farmer_user_id": o.farmer_user_id,
             "farmer_name": u.name,
             "farmer_phone": u.phone,
             "farmer_photo_url": u.photo_url,
+            "farmer_gps_lat": float(u.gps_lat) if u.gps_lat is not None else None,
+            "farmer_gps_lng": float(u.gps_lng) if u.gps_lng is not None else None,
             "facilitator_user_id": o.facilitator_user_id,
+            "facilitator_name": facilitator.get("name") if facilitator else None,
+            "facilitator_phone": facilitator.get("phone") if facilitator else None,
             "client_id": o.client_id,
             "client_name": c.display_name or c.short_name,
             "category": o.category,
@@ -2047,6 +2068,7 @@ async def list_dealer_orders(
             "created_at": o.created_at,
             "item_status_counts": counts,
             "packing_items": packing_items,
+            "packing_code": pl.packing_code if pl else None,
             "packing_list_shared_at": (
                 pl.first_shared_at.isoformat() if pl and pl.first_shared_at else None
             ),
@@ -2078,17 +2100,7 @@ async def remove_packing_list_from_dealer_view(
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    # Lazy-create the packing list row if it doesn't exist yet (the
-    # dealer may remove an order from Packing without ever having
-    # called generate first — e.g. when they just hand items over in
-    # person and don't need a list).
-    pl = (await db.execute(
-        select(PackingList).where(PackingList.order_id == order_id)
-    )).scalar_one_or_none()
-    if pl is None:
-        pl = PackingList(order_id=order_id, pdf_url=None)
-        db.add(pl)
-        await db.flush()
+    pl = await _ensure_packing_list(db, order_id)
     pl.dealer_removed_at = datetime.now(timezone.utc)
     await db.commit()
     return {"order_id": order_id, "dealer_removed_at": pl.dealer_removed_at.isoformat()}
@@ -2963,20 +2975,77 @@ async def generate_packing_list(
     return {"packing_list_id": existing.id, "pdf_url": existing.pdf_url}
 
 
+_PACKING_CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
+
+
+async def _generate_packing_code(db: AsyncSession) -> str:
+    """Generate a 6-char paper-friendly packing code with collision
+    retry. The alphabet excludes 0/O/1/I/L so the code reads cleanly
+    when written on paper or read aloud over the phone."""
+    import secrets
+    for _ in range(8):
+        code = ''.join(secrets.choice(_PACKING_CODE_ALPHABET) for _ in range(6))
+        exists = (await db.execute(
+            select(PackingList.id).where(PackingList.packing_code == code)
+        )).scalar_one_or_none()
+        if exists is None:
+            return code
+    raise HTTPException(
+        status_code=500,
+        detail="Could not generate a unique packing code; retry",
+    )
+
+
+async def _ensure_packing_list(db: AsyncSession, order_id: str) -> PackingList:
+    """Lazy-get-or-create a PackingList for an order, ensuring it has
+    a packing_code. Shared helper for mark-shared / remove / share
+    endpoints — any of them can be the first to materialise the row.
+    """
+    pl = (await db.execute(
+        select(PackingList).where(PackingList.order_id == order_id)
+    )).scalar_one_or_none()
+    if pl is None:
+        pl = PackingList(
+            order_id=order_id,
+            pdf_url=None,
+            packing_code=await _generate_packing_code(db),
+        )
+        db.add(pl)
+        await db.flush()
+    elif pl.packing_code is None:
+        pl.packing_code = await _generate_packing_code(db)
+    return pl
+
+
 @router.put("/dealer/orders/{order_id}/packing-list/mark-shared")
 async def mark_packing_list_shared(
     order_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Dealer's "I've shared this list" signal — sets first_shared_at
+    on first call (no-op on re-shares; the PWA shows a confirm warning
+    before re-trigger). Lazy-creates the PackingList row if needed so
+    a fresh order can be shared without a prior `generate` call.
+    Surfaces the canonical packing_code so the dealer's UI can render
+    it on the first share.
+    """
     await _assert_active_dealer(db, current_user.id)
-    pl = (await db.execute(select(PackingList).where(PackingList.order_id == order_id))).scalar_one_or_none()
-    if not pl:
-        raise HTTPException(status_code=404, detail="Packing list not found")
+    # Make sure the dealer owns this order.
+    order = (await db.execute(
+        select(Order).where(Order.id == order_id, Order.dealer_user_id == current_user.id)
+    )).scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    pl = await _ensure_packing_list(db, order_id)
     if not pl.first_shared_at:
         pl.first_shared_at = datetime.now(timezone.utc)
     await db.commit()
-    return {"detail": "Marked as shared", "first_shared_at": pl.first_shared_at}
+    return {
+        "detail": "Marked as shared",
+        "first_shared_at": pl.first_shared_at,
+        "packing_code": pl.packing_code,
+    }
 
 
 # ── Facilitator: Route and handle orders ──────────────────────────────────────

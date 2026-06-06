@@ -239,6 +239,11 @@ class PackingList(Base):
     # Doesn't delete history; just hides the order from Packing and
     # qualifies the order for the Completed pill.
     dealer_removed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 2026-06-06 — Paper-friendly cross-surface identifier. Six chars
+    # from ABCDEFGHJKMNPQRSTUVWXYZ23456789 (no 0/O/1/I/L). Generated
+    # on first creation of the PackingList row; visible to dealer +
+    # farmer + facilitator so all three can refer to the same batch.
+    packing_code: Mapped[str] = mapped_column(String(12), nullable=True, unique=True)
 
 
 class DealerProfile(Base):
