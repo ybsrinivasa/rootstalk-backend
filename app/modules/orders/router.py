@@ -1868,13 +1868,22 @@ async def list_purchased_items(
     # but-not-yet-confirmed items live in a "Ready to pick up" strip
     # on the same tab (driven by pickup_ready_count on the
     # subscriptions/orders endpoint).
+    from app.modules.orders.models import BrandLookupCache
     q = (
-        select(OrderItem, Order, Timeline, AdvPractice, Subscription)
+        select(
+            OrderItem, Order, Timeline, AdvPractice, Subscription,
+            User.name.label("dealer_name"),
+            User.phone.label("dealer_phone"),
+            DealerProfile.shop_name.label("dealer_shop_name"),
+            PackingList.farmer_received_at.label("received_at"),
+        )
         .join(Order, Order.id == OrderItem.order_id)
         .join(Timeline, Timeline.id == OrderItem.timeline_id)
         .join(AdvPractice, AdvPractice.id == OrderItem.practice_id)
         .join(Subscription, Subscription.id == Order.subscription_id)
         .join(PackingList, PackingList.order_id == Order.id)
+        .outerjoin(User, User.id == Order.dealer_user_id)
+        .outerjoin(DealerProfile, DealerProfile.user_id == Order.dealer_user_id)
         .where(
             Order.farmer_user_id == current_user.id,
             OrderItem.status == OrderItemStatus.APPROVED,
@@ -1886,8 +1895,22 @@ async def list_purchased_items(
         q = q.where(Order.subscription_id == subscription_id)
     rows = (await db.execute(q)).all()
 
+    # Manufacturer lookup batched across all rows.
+    brand_ids = {r[0].brand_cosh_id for r in rows if r[0].brand_cosh_id}
+    manufacturer_by_brand: dict[str, str | None] = {}
+    if brand_ids:
+        mfr_rows = (await db.execute(
+            select(
+                BrandLookupCache.trade_name_cosh_id,
+                BrandLookupCache.manufacturer_name,
+            ).where(BrandLookupCache.trade_name_cosh_id.in_(brand_ids))
+        )).all()
+        for tn_id, mfr in mfr_rows:
+            if tn_id not in manufacturer_by_brand and mfr:
+                manufacturer_by_brand[tn_id] = mfr
+
     out: list[dict] = []
-    for item, order, tl, practice, sub in rows:
+    for item, order, tl, practice, sub, dealer_name, dealer_phone, dealer_shop_name, received_at in rows:
         # BL-17 audit (2026-05-06): replaced inline DAS/DBS date
         # arithmetic with the canonical helper. Pre-audit this branch
         # duplicated cca_calendar_dates' logic — drift risk if BL-17
@@ -1916,6 +1939,7 @@ async def list_purchased_items(
             "practice_id": item.practice_id,
             "brand_cosh_id": item.brand_cosh_id,
             "brand_name": item.brand_name,
+            "manufacturer_name": manufacturer_by_brand.get(item.brand_cosh_id) if item.brand_cosh_id else None,
             "l1_type": practice.l1_type,
             "l2_type": practice.l2_type,
             "given_volume": float(item.given_volume) if item.given_volume is not None else None,
@@ -1931,6 +1955,13 @@ async def list_purchased_items(
             "application_date_from": date_from_iso,
             "application_date_to": date_to_iso,
             "frequency_days": int(practice.frequency_days) if practice.frequency_days else None,
+            # 2026-06-06 — Recipient context per item so every Received
+            # card matches the seed-order card shape (dealer name +
+            # shop + phone).
+            "dealer_name": dealer_name,
+            "dealer_phone": dealer_phone,
+            "dealer_shop_name": dealer_shop_name,
+            "received_at": received_at.isoformat() if received_at else None,
         })
     # 2026-06-03 — Brand consolidation across timelines. A practice
     # recommended in multiple non-overlapping timelines (e.g. a foliar
