@@ -768,6 +768,12 @@ async def get_farmer_order_detail(
     from app.modules.advisory.models import Practice as AdvPractice
 
     order = await _get_farmer_order(db, order_id, current_user.id)
+    # 2026-06-06 — Lazy-create a PackingList row + code once items
+    # have been approved so the farmer sees the Packing ID alongside
+    # the approve action.
+    packing_list = (await db.execute(
+        select(PackingList).where(PackingList.order_id == order.id)
+    )).scalar_one_or_none()
     items_result = await db.execute(
         select(OrderItem).where(
             OrderItem.order_id == order.id,
@@ -874,6 +880,11 @@ async def get_farmer_order_detail(
         # are still SFA, so the page can render "Approval 1 of 2".
         "approval_round_current": current_round,
         "approval_rounds_pending": len(queued_rounds),
+        # 2026-06-06 — Packing surface fields for the farmer review.
+        # Lazy-create the row when there's at least one approved item
+        # so the Packing ID is visible from the moment the farmer
+        # could possibly want to confirm receipt.
+        **(await _farmer_packing_fields(db, order, packing_list, len(approved_raw))),
         # Legacy flat list kept for any pre-2026-06-03 caller.
         "items": [
             {
@@ -2074,6 +2085,18 @@ async def list_dealer_orders(
             facilitator_by_id.get(o.facilitator_user_id)
             if o.facilitator_user_id else None
         )
+        # 2026-06-06 — Derive pickup role + picker name so the dealer
+        # card can render "Picked up by Sri Lakshmi · DD MMM HH:MM"
+        # without a per-row lookup.
+        pickup_role: str | None = None
+        pickup_name: str | None = None
+        if pl and pl.picked_up_by_user_id:
+            if pl.picked_up_by_user_id == o.farmer_user_id:
+                pickup_role = "FARMER"
+                pickup_name = u.name
+            elif pl.picked_up_by_user_id == o.facilitator_user_id and facilitator:
+                pickup_role = "FACILITATOR"
+                pickup_name = facilitator.get("name")
         out.append({
             "id": o.id, "status": o.status,
             "farmer_user_id": o.farmer_user_id,
@@ -2098,6 +2121,14 @@ async def list_dealer_orders(
             ),
             "packing_list_removed_at": (
                 pl.dealer_removed_at.isoformat() if pl and pl.dealer_removed_at else None
+            ),
+            "packing_picked_up_at": (
+                pl.picked_up_at.isoformat() if pl and pl.picked_up_at else None
+            ),
+            "packing_picked_up_by_role": pickup_role,
+            "packing_picked_up_by_name": pickup_name,
+            "packing_farmer_received_at": (
+                pl.farmer_received_at.isoformat() if pl and pl.farmer_received_at else None
             ),
         })
     return out
@@ -2999,6 +3030,44 @@ async def generate_packing_list(
     return {"packing_list_id": existing.id, "pdf_url": existing.pdf_url}
 
 
+async def _farmer_packing_fields(
+    db: AsyncSession,
+    order: Order,
+    pl: PackingList | None,
+    approved_count: int,
+) -> dict:
+    """Packing-surface fields for the farmer's review payload.
+    Lazy-creates the row + code when approved_count > 0 so the
+    farmer sees the Packing ID alongside the receipt-confirmation
+    action. Mirrors the dealer-side pattern."""
+    if pl is None and approved_count > 0:
+        pl = await _ensure_packing_list(db, order.id)
+        await db.commit()
+    if pl is None:
+        return {
+            "packing_code": None,
+            "packing_shared_at": None,
+            "packing_picked_up_at": None,
+            "packing_picked_up_by_role": None,
+            "packing_farmer_received_at": None,
+        }
+    pickup_role: str | None = None
+    if pl.picked_up_by_user_id:
+        if pl.picked_up_by_user_id == order.farmer_user_id:
+            pickup_role = "FARMER"
+        elif pl.picked_up_by_user_id == order.facilitator_user_id:
+            pickup_role = "FACILITATOR"
+    return {
+        "packing_code": pl.packing_code,
+        "packing_shared_at": pl.first_shared_at.isoformat() if pl.first_shared_at else None,
+        "packing_picked_up_at": pl.picked_up_at.isoformat() if pl.picked_up_at else None,
+        "packing_picked_up_by_role": pickup_role,
+        "packing_farmer_received_at": (
+            pl.farmer_received_at.isoformat() if pl.farmer_received_at else None
+        ),
+    }
+
+
 _PACKING_CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
 
 
@@ -3069,6 +3138,80 @@ async def mark_packing_list_shared(
         "detail": "Marked as shared",
         "first_shared_at": pl.first_shared_at,
         "packing_code": pl.packing_code,
+    }
+
+
+# ── Packing pickup / received tracking (2026-06-06) ───────────────────────────
+
+@router.put("/facilitator/orders/{order_id}/packing-list/mark-picked-up")
+async def facilitator_mark_packing_picked_up(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Facilitator confirms they collected items from the dealer's
+    shop. Sets picked_up_at + picked_up_by_user_id. Does NOT set
+    farmer_received_at — that's the farmer's separate confirmation
+    after the facilitator hand-over.
+    """
+    from datetime import datetime, timezone
+
+    order = (await db.execute(
+        select(Order).where(
+            Order.id == order_id,
+            Order.facilitator_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found or not yours")
+    pl = await _ensure_packing_list(db, order_id)
+    if pl.picked_up_at is None:
+        pl.picked_up_at = datetime.now(timezone.utc)
+        pl.picked_up_by_user_id = current_user.id
+    await db.commit()
+    return {
+        "order_id": order_id,
+        "picked_up_at": pl.picked_up_at.isoformat() if pl.picked_up_at else None,
+        "picked_up_by_user_id": pl.picked_up_by_user_id,
+        "farmer_received_at": pl.farmer_received_at.isoformat() if pl.farmer_received_at else None,
+    }
+
+
+@router.put("/farmer/orders/{order_id}/packing-list/mark-received")
+async def farmer_mark_packing_received(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Farmer confirms they have the items in hand. If no pickup has
+    been recorded yet, the farmer's tap counts as the pickup too
+    (auto-pickup for direct dealer-to-farmer handovers — no
+    facilitator in the loop). If a facilitator already marked
+    pickup, this just stamps the final farmer_received_at.
+    """
+    from datetime import datetime, timezone
+
+    order = (await db.execute(
+        select(Order).where(
+            Order.id == order_id,
+            Order.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found or not yours")
+    pl = await _ensure_packing_list(db, order_id)
+    now_utc = datetime.now(timezone.utc)
+    if pl.picked_up_at is None:
+        pl.picked_up_at = now_utc
+        pl.picked_up_by_user_id = current_user.id
+    if pl.farmer_received_at is None:
+        pl.farmer_received_at = now_utc
+    await db.commit()
+    return {
+        "order_id": order_id,
+        "picked_up_at": pl.picked_up_at.isoformat() if pl.picked_up_at else None,
+        "picked_up_by_user_id": pl.picked_up_by_user_id,
+        "farmer_received_at": pl.farmer_received_at.isoformat() if pl.farmer_received_at else None,
     }
 
 
@@ -3159,6 +3302,12 @@ async def get_facilitator_order(
         )
     )
     items = items_result.scalars().all()
+    # 2026-06-06 — Packing fields for the facilitator's pickup tap.
+    approved_count = sum(1 for i in items if i.status == OrderItemStatus.APPROVED)
+    pl = (await db.execute(
+        select(PackingList).where(PackingList.order_id == order.id)
+    )).scalar_one_or_none()
+    packing_fields = await _farmer_packing_fields(db, order, pl, approved_count)
     return {
         "id": order.id, "status": order.status,
         "farmer_user_id": order.farmer_user_id, "client_id": order.client_id,
@@ -3174,6 +3323,7 @@ async def get_facilitator_order(
             }
             for i in items
         ],
+        **packing_fields,
     }
 
 

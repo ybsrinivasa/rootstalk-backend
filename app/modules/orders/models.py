@@ -244,6 +244,23 @@ class PackingList(Base):
     # on first creation of the PackingList row; visible to dealer +
     # farmer + facilitator so all three can refer to the same batch.
     packing_code: Mapped[str] = mapped_column(String(12), nullable=True, unique=True)
+    # 2026-06-06 — Pickup + receipt tracking. The dealer cares about
+    # two questions after handover: did someone collect the items
+    # from my shop, and did they ultimately reach the farmer?
+    #   picked_up_at         — when first pickup happened.
+    #   picked_up_by_user_id — the picker; role derived at read time
+    #                          (matches order.farmer_user_id OR
+    #                          order.facilitator_user_id).
+    #   farmer_received_at   — auto-set on farmer pickup; set later
+    #                          when farmer confirms after a
+    #                          facilitator-pickup hand-over.
+    picked_up_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    picked_up_by_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=True,
+    )
+    farmer_received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
 
 
 class DealerProfile(Base):
