@@ -3380,6 +3380,16 @@ async def list_facilitator_orders(
         for did, sname in srows:
             shop_by_dealer_id[did] = sname
 
+    # Packing rows for the Pickup / Completed pill membership.
+    order_ids = [o.id for o in orders]
+    pl_by_order: dict[str, PackingList] = {}
+    if order_ids:
+        plrows = (await db.execute(
+            select(PackingList).where(PackingList.order_id.in_(order_ids))
+        )).scalars().all()
+        for pl in plrows:
+            pl_by_order[pl.order_id] = pl
+
     out = []
     for o in orders:
         # Active items only (Batch 8 — exclude timeline-archived).
@@ -3401,6 +3411,7 @@ async def list_facilitator_orders(
             "approved": sum(1 for i in items if i.status == OrderItemStatus.APPROVED),
             "rejected": sum(1 for i in items if i.status == OrderItemStatus.REJECTED),
         }
+        pl = pl_by_order.get(o.id)
         out.append({
             "id": o.id, "status": o.status,
             "farmer_user_id": o.farmer_user_id, "client_id": o.client_id,
@@ -3420,6 +3431,16 @@ async def list_facilitator_orders(
             "dealer_name": dealer.name if dealer else None,
             "dealer_phone": dealer.phone if dealer else None,
             "dealer_shop_name": shop_by_dealer_id.get(o.dealer_user_id) if o.dealer_user_id else None,
+            # 2026-06-06 — Packing fields drive the Pickup pill
+            # (approved items the facilitator hasn't picked up yet)
+            # and the Completed pill (farmer-confirmed receipt).
+            "packing_code": pl.packing_code if pl else None,
+            "packing_picked_up_at": (
+                pl.picked_up_at.isoformat() if pl and pl.picked_up_at else None
+            ),
+            "packing_farmer_received_at": (
+                pl.farmer_received_at.isoformat() if pl and pl.farmer_received_at else None
+            ),
         })
     return out
 
@@ -6524,54 +6545,130 @@ async def facilitator_reject_order(
     }
 
 
-@router.put("/facilitator/orders/{order_id}/confirm-delivery")
-async def confirm_delivery(
-    order_id: str,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """Facilitator marks delivery done. Only enabled after delivery list shared."""
-    await _assert_active_facilitator(db, current_user.id)
-    order = (await db.execute(
-        select(Order).where(Order.id == order_id, Order.facilitator_user_id == current_user.id)
-    )).scalar_one_or_none()
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
-    pl = (await db.execute(select(PackingList).where(PackingList.order_id == order_id))).scalar_one_or_none()
-    if not pl or not pl.first_shared_at:
-        raise HTTPException(status_code=400, detail="Delivery list must be shared before confirming")
-    order.status = OrderStatus.COMPLETED
-    await db.commit()
-    return {"order_id": order_id, "status": order.status}
-
-
 @router.put("/facilitator/orders/{order_id}/return-to-farmer")
 async def return_to_farmer(
     order_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Facilitator returns NOT_AVAILABLE items to farmer when unable to source."""
+    """Facilitator gives up on the returned items and hands them back
+    to the farmer.
+
+    2026-06-06 — Was a soft "flip NOT_AVAILABLE → PENDING + clear
+    dealer + keep facilitator" that left the farmer with no clear
+    "action needed" surface. Now mirrors cancel-and-migrate: the
+    returned items migrate to a fresh DRAFT (dealer + facilitator
+    both cleared) and the farmer's Manage tab gets a new DRAFT card.
+    From there the farmer picks a new recipient — dealer OR
+    facilitator — per spec.
+
+    Source items become REROUTED so the audit trail tells the full
+    story. lineage_root_id preserved so the farmer's Manage tab
+    groups the chain under one card.
+    """
     await _assert_active_facilitator(db, current_user.id)
     order = (await db.execute(
         select(Order).where(Order.id == order_id, Order.facilitator_user_id == current_user.id)
     )).scalar_one_or_none()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-    items = (await db.execute(
+
+    returned_set = {OrderItemStatus.NOT_AVAILABLE, OrderItemStatus.REJECTED}
+    items_to_migrate = (await db.execute(
         select(OrderItem).where(
             OrderItem.order_id == order_id,
-            OrderItem.status == OrderItemStatus.NOT_AVAILABLE,
+            OrderItem.archived_at.is_(None),
+            OrderItem.status.in_(returned_set),
         )
     )).scalars().all()
-    for item in items:
-        item.status = OrderItemStatus.PENDING
-        item.brand_cosh_id = None
-        item.brand_name = None
-    order.dealer_user_id = None
-    order.status = OrderStatus.SENT
+    if not items_to_migrate:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "nothing_to_return",
+                "message": "No returned items on this order.",
+            },
+        )
+
+    new_lineage_root = order.lineage_root_id or order.id
+
+    new_draft = Order(
+        subscription_id=order.subscription_id,
+        farmer_user_id=order.farmer_user_id,
+        client_id=order.client_id,
+        category=order.category,
+        date_from=order.date_from,
+        date_to=order.date_to,
+        status=OrderStatus.DRAFT,
+        dealer_user_id=None,
+        facilitator_user_id=None,
+        locked_timelines=order.locked_timelines,
+        expires_at=order.expires_at,
+        lineage_root_id=new_lineage_root,
+    )
+    db.add(new_draft)
+    await db.flush()
+
+    if order.lineage_root_id is None:
+        order.lineage_root_id = order.id
+
+    for it in items_to_migrate:
+        prev = it.status.value if hasattr(it.status, "value") else it.status
+        new_item = OrderItem(
+            order_id=new_draft.id,
+            practice_id=it.practice_id,
+            timeline_id=it.timeline_id,
+            brand_cosh_id=None,
+            brand_name=None,
+            given_volume=None,
+            volume_unit=it.volume_unit,
+            price=None,
+            estimated_volume=it.estimated_volume,
+            relation_id=it.relation_id,
+            relation_type=it.relation_type,
+            relation_role=it.relation_role,
+            scan_verified=False,
+            status=OrderItemStatus.PENDING,
+            snapshot_id=it.snapshot_id,
+            lineage_id=it.lineage_id,
+        )
+        db.add(new_item)
+        await db.flush()
+        await _record_event(
+            db, lineage_id=it.lineage_id,
+            event_type="REROUTED_FROM",
+            actor_user_id=current_user.id, actor_role="FACILITATOR",
+            order_id=order.id, order_item_id=it.id,
+            prev_status=prev,
+            new_status=OrderItemStatus.REROUTED.value,
+            metadata={
+                "to_order_id": new_draft.id,
+                "to_order_item_id": new_item.id,
+                "reason": "facilitator_return_to_farmer",
+            },
+        )
+        await _record_event(
+            db, lineage_id=it.lineage_id,
+            event_type="REROUTED_TO",
+            actor_user_id=current_user.id, actor_role="FACILITATOR",
+            order_id=new_draft.id, order_item_id=new_item.id,
+            prev_status=OrderItemStatus.REROUTED.value,
+            new_status=OrderItemStatus.PENDING.value,
+            metadata={
+                "from_order_id": order.id,
+                "from_order_item_id": it.id,
+                "reason": "facilitator_return_to_farmer",
+            },
+        )
+        it.status = OrderItemStatus.REROUTED
+
+    await _update_order_status(db, order.id)
     await db.commit()
-    return {"order_id": order_id, "returned_items": len(items)}
+    return {
+        "order_id": order_id,
+        "returned_items": len(items_to_migrate),
+        "new_draft_order_id": new_draft.id,
+    }
 
 
 @router.post("/facilitator/orders/{order_id}/reroute-returned", status_code=201)
