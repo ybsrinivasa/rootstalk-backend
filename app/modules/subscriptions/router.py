@@ -3837,6 +3837,19 @@ async def my_subscriptions(
     if not subs:
         return []
 
+    # 2026-06-06 — Resolve farmer's district name once via Cosh
+    # core_items so every History card can show "Crop · Company ·
+    # District" context without a per-card lookup.
+    farmer_district_name: str | None = None
+    if current_user.district_cosh_id:
+        d_row = (await db.execute(
+            select(CoshCoreItem.translations).where(
+                CoshCoreItem.cosh_id == current_user.district_cosh_id
+            )
+        )).scalar_one_or_none()
+        if isinstance(d_row, dict):
+            farmer_district_name = d_row.get("en") or None
+
     for s in subs:
         pkg_name, crop_cosh_id = pkg_by_id.get(s.package_id, (None, None))
         client = client_info_by_id.get(s.client_id, {})
@@ -3870,6 +3883,11 @@ async def my_subscriptions(
             # receive a query at this client.
             "client_has_primary_expert": has_primary_by_client.get(s.client_id, False),
             "pending_payment_from": pending_delegate_by_sub_id.get(s.id),
+            # 2026-06-06 — Farmer's district for the History card
+            # context line. Same value across all rows of one
+            # response; surfaced per-row so the PWA doesn't need a
+            # separate /profile fetch.
+            "farmer_district_name": farmer_district_name,
         })
     return out
 
