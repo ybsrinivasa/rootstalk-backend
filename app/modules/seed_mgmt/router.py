@@ -856,6 +856,7 @@ async def list_dealer_seed_orders(
     current_user: User = Depends(get_current_user),
 ):
     from app.modules.orders.router import _assert_active_dealer
+    from app.modules.clients.models import Client
     await _assert_active_dealer(db, current_user.id)
     result = await db.execute(
         select(SeedOrderFull).where(
@@ -864,17 +865,64 @@ async def list_dealer_seed_orders(
         ).order_by(SeedOrderFull.created_at.desc())
     )
     orders = result.scalars().all()
+    # 2026-06-06 — Per-order details enriched with
+    # farmer_phone / farmer_photo_url / client_name and the explicit
+    # category sentinel "SEED" so the unified dealer-orders feed can
+    # render seed cards through the same OrderHeaderRow component
+    # used for regular inputs orders. Batched lookups (one query per
+    # FK across the page) keep the N+1 in check.
+    variety_ids = {o.variety_id for o in orders}
+    farmer_ids = {o.farmer_user_id for o in orders}
+    sub_ids = {o.subscription_id for o in orders}
+    client_ids = {o.client_id for o in orders}
+
+    varieties: dict[str, SeedVariety] = {}
+    if variety_ids:
+        varieties = {
+            v.id: v for v in (await db.execute(
+                select(SeedVariety).where(SeedVariety.id.in_(variety_ids))
+            )).scalars().all()
+        }
+    farmers: dict[str, User] = {}
+    if farmer_ids:
+        farmers = {
+            u.id: u for u in (await db.execute(
+                select(User).where(User.id.in_(farmer_ids))
+            )).scalars().all()
+        }
+    subs: dict[str, Subscription] = {}
+    if sub_ids:
+        subs = {
+            s.id: s for s in (await db.execute(
+                select(Subscription).where(Subscription.id.in_(sub_ids))
+            )).scalars().all()
+        }
+    clients: dict[str, Client] = {}
+    if client_ids:
+        clients = {
+            c.id: c for c in (await db.execute(
+                select(Client).where(Client.id.in_(client_ids))
+            )).scalars().all()
+        }
+
     out = []
     for o in orders:
-        variety = (await db.execute(select(SeedVariety).where(SeedVariety.id == o.variety_id))).scalar_one_or_none()
-        farmer = (await db.execute(select(User).where(User.id == o.farmer_user_id))).scalar_one_or_none()
-        sub = (await db.execute(select(Subscription).where(Subscription.id == o.subscription_id))).scalar_one_or_none()
+        variety = varieties.get(o.variety_id)
+        farmer = farmers.get(o.farmer_user_id)
+        sub = subs.get(o.subscription_id)
+        client = clients.get(o.client_id)
         out.append({
             "id": o.id, "status": o.status,
+            "category": "SEED",
             "variety_name": variety.name if variety else None,
             "crop_cosh_id": variety.crop_cosh_id if variety else None,
+            "farmer_user_id": o.farmer_user_id,
             "farmer_name": farmer.name if farmer else None,
+            "farmer_phone": farmer.phone if farmer else None,
+            "farmer_photo_url": farmer.photo_url if farmer else None,
             "farm_area_acres": float(sub.farm_area_acres) if sub and sub.farm_area_acres else None,
+            "client_id": o.client_id,
+            "client_name": (client.display_name or client.short_name) if client else None,
             "unit": o.unit,
             "quantity": float(o.quantity) if o.quantity else None,
             "total_price": float(o.total_price) if o.total_price else None,
