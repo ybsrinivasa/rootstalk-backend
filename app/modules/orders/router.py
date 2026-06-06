@@ -556,6 +556,19 @@ async def list_subscription_orders(
         ).order_by(Order.created_at.desc())
     )).scalars().all()
 
+    # 2026-06-06 — Packing receipt status for the "Pick up" banner
+    # on the Manage tab. Batch-loaded so each card knows whether the
+    # farmer has already confirmed receipt for that order.
+    pl_received_by_order: dict[str, bool] = {}
+    if regular_rows:
+        regular_ids = [o.id for o in regular_rows]
+        pl_rows = (await db.execute(
+            select(PackingList.order_id, PackingList.farmer_received_at)
+            .where(PackingList.order_id.in_(regular_ids))
+        )).all()
+        for oid, recv_at in pl_rows:
+            pl_received_by_order[oid] = recv_at is not None
+
     # 2026-06-02 — recipient info batch-loaded once for the whole
     # list so cards can show dealer / facilitator name + shop +
     # phone without per-row lookups.
@@ -639,6 +652,7 @@ async def list_subscription_orders(
         awaiting_count = len(sfa_items_for_o)
         returned_count = sum(1 for i in items if i.status in RETURNED)
         postponed_count = sum(1 for i in items if i.status in POSTPONED)
+        approved_count = sum(1 for i in items if i.status == OrderItemStatus.APPROVED)
         # 2026-06-05 — Round queueing for the Manage tab card. The PWA
         # already filters to "earliest awaiting order" globally; this
         # surfaces "Approval 1 of 2" WITHIN one order when the dealer
@@ -674,6 +688,12 @@ async def list_subscription_orders(
             "approval_rounds_pending": len(queued_rounds_for_o),
             "returned_count": returned_count,
             "postponed_count": postponed_count,
+            # 2026-06-06 — Drives the emerald "Pick up N items from X"
+            # banner on the Manage card. Counts approved items only
+            # when the farmer hasn't yet confirmed receipt.
+            "pickup_ready_count": (
+                approved_count if not pl_received_by_order.get(o.id, False) else 0
+            ),
             # 2026-06-03 — Lineage so the Manage tab can group sub-
             # orders under one card per original procurement intent.
             # When null on a legacy row, client treats the order's
@@ -768,6 +788,26 @@ async def get_farmer_order_detail(
     from app.modules.advisory.models import Practice as AdvPractice
 
     order = await _get_farmer_order(db, order_id, current_user.id)
+    # 2026-06-06 — Dealer + facilitator display names so the focused
+    # pickup page can render "From Sri Lakshmi Agro Inputs" without
+    # a per-page round-trip.
+    from app.modules.orders.models import DealerProfile
+    dealer_name = None
+    if order.dealer_user_id:
+        row = (await db.execute(
+            select(User.name, DealerProfile.shop_name)
+            .join(DealerProfile, DealerProfile.user_id == User.id, isouter=True)
+            .where(User.id == order.dealer_user_id)
+        )).first()
+        if row:
+            dealer_name = row[1] or row[0]
+    facilitator_name = None
+    if order.facilitator_user_id:
+        row = (await db.execute(
+            select(User.name).where(User.id == order.facilitator_user_id)
+        )).first()
+        if row:
+            facilitator_name = row[0]
     # 2026-06-06 — Lazy-create a PackingList row + code once items
     # have been approved so the farmer sees the Packing ID alongside
     # the approve action.
@@ -861,7 +901,9 @@ async def get_farmer_order_detail(
         "date_from": order.date_from, "date_to": order.date_to,
         "created_at": order.created_at,
         "dealer_user_id": order.dealer_user_id,
+        "dealer_name": dealer_name,
         "facilitator_user_id": order.facilitator_user_id,
+        "facilitator_name": facilitator_name,
         "subscription_id": order.subscription_id,
         "category": order.category,
         # 2026-06-03 — Bucketed items for the review page. The brand
