@@ -125,7 +125,11 @@ _ITEM_TRANSITIONS: dict[tuple[str, str], frozenset[str]] = {
     #             postponed item and confirms they can't supply it.
     #             The item joins the farmer's Returned bucket on the
     #             review page so the farmer can reroute / skip.
-    ("POSTPONED", "NOT_AVAILABLE"):          frozenset({FARMER, DEALER}),
+    # 2026-06-06 — FACILITATOR added so the facilitator's
+    # reroute-returned can include POSTPONED items when the dealer
+    # hadn't resolved them (mirrors the farmer's include_postponed
+    # branch on /farmer/orders/{id}/reroute-returned).
+    ("POSTPONED", "NOT_AVAILABLE"):          frozenset({FARMER, DEALER, FACILITATOR}),
 
     # Orders V2 (2026-05-31): the bundled re-route and cancel-migrate
     # flows stamp items REROUTED on the source order while creating

@@ -35,7 +35,7 @@ from app.services.npk_trade_names import (
 )
 from app.modules.sync.models import CoshCoreItem as _NPKCoshCoreItem
 from app.services.bl10_order_state import (
-    DEALER, FARMER,
+    DEALER, FACILITATOR, FARMER,
     is_item_abortable, is_order_abortable,
     validate_item_transition, validate_order_transition,
 )
@@ -3346,13 +3346,40 @@ async def list_facilitator_orders(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Orders routed to this facilitator for handling."""
+    """Orders routed to this facilitator for handling.
+
+    2026-06-06 — Enriched with per-status item counts so the
+    facilitator's Manage card can surface the same "N returned items"
+    strip the farmer's Manage tab shows for direct-to-dealer orders.
+    Spec: returned items belong to the facilitator (not the farmer)
+    while the facilitator owns the order. Farmer side will hide its
+    own returned strip when `o.facilitator_user_id` is set.
+    """
     await _assert_active_facilitator(db, current_user.id)
     q = select(Order).where(Order.facilitator_user_id == current_user.id).order_by(Order.created_at.desc())
     if status_filter:
         q = q.where(Order.status == status_filter)
     result = await db.execute(q)
     orders = result.scalars().all()
+
+    farmer_ids = {o.farmer_user_id for o in orders}
+    dealer_ids = {o.dealer_user_id for o in orders if o.dealer_user_id}
+    user_by_id: dict[str, User] = {}
+    if farmer_ids or dealer_ids:
+        ids = list(farmer_ids | dealer_ids)
+        urows = (await db.execute(
+            select(User).where(User.id.in_(ids))
+        )).scalars().all()
+        user_by_id = {u.id: u for u in urows}
+    shop_by_dealer_id: dict[str, str | None] = {}
+    if dealer_ids:
+        srows = (await db.execute(
+            select(DealerProfile.user_id, DealerProfile.shop_name)
+            .where(DealerProfile.user_id.in_(dealer_ids))
+        )).all()
+        for did, sname in srows:
+            shop_by_dealer_id[did] = sname
+
     out = []
     for o in orders:
         # Active items only (Batch 8 — exclude timeline-archived).
@@ -3363,6 +3390,17 @@ async def list_facilitator_orders(
             )
         )
         items = items_result.scalars().all()
+        farmer = user_by_id.get(o.farmer_user_id)
+        dealer = user_by_id.get(o.dealer_user_id) if o.dealer_user_id else None
+        counts = {
+            "pending": sum(1 for i in items if i.status == OrderItemStatus.PENDING),
+            "available": sum(1 for i in items if i.status == OrderItemStatus.AVAILABLE),
+            "postponed": sum(1 for i in items if i.status == OrderItemStatus.POSTPONED),
+            "not_available": sum(1 for i in items if i.status == OrderItemStatus.NOT_AVAILABLE),
+            "sent_for_approval": sum(1 for i in items if i.status == OrderItemStatus.SENT_FOR_APPROVAL),
+            "approved": sum(1 for i in items if i.status == OrderItemStatus.APPROVED),
+            "rejected": sum(1 for i in items if i.status == OrderItemStatus.REJECTED),
+        }
         out.append({
             "id": o.id, "status": o.status,
             "farmer_user_id": o.farmer_user_id, "client_id": o.client_id,
@@ -3370,7 +3408,18 @@ async def list_facilitator_orders(
             "date_from": o.date_from, "date_to": o.date_to,
             "created_at": o.created_at,
             "item_count": len(items),
-            "pending_count": sum(1 for i in items if i.status == OrderItemStatus.PENDING),
+            "pending_count": counts["pending"],
+            # Per-status counts so the PWA can render strips for
+            # returned / awaiting-approval without a per-id round-trip.
+            "item_status_counts": counts,
+            # Farmer + dealer contact so the facilitator card can
+            # render the chain without a /admin/users lookup.
+            "farmer_name": farmer.name if farmer else None,
+            "farmer_phone": farmer.phone if farmer else None,
+            "farmer_photo_url": farmer.photo_url if farmer else None,
+            "dealer_name": dealer.name if dealer else None,
+            "dealer_phone": dealer.phone if dealer else None,
+            "dealer_shop_name": shop_by_dealer_id.get(o.dealer_user_id) if o.dealer_user_id else None,
         })
     return out
 
@@ -3391,8 +3440,16 @@ async def route_order_to_dealer(
         raise HTTPException(status_code=404, detail="Order not found or not assigned to you")
     if order.status not in [OrderStatus.SENT, OrderStatus.ACCEPTED]:
         raise HTTPException(status_code=400, detail="Order cannot be routed in current status")
+    dealer_user_id = data.get("dealer_user_id")
+    if not dealer_user_id:
+        raise HTTPException(status_code=422, detail="dealer_user_id required")
+    # 2026-06-06 — Spec: facilitators can only forward to dealers,
+    # never to another facilitator. Guard recipient is an active
+    # dealer (the picker UI is dealer-only, but the endpoint took
+    # any user id before this check landed).
+    await _assert_active_dealer(db, dealer_user_id)
     prev_status = order.status.value if hasattr(order.status, "value") else order.status
-    order.dealer_user_id = data["dealer_user_id"]
+    order.dealer_user_id = dealer_user_id
     order.status = OrderStatus.PROCESSING
     await _record_event(
         db, lineage_id=order.id,
@@ -6337,6 +6394,19 @@ async def facilitator_reject_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Facilitator declines a fresh order.
+
+    2026-06-06 — Was a soft "set CANCELLED + null facilitator" that
+    left the farmer's order silently dead. Now mirrors the farmer's
+    /farmer/orders/{id}/cancel cancel-and-migrate: husk → CANCELLED;
+    every active item migrates onto a fresh DRAFT (dealer +
+    facilitator both cleared) so the farmer's Manage tab picks up a
+    new DRAFT card and can re-route to someone else without
+    re-keying the items.
+
+    Lineage preserved via lineage_root_id so the farmer's Manage tab
+    groups the husk + new DRAFT under one chain.
+    """
     await _assert_active_facilitator(db, current_user.id)
     order = (await db.execute(
         select(Order).where(Order.id == order_id, Order.facilitator_user_id == current_user.id)
@@ -6345,10 +6415,113 @@ async def facilitator_reject_order(
         raise HTTPException(status_code=404, detail="Order not found")
     if order.status != OrderStatus.SENT:
         raise HTTPException(status_code=400, detail="Order can only be rejected when in SENT status")
+
+    prev_status = order.status.value if hasattr(order.status, "value") else order.status
+
+    items_q = await db.execute(
+        select(OrderItem).where(
+            OrderItem.order_id == order.id,
+            OrderItem.archived_at.is_(None),
+        )
+    )
+    skip_statuses = {OrderItemStatus.REROUTED, OrderItemStatus.REMOVED}
+    items_to_migrate = [
+        it for it in items_q.scalars().all() if it.status not in skip_statuses
+    ]
+
+    new_lineage_root = order.lineage_root_id or order.id
+
+    new_draft = Order(
+        subscription_id=order.subscription_id,
+        farmer_user_id=order.farmer_user_id,
+        client_id=order.client_id,
+        category=order.category,
+        date_from=order.date_from,
+        date_to=order.date_to,
+        status=OrderStatus.DRAFT,
+        dealer_user_id=None,
+        facilitator_user_id=None,
+        locked_timelines=order.locked_timelines,
+        expires_at=order.expires_at,
+        lineage_root_id=new_lineage_root,
+    )
+    db.add(new_draft)
+    await db.flush()
+
+    if order.lineage_root_id is None:
+        order.lineage_root_id = order.id
+
+    for it in items_to_migrate:
+        prev_item_status = it.status.value if hasattr(it.status, "value") else it.status
+        new_item = OrderItem(
+            order_id=new_draft.id,
+            practice_id=it.practice_id,
+            timeline_id=it.timeline_id,
+            brand_cosh_id=None,
+            brand_name=None,
+            given_volume=None,
+            volume_unit=it.volume_unit,
+            price=None,
+            estimated_volume=it.estimated_volume,
+            relation_id=it.relation_id,
+            relation_type=it.relation_type,
+            relation_role=it.relation_role,
+            scan_verified=False,
+            status=OrderItemStatus.PENDING,
+            snapshot_id=it.snapshot_id,
+            lineage_id=it.lineage_id,
+        )
+        db.add(new_item)
+        await db.flush()
+        await _record_event(
+            db, lineage_id=it.lineage_id,
+            event_type="REROUTED_FROM",
+            actor_user_id=current_user.id, actor_role="FACILITATOR",
+            order_id=order.id, order_item_id=it.id,
+            prev_status=prev_item_status,
+            new_status=OrderItemStatus.REROUTED.value,
+            metadata={
+                "to_order_id": new_draft.id,
+                "to_order_item_id": new_item.id,
+                "reason": "facilitator_reject_migrate",
+            },
+        )
+        await _record_event(
+            db, lineage_id=it.lineage_id,
+            event_type="REROUTED_TO",
+            actor_user_id=current_user.id, actor_role="FACILITATOR",
+            order_id=new_draft.id, order_item_id=new_item.id,
+            prev_status=OrderItemStatus.REROUTED.value,
+            new_status=OrderItemStatus.PENDING.value,
+            metadata={
+                "from_order_id": order.id,
+                "from_order_item_id": it.id,
+                "reason": "facilitator_reject_migrate",
+            },
+        )
+        it.status = OrderItemStatus.REROUTED
+
+    await _record_event(
+        db, lineage_id=order.id,
+        event_type="REJECTED_BY_FACILITATOR",
+        actor_user_id=current_user.id, actor_role="FACILITATOR",
+        order_id=order.id,
+        prev_status=prev_status, new_status=OrderStatus.CANCELLED.value,
+        metadata={
+            "new_draft_order_id": new_draft.id,
+            "reason": data.get("reason") if data else None,
+        },
+    )
+
     order.status = OrderStatus.CANCELLED
     order.facilitator_user_id = None
     await db.commit()
-    return {"order_id": order_id, "status": order.status, "reason": data.get("reason")}
+    return {
+        "order_id": order_id,
+        "status": order.status,
+        "new_draft_order_id": new_draft.id,
+        "reason": (data or {}).get("reason"),
+    }
 
 
 @router.put("/facilitator/orders/{order_id}/confirm-delivery")
@@ -6399,6 +6572,175 @@ async def return_to_farmer(
     order.status = OrderStatus.SENT
     await db.commit()
     return {"order_id": order_id, "returned_items": len(items)}
+
+
+@router.post("/facilitator/orders/{order_id}/reroute-returned", status_code=201)
+async def facilitator_reroute_returned(
+    order_id: str,
+    data: Optional[dict] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Facilitator forwards returned items to another dealer.
+
+    Spec (2026-06-06): when a dealer marks items NOT_AVAILABLE on a
+    facilitator-routed order, the returned items belong to the
+    facilitator's queue — NOT the farmer's. The facilitator either
+    re-forwards them to a different dealer (this endpoint) or hands
+    them back to the farmer via /return-to-farmer.
+
+    Mirrors the farmer's /farmer/orders/{id}/reroute-returned shape
+    but single-step: facilitator picks the new dealer at the point of
+    reroute, so the new Order is created in SENT directly (no DRAFT
+    waiting for a separate /send). Body:
+      { dealer_user_id: str, include_postponed?: bool }
+
+    Lineage: new order inherits source's lineage_root_id (or source.id
+    if null). Source items become REROUTED; new items start PENDING
+    on the fresh order. Both orders carry the same facilitator_user_id
+    so the facilitator's list groups them under one chain.
+    """
+    await _assert_active_facilitator(db, current_user.id)
+    order = (await db.execute(
+        select(Order).where(
+            Order.id == order_id,
+            Order.facilitator_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    payload = data or {}
+    new_dealer_id = payload.get("dealer_user_id")
+    if not new_dealer_id:
+        raise HTTPException(status_code=422, detail="dealer_user_id required")
+    await _assert_active_dealer(db, new_dealer_id)
+    include_postponed = bool(payload.get("include_postponed"))
+
+    items_q = await db.execute(
+        select(OrderItem).where(
+            OrderItem.order_id == order.id,
+            OrderItem.archived_at.is_(None),
+        )
+    )
+    all_items = items_q.scalars().all()
+
+    returned_set = {OrderItemStatus.NOT_AVAILABLE, OrderItemStatus.REJECTED}
+    items_to_reroute = [it for it in all_items if it.status in returned_set]
+    postponed_items = [it for it in all_items if it.status == OrderItemStatus.POSTPONED]
+
+    if include_postponed:
+        for pi in postponed_items:
+            prev = pi.status.value if hasattr(pi.status, "value") else pi.status
+            res = validate_item_transition(
+                pi.status, OrderItemStatus.NOT_AVAILABLE.value, FACILITATOR,
+            )
+            if not res.allowed:
+                _raise_transition(res)
+            pi.status = OrderItemStatus.NOT_AVAILABLE
+            await _record_event(
+                db, lineage_id=pi.lineage_id,
+                event_type="POSTPONED_CANCELLED_BY_FACILITATOR",
+                actor_user_id=current_user.id, actor_role="FACILITATOR",
+                order_id=order.id, order_item_id=pi.id,
+                prev_status=prev, new_status=OrderItemStatus.NOT_AVAILABLE.value,
+                metadata={"trigger": "facilitator_reroute_include_postponed"},
+            )
+            items_to_reroute.append(pi)
+
+    if not items_to_reroute:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "nothing_to_reroute",
+                "message": "No items in this order need re-routing.",
+            },
+        )
+
+    new_lineage_root = order.lineage_root_id or order.id
+
+    new_order = Order(
+        subscription_id=order.subscription_id,
+        farmer_user_id=order.farmer_user_id,
+        client_id=order.client_id,
+        category=order.category,
+        date_from=order.date_from,
+        date_to=order.date_to,
+        # Facilitator-driven reroute lands as SENT directly: the
+        # facilitator picked the dealer at the time of reroute, no
+        # DRAFT step needed.
+        status=OrderStatus.SENT,
+        dealer_user_id=new_dealer_id,
+        facilitator_user_id=current_user.id,
+        locked_timelines=order.locked_timelines,
+        expires_at=datetime.now(timezone.utc) + timedelta(days=14),
+        lineage_root_id=new_lineage_root,
+    )
+    db.add(new_order)
+    await db.flush()
+
+    if order.lineage_root_id is None:
+        order.lineage_root_id = order.id
+
+    for it in items_to_reroute:
+        prev_status = it.status.value if hasattr(it.status, "value") else it.status
+        new_item = OrderItem(
+            order_id=new_order.id,
+            practice_id=it.practice_id,
+            timeline_id=it.timeline_id,
+            brand_cosh_id=None,
+            brand_name=None,
+            given_volume=None,
+            volume_unit=it.volume_unit,
+            price=None,
+            estimated_volume=it.estimated_volume,
+            relation_id=it.relation_id,
+            relation_type=it.relation_type,
+            relation_role=it.relation_role,
+            scan_verified=False,
+            status=OrderItemStatus.PENDING,
+            snapshot_id=it.snapshot_id,
+            lineage_id=it.lineage_id,
+        )
+        db.add(new_item)
+        await db.flush()
+
+        await _record_event(
+            db, lineage_id=it.lineage_id,
+            event_type="REROUTED_FROM",
+            actor_user_id=current_user.id, actor_role="FACILITATOR",
+            order_id=order.id, order_item_id=it.id,
+            prev_status=prev_status,
+            new_status=OrderItemStatus.REROUTED.value,
+            metadata={
+                "to_order_id": new_order.id,
+                "to_order_item_id": new_item.id,
+                "to_dealer_user_id": new_dealer_id,
+                "reason": "facilitator_reroute",
+            },
+        )
+        await _record_event(
+            db, lineage_id=it.lineage_id,
+            event_type="REROUTED_TO",
+            actor_user_id=current_user.id, actor_role="FACILITATOR",
+            order_id=new_order.id, order_item_id=new_item.id,
+            prev_status=OrderItemStatus.REROUTED.value,
+            new_status=OrderItemStatus.PENDING.value,
+            metadata={
+                "from_order_id": order.id,
+                "from_order_item_id": it.id,
+                "reason": "facilitator_reroute",
+            },
+        )
+        it.status = OrderItemStatus.REROUTED
+
+    await _update_order_status(db, order.id)
+    await db.commit()
+    return {
+        "new_order_id": new_order.id,
+        "rerouted_count": len(items_to_reroute),
+        "dealer_user_id": new_dealer_id,
+    }
 
 
 # ── Facilitator: Nearby dealers for forwarding ───────────────────────────────
