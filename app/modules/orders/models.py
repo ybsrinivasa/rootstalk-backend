@@ -95,6 +95,15 @@ class Order(Base):
     lineage_root_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("orders.id"), nullable=True,
     )
+    # 2026-06-07 — Human-readable Order ID, shared across every order
+    # in a lineage chain. Format `RT-YY-NNNNNN` (e.g. RT-26-001247).
+    # Generated on root creation; reroute / cancel-migrate children
+    # inherit. NOT unique (the whole lineage shares it). Surfaces on
+    # all three role PWAs so the same physical order is recognisable
+    # everywhere. See feedback / order_integrity memory entries.
+    reference_number: Mapped[str] = mapped_column(
+        String(15), nullable=True, index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 

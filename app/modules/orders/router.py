@@ -40,6 +40,9 @@ from app.services.bl10_order_state import (
     validate_item_transition, validate_order_transition,
 )
 from app.services.bl14_approval import is_brand_visible_to_farmer
+from app.services.bl15_reference import (
+    format_reference, parse_sequence, reference_prefix, two_digit_year,
+)
 from app.services.fcm_service import send_fcm
 import logging
 from app.modules.advisory.models import RelationType
@@ -193,6 +196,10 @@ async def create_order(
         elif first_l1 == "FERTILIZER":
             resolved_category = "FERTILIZER"
 
+    # 2026-06-07 — Root order creation: generate the human-readable
+    # Order ID. Every reroute / cancel-migrate child inherits this
+    # value so the whole lineage shares one ID across all three PWAs.
+    reference_number = await _generate_order_reference(db)
     order = Order(
         subscription_id=request.subscription_id,
         farmer_user_id=current_user.id,
@@ -204,6 +211,7 @@ async def create_order(
         date_to=request.date_to,
         status=OrderStatus.SENT,
         expires_at=datetime.now(timezone.utc) + timedelta(days=14),
+        reference_number=reference_number,
     )
     db.add(order)
     await db.flush()
@@ -491,6 +499,10 @@ async def list_farmer_orders(
         out.append({
             "id": o.id,
             "status": o.status,
+            # 2026-06-07 — Human-readable Order ID; shared across all
+            # orders in a lineage. May be null on legacy rows where
+            # the backfill missed.
+            "reference_number": o.reference_number,
             "date_from": o.date_from,
             "date_to": o.date_to,
             "dealer_user_id": o.dealer_user_id,
@@ -675,6 +687,11 @@ async def list_subscription_orders(
             "kind": "REGULAR",
             "id": o.id,
             "status": o.status,
+            # 2026-06-07 — Human-readable Order ID (shared across
+            # lineage). Surfaced as a prominent chip on the Manage
+            # card so the farmer recognises the same order across
+            # surfaces / conversations with dealer + facilitator.
+            "reference_number": o.reference_number,
             "date_from": o.date_from,
             "date_to": o.date_to,
             "dealer_user_id": o.dealer_user_id,
@@ -898,6 +915,7 @@ async def get_farmer_order_detail(
 
     return {
         "id": order.id, "status": order.status,
+        "reference_number": order.reference_number,
         "date_from": order.date_from, "date_to": order.date_to,
         "created_at": order.created_at,
         "dealer_user_id": order.dealer_user_id,
@@ -1020,6 +1038,9 @@ async def cancel_order(
         # Inherit the original 14-day expiry; the farmer needs to
         # actually send this draft before then.
         expires_at=order.expires_at,
+        # 2026-06-07 — Lineage shares one Order ID. Cancel-migrate
+        # carries the source's reference_number to the new draft.
+        reference_number=order.reference_number,
     )
     db.add(new_draft)
     await db.flush()
@@ -1455,6 +1476,9 @@ async def create_dbs_bulk_order(
     else:
         synth_to = synth_from + timedelta(days=365)
 
+    # 2026-06-07 — DBS-bulk is also a root creation path; generate
+    # the Order ID. Lineage children downstream inherit.
+    reference_number = await _generate_order_reference(db)
     order = Order(
         subscription_id=request.subscription_id,
         farmer_user_id=current_user.id,
@@ -1466,6 +1490,7 @@ async def create_dbs_bulk_order(
         date_to=synth_to,
         status=OrderStatus.SENT,
         expires_at=datetime.now(timezone.utc) + timedelta(days=14),
+        reference_number=reference_number,
     )
     db.add(order)
     await db.flush()
@@ -2222,6 +2247,8 @@ async def list_dealer_orders(
                 pickup_name = facilitator.get("name")
         out.append({
             "id": o.id, "status": o.status,
+            # 2026-06-07 — Human-readable Order ID.
+            "reference_number": o.reference_number,
             "farmer_user_id": o.farmer_user_id,
             "farmer_name": u.name,
             "farmer_phone": u.phone,
@@ -3204,6 +3231,38 @@ async def _farmer_packing_fields(
 _PACKING_CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
 
 
+_ORDER_REFERENCE_PREFIX = "RT"
+
+
+async def _generate_order_reference(db: AsyncSession) -> str:
+    """Generate the next RT-YY-NNNNNN order reference for the current
+    UTC year. Sequential allocation: SELECT the lexicographically-
+    highest existing reference matching the (RT, year) prefix, parse
+    its 6-digit suffix, return prefix + (suffix + 1). Mirrors the
+    BL-15 subscription-reference pattern.
+
+    Concurrency note: under concurrent order creation in the same
+    year, two transactions may compute the same next number and one
+    will fail at commit. Caller retries are out of scope for V1 — the
+    rate is low enough that a 500 + farmer retry is acceptable. V2
+    will tighten via SELECT FOR UPDATE on a counter row.
+    """
+    year = two_digit_year()
+    prefix = reference_prefix(_ORDER_REFERENCE_PREFIX, year)
+    last = (await db.execute(
+        select(Order.reference_number)
+        .where(Order.reference_number.like(f"{prefix}%"))
+        .order_by(Order.reference_number.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+    if last:
+        prev_seq = parse_sequence(last)
+        next_seq = prev_seq + 1 if prev_seq >= 0 else 1
+    else:
+        next_seq = 1
+    return format_reference(_ORDER_REFERENCE_PREFIX, year, next_seq)
+
+
 async def _generate_packing_code(db: AsyncSession) -> str:
     """Generate a 6-char paper-friendly packing code with collision
     retry. The alphabet excludes 0/O/1/I/L so the code reads cleanly
@@ -3424,6 +3483,8 @@ async def list_facilitator_orders(
         pl = pl_by_order.get(o.id)
         out.append({
             "id": o.id, "status": o.status,
+            # 2026-06-07 — Order ID.
+            "reference_number": o.reference_number,
             "farmer_user_id": o.farmer_user_id, "client_id": o.client_id,
             "dealer_user_id": o.dealer_user_id,
             "date_from": o.date_from, "date_to": o.date_to,
@@ -3521,6 +3582,7 @@ async def get_facilitator_order(
     packing_fields = await _farmer_packing_fields(db, order, pl, approved_count)
     return {
         "id": order.id, "status": order.status,
+        "reference_number": order.reference_number,
         "farmer_user_id": order.farmer_user_id, "client_id": order.client_id,
         "dealer_user_id": order.dealer_user_id,
         "date_from": order.date_from, "date_to": order.date_to,
@@ -3989,6 +4051,7 @@ async def get_dealer_order(
 
     return {
         "id": order.id, "status": order.status,
+        "reference_number": order.reference_number,
         "farmer_user_id": order.farmer_user_id, "client_id": order.client_id,
         "facilitator_user_id": order.facilitator_user_id,
         "date_from": order.date_from, "date_to": order.date_to,
@@ -4570,6 +4633,8 @@ async def reroute_returned_items(
         locked_timelines=order.locked_timelines,
         expires_at=order.expires_at,
         lineage_root_id=new_lineage_root,
+        # Farmer reroute-returned inherits the Order ID.
+        reference_number=order.reference_number,
     )
     db.add(new_draft)
     await db.flush()
@@ -4812,6 +4877,8 @@ async def dealer_decline_order(
         locked_timelines=order.locked_timelines,
         expires_at=order.expires_at,
         lineage_root_id=new_lineage_root,
+        # Dealer decline-migrate inherits the Order ID.
+        reference_number=order.reference_number,
     )
     db.add(new_draft)
     await db.flush()
@@ -6475,6 +6542,8 @@ async def facilitator_reject_order(
         locked_timelines=order.locked_timelines,
         expires_at=order.expires_at,
         lineage_root_id=new_lineage_root,
+        # Facilitator reject-migrate inherits the Order ID.
+        reference_number=order.reference_number,
     )
     db.add(new_draft)
     await db.flush()
@@ -6615,6 +6684,8 @@ async def return_to_farmer(
         locked_timelines=order.locked_timelines,
         expires_at=order.expires_at,
         lineage_root_id=new_lineage_root,
+        # Facilitator return-to-farmer inherits the Order ID.
+        reference_number=order.reference_number,
     )
     db.add(new_draft)
     await db.flush()
@@ -6782,6 +6853,8 @@ async def facilitator_reroute_returned(
         locked_timelines=order.locked_timelines,
         expires_at=datetime.now(timezone.utc) + timedelta(days=14),
         lineage_root_id=new_lineage_root,
+        # Facilitator reroute-returned inherits the Order ID.
+        reference_number=order.reference_number,
     )
     db.add(new_order)
     await db.flush()
