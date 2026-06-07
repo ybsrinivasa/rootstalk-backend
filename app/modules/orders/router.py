@@ -2795,12 +2795,22 @@ def _timeline_end_date(timeline, sub_crop_start):
 async def _postpone_window_for_item(
     db: AsyncSession, order: Order, item: OrderItem,
 ) -> dict:
-    """Compute max postpone days for an item per the 2026-05-31
-    narrative: max = (timeline_end - today) - 1.
+    """Compute max postpone days for an item per the 2026-06-07 rule:
+    max = (timeline_end - today). Dealer can postpone on any day
+    that is NOT the last day; postpone target may land on the last
+    day, where Sell is still allowed.
 
-    The -1 guarantees the farmer ≥1 clear day to re-route after a
-    postpone elapses naturally. Returns a dict the endpoint can
-    serialise without further work.
+    Examples (timeline ends on day 15):
+      Today day 13: remaining_days=2  max_days=2  can postpone (1-2)
+      Today day 14 (penultimate): remaining_days=1  max_days=1
+        can postpone by exactly 1 day → target = day 15 (last day,
+        Sell still valid)
+      Today day 15 (last day): remaining_days=0  max_days=0  disabled
+
+    Pre-2026-06-07 the formula used `remaining_days - 1` to reserve
+    a clear day for farmer reroute if the postpone elapsed to NA;
+    user direction relaxed that trade-off in favour of dealer
+    flexibility on the penultimate day.
     """
     from datetime import date as _date, timedelta as _timedelta
     sub = (await db.execute(
@@ -2823,7 +2833,7 @@ async def _postpone_window_for_item(
         window_end = order.date_to.date() if hasattr(order.date_to, "date") else order.date_to
 
     remaining_days = (window_end - ist_today).days if window_end else 0
-    max_days = max(0, remaining_days - 1)
+    max_days = max(0, remaining_days)
     return {
         "today": ist_today.isoformat(),
         "timeline_end": window_end.isoformat() if window_end else None,

@@ -1,7 +1,7 @@
 """Orders V2 Batch 7 — postpone-days picker + expiry sweep.
 
 Locks the 2026-05-31 narrative rules:
-- Dealer's postpone picker offers 1 … (remaining_days − 1) so the
+- Dealer's postpone picker offers 1 … remaining_days so the
   farmer always has ≥1 clear day to re-route after a postpone
   elapses.
 - The sweep auto-flips POSTPONED items past their `postponed_until`
@@ -80,11 +80,11 @@ async def test_postpone_window_returns_max_days(db):
     res = await get_postpone_window(
         order_id=order.id, item_id=item.id, db=db, current_user=dealer,
     )
-    # Timeline ends in ~10 days, max_days = remaining - 1 = ~9.
+    # Timeline ends in ~10 days, max_days = remaining = ~10.
     # IST/UTC drift on the day-of-test can shift by 1; just check
     # that the picker offers a sensible non-zero window.
     assert res["can_postpone"] is True
-    assert 1 <= res["max_days"] <= 10
+    assert 1 <= res["max_days"] <= 11
 
 
 @requires_docker
@@ -106,7 +106,7 @@ async def test_postpone_days_within_window_succeeds(db):
 @pytest.mark.asyncio
 async def test_postpone_days_out_of_range_refused(db):
     _, dealer, order, item = await _accepted_order_with_item(db, to_value=3)
-    # max_days = ~(3-1) - 1 = 1. Asking for 50 days is way past.
+    # max_days = ~3 (2026-06-07: dropped the -1). Asking for 50 days is way past.
     with pytest.raises(HTTPException) as exc:
         await postpone_item(
             order_id=order.id, item_id=item.id,
