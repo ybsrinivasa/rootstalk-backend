@@ -3707,6 +3707,176 @@ async def get_facilitator_order(
     }
 
 
+@router.get("/facilitator/pickup")
+async def list_facilitator_pickup(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """For Pickup — the facilitator's separate basket of approved
+    items waiting to be picked up from the dealer + handed off to
+    the farmer.
+
+    Spec (2026-06-07): persists past timeline expiry — the ONE
+    exception to the rule that items disappear from active surfaces
+    when their timeline window closes. Reasoning: once items are
+    APPROVED, the dealer is holding them; the facilitator still has
+    to physically collect them regardless of advisory window state.
+
+    Card surface per Order ID (the PWA groups client-side):
+    - Packing ID (lead identifier — paper-friendly)
+    - Order ID (reference)
+    - Farmer name + phone (handoff)
+    - Dealer shop + address + GPS + phone (pickup)
+    - Items list: brand + qty + cost (post-approval anti-manipulation
+      rule allows full visibility)
+    - Total + status note (Awaiting pickup / Picked up & awaiting
+      farmer receipt)
+
+    Drops out of this list when the farmer marks received
+    (packing_lists.farmer_received_at is set) — order completes
+    automatically via _update_order_status.
+    """
+    await _assert_active_facilitator(db, current_user.id)
+    # Approved items the facilitator owns. DO NOT filter on
+    # archived_at — pickup persists past timeline expiry per spec.
+    rows = (await db.execute(
+        select(OrderItem, Order)
+        .join(Order, Order.id == OrderItem.order_id)
+        .where(
+            Order.facilitator_user_id == current_user.id,
+            OrderItem.status == OrderItemStatus.APPROVED,
+        )
+    )).all()
+
+    # Group items by order_id.
+    items_by_order: dict[str, list[OrderItem]] = {}
+    order_by_id: dict[str, Order] = {}
+    for item, order in rows:
+        items_by_order.setdefault(order.id, []).append(item)
+        order_by_id[order.id] = order
+
+    if not items_by_order:
+        return []
+
+    order_ids = list(items_by_order.keys())
+    pls = (await db.execute(
+        select(PackingList).where(PackingList.order_id.in_(order_ids))
+    )).scalars().all()
+    pl_by_order = {pl.order_id: pl for pl in pls}
+
+    # Drop orders already farmer-received — those are done.
+    live_order_ids = [
+        oid for oid in order_ids
+        if not (pl_by_order.get(oid) and pl_by_order[oid].farmer_received_at)
+    ]
+    if not live_order_ids:
+        return []
+
+    # Resolve farmer / dealer / dealer profile / crop name. Batched.
+    orders = [order_by_id[oid] for oid in live_order_ids]
+    farmer_ids = {o.farmer_user_id for o in orders}
+    dealer_ids = {o.dealer_user_id for o in orders if o.dealer_user_id}
+    user_by_id: dict[str, User] = {}
+    if farmer_ids or dealer_ids:
+        urows = (await db.execute(
+            select(User).where(User.id.in_(list(farmer_ids | dealer_ids)))
+        )).scalars().all()
+        user_by_id = {u.id: u for u in urows}
+    dealer_profile_by_id: dict[str, dict] = {}
+    if dealer_ids:
+        prows = (await db.execute(
+            select(
+                DealerProfile.user_id, DealerProfile.shop_name,
+                DealerProfile.shop_address,
+                DealerProfile.shop_gps_lat, DealerProfile.shop_gps_lng,
+            ).where(DealerProfile.user_id.in_(dealer_ids))
+        )).all()
+        for did, sname, saddr, slat, slng in prows:
+            dealer_profile_by_id[did] = {
+                "shop_name": sname,
+                "shop_address": saddr,
+                "shop_gps_lat": float(slat) if slat is not None else None,
+                "shop_gps_lng": float(slng) if slng is not None else None,
+            }
+    sub_ids = {o.subscription_id for o in orders if o.subscription_id}
+    sub_by_id: dict[str, Subscription] = {}
+    if sub_ids:
+        srows = (await db.execute(
+            select(Subscription).where(Subscription.id.in_(sub_ids))
+        )).scalars().all()
+        sub_by_id = {s.id: s for s in srows}
+    pkg_ids = {s.package_id for s in sub_by_id.values() if s.package_id}
+    pkg_by_id: dict[str, Package] = {}
+    if pkg_ids:
+        prows = (await db.execute(
+            select(Package).where(Package.id.in_(pkg_ids))
+        )).scalars().all()
+        pkg_by_id = {p.id: p for p in prows}
+    crop_cosh_ids = {p.crop_cosh_id for p in pkg_by_id.values() if p.crop_cosh_id}
+    crop_name_by_cosh_id: dict[str, str] = {}
+    if crop_cosh_ids:
+        from app.modules.sync.models import CoshCoreItem
+        crows = (await db.execute(
+            select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
+            .where(CoshCoreItem.cosh_id.in_(crop_cosh_ids))
+        )).all()
+        for cid, tr in crows:
+            if isinstance(tr, dict):
+                name = tr.get("en")
+                if name:
+                    crop_name_by_cosh_id[cid] = name
+
+    out = []
+    for oid in live_order_ids:
+        o = order_by_id[oid]
+        items = items_by_order[oid]
+        pl = pl_by_order.get(oid)
+        farmer = user_by_id.get(o.farmer_user_id)
+        dealer = user_by_id.get(o.dealer_user_id) if o.dealer_user_id else None
+        dprof = dealer_profile_by_id.get(o.dealer_user_id) if o.dealer_user_id else None
+        sub = sub_by_id.get(o.subscription_id) if o.subscription_id else None
+        pkg = pkg_by_id.get(sub.package_id) if (sub and sub.package_id) else None
+        crop_name = (
+            crop_name_by_cosh_id.get(pkg.crop_cosh_id)
+            if (pkg and pkg.crop_cosh_id) else None
+        )
+        total = sum(float(i.price) for i in items if i.price)
+        out.append({
+            "order_id": o.id,
+            "reference_number": o.reference_number,
+            "packing_code": pl.packing_code if pl else None,
+            "packing_shared_at": pl.first_shared_at.isoformat() if pl and pl.first_shared_at else None,
+            "picked_up_at": pl.picked_up_at.isoformat() if pl and pl.picked_up_at else None,
+            "farmer_received_at": None,  # always null here (we filtered them out)
+            "created_at": o.created_at,
+            "subscription_id": o.subscription_id,
+            "crop_name": crop_name,
+            "farmer_name": farmer.name if farmer else None,
+            "farmer_phone": farmer.phone if farmer else None,
+            "farmer_photo_url": farmer.photo_url if farmer else None,
+            "dealer_name": dealer.name if dealer else None,
+            "dealer_phone": dealer.phone if dealer else None,
+            "dealer_shop_name": dprof.get("shop_name") if dprof else None,
+            "dealer_shop_address": dprof.get("shop_address") if dprof else None,
+            "dealer_shop_gps_lat": dprof.get("shop_gps_lat") if dprof else None,
+            "dealer_shop_gps_lng": dprof.get("shop_gps_lng") if dprof else None,
+            "items": [
+                {
+                    "id": i.id,
+                    "brand_name": i.brand_name,
+                    "given_volume": float(i.given_volume) if i.given_volume else None,
+                    "volume_unit": i.volume_unit,
+                    "price": float(i.price) if i.price else None,
+                }
+                for i in items
+            ],
+            "total_amount": total,
+        })
+    # Sort newest first.
+    out.sort(key=lambda d: d["created_at"], reverse=True)
+    return out
+
+
 # ── Dealer: presence heartbeat (Orders V2 Batch 2) ─────────────────────────────
 #
 # The dealer's app calls this every ~20 s while the order detail
