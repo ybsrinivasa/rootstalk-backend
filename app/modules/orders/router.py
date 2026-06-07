@@ -3455,14 +3455,58 @@ async def list_facilitator_orders(
             select(User).where(User.id.in_(ids))
         )).scalars().all()
         user_by_id = {u.id: u for u in urows}
-    shop_by_dealer_id: dict[str, str | None] = {}
+    # 2026-06-07 — Dealer profile bundle: shop name + address + GPS
+    # so the facilitator card can render the full dealer contact
+    # block (call + maps link) per user spec for the Routed/Returned/
+    # With Farmer card bodies.
+    dealer_profile_by_id: dict[str, dict] = {}
     if dealer_ids:
-        srows = (await db.execute(
-            select(DealerProfile.user_id, DealerProfile.shop_name)
-            .where(DealerProfile.user_id.in_(dealer_ids))
+        prows = (await db.execute(
+            select(
+                DealerProfile.user_id,
+                DealerProfile.shop_name,
+                DealerProfile.shop_address,
+                DealerProfile.shop_gps_lat,
+                DealerProfile.shop_gps_lng,
+            ).where(DealerProfile.user_id.in_(dealer_ids))
         )).all()
-        for did, sname in srows:
-            shop_by_dealer_id[did] = sname
+        for did, sname, saddr, slat, slng in prows:
+            dealer_profile_by_id[did] = {
+                "shop_name": sname,
+                "shop_address": saddr,
+                "shop_gps_lat": float(slat) if slat is not None else None,
+                "shop_gps_lng": float(slng) if slng is not None else None,
+            }
+
+    # 2026-06-07 — Crop name per order via subscription → package →
+    # CoshCoreItem.translations. Batched lookups (one query per FK).
+    sub_ids = {o.subscription_id for o in orders if o.subscription_id}
+    sub_by_id: dict[str, Subscription] = {}
+    if sub_ids:
+        srows = (await db.execute(
+            select(Subscription).where(Subscription.id.in_(sub_ids))
+        )).scalars().all()
+        sub_by_id = {s.id: s for s in srows}
+    pkg_ids = {s.package_id for s in sub_by_id.values() if s.package_id}
+    pkg_by_id: dict[str, Package] = {}
+    if pkg_ids:
+        prows = (await db.execute(
+            select(Package).where(Package.id.in_(pkg_ids))
+        )).scalars().all()
+        pkg_by_id = {p.id: p for p in prows}
+    crop_cosh_ids = {p.crop_cosh_id for p in pkg_by_id.values() if p.crop_cosh_id}
+    crop_name_by_cosh_id: dict[str, str] = {}
+    if crop_cosh_ids:
+        from app.modules.sync.models import CoshCoreItem
+        crows = (await db.execute(
+            select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
+            .where(CoshCoreItem.cosh_id.in_(crop_cosh_ids))
+        )).all()
+        for cid, tr in crows:
+            if isinstance(tr, dict):
+                name = tr.get("en")
+                if name:
+                    crop_name_by_cosh_id[cid] = name
 
     # Packing rows for the Pickup / Completed pill membership.
     order_ids = [o.id for o in orders]
@@ -3494,6 +3538,13 @@ async def list_facilitator_orders(
             continue
         farmer = user_by_id.get(o.farmer_user_id)
         dealer = user_by_id.get(o.dealer_user_id) if o.dealer_user_id else None
+        dealer_prof = dealer_profile_by_id.get(o.dealer_user_id) if o.dealer_user_id else None
+        sub = sub_by_id.get(o.subscription_id) if o.subscription_id else None
+        pkg = pkg_by_id.get(sub.package_id) if (sub and sub.package_id) else None
+        crop_name = (
+            crop_name_by_cosh_id.get(pkg.crop_cosh_id)
+            if (pkg and pkg.crop_cosh_id) else None
+        )
         counts = {
             "pending": sum(1 for i in live_items if i.status == OrderItemStatus.PENDING),
             "available": sum(1 for i in live_items if i.status == OrderItemStatus.AVAILABLE),
@@ -3524,7 +3575,16 @@ async def list_facilitator_orders(
             "farmer_photo_url": farmer.photo_url if farmer else None,
             "dealer_name": dealer.name if dealer else None,
             "dealer_phone": dealer.phone if dealer else None,
-            "dealer_shop_name": shop_by_dealer_id.get(o.dealer_user_id) if o.dealer_user_id else None,
+            "dealer_shop_name": dealer_prof.get("shop_name") if dealer_prof else None,
+            # 2026-06-07 — full dealer location for Routed/Returned/
+            # With-Farmer card bodies (call + address + maps link).
+            "dealer_shop_address": dealer_prof.get("shop_address") if dealer_prof else None,
+            "dealer_shop_gps_lat": dealer_prof.get("shop_gps_lat") if dealer_prof else None,
+            "dealer_shop_gps_lng": dealer_prof.get("shop_gps_lng") if dealer_prof else None,
+            # 2026-06-07 — Crop name + subscription_id for the card
+            # header (per facilitator card spec).
+            "crop_name": crop_name,
+            "subscription_id": o.subscription_id,
             # 2026-06-06 — Packing fields drive the Pickup pill
             # (approved items the facilitator hasn't picked up yet)
             # and the Completed pill (farmer-confirmed receipt).
