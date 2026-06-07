@@ -3412,6 +3412,7 @@ async def farmer_mark_packing_received(
 @router.get("/facilitator/orders")
 async def list_facilitator_orders(
     status_filter: Optional[str] = None,
+    include_husks: bool = False,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -3423,6 +3424,20 @@ async def list_facilitator_orders(
     Spec: returned items belong to the facilitator (not the farmer)
     while the facilitator owns the order. Farmer side will hide its
     own returned strip when `o.facilitator_user_id` is set.
+
+    2026-06-07 — Husk suppression. After the facilitator forwards
+    returned items to a new dealer (reroute) or hands them back to
+    the farmer (return-to-farmer), the source order's items become
+    REROUTED — audit-only pointers, no live work. Orders whose
+    EVERY active item is REROUTED are filtered out of the default
+    response so the facilitator's queue isn't cluttered with
+    historical husks. `?include_husks=true` opts in (audit
+    deep-dive). Mixed orders (some REROUTED + some live) still
+    surface because live work remains.
+
+    All counts (`item_count`, `item_status_counts`) compute off
+    live items only — REROUTED rows are excluded from both so the
+    card numbers reflect the actionable work, not the history.
     """
     await _assert_active_facilitator(db, current_user.id)
     q = select(Order).where(Order.facilitator_user_id == current_user.id).order_by(Order.created_at.desc())
@@ -3469,16 +3484,24 @@ async def list_facilitator_orders(
             )
         )
         items = items_result.scalars().all()
+        # 2026-06-07 — Live items = non-archived AND non-REROUTED.
+        # Husk = order with zero live items (every item migrated away
+        # to a new lineage child). Filter unless include_husks=true.
+        live_items = [
+            i for i in items if i.status != OrderItemStatus.REROUTED
+        ]
+        if not live_items and not include_husks:
+            continue
         farmer = user_by_id.get(o.farmer_user_id)
         dealer = user_by_id.get(o.dealer_user_id) if o.dealer_user_id else None
         counts = {
-            "pending": sum(1 for i in items if i.status == OrderItemStatus.PENDING),
-            "available": sum(1 for i in items if i.status == OrderItemStatus.AVAILABLE),
-            "postponed": sum(1 for i in items if i.status == OrderItemStatus.POSTPONED),
-            "not_available": sum(1 for i in items if i.status == OrderItemStatus.NOT_AVAILABLE),
-            "sent_for_approval": sum(1 for i in items if i.status == OrderItemStatus.SENT_FOR_APPROVAL),
-            "approved": sum(1 for i in items if i.status == OrderItemStatus.APPROVED),
-            "rejected": sum(1 for i in items if i.status == OrderItemStatus.REJECTED),
+            "pending": sum(1 for i in live_items if i.status == OrderItemStatus.PENDING),
+            "available": sum(1 for i in live_items if i.status == OrderItemStatus.AVAILABLE),
+            "postponed": sum(1 for i in live_items if i.status == OrderItemStatus.POSTPONED),
+            "not_available": sum(1 for i in live_items if i.status == OrderItemStatus.NOT_AVAILABLE),
+            "sent_for_approval": sum(1 for i in live_items if i.status == OrderItemStatus.SENT_FOR_APPROVAL),
+            "approved": sum(1 for i in live_items if i.status == OrderItemStatus.APPROVED),
+            "rejected": sum(1 for i in live_items if i.status == OrderItemStatus.REJECTED),
         }
         pl = pl_by_order.get(o.id)
         out.append({
@@ -3489,7 +3512,7 @@ async def list_facilitator_orders(
             "dealer_user_id": o.dealer_user_id,
             "date_from": o.date_from, "date_to": o.date_to,
             "created_at": o.created_at,
-            "item_count": len(items),
+            "item_count": len(live_items),
             "pending_count": counts["pending"],
             # Per-status counts so the PWA can render strips for
             # returned / awaiting-approval without a per-id round-trip.
