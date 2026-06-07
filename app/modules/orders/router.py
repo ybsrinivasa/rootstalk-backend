@@ -1009,20 +1009,29 @@ async def cancel_order(
 
     prev_order_status = order.status.value if hasattr(order.status, "value") else order.status
 
-    # Snapshot the live items (i.e. anything that isn't already
-    # archived from a prior partial flow) and migrate them onto a
-    # fresh DRAFT order. REROUTED rows stay behind as historical
-    # pointers on the husk.
-    skip_statuses = {OrderItemStatus.REROUTED, OrderItemStatus.REMOVED}
-    # Don't migrate timeline-archived items either — their advisory
-    # context is gone, re-routing them would just leak ghost rows.
-    items_q = await db.execute(
-        select(OrderItem).where(
-            OrderItem.order_id == order.id,
-            OrderItem.archived_at.is_(None),
+    # 2026-06-07 — Cascade cancel across the whole lineage.
+    # User direction: "If a farmer cancels the Order, then it remains
+    # cancelled for both facilitator and the dealer." The Order ID
+    # groups all sub-orders sharing one reference_number /
+    # lineage_root_id; cancelling the source cascades CANCELLED
+    # silently to every non-terminal sibling. No popup / FCM noise —
+    # siblings just surface as Cancelled in History on next refresh.
+    #
+    # All items from every cancelled sibling migrate to ONE new
+    # DRAFT so the farmer ends up with a single re-route target.
+    root_id = order.lineage_root_id or order.id
+    sibling_rows = (await db.execute(
+        select(Order).where(
+            ((Order.lineage_root_id == root_id) | (Order.id == root_id))
+            & (Order.id != order.id)
         )
-    )
-    items_to_migrate = [it for it in items_q.scalars().all() if it.status not in skip_statuses]
+    )).scalars().all()
+    siblings_to_cancel = [
+        s for s in sibling_rows if s.status not in terminal
+    ]
+
+    # Lease check on the source only — the farmer tapped cancel here.
+    # Siblings cancel silently regardless of their own lease state.
 
     new_draft = Order(
         subscription_id=order.subscription_id,
@@ -1041,69 +1050,114 @@ async def cancel_order(
         # 2026-06-07 — Lineage shares one Order ID. Cancel-migrate
         # carries the source's reference_number to the new draft.
         reference_number=order.reference_number,
+        # Inherit lineage_root_id so the new draft groups with the
+        # rest of the chain on read endpoints.
+        lineage_root_id=(order.lineage_root_id or order.id),
     )
     db.add(new_draft)
     await db.flush()
 
-    for it in items_to_migrate:
-        prev_item_status = it.status.value if hasattr(it.status, "value") else it.status
+    # Backfill lineage_root_id on the source if it's still null
+    # (this is the first lineage event for it).
+    if order.lineage_root_id is None:
+        order.lineage_root_id = order.id
 
-        new_item = OrderItem(
-            order_id=new_draft.id,
-            practice_id=it.practice_id,
-            timeline_id=it.timeline_id,
-            brand_cosh_id=it.brand_cosh_id,
-            brand_name=it.brand_name,
-            given_volume=it.given_volume,
-            volume_unit=it.volume_unit,
-            price=it.price,
-            estimated_volume=it.estimated_volume,
-            relation_id=it.relation_id,
-            relation_type=it.relation_type,
-            relation_role=it.relation_role,
-            scan_verified=False,  # reset for the new leg
-            status=OrderItemStatus.PENDING,
-            snapshot_id=it.snapshot_id,
-            lineage_id=it.lineage_id,  # ← key: preserves the journey
+    skip_statuses = {OrderItemStatus.REROUTED, OrderItemStatus.REMOVED}
+
+    async def _migrate_items_and_cancel(target: Order, *, is_source: bool) -> int:
+        """Migrate target's live items to the shared new_draft and
+        mark target CANCELLED. Returns count of migrated items."""
+        items_q = await db.execute(
+            select(OrderItem).where(
+                OrderItem.order_id == target.id,
+                OrderItem.archived_at.is_(None),
+            )
         )
-        db.add(new_item)
-        await db.flush()
+        to_migrate = [
+            it for it in items_q.scalars().all()
+            if it.status not in skip_statuses
+        ]
+        for it in to_migrate:
+            prev_item_status = it.status.value if hasattr(it.status, "value") else it.status
+            new_item = OrderItem(
+                order_id=new_draft.id,
+                practice_id=it.practice_id,
+                timeline_id=it.timeline_id,
+                brand_cosh_id=it.brand_cosh_id,
+                brand_name=it.brand_name,
+                given_volume=it.given_volume,
+                volume_unit=it.volume_unit,
+                price=it.price,
+                estimated_volume=it.estimated_volume,
+                relation_id=it.relation_id,
+                relation_type=it.relation_type,
+                relation_role=it.relation_role,
+                scan_verified=False,
+                status=OrderItemStatus.PENDING,
+                snapshot_id=it.snapshot_id,
+                lineage_id=it.lineage_id,
+            )
+            db.add(new_item)
+            await db.flush()
+            await _record_event(
+                db, lineage_id=it.lineage_id,
+                event_type="REROUTED_FROM",
+                actor_user_id=current_user.id, actor_role="FARMER",
+                order_id=target.id, order_item_id=it.id,
+                prev_status=prev_item_status,
+                new_status=OrderItemStatus.REROUTED.value,
+                metadata={
+                    "to_order_id": new_draft.id,
+                    "to_order_item_id": new_item.id,
+                    "reason": "farmer_cancel_cascade" if not is_source else "farmer_cancel",
+                },
+            )
+            await _record_event(
+                db, lineage_id=it.lineage_id,
+                event_type="REROUTED_TO",
+                actor_user_id=current_user.id, actor_role="FARMER",
+                order_id=new_draft.id, order_item_id=new_item.id,
+                prev_status=OrderItemStatus.REROUTED.value,
+                new_status=OrderItemStatus.PENDING.value,
+                metadata={
+                    "from_order_id": target.id,
+                    "from_order_item_id": it.id,
+                    "reason": "farmer_cancel_cascade" if not is_source else "farmer_cancel",
+                },
+            )
+            it.status = OrderItemStatus.REROUTED
 
-        # Audit pair: leg-out on the husk, leg-in on the draft.
-        # Recorded before we flip the old row so its FK is still valid.
+        # Husk goes terminal. Backfill its lineage_root_id if null.
+        if target.lineage_root_id is None:
+            target.lineage_root_id = root_id
+        target.status = OrderStatus.CANCELLED
+        return len(to_migrate)
+
+    migrated_source = await _migrate_items_and_cancel(order, is_source=True)
+    cascaded_counts = []
+    for sibling in siblings_to_cancel:
+        n = await _migrate_items_and_cancel(sibling, is_source=False)
+        cascaded_counts.append((sibling.id, n))
+        # Per-sibling audit so the History row carries the silent-
+        # cascade reason. No FCM (intentional — see spec).
         await _record_event(
-            db,
-            lineage_id=it.lineage_id,
-            event_type="REROUTED_FROM",
-            actor_user_id=current_user.id,
-            actor_role="FARMER",
-            order_id=order.id,
-            order_item_id=it.id,
-            prev_status=prev_item_status,
-            new_status=OrderItemStatus.REROUTED.value,
-            metadata={"to_order_id": new_draft.id, "to_order_item_id": new_item.id},
-        )
-        await _record_event(
-            db,
-            lineage_id=it.lineage_id,
-            event_type="REROUTED_TO",
-            actor_user_id=current_user.id,
-            actor_role="FARMER",
-            order_id=new_draft.id,
-            order_item_id=new_item.id,
-            prev_status=OrderItemStatus.REROUTED.value,
-            new_status=OrderItemStatus.PENDING.value,
-            metadata={"from_order_id": order.id, "from_order_item_id": it.id},
+            db, lineage_id=sibling.id,
+            event_type="CANCELLED_BY_FARMER",
+            actor_user_id=current_user.id, actor_role="FARMER",
+            order_id=sibling.id,
+            prev_status=(sibling.status.value if hasattr(sibling.status, "value") else sibling.status),
+            new_status=OrderStatus.CANCELLED.value,
+            metadata={
+                "trigger": "lineage_cascade",
+                "source_order_id": order.id,
+                "new_draft_order_id": new_draft.id,
+                "migrated_item_count": n,
+            },
         )
 
-        it.status = OrderItemStatus.REROUTED
-
-    # Husk goes terminal.
-    order.status = OrderStatus.CANCELLED
-
-    # Order-level audit. `lineage_id = order.id` keeps the schema
-    # happy; order ids and item lineage ids share the UUID namespace
-    # so this can't collide with an item lineage in practice.
+    # Source-level audit (after the cascade so its metadata can
+    # enumerate the siblings).
+    total_migrated = migrated_source + sum(n for _, n in cascaded_counts)
     await _record_event(
         db,
         lineage_id=order.id,
@@ -1115,7 +1169,10 @@ async def cancel_order(
         new_status=OrderStatus.CANCELLED.value,
         metadata={
             "new_draft_order_id": new_draft.id,
-            "migrated_item_count": len(items_to_migrate),
+            "migrated_item_count": migrated_source,
+            "cascaded_sibling_count": len(cascaded_counts),
+            "cascaded_sibling_ids": [sid for sid, _ in cascaded_counts],
+            "total_migrated_item_count": total_migrated,
         },
     )
 
@@ -1123,7 +1180,9 @@ async def cancel_order(
     return {
         "status": order.status,
         "new_draft_order_id": new_draft.id,
-        "migrated_item_count": len(items_to_migrate),
+        "migrated_item_count": migrated_source,
+        "cascaded_sibling_count": len(cascaded_counts),
+        "total_migrated_item_count": total_migrated,
     }
 
 
@@ -1162,8 +1221,20 @@ async def delete_cancelled_order(
     # Wipe the REROUTED husk-items so the Order row can drop without
     # tripping the order_items.order_id FK. The events table keeps
     # the lineage trail via SET NULL.
-    from sqlalchemy import delete as sa_delete
+    from sqlalchemy import delete as sa_delete, update as sa_update
     await db.execute(sa_delete(OrderItem).where(OrderItem.order_id == order.id))
+
+    # 2026-06-07 — Other orders in the same lineage may carry
+    # lineage_root_id pointing at this husk's id (the cancel +
+    # reroute paths now set this consistently). Null those
+    # references before dropping the row; the audit chain still
+    # survives via reference_number + the events table's
+    # lineage_id. Self-reference also handled.
+    await db.execute(
+        sa_update(Order)
+        .where(Order.lineage_root_id == order.id)
+        .values(lineage_root_id=None)
+    )
 
     await _record_event(
         db,
