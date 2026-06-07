@@ -3587,12 +3587,36 @@ async def get_facilitator_order(
         "dealer_user_id": order.dealer_user_id,
         "date_from": order.date_from, "date_to": order.date_to,
         "created_at": order.created_at,
+        # 2026-06-07 — Anti-manipulation rule: facilitator sees per-
+        # item brand / qty / cost ONLY for items in APPROVED status
+        # (post farmer-approval, needed for the pickup at the
+        # dealer). All other statuses (PENDING / AVAILABLE / POSTPONED
+        # / NOT_AVAILABLE / SENT_FOR_APPROVAL / REJECTED) ship as
+        # count-only — practice_id + status, brand/qty/cost null.
         "items": [
             {
-                "id": i.id, "practice_id": i.practice_id,
-                "status": i.status, "brand_cosh_id": i.brand_cosh_id,
-                "brand_name": i.brand_name, "given_volume": float(i.given_volume) if i.given_volume else None,
-                "volume_unit": i.volume_unit, "price": float(i.price) if i.price else None,
+                "id": i.id,
+                "practice_id": i.practice_id,
+                "status": i.status,
+                "brand_cosh_id": (
+                    i.brand_cosh_id if i.status == OrderItemStatus.APPROVED else None
+                ),
+                "brand_name": (
+                    i.brand_name if i.status == OrderItemStatus.APPROVED else None
+                ),
+                "given_volume": (
+                    float(i.given_volume)
+                    if i.status == OrderItemStatus.APPROVED and i.given_volume
+                    else None
+                ),
+                "volume_unit": (
+                    i.volume_unit if i.status == OrderItemStatus.APPROVED else None
+                ),
+                "price": (
+                    float(i.price)
+                    if i.status == OrderItemStatus.APPROVED and i.price
+                    else None
+                ),
             }
             for i in items
         ],
