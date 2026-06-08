@@ -571,15 +571,32 @@ async def list_subscription_orders(
     # 2026-06-06 — Packing receipt status for the "Pick up" banner
     # on the Manage tab. Batch-loaded so each card knows whether the
     # farmer has already confirmed receipt for that order.
+    # 2026-06-08 — Also load picked_up_by_user_id so the banner can
+    # switch from "Pick up" → "Receive" wording when a facilitator
+    # has already collected the items from the dealer (farmer is now
+    # receiving from facilitator, not picking up from dealer).
     pl_received_by_order: dict[str, bool] = {}
+    pl_picked_up_by_role: dict[str, str | None] = {}
     if regular_rows:
         regular_ids = [o.id for o in regular_rows]
         pl_rows = (await db.execute(
-            select(PackingList.order_id, PackingList.farmer_received_at)
-            .where(PackingList.order_id.in_(regular_ids))
+            select(
+                PackingList.order_id,
+                PackingList.farmer_received_at,
+                PackingList.picked_up_at,
+                PackingList.picked_up_by_user_id,
+            ).where(PackingList.order_id.in_(regular_ids))
         )).all()
-        for oid, recv_at in pl_rows:
+        # Build a quick lookup from order to facilitator_user_id for
+        # the role derivation below.
+        fac_by_order = {o.id: o.facilitator_user_id for o in regular_rows}
+        for oid, recv_at, picked_at, picked_by in pl_rows:
             pl_received_by_order[oid] = recv_at is not None
+            if picked_at and picked_by:
+                if picked_by == fac_by_order.get(oid):
+                    pl_picked_up_by_role[oid] = "FACILITATOR"
+                else:
+                    pl_picked_up_by_role[oid] = "FARMER"
 
     # 2026-06-02 — recipient info batch-loaded once for the whole
     # list so cards can show dealer / facilitator name + shop +
@@ -711,6 +728,11 @@ async def list_subscription_orders(
             "pickup_ready_count": (
                 approved_count if not pl_received_by_order.get(o.id, False) else 0
             ),
+            # 2026-06-08 — When 'FACILITATOR', the farmer's banner +
+            # confirmation page switch wording from "Pick up" →
+            # "Receive" (facilitator has already collected from the
+            # dealer; farmer is receiving from them).
+            "packing_picked_up_by_role": pl_picked_up_by_role.get(o.id),
             # 2026-06-03 — Lineage so the Manage tab can group sub-
             # orders under one card per original procurement intent.
             # When null on a legacy row, client treats the order's
