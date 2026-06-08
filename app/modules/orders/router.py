@@ -4937,6 +4937,30 @@ async def reroute_returned_items(
     leg's dealer did.
     """
     order = await _get_farmer_order(db, order_id, current_user.id)
+
+    # 2026-06-08 — Spec defence: when a facilitator owns the order
+    # (`order.facilitator_user_id` is set), the returned items belong
+    # to the facilitator's queue. The facilitator either forwards
+    # them to another dealer via /facilitator/orders/{id}/reroute-
+    # returned OR hands them back via /return-to-farmer. Letting the
+    # farmer reroute here would create a new DRAFT with
+    # facilitator_user_id=None and silently steal the order out of
+    # the facilitator's loop. The PWA Manage tab + review page
+    # already hide the CTA; this guard is defence-in-depth for
+    # stale tabs / direct URL hits.
+    if order.facilitator_user_id:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "facilitator_owns_order",
+                "message": (
+                    "This order is being handled by your facilitator. "
+                    "They will forward returned items to another "
+                    "dealer or hand them back to you."
+                ),
+            },
+        )
+
     payload = data or {}
     include_postponed = bool(payload.get("include_postponed"))
 
