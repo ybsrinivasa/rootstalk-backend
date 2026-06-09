@@ -577,6 +577,9 @@ async def list_subscription_orders(
     # receiving from facilitator, not picking up from dealer).
     pl_received_by_order: dict[str, bool] = {}
     pl_picked_up_by_role: dict[str, str | None] = {}
+    # 2026-06-09 — Packing ID per order so the Manage tab's Pickup
+    # pill chunk can lead with it (Facilitator pickup-card parity).
+    pl_code_by_order: dict[str, str | None] = {}
     if regular_rows:
         regular_ids = [o.id for o in regular_rows]
         pl_rows = (await db.execute(
@@ -585,13 +588,15 @@ async def list_subscription_orders(
                 PackingList.farmer_received_at,
                 PackingList.picked_up_at,
                 PackingList.picked_up_by_user_id,
+                PackingList.packing_code,
             ).where(PackingList.order_id.in_(regular_ids))
         )).all()
         # Build a quick lookup from order to facilitator_user_id for
         # the role derivation below.
         fac_by_order = {o.id: o.facilitator_user_id for o in regular_rows}
-        for oid, recv_at, picked_at, picked_by in pl_rows:
+        for oid, recv_at, picked_at, picked_by, p_code in pl_rows:
             pl_received_by_order[oid] = recv_at is not None
+            pl_code_by_order[oid] = p_code
             if picked_at and picked_by:
                 if picked_by == fac_by_order.get(oid):
                     pl_picked_up_by_role[oid] = "FACILITATOR"
@@ -733,6 +738,10 @@ async def list_subscription_orders(
             # "Receive" (facilitator has already collected from the
             # dealer; farmer is receiving from them).
             "packing_picked_up_by_role": pl_picked_up_by_role.get(o.id),
+            # 2026-06-09 — Packing ID for the Manage tab Pickup pill
+            # chunk so the farmer can lead with it (parity with
+            # Facilitator pickup card composition).
+            "packing_code": pl_code_by_order.get(o.id),
             # 2026-06-03 — Lineage so the Manage tab can group sub-
             # orders under one card per original procurement intent.
             # When null on a legacy row, client treats the order's
