@@ -2197,6 +2197,7 @@ def consolidate_purchased_items(rows: list[dict]) -> list[dict]:
 
 @router.get("/dealer/orders")
 async def list_dealer_orders(
+    include_husks: bool = False,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -2204,21 +2205,33 @@ async def list_dealer_orders(
 
     2026-06-05 — Enriched with per-status item counts and
     packing-list state so the PWA can split the feed across pills
-    (Pending / Postponed / With Farmer / Packing / Completed)
-    without a per-order round-trip.
+    (Pending / Postponed / With Farmer / Packing) without a per-
+    order round-trip.
+
+    2026-06-09 — Husk suppression (Batch 3 of Dealer mirroring).
+    Default response excludes terminal orders (CANCELLED / EXPIRED)
+    AND orders where every active item is REROUTED (audit-only
+    husks left behind by a reroute). `?include_husks=true` lifts
+    both filters — used by /dealer/history's Cancelled tab to
+    surface the dealer's terminal sub-orders.
+
+    `item_status_counts` is always computed off LIVE items
+    (REROUTED excluded) so card numbers reflect actionable work.
     """
     from app.modules.clients.models import Client
     from app.modules.orders.models import BrandLookupCache
 
     await _assert_active_dealer(db, current_user.id)
+    base_where = [Order.dealer_user_id == current_user.id]
+    if not include_husks:
+        base_where.append(Order.status.notin_([
+            OrderStatus.CANCELLED, OrderStatus.EXPIRED,
+        ]))
     rows = (await db.execute(
         select(Order, User, Client)
         .join(User, User.id == Order.farmer_user_id)
         .join(Client, Client.id == Order.client_id)
-        .where(
-            Order.dealer_user_id == current_user.id,
-            Order.status.notin_([OrderStatus.CANCELLED, OrderStatus.EXPIRED]),
-        )
+        .where(*base_where)
         .order_by(Order.created_at.desc())
     )).all()
 
@@ -2302,14 +2315,20 @@ async def list_dealer_orders(
     out = []
     for o, u, c in rows:
         items = items_by_order.get(o.id, [])
+        # 2026-06-09 — Live items only (REROUTED excluded). Counts
+        # reflect actionable work; pure husks (every item REROUTED)
+        # are filtered out unless include_husks=True.
+        live_items = [i for i in items if i.status != OrderItemStatus.REROUTED]
+        if items and not live_items and not include_husks:
+            continue
         counts = {
-            "pending": sum(1 for i in items if i.status == OrderItemStatus.PENDING),
-            "available": sum(1 for i in items if i.status == OrderItemStatus.AVAILABLE),
-            "postponed": sum(1 for i in items if i.status == OrderItemStatus.POSTPONED),
-            "not_available": sum(1 for i in items if i.status == OrderItemStatus.NOT_AVAILABLE),
-            "sent_for_approval": sum(1 for i in items if i.status == OrderItemStatus.SENT_FOR_APPROVAL),
-            "approved": sum(1 for i in items if i.status == OrderItemStatus.APPROVED),
-            "rejected": sum(1 for i in items if i.status == OrderItemStatus.REJECTED),
+            "pending": sum(1 for i in live_items if i.status == OrderItemStatus.PENDING),
+            "available": sum(1 for i in live_items if i.status == OrderItemStatus.AVAILABLE),
+            "postponed": sum(1 for i in live_items if i.status == OrderItemStatus.POSTPONED),
+            "not_available": sum(1 for i in live_items if i.status == OrderItemStatus.NOT_AVAILABLE),
+            "sent_for_approval": sum(1 for i in live_items if i.status == OrderItemStatus.SENT_FOR_APPROVAL),
+            "approved": sum(1 for i in live_items if i.status == OrderItemStatus.APPROVED),
+            "rejected": sum(1 for i in live_items if i.status == OrderItemStatus.REJECTED),
         }
         pl = pl_by_order.get(o.id)
         # Packing items — only when there are APPROVED items AND the
