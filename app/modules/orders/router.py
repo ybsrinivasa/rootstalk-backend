@@ -524,6 +524,7 @@ async def list_farmer_orders(
 @router.get("/farmer/subscriptions/{subscription_id}/orders")
 async def list_subscription_orders(
     subscription_id: str,
+    include_husks: bool = False,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -536,6 +537,16 @@ async def list_subscription_orders(
     counted only when active (archived rows live in History
     elsewhere). Seed-order rows interleave via `kind="SEED"` so the
     PWA can render both shapes in one chronological list.
+
+    2026-06-09 — Husk suppression (parity with /dealer/orders +
+    /facilitator/orders). The Manage tab Routed pill matched any
+    order with awaiting/returned/pickup === 0, which silently
+    included REROUTED-only husks (lineage parents whose items all
+    migrated to a new order). New `include_husks=false` default
+    skips those husks; `?include_husks=true` lifts the filter for
+    the per-crop History page's audit deep-dive. Each SubOrder row
+    also ships `rerouted_count` so the PWA can distinguish a husk
+    from a live order in History's Cancelled tab.
     """
     from app.modules.advisory.models import Relation
     from app.modules.seed_mgmt.models import SeedOrderFull, SeedOrderStatus, SeedVariety
@@ -687,6 +698,16 @@ async def list_subscription_orders(
         returned_count = sum(1 for i in items if i.status in RETURNED)
         postponed_count = sum(1 for i in items if i.status in POSTPONED)
         approved_count = sum(1 for i in items if i.status == OrderItemStatus.APPROVED)
+        # 2026-06-09 — REROUTED items live on a husk after a reroute /
+        # cancel-migrate. Count separately so the PWA's History page
+        # can show "lineage husk" rows under Cancelled.
+        rerouted_count = sum(1 for i in items if i.status == OrderItemStatus.REROUTED)
+        live_items = [i for i in items if i.status != OrderItemStatus.REROUTED]
+        # Pure husk = the order has items, but every active item is
+        # REROUTED (no live work). Drop from default response; lift
+        # via `include_husks=true` for History.
+        if items and not live_items and not include_husks:
+            continue
         # 2026-06-05 — Round queueing for the Manage tab card. The PWA
         # already filters to "earliest awaiting order" globally; this
         # surfaces "Approval 1 of 2" WITHIN one order when the dealer
@@ -727,6 +748,10 @@ async def list_subscription_orders(
             "approval_rounds_pending": len(queued_rounds_for_o),
             "returned_count": returned_count,
             "postponed_count": postponed_count,
+            # 2026-06-09 — Lineage husk indicator. PWA History page
+            # uses this to surface a "lineage husk" row under
+            # Cancelled even when order.status is still PROCESSING.
+            "rerouted_count": rerouted_count,
             # 2026-06-06 — Drives the emerald "Pick up N items from X"
             # banner on the Manage card. Counts approved items only
             # when the farmer hasn't yet confirmed receipt.
