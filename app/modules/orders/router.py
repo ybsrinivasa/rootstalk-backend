@@ -5243,10 +5243,25 @@ async def dealer_decline_order(
 
     Mirrors the farmer-side cancel-with-migrate flow: the husk goes
     CANCELLED with a DECLINED_BY_DEALER event; items duplicate into a
-    new DRAFT (status PENDING, no recipient) carrying the source's
-    lineage_root_id so the farmer's Manage tab groups them under the
-    same procurement intent. The farmer then picks a new dealer or
-    facilitator on the new DRAFT.
+    new order carrying the source's lineage_root_id so the
+    procurement intent stays grouped.
+
+    Branch on `source.facilitator_user_id`:
+    - **No facilitator** (direct farmer → dealer): new order in
+      DRAFT, both recipient fields cleared. The farmer's Manage tab
+      Routed pill picks it up and they pick a new recipient.
+    - **Facilitator owns** (farmer → facilitator → dealer):
+      returned-items-stay-with-facilitator rule applies at the
+      order level too. New order in ACCEPTED status,
+      facilitator_user_id preserved, dealer_user_id cleared. The
+      facilitator's Pending pill (expanded to include
+      `ACCEPTED && !dealer_user_id`) picks it up and the chunk
+      offers Forward-to-another-dealer.
+
+    2026-06-09 — Earlier code unconditionally nulled
+    facilitator_user_id, dropping the order back on the farmer
+    even when a facilitator was actively handling it. Same bug
+    class as the 2026-06-08 farmer-reroute fix.
     """
     await _assert_active_dealer(db, current_user.id)
     order = (await db.execute(
@@ -5267,6 +5282,7 @@ async def dealer_decline_order(
     )).scalars().all()
 
     new_lineage_root = order.lineage_root_id or order.id
+    facilitator_owns = order.facilitator_user_id is not None
     new_draft = Order(
         subscription_id=order.subscription_id,
         farmer_user_id=order.farmer_user_id,
@@ -5274,9 +5290,13 @@ async def dealer_decline_order(
         category=order.category,
         date_from=order.date_from,
         date_to=order.date_to,
-        status=OrderStatus.DRAFT,
+        # Facilitator-routed → new order lands in ACCEPTED (the
+        # facilitator already committed by forwarding; no need to
+        # re-Accept). Direct-dealer → DRAFT so the farmer can
+        # pick a new recipient.
+        status=OrderStatus.ACCEPTED if facilitator_owns else OrderStatus.DRAFT,
         dealer_user_id=None,
-        facilitator_user_id=None,
+        facilitator_user_id=order.facilitator_user_id if facilitator_owns else None,
         locked_timelines=order.locked_timelines,
         expires_at=order.expires_at,
         lineage_root_id=new_lineage_root,
@@ -5344,14 +5364,21 @@ async def dealer_decline_order(
         order_id=order.id,
         prev_status=OrderStatus.SENT.value,
         new_status=OrderStatus.CANCELLED.value,
-        metadata={"new_draft_order_id": new_draft.id,
-                  "migrated_item_count": migrated},
+        metadata={
+            "new_draft_order_id": new_draft.id,
+            "migrated_item_count": migrated,
+            # 2026-06-09 — Routing target lets the UI / reports
+            # know whether the items went to the facilitator's
+            # queue or the farmer's queue.
+            "routed_back_to": "FACILITATOR" if facilitator_owns else "FARMER",
+        },
     )
     await db.commit()
     return {
         "status": order.status,
         "new_draft_order_id": new_draft.id,
         "migrated_item_count": migrated,
+        "routed_back_to": "FACILITATOR" if facilitator_owns else "FARMER",
     }
 
 
