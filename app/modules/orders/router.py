@@ -1248,29 +1248,27 @@ async def delete_cancelled_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Farmer deletes a CANCELLED order husk.
+    """Farmer deletes a CANCELLED husk or a DRAFT order.
 
-    Only allowed once the order is in CANCELLED status — i.e. the
-    server has acknowledged the cancel and the farmer has chosen to
-    discard the husk instead of (or in addition to) re-sending the
-    migrated draft.
+    Two valid call shapes:
+    - CANCELLED: standard husk delete (existing behavior). Items
+      sit on the husk as REROUTED historical pointers and get
+      removed here.
+    - DRAFT: 2026-06-09 — the farmer discards a never-sent draft
+      (typically created by dealer-decline). The DRAFT carries
+      PENDING items; delete them along with the order row.
 
-    Items already migrated under their REROUTED status; they sit on
-    this order as historical pointers and get removed here. The
-    `order_item_events` rows that referenced them keep their
-    `lineage_id` populated; their `order_id` / `order_item_id` FKs
-    SET NULL via the migration so the trail survives row deletion.
-
-    Deleting a DRAFT or any non-terminal status is refused — the
-    farmer must cancel first.
+    Any other status is refused. `order_item_events` rows survive
+    via the FK SET NULL migration so the audit trail (lineage_id +
+    reference_number) is preserved.
     """
     order = await _get_farmer_order(db, order_id, current_user.id)
-    if order.status != OrderStatus.CANCELLED:
+    if order.status not in (OrderStatus.CANCELLED, OrderStatus.DRAFT):
         raise HTTPException(
             status_code=400,
             detail={
-                "code": "must_cancel_first",
-                "message": "Only cancelled orders can be deleted. Cancel this order first.",
+                "code": "delete_not_allowed",
+                "message": "Only CANCELLED husks or DRAFT orders can be deleted.",
             },
         )
 
@@ -3752,7 +3750,14 @@ async def route_order_to_dealer(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Facilitator assigns a dealer to handle a specific order."""
+    """Facilitator assigns a dealer to handle a specific order.
+
+    2026-06-09 — Status set to SENT (not PROCESSING). The dealer
+    sees the order in their Pending pill with the Accept / Decline
+    buttons, identical to a direct farmer→dealer order. Earlier
+    code flipped straight to PROCESSING, robbing the dealer of the
+    chance to decline (per user direction 2026-06-09 Issue 1).
+    """
     await _assert_active_facilitator(db, current_user.id)
     order = (await db.execute(
         select(Order).where(Order.id == order_id, Order.facilitator_user_id == current_user.id)
@@ -3771,13 +3776,16 @@ async def route_order_to_dealer(
     await _assert_active_dealer(db, dealer_user_id)
     prev_status = order.status.value if hasattr(order.status, "value") else order.status
     order.dealer_user_id = dealer_user_id
-    order.status = OrderStatus.PROCESSING
+    # 2026-06-09 — SENT so the dealer can Accept / Decline. The
+    # facilitator handed off the routing decision; the dealer still
+    # owns the commit-to-process decision.
+    order.status = OrderStatus.SENT
     await _record_event(
         db, lineage_id=order.id,
         event_type="ROUTED_TO_DEALER",
         actor_user_id=current_user.id, actor_role="FACILITATOR",
         order_id=order.id,
-        prev_status=prev_status, new_status=OrderStatus.PROCESSING.value,
+        prev_status=prev_status, new_status=OrderStatus.SENT.value,
         metadata={"dealer_user_id": order.dealer_user_id},
     )
     await db.commit()
