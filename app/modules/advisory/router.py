@@ -9860,22 +9860,23 @@ async def get_client_sp_lineage(
 # Filter chips (?crop_cosh_id=, ?package_id=, ?timeline_id=) follow the
 # user's selection and are independently clearable.
 
-async def _crop_names_by_cosh_id(db: AsyncSession, cosh_ids: set[str]) -> dict[str, str]:
-    """Look up English names for a set of biological_name cosh_ids.
-    Returns {cosh_id: name_en} — missing cosh_ids are absent (caller
-    falls back to the raw id)."""
-    if not cosh_ids:
-        return {}
-    rows = (await db.execute(
-        select(CoshCoreItem).where(
-            CoshCoreItem.cosh_id.in_(cosh_ids),
-            CoshCoreItem.core_type == COSH_BIOLOGICAL_NAMES_CORE,
-        )
-    )).scalars().all()
-    return {
-        r.cosh_id: (r.translations or {}).get("en", r.cosh_id)
-        for r in rows
-    }
+async def _crop_names_by_cosh_id(
+    db: AsyncSession, cosh_ids: set[str], lang: str = "en",
+) -> dict[str, str]:
+    """Look up biological_name display labels for a set of cosh_ids,
+    prefering `lang` then English. Returns {cosh_id: name} — missing
+    cosh_ids are absent (caller falls back to the raw id).
+
+    Default `lang="en"` preserves legacy behaviour for the existing
+    SE-portal / CCA admin callers (those endpoints are not user-
+    localised). PWA-facing callers added later should pass
+    `current_user.language_code or "en"` explicitly.
+
+    Thin wrapper over `app.services.i18n_cosh.resolve_names_by_cosh_id`."""
+    from app.services.i18n_cosh import resolve_names_by_cosh_id
+    return await resolve_names_by_cosh_id(
+        db, cosh_ids, lang, core_type=COSH_BIOLOGICAL_NAMES_CORE,
+    )
 
 
 @router.get("/client/{client_id}/cca/crops")

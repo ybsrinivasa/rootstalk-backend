@@ -40,6 +40,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.sync.models import CoshCoreItem
+from app.services.i18n_cosh import pick_translation
 
 
 @dataclass(frozen=True)
@@ -134,7 +135,7 @@ async def find_reference_images(
             cosh_id=c.cosh_id if c else url,
             url=url,
             media_type=meta.get("media_type", "image"),
-            caption=translations.get(language_code) or translations.get("en"),
+            caption=pick_translation(translations, language_code, "") or None,
         ))
     return out
 
@@ -173,8 +174,7 @@ async def build_google_images_query(
         row = by_id.get(cid)
         if not row:
             continue
-        translations = row.translations or {}
-        name = translations.get(language_code) or translations.get("en")
+        name = pick_translation(row.translations, language_code, "")
         if name:
             parts.append(name)
     return " ".join(parts).strip()

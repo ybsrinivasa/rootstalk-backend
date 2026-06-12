@@ -25,6 +25,7 @@ from app.modules.advisory.models import PGRecommendation, SPRecommendation, Time
 from app.modules.platform.models import UserRole, RoleType
 from app.modules.orders.models import DealerProfile, OrderItem, OrderItemStatus
 from app.modules.clients.models import Client, ClientLocation, ClientStatus
+from app.services.i18n_cosh import pick_translation
 from app.services.bl11_subscription_state import (
     DEALER as BL11_DEALER, FARMER as BL11_FARMER,
     is_self_unsubscribable, validate_transition as validate_sub_transition,
@@ -655,7 +656,7 @@ async def promoter_crops(
     name_by_id: dict[str, str | None] = {}
     for cosh_id, translations in name_rows:
         if isinstance(translations, dict):
-            name_by_id[cosh_id] = translations.get(lang) or translations.get("en")
+            name_by_id[cosh_id] = pick_translation(translations, lang, "")
         else:
             name_by_id[cosh_id] = None
     # 2026-05-30 — surface the per-crop AREA_WISE / PLANT_WISE measure
@@ -1059,7 +1060,7 @@ async def discover_crops(
     name_by_id: dict[str, str | None] = {}
     for cosh_id, translations in name_rows:
         if isinstance(translations, dict):
-            name_by_id[cosh_id] = translations.get(lang) or translations.get("en")
+            name_by_id[cosh_id] = pick_translation(translations, lang, "")
         else:
             name_by_id[cosh_id] = None
     return [{"crop_cosh_id": c, "name": name_by_id.get(c)} for c in crop_ids]
@@ -1123,12 +1124,7 @@ async def discover_crops_and_companies(
         )).all()
         for cosh_id, translations in name_rows:
             if isinstance(translations, dict):
-                crop_name_by_id[cosh_id] = (
-                    translations.get(lang)
-                    or translations.get("en")
-                    or translations.get("English")
-                    or cosh_id
-                )
+                crop_name_by_id[cosh_id] = pick_translation(translations, lang, cosh_id)
 
     # Resolve client details.
     client_ids = list(client_to_crops.keys())
@@ -1148,11 +1144,7 @@ async def discover_crops_and_companies(
         )
     )).scalar_one_or_none()
     if dist_core and isinstance(dist_core.translations, dict):
-        district_name = (
-            dist_core.translations.get(lang)
-            or dist_core.translations.get("en")
-            or dist_core.translations.get("English")
-        )
+        district_name = pick_translation(dist_core.translations, lang, "") or None
 
     crops = sorted(
         [
@@ -2042,6 +2034,7 @@ async def promoter_assignment_today(
         db,
         farmer_user_id=sub.farmer_user_id,
         only_subscription_id=subscription_id,
+        lang=current_user.language_code or "en",
     )
     if not days:
         # Active assignment but no rendered window yet (e.g. farmer
@@ -3689,7 +3682,7 @@ async def my_subscriptions(
         )).all()
         for cosh_id, translations in name_rows:
             if isinstance(translations, dict):
-                crop_name_by_id[cosh_id] = translations.get(lang) or translations.get("en")
+                crop_name_by_id[cosh_id] = pick_translation(translations, lang, "")
             else:
                 crop_name_by_id[cosh_id] = None
 
@@ -4087,6 +4080,7 @@ async def get_today_advisory(
     """
     return await _today_advisory_for_user(
         db, farmer_user_id=current_user.id, only_subscription_id=None,
+        lang=current_user.language_code or "en",
     )
 
 
@@ -4095,6 +4089,7 @@ async def _today_advisory_for_user(
     *,
     farmer_user_id: str,
     only_subscription_id: Optional[str] = None,
+    lang: str = "en",
 ):
     """Shared kernel for the today-advisory view.
 
@@ -4532,7 +4527,7 @@ async def _today_advisory_for_user(
                 .where(CoshCoreItem.cosh_id.in_(ref_ids))
             )).all():
                 if isinstance(translations, dict):
-                    label = translations.get("en") or translations.get("English")
+                    label = pick_translation(translations, lang, "")
                     if label:
                         name_by_cosh_id[cosh_id] = label
 

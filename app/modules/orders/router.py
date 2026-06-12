@@ -4944,6 +4944,7 @@ async def get_item_brand_options(
         )).scalar_one_or_none()
     result = await get_brand_options(
         db, item.practice_id, current_user.id, snapshot=snapshot,
+        lang=current_user.language_code or "en",
     )
     return result.to_dict()
 

@@ -186,6 +186,7 @@ async def get_brand_options(
     practice_id: str,
     dealer_user_id: str,
     snapshot=None,
+    lang: str = "en",
 ) -> BrandOptionsResult:
     """
     Returns brand options for a given practice and dealer.
@@ -244,7 +245,10 @@ async def get_brand_options(
             unit_family = None
             if brand_entry:
                 if brand_entry.translations:
-                    brand_name = brand_entry.translations.get("en") or locked_cosh_ref
+                    from app.services.i18n_cosh import pick_translation
+                    brand_name = pick_translation(
+                        brand_entry.translations, lang, locked_cosh_ref,
+                    )
                 # Batch 25 — also resolve unit family for the locked brand
                 # so the PWA's Given-Volume dropdown is constrained.
                 fid = (brand_entry.metadata_ or {}).get("formulation_cosh_id")

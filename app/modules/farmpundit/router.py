@@ -16,6 +16,7 @@ from app.modules.farmpundit.models import (
     Query, QueryMedia, QueryRemark, QueryResponse, QueryResponseMedia,
     StandardResponse, QueryStatus, QueryRemarkAction,
 )
+from app.services.i18n_cosh import pick_translation
 from app.services.bl12_query_routing import route_query, ExpertSlot
 from app.services.bl12_query_state import (
     PANEL as BL12_PANEL, PRIMARY as BL12_PRIMARY,
@@ -385,7 +386,7 @@ async def get_pundit_profile_detail(
             .where(CoshCoreItem.cosh_id.in_(ref_ids))
         )).all():
             if isinstance(translations, dict):
-                label = translations.get("en") or translations.get("English")
+                label = pick_translation(translations, current_user.language_code or "en", "")
                 if label:
                     name_by_cosh_id[cosh_id] = label
 
@@ -1732,7 +1733,7 @@ async def search_pundits(
             )
         )).all():
             if isinstance(translations, dict):
-                label = translations.get("en") or translations.get("English")
+                label = pick_translation(translations, current_user.language_code or "en", "")
                 if label:
                     name_by_cosh_id[cosh_id] = label
 
@@ -1931,7 +1932,7 @@ async def get_company_pundit_profile(
             .where(CoshCoreItem.cosh_id.in_(ref_ids))
         )).all():
             if isinstance(translations, dict):
-                label = translations.get("en") or translations.get("English")
+                label = pick_translation(translations, current_user.language_code or "en", "")
                 if label:
                     name_by_cosh_id[cosh_id] = label
 
@@ -2504,10 +2505,9 @@ async def get_query_detail_pundit(
             )
         )).scalar_one_or_none()
         if rp_row and isinstance(rp_row.translations, dict):
-            response_problem_name = (
-                rp_row.translations.get("en")
-                or rp_row.translations.get("English")
-            )
+            response_problem_name = pick_translation(
+                rp_row.translations, current_user.language_code or "en", ""
+            ) or None
 
     # Batch resolve every Cosh translation the response needs in
     # one query: query_types (Nature of Query), the crop name, and
@@ -2666,10 +2666,9 @@ async def get_query_detail_farmer(
             select(CoshCoreItem).where(CoshCoreItem.cosh_id == response.problem_cosh_id)
         )).scalar_one_or_none()
         if prow and isinstance(prow.translations, dict):
-            problem_name = (
-                prow.translations.get("en")
-                or prow.translations.get("English")
-            )
+            problem_name = pick_translation(
+                prow.translations, current_user.language_code or "en", ""
+            ) or None
 
     return {
         "id": query.id,
