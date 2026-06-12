@@ -148,29 +148,17 @@ async def _filter_rows(
     return out
 
 
-def _translation_en(core: Optional[CoshCoreItem], fallback: str) -> str:
-    if core is None:
-        return fallback
-    t = core.translations or {}
-    return t.get("en") or t.get("English") or fallback
-
-
 async def _resolve_core_names(
-    db: AsyncSession, *, core_type: str, cosh_ids: set[str],
+    db: AsyncSession, *, core_type: str, cosh_ids: set[str], lang: str = "en",
 ) -> dict[str, str]:
-    """Return {cosh_id: en_name} for the given Core items. Inactive
-    items are dropped — keeps stale items out of farmer dropdowns."""
-    cosh_ids = {c for c in cosh_ids if c is not None}
-    if not cosh_ids:
-        return {}
-    cores = (await db.execute(
-        select(CoshCoreItem).where(
-            CoshCoreItem.core_type == core_type,
-            CoshCoreItem.cosh_id.in_(cosh_ids),
-            CoshCoreItem.status == "active",
-        )
-    )).scalars().all()
-    return {c.cosh_id: _translation_en(c, c.cosh_id) for c in cores}
+    """Return {cosh_id: name} for the given Core items, prefering `lang`
+    then English. Inactive items are dropped — keeps stale items out
+    of farmer dropdowns. Thin wrapper over the central helper; kept as
+    a module function so existing callers don't have to rewire."""
+    from app.services.i18n_cosh import resolve_names_by_cosh_id
+    return await resolve_names_by_cosh_id(
+        db, set(cosh_ids), lang, core_type=core_type,
+    )
 
 
 def _options_from_rows(
@@ -191,7 +179,7 @@ def _options_from_rows(
 
 async def _list_dimension(
     db: AsyncSession, filters: DiagnosisFilters, *,
-    position: int, core_type: str,
+    position: int, core_type: str, lang: str = "en",
 ) -> list[dict]:
     rows = await _filter_rows(db, filters)
     cosh_ids = _options_from_rows(
@@ -199,7 +187,7 @@ async def _list_dimension(
         blank_box=PD_BLANK_BOX_BY_CORE.get(core_type),
     )
     name_by_id = await _resolve_core_names(
-        db, core_type=core_type, cosh_ids=cosh_ids,
+        db, core_type=core_type, cosh_ids=cosh_ids, lang=lang,
     )
     items = [
         {"cosh_id": c, "name": name_by_id.get(c, c)}
@@ -211,28 +199,30 @@ async def _list_dimension(
 # ── Dimension lookups ─────────────────────────────────────────────────────
 
 async def list_crop_stages(
-    db: AsyncSession, *, crop_cosh_id: str,
+    db: AsyncSession, *, crop_cosh_id: str, lang: str = "en",
 ) -> list[dict]:
     return await _list_dimension(
         db, DiagnosisFilters(crop_cosh_id=crop_cosh_id),
         position=PD_POS_CROP_STAGE, core_type=COSH_CROP_STAGES_CORE,
+        lang=lang,
     )
 
 
 async def list_plant_parts(
     db: AsyncSession, *, crop_cosh_id: str,
-    crop_stage: Optional[str] = None,
+    crop_stage: Optional[str] = None, lang: str = "en",
 ) -> list[dict]:
     return await _list_dimension(
         db, DiagnosisFilters(crop_cosh_id=crop_cosh_id, crop_stage=crop_stage),
         position=PD_POS_PLANT_PART, core_type=COSH_PLANT_PARTS_CORE,
+        lang=lang,
     )
 
 
 async def list_plant_subparts(
     db: AsyncSession, *, crop_cosh_id: str,
     crop_stage: Optional[str] = None,
-    plant_part: Optional[str] = None,
+    plant_part: Optional[str] = None, lang: str = "en",
 ) -> list[dict]:
     return await _list_dimension(
         db, DiagnosisFilters(
@@ -240,6 +230,7 @@ async def list_plant_subparts(
             plant_part=plant_part,
         ),
         position=PD_POS_PLANT_SUBPART, core_type=COSH_PLANT_SUBPARTS_CORE,
+        lang=lang,
     )
 
 
@@ -247,7 +238,7 @@ async def list_symptoms(
     db: AsyncSession, *, crop_cosh_id: str,
     crop_stage: Optional[str] = None,
     plant_part: Optional[str] = None,
-    plant_subpart: Optional[str] = None,
+    plant_subpart: Optional[str] = None, lang: str = "en",
 ) -> list[dict]:
     return await _list_dimension(
         db, DiagnosisFilters(
@@ -255,6 +246,7 @@ async def list_symptoms(
             plant_part=plant_part, plant_subpart=plant_subpart,
         ),
         position=PD_POS_SYMPTOM, core_type=COSH_DAMAGE_SYMPTOMS_CORE,
+        lang=lang,
     )
 
 
@@ -263,7 +255,7 @@ async def list_subsymptoms(
     crop_stage: Optional[str] = None,
     plant_part: Optional[str] = None,
     plant_subpart: Optional[str] = None,
-    symptom: Optional[str] = None,
+    symptom: Optional[str] = None, lang: str = "en",
 ) -> list[dict]:
     return await _list_dimension(
         db, DiagnosisFilters(
@@ -272,6 +264,7 @@ async def list_subsymptoms(
             symptom=symptom,
         ),
         position=PD_POS_SUBSYMPTOM, core_type=COSH_DAMAGE_SUBSYMPTOMS_CORE,
+        lang=lang,
     )
 
 
@@ -293,6 +286,7 @@ async def list_candidates(
     plant_subpart: Optional[str] = None,
     symptom: Optional[str] = None,
     subsymptom: Optional[str] = None,
+    lang: str = "en",
 ) -> list[dict]:
     """Final diagnosis lookup. Returns candidate pests with their
     life stage + priority rank, sorted by rank (lowest = highest
@@ -340,13 +334,13 @@ async def list_candidates(
         rank_ids.add(rank)
 
     pest_names = await _resolve_core_names(
-        db, core_type=COSH_BIOLOGICAL_NAMES_CORE, cosh_ids=pest_ids,
+        db, core_type=COSH_BIOLOGICAL_NAMES_CORE, cosh_ids=pest_ids, lang=lang,
     )
     stage_names = await _resolve_core_names(
-        db, core_type=COSH_PEST_STAGES_CORE, cosh_ids=stage_ids,
+        db, core_type=COSH_PEST_STAGES_CORE, cosh_ids=stage_ids, lang=lang,
     )
     rank_names = await _resolve_core_names(
-        db, core_type=COSH_PRIORITY_RANK_PESTS_CORE, cosh_ids=rank_ids,
+        db, core_type=COSH_PRIORITY_RANK_PESTS_CORE, cosh_ids=rank_ids, lang=lang,
     )
 
     # Dedupe by (pest, stage) keeping the row whose rank int is

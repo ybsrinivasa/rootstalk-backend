@@ -888,6 +888,7 @@ async def ai_direct_diagnose(
         db,
         crop_cosh_id=request.crop_cosh_id,
         crop_stage=request.crop_stage_cosh_id,
+        lang=current_user.language_code or "en",
     )
     # Collapse to one entry per pest (Claude shouldn't see the same
     # pest 3× because Cosh has separate rows per life-stage); keep
@@ -1133,7 +1134,10 @@ async def diagnosis_crop_stages(
     current_user: User = Depends(get_current_user),
 ):
     from app.services.pest_diagnosis_view import list_crop_stages
-    return await list_crop_stages(db, crop_cosh_id=crop_cosh_id)
+    return await list_crop_stages(
+        db, crop_cosh_id=crop_cosh_id,
+        lang=current_user.language_code or "en",
+    )
 
 
 @router.get("/diagnosis/plant-parts")
@@ -1146,6 +1150,7 @@ async def diagnosis_plant_parts(
     from app.services.pest_diagnosis_view import list_plant_parts
     return await list_plant_parts(
         db, crop_cosh_id=crop_cosh_id, crop_stage=crop_stage,
+        lang=current_user.language_code or "en",
     )
 
 
@@ -1161,6 +1166,7 @@ async def diagnosis_plant_subparts(
     return await list_plant_subparts(
         db, crop_cosh_id=crop_cosh_id, crop_stage=crop_stage,
         plant_part=plant_part,
+        lang=current_user.language_code or "en",
     )
 
 
@@ -1177,6 +1183,7 @@ async def diagnosis_symptoms(
     return await list_symptoms(
         db, crop_cosh_id=crop_cosh_id, crop_stage=crop_stage,
         plant_part=plant_part, plant_subpart=plant_subpart,
+        lang=current_user.language_code or "en",
     )
 
 
@@ -1195,6 +1202,7 @@ async def diagnosis_subsymptoms(
         db, crop_cosh_id=crop_cosh_id, crop_stage=crop_stage,
         plant_part=plant_part, plant_subpart=plant_subpart,
         symptom=symptom,
+        lang=current_user.language_code or "en",
     )
 
 
@@ -1220,6 +1228,7 @@ async def diagnosis_candidates(
         db, crop_cosh_id=crop_cosh_id, crop_stage=crop_stage,
         plant_part=plant_part, plant_subpart=plant_subpart,
         symptom=symptom, subsymptom=subsymptom,
+        lang=current_user.language_code or "en",
     )
 
 

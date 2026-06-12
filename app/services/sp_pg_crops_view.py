@@ -53,30 +53,17 @@ async def _walk_active_rows(db: AsyncSession) -> list[CoshConnectRow]:
     return list(rows)
 
 
-def _translation_en(core: Optional[CoshCoreItem], fallback: str) -> str:
-    if core is None:
-        return fallback
-    t = core.translations or {}
-    return t.get("en") or t.get("English") or fallback
-
-
 async def _resolve_core_names(
-    db: AsyncSession, *, core_type: str, cosh_ids: set[str],
+    db: AsyncSession, *, core_type: str, cosh_ids: set[str], lang: str = "en",
 ) -> dict[str, str]:
-    """Return {cosh_id: en_name} for *active* Core items of the
-    requested core_type. Inactive items are dropped, so a stale
-    SP / PG / crop never surfaces in dropdowns."""
-    cosh_ids = {c for c in cosh_ids if c}
-    if not cosh_ids:
-        return {}
-    cores = (await db.execute(
-        select(CoshCoreItem).where(
-            CoshCoreItem.core_type == core_type,
-            CoshCoreItem.cosh_id.in_(cosh_ids),
-            CoshCoreItem.status == "active",
-        )
-    )).scalars().all()
-    return {c.cosh_id: _translation_en(c, c.cosh_id) for c in cores}
+    """Return {cosh_id: name} for *active* Core items of the requested
+    core_type, prefering `lang` then English. Inactive items are
+    dropped — keeps stale SP / PG / crop entries out of dropdowns.
+    Thin wrapper over the central helper."""
+    from app.services.i18n_cosh import resolve_names_by_cosh_id
+    return await resolve_names_by_cosh_id(
+        db, set(cosh_ids), lang, core_type=core_type,
+    )
 
 
 def _collect_at_position(
@@ -104,7 +91,7 @@ def _name_items(
 
 
 async def list_crops_for_pg(
-    db: AsyncSession, *, pg_cosh_id: str,
+    db: AsyncSession, *, pg_cosh_id: str, lang: str = "en",
 ) -> list[dict]:
     """Crops applicable to a Problem Group. Returns [{cosh_id, name_en}],
     sorted alphabetically. Empty list when the PG has no rows or is
@@ -115,13 +102,13 @@ async def list_crops_for_pg(
     ]
     crop_ids = _collect_at_position(rows, SPPC_POS_CROP)
     names = await _resolve_core_names(
-        db, core_type=COSH_BIOLOGICAL_NAMES_CORE, cosh_ids=crop_ids,
+        db, core_type=COSH_BIOLOGICAL_NAMES_CORE, cosh_ids=crop_ids, lang=lang,
     )
     return _name_items(crop_ids, names)
 
 
 async def list_pgs_for_crop(
-    db: AsyncSession, *, crop_cosh_id: str,
+    db: AsyncSession, *, crop_cosh_id: str, lang: str = "en",
 ) -> list[dict]:
     """Problem Groups applicable to a crop. Reverse direction of
     `list_crops_for_pg`."""
@@ -131,13 +118,13 @@ async def list_pgs_for_crop(
     ]
     pg_ids = _collect_at_position(rows, SPPC_POS_PG)
     names = await _resolve_core_names(
-        db, core_type=COSH_PROBLEM_GROUPS_CORE, cosh_ids=pg_ids,
+        db, core_type=COSH_PROBLEM_GROUPS_CORE, cosh_ids=pg_ids, lang=lang,
     )
     return _name_items(pg_ids, names)
 
 
 async def list_sps_for_pg_crop(
-    db: AsyncSession, *, pg_cosh_id: str, crop_cosh_id: str,
+    db: AsyncSession, *, pg_cosh_id: str, crop_cosh_id: str, lang: str = "en",
 ) -> list[dict]:
     """Specific Problems at the (PG, crop) intersection."""
     rows = [
@@ -147,7 +134,7 @@ async def list_sps_for_pg_crop(
     ]
     sp_ids = _collect_at_position(rows, SPPC_POS_SP)
     names = await _resolve_core_names(
-        db, core_type=COSH_BIOLOGICAL_NAMES_CORE, cosh_ids=sp_ids,
+        db, core_type=COSH_BIOLOGICAL_NAMES_CORE, cosh_ids=sp_ids, lang=lang,
     )
     return _name_items(sp_ids, names)
 
@@ -174,7 +161,7 @@ async def pg_for_sp_crop(
 
 
 async def list_sps_for_crop(
-    db: AsyncSession, *, crop_cosh_id: str,
+    db: AsyncSession, *, crop_cosh_id: str, lang: str = "en",
 ) -> list[dict]:
     """All Specific Problems applicable to a crop, across every PG.
 
@@ -189,6 +176,6 @@ async def list_sps_for_crop(
     ]
     sp_ids = _collect_at_position(rows, SPPC_POS_SP)
     names = await _resolve_core_names(
-        db, core_type=COSH_BIOLOGICAL_NAMES_CORE, cosh_ids=sp_ids,
+        db, core_type=COSH_BIOLOGICAL_NAMES_CORE, cosh_ids=sp_ids, lang=lang,
     )
     return _name_items(sp_ids, names)

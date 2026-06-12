@@ -50,27 +50,16 @@ def _endpoint_at_position(row: CoshConnectRow, position: int) -> Optional[str]:
     return None
 
 
-def _translation_en(core: Optional[CoshCoreItem], fallback: str) -> str:
-    if core is None:
-        return fallback
-    t = core.translations or {}
-    return t.get("en") or t.get("English") or fallback
-
-
 async def _resolve_core_names(
-    db: AsyncSession, *, core_type: str, cosh_ids: set[str],
+    db: AsyncSession, *, core_type: str, cosh_ids: set[str], lang: str = "en",
 ) -> dict[str, str]:
-    cosh_ids = {c for c in cosh_ids if c}
-    if not cosh_ids:
-        return {}
-    cores = (await db.execute(
-        select(CoshCoreItem).where(
-            CoshCoreItem.core_type == core_type,
-            CoshCoreItem.cosh_id.in_(cosh_ids),
-            CoshCoreItem.status == "active",
-        )
-    )).scalars().all()
-    return {c.cosh_id: _translation_en(c, c.cosh_id) for c in cores}
+    """Thin wrapper over the central helper. Default lang=en preserves
+    legacy behaviour for any caller that doesn't yet thread the user's
+    language through."""
+    from app.services.i18n_cosh import resolve_names_by_cosh_id
+    return await resolve_names_by_cosh_id(
+        db, set(cosh_ids), lang, core_type=core_type,
+    )
 
 
 async def _walk_rows_for_crop(
@@ -89,7 +78,7 @@ async def _walk_rows_for_crop(
 
 
 async def list_dus_options_for_crop(
-    db: AsyncSession, *, crop_cosh_id: str,
+    db: AsyncSession, *, crop_cosh_id: str, lang: str = "en",
 ) -> list[dict]:
     """Full DUS taxonomy for a crop, nested for cascading pickers.
 
@@ -150,16 +139,16 @@ async def list_dus_options_for_crop(
         descriptor_ids.add(_endpoint_at_position(r, DCD_POS_DESCRIPTOR) or "")
 
     part_names = await _resolve_core_names(
-        db, core_type=COSH_PLANT_PARTS_CORE, cosh_ids=part_ids,
+        db, core_type=COSH_PLANT_PARTS_CORE, cosh_ids=part_ids, lang=lang,
     )
     subpart_names = await _resolve_core_names(
-        db, core_type=COSH_PLANT_SUBPARTS_CORE, cosh_ids=subpart_ids,
+        db, core_type=COSH_PLANT_SUBPARTS_CORE, cosh_ids=subpart_ids, lang=lang,
     )
     character_names = await _resolve_core_names(
-        db, core_type=COSH_DUS_CHARACTERS_CORE, cosh_ids=character_ids,
+        db, core_type=COSH_DUS_CHARACTERS_CORE, cosh_ids=character_ids, lang=lang,
     )
     descriptor_names = await _resolve_core_names(
-        db, core_type=COSH_DUS_DESCRIPTORS_CORE, cosh_ids=descriptor_ids,
+        db, core_type=COSH_DUS_DESCRIPTORS_CORE, cosh_ids=descriptor_ids, lang=lang,
     )
 
     # tree[part_id][subpart_id_or_None][character_id] = set[descriptor_id]
