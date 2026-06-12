@@ -351,15 +351,25 @@ class BrandLookupCache(Base):
     common_name_cosh_id: Mapped[str] = mapped_column(String(100), primary_key=True)
     trade_name_cosh_id: Mapped[str] = mapped_column(String(100), primary_key=True)
     trade_name: Mapped[str] = mapped_column(String(500), nullable=False)
+    # 2026-06-12 — locale map mirrored from cosh_core_items.translations
+    # at refresh time. Read sites call pick_translation(translations, lang,
+    # trade_name). Null until the first post-migration refresh.
+    trade_name_translations: Mapped[dict] = mapped_column(JSON, nullable=True)
     manufacturer_cosh_id: Mapped[str] = mapped_column(String(100), nullable=True)
     manufacturer_name: Mapped[str] = mapped_column(String(500), nullable=True)
+    manufacturer_translations: Mapped[dict] = mapped_column(JSON, nullable=True)
     formulation_cosh_id: Mapped[str] = mapped_column(String(100), nullable=True)
     formulation_name: Mapped[str] = mapped_column(String(500), nullable=True)
+    formulation_translations: Mapped[dict] = mapped_column(JSON, nullable=True)
     # Fix 2026-06-01 — sourced from Cosh's tradenames_units Connect.
     # Each trade name has 1-2 allowed pack units (e.g. {"cosh_id":...,
     # "name":"kg"}). Replaces the formulation-class inference for the
     # dealer's Unit dropdown so the dropdown only shows units this
     # brand is actually sold in.
+    #
+    # 2026-06-12 — refresh now also writes {"cosh_id", "name",
+    # "translations"} per entry. Older cached rows keep the 2-field
+    # shape until the next /admin/brand-cache/refresh.
     units: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     refreshed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow,

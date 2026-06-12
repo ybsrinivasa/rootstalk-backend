@@ -4422,16 +4422,26 @@ async def _today_advisory_for_user(
             ) == "APPROVED"
         }
         manufacturer_by_brand: dict[str, str | None] = {}
+        brand_loc: dict[str, str | None] = {}
         if approved_brand_ids:
             mfr_rows = (await db.execute(
                 select(
                     BrandLookupCache.trade_name_cosh_id,
+                    BrandLookupCache.trade_name,
+                    BrandLookupCache.trade_name_translations,
                     BrandLookupCache.manufacturer_name,
+                    BrandLookupCache.manufacturer_translations,
                 ).where(BrandLookupCache.trade_name_cosh_id.in_(approved_brand_ids))
             )).all()
-            for tn_id, mfr in mfr_rows:
-                if tn_id not in manufacturer_by_brand and mfr:
-                    manufacturer_by_brand[tn_id] = mfr
+            for tn_id, tn_en, tn_tr, mfr_en, mfr_tr in mfr_rows:
+                if tn_id not in manufacturer_by_brand and mfr_en:
+                    manufacturer_by_brand[tn_id] = pick_translation(
+                        mfr_tr or {}, lang, mfr_en,
+                    )
+                if tn_id not in brand_loc and tn_en:
+                    brand_loc[tn_id] = pick_translation(
+                        tn_tr or {}, lang, tn_en,
+                    )
         # Take the first (most recent) row per practice_id.
         fulfilment_by_practice: dict[str, dict] = {}
         for it, ord_row, pl in active_items_rows:
@@ -4454,7 +4464,10 @@ async def _today_advisory_for_user(
                 "order_status": ord_row.status.value if hasattr(ord_row.status, "value") else ord_row.status,
                 "dealer_user_id": ord_row.dealer_user_id,
                 "facilitator_user_id": ord_row.facilitator_user_id,
-                "brand_name": it.brand_name if show_money else None,
+                "brand_name": (
+                    brand_loc.get(it.brand_cosh_id) or it.brand_name
+                    if show_money else None
+                ),
                 "manufacturer_name": (
                     manufacturer_by_brand.get(it.brand_cosh_id)
                     if (show_money and it.brand_cosh_id) else None

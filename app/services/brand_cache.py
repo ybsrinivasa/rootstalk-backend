@@ -119,9 +119,16 @@ async def rebuild_brand_cache(db: AsyncSession) -> int:
             CoshCoreItem.status == "active",
         )
     )).scalars().all() if needed_cosh_ids else []
+    # English baseline (fallback at read time when translations map is
+    # null or lacks the user's locale).
     en_name = {
         c.cosh_id: ((c.translations or {}).get("en") or c.cosh_id)
         for c in cores
+    }
+    # Full translations map per cosh_id — mirrored verbatim into the
+    # cache so read sites can pick the right locale without a JOIN.
+    translations_by_id = {
+        c.cosh_id: (c.translations or {}) for c in cores
     }
     valid_core_ids = {c.cosh_id for c in cores}
 
@@ -149,6 +156,8 @@ async def rebuild_brand_cache(db: AsyncSession) -> int:
         fmt_id = tn_to_formulation.get(tn)
         # Build the unit list once; the cache row mirrors what the
         # /brand-options endpoint surfaces straight to the PWA dropdown.
+        # `translations` per unit lets read sites localise the dropdown
+        # without re-querying cosh_core_items.
         units: list[dict] = []
         seen_unit_ids: set[str] = set()
         for unit_id in tn_to_unit_ids.get(tn, []):
@@ -158,6 +167,7 @@ async def rebuild_brand_cache(db: AsyncSession) -> int:
             units.append({
                 "cosh_id": unit_id,
                 "name": en_name.get(unit_id, unit_id),
+                "translations": translations_by_id.get(unit_id, {}),
             })
         # Alphabetical so the dropdown order is stable.
         units.sort(key=lambda u: u["name"].lower())
@@ -165,10 +175,17 @@ async def rebuild_brand_cache(db: AsyncSession) -> int:
             common_name_cosh_id=cn,
             trade_name_cosh_id=tn,
             trade_name=en_name.get(tn, tn),
+            trade_name_translations=translations_by_id.get(tn, {}),
             manufacturer_cosh_id=mfr_id,
             manufacturer_name=en_name.get(mfr_id) if mfr_id else None,
+            manufacturer_translations=(
+                translations_by_id.get(mfr_id, {}) if mfr_id else None
+            ),
             formulation_cosh_id=fmt_id,
             formulation_name=en_name.get(fmt_id) if fmt_id else None,
+            formulation_translations=(
+                translations_by_id.get(fmt_id, {}) if fmt_id else None
+            ),
             units=units,
             refreshed_at=now,
         ))

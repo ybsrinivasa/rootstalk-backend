@@ -21,6 +21,7 @@ from app.modules.advisory.models import Package, Practice, Element, Timeline
 from app.services.bl06_volume_calc import calculate_volume
 from math import radians, cos, sin, asin, sqrt
 from app.services.bl07_brand_options import get_brand_options
+from app.services.i18n_cosh import pick_translation
 from app.services.npk_candidates import load_fertiliser_candidates
 from app.services.npk_ranking import (
     Candidate as NPKCandidate, Concentration as NPKConcentration, Dose,
@@ -895,22 +896,34 @@ async def get_farmer_order_detail(
     )
     items = items_result.scalars().all()
 
-    # Batch-load manufacturer names for every distinct brand_cosh_id.
+    # Batch-load brand + manufacturer names (locale-aware) for every
+    # distinct brand_cosh_id on the order's items.
     brand_ids = sorted({i.brand_cosh_id for i in items if i.brand_cosh_id})
+    lang = current_user.language_code or "en"
     manufacturer_by_brand: dict[str, str | None] = {}
+    brand_loc: dict[str, str | None] = {}
     if brand_ids:
         rows = (await db.execute(
             select(
                 BrandLookupCache.trade_name_cosh_id,
+                BrandLookupCache.trade_name,
+                BrandLookupCache.trade_name_translations,
                 BrandLookupCache.manufacturer_name,
+                BrandLookupCache.manufacturer_translations,
             ).where(BrandLookupCache.trade_name_cosh_id.in_(brand_ids))
         )).all()
-        for tn_id, mfr in rows:
+        for tn_id, tn_en, tn_tr, mfr_en, mfr_tr in rows:
             # Take the first non-null manufacturer per brand. Some
             # brands appear under multiple common_names; same trade-
             # name resolves to same manufacturer in practice.
-            if tn_id not in manufacturer_by_brand and mfr:
-                manufacturer_by_brand[tn_id] = mfr
+            if tn_id not in manufacturer_by_brand and mfr_en:
+                manufacturer_by_brand[tn_id] = pick_translation(
+                    mfr_tr or {}, lang, mfr_en,
+                )
+            if tn_id not in brand_loc and tn_en:
+                brand_loc[tn_id] = pick_translation(
+                    tn_tr or {}, lang, tn_en,
+                )
 
     # Batch-load practice names for the Returned + Postponed cards
     # (those rows can't always lean on brand_name since the dealer
@@ -933,7 +946,10 @@ async def get_farmer_order_detail(
             "practice_name": practice_name_by_id.get(i.practice_id),
             "status": i.status,
             "brand_cosh_id": i.brand_cosh_id,
-            "brand_name": i.brand_name if is_brand_visible_to_farmer(i.status) else None,
+            "brand_name": (
+                (brand_loc.get(i.brand_cosh_id) or i.brand_name)
+                if is_brand_visible_to_farmer(i.status) else None
+            ),
             "manufacturer_name": (
                 manufacturer_by_brand.get(i.brand_cosh_id)
                 if i.brand_cosh_id and is_brand_visible_to_farmer(i.status)
@@ -2067,19 +2083,30 @@ async def list_purchased_items(
         for did, sname in srows:
             shop_by_dealer_id[did] = sname
 
-    # Manufacturer lookup batched across all rows.
+    # Manufacturer + brand lookup batched across all rows, locale-aware.
     brand_ids = {r[0].brand_cosh_id for r in rows if r[0].brand_cosh_id}
+    lang = current_user.language_code or "en"
     manufacturer_by_brand: dict[str, str | None] = {}
+    brand_loc: dict[str, str | None] = {}
     if brand_ids:
         mfr_rows = (await db.execute(
             select(
                 BrandLookupCache.trade_name_cosh_id,
+                BrandLookupCache.trade_name,
+                BrandLookupCache.trade_name_translations,
                 BrandLookupCache.manufacturer_name,
+                BrandLookupCache.manufacturer_translations,
             ).where(BrandLookupCache.trade_name_cosh_id.in_(brand_ids))
         )).all()
-        for tn_id, mfr in mfr_rows:
-            if tn_id not in manufacturer_by_brand and mfr:
-                manufacturer_by_brand[tn_id] = mfr
+        for tn_id, tn_en, tn_tr, mfr_en, mfr_tr in mfr_rows:
+            if tn_id not in manufacturer_by_brand and mfr_en:
+                manufacturer_by_brand[tn_id] = pick_translation(
+                    mfr_tr or {}, lang, mfr_en,
+                )
+            if tn_id not in brand_loc and tn_en:
+                brand_loc[tn_id] = pick_translation(
+                    tn_tr or {}, lang, tn_en,
+                )
 
     out: list[dict] = []
     for item, order, tl, practice, sub, received_at in rows:
@@ -2127,7 +2154,7 @@ async def list_purchased_items(
             "id": item.id,
             "practice_id": item.practice_id,
             "brand_cosh_id": item.brand_cosh_id,
-            "brand_name": item.brand_name,
+            "brand_name": brand_loc.get(item.brand_cosh_id) or item.brand_name,
             "manufacturer_name": manufacturer_by_brand.get(item.brand_cosh_id) if item.brand_cosh_id else None,
             "l1_type": practice.l1_type,
             "l2_type": practice.l2_type,
@@ -2323,17 +2350,28 @@ async def list_dealer_orders(
         for i in items
         if i.status == OrderItemStatus.APPROVED and i.brand_cosh_id
     }
+    lang = current_user.language_code or "en"
     manufacturer_by_brand: dict[str, str | None] = {}
+    brand_loc: dict[str, str | None] = {}
     if approved_brand_ids:
         mfr_rows = (await db.execute(
             select(
                 BrandLookupCache.trade_name_cosh_id,
+                BrandLookupCache.trade_name,
+                BrandLookupCache.trade_name_translations,
                 BrandLookupCache.manufacturer_name,
+                BrandLookupCache.manufacturer_translations,
             ).where(BrandLookupCache.trade_name_cosh_id.in_(approved_brand_ids))
         )).all()
-        for tn_id, mfr in mfr_rows:
-            if tn_id not in manufacturer_by_brand and mfr:
-                manufacturer_by_brand[tn_id] = mfr
+        for tn_id, tn_en, tn_tr, mfr_en, mfr_tr in mfr_rows:
+            if tn_id not in manufacturer_by_brand and mfr_en:
+                manufacturer_by_brand[tn_id] = pick_translation(
+                    mfr_tr or {}, lang, mfr_en,
+                )
+            if tn_id not in brand_loc and tn_en:
+                brand_loc[tn_id] = pick_translation(
+                    tn_tr or {}, lang, tn_en,
+                )
 
     out = []
     for o, u, c in rows:
@@ -2364,7 +2402,7 @@ async def list_dealer_orders(
                     continue
                 packing_items.append({
                     "id": i.id,
-                    "brand_name": i.brand_name,
+                    "brand_name": brand_loc.get(i.brand_cosh_id) or i.brand_name,
                     "manufacturer_name": (
                         manufacturer_by_brand.get(i.brand_cosh_id)
                         if i.brand_cosh_id else None
