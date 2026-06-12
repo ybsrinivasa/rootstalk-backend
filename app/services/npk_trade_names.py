@@ -36,10 +36,11 @@ from app.services.cosh_constants import (
 
 
 async def trade_names_for_chemical_npk(
-    db: AsyncSession, common_name_cosh_id: str,
+    db: AsyncSession, common_name_cosh_id: str, lang: str = "en",
 ) -> list[tuple[str, str, Optional[str]]]:
     """Walk tradename_commonname → trade_names, then tradename_manufacturer
-    → manufacturers, returning the joined view."""
+    → manufacturers, returning the joined view. Trade-name display
+    prefers `lang`, falls back to English."""
     tncn = (await db.execute(
         select(CoshConnectRow).where(
             CoshConnectRow.connect_type == COSH_TRADENAME_COMMONNAME_CONNECT,
@@ -57,11 +58,11 @@ async def trade_names_for_chemical_npk(
 
     if not tn_ids:
         return []
-    return await _materialize_trade_names(db, tn_ids)
+    return await _materialize_trade_names(db, tn_ids, lang=lang)
 
 
 async def trade_names_for_fertigation_npk(
-    db: AsyncSession, common_name_cosh_id: str,
+    db: AsyncSession, common_name_cosh_id: str, lang: str = "en",
 ) -> list[tuple[str, str, Optional[str]]]:
     """Walk npk_fertigation_products → commonnames_l2 reverse → match
     common_name → take the corresponding tradename_manufacturer → resolve
@@ -129,7 +130,7 @@ async def trade_names_for_fertigation_npk(
 
     if not tn_ids:
         return []
-    rows = await _materialize_trade_names(db, tn_ids)
+    rows = await _materialize_trade_names(db, tn_ids, lang=lang)
     # Override the manufacturer from our explicit map (the materializer
     # falls back to tradename_manufacturer too but the fertigation walk
     # is the authoritative source here).
@@ -200,9 +201,11 @@ async def group_trade_names_for_dealer(
 
 
 async def _materialize_trade_names(
-    db: AsyncSession, tn_ids: set[str],
+    db: AsyncSession, tn_ids: set[str], lang: str = "en",
 ) -> list[tuple[str, str, Optional[str]]]:
-    """Resolve trade-name cosh_ids → (cosh_id, english_name, manufacturer_cosh_id)."""
+    """Resolve trade-name cosh_ids → (cosh_id, display_name, manufacturer_cosh_id).
+    Display name prefers `lang`, falls back to English."""
+    from app.services.i18n_cosh import pick_translation
     cores = (await db.execute(
         select(CoshCoreItem).where(
             CoshCoreItem.core_type == COSH_TRADE_NAMES_CORE,
@@ -227,7 +230,7 @@ async def _materialize_trade_names(
 
     out: list[tuple[str, str, Optional[str]]] = []
     for c in cores:
-        name = (c.translations or {}).get("en") or c.cosh_id
+        name = pick_translation(c.translations, lang, c.cosh_id)
         out.append((c.cosh_id, name, tn_to_mfr.get(c.cosh_id)))
     out.sort(key=lambda r: r[1].lower())  # alphabetical per spec §3.1
     return out

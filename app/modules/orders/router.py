@@ -5683,10 +5683,11 @@ async def get_npk_trade_names(
         )
 
     fertigation = practice.l2_type == "FERTIGATION_NPK_DOSAGES"
+    lang = current_user.language_code or "en"
     if fertigation:
-        rows = await trade_names_for_fertigation_npk(db, common_name_cosh_id)
+        rows = await trade_names_for_fertigation_npk(db, common_name_cosh_id, lang=lang)
     else:
-        rows = await trade_names_for_chemical_npk(db, common_name_cosh_id)
+        rows = await trade_names_for_chemical_npk(db, common_name_cosh_id, lang=lang)
 
     # Spec §3.1 — three-group layout (Recommended / My Brands / Other Brands).
     # NPK has no SE-recommended brand so Recommended is always empty; the PWA
