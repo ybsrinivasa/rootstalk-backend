@@ -343,3 +343,75 @@ async def test_full_sync_inactivates_absent_connect_rows(db):
     )).scalar_one()
     assert dropped.status == "inactive"
     assert kept.status == "active"
+
+
+# ── Brand-cache auto-refresh hook ───────────────────────────────────────────
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_brand_cache_rebuild_fires_when_input_manufacturers_synced(db):
+    """Sync that touches a brand-cache-feeding Core appends a synthetic
+    _brand_lookup_cache_rebuild entry to entity_results so the operator
+    knows the cache was refreshed without a separate trigger."""
+    log = await _new_log(db)
+    result = await process_payload(db, _payload(_batch(
+        "input_manufacturers",
+        {"cosh_id": "mfr:bayer", "translations": {"en": "Bayer", "hi": "बायर"}},
+    )), log)
+    await db.commit()
+
+    rebuild_entries = [
+        e for e in result["entity_results"]
+        if e.get("entity_type") == "_brand_lookup_cache_rebuild"
+    ]
+    assert len(rebuild_entries) == 1, (
+        "brand cache rebuild should fire for input_manufacturers sync; "
+        f"entity_results={result['entity_results']}"
+    )
+    assert rebuild_entries[0]["failed"] == 0
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_brand_cache_rebuild_skipped_for_unrelated_sync(db):
+    """Sync that doesn't touch any brand-cache-feeding entity_type should
+    not trigger the rebuild — keeps the hook free for the common case
+    where someone syncs an unrelated Core."""
+    log = await _new_log(db)
+    result = await process_payload(db, _payload(_batch(
+        "crop",
+        {"cosh_id": "crop:wheat", "translations": {"en": "Wheat", "hi": "गेहूँ"}},
+    )), log)
+    await db.commit()
+
+    rebuild_entries = [
+        e for e in result["entity_results"]
+        if e.get("entity_type") == "_brand_lookup_cache_rebuild"
+    ]
+    assert rebuild_entries == [], (
+        f"rebuild should be skipped for non-brand sync; entries={rebuild_entries}"
+    )
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_brand_cache_rebuild_skipped_when_no_rows_changed(db):
+    """If a brand-cache-feeding sync runs but every row failed validation
+    (no inserts/updates), there's nothing to mirror — skip the rebuild."""
+    log = await _new_log(db)
+    result = await process_payload(db, _payload(_batch(
+        "trade_names",
+        # Missing cosh_id triggers the validation path; row counts stay 0.
+        {"translations": {"en": "Anonymous Brand"}},
+    )), log)
+    await db.commit()
+
+    rebuild_entries = [
+        e for e in result["entity_results"]
+        if e.get("entity_type") == "_brand_lookup_cache_rebuild"
+    ]
+    assert rebuild_entries == [], (
+        "no rebuild when zero rows changed; "
+        f"entries={rebuild_entries}, results={result['entity_results']}"
+    )
+
