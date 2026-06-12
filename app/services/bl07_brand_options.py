@@ -328,14 +328,26 @@ async def get_brand_options(
     brand_unit_family: dict[str, str] = {}
     units_by_brand: dict[str, list] = {}
 
+    from app.services.i18n_cosh import pick_translation
     for b in all_brands:
         # Fix 2026-06-01: BrandLookupCache shape — trade_name_cosh_id +
         # trade_name + manufacturer_name + formulation_name.
         cosh_id = b.trade_name_cosh_id
-        name = b.trade_name or cosh_id
-        manufacturer = b.manufacturer_name
+        # Localisation 2026-06-12: prefer JSONB translations populated
+        # by the cache rebuild; English columns stay as fallback for
+        # rows written before the schema added translations.
+        name = pick_translation(
+            b.trade_name_translations or {}, lang, b.trade_name or cosh_id,
+        )
+        manufacturer = pick_translation(
+            b.manufacturer_translations or {}, lang, b.manufacturer_name,
+        ) if b.manufacturer_name else None
+        # Preference match stays English-keyed: DealerRelationship rows
+        # store the EN manufacturer name. Use cached EN column for the
+        # comparison, not the localised string.
         is_preferred = bool(
-            manufacturer and manufacturer.lower() in preferred_names
+            b.manufacturer_name
+            and b.manufacturer_name.lower() in preferred_names
         )
         option = BrandOption(
             cosh_id=cosh_id, name=name, manufacturer=manufacturer,

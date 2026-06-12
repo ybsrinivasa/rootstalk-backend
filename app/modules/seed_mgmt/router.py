@@ -575,6 +575,7 @@ async def list_farmer_seed_orders(
     # the order surface uses, so the farmer reads them consistently.
     meta_by_sub = await load_meta_for_subscription_ids(
         db, [o.subscription_id for o in orders],
+        lang=current_user.language_code or "en",
     )
     recipients = await load_recipients(
         db,

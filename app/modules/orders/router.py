@@ -427,6 +427,7 @@ async def list_farmer_orders(
     # loads all the join chain in one round.
     meta_by_sub = await load_meta_for_subscription_ids(
         db, [o.subscription_id for o in orders],
+        lang=current_user.language_code or "en",
     )
     # 2026-06-02 — surface recipient (dealer / facilitator) name +
     # shop + phone on every card so tracking an order doesn't
@@ -569,7 +570,10 @@ async def list_subscription_orders(
     if sub is None:
         raise HTTPException(status_code=404, detail="Subscription not found")
 
-    meta_by_sub = await load_meta_for_subscription_ids(db, [subscription_id])
+    meta_by_sub = await load_meta_for_subscription_ids(
+        db, [subscription_id],
+        lang=current_user.language_code or "en",
+    )
     meta_dict = meta_by_sub.get(subscription_id).to_dict() if meta_by_sub.get(subscription_id) else {}
 
     # ── Regular orders ────────────────────────────────────────────────
@@ -3684,9 +3688,10 @@ async def list_facilitator_orders(
             select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
             .where(CoshCoreItem.cosh_id.in_(crop_cosh_ids))
         )).all()
+        lang = current_user.language_code or "en"
         for cid, tr in crows:
             if isinstance(tr, dict):
-                name = tr.get("en")
+                name = pick_translation(tr, lang, "")
                 if name:
                     crop_name_by_cosh_id[cid] = name
 
@@ -4012,9 +4017,10 @@ async def list_facilitator_pickup(
             select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
             .where(CoshCoreItem.cosh_id.in_(crop_cosh_ids))
         )).all()
+        lang = current_user.language_code or "en"
         for cid, tr in crows:
             if isinstance(tr, dict):
-                name = tr.get("en")
+                name = pick_translation(tr, lang, "")
                 if name:
                     crop_name_by_cosh_id[cid] = name
 
@@ -4391,6 +4397,7 @@ async def get_dealer_order(
             if spec[k]:
                 cosh_refs_needed.add(spec[k])
 
+    lang = current_user.language_code or "en"
     cosh_name_by_id: dict[str, str] = {}
     if cosh_refs_needed:
         cosh_rows = (await db.execute(
@@ -4399,7 +4406,9 @@ async def get_dealer_order(
         for cc in cosh_rows:
             tr = cc.translations or {}
             if isinstance(tr, dict):
-                cosh_name_by_id[cc.cosh_id] = tr.get("en") or cc.cosh_id
+                cosh_name_by_id[cc.cosh_id] = pick_translation(
+                    tr, lang, cc.cosh_id,
+                )
 
     def _resolve_name(ref):
         return cosh_name_by_id.get(ref) if ref else None
@@ -4516,7 +4525,7 @@ async def get_dealer_order(
     # and Today's date, if it is plant-wise you will derive it from
     # the difference between the Planting year and current year),
     # Number of acres/Number of plants (as the case may be)."
-    farmer_context = await _build_farmer_context(db, order)
+    farmer_context = await _build_farmer_context(db, order, lang=lang)
 
     return {
         "id": order.id, "status": order.status,
@@ -4589,7 +4598,9 @@ def _consolidate_brands_across_items(items: list[OrderItem]) -> list[dict]:
     return out
 
 
-async def _build_farmer_context(db: AsyncSession, order: Order) -> dict:
+async def _build_farmer_context(
+    db: AsyncSession, order: Order, *, lang: str = "en",
+) -> dict:
     """Resolve farmer + crop + measure context for the dealer order
     detail. Returns the block the dealer screen renders at the top.
 
@@ -4623,7 +4634,8 @@ async def _build_farmer_context(db: AsyncSession, order: Order) -> dict:
             )).scalar_one_or_none()
             if crop_row is not None:
                 tr = crop_row.translations or {}
-                crop_name = tr.get("en") if isinstance(tr, dict) else None
+                if isinstance(tr, dict):
+                    crop_name = pick_translation(tr, lang, "") or None
 
     measure: str | None = None
     age_value: int | None = None
@@ -7655,15 +7667,17 @@ async def facilitator_payment_requests(
         .order_by(SubscriptionPaymentRequest.created_at.desc())
     )).all()
 
-    # Bulk-resolve crop English names so we never echo a raw cosh_id.
+    # Bulk-resolve crop names in the Facilitator's chosen locale; falls
+    # back to EN → cosh_id via pick_translation.
     crop_ids = {pkg.crop_cosh_id for _, _, pkg, _ in rows if pkg.crop_cosh_id}
     crop_name_by_id: dict[str, str] = {}
     if crop_ids:
+        lang = current_user.language_code or "en"
         for r in (await db.execute(
             select(CoshCoreItem).where(CoshCoreItem.cosh_id.in_(crop_ids))
         )).scalars().all():
             tr = r.translations or {}
-            crop_name_by_id[r.cosh_id] = tr.get("en") or tr.get("hi") or r.cosh_id
+            crop_name_by_id[r.cosh_id] = pick_translation(tr, lang, r.cosh_id)
 
     now = datetime.now(timezone.utc)
     out = []

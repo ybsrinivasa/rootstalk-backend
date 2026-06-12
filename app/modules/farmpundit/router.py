@@ -238,9 +238,13 @@ async def cosh_pundit_options(
             CoshCoreItem.status == "active",
         )
     )).all()
+    lang = current_user.language_code or "en"
     out = []
     for cosh_id, translations in rows:
-        name = (translations or {}).get("en") if isinstance(translations, dict) else None
+        name = (
+            pick_translation(translations, lang, "")
+            if isinstance(translations, dict) else None
+        )
         if name:
             out.append({"cosh_id": cosh_id, "name": name})
     out.sort(key=lambda x: x["name"].casefold())
@@ -884,9 +888,13 @@ async def cosh_query_types(
             CoshCoreItem.status == "active",
         )
     )).all()
+    lang = current_user.language_code or "en"
     out = []
     for cosh_id, translations in rows:
-        name = (translations or {}).get("en") if isinstance(translations, dict) else None
+        name = (
+            pick_translation(translations, lang, "")
+            if isinstance(translations, dict) else None
+        )
         if name:
             out.append({"cosh_id": cosh_id, "name": name})
     out.sort(key=lambda x: x["name"].casefold())
@@ -2534,11 +2542,15 @@ async def get_query_detail_pundit(
         if farmer_user.district_cosh_id: ref_ids.add(farmer_user.district_cosh_id)
     name_by_cosh_id: dict[str, str] = {}
     if ref_ids:
+        lang = current_user.language_code or "en"
         for cid, tr in (await db.execute(
             select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
             .where(CoshCoreItem.cosh_id.in_(ref_ids))
         )).all():
-            label = (tr or {}).get("en") if isinstance(tr, dict) else None
+            label = (
+                pick_translation(tr, lang, "")
+                if isinstance(tr, dict) else None
+            )
             if label:
                 name_by_cosh_id[cid] = label
 

@@ -133,6 +133,7 @@ async def load_recipients(
 
 async def load_meta_for_subscription_ids(
     db: AsyncSession, subscription_ids: Iterable[str],
+    *, lang: str = "en",
 ) -> dict[str, OrderPackageMeta]:
     """Return {subscription_id → OrderPackageMeta} for the given ids.
 
@@ -154,12 +155,13 @@ async def load_meta_for_subscription_ids(
     crop_ids = {pkg.crop_cosh_id for _, pkg, _ in rows if pkg.crop_cosh_id}
     crop_name_by_id: dict[str, str] = {}
     if crop_ids:
+        from app.services.i18n_cosh import pick_translation
         cores = (await db.execute(
             select(CoshCoreItem).where(CoshCoreItem.cosh_id.in_(crop_ids))
         )).scalars().all()
         for c in cores:
             tr = c.translations or {}
-            crop_name_by_id[c.cosh_id] = tr.get("en") or tr.get("hi") or c.cosh_id
+            crop_name_by_id[c.cosh_id] = pick_translation(tr, lang, c.cosh_id)
 
     out: dict[str, OrderPackageMeta] = {}
     for sub, pkg, client in rows:

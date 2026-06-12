@@ -1959,7 +1959,7 @@ async def my_incoming_alerts(
         )).all():
             tr = r.translations or {}
             if isinstance(tr, dict):
-                crop_name_by_id[r.cosh_id] = tr.get(lang) or tr.get("en")
+                crop_name_by_id[r.cosh_id] = pick_translation(tr, lang, "") or None
             else:
                 crop_name_by_id[r.cosh_id] = None
 
@@ -2303,7 +2303,7 @@ async def get_assignment_details(
             )
         )).scalar_one_or_none()
         if isinstance(row, dict):
-            crop_name = row.get(lang) or row.get("en") or None
+            crop_name = pick_translation(row, lang, "") or None
 
     return {
         "subscription_id": sub.id,
@@ -2671,7 +2671,7 @@ async def get_my_payment_request(
         if item:
             tr = item.translations or {}
             lang = current_user.language_code or "en"
-            crop_name = tr.get(lang) or tr.get("en") or pkg.crop_cosh_id
+            crop_name = pick_translation(tr, lang, pkg.crop_cosh_id)
 
     now_utc = datetime.now(timezone.utc)
     hours_remaining = max(0, int((pr.expires_at - now_utc).total_seconds() // 3600))
@@ -2872,7 +2872,7 @@ async def list_payment_requests(
             select(CoshCoreItem).where(CoshCoreItem.cosh_id.in_(crop_ids))
         )).scalars().all():
             tr = r.translations or {}
-            crop_name_by_id[r.cosh_id] = tr.get(lang) or tr.get("en") or r.cosh_id
+            crop_name_by_id[r.cosh_id] = pick_translation(tr, lang, r.cosh_id)
 
     now = datetime.now(timezone.utc)
     out = []
@@ -3861,7 +3861,7 @@ async def my_subscriptions(
             )
         )).scalar_one_or_none()
         if isinstance(d_row, dict):
-            farmer_district_name = d_row.get(lang) or d_row.get("en") or None
+            farmer_district_name = pick_translation(d_row, lang, "") or None
 
     for s in subs:
         pkg_name, crop_cosh_id = pkg_by_id.get(s.package_id, (None, None))
