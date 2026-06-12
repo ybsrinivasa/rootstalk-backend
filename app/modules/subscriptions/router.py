@@ -647,14 +647,17 @@ async def promoter_crops(
     crop_ids = list(result.scalars().all())
     if not crop_ids:
         return []
+    lang = current_user.language_code or "en"
     name_rows = (await db.execute(
         select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
         .where(CoshCoreItem.cosh_id.in_(crop_ids))
     )).all()
     name_by_id: dict[str, str | None] = {}
     for cosh_id, translations in name_rows:
-        name = (translations or {}).get("en") if isinstance(translations, dict) else None
-        name_by_id[cosh_id] = name
+        if isinstance(translations, dict):
+            name_by_id[cosh_id] = translations.get(lang) or translations.get("en")
+        else:
+            name_by_id[cosh_id] = None
     # 2026-05-30 — surface the per-crop AREA_WISE / PLANT_WISE measure
     # so the Promoter PWA can render the right input (acres vs plants
     # + planting year) automatically instead of asking the Promoter
@@ -1046,15 +1049,19 @@ async def discover_crops(
         return []
     # Resolve names from cosh_core_items (Cosh stores crop labels
     # under the `biological_names` core_type). Translations is a
-    # JSON map keyed by language code; English is the baseline.
+    # JSON map keyed by language code; prefer the farmer's language,
+    # fall back to English.
+    lang = current_user.language_code or "en"
     name_rows = (await db.execute(
         select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
         .where(CoshCoreItem.cosh_id.in_(crop_ids))
     )).all()
     name_by_id: dict[str, str | None] = {}
     for cosh_id, translations in name_rows:
-        name = (translations or {}).get("en") if isinstance(translations, dict) else None
-        name_by_id[cosh_id] = name
+        if isinstance(translations, dict):
+            name_by_id[cosh_id] = translations.get(lang) or translations.get("en")
+        else:
+            name_by_id[cosh_id] = None
     return [{"crop_cosh_id": c, "name": name_by_id.get(c)} for c in crop_ids]
 
 
@@ -1105,7 +1112,8 @@ async def discover_crops_and_companies(
         crop_to_clients.setdefault(crop_id, set()).add(client_id)
         client_to_crops.setdefault(client_id, set()).add(crop_id)
 
-    # Resolve crop English names from Cosh.
+    # Resolve crop names from Cosh, preferring the farmer's language.
+    lang = current_user.language_code or "en"
     crop_ids = list(crop_to_clients.keys())
     crop_name_by_id: dict[str, str] = {}
     if crop_ids:
@@ -1116,7 +1124,10 @@ async def discover_crops_and_companies(
         for cosh_id, translations in name_rows:
             if isinstance(translations, dict):
                 crop_name_by_id[cosh_id] = (
-                    translations.get("en") or translations.get("English") or cosh_id
+                    translations.get(lang)
+                    or translations.get("en")
+                    or translations.get("English")
+                    or cosh_id
                 )
 
     # Resolve client details.
@@ -1128,7 +1139,7 @@ async def discover_crops_and_companies(
         )).scalars().all():
             clients_by_id[c.id] = c
 
-    # District display name — single core lookup.
+    # District display name — single core lookup, same locale preference.
     district_name: str | None = None
     dist_core = (await db.execute(
         select(CoshCoreItem).where(
@@ -1138,7 +1149,8 @@ async def discover_crops_and_companies(
     )).scalar_one_or_none()
     if dist_core and isinstance(dist_core.translations, dict):
         district_name = (
-            dist_core.translations.get("en")
+            dist_core.translations.get(lang)
+            or dist_core.translations.get("en")
             or dist_core.translations.get("English")
         )
 
@@ -1944,7 +1956,8 @@ async def my_incoming_alerts(
     if not rows:
         return []
 
-    # Resolve crop English names in one batch.
+    # Resolve crop names in one batch, preferring the recipient's language.
+    lang = current_user.language_code or "en"
     crop_ids = {pkg.crop_cosh_id for _, _, pkg, _ in rows if pkg.crop_cosh_id}
     crop_name_by_id: dict[str, str | None] = {}
     if crop_ids:
@@ -1953,9 +1966,10 @@ async def my_incoming_alerts(
             .where(CoshCoreItem.cosh_id.in_(crop_ids))
         )).all():
             tr = r.translations or {}
-            crop_name_by_id[r.cosh_id] = (
-                tr.get("en") if isinstance(tr, dict) else None
-            )
+            if isinstance(tr, dict):
+                crop_name_by_id[r.cosh_id] = tr.get(lang) or tr.get("en")
+            else:
+                crop_name_by_id[r.cosh_id] = None
 
     out = []
     for alert, sub, pkg, farmer in rows:
@@ -2283,19 +2297,20 @@ async def get_assignment_details(
         select(User).where(User.id == assignment.promoter_user_id)
     )).scalar_one_or_none()
 
-    # Resolve the crop's English display name from Cosh so the PWA's
-    # review screen renders "Coconut" instead of a raw UUID. Falls
-    # back to None if the crop isn't in `cosh_core_items` yet.
+    # Resolve the crop's display name from Cosh — prefer the farmer's
+    # language, fall back to English. Falls back to None if the crop
+    # isn't in `cosh_core_items` yet.
     crop_name: str | None = None
     if package and package.crop_cosh_id:
         from app.modules.sync.models import CoshCoreItem
+        lang = current_user.language_code or "en"
         row = (await db.execute(
             select(CoshCoreItem.translations).where(
                 CoshCoreItem.cosh_id == package.crop_cosh_id,
             )
         )).scalar_one_or_none()
         if isinstance(row, dict):
-            crop_name = row.get("en") or row.get("hi") or None
+            crop_name = row.get(lang) or row.get("en") or None
 
     return {
         "subscription_id": sub.id,
@@ -2662,7 +2677,8 @@ async def get_my_payment_request(
         )).scalar_one_or_none()
         if item:
             tr = item.translations or {}
-            crop_name = tr.get("en") or tr.get("hi") or pkg.crop_cosh_id
+            lang = current_user.language_code or "en"
+            crop_name = tr.get(lang) or tr.get("en") or pkg.crop_cosh_id
 
     now_utc = datetime.now(timezone.utc)
     hours_remaining = max(0, int((pr.expires_at - now_utc).total_seconds() // 3600))
@@ -2855,6 +2871,7 @@ async def list_payment_requests(
         .order_by(SubscriptionPaymentRequest.created_at.desc())
     )).all()
 
+    lang = current_user.language_code or "en"
     crop_ids = {pkg.crop_cosh_id for _, _, pkg, _ in rows if pkg.crop_cosh_id}
     crop_name_by_id: dict[str, str] = {}
     if crop_ids:
@@ -2862,7 +2879,7 @@ async def list_payment_requests(
             select(CoshCoreItem).where(CoshCoreItem.cosh_id.in_(crop_ids))
         )).scalars().all():
             tr = r.translations or {}
-            crop_name_by_id[r.cosh_id] = tr.get("en") or tr.get("hi") or r.cosh_id
+            crop_name_by_id[r.cosh_id] = tr.get(lang) or tr.get("en") or r.cosh_id
 
     now = datetime.now(timezone.utc)
     out = []
@@ -3662,6 +3679,7 @@ async def my_subscriptions(
         pid: (name, crop) for pid, name, crop in pkg_rows
     }
 
+    lang = current_user.language_code or "en"
     crop_ids = {crop for _, crop in pkg_by_id.values() if crop}
     crop_name_by_id: dict[str, str | None] = {}
     if crop_ids:
@@ -3670,8 +3688,10 @@ async def my_subscriptions(
             .where(CoshCoreItem.cosh_id.in_(crop_ids))
         )).all()
         for cosh_id, translations in name_rows:
-            n = (translations or {}).get("en") if isinstance(translations, dict) else None
-            crop_name_by_id[cosh_id] = n
+            if isinstance(translations, dict):
+                crop_name_by_id[cosh_id] = translations.get(lang) or translations.get("en")
+            else:
+                crop_name_by_id[cosh_id] = None
 
     # ── Client identity per subscription. Surfaced so inside
     # screens (advisory, diagnose, ask-expert, …) can render a
@@ -3848,7 +3868,7 @@ async def my_subscriptions(
             )
         )).scalar_one_or_none()
         if isinstance(d_row, dict):
-            farmer_district_name = d_row.get("en") or None
+            farmer_district_name = d_row.get(lang) or d_row.get("en") or None
 
     for s in subs:
         pkg_name, crop_cosh_id = pkg_by_id.get(s.package_id, (None, None))

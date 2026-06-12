@@ -381,10 +381,23 @@ async def _trigger_cha_from_diagnosis(
     ))
 
 
-async def _get_problem_info(db: AsyncSession, problem_cosh_id: str) -> dict:
+def _pick_translation(translations: Optional[dict], lang: str, fallback: str) -> str:
+    """Prefer the user's language, then English, then a caller-supplied
+    fallback (typically the cosh_id so the UI never silently drops the row).
+    Symmetric helper used wherever `cosh_core_items.translations` feeds an
+    API response."""
+    t = translations or {}
+    return t.get(lang) or t.get("en") or fallback
+
+
+async def _get_problem_info(
+    db: AsyncSession, problem_cosh_id: str, lang: str = "en",
+) -> dict:
     """Resolve problem cosh_id to {cosh_id, name, translations, type,
     parent_cosh_id}. Tries specific_problem first, then problem_group,
-    then degrades to a humanised id fallback."""
+    then degrades to a humanised id fallback. `name` is localised to
+    `lang` when a translation exists, otherwise English, otherwise the
+    cosh_id."""
     sp = (await db.execute(
         select(CoshCoreItem).where(
             CoshCoreItem.cosh_id == problem_cosh_id,
@@ -401,7 +414,7 @@ async def _get_problem_info(db: AsyncSession, problem_cosh_id: str) -> dict:
         if pg:
             return {
                 "cosh_id": problem_cosh_id,
-                "name": pg.translations.get("en", problem_cosh_id),
+                "name": _pick_translation(pg.translations, lang, problem_cosh_id),
                 "translations": pg.translations,
                 "type": "problem_group",
                 "parent_cosh_id": pg.parent_cosh_id,
@@ -418,7 +431,7 @@ async def _get_problem_info(db: AsyncSession, problem_cosh_id: str) -> dict:
         if any_core:
             return {
                 "cosh_id": problem_cosh_id,
-                "name": (any_core.translations or {}).get("en", problem_cosh_id),
+                "name": _pick_translation(any_core.translations, lang, problem_cosh_id),
                 "translations": any_core.translations,
                 "type": any_core.core_type,
             }
@@ -429,7 +442,7 @@ async def _get_problem_info(db: AsyncSession, problem_cosh_id: str) -> dict:
         }
     return {
         "cosh_id": problem_cosh_id,
-        "name": sp.translations.get("en", problem_cosh_id),
+        "name": _pick_translation(sp.translations, lang, problem_cosh_id),
         "translations": sp.translations,
         "type": "specific_problem",
         "parent_cosh_id": sp.parent_cosh_id,
@@ -555,7 +568,9 @@ async def start_diagnosis(
         # answers — resolve its name so the PWA can render the
         # confirmation prompt. Session remains ACTIVE until the farmer
         # answers the confirmation.
-        problem_info = await _get_problem_info(db, step.diagnosed_problem_cosh_id)
+        problem_info = await _get_problem_info(
+            db, step.diagnosed_problem_cosh_id, current_user.language_code or "en",
+        )
         crop_name = await _resolve_name_for_cosh_id(
             db, request.crop_cosh_id, current_user.language_code or "en",
         ) or request.crop_cosh_id
@@ -635,7 +650,9 @@ async def answer_question(
         if request.answer == "YES":
             session.status = "DIAGNOSED"
             session.diagnosed_problem_cosh_id = candidate_cosh_id
-            problem_info = await _get_problem_info(db, candidate_cosh_id)
+            problem_info = await _get_problem_info(
+                db, candidate_cosh_id, current_user.language_code or "en",
+            )
             crop_name = await _resolve_name_for_cosh_id(
                 db, session.crop_cosh_id, current_user.language_code or "en",
             ) or session.crop_cosh_id
@@ -698,7 +715,9 @@ async def answer_question(
         # CONFIRMATION instead, per the BL-08 §8 amendment.)
         session.status = "DIAGNOSED"
         session.diagnosed_problem_cosh_id = step.diagnosed_problem_cosh_id
-        problem_info = await _get_problem_info(db, step.diagnosed_problem_cosh_id)
+        problem_info = await _get_problem_info(
+            db, step.diagnosed_problem_cosh_id, current_user.language_code or "en",
+        )
         crop_name = await _resolve_name_for_cosh_id(
             db, session.crop_cosh_id, current_user.language_code or "en",
         ) or session.crop_cosh_id
@@ -712,7 +731,9 @@ async def answer_question(
         # is X. Does this match what you're seeing?"). Session stays
         # ACTIVE — terminal transition fires when the farmer answers
         # the confirmation via the is_confirmation branch above.
-        problem_info = await _get_problem_info(db, step.diagnosed_problem_cosh_id)
+        problem_info = await _get_problem_info(
+            db, step.diagnosed_problem_cosh_id, current_user.language_code or "en",
+        )
         crop_name = await _resolve_name_for_cosh_id(
             db, session.crop_cosh_id, current_user.language_code or "en",
         ) or session.crop_cosh_id
@@ -772,7 +793,9 @@ async def abort_diagnosis(
         session.diagnosed_problem_cosh_id = problem_cosh_id
         # CHA trigger deferred to /commit-to-advisory (opt-in).
         await db.commit()
-        problem_info = await _get_problem_info(db, problem_cosh_id)
+        problem_info = await _get_problem_info(
+            db, problem_cosh_id, current_user.language_code or "en",
+        )
         crop_name = await _resolve_name_for_cosh_id(
             db, session.crop_cosh_id, current_user.language_code or "en",
         ) or session.crop_cosh_id
@@ -972,7 +995,9 @@ async def ai_direct_diagnose(
     # description in the farmer's language — same enrichment path the
     # BL-08 DIAGNOSED branch uses, so the diagnosed-screen render is
     # uniform regardless of which path landed us here.
-    problem_info = await _get_problem_info(db, result.problem_cosh_id)
+    problem_info = await _get_problem_info(
+        db, result.problem_cosh_id, current_user.language_code or "en",
+    )
     problem_info = await enrich_problem_with_description(problem_info, crop_name)
 
     return {
@@ -994,12 +1019,14 @@ async def list_problems_for_crop(
     current_user: User = Depends(get_current_user),
 ):
     """'I Know the Problem' — returns problems filtered to
-    crop+stage+part."""
+    crop+stage+part. Problem names are returned in the user's
+    language when available, else English."""
+    lang = current_user.language_code or "en"
     rows = await _load_problem_symptom_rows(db, crop_cosh_id, crop_stage_cosh_id)
     problem_ids = get_problem_list(rows, plant_part=plant_part_cosh_id)
     result = []
     for pid in problem_ids:
-        result.append(await _get_problem_info(db, pid))
+        result.append(await _get_problem_info(db, pid, lang))
     return result
 
 
@@ -1020,7 +1047,7 @@ async def analyse_image_with_claude(
     known_problem_ids = list(dict.fromkeys(r.problem_cosh_id for r in rows))
     known_problem_names: list[str] = []
     for pid in known_problem_ids[:20]:
-        info = await _get_problem_info(db, pid)
+        info = await _get_problem_info(db, pid, current_user.language_code or "en")
         known_problem_names.append(info.get("name", pid))
 
     result = await analyze_crop_image(
