@@ -331,18 +331,18 @@ async def process_payload(
             "errors": errors,
         })
 
-    # 2026-06-12 — Auto-rebuild brand_lookup_cache when this sync touched
-    # any Core/Connect that feeds the cache. The cache snapshots
-    # translations at refresh time (not at read), so a sync that adds
-    # Hindi names to input_manufacturers has no effect on the PWA until
-    # the cache is rebuilt. Manual rebuild via /admin/brand-cache/refresh
-    # remains available; this hook just removes the coordination cost
-    # for the common case.
+    # 2026-06-12 — Auto-rebuild materialised caches that snapshot
+    # cosh_core_items.translations at refresh time (not at read), so
+    # a sync that brings new Hindi/Kannada/Tamil names has no PWA
+    # effect until the caches are rebuilt. Two caches today:
+    # brand_lookup_cache (BL-07 dealer brand picker, farmer purchased
+    # heading) and dealer_manufacturer_catalog (the dealer Dealerships
+    # page). Manual rebuild via the SA admin endpoints remains
+    # available; this hook removes the coordination cost.
     #
-    # Errors are caught and surfaced on the sync log but do NOT fail the
-    # sync — the upstream entity rows are already committed and the
-    # operator can rebuild manually if needed.
-    await _maybe_rebuild_brand_cache(db, sync_log, entity_results)
+    # Errors are caught and surfaced on the sync log but do NOT fail
+    # the sync — the upstream entity rows are already committed.
+    await _maybe_rebuild_caches(db, sync_log, entity_results)
 
     sync_log.items_synced = total_inserted + total_updated
     sync_log.items_failed = total_failed
@@ -382,11 +382,15 @@ async def process_payload(
     }
 
 
-# ── Brand-cache auto-refresh ────────────────────────────────────────────────
+# ── Materialised-cache auto-refresh ─────────────────────────────────────────
 
+# Two materialised caches need refreshing when Cosh data changes. They
+# each have their own feeding set so a sync that only touches one chain
+# (e.g. tradename_formulation) doesn't redundantly rebuild the other.
+#
 # Cores + Connects that feed `brand_lookup_cache` via
-# services/brand_cache.py:rebuild_brand_cache. Source of truth — kept in
-# sync with the constants imported by that file.
+# services/brand_cache.py::rebuild_brand_cache. Mirrors the constants
+# imported by that file.
 _BRAND_CACHE_FEEDING_ENTITY_TYPES = frozenset({
     # Cores
     "common_names_of_inputs",
@@ -401,56 +405,90 @@ _BRAND_CACHE_FEEDING_ENTITY_TYPES = frozenset({
     "tradenames_units",
 })
 
+# Cores + Connects that feed `dealer_manufacturer_catalog` via
+# orders/router.py::_rebuild_manufacturer_catalog. Mirrors the
+# `_walk_cosh_manufacturers` 3-pass walk: L2 → CN → TN → MFR.
+_DEALER_CATALOG_FEEDING_ENTITY_TYPES = frozenset({
+    # Cores
+    "common_names_of_inputs",
+    "input_manufacturers",
+    "l2_data",
+    # Connects
+    "commonnames_l2",
+    "tradename_commonname",
+    "tradename_manufacturer",
+})
 
-async def _maybe_rebuild_brand_cache(
+
+def _touched(entity_results: list[dict], feeding: frozenset[str]) -> bool:
+    """True if any batch in this sync touched a feeding entity_type AND
+    landed at least one inserted/updated row."""
+    return any(
+        e.get("entity_type") in feeding
+        and (e.get("inserted", 0) + e.get("updated", 0)) > 0
+        for e in entity_results
+    )
+
+
+def _record_rebuild(
+    entity_results: list[dict],
+    synthetic_type: str,
+    updated: int = 0,
+    failed: int = 0,
+    reason: str | None = None,
+) -> None:
+    """Append a synthetic entity_results row so the SA Sync Log surfaces
+    the rebuild + its rowcount alongside the rest of the run."""
+    entity_results.append({
+        "entity_type": synthetic_type,
+        "received": 0,
+        "inserted": 0,
+        "updated": updated,
+        "failed": failed,
+        "errors": [{"cosh_id": "rebuild", "reason": reason}] if reason else [],
+    })
+
+
+async def _maybe_rebuild_caches(
     db: AsyncSession,
     sync_log: CoshSyncLog,
     entity_results: list[dict],
 ) -> None:
-    """Rebuild brand_lookup_cache if this sync changed any brand-cache-
-    feeding Core/Connect. No-op when nothing relevant changed.
+    """Rebuild brand_lookup_cache and/or dealer_manufacturer_catalog
+    when this sync changed any of their feeding Cores/Connects. No-op
+    when nothing relevant changed.
 
     Hooked into process_payload as a fire-and-log step — never fails
-    the sync. Any error is caught and recorded on the sync log so the
-    operator knows to retry manually via /admin/brand-cache/refresh."""
-    touched = [
-        e for e in entity_results
-        if e.get("entity_type") in _BRAND_CACHE_FEEDING_ENTITY_TYPES
-        and (e.get("inserted", 0) + e.get("updated", 0)) > 0
-    ]
-    if not touched:
-        return
+    the sync. Any error is caught and recorded on the synthetic
+    entity_results row so the operator knows to retry manually:
 
-    # Import here to avoid a circular import at module load (brand_cache
-    # → orders/models → … → sync paths).
-    from app.services.brand_cache import rebuild_brand_cache
+      - /admin/brand-cache/refresh
+      - /admin/dealer/manufacturers-catalog/refresh
+    """
+    if _touched(entity_results, _BRAND_CACHE_FEEDING_ENTITY_TYPES):
+        # Import here to avoid a circular import at module load.
+        from app.services.brand_cache import rebuild_brand_cache
+        try:
+            written = await rebuild_brand_cache(db)
+            _record_rebuild(entity_results, "_brand_lookup_cache_rebuild", updated=written)
+        except Exception as e:
+            _record_rebuild(
+                entity_results, "_brand_lookup_cache_rebuild",
+                failed=1, reason=str(e),
+            )
 
-    try:
-        written = await rebuild_brand_cache(db)
-        # Append a synthetic entry to entity_results so the SA's Sync Log
-        # UI surfaces the rebuild + its rowcount alongside the rest of
-        # the run. Not a real entity; uses a synthetic entity_type name
-        # so the UI can render it as a hook event rather than a row.
-        entity_results.append({
-            "entity_type": "_brand_lookup_cache_rebuild",
-            "received": 0,
-            "inserted": 0,
-            "updated": written,
-            "failed": 0,
-            "errors": [],
-        })
-    except Exception as e:
-        # Don't propagate — the entity upserts already committed and
-        # rebuild_brand_cache can be re-run manually. Log so the
-        # operator sees the failure.
-        entity_results.append({
-            "entity_type": "_brand_lookup_cache_rebuild",
-            "received": 0,
-            "inserted": 0,
-            "updated": 0,
-            "failed": 1,
-            "errors": [{"cosh_id": "rebuild", "reason": str(e)}],
-        })
+    if _touched(entity_results, _DEALER_CATALOG_FEEDING_ENTITY_TYPES):
+        # Import here for the same circular-import reason; also keeps
+        # the orders/router import-graph out of the sync module.
+        from app.modules.orders.router import _rebuild_manufacturer_catalog
+        try:
+            written = await _rebuild_manufacturer_catalog(db)
+            _record_rebuild(entity_results, "_dealer_manufacturer_catalog_rebuild", updated=written)
+        except Exception as e:
+            _record_rebuild(
+                entity_results, "_dealer_manufacturer_catalog_rebuild",
+                failed=1, reason=str(e),
+            )
 
 
 def get_cosh_entity(db_sync, cosh_id: str, entity_type: str):

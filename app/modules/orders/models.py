@@ -326,6 +326,11 @@ class DealerManufacturerCatalog(Base):
     category: Mapped[str] = mapped_column(String(20), primary_key=True)
     manufacturer_cosh_id: Mapped[str] = mapped_column(String(100), primary_key=True)
     manufacturer_name: Mapped[str] = mapped_column(String(500), nullable=False)
+    # 2026-06-12 — Locale map mirrored from cosh_core_items.translations
+    # at refresh time. Read sites call pick_translation(translations,
+    # lang, manufacturer_name). Null until the first post-migration
+    # refresh; reads fall through to the English column.
+    manufacturer_translations: Mapped[dict] = mapped_column(JSON, nullable=True)
     refreshed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow,
     )

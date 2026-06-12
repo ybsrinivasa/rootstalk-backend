@@ -6420,10 +6420,24 @@ async def _walk_cosh_manufacturers(db: AsyncSession, category: str) -> dict[str,
     if not mfr_ids:
         return {}
 
-    items = await _resolve_names(
-        db, core_type=COSH_INPUT_MANUFACTURERS_CORE, cosh_ids=mfr_ids,
-    )
-    return {i["cosh_id"]: i["name"] for i in items}
+    # Pull active manufacturer rows in one query so we get both the
+    # English baseline AND the full translations dict per cosh_id —
+    # the materialised cache mirrors both so reads can localise without
+    # an extra JOIN. (Was: `_resolve_names` which returns name-only.)
+    from app.modules.sync.models import CoshCoreItem
+    rows = (await db.execute(
+        select(CoshCoreItem).where(
+            CoshCoreItem.cosh_id.in_(mfr_ids),
+            CoshCoreItem.core_type == COSH_INPUT_MANUFACTURERS_CORE,
+            CoshCoreItem.status == "active",
+        )
+    )).scalars().all()
+    out: dict[str, dict] = {}
+    for r in rows:
+        tr = r.translations or {}
+        en_name = tr.get("en") or tr.get("English") or r.cosh_id
+        out[r.cosh_id] = {"name": en_name, "translations": tr}
+    return out
 
 
 async def _rebuild_manufacturer_catalog(
@@ -6431,7 +6445,13 @@ async def _rebuild_manufacturer_catalog(
 ) -> int:
     """Truncate-and-reload the materialised catalog. Returns the
     total number of rows written. Pass `only_category` to refresh
-    just one half (the other half's rows are untouched)."""
+    just one half (the other half's rows are untouched).
+
+    2026-06-12 — Now mirrors the per-cosh_id translations dict alongside
+    the English name so the /dealer/manufacturers-catalog endpoint can
+    render in the dealer's chosen language. English column stays as
+    the audit-trail fallback for any caller that doesn't yet thread a
+    locale."""
     from datetime import datetime, timezone
     cats = [only_category.upper()] if only_category else list(_CATEGORY_TO_L2S.keys())
     total = 0
@@ -6443,10 +6463,12 @@ async def _rebuild_manufacturer_catalog(
         )
         mfrs = await _walk_cosh_manufacturers(db, cat)
         now = datetime.now(timezone.utc)
-        for cosh_id, name in mfrs.items():
+        for cosh_id, entry in mfrs.items():
             db.add(DealerManufacturerCatalog(
                 category=cat, manufacturer_cosh_id=cosh_id,
-                manufacturer_name=name, refreshed_at=now,
+                manufacturer_name=entry["name"],
+                manufacturer_translations=entry["translations"],
+                refreshed_at=now,
             ))
             total += 1
     await db.commit()
@@ -6488,8 +6510,18 @@ async def dealer_manufacturers_catalog(
                 DealerManufacturerCatalog.category == cat,
             ).order_by(DealerManufacturerCatalog.manufacturer_name)
         )).scalars().all()
+    # 2026-06-12 — Surface the dealer's chosen language. Translations
+    # column populated at refresh time mirrors cosh_core_items.
+    # translations; null on rows refreshed before the migration ran,
+    # in which case pick_translation falls through to manufacturer_name.
+    lang = current_user.language_code or "en"
     return [
-        {"cosh_id": r.manufacturer_cosh_id, "name": r.manufacturer_name}
+        {
+            "cosh_id": r.manufacturer_cosh_id,
+            "name": pick_translation(
+                r.manufacturer_translations or {}, lang, r.manufacturer_name,
+            ),
+        }
         for r in rows
     ]
 

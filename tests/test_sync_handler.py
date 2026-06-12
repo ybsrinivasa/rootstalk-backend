@@ -352,7 +352,10 @@ async def test_full_sync_inactivates_absent_connect_rows(db):
 async def test_brand_cache_rebuild_fires_when_input_manufacturers_synced(db):
     """Sync that touches a brand-cache-feeding Core appends a synthetic
     _brand_lookup_cache_rebuild entry to entity_results so the operator
-    knows the cache was refreshed without a separate trigger."""
+    knows the cache was refreshed without a separate trigger.
+
+    Same sync also feeds dealer_manufacturer_catalog (input_manufacturers
+    is on BOTH feeding sets) so both rebuild rows should appear."""
     log = await _new_log(db)
     result = await process_payload(db, _payload(_batch(
         "input_manufacturers",
@@ -360,22 +363,60 @@ async def test_brand_cache_rebuild_fires_when_input_manufacturers_synced(db):
     )), log)
     await db.commit()
 
-    rebuild_entries = [
+    brand_entries = [
         e for e in result["entity_results"]
         if e.get("entity_type") == "_brand_lookup_cache_rebuild"
     ]
-    assert len(rebuild_entries) == 1, (
-        "brand cache rebuild should fire for input_manufacturers sync; "
-        f"entity_results={result['entity_results']}"
+    catalog_entries = [
+        e for e in result["entity_results"]
+        if e.get("entity_type") == "_dealer_manufacturer_catalog_rebuild"
+    ]
+    assert len(brand_entries) == 1 and brand_entries[0]["failed"] == 0, (
+        f"brand_lookup_cache rebuild missing; results={result['entity_results']}"
     )
-    assert rebuild_entries[0]["failed"] == 0
+    assert len(catalog_entries) == 1 and catalog_entries[0]["failed"] == 0, (
+        f"dealer_manufacturer_catalog rebuild missing; "
+        f"results={result['entity_results']}"
+    )
 
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_brand_cache_rebuild_skipped_for_unrelated_sync(db):
-    """Sync that doesn't touch any brand-cache-feeding entity_type should
-    not trigger the rebuild — keeps the hook free for the common case
+async def test_dealer_catalog_rebuild_fires_for_commonnames_l2_sync(db):
+    """commonnames_l2 feeds dealer_manufacturer_catalog only (not the
+    brand_lookup_cache). The hook should fire just the catalog rebuild."""
+    log = await _new_log(db)
+    result = await process_payload(db, _payload(_batch(
+        "commonnames_l2",
+        {"cosh_id": "cnl2:row1", "status": "active",
+         "positions": _positions(
+             (1, "common_names_of_inputs", "cn:urea"),
+             (2, "l2_data", "l2:n_dosages"),
+         )},
+    )), log)
+    await db.commit()
+
+    brand_entries = [
+        e for e in result["entity_results"]
+        if e.get("entity_type") == "_brand_lookup_cache_rebuild"
+    ]
+    catalog_entries = [
+        e for e in result["entity_results"]
+        if e.get("entity_type") == "_dealer_manufacturer_catalog_rebuild"
+    ]
+    assert brand_entries == [], (
+        f"brand cache rebuild should NOT fire for commonnames_l2; entries={brand_entries}"
+    )
+    assert len(catalog_entries) == 1 and catalog_entries[0]["failed"] == 0, (
+        f"dealer catalog rebuild missing; results={result['entity_results']}"
+    )
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_cache_rebuilds_skipped_for_unrelated_sync(db):
+    """Sync that doesn't touch any cache-feeding entity_type should not
+    trigger either rebuild — keeps the hook free for the common case
     where someone syncs an unrelated Core."""
     log = await _new_log(db)
     result = await process_payload(db, _payload(_batch(
@@ -386,10 +427,14 @@ async def test_brand_cache_rebuild_skipped_for_unrelated_sync(db):
 
     rebuild_entries = [
         e for e in result["entity_results"]
-        if e.get("entity_type") == "_brand_lookup_cache_rebuild"
+        if e.get("entity_type") in (
+            "_brand_lookup_cache_rebuild",
+            "_dealer_manufacturer_catalog_rebuild",
+        )
     ]
     assert rebuild_entries == [], (
-        f"rebuild should be skipped for non-brand sync; entries={rebuild_entries}"
+        f"no rebuild should fire for non-cache-feeding sync; "
+        f"entries={rebuild_entries}"
     )
 
 
