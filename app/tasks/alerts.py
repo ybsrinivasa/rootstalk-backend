@@ -38,12 +38,12 @@ from app.services.sms_service import send_sms
 logger = logging.getLogger(__name__)
 
 START_DATE_ALERT_SMS = (
-    "RootsTalk: {name}, your crop advisory for {package} is active "
+    "RootsTalk: {name}, your {crop} advisory is active "
     "but no start date is set. Please set your sowing date in the app."
 )
 INPUT_ALERT_SMS = (
-    "RootsTalk: {name}, an input is due today for your {package} "
-    "crop advisory. Open RootsTalk to place your order."
+    "RootsTalk: {name}, an input is due today for your {crop} "
+    "advisory. Open RootsTalk to place your order."
 )
 
 # FCM payloads — short title for the lock-screen banner, body
@@ -52,12 +52,12 @@ INPUT_ALERT_SMS = (
 # the app).
 START_DATE_ALERT_FCM_TITLE = "Set your sowing date"
 START_DATE_ALERT_FCM_BODY = (
-    "Your {package} advisory is active. Set your sowing date to start receiving "
+    "Your {crop} advisory is active. Set your sowing date to start receiving "
     "daily guidance."
 )
 INPUT_ALERT_FCM_TITLE = "Input due today"
 INPUT_ALERT_FCM_BODY = (
-    "An input is due today for your {package} advisory. Open RootsTalk to place "
+    "An input is due today for your {crop} advisory. Open RootsTalk to place "
     "your order."
 )
 
@@ -243,6 +243,18 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
     if not pkg:
         return
 
+    # Crop name in the recipient's locale — resolved once per sub.
+    # Package name was previously interpolated into SMS / FCM bodies
+    # ("…your {package} advisory") but it's an SE-internal label and
+    # leaks SE jargon to farmers (2026-06-17 rule). Falls back to a
+    # generic "crop" word when Cosh has no entry.
+    from app.modules.sync.models import CoshCoreItem
+    from app.services.i18n_cosh import pick_translation
+    crop_core = (await db.execute(
+        select(CoshCoreItem).where(CoshCoreItem.cosh_id == pkg.crop_cosh_id)
+    )).scalar_one_or_none() if pkg.crop_cosh_id else None
+    crop_translations = (crop_core.translations or {}) if crop_core else {}
+
     crop_start = sub.crop_start_date.date() if sub.crop_start_date else None
     sub_view = SubscriptionView(
         subscription_id=sub.id,
@@ -285,10 +297,13 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
             user = user_by_id.get(recipient.user_id)
             if not user:
                 continue
-            sms = START_DATE_ALERT_SMS.format(
-                name=user.name or "Farmer", package=pkg.name,
+            crop_loc = pick_translation(
+                crop_translations, user.language_code or "en", "crop",
             )
-            fcm_body = START_DATE_ALERT_FCM_BODY.format(package=pkg.name)
+            sms = START_DATE_ALERT_SMS.format(
+                name=user.name or "Farmer", crop=crop_loc,
+            )
+            fcm_body = START_DATE_ALERT_FCM_BODY.format(crop=crop_loc)
             await _send_to_recipient(
                 db, sub.id, AlertType.START_DATE, recipient, user,
                 sms_body=sms,
@@ -340,10 +355,13 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
         user = user_by_id.get(recipient.user_id)
         if not user:
             continue
-        sms = INPUT_ALERT_SMS.format(
-            name=user.name or "Farmer", package=pkg.name,
+        crop_loc = pick_translation(
+            crop_translations, user.language_code or "en", "crop",
         )
-        fcm_body = INPUT_ALERT_FCM_BODY.format(package=pkg.name)
+        sms = INPUT_ALERT_SMS.format(
+            name=user.name or "Farmer", crop=crop_loc,
+        )
+        fcm_body = INPUT_ALERT_FCM_BODY.format(crop=crop_loc)
         await _send_to_recipient(
             db, sub.id, AlertType.INPUT, recipient, user,
             sms_body=sms,
