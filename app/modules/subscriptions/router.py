@@ -4084,6 +4084,36 @@ async def get_today_advisory(
     )
 
 
+async def _l2_name_loc_map(db: AsyncSession, lang: str) -> dict[str, str]:
+    """Returns `{L2_enum: localised_name}` for every L2 we have a Cosh
+    UUID mapping for. Reads `cosh_core_items.translations` once per
+    request and picks the user's locale via `pick_translation`.
+    Missing translations fall through silently so the PWA can humanize
+    the enum as a last resort.
+    """
+    from app.modules.sync.models import CoshCoreItem
+    from app.services.cosh_constants import PYTHON_L2_TO_COSH_UUID
+    cosh_ids = list(PYTHON_L2_TO_COSH_UUID.values())
+    if not cosh_ids:
+        return {}
+    rows = (await db.execute(
+        select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
+        .where(CoshCoreItem.cosh_id.in_(cosh_ids))
+    )).all()
+    rev = {v: k for k, v in PYTHON_L2_TO_COSH_UUID.items()}
+    out: dict[str, str] = {}
+    for cid, tr in rows:
+        if not isinstance(tr, dict):
+            continue
+        enum = rev.get(cid)
+        if enum is None:
+            continue
+        name = pick_translation(tr, lang, "")
+        if name:
+            out[enum] = name
+    return out
+
+
 async def _today_advisory_for_user(
     db: AsyncSession,
     *,
@@ -4101,6 +4131,7 @@ async def _today_advisory_for_user(
     and the result is the one-element list — caller is expected to
     pick out [0] and handle the empty case.
     """
+    l2_name_loc = await _l2_name_loc_map(db, lang)
     today = date.today()
 
     # All ACTIVE subscriptions with a crop_start_date — narrowed if
@@ -4577,6 +4608,7 @@ async def _today_advisory_for_user(
                     {
                         "id": p.id, "l0_type": p.l0_type,
                         "l1_type": p.l1_type, "l2_type": p.l2_type,
+                        "l2_name_loc": l2_name_loc.get(p.l2_type or "") or None,
                         "display_order": p.display_order, "is_special_input": p.is_special_input,
                         "relation_id": p.relation_id,
                         "relation_role": p.relation_role,
@@ -4900,6 +4932,8 @@ async def get_pre_start_inputs(
     timelines = tl_result.scalars().all()
 
     dbs_timelines = [tl for tl in timelines if tl.from_type.value == "DBS"]
+    lang = current_user.language_code or "en"
+    l2_name_loc = await _l2_name_loc_map(db, lang)
 
     out = []
     for tl in dbs_timelines:
@@ -4919,6 +4953,7 @@ async def get_pre_start_inputs(
                         "l0_type": p.l0_type.value,
                         "l1_type": p.l1_type,
                         "l2_type": p.l2_type,
+                        "l2_name_loc": l2_name_loc.get(p.l2_type or "") or None,
                         "display_order": p.display_order,
                     }
                     for p in input_practices
@@ -4956,6 +4991,8 @@ async def get_missed_items(
         select(Timeline).where(Timeline.package_id == sub.package_id)
     )
     timelines = tl_result.scalars().all()
+    lang = current_user.language_code or "en"
+    l2_name_loc = await _l2_name_loc_map(db, lang)
 
     missed = []
     for tl in timelines:
@@ -4990,6 +5027,7 @@ async def get_missed_items(
                             "l0_type": p.l0_type.value,
                             "l1_type": p.l1_type,
                             "l2_type": p.l2_type,
+                            "l2_name_loc": l2_name_loc.get(p.l2_type or "") or None,
                         }
                         for p in practices
                     ],
