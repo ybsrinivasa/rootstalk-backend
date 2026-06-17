@@ -533,7 +533,7 @@ async def start_diagnosis(
         crop_name = await resolve_name_for_cosh_id(
             db, request.crop_cosh_id, current_user.language_code or "en",
         ) or request.crop_cosh_id
-        problem_info = await enrich_problem_with_description(problem_info, crop_name)
+        problem_info = await enrich_problem_with_description(problem_info, crop_name, language_code=current_user.language_code or "en")
     elif step.status == "INCONCLUSIVE":
         # Pool empty at start: no problems mapped to this crop + stage
         # + plant_part. Surface as OUTSIDE_LIST so the PWA shows the
@@ -615,7 +615,7 @@ async def answer_question(
             crop_name = await resolve_name_for_cosh_id(
                 db, session.crop_cosh_id, current_user.language_code or "en",
             ) or session.crop_cosh_id
-            problem_info = await enrich_problem_with_description(problem_info, crop_name)
+            problem_info = await enrich_problem_with_description(problem_info, crop_name, language_code=current_user.language_code or "en")
             await db.commit()
             return {
                 "session_id": session_id,
@@ -680,7 +680,7 @@ async def answer_question(
         crop_name = await resolve_name_for_cosh_id(
             db, session.crop_cosh_id, current_user.language_code or "en",
         ) or session.crop_cosh_id
-        problem_info = await enrich_problem_with_description(problem_info, crop_name)
+        problem_info = await enrich_problem_with_description(problem_info, crop_name, language_code=current_user.language_code or "en")
         # NB: CHA trigger is no longer fired here. The farmer commits
         # the diagnosis to their advisory explicitly via the
         # /diagnosis/{session_id}/commit-to-advisory endpoint.
@@ -696,7 +696,7 @@ async def answer_question(
         crop_name = await resolve_name_for_cosh_id(
             db, session.crop_cosh_id, current_user.language_code or "en",
         ) or session.crop_cosh_id
-        problem_info = await enrich_problem_with_description(problem_info, crop_name)
+        problem_info = await enrich_problem_with_description(problem_info, crop_name, language_code=current_user.language_code or "en")
     elif step.status == "INCONCLUSIVE":
         # Rare: a NO that eliminated the last 2+ candidates at once.
         # Surface to the farmer as OUTSIDE_LIST — same UX as a NO on a
@@ -758,7 +758,7 @@ async def abort_diagnosis(
         crop_name = await resolve_name_for_cosh_id(
             db, session.crop_cosh_id, current_user.language_code or "en",
         ) or session.crop_cosh_id
-        problem_info = await enrich_problem_with_description(problem_info, crop_name)
+        problem_info = await enrich_problem_with_description(problem_info, crop_name, language_code=current_user.language_code or "en")
         return {
             "status": "DIAGNOSED",
             "diagnosed_problem_cosh_id": problem_cosh_id,
@@ -958,7 +958,7 @@ async def ai_direct_diagnose(
     problem_info = await _get_problem_info(
         db, result.problem_cosh_id, current_user.language_code or "en",
     )
-    problem_info = await enrich_problem_with_description(problem_info, crop_name)
+    problem_info = await enrich_problem_with_description(problem_info, crop_name, language_code=current_user.language_code or "en")
 
     return {
         "needs_expert": False,

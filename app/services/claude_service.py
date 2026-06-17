@@ -511,13 +511,44 @@ Output ONLY the 2 sentences, nothing else."""
 
 # ── Batch: enrich problem info with Claude description ─────────────────────────
 
+# language_code → English name of the language. Used to construct the
+# "Write in {language_name}." instruction sent to Claude so the
+# diagnosis description lands in the farmer's locale. Matches the
+# 13 PWA message catalogs.
+LANGUAGE_CODE_TO_NAME: dict[str, str] = {
+    "en": "English",
+    "hi": "Hindi",
+    "kn": "Kannada",
+    "ta": "Tamil",
+    "te": "Telugu",
+    "ml": "Malayalam",
+    "mr": "Marathi",
+    "gu": "Gujarati",
+    "pa": "Punjabi",
+    "or": "Odia",
+    "bn": "Bengali",
+    "as": "Assamese",
+    "ur": "Urdu",
+}
+
+
+def language_name_for(code: str | None) -> str:
+    """Resolve a locale code to an English language name. Falls back
+    to 'English' so Claude doesn't fail on an unknown code."""
+    if not code:
+        return "English"
+    return LANGUAGE_CODE_TO_NAME.get(code, "English")
+
+
 async def enrich_problem_with_description(
     problem_info: dict,
     crop_name: str,
     language_code: str = "en",
-    language_name: str = "English",
+    language_name: str | None = None,
 ) -> dict:
     """Add Claude-generated description to an existing problem_info dict."""
+    if language_name is None:
+        language_name = language_name_for(language_code)
     desc = await describe_crop_problem(
         problem_name=problem_info.get("name", problem_info.get("cosh_id", "")),
         crop_name=crop_name,
