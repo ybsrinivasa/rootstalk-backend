@@ -162,18 +162,20 @@ async def create_order(
     # The cancel→re-send path runs this same check; doing it here too
     # closes the consistency gap where a stale /order/new picker
     # could put a brand-locked order in front of a non-onboarded
-    # dealer or a facilitator.
+    # dealer.
+    #
+    # 2026-06-18 — facilitator branch removed. The earlier code raised
+    # 409 when has_locked + facilitator_user_id, but per the seed-flow
+    # audit (Points 3b + 3c) and the DBS path's permissive treatment
+    # at line ~1586, the farmer CAN route a locked-brand order
+    # through a facilitator. The brand-lock enforces on the
+    # facilitator's onward route-to-dealer hop (which got its own
+    # brand-lock check the same day at line ~3819). PWA was rendering
+    # the 409's structured detail as "Page Not Found" because the
+    # error handler typed `detail` as string.
     if request.practice_ids:
         has_locked = await _practice_ids_have_locked_brand(db, request.practice_ids)
         if has_locked:
-            if request.facilitator_user_id:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "locked_brand_requires_onboarded_dealer",
-                        "message": "This order has a brand-locked item. It can only be sent to a dealer onboarded by the company.",
-                    },
-                )
             if request.dealer_user_id and not await _is_dealer_onboarded_by_client(
                 db, request.dealer_user_id, request.client_id,
             ):
