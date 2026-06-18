@@ -1166,6 +1166,308 @@ async def abort_seed_order(
     return {"id": order_id, "status": order.status}
 
 
+# ── Facilitator: variety-blind passthrough surface ────────────────────────────
+#
+# Point 3c + 4b (2026-06-18). The farmer can route a seed order to a
+# facilitator without the facilitator being onboarded by the variety's
+# owning client (Point 3b — permissive on the farmer→facilitator hop).
+# When the facilitator forwards onward to a dealer, the same brand-lock
+# rule that fires on the direct farmer→dealer path kicks in here:
+# dealer must be onboarded by `order.client_id`.
+#
+# The variety name + id are NEVER exposed on the facilitator surface —
+# not in the list, not in detail, not even after the facilitator
+# accepts. The facilitator is a routing role for seeds; the brand
+# secrecy is what makes brand-lock meaningful (otherwise a
+# non-onboarded facilitator could fish for variety names just by
+# accepting orders).
+
+
+def _seed_for_facilitator_payload(
+    o: "SeedOrderFull",
+    farmer: Optional[User] = None,
+    sub: Optional[Subscription] = None,
+    client: Optional["Client"] = None,
+) -> dict:
+    """Variety-blind response shape for the facilitator surface.
+
+    Deliberately omits `variety_name` AND `variety_id`. The
+    facilitator gets enough to ring the farmer and pick a dealer —
+    crop name (via crop_cosh_id resolves to a generic Chilli / Tomato
+    label), farmer contact info, the client (seed company) name, and
+    farm area for context.
+    """
+    return {
+        "id": o.id,
+        "status": o.status,
+        "category": "SEED",
+        "crop_cosh_id": None,  # set by caller after variety lookup
+        "farmer_user_id": o.farmer_user_id,
+        "farmer_name": farmer.name if farmer else None,
+        "farmer_phone": farmer.phone if farmer else None,
+        "farmer_photo_url": farmer.photo_url if farmer else None,
+        "farm_area_acres": float(sub.farm_area_acres) if sub and sub.farm_area_acres else None,
+        "client_id": o.client_id,
+        "client_name": (client.display_name or client.short_name) if client else None,
+        "dealer_user_id": o.dealer_user_id,
+        "created_at": o.created_at,
+    }
+
+
+@router.get("/facilitator/seed-orders")
+async def list_facilitator_seed_orders(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Seed orders the farmer routed to this facilitator. Variety
+    name + id are stripped from the payload — see module note above."""
+    from app.modules.orders.router import _assert_active_facilitator
+    from app.modules.clients.models import Client
+    await _assert_active_facilitator(db, current_user.id)
+    result = await db.execute(
+        select(SeedOrderFull).where(
+            SeedOrderFull.facilitator_user_id == current_user.id,
+            SeedOrderFull.status.notin_([SeedOrderStatus.CANCELLED]),
+        ).order_by(SeedOrderFull.created_at.desc())
+    )
+    orders = result.scalars().all()
+
+    variety_ids = {o.variety_id for o in orders}
+    farmer_ids = {o.farmer_user_id for o in orders}
+    sub_ids = {o.subscription_id for o in orders}
+    client_ids = {o.client_id for o in orders}
+
+    # We still load the variety — but only to resolve the crop_cosh_id
+    # for the response. The variety's `name` never leaves this scope.
+    varieties: dict[str, SeedVariety] = {}
+    if variety_ids:
+        varieties = {
+            v.id: v for v in (await db.execute(
+                select(SeedVariety).where(SeedVariety.id.in_(variety_ids))
+            )).scalars().all()
+        }
+    farmers: dict[str, User] = {}
+    if farmer_ids:
+        farmers = {
+            u.id: u for u in (await db.execute(
+                select(User).where(User.id.in_(farmer_ids))
+            )).scalars().all()
+        }
+    subs: dict[str, Subscription] = {}
+    if sub_ids:
+        subs = {
+            s.id: s for s in (await db.execute(
+                select(Subscription).where(Subscription.id.in_(sub_ids))
+            )).scalars().all()
+        }
+    clients: dict[str, Client] = {}
+    if client_ids:
+        clients = {
+            c.id: c for c in (await db.execute(
+                select(Client).where(Client.id.in_(client_ids))
+            )).scalars().all()
+        }
+
+    out = []
+    for o in orders:
+        variety = varieties.get(o.variety_id)
+        payload = _seed_for_facilitator_payload(
+            o,
+            farmer=farmers.get(o.farmer_user_id),
+            sub=subs.get(o.subscription_id),
+            client=clients.get(o.client_id),
+        )
+        payload["crop_cosh_id"] = variety.crop_cosh_id if variety else None
+        out.append(payload)
+    return out
+
+
+async def _get_facilitator_seed_order(
+    db: AsyncSession, order_id: str, facilitator_user_id: str,
+) -> SeedOrderFull:
+    order = (await db.execute(
+        select(SeedOrderFull).where(
+            SeedOrderFull.id == order_id,
+            SeedOrderFull.facilitator_user_id == facilitator_user_id,
+        )
+    )).scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Seed order not found")
+    return order
+
+
+@router.put("/facilitator/seed-orders/{order_id}/accept")
+async def facilitator_accept_seed_order(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Facilitator accepts the routing. Status SENT → ACCEPTED.
+
+    Per user spec 2026-06-18: a facilitator CAN accept a seed order
+    even when not onboarded by the variety's owning client. The
+    brand-lock check fires only on the onward route-to-dealer step.
+    """
+    from app.modules.orders.router import _assert_active_facilitator
+    await _assert_active_facilitator(db, current_user.id)
+    order = await _get_facilitator_seed_order(db, order_id, current_user.id)
+    if order.status != SeedOrderStatus.SENT:
+        raise HTTPException(
+            status_code=400,
+            detail="Seed order can only be accepted from SENT status",
+        )
+    order.status = SeedOrderStatus.ACCEPTED
+    await db.commit()
+    return {"id": order_id, "status": order.status}
+
+
+@router.put("/facilitator/seed-orders/{order_id}/reject")
+async def facilitator_reject_seed_order(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Facilitator declines a seed order. Status → REJECTED. The
+    farmer's existing cancel-and-migrate machinery
+    (`/farmer/seed-orders/{id}/cancel`) then lets them route the
+    intent elsewhere; mirroring the regular-order
+    facilitator-reject auto-migration is deferred until users ask
+    for it on the seed side."""
+    from app.modules.orders.router import _assert_active_facilitator
+    await _assert_active_facilitator(db, current_user.id)
+    order = await _get_facilitator_seed_order(db, order_id, current_user.id)
+    if order.status not in (SeedOrderStatus.SENT, SeedOrderStatus.ACCEPTED):
+        raise HTTPException(
+            status_code=400,
+            detail="Seed order can only be rejected from SENT or ACCEPTED",
+        )
+    order.status = SeedOrderStatus.REJECTED
+    await db.commit()
+    return {"id": order_id, "status": order.status}
+
+
+@router.get("/facilitator/seed-orders/{order_id}/nearby-dealers")
+async def facilitator_seed_order_nearby_dealers(
+    order_id: str,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Brand-lock-filtered dealer picker for the facilitator's
+    forward step. Reads `order.client_id` and drops any dealer not
+    onboarded by that client — same invariant the farmer-side
+    picker enforces (`subscriptions/router.py::nearby_dealers_for_farmer`
+    with `variety_id`)."""
+    from app.modules.orders.router import _assert_active_facilitator
+    from app.modules.clients.models import ClientPromoter
+    from app.modules.subscriptions.router import _haversine_sub
+    await _assert_active_facilitator(db, current_user.id)
+    order = await _get_facilitator_seed_order(db, order_id, current_user.id)
+
+    fac_lat = lat or (float(current_user.gps_lat) if current_user.gps_lat else 0.0)
+    fac_lng = lng or (float(current_user.gps_lng) if current_user.gps_lng else 0.0)
+
+    onboarded_rows = (await db.execute(
+        select(ClientPromoter.user_id).where(
+            ClientPromoter.client_id == order.client_id,
+            ClientPromoter.promoter_type == "DEALER",
+            ClientPromoter.status == "ACTIVE",
+        )
+    )).scalars().all()
+    onboarded_dealer_ids = set(onboarded_rows)
+    if not onboarded_dealer_ids:
+        return []
+
+    from app.modules.orders.models import DealerProfile
+    profiles = (await db.execute(
+        select(DealerProfile).where(DealerProfile.user_id.in_(onboarded_dealer_ids))
+    )).scalars().all()
+
+    results = []
+    for profile in profiles:
+        if "SEEDS" not in (profile.sell_categories or []):
+            continue
+        if not profile.shop_gps_lat or not profile.shop_gps_lng:
+            continue
+        dist = _haversine_sub(fac_lat, fac_lng,
+                              float(profile.shop_gps_lat), float(profile.shop_gps_lng))
+        dealer = (await db.execute(
+            select(User).where(User.id == profile.user_id)
+        )).scalar_one_or_none()
+        if dealer:
+            results.append({
+                "user_id": dealer.id,
+                "name": dealer.name,
+                "phone": dealer.phone,
+                "shop_name": profile.shop_name,
+                "shop_address": profile.shop_address,
+                "distance_km": round(dist, 1),
+            })
+
+    results.sort(key=lambda x: x["distance_km"])
+    return results[:5]
+
+
+@router.put("/facilitator/seed-orders/{order_id}/route-to-dealer")
+async def facilitator_route_seed_to_dealer(
+    order_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Facilitator forwards the seed order to a chosen dealer.
+
+    Brand-lock guard: dealer must be onboarded by `order.client_id`.
+    Mirrors the write-time check on
+    `POST /farmer/seed-orders` so a direct API call can't bypass
+    the picker's filter.
+
+    Status flips to SENT after re-assignment so the dealer sees an
+    Accept / Decline decision — same shape the
+    `route-to-dealer` on the regular-orders side uses
+    (orders/router.py:3822-3825, 2026-06-09 design).
+    """
+    from app.modules.orders.router import (
+        _assert_active_dealer,
+        _assert_active_facilitator,
+        _is_dealer_onboarded_by_client,
+    )
+    await _assert_active_facilitator(db, current_user.id)
+    order = await _get_facilitator_seed_order(db, order_id, current_user.id)
+    if order.status not in (SeedOrderStatus.SENT, SeedOrderStatus.ACCEPTED):
+        raise HTTPException(
+            status_code=400,
+            detail="Seed order cannot be routed in current status",
+        )
+    dealer_user_id = data.get("dealer_user_id")
+    if not dealer_user_id:
+        raise HTTPException(status_code=422, detail="dealer_user_id required")
+    await _assert_active_dealer(db, dealer_user_id)
+    if not await _is_dealer_onboarded_by_client(
+        db, dealer_user_id, order.client_id,
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "locked_brand_requires_onboarded_dealer",
+                "message": (
+                    "Seed varieties are brand-locked — this order "
+                    "can only be forwarded to a dealer onboarded by "
+                    "the seed company."
+                ),
+            },
+        )
+    order.dealer_user_id = dealer_user_id
+    order.status = SeedOrderStatus.SENT
+    await db.commit()
+    return {
+        "id": order_id,
+        "status": order.status,
+        "dealer_user_id": order.dealer_user_id,
+    }
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _variety_out(v: SeedVariety, dus_names: Optional[dict[str, str]] = None) -> dict:
