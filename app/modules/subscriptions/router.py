@@ -4886,13 +4886,22 @@ async def active_advisories_in_district(
 async def nearby_dealers_for_farmer(
     subscription_id: str,
     order_type: Optional[str] = None,
+    variety_id: Optional[str] = None,
     lat: Optional[float] = None,
     lng: Optional[float] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Returns up to 5 nearest dealers + Promoter pinned first.
-    order_type: PESTICIDE | FERTILISER | SEED — filters by sell_categories."""
+    order_type: PESTICIDE | FERTILISER | SEED — filters by sell_categories.
+
+    `variety_id` is the seed-order brand-lock hook (Point 3a, 2026-06-18).
+    When supplied, the picker drops any dealer not onboarded by the
+    variety's owning client. Seed varieties are always brand-locked, so
+    the PWA's seed-order picker must always pass this. Pesticide /
+    fertiliser callers leave it null and use the existing brand-lock
+    machinery on `/eligible-recipients-for-new-order`.
+    """
     sub = (await db.execute(
         select(Subscription).where(
             Subscription.id == subscription_id,
@@ -4901,6 +4910,20 @@ async def nearby_dealers_for_farmer(
     )).scalar_one_or_none()
     if not sub:
         raise HTTPException(status_code=404, detail="Subscription not found")
+
+    # Resolve the variety's client_id for the brand-lock filter. We
+    # narrow on `variety.client_id`, not `sub.client_id`, because the
+    # subscription's package can carry varieties from multiple
+    # seed-company clients via VarietyPoP.
+    brand_lock_client_id: Optional[str] = None
+    if variety_id:
+        from app.modules.seed_mgmt.models import SeedVariety as _Var
+        var_row = (await db.execute(
+            select(_Var.client_id).where(_Var.id == variety_id)
+        )).scalar_one_or_none()
+        if var_row is None:
+            raise HTTPException(status_code=404, detail="Variety not found")
+        brand_lock_client_id = var_row
 
     farmer_lat = lat or (float(current_user.gps_lat) if current_user.gps_lat else 0.0)
     farmer_lng = lng or (float(current_user.gps_lng) if current_user.gps_lng else 0.0)
@@ -4918,10 +4941,27 @@ async def nearby_dealers_for_farmer(
     }
     required_cat = category_map.get((order_type or "").upper()) if order_type else None
 
+    # Pre-compute the onboarded-dealer allow-list for the brand-lock
+    # case. Cheaper than calling `_is_dealer_onboarded_by_client` per
+    # dealer in the loop below (which would issue one query per row).
+    onboarded_dealer_ids: Optional[set[str]] = None
+    if brand_lock_client_id:
+        from app.modules.clients.models import ClientPromoter
+        onboarded_rows = (await db.execute(
+            select(ClientPromoter.user_id).where(
+                ClientPromoter.client_id == brand_lock_client_id,
+                ClientPromoter.promoter_type == "DEALER",
+                ClientPromoter.status == "ACTIVE",
+            )
+        )).scalars().all()
+        onboarded_dealer_ids = set(onboarded_rows)
+
     profiles = (await db.execute(select(DealerProfile))).scalars().all()
     results = []
     for profile in profiles:
         if required_cat and required_cat not in (profile.sell_categories or []):
+            continue
+        if onboarded_dealer_ids is not None and profile.user_id not in onboarded_dealer_ids:
             continue
         if not profile.shop_gps_lat or not profile.shop_gps_lng:
             continue

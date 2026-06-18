@@ -562,12 +562,38 @@ async def place_seed_order(
     if not variety:
         raise HTTPException(status_code=404, detail="Variety not found")
 
+    # Brand-lock guard (Point 3a, 2026-06-18). Seed varieties are
+    # always brand-locked: a SEED order can only be sent to a dealer
+    # who is onboarded by the variety's owning client. Facilitators
+    # are exempt at the farmer→facilitator hop — the facilitator's
+    # eventual onward route-to-dealer carries the same check (deferred
+    # until those endpoints get built; see Point 3c in the audit).
+    # Mirrors the pesticide/fertiliser pattern at
+    # `orders/router.py:1583-1601`.
+    dealer_user_id = data.get("dealer_user_id")
+    if dealer_user_id:
+        from app.modules.orders.router import _is_dealer_onboarded_by_client
+        if not await _is_dealer_onboarded_by_client(
+            db, dealer_user_id, variety.client_id,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "locked_brand_requires_onboarded_dealer",
+                    "message": (
+                        "Seed varieties are brand-locked — this order "
+                        "can only be sent to a dealer onboarded by the "
+                        "seed company."
+                    ),
+                },
+            )
+
     order = SeedOrderFull(
         subscription_id=data["subscription_id"],
         farmer_user_id=current_user.id,
         variety_id=data["variety_id"],
         client_id=variety.client_id,
-        dealer_user_id=data.get("dealer_user_id"),
+        dealer_user_id=dealer_user_id,
         facilitator_user_id=data.get("facilitator_user_id"),
     )
     db.add(order)
