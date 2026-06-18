@@ -539,6 +539,154 @@ async def browse_seed_varieties(
     return [_variety_out(v, dus_names=names) for v in varieties]
 
 
+# ── Farmer: Lookup a recipient by phone ───────────────────────────────────────
+#
+# Points 1 + 2 (2026-06-18). The seed-order picker used to be a
+# pure pick-from-list — the farmer couldn't type a known dealer /
+# facilitator's number. This endpoint backs the new phone-entry
+# input on the seed-varieties picker: returns whether the looked-up
+# user is eligible to receive THIS seed order, with localised
+# state/district + role + photo so the farmer can confirm before
+# sending.
+#
+# Variety-blind for safety: we do NOT echo `variety_name` or
+# `variety_id` back to the farmer here (the farmer sees the variety
+# on the variety-detail screen separately). This keeps the response
+# shape symmetric with the facilitator/dealer surfaces' Point 4b
+# rule, even though the farmer is allowed to see the variety
+# elsewhere.
+
+@router.get("/farmer/seed-orders/lookup-recipient")
+async def lookup_seed_recipient(
+    phone: str,
+    variety_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    lang: str = Depends(get_locale),
+):
+    """Resolve a phone number for the seed-order recipient picker.
+
+    Eligibility rules (locked 2026-06-18 audit):
+      - FACILITATOR — always allowed, even when not onboarded by the
+        variety's owning client. The brand-lock kicks in only on the
+        facilitator's eventual onward route-to-dealer step.
+      - DEALER — allowed only when onboarded as DEALER by the
+        variety's owning client (ClientPromoter row, ACTIVE). Seed
+        varieties are brand-locked.
+      - Anything else (no DEALER / FACILITATOR ClientPromoter row,
+        or the user is the caller themselves) — not eligible.
+
+    Always returns 200 with structured payload so the PWA can render
+    a friendly card per reason. The single exception is auth/missing
+    params, which raise normally.
+    """
+    from app.modules.auth.service import get_user_by_phone
+    from app.modules.clients.models import Client, ClientPromoter
+    from app.modules.orders.router import _is_dealer_onboarded_by_client
+
+    variety = (await db.execute(
+        select(SeedVariety).where(SeedVariety.id == variety_id)
+    )).scalar_one_or_none()
+    if not variety:
+        raise HTTPException(status_code=404, detail="Variety not found")
+    client_id = variety.client_id
+
+    # Phone normalisation mirrors /platform/lookup-user-by-phone:
+    # strip non-digits, take last 10, prefix +91.
+    digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+    if len(digits) < 10:
+        return {"found": False, "reason": "phone_not_registered", "phone": phone}
+    normalised = "+91" + digits[-10:]
+    target = await get_user_by_phone(db, normalised)
+    if target is None:
+        return {"found": False, "reason": "phone_not_registered", "phone": normalised}
+
+    if target.id == current_user.id:
+        return {
+            "found": True,
+            "user_id": target.id,
+            "phone": target.phone,
+            "name": target.name,
+            "can_receive": False,
+            "reason": "self",
+        }
+
+    # Resolve which (active) roles this user holds across all clients.
+    cp_rows = (await db.execute(
+        select(ClientPromoter.promoter_type, ClientPromoter.client_id)
+        .where(
+            ClientPromoter.user_id == target.id,
+            ClientPromoter.promoter_type.in_(("FACILITATOR", "DEALER")),
+            ClientPromoter.status == "ACTIVE",
+        )
+    )).all()
+    roles_held = {ptype for (ptype, _cid) in cp_rows}
+    is_active = bool(cp_rows)
+
+    # Resolve the seed company name (for the reason copy) +
+    # localised state / district names for the confirmation card.
+    seed_company = (await db.execute(
+        select(Client).where(Client.id == client_id)
+    )).scalar_one_or_none()
+    client_name = (
+        (seed_company.display_name or seed_company.short_name)
+        if seed_company else None
+    )
+
+    loc_ids = {
+        cid for cid in (target.state_cosh_id, target.district_cosh_id) if cid
+    }
+    loc_names = await resolve_names_by_cosh_id(db, loc_ids, lang) if loc_ids else {}
+
+    base = {
+        "found": True,
+        "user_id": target.id,
+        "phone": target.phone,
+        "name": target.name,
+        "photo_url": target.photo_url,
+        "state_name": loc_names.get(target.state_cosh_id) if target.state_cosh_id else None,
+        "district_name": loc_names.get(target.district_cosh_id) if target.district_cosh_id else None,
+        "is_active": is_active,
+        "client_name": client_name,
+    }
+
+    # Role precedence: prefer DEALER when onboarded by THIS client
+    # (direct fulfilment path). Otherwise fall back to FACILITATOR
+    # (permissive passthrough). Both held + dealer-not-onboarded:
+    # treat as FACILITATOR — the farmer can still route through
+    # them as a passthrough.
+    if "DEALER" in roles_held and await _is_dealer_onboarded_by_client(
+        db, target.id, client_id,
+    ):
+        return {
+            **base,
+            "role": "DEALER",
+            "can_receive": True,
+            "reason": "ok",
+        }
+    if "FACILITATOR" in roles_held:
+        return {
+            **base,
+            "role": "FACILITATOR",
+            "can_receive": True,
+            "reason": "ok",
+        }
+    if "DEALER" in roles_held:
+        # Dealer-only, not onboarded by this client → brand-lock blocks.
+        return {
+            **base,
+            "role": "DEALER",
+            "can_receive": False,
+            "reason": "dealer_not_onboarded",
+        }
+    return {
+        **base,
+        "role": None,
+        "can_receive": False,
+        "reason": "not_dealer_or_facilitator",
+    }
+
+
 # ── Farmer: Place seed order ───────────────────────────────────────────────────
 
 @router.post("/farmer/seed-orders", status_code=201)

@@ -3817,6 +3817,22 @@ async def route_order_to_dealer(
     # dealer (the picker UI is dealer-only, but the endpoint took
     # any user id before this check landed).
     await _assert_active_dealer(db, dealer_user_id)
+    # 2026-06-18 — Brand-lock guard on the facilitator's onward hop.
+    # Mirror of the farmer→dealer write-time check at line 1592 and
+    # the same rule the seed-flow `/facilitator/seed-orders/{id}/
+    # route-to-dealer` enforces. Audit had this flagged as a sibling
+    # gap when Point 3c landed for seeds.
+    if await _order_has_locked_brand_items(db, order.id):
+        if not await _is_dealer_onboarded_by_client(
+            db, dealer_user_id, order.client_id,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "locked_brand_requires_onboarded_dealer",
+                    "message": "This order has a brand-locked item. It can only be forwarded to a dealer onboarded by the company.",
+                },
+            )
     prev_status = order.status.value if hasattr(order.status, "value") else order.status
     order.dealer_user_id = dealer_user_id
     # 2026-06-09 — SENT so the dealer can Accept / Decline. The
