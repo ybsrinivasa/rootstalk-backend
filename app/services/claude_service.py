@@ -11,6 +11,7 @@ Both functions degrade gracefully when ANTHROPIC_API_KEY is not set.
 """
 import json
 import logging
+from dataclasses import dataclass
 from typing import Optional
 from app.config import settings
 
@@ -506,6 +507,141 @@ Output ONLY the 2 sentences, nothing else."""
         return (
             f"Look at the {plant_part_name} of your {crop_name}. "
             f"If you can clearly see {symptom_name}, tap Yes. If you are unsure, tap No."
+        )
+
+
+# ── Image-backed Yes/No decision support ──────────────────────────────────────
+#
+# Used by the dichotomous diagnose loop when the farmer is stuck on a
+# Yes/No question and wants AI help. The model is asked specifically
+# "does this photo show {symptom} on {part}?" — NOT "what problem is
+# this?". Returns a verdict the farmer uses to choose their own answer;
+# the loop never auto-advances based on the model's reply.
+
+@dataclass
+class SymptomCheckResult:
+    verdict: str          # "YES" | "NO" | "UNCERTAIN"
+    confidence: str       # "HIGH" | "MEDIUM" | "LOW"
+    reasoning: str        # 1–2 farmer-language sentences
+
+    def to_dict(self) -> dict:
+        return {
+            "verdict": self.verdict,
+            "confidence": self.confidence,
+            "reasoning": self.reasoning,
+        }
+
+
+async def check_symptom_in_image(
+    image_base64: str,
+    media_type: str,
+    crop_name: str,
+    plant_part_name: str,
+    symptom_name: str,
+    sub_part_name: Optional[str] = None,
+    sub_symptom_name: Optional[str] = None,
+    language_code: str = "en",
+    language_name: str = "English",
+) -> SymptomCheckResult:
+    """Look at the photo and verdict whether the named symptom is
+    present on the named plant part. Powers the in-loop `Ask AI`
+    button on the dichotomous diagnose screen.
+
+    The deliberately narrow scope keeps the model from speculating
+    about the underlying problem (a separate `/diagnosis/image-analysis`
+    flow exists for that case). The farmer keeps control of the Yes/No
+    answer; the model is just a second pair of eyes.
+    """
+    if not settings.anthropic_api_key:
+        return SymptomCheckResult(
+            verdict="UNCERTAIN",
+            confidence="LOW",
+            reasoning=(
+                f"Look at the {plant_part_name} of your {crop_name}. "
+                f"If you can clearly see {symptom_name}, tap Yes. Otherwise tap No."
+            ),
+        )
+
+    try:
+        import anthropic
+        import json
+
+        sub_clause = ""
+        if sub_part_name or sub_symptom_name:
+            extras = " ".join(filter(None, [sub_part_name, sub_symptom_name]))
+            sub_clause = f" Specifically: {extras}."
+
+        language_instruction = (
+            f"Write `reasoning` in {language_name}." if language_code != "en"
+            else "Write `reasoning` in simple English."
+        )
+
+        prompt = f"""You are helping a farmer in India decide a single Yes/No question while diagnosing their crop.
+
+The farmer is looking at a {plant_part_name} on a {crop_name} plant.
+The question they must answer: "Do you see {symptom_name} on the {plant_part_name}?"{sub_clause}
+
+Look ONLY at the photo and decide whether the symptom is present.
+
+Pick verdict:
+  YES — the symptom is clearly visible on the {plant_part_name}.
+  NO — the {plant_part_name} is visible and the symptom is clearly absent.
+  UNCERTAIN — the photo is unclear, the wrong plant part, or the symptom is ambiguous.
+
+Pick confidence: HIGH, MEDIUM, or LOW.
+
+Write 1–2 short sentences as `reasoning` explaining what you see (or do not see) that led to your verdict. Plain language, Class 5 reading level, no Latin, no jargon. Each sentence under 25 words. {language_instruction}
+
+DO NOT suggest a problem name. DO NOT name a disease or pest. DO NOT recommend treatment. Your only job is to help the farmer decide Yes or No for THIS question.
+
+Output ONLY this JSON (no markdown, no preamble):
+{{"verdict": "YES|NO|UNCERTAIN", "confidence": "HIGH|MEDIUM|LOW", "reasoning": "..."}}"""
+
+        client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=350,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": image_base64,
+                        },
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        )
+        raw = response.content[0].text.strip()
+        # Tolerate stray code fences if the model wraps the JSON.
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.lower().startswith("json"):
+                raw = raw[4:].lstrip()
+        data = json.loads(raw)
+        verdict = (data.get("verdict") or "UNCERTAIN").upper()
+        confidence = (data.get("confidence") or "LOW").upper()
+        reasoning = (data.get("reasoning") or "").strip()
+        if verdict not in ("YES", "NO", "UNCERTAIN"):
+            verdict = "UNCERTAIN"
+        if confidence not in ("HIGH", "MEDIUM", "LOW"):
+            confidence = "LOW"
+        return SymptomCheckResult(
+            verdict=verdict, confidence=confidence, reasoning=reasoning,
+        )
+    except Exception as e:
+        logger.error(f"Claude symptom-image check failed: {e}")
+        return SymptomCheckResult(
+            verdict="UNCERTAIN",
+            confidence="LOW",
+            reasoning=(
+                f"Look at the {plant_part_name} of your {crop_name}. "
+                f"If you can clearly see {symptom_name}, tap Yes. Otherwise tap No."
+            ),
         )
 
 

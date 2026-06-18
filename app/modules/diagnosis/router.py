@@ -41,6 +41,7 @@ from app.modules.diagnosis.schemas import (
     AIDirectDiagnoseRequest,
     AnswerRequest,
     ExplainSymptomRequest,
+    ImageCheckSymptomRequest,
     ImageAnalysisRequest,
     ReferenceImagesRequest,
     StartDiagnosisRequest,
@@ -62,6 +63,7 @@ from app.services.bl08_diagnosis_path import (
 from app.services.claude_service import (
     analyze_crop_image,
     analyze_crop_images_constrained,
+    check_symptom_in_image,
     enrich_problem_with_description,
     explain_symptom,
     language_name_for,
@@ -80,6 +82,7 @@ router = APIRouter(tags=["Diagnosis"])
 __all__ = [
     "router",
     "AnswerRequest", "ExplainSymptomRequest", "ImageAnalysisRequest",
+    "ImageCheckSymptomRequest",
     "ReferenceImagesRequest", "StartDiagnosisRequest",
     "DiagnosisSession",
     "_load_problem_symptom_rows",  # used by one test inline-import
@@ -87,6 +90,7 @@ __all__ = [
     "explain_symptom_route", "get_diagnosis_eligibility",
     "get_reference_images", "list_problems_for_crop",
     "analyse_image_with_claude",
+    "image_check_symptom_route",
 ]
 
 
@@ -1079,6 +1083,54 @@ async def explain_symptom_route(
         language_name=lang_name,
     )
     return {"explanation": text, "language_code": lang}
+
+
+@router.post("/diagnosis/image-check-symptom")
+async def image_check_symptom_route(
+    request: ImageCheckSymptomRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """In-loop AI decision support for the dichotomous Yes/No flow.
+
+    Farmer is on a question like "Do you see {symptom} on {part}?" and
+    is unsure. They tap `Ask AI`, take a photo, and we ask Claude
+    specifically whether the symptom is present — NOT what the
+    underlying problem might be. Claude returns
+    {verdict: YES|NO|UNCERTAIN, confidence, reasoning}; the PWA shows
+    this as a hint and the farmer picks Yes / No themselves. The
+    diagnose loop never auto-advances based on this reply — that's
+    what `/diagnosis/image-analysis` is for (a different entry point
+    above the question loop, where the farmer is explicitly delegating
+    the diagnosis to AI).
+
+    Locale derives from `current_user.language_code` so the reasoning
+    text lands in the farmer's language without the PWA having to
+    thread the field through.
+    """
+    lang = current_user.language_code or "en"
+    lang_name = language_name_for(current_user.language_code)
+    names = await resolve_names_by_cosh_id(
+        db,
+        {
+            request.crop_cosh_id, request.plant_part_cosh_id,
+            request.symptom_cosh_id, request.sub_part_cosh_id,
+            request.sub_symptom_cosh_id,
+        } - {None, ""},
+        lang,
+    )
+    result = await check_symptom_in_image(
+        image_base64=request.image_base64,
+        media_type=request.media_type,
+        crop_name=names.get(request.crop_cosh_id) or request.crop_cosh_id,
+        plant_part_name=names.get(request.plant_part_cosh_id) or request.plant_part_cosh_id,
+        symptom_name=names.get(request.symptom_cosh_id) or request.symptom_cosh_id,
+        sub_part_name=names.get(request.sub_part_cosh_id) if request.sub_part_cosh_id else None,
+        sub_symptom_name=names.get(request.sub_symptom_cosh_id) if request.sub_symptom_cosh_id else None,
+        language_code=lang,
+        language_name=lang_name,
+    )
+    return {"check": result.to_dict(), "language_code": lang}
 
 
 @router.post("/diagnosis/reference-images")

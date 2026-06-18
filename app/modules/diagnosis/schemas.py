@@ -55,6 +55,19 @@ class ExplainSymptomRequest(BaseModel):
     language_name: str = "English"
 
 
+class ImageCheckSymptomRequest(BaseModel):
+    """In-loop AI decision support for the current Yes/No question.
+    Locale derives from current_user (request-body language fields are
+    ignored)."""
+    image_base64: str
+    media_type: str = "image/jpeg"
+    crop_cosh_id: str
+    plant_part_cosh_id: str
+    symptom_cosh_id: str
+    sub_part_cosh_id: Optional[str] = None
+    sub_symptom_cosh_id: Optional[str] = None
+
+
 class AIDirectImage(BaseModel):
     base64: str
     media_type: str = "image/jpeg"
