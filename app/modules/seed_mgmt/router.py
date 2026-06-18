@@ -954,16 +954,31 @@ async def list_dealer_seed_orders(
             )).scalars().all()
         }
 
+    # Point 4a (2026-06-18): the dealer cannot see the variety name
+    # until they accept the order. Seed varieties are brand-locked,
+    # and exposing the name pre-accept would let a non-onboarded
+    # dealer fish for brands. Pre-accept = `SENT` (or `DRAFT`, which
+    # only exists transiently on cancel-and-migrate and wouldn't
+    # carry a dealer assignment in practice, but guarded anyway).
+    PRE_ACCEPT_STATUSES = {
+        SeedOrderStatus.SENT.value,
+        SeedOrderStatus.DRAFT.value,
+    }
     out = []
     for o in orders:
         variety = varieties.get(o.variety_id)
         farmer = farmers.get(o.farmer_user_id)
         sub = subs.get(o.subscription_id)
         client = clients.get(o.client_id)
+        variety_hidden = o.status in PRE_ACCEPT_STATUSES
         out.append({
             "id": o.id, "status": o.status,
             "category": "SEED",
-            "variety_name": variety.name if variety else None,
+            "variety_name": (
+                None if variety_hidden
+                else (variety.name if variety else None)
+            ),
+            "variety_name_hidden": variety_hidden,
             "crop_cosh_id": variety.crop_cosh_id if variety else None,
             "farmer_user_id": o.farmer_user_id,
             "farmer_name": farmer.name if farmer else None,
