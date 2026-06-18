@@ -64,6 +64,7 @@ from app.services.claude_service import (
     analyze_crop_images_constrained,
     enrich_problem_with_description,
     explain_symptom,
+    language_name_for,
 )
 from app.services.diagnosis_images import (
     build_google_images_query,
@@ -1041,8 +1042,20 @@ async def explain_symptom_route(
     """Two plain-language sentences telling the farmer how to verify
     the current question's symptom. Names get resolved through Cosh
     (cosh_core_items.translations) before they reach Claude — a raw
-    UUID in the prompt would confuse the model."""
-    lang = request.language_code or "en"
+    UUID in the prompt would confuse the model.
+
+    Locale resolution prefers `current_user.language_code` over the
+    request body — the PWA doesn't pass language fields here and the
+    Pydantic default of "en" was silently overriding the farmer's
+    actual language. Falls back to the request body / English when
+    the user has no language set.
+    """
+    lang = current_user.language_code or request.language_code or "en"
+    lang_name = (
+        language_name_for(current_user.language_code)
+        if current_user.language_code
+        else request.language_name or "English"
+    )
     names = await resolve_names_by_cosh_id(
         db,
         {
@@ -1058,10 +1071,10 @@ async def explain_symptom_route(
         symptom_name=names.get(request.symptom_cosh_id) or request.symptom_cosh_id,
         sub_part_name=names.get(request.sub_part_cosh_id) if request.sub_part_cosh_id else None,
         sub_symptom_name=names.get(request.sub_symptom_cosh_id) if request.sub_symptom_cosh_id else None,
-        language_code=request.language_code,
-        language_name=request.language_name,
+        language_code=lang,
+        language_name=lang_name,
     )
-    return {"explanation": text, "language_code": request.language_code}
+    return {"explanation": text, "language_code": lang}
 
 
 @router.post("/diagnosis/reference-images")
