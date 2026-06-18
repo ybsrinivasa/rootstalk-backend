@@ -21,7 +21,7 @@ from app.modules.advisory.models import Package, Practice, Element, Timeline
 from app.services.bl06_volume_calc import calculate_volume
 from math import radians, cos, sin, asin, sqrt
 from app.services.bl07_brand_options import get_brand_options
-from app.services.i18n_cosh import pick_translation
+from app.services.i18n_cosh import pick_translation, get_locale
 from app.services.npk_candidates import load_fertiliser_candidates
 from app.services.npk_ranking import (
     Candidate as NPKCandidate, Concentration as NPKConcentration, Dose,
@@ -1927,6 +1927,143 @@ async def list_eligible_recipients_for_new_order(
         category=category,
         has_locked=has_locked,
     )
+
+
+@router.get("/farmer/subscriptions/{subscription_id}/lookup-recipient")
+async def lookup_recipient_for_new_order(
+    subscription_id: str,
+    phone: str,
+    category: str,
+    practice_ids: str = "",
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    lang: str = Depends(get_locale),
+):
+    """Phone-entry lookup for the pesticide / fertiliser order picker.
+
+    Mirrors the seed-order
+    `/farmer/seed-orders/lookup-recipient` shape so the PWA can
+    reuse the same `LookupCard` rendering. The brand-lock branch
+    fires only when at least one of `practice_ids` is on a
+    `Practice.is_brand_locked=True` row — pesticide/fertiliser
+    items opt in (unlike seeds where every variety is locked).
+
+    Eligibility rules (locked 2026-06-18 audit):
+      FACILITATOR — always allowed, even when has_locked=True
+        (the farmer can route locked-brand through a facilitator;
+        the facilitator's onward route-to-dealer enforces the
+        same dealer-onboarded check at the next hop).
+      DEALER — allowed when has_locked=False; when has_locked=True,
+        must be onboarded as DEALER by the subscription's client.
+      Both held — DEALER takes priority when onboarded-or-not-locked;
+        else falls through to FACILITATOR (permissive passthrough).
+      Neither — `not_dealer_or_facilitator`, not eligible.
+      Self / phone unknown — guarded same as the seed flow.
+
+    Always returns 200 with a structured payload; `reason` carries
+    the verdict.
+    """
+    from app.services.i18n_cosh import resolve_names_by_cosh_id
+    from app.modules.auth.service import get_user_by_phone
+    from app.modules.clients.models import Client, ClientPromoter
+
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    pids = [p for p in (practice_ids or "").split(",") if p]
+    has_locked = await _practice_ids_have_locked_brand(db, pids)
+
+    digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+    if len(digits) < 10:
+        return {"found": False, "reason": "phone_not_registered", "phone": phone}
+    normalised = "+91" + digits[-10:]
+    target = await get_user_by_phone(db, normalised)
+    if target is None:
+        return {"found": False, "reason": "phone_not_registered", "phone": normalised}
+
+    if target.id == current_user.id:
+        return {
+            "found": True,
+            "user_id": target.id,
+            "phone": target.phone,
+            "name": target.name,
+            "can_receive": False,
+            "reason": "self",
+        }
+
+    cp_rows = (await db.execute(
+        select(ClientPromoter.promoter_type, ClientPromoter.client_id)
+        .where(
+            ClientPromoter.user_id == target.id,
+            ClientPromoter.promoter_type.in_(("FACILITATOR", "DEALER")),
+            ClientPromoter.status == "ACTIVE",
+        )
+    )).all()
+    roles_held = {ptype for (ptype, _cid) in cp_rows}
+    is_active = bool(cp_rows)
+
+    company = (await db.execute(
+        select(Client).where(Client.id == sub.client_id)
+    )).scalar_one_or_none()
+    client_name = (
+        (company.display_name or company.short_name) if company else None
+    )
+
+    loc_ids = {
+        cid for cid in (target.state_cosh_id, target.district_cosh_id) if cid
+    }
+    loc_names = await resolve_names_by_cosh_id(db, loc_ids, lang) if loc_ids else {}
+
+    base = {
+        "found": True,
+        "user_id": target.id,
+        "phone": target.phone,
+        "name": target.name,
+        "photo_url": target.photo_url,
+        "state_name": loc_names.get(target.state_cosh_id) if target.state_cosh_id else None,
+        "district_name": loc_names.get(target.district_cosh_id) if target.district_cosh_id else None,
+        "is_active": is_active,
+        "client_name": client_name,
+        "has_locked_brand": has_locked,
+    }
+
+    # Role precedence. Same shape as the seed-order lookup, except
+    # the DEALER onboarded-check fires only when has_locked is True
+    # (regular orders without a locked brand are open to any active
+    # dealer in the right licence category).
+    dealer_allowed = False
+    if "DEALER" in roles_held:
+        if not has_locked:
+            dealer_allowed = True
+        elif await _is_dealer_onboarded_by_client(
+            db, target.id, sub.client_id,
+        ):
+            dealer_allowed = True
+
+    if dealer_allowed:
+        return {**base, "role": "DEALER", "can_receive": True, "reason": "ok"}
+    if "FACILITATOR" in roles_held:
+        return {**base, "role": "FACILITATOR", "can_receive": True, "reason": "ok"}
+    if "DEALER" in roles_held:
+        # Dealer-only + has_locked + not onboarded by this client.
+        return {
+            **base,
+            "role": "DEALER",
+            "can_receive": False,
+            "reason": "dealer_not_onboarded",
+        }
+    return {
+        **base,
+        "role": None,
+        "can_receive": False,
+        "reason": "not_dealer_or_facilitator",
+    }
 
 
 @router.put("/farmer/orders/{order_id}/items/{item_id}/approve")
