@@ -939,9 +939,31 @@ async def guided_elimination_step(
         .order_by(Parameter.display_order.asc())
     )).scalars().all() if param_ids_in_pool else []
 
+    # ── Load Kannada / Hindi / etc. parameter+variable names via Cosh ────
+    # Parameter and Variable rows mirror Cosh entities; their Kannada
+    # names live on `cosh_core_items.translations` keyed by `cosh_id`.
+    # Custom (non-Cosh) rows fall through to the local `.name` column.
+    from app.modules.sync.models import CoshCoreItem
+    from app.services.i18n_cosh import pick_translation
+    lang = current_user.language_code or "en"
+    pv_cosh_ids = {pr.cosh_id for pr in param_rows if pr.cosh_id}
+    cosh_translations: dict[str, dict] = {}
+    if pv_cosh_ids:
+        rows = (await db.execute(
+            select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
+            .where(CoshCoreItem.cosh_id.in_(pv_cosh_ids))
+        )).all()
+        for cid, tr in rows:
+            cosh_translations[cid] = tr or {}
+
+    def _localised_name(local_name: str, cosh_id: str | None) -> str:
+        if cosh_id and cosh_id in cosh_translations:
+            return pick_translation(cosh_translations[cosh_id], lang, local_name)
+        return local_name
+
     parameters: list[ServiceParameterOption] = [
         ServiceParameterOption(
-            id=pr.id, name=pr.name,
+            id=pr.id, name=_localised_name(pr.name, pr.cosh_id),
             display_order=int(pr.display_order or 0),
         )
         for pr in param_rows
@@ -954,7 +976,17 @@ async def guided_elimination_step(
     var_rows = (await db.execute(
         select(Variable).where(Variable.id.in_(var_ids_in_pool))
     )).scalars().all() if var_ids_in_pool else []
-    variable_names: dict[str, str] = {v.id: v.name for v in var_rows}
+    var_cosh_ids = {v.cosh_id for v in var_rows if v.cosh_id}
+    if var_cosh_ids:
+        rows = (await db.execute(
+            select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
+            .where(CoshCoreItem.cosh_id.in_(var_cosh_ids))
+        )).all()
+        for cid, tr in rows:
+            cosh_translations[cid] = tr or {}
+    variable_names: dict[str, str] = {
+        v.id: _localised_name(v.name, v.cosh_id) for v in var_rows
+    }
 
     # ── Run the algorithm ────────────────────────────────────────────────
     step = run_elimination(pool, parameters, parsed_answers, variable_names)
