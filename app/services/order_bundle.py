@@ -595,6 +595,25 @@ async def compute_bundle(
     if not l1_set:
         return {"practices": [], "excluded_already_ordered": 0}
 
+    # Perennial gates (2026-06-18) — keep the order bundle in lockstep
+    # with `_today_advisory_for_user`:
+    #   (1) 365-day lifespan from crop_start.
+    #   (2) No orderable practices before crop_start.
+    # CALENDAR windows correctly resolve in `_timeline_window` and
+    # would otherwise let pre-start or post-365 days slip through
+    # when today's day-of-year happens to overlap.
+    from app.modules.advisory.models import Package as _Package
+    pkg_row = (await db.execute(
+        select(_Package).where(_Package.id == subscription.package_id)
+    )).scalar_one_or_none()
+    pkg_type_str = (
+        pkg_row.package_type.value if pkg_row and hasattr(pkg_row.package_type, "value")
+        else (str(pkg_row.package_type) if pkg_row else None)
+    )
+    if pkg_type_str == "PERENNIAL" and crop_start is not None:
+        if today < crop_start or today > crop_start + timedelta(days=365):
+            return {"practices": [], "excluded_already_ordered": 0}
+
     # Batch 23: load CCA (package) timelines + active triggered CHA
     # (PG / SP / QA) timelines for this subscription. CHA-derived
     # practices recommended by diagnosis pipes must be orderable

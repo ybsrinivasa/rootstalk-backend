@@ -4193,11 +4193,32 @@ async def _today_advisory_for_user(
         crop_start = sub.crop_start_date.date() if hasattr(sub.crop_start_date, 'date') else sub.crop_start_date
         day_offset = (today - crop_start).days  # positive = days after sowing
 
+        # Perennial gates (rules confirmed 2026-06-18):
+        #   (1) 365-day window from crop_start drives the package
+        #       duration. Perennial packages have duration_days forced
+        #       to 365 by the CCA author flow; this gate makes the
+        #       advisory honor the same lifespan at read time.
+        #   (2) No advisory pre-start. CALENDAR timelines never fire
+        #       before crop_start_date even when today's day-of-year
+        #       happens to fall inside one of their authored windows.
+        # Annual packages keep their existing DBS/DAS behaviour (DBS
+        # practices DO show pre-start by design — seed treatment etc.).
+        from datetime import timedelta as _td
+        pkg_type_str = pkg.package_type.value if hasattr(pkg.package_type, "value") else str(pkg.package_type)
+        perennial_out_of_window = False
+        if pkg_type_str == "PERENNIAL":
+            perennial_end = crop_start + _td(days=365)
+            if today < crop_start or today > perennial_end:
+                perennial_out_of_window = True
+
         # Load all timelines for this package
-        tl_result = await db.execute(
-            select(Timeline).where(Timeline.package_id == pkg.id).order_by(Timeline.display_order)
-        )
-        timelines = tl_result.scalars().all()
+        if perennial_out_of_window:
+            timelines: list = []
+        else:
+            tl_result = await db.execute(
+                select(Timeline).where(Timeline.package_id == pkg.id).order_by(Timeline.display_order)
+            )
+            timelines = tl_result.scalars().all()
 
         # ── Phase 3: load existing snapshots for this subscription ────────────
         # If a snapshot exists for a timeline, its frozen window drives BL-04
@@ -4289,12 +4310,17 @@ async def _today_advisory_for_user(
             tl_date_map[tl.id] = (from_d, to_d, day_num)
 
         # ── Load triggered CHA timelines (from diagnosis or FarmPundit queries) ─
-        cha_entries = (await db.execute(
-            select(TriggeredCHAEntry).where(
-                TriggeredCHAEntry.subscription_id == sub.id,
-                TriggeredCHAEntry.status == "ACTIVE",
-            )
-        )).scalars().all()
+        # Perennial out-of-window subs surface NO advisory at all —
+        # CHA recommendations are gated on the same window as CCA.
+        if perennial_out_of_window:
+            cha_entries: list = []
+        else:
+            cha_entries = (await db.execute(
+                select(TriggeredCHAEntry).where(
+                    TriggeredCHAEntry.subscription_id == sub.id,
+                    TriggeredCHAEntry.status == "ACTIVE",
+                )
+            )).scalars().all()
 
         # Per-timeline CHA/QA metadata for the response composer.
         # Keyed by the synthetic `cha_tl_id` we build below so it
