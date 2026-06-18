@@ -10,6 +10,7 @@ from app.dependencies import get_current_user
 from app.modules.platform.models import User
 from app.modules.seed_mgmt.models import SeedVariety, VarietyPoP, SeedOrderFull, SeedOrderStatus
 from app.modules.subscriptions.models import Subscription
+from app.services.i18n_cosh import get_locale, resolve_names_by_cosh_id
 
 router = APIRouter(tags=["Seed Management"])
 
@@ -491,8 +492,19 @@ async def browse_seed_varieties(
     sub_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    lang: str = Depends(get_locale),
 ):
-    """Farmer browses varieties recommended for their subscription's PoP."""
+    """Farmer browses varieties recommended for their subscription's PoP.
+
+    DUS character rows on each variety carry `part_cosh_id`,
+    `character_cosh_id`, and `descriptor_cosh_id` (snapshotted into
+    `dus_characters` JSONB at SE-save time alongside `_name_en`
+    fallbacks). Resolve those cosh_ids against the user's locale on
+    the read path so the farmer sees ತೋಟಗಾರಿಕೆ vocabulary in Cosh's
+    curated form rather than the snapshotted English. Falls through
+    to `_name_en` when Cosh has no translation for the user's
+    language (Latin binomials live exclusively in English by design).
+    """
     sub = (await db.execute(
         select(Subscription).where(
             Subscription.id == sub_id,
@@ -514,7 +526,17 @@ async def browse_seed_varieties(
         .order_by(SeedVariety.name)
     )
     varieties = result.scalars().all()
-    return [_variety_out(v) for v in varieties]
+
+    cosh_ids: set[str] = set()
+    for v in varieties:
+        for r in (v.dus_characters or []):
+            for k in ("part_cosh_id", "character_cosh_id", "descriptor_cosh_id"):
+                cid = r.get(k)
+                if cid:
+                    cosh_ids.add(cid)
+    names = await resolve_names_by_cosh_id(db, cosh_ids, lang) if cosh_ids else {}
+
+    return [_variety_out(v, dus_names=names) for v in varieties]
 
 
 # ── Farmer: Place seed order ───────────────────────────────────────────────────
@@ -1105,7 +1127,7 @@ async def abort_seed_order(
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _variety_out(v: SeedVariety) -> dict:
+def _variety_out(v: SeedVariety, dus_names: Optional[dict[str, str]] = None) -> dict:
     return {
         "id": v.id,
         "client_id": v.client_id,
@@ -1113,12 +1135,40 @@ def _variety_out(v: SeedVariety) -> dict:
         "name": v.name,
         "variety_type": v.variety_type,
         "description_points": v.description_points or [],
-        "dus_characters": v.dus_characters,
+        "dus_characters": _localise_dus_rows(v.dus_characters, dus_names),
         "photos": v.photos or [],
         "status": v.status,
         "pop_assignments": [{"package_id": a.package_id, "status": a.status}
                             for a in (v.pop_assignments or [])],
     }
+
+
+def _localise_dus_rows(
+    rows: Optional[list[dict]],
+    names: Optional[dict[str, str]],
+) -> Optional[list[dict]]:
+    """Inject localised `part_name` / `character_name` / `descriptor_name`
+    alongside the existing `_name_en` snapshots. PWA prefers the
+    plain `_name` field; falls through to `_name_en` when a cosh_id
+    has no translation for the user's locale (e.g. Latin binomials).
+    Returns a NEW list — does not mutate the JSONB column."""
+    if not rows:
+        return rows
+    if not names:
+        names = {}
+    out = []
+    for r in rows:
+        copy = dict(r)
+        for field, en_field in (
+            ("part_name", "part_name_en"),
+            ("character_name", "character_name_en"),
+            ("descriptor_name", "descriptor_name_en"),
+        ):
+            cid_field = field.replace("_name", "_cosh_id")
+            cid = r.get(cid_field)
+            copy[field] = (names.get(cid) if cid else None) or r.get(en_field)
+        out.append(copy)
+    return out
 
 
 async def _get_variety(db: AsyncSession, variety_id: str, client_id: str) -> SeedVariety:
