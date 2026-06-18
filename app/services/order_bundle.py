@@ -522,17 +522,37 @@ async def resolve_dbs_practices_for_category(
 async def already_ordered_practice_ids(
     db: AsyncSession, subscription_id: str,
 ) -> set[str]:
-    """Every practice_id appearing in any non-CANCELLED order for
-    this subscription. Cancelled orders release their practices
-    back into the pool — same rule as BL-10's "Cancel returns
-    items to Purchase required".
+    """Every practice_id appearing in any LIVE order-item for this
+    subscription. "Live" mirrors the advisory walk's definition
+    (`_today_advisory_for_user.fulfilment_by_practice`) so the two
+    surfaces agree on what counts as "already ordered":
+
+      - Order.status NOT IN (CANCELLED, EXPIRED) — CANCELLED returns
+        items to Purchase-required per BL-10; EXPIRED items are dead
+        too (the timeline window closed without dealer action).
+      - OrderItem.archived_at IS NULL — archived rows are off the
+        active surface by design; an expiry sweep archives PENDING
+        items so they don't keep blocking new orders.
+      - OrderItem.status NOT IN (REROUTED, REMOVED) — same exclusions
+        the advisory walk uses; REROUTED has spawned a successor item
+        and REMOVED dropped from the pool entirely.
+
+    Fix 2026-06-18: previously this only excluded CANCELLED. When a
+    dealer let a pesticide order expire, the EXPIRED items kept the
+    practice blocked from re-bundling even though the advisory had
+    correctly dropped them and was re-surfacing the "Order" button.
+    Farmer ended up in a dead-end: tap Order → "Nothing recommended
+    in this window."
     """
+    from app.modules.orders.models import OrderItemStatus
     rows = (await db.execute(
         select(OrderItem.practice_id)
         .join(Order, Order.id == OrderItem.order_id)
         .where(
             Order.subscription_id == subscription_id,
-            Order.status != OrderStatus.CANCELLED,
+            Order.status.notin_([OrderStatus.CANCELLED, OrderStatus.EXPIRED]),
+            OrderItem.archived_at.is_(None),
+            OrderItem.status.notin_([OrderItemStatus.REROUTED, OrderItemStatus.REMOVED]),
         )
     )).all()
     return {r[0] for r in rows if r[0]}
