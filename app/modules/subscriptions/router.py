@@ -4276,7 +4276,7 @@ async def _today_advisory_for_user(
             if rendered.blank_paths:
                 blank_paths_by_tl[tl.id] = rendered.blank_paths
 
-            from_d, to_d = cca_calendar_dates(meta, crop_start)
+            from_d, to_d = cca_calendar_dates(meta, crop_start, today)
 
             tl_window = TLWindow(
                 id=tl.id,
@@ -4565,7 +4565,7 @@ async def _today_advisory_for_user(
                 ctx_meta = metadata_from_master_cca(ctx_tl)
                 ctx_content, _ = await resolve_cca_content(db, sub.id, ctx_tl.id)
                 ctx_rendered = render_cca_from_content(ctx_content, today_answers)
-                ctx_from_d, ctx_to_d = cca_calendar_dates(ctx_meta, crop_start)
+                ctx_from_d, ctx_to_d = cca_calendar_dates(ctx_meta, crop_start, today)
                 tl_windows.append(TLWindow(
                     id=ctx_tl.id,
                     name=(ctx_content.get("timeline") or {}).get("name") or ctx_tl.name,
@@ -4686,11 +4686,16 @@ async def _today_advisory_for_user(
                 tl_entry["triggered_at"] = cha_meta["triggered_at"]
             timeline_data.append(tl_entry)
 
+        pkg_type_val = (
+            pkg.package_type.value if hasattr(pkg.package_type, "value")
+            else (str(pkg.package_type) if pkg.package_type else None)
+        )
         out.append({
             "subscription_id": sub.id,
             "client_id": sub.client_id,
             "package_id": sub.package_id,
             "package_name": pkg.name,
+            "package_type": pkg_type_val,
             "crop_cosh_id": pkg.crop_cosh_id,
             "crop_start_date": sub.crop_start_date,
             "day_offset": day_offset,

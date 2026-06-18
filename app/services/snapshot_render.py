@@ -111,8 +111,21 @@ def cca_window_active(
 
 def cca_calendar_dates(
     meta: TimelineMetadata, crop_start: date,
+    today: Optional[date] = None,
 ) -> tuple[date, date]:
-    """Compute (from_date, to_date) used by BL-03 + the response payload."""
+    """Compute (from_date, to_date) used by BL-03 + the response payload.
+
+    CALENDAR (Perennial): `from_value` / `to_value` are day-of-year
+    (1..365/366). Window resolves to `today.year`. Bug fix
+    2026-06-18 — this branch previously fell through to
+    `(crop_start, crop_start)`, which made the date range shown on
+    the farmer's advisory card collapse to a single day at the
+    sowing date instead of the actual calendar window the timeline
+    covers; BL-03 dedup also lost its overlap signal because every
+    CALENDAR timeline reported the same one-day window. Now mirrors
+    the equivalent `_timeline_window` logic in
+    `app/services/order_bundle.py`.
+    """
     if meta.from_type == "DAS":
         return (
             crop_start + timedelta(days=meta.from_value),
@@ -124,6 +137,14 @@ def cca_calendar_dates(
         return (
             crop_start - timedelta(days=meta.from_value),
             crop_start - timedelta(days=max(meta.to_value, 1)),
+        )
+    if meta.from_type == "CALENDAR":
+        if today is None:
+            today = date.today()
+        year_start = date(today.year, 1, 1)
+        return (
+            year_start + timedelta(days=int(meta.from_value) - 1),
+            year_start + timedelta(days=int(meta.to_value) - 1),
         )
     return (crop_start, crop_start)
 
