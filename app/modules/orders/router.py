@@ -7646,6 +7646,107 @@ async def facilitator_reroute_returned(
 
 # ── Facilitator: Nearby dealers for forwarding ───────────────────────────────
 
+@router.get("/facilitator/orders/{order_id}/lookup-dealer")
+async def facilitator_lookup_dealer_for_order(
+    order_id: str,
+    phone: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    lang: str = Depends(get_locale),
+):
+    """Facilitator-side phone lookup for the
+    `/facilitator/orders/{id}/route-to-dealer` flow. Same response
+    shape as `/farmer/subscriptions/{id}/lookup-recipient` so the
+    PWA reuses `RecipientLookupCard`.
+
+    Brand-lock check uses the ORDER's items
+    (`_order_has_locked_brand_items`), not practice_ids passed in.
+    Facilitators only ever forward to dealers — a phone belonging
+    to a non-dealer (e.g. facilitator-only) returns
+    `not_dealer_or_facilitator`. The dealer must additionally be
+    onboarded by `order.client_id` when has_locked is True; without
+    a brand-locked item, any active dealer is allowed (matches the
+    farmer-side rule in
+    `/farmer/subscriptions/{id}/lookup-recipient`).
+    """
+    from app.modules.auth.service import get_user_by_phone
+    from app.modules.clients.models import Client, ClientPromoter
+    from app.services.i18n_cosh import resolve_names_by_cosh_id
+
+    await _assert_active_facilitator(db, current_user.id)
+    order = (await db.execute(
+        select(Order).where(
+            Order.id == order_id,
+            Order.facilitator_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    has_locked = await _order_has_locked_brand_items(db, order.id)
+
+    digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+    if len(digits) < 10:
+        return {"found": False, "reason": "phone_not_registered", "phone": phone}
+    normalised = "+91" + digits[-10:]
+    target = await get_user_by_phone(db, normalised)
+    if target is None:
+        return {"found": False, "reason": "phone_not_registered", "phone": normalised}
+
+    if target.id == current_user.id:
+        return {
+            "found": True, "user_id": target.id, "phone": target.phone,
+            "name": target.name, "can_receive": False, "reason": "self",
+        }
+
+    cp_rows = (await db.execute(
+        select(ClientPromoter.promoter_type)
+        .where(
+            ClientPromoter.user_id == target.id,
+            ClientPromoter.promoter_type.in_(("FACILITATOR", "DEALER")),
+            ClientPromoter.status == "ACTIVE",
+        )
+    )).scalars().all()
+    roles_held = set(cp_rows)
+    is_active = bool(cp_rows)
+
+    company = (await db.execute(
+        select(Client).where(Client.id == order.client_id)
+    )).scalar_one_or_none()
+    client_name = (company.display_name or company.short_name) if company else None
+
+    loc_ids = {cid for cid in (target.state_cosh_id, target.district_cosh_id) if cid}
+    loc_names = await resolve_names_by_cosh_id(db, loc_ids, lang) if loc_ids else {}
+
+    base = {
+        "found": True,
+        "user_id": target.id,
+        "phone": target.phone,
+        "name": target.name,
+        "photo_url": target.photo_url,
+        "state_name": loc_names.get(target.state_cosh_id) if target.state_cosh_id else None,
+        "district_name": loc_names.get(target.district_cosh_id) if target.district_cosh_id else None,
+        "is_active": is_active,
+        "client_name": client_name,
+        "has_locked_brand": has_locked,
+    }
+
+    if "DEALER" not in roles_held:
+        # Facilitator-only or no-role user — facilitators don't
+        # forward to facilitators. The PWA copy on this side reads
+        # "Not a dealer — facilitators only forward to dealers."
+        return {**base, "role": None, "can_receive": False,
+                "reason": "not_dealer_or_facilitator"}
+
+    if has_locked and not await _is_dealer_onboarded_by_client(
+        db, target.id, order.client_id,
+    ):
+        return {**base, "role": "DEALER", "can_receive": False,
+                "reason": "dealer_not_onboarded"}
+
+    return {**base, "role": "DEALER", "can_receive": True, "reason": "ok"}
+
+
 @router.get("/facilitator/nearby-dealers")
 async def nearby_dealers(
     order_type: Optional[str] = None,

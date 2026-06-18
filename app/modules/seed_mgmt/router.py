@@ -1616,6 +1616,93 @@ async def facilitator_route_seed_to_dealer(
     }
 
 
+@router.get("/facilitator/seed-orders/{order_id}/lookup-dealer")
+async def facilitator_lookup_dealer_for_seed_order(
+    order_id: str,
+    phone: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    lang: str = Depends(get_locale),
+):
+    """Facilitator-side phone lookup for the
+    `/facilitator/seed-orders/{id}/route-to-dealer` flow. Mirrors
+    `/facilitator/orders/{id}/lookup-dealer` but with the
+    seed-flow rule baked in: every seed variety is brand-locked,
+    so the dealer must always be onboarded by `order.client_id`.
+
+    Variety-blind per Point 4b — no variety_name / variety_id
+    appears in the response. The facilitator never sees the
+    underlying variety, even at the dealer-picking step.
+    """
+    from app.modules.orders.router import (
+        _assert_active_facilitator,
+        _is_dealer_onboarded_by_client,
+    )
+    from app.modules.auth.service import get_user_by_phone
+    from app.modules.clients.models import Client, ClientPromoter
+
+    await _assert_active_facilitator(db, current_user.id)
+    order = await _get_facilitator_seed_order(db, order_id, current_user.id)
+
+    digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+    if len(digits) < 10:
+        return {"found": False, "reason": "phone_not_registered", "phone": phone}
+    normalised = "+91" + digits[-10:]
+    target = await get_user_by_phone(db, normalised)
+    if target is None:
+        return {"found": False, "reason": "phone_not_registered", "phone": normalised}
+
+    if target.id == current_user.id:
+        return {
+            "found": True, "user_id": target.id, "phone": target.phone,
+            "name": target.name, "can_receive": False, "reason": "self",
+        }
+
+    cp_rows = (await db.execute(
+        select(ClientPromoter.promoter_type)
+        .where(
+            ClientPromoter.user_id == target.id,
+            ClientPromoter.promoter_type.in_(("FACILITATOR", "DEALER")),
+            ClientPromoter.status == "ACTIVE",
+        )
+    )).scalars().all()
+    roles_held = set(cp_rows)
+    is_active = bool(cp_rows)
+
+    company = (await db.execute(
+        select(Client).where(Client.id == order.client_id)
+    )).scalar_one_or_none()
+    client_name = (company.display_name or company.short_name) if company else None
+
+    loc_ids = {cid for cid in (target.state_cosh_id, target.district_cosh_id) if cid}
+    loc_names = await resolve_names_by_cosh_id(db, loc_ids, lang) if loc_ids else {}
+
+    base = {
+        "found": True,
+        "user_id": target.id,
+        "phone": target.phone,
+        "name": target.name,
+        "photo_url": target.photo_url,
+        "state_name": loc_names.get(target.state_cosh_id) if target.state_cosh_id else None,
+        "district_name": loc_names.get(target.district_cosh_id) if target.district_cosh_id else None,
+        "is_active": is_active,
+        "client_name": client_name,
+        "has_locked_brand": True,  # always True for seeds
+    }
+
+    if "DEALER" not in roles_held:
+        return {**base, "role": None, "can_receive": False,
+                "reason": "not_dealer_or_facilitator"}
+
+    if not await _is_dealer_onboarded_by_client(
+        db, target.id, order.client_id,
+    ):
+        return {**base, "role": "DEALER", "can_receive": False,
+                "reason": "dealer_not_onboarded"}
+
+    return {**base, "role": "DEALER", "can_receive": True, "reason": "ok"}
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _variety_out(v: SeedVariety, dus_names: Optional[dict[str, str]] = None) -> dict:
