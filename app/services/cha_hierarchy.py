@@ -48,6 +48,7 @@ async def resolve_cha_recommendation(
     client_id: str,
     problem_cosh_id: str,
     crop_cosh_id: Optional[str] = None,
+    lang: str = "en",
 ) -> Optional[ResolvedCHA]:
     """
     Full SP → PG hierarchy lookup.
@@ -68,10 +69,17 @@ async def resolve_cha_recommendation(
     from app.modules.advisory.models import SPRecommendation, PGRecommendation
     from app.services.cosh_crop_view import get_measure_for_biological_name
     from app.services.sp_pg_crops_view import pg_for_sp_crop
+    from app.services.i18n_cosh import pick_translation
 
     # Display name for the advisory card — resolved from Cosh's
     # translation row for the diagnosed cosh_id. Used in every
-    # branch; cheap one-shot lookup.
+    # branch; cheap one-shot lookup. Localised via `pick_translation`
+    # against the caller-supplied `lang` (falls through to English
+    # and then to the cosh_id). The 2026-06-18 read-path resolver in
+    # `_today_advisory_for_user` re-localises on every render, so
+    # even existing rows with an English snapshot now render in the
+    # farmer's current language — this just makes new commits land
+    # in the right language from the start.
     diagnosed_core = (await db.execute(
         select(CoshCoreItem).where(
             CoshCoreItem.cosh_id == problem_cosh_id,
@@ -79,7 +87,7 @@ async def resolve_cha_recommendation(
         )
     )).scalar_one_or_none()
     problem_name = (
-        (diagnosed_core.translations or {}).get("en", problem_cosh_id)
+        pick_translation(diagnosed_core.translations, lang, problem_cosh_id)
         if diagnosed_core else problem_cosh_id
     )
 

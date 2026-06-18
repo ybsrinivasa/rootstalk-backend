@@ -331,8 +331,12 @@ async def _trigger_cha_from_diagnosis(
     )).scalar_one_or_none()
     sub_crop = package.crop_cosh_id if package else None
 
+    farmer = (await db.execute(
+        select(User).where(User.id == session.farmer_user_id)
+    )).scalar_one_or_none()
     resolved = await resolve_cha_recommendation(
         db, sub.client_id, problem_cosh_id, crop_cosh_id=sub_crop,
+        lang=(farmer.language_code if farmer else None) or "en",
     )
     if not resolved:
         return

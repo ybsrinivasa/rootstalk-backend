@@ -25,7 +25,7 @@ from app.modules.advisory.models import PGRecommendation, SPRecommendation, Time
 from app.modules.platform.models import UserRole, RoleType
 from app.modules.orders.models import DealerProfile, OrderItem, OrderItemStatus
 from app.modules.clients.models import Client, ClientLocation, ClientStatus
-from app.services.i18n_cosh import pick_translation
+from app.services.i18n_cosh import pick_translation, resolve_names_by_cosh_id
 from app.services.bl11_subscription_state import (
     DEALER as BL11_DEALER, FARMER as BL11_FARMER,
     is_self_unsubscribable, validate_transition as validate_sub_transition,
@@ -4322,6 +4322,20 @@ async def _today_advisory_for_user(
                 )
             )).scalars().all()
 
+        # Localise CHA problem labels on the read path. The stored
+        # `cha.problem_name` is a snapshot — diagnosis used to write
+        # the English string (cha_hierarchy.py:81 hardcoded `.get("en")`
+        # before the 2026-06-18 fix), and existing rows still carry
+        # the English snapshot. Resolve each `problem_cosh_id` against
+        # the current farmer's locale via `pick_translation`, falling
+        # back to the snapshot so QA rows (which store the farmer's
+        # own question text, not a cosh_id) keep their label.
+        cha_problem_loc: dict[str, str] = await resolve_names_by_cosh_id(
+            db,
+            {c.problem_cosh_id for c in cha_entries if c.problem_cosh_id},
+            lang,
+        ) if cha_entries else {}
+
         # Per-timeline CHA/QA metadata for the response composer.
         # Keyed by the synthetic `cha_tl_id` we build below so it
         # survives BL-03's dedup pass (which keeps the same `tl.id`).
@@ -4356,7 +4370,11 @@ async def _today_advisory_for_user(
                     content, _locked = await resolve_cha_content(db, sub.id, sp_tl.id, "SP")
                     stubs = render_cha_from_content(content)
                     cha_tl_id = f"cha-sp-{sp_tl.id}"
-                    problem_label = cha.problem_name or cha.problem_cosh_id
+                    problem_label = (
+                        cha_problem_loc.get(cha.problem_cosh_id)
+                        or cha.problem_name
+                        or cha.problem_cosh_id
+                    )
                     tl_windows.append(TLWindow(
                         id=cha_tl_id, name=f"CHA — {problem_label}: {sp_tl.name}",
                         from_date=from_d, to_date=to_d,
@@ -4395,7 +4413,11 @@ async def _today_advisory_for_user(
                     content, _locked = await resolve_cha_content(db, sub.id, pg_tl.id, "PG")
                     stubs = render_cha_from_content(content)
                     cha_tl_id = f"cha-pg-{pg_tl.id}"
-                    problem_label = cha.problem_name or cha.problem_cosh_id
+                    problem_label = (
+                        cha_problem_loc.get(cha.problem_cosh_id)
+                        or cha.problem_name
+                        or cha.problem_cosh_id
+                    )
                     tl_windows.append(TLWindow(
                         id=cha_tl_id, name=f"CHA — {problem_label}: {pg_tl.name}",
                         from_date=from_d, to_date=to_d,
