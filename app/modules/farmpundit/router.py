@@ -932,14 +932,31 @@ async def get_query_quota(
 
 @router.get("/farmer/queries")
 async def list_farmer_queries(
+    subscription_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Farmer-facing query list.
+
+    Default (no `subscription_id`) — every query the farmer has
+    ever raised. Drives the bottom-nav "Queries" tab at
+    `/my-queries` in the PWA.
+
+    With `subscription_id` — queries scoped to ONE subscription.
+    Drives the per-sub Queries page at
+    `/crop-detail/{subscription_id}/queries` (added 2026-06-18 per
+    Option A: "let the farmer see waitlisted / responded / closed
+    queries from inside the subscription drill-down").
+    """
+    where = [Query.farmer_user_id == current_user.id]
+    if subscription_id is not None:
+        where.append(Query.subscription_id == subscription_id)
     result = await db.execute(
-        select(Query).where(Query.farmer_user_id == current_user.id).order_by(Query.created_at.desc())
+        select(Query).where(*where).order_by(Query.created_at.desc())
     )
     queries = result.scalars().all()
     return [{"id": q.id, "title": q.title, "status": q.status, "severity": q.severity,
+             "subscription_id": q.subscription_id,
              "expires_at": q.expires_at, "created_at": q.created_at} for q in queries]
 
 
