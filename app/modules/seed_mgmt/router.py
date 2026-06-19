@@ -779,9 +779,10 @@ async def list_farmer_seed_orders(
     # Phase 1 of the farmer Orders restructure (2026-06-02): seed
     # cards get the same crop / company / start-date header rest of
     # the order surface uses, so the farmer reads them consistently.
+    lang = await get_locale(db, current_user)
     meta_by_sub = await load_meta_for_subscription_ids(
         db, [o.subscription_id for o in orders],
-        lang=current_user.language_code or "en",
+        lang=lang,
     )
     recipients = await load_recipients(
         db,
@@ -789,9 +790,23 @@ async def list_farmer_seed_orders(
         [o.facilitator_user_id for o in orders],
     )
 
+    # 2026-06-19 — Bulk-resolve crop_cosh_id → localised crop_name so
+    # the PWA's cropDisplayName helper renders the real crop name
+    # instead of falling through to its UUID-safe "Crop" placeholder.
+    # Mirror of the same fix applied to /dealer/seed-orders.
+    variety_ids = [o.variety_id for o in orders]
+    variety_by_id: dict[str, SeedVariety] = {}
+    if variety_ids:
+        rows = (await db.execute(
+            select(SeedVariety).where(SeedVariety.id.in_(variety_ids))
+        )).scalars().all()
+        variety_by_id = {v.id: v for v in rows}
+    crop_cosh_ids = {v.crop_cosh_id for v in variety_by_id.values() if v.crop_cosh_id}
+    crop_name_by_id = await resolve_names_by_cosh_id(db, crop_cosh_ids, lang) if crop_cosh_ids else {}
+
     out = []
     for o in orders:
-        variety = (await db.execute(select(SeedVariety).where(SeedVariety.id == o.variety_id))).scalar_one_or_none()
+        variety = variety_by_id.get(o.variety_id)
         meta = meta_by_sub.get(o.subscription_id)
         rcp = recipients.get(o.dealer_user_id) or recipients.get(o.facilitator_user_id)
         out.append({
@@ -799,6 +814,10 @@ async def list_farmer_seed_orders(
             "reference_number": o.reference_number,
             "variety_name": variety.name if variety else None,
             "crop_cosh_id": variety.crop_cosh_id if variety else None,
+            "crop_name": (
+                crop_name_by_id.get(variety.crop_cosh_id)
+                if variety and variety.crop_cosh_id else None
+            ),
             "unit": o.unit, "quantity": float(o.quantity) if o.quantity else None,
             "total_price": float(o.total_price) if o.total_price else None,
             "created_at": o.created_at,
@@ -829,6 +848,12 @@ async def get_farmer_seed_order(
     variety = (await db.execute(
         select(SeedVariety).where(SeedVariety.id == order.variety_id)
     )).scalar_one_or_none()
+    # 2026-06-19 — Resolve crop_name same way the list endpoint does.
+    lang = await get_locale(db, current_user)
+    crop_name = None
+    if variety and variety.crop_cosh_id:
+        names = await resolve_names_by_cosh_id(db, {variety.crop_cosh_id}, lang)
+        crop_name = names.get(variety.crop_cosh_id)
     return {
         "id": order.id,
         "status": order.status,
@@ -836,6 +861,7 @@ async def get_farmer_seed_order(
         "variety_id": order.variety_id,
         "variety_name": variety.name if variety else None,
         "crop_cosh_id": variety.crop_cosh_id if variety else None,
+        "crop_name": crop_name,
         "unit": order.unit,
         "quantity": float(order.quantity) if order.quantity else None,
         "total_price": float(order.total_price) if order.total_price else None,
@@ -875,12 +901,13 @@ async def handover_seed_order(
     current_user: User = Depends(get_current_user),
 ):
     """Dealer marks the seed packet as physically handed over to
-    the farmer. Final step in the seed flow.
+    the farmer.
 
     Allowed only from `READY_FOR_PICKUP`. Lands at `PURCHASED`
-    (terminal). Farmer doesn't have an equivalent endpoint — the
-    dealer is the one physically holding the packet so they are
-    the authority on handover.
+    (terminal). Farmer has a parallel endpoint (`/mark-received`)
+    that lands at the same terminal — whichever party taps first
+    closes the order; the other side just sees it drop off their
+    pill on the next refresh.
     """
     from app.modules.orders.router import _assert_active_dealer
     await _assert_active_dealer(db, current_user.id)
@@ -889,6 +916,30 @@ async def handover_seed_order(
         raise HTTPException(
             status_code=400,
             detail="Seed order can only be handed over from READY_FOR_PICKUP",
+        )
+    order.status = SeedOrderStatus.PURCHASED
+    await db.commit()
+    return {"id": order_id, "status": order.status}
+
+
+@router.put("/farmer/seed-orders/{order_id}/mark-received")
+async def mark_received_seed_order(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Farmer confirms they have physically picked up the seed
+    packet from the dealer.
+
+    Allowed only from `READY_FOR_PICKUP`. Lands at `PURCHASED`
+    (terminal). Mirror of the dealer's `/handover` endpoint —
+    whichever party taps first closes the order.
+    """
+    order = await _get_seed_order(db, order_id, current_user.id, farmer=True)
+    if order.status != SeedOrderStatus.READY_FOR_PICKUP:
+        raise HTTPException(
+            status_code=400,
+            detail="Seed order can only be marked received from READY_FOR_PICKUP",
         )
     order.status = SeedOrderStatus.PURCHASED
     await db.commit()
