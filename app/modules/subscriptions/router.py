@@ -5763,15 +5763,33 @@ async def buy_all_dbs(
         date_from = today
         date_to = today + timedelta(days=14)
 
+    # 2026-06-19 — User reported the DBS path was creating SENT
+    # orders with both dealer_user_id and facilitator_user_id NULL
+    # (the PWA's order sheet never collected a recipient before
+    # POST). The order went "into thin air". Plus reference_number
+    # was never generated, so the Manage tab fell back to the raw
+    # order UUID.
+    #
+    # Fix: land as DRAFT with a generated reference_number. The
+    # farmer is then routed to `/orders/[id]` where the existing
+    # DRAFT picker (brand-lock-aware via
+    # `/eligible-recipients`) handles dealer / facilitator
+    # selection.
+    from app.modules.orders.router import _generate_order_reference
+    reference_number = await _generate_order_reference(db)
     order = Order(
         subscription_id=subscription_id,
         farmer_user_id=current_user.id,
         client_id=sub.client_id,
-        dealer_user_id=(data or {}).get("dealer_user_id"),
-        facilitator_user_id=(data or {}).get("facilitator_user_id"),
+        # No recipient set at create — farmer picks via the DRAFT
+        # picker on the next screen.
+        dealer_user_id=None,
+        facilitator_user_id=None,
         date_from=date_from,
         date_to=date_to,
-        status=OrderStatus.SENT,
+        category=category,
+        status=OrderStatus.DRAFT,
+        reference_number=reference_number,
         expires_at=datetime.now(timezone.utc) + timedelta(days=14),
     )
     db.add(order)

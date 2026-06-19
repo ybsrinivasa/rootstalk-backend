@@ -1755,21 +1755,17 @@ async def send_draft_order(
         )
 
     # ── Locked-brand gate (Orders V2 Batch 5) ────────────────────
-    # If even one item is brand-locked, the order must go to a
-    # dealer onboarded by this client — no facilitators, no
-    # non-onboarded dealers. Phrased as one rule (rather than two
-    # separate gates) so the picker can also refuse cleanly with
-    # one error code.
+    # If even one item is brand-locked, the recipient dealer must
+    # be onboarded by the order's client.
+    #
+    # 2026-06-19 — facilitator branch removed. Same correction as
+    # `POST /farmer/orders` (commit 4f7e196): the farmer CAN route
+    # a locked-brand order through a facilitator; the brand-lock
+    # enforces on the facilitator's onward route-to-dealer hop
+    # (which carries its own brand-lock check). The dealer branch
+    # of the gate stays.
     has_locked = await _order_has_locked_brand_items(db, order.id)
-    if has_locked:
-        if body.facilitator_user_id:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "locked_brand_requires_onboarded_dealer",
-                    "message": "This order has a brand-locked item. It can only be sent to a dealer onboarded by the company.",
-                },
-            )
+    if has_locked and body.dealer_user_id:
         if not await _is_dealer_onboarded_by_client(
             db, body.dealer_user_id, order.client_id,
         ):
