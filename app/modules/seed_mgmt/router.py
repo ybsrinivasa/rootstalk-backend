@@ -1066,6 +1066,7 @@ async def send_draft_seed_order(
 async def list_dealer_seed_orders(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    lang: str = Depends(get_locale),
 ):
     from app.modules.orders.router import _assert_active_dealer
     from app.modules.clients.models import Client
@@ -1117,6 +1118,16 @@ async def list_dealer_seed_orders(
             )).scalars().all()
         }
 
+    # 2026-06-19 — Resolve crop_cosh_id → localised crop name.
+    # Pre-fix the response shipped only `crop_cosh_id`; the PWA's
+    # `cropDisplayName` helper sees a UUID and falls back to the
+    # neutral "Crop" placeholder, leaving the dealer card without
+    # the actual crop. Bulk-resolve via the i18n_cosh helper.
+    crop_cosh_ids = {v.crop_cosh_id for v in varieties.values() if v.crop_cosh_id}
+    crop_name_by_id = await resolve_names_by_cosh_id(
+        db, crop_cosh_ids, lang,
+    ) if crop_cosh_ids else {}
+
     # Point 4a (2026-06-18): the dealer cannot see the variety name
     # until they accept the order. Seed varieties are brand-locked,
     # and exposing the name pre-accept would let a non-onboarded
@@ -1144,6 +1155,10 @@ async def list_dealer_seed_orders(
             ),
             "variety_name_hidden": variety_hidden,
             "crop_cosh_id": variety.crop_cosh_id if variety else None,
+            "crop_name": (
+                crop_name_by_id.get(variety.crop_cosh_id)
+                if variety and variety.crop_cosh_id else None
+            ),
             "farmer_user_id": o.farmer_user_id,
             "farmer_name": farmer.name if farmer else None,
             "farmer_phone": farmer.phone if farmer else None,
