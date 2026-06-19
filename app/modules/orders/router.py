@@ -3889,6 +3889,9 @@ async def list_facilitator_orders(
             "id": o.id, "status": o.status,
             # 2026-06-07 — Order ID.
             "reference_number": o.reference_number,
+            # 2026-06-19 — `category` drives the PWA's
+            # confirm-forward-to-dealer sheet's inputType label.
+            "category": o.category,
             "farmer_user_id": o.farmer_user_id, "client_id": o.client_id,
             "dealer_user_id": o.dealer_user_id,
             "date_from": o.date_from, "date_to": o.date_to,
@@ -4022,6 +4025,10 @@ async def get_facilitator_order(
     return {
         "id": order.id, "status": order.status,
         "reference_number": order.reference_number,
+        # 2026-06-19 — `category` drives the confirm-forward-to-dealer
+        # sheet on the PWA ("Do you wish to send the {inputType} Order
+        # to {dealer}?"). PESTICIDE / FERTILIZER on regular orders.
+        "category": order.category,
         "farmer_user_id": order.farmer_user_id, "client_id": order.client_id,
         "dealer_user_id": order.dealer_user_id,
         "date_from": order.date_from, "date_to": order.date_to,
