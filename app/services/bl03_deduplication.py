@@ -57,6 +57,11 @@ class TimelineWindow:
     created_at: date        # tie-breaking when from_date is equal
     practices: list[PracticeStub] = field(default_factory=list)
     source: str = "CCA"    # CCA | CHA | QUERY
+    # 2026-06-19 — Stable identifier that survives publishes.
+    # CCA: Timeline.lineage_id (UUID). CHA/QA: synthetic
+    # cha-{sp|pg|qa}-{Timeline.lineage_id}. Drives the per-occurrence
+    # practice-acknowledgement key.
+    lineage_id: str = ""
 
 
 @dataclass

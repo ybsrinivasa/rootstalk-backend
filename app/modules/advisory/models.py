@@ -1,8 +1,8 @@
 import uuid
 import enum
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from sqlalchemy import (
-    String, Text, Boolean, Integer, DateTime, ForeignKey,
+    String, Text, Boolean, Integer, DateTime, Date, ForeignKey,
     Enum as SAEnum, UniqueConstraint, Index, CheckConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -663,3 +663,54 @@ class SPRecommendation(Base):
         "Timeline", back_populates="sp_recommendation",
         foreign_keys="Timeline.sp_recommendation_id",
     )
+
+
+# 2026-06-19 — Practice acknowledgement: backs the farmer's "I've
+# done this" tick on each advisory practice card. Two timestamps
+# drive the UI state machine:
+#   - both null       → ACTIVE (grey tick, counts toward badge)
+#   - marked, !hidden → MARKED (green tick + delete button)
+#   - hidden          → invisible to farmer (no undo from PWA)
+# `timeline_lineage_id` is the stable identifier that survives
+# publishes (NOT timeline.id). `occurrence_date` discriminates
+# frequency-recurring practices — Day 5 fertigation vs Day 12 are
+# separate acks. For non-frequency practices the PWA stamps it with
+# the timeline's `from_date` so the ack is stable across the window.
+class PracticeAcknowledgement(Base):
+    __tablename__ = "practice_acknowledgements"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4()),
+    )
+    farmer_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=False, index=True,
+    )
+    subscription_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("subscriptions.id"), nullable=False, index=True,
+    )
+    timeline_lineage_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    practice_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("practices.id"), nullable=False,
+    )
+    occurrence_date: Mapped[date] = mapped_column(Date, nullable=False)
+    marked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    hidden_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "subscription_id", "timeline_lineage_id", "practice_id",
+            "occurrence_date",
+            name="uq_practice_ack_key",
+        ),
+    )
+

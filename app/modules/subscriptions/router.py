@@ -4122,6 +4122,279 @@ async def get_today_advisory(
     )
 
 
+# ── Practice acknowledgement: "I've done this" tick ───────────────────────────
+# Three actions, all upserts on the same composite key.
+#   mark   — green tick. Counts off the badge. Reveals "Delete" button.
+#   unmark — grey tick again. Re-counts toward badge. Delete button vanishes.
+#   hide   — only allowed after mark. Practice disappears from the farmer's
+#            UI; the row stays so re-publishes / re-renders don't resurrect
+#            it. No undo from the PWA.
+class _PracticeAckBody(BaseModel):
+    subscription_id: str
+    timeline_lineage_id: str
+    practice_id: str
+    occurrence_date: date
+
+
+async def _upsert_practice_ack(
+    db: AsyncSession,
+    farmer_user_id: str,
+    body: _PracticeAckBody,
+    action: str,
+):
+    from app.modules.advisory.models import PracticeAcknowledgement
+    from app.modules.subscriptions.models import Subscription
+
+    # Auth: the subscription must belong to this farmer.
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == body.subscription_id,
+            Subscription.farmer_user_id == farmer_user_id,
+        )
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    ack = (await db.execute(
+        select(PracticeAcknowledgement).where(
+            PracticeAcknowledgement.subscription_id == body.subscription_id,
+            PracticeAcknowledgement.timeline_lineage_id == body.timeline_lineage_id,
+            PracticeAcknowledgement.practice_id == body.practice_id,
+            PracticeAcknowledgement.occurrence_date == body.occurrence_date,
+        )
+    )).scalar_one_or_none()
+
+    now = datetime.now(timezone.utc)
+    if ack is None:
+        ack = PracticeAcknowledgement(
+            farmer_user_id=farmer_user_id,
+            subscription_id=body.subscription_id,
+            timeline_lineage_id=body.timeline_lineage_id,
+            practice_id=body.practice_id,
+            occurrence_date=body.occurrence_date,
+        )
+        db.add(ack)
+
+    if action == "mark":
+        ack.marked_at = now
+        ack.hidden_at = None
+    elif action == "unmark":
+        ack.marked_at = None
+        ack.hidden_at = None
+    elif action == "hide":
+        # User decision (2026-06-19): hide is only allowed after mark.
+        # If the farmer somehow hits this without marking first (stale
+        # PWA), reject so the state machine stays clean.
+        if ack.marked_at is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot hide a practice that hasn't been marked done",
+            )
+        ack.hidden_at = now
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown action: {action}")
+
+    await db.commit()
+    return {
+        "subscription_id": ack.subscription_id,
+        "timeline_lineage_id": ack.timeline_lineage_id,
+        "practice_id": ack.practice_id,
+        "occurrence_date": ack.occurrence_date.isoformat(),
+        "ack_status": (
+            "HIDDEN" if ack.hidden_at else "MARKED" if ack.marked_at else "ACTIVE"
+        ),
+    }
+
+
+@router.post("/farmer/practice-ack/mark")
+async def mark_practice(
+    body: _PracticeAckBody,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return await _upsert_practice_ack(db, current_user.id, body, "mark")
+
+
+@router.post("/farmer/practice-ack/unmark")
+async def unmark_practice(
+    body: _PracticeAckBody,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return await _upsert_practice_ack(db, current_user.id, body, "unmark")
+
+
+@router.post("/farmer/practice-ack/hide")
+async def hide_practice(
+    body: _PracticeAckBody,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return await _upsert_practice_ack(db, current_user.id, body, "hide")
+
+
+# ── Dashboard attention counts ────────────────────────────────────────────────
+@router.get("/farmer/dashboard/attention")
+async def get_dashboard_attention(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Aggregate "things needing the farmer's action" across every
+    active subscription. Feeds three dashboards: Crop (single-sub
+    drill), Company (per-client_id rollup), Farmer Main (grand total).
+
+    Counts by bucket:
+      - advisory_unmarked: practices visible today that aren't marked
+        and aren't hidden (the unified advisory signal — replaces
+        new/viewed/acted-on tracking via the ack table).
+      - orders_awaiting_approval: OrderItem.status = SENT_FOR_APPROVAL.
+      - orders_returned: OrderItem.status = NOT_AVAILABLE (farmer
+        must reroute) — only on direct-to-dealer orders (facilitator-
+        held NOT_AVAILABLE belongs to the facilitator's queue).
+      - orders_pickup_ready: PackingList.shared, not yet received.
+      - seeds_*: equivalents on SeedOrderFull (SENT_FOR_APPROVAL,
+        NOT_AVAILABLE, READY_FOR_PICKUP).
+      - queries_responded: Query.status = RESPONDED, unread.
+      - payments_pending: PaymentRequest.status = PENDING.
+
+    Hero-strip + per-tile badge sources. PWA computes its own total
+    (sum of buckets) so we don't impose a tile model from here.
+    """
+    from app.modules.advisory.models import Practice
+    from app.modules.orders.models import Order, OrderItem, OrderItemStatus, PackingList
+    from app.modules.seed_mgmt.models import SeedOrderFull, SeedOrderStatus
+    from app.modules.subscriptions.models import Subscription, SubscriptionStatus
+
+    subs = (await db.execute(
+        select(Subscription).where(
+            Subscription.farmer_user_id == current_user.id,
+            Subscription.status == SubscriptionStatus.ACTIVE,
+        )
+    )).scalars().all()
+
+    by_sub: dict[str, dict] = {}
+    by_company: dict[str, dict] = {}
+
+    # Pre-compute advisory_unmarked by running the today-advisory and
+    # counting ACTIVE-state practices. Re-using the existing kernel
+    # keeps the badge math identical to what the farmer sees.
+    advisory = await _today_advisory_for_user(
+        db, farmer_user_id=current_user.id, only_subscription_id=None,
+        lang=current_user.language_code or "en",
+    )
+    advisory_by_sub: dict[str, int] = {}
+    for day in advisory:
+        sub_id = day.get("subscription_id")
+        if not sub_id:
+            continue
+        count = 0
+        for tl in day.get("timelines") or []:
+            for p in tl.get("practices") or []:
+                if p.get("ack_status") == "ACTIVE":
+                    # Per user direction (2026-06-19): for INPUT
+                    # practices the tick only appears post-purchase.
+                    # An INPUT that's pre-purchase shouldn't count
+                    # toward "unmarked" since the farmer can't act
+                    # on it as a practice yet.
+                    if p.get("l0_type") == "INPUT" and not p.get("is_purchased"):
+                        continue
+                    count += 1
+        advisory_by_sub[sub_id] = count
+
+    for sub in subs:
+        bucket = {
+            "subscription_id": sub.id,
+            "client_id": sub.client_id,
+            "advisory_unmarked": advisory_by_sub.get(sub.id, 0),
+            "orders_awaiting_approval": 0,
+            "orders_returned": 0,
+            "orders_pickup_ready": 0,
+            "seeds_awaiting_approval": 0,
+            "seeds_returned": 0,
+            "seeds_pickup_ready": 0,
+            "queries_responded": 0,
+            "payments_pending": 0,
+        }
+
+        # Regular orders' attention items.
+        order_rows = (await db.execute(
+            select(Order).where(
+                Order.subscription_id == sub.id,
+                Order.farmer_user_id == current_user.id,
+            )
+        )).scalars().all()
+        for o in order_rows:
+            items = (await db.execute(
+                select(OrderItem).where(
+                    OrderItem.order_id == o.id,
+                    OrderItem.archived_at.is_(None),
+                )
+            )).scalars().all()
+            bucket["orders_awaiting_approval"] += sum(
+                1 for i in items if i.status == OrderItemStatus.SENT_FOR_APPROVAL
+            )
+            # Returned items only belong to the farmer when the order
+            # is direct-to-dealer; facilitator-held NOT_AVAILABLE is
+            # the facilitator's queue.
+            if not o.facilitator_user_id:
+                bucket["orders_returned"] += sum(
+                    1 for i in items if i.status == OrderItemStatus.NOT_AVAILABLE
+                )
+            # Pickup ready = packing list shared + nothing received yet
+            # + at least one APPROVED item present.
+            pl = (await db.execute(
+                select(PackingList).where(PackingList.order_id == o.id)
+            )).scalar_one_or_none()
+            if (
+                pl is not None
+                and pl.shared_at is not None
+                and pl.farmer_received_at is None
+                and any(i.status == OrderItemStatus.APPROVED for i in items)
+            ):
+                bucket["orders_pickup_ready"] += 1
+
+        # Seed orders' attention items.
+        seed_rows = (await db.execute(
+            select(SeedOrderFull).where(
+                SeedOrderFull.subscription_id == sub.id,
+                SeedOrderFull.farmer_user_id == current_user.id,
+            )
+        )).scalars().all()
+        for so in seed_rows:
+            if so.status == SeedOrderStatus.SENT_FOR_APPROVAL.value:
+                bucket["seeds_awaiting_approval"] += 1
+            elif so.status == SeedOrderStatus.NOT_AVAILABLE.value:
+                bucket["seeds_returned"] += 1
+            elif so.status == SeedOrderStatus.READY_FOR_PICKUP.value:
+                bucket["seeds_pickup_ready"] += 1
+
+        bucket["total"] = (
+            bucket["advisory_unmarked"]
+            + bucket["orders_awaiting_approval"]
+            + bucket["orders_returned"]
+            + bucket["orders_pickup_ready"]
+            + bucket["seeds_awaiting_approval"]
+            + bucket["seeds_returned"]
+            + bucket["seeds_pickup_ready"]
+            + bucket["queries_responded"]
+            + bucket["payments_pending"]
+        )
+        by_sub[sub.id] = bucket
+        cid = sub.client_id
+        co = by_company.setdefault(cid, {
+            "client_id": cid, "total": 0, "subscription_ids": [],
+        })
+        co["total"] += bucket["total"]
+        co["subscription_ids"].append(sub.id)
+
+    grand_total = sum(b["total"] for b in by_sub.values())
+    return {
+        "by_subscription": by_sub,
+        "by_company": list(by_company.values()),
+        "grand_total": grand_total,
+    }
+
+
 async def _l2_name_loc_map(db: AsyncSession, lang: str) -> dict[str, str]:
     """Returns `{L2_enum: localised_name}` for every L2 we have a Cosh
     UUID mapping for. Reads `cosh_core_items.translations` once per
@@ -4244,6 +4517,21 @@ async def _today_advisory_for_user(
                 LockedTimelineSnapshot.source == "CCA",
             )
         )).scalars().all()
+
+        # 2026-06-19 — Per-occurrence practice acks for this sub.
+        # Key shape: (timeline_lineage_id, practice_id, occurrence_date).
+        # Filter out hidden practices later; surface marked state on the
+        # rest so the PWA can render the green tick.
+        from app.modules.advisory.models import PracticeAcknowledgement
+        ack_rows = (await db.execute(
+            select(PracticeAcknowledgement).where(
+                PracticeAcknowledgement.subscription_id == sub.id,
+            )
+        )).scalars().all()
+        ack_by_key: dict[tuple[str, str, date], PracticeAcknowledgement] = {
+            (a.timeline_lineage_id, a.practice_id, a.occurrence_date): a
+            for a in ack_rows
+        }
         # 2026-06-19 — Key by lineage_id, not timeline_id. After a
         # publish, the sub's package has new Timeline rows with new
         # ids but the SAME lineage_id as their pre-publish ancestors.
@@ -4317,6 +4605,7 @@ async def _today_advisory_for_user(
                 from_date=from_d, to_date=to_d,
                 created_at=tl.created_at.date() if hasattr(tl.created_at, 'date') else today,
                 practices=rendered.practice_stubs, source="CCA",
+                lineage_id=tl.lineage_id,
             )
             tl_windows.append(tl_window)
             tl_date_map[tl.id] = (from_d, to_d, day_num)
@@ -4404,6 +4693,7 @@ async def _today_advisory_for_user(
                         from_date=from_d, to_date=to_d,
                         created_at=cha.triggered_at.date() if hasattr(cha.triggered_at, 'date') else today,
                         practices=stubs, source="CHA",
+                        lineage_id=f"cha-sp-{sp_tl.lineage_id}",
                     ))
                     tl_date_map[cha_tl_id] = (from_d, to_d, 0)
                     cha_meta_by_tl_id[cha_tl_id] = {
@@ -4448,6 +4738,7 @@ async def _today_advisory_for_user(
                         from_date=from_d, to_date=to_d,
                         created_at=cha.triggered_at.date() if hasattr(cha.triggered_at, 'date') else today,
                         practices=stubs, source="CHA",
+                        lineage_id=f"cha-pg-{pg_tl.lineage_id}",
                     ))
                     tl_date_map[cha_tl_id] = (from_d, to_d, 0)
                     cha_meta_by_tl_id[cha_tl_id] = {
@@ -4494,6 +4785,7 @@ async def _today_advisory_for_user(
                         from_date=from_d, to_date=to_d,
                         created_at=cha.triggered_at.date() if hasattr(cha.triggered_at, 'date') else today,
                         practices=stubs, source="QA",
+                        lineage_id=f"cha-qa-{qa_tl.lineage_id}",
                     ))
                     tl_date_map[cha_tl_id] = (from_d, to_d, 0)
                     cha_meta_by_tl_id[cha_tl_id] = {
@@ -4697,6 +4989,7 @@ async def _today_advisory_for_user(
                             if hasattr(ctx_tl.created_at, "date") else today
                         ),
                         practices=ctx_rendered.practice_stubs, source="CCA",
+                        lineage_id=ctx_tl.lineage_id,
                     ))
                     context_render_ids.add(ctx_tl.id)
                 else:
@@ -4747,6 +5040,11 @@ async def _today_advisory_for_user(
                         created_at=triggered_d,
                         practices=ctx_stubs,
                         source="CHA" if cha_source != "QA" else "QA",
+                        lineage_id=(
+                            f"cha-sp-{ctx_tl.lineage_id}" if ctx_tl.sp_recommendation_id
+                            else f"cha-pg-{ctx_tl.lineage_id}" if ctx_tl.pg_recommendation_id
+                            else f"cha-qa-{ctx_tl.lineage_id}"
+                        ),
                     ))
                     context_render_ids.add(cha_tl_id_synth)
 
@@ -4800,47 +5098,51 @@ async def _today_advisory_for_user(
                 p for p in dedup_tl.visible_practices
                 if _is_frequency_due_today(p.frequency_days, from_d, today)
             ]
+            # 2026-06-19 — Per-practice ack lookup. occurrence_date is
+            # the timeline's from_d for non-frequency (sticky across the
+            # whole window) or today for frequency (each due day is its
+            # own ack). Hidden practices drop out entirely here.
+            tl_practices_out: list[dict] = []
+            for p in freq_filtered_practices:
+                occ_date = today if (p.frequency_days and p.frequency_days >= 2) else from_d
+                ack = ack_by_key.get((tl.lineage_id, p.id, occ_date))
+                if ack and ack.hidden_at is not None:
+                    continue  # farmer "deleted" — invisible to them
+                ack_status = "MARKED" if (ack and ack.marked_at is not None) else "ACTIVE"
+                tl_practices_out.append({
+                    "id": p.id, "l0_type": p.l0_type,
+                    "l1_type": p.l1_type, "l2_type": p.l2_type,
+                    "l2_name_loc": l2_name_loc.get(p.l2_type or "") or None,
+                    "display_order": p.display_order, "is_special_input": p.is_special_input,
+                    "relation_id": p.relation_id,
+                    "relation_role": p.relation_role,
+                    "relation_type": p.relation_type,
+                    "frequency_days": p.frequency_days,
+                    "is_frequency_due_today": True,
+                    "is_purchased": p.id in approved_ids,
+                    "fulfilment": fulfilment_by_practice.get(p.id),
+                    "elements": [{
+                        "element_type": el.element_type,
+                        "cosh_ref": _resolve(el.cosh_ref),
+                        "value": el.value,
+                        "unit_cosh_id": _resolve(el.unit_cosh_id),
+                    } for el in p.elements],
+                    # Practice ack state + the occurrence_date the PWA
+                    # must echo back on mark/unmark/hide calls.
+                    "ack_status": ack_status,
+                    "occurrence_date": occ_date.isoformat(),
+                })
             tl_entry: dict = {
                 "id": tl.id,
+                # 2026-06-19 — Stable lineage id for the ack key.
+                "lineage_id": tl.lineage_id,
                 "name": tl.name,
                 "source": tl.source,  # CCA | CHA
                 "from_date": from_d.isoformat(),
                 "to_date": to_d.isoformat(),
                 "day_number": day_num,
                 "suppressed_count": len(dedup_tl.suppressed),
-                "practices": [
-                    {
-                        "id": p.id, "l0_type": p.l0_type,
-                        "l1_type": p.l1_type, "l2_type": p.l2_type,
-                        "l2_name_loc": l2_name_loc.get(p.l2_type or "") or None,
-                        "display_order": p.display_order, "is_special_input": p.is_special_input,
-                        "relation_id": p.relation_id,
-                        "relation_role": p.relation_role,
-                        "relation_type": p.relation_type,
-                        "frequency_days": p.frequency_days,
-                        "is_frequency_due_today": True,  # always True — list is already filtered
-                        # Drives the PWA "hide INPUT details until
-                        # purchased" rule. Mirrors the BL-03 dedup
-                        # threshold (APPROVED order item == farmer
-                        # has the product in hand). Always set for
-                        # all L0 types; PWA only acts on it for
-                        # INPUT practices.
-                        "is_purchased": p.id in approved_ids,
-                        # Orders V2 Batch 11 — tappable status. Null
-                        # when the practice has no live order item;
-                        # otherwise the latest active row's status +
-                        # the bits the farmer needs to decide what
-                        # to do next.
-                        "fulfilment": fulfilment_by_practice.get(p.id),
-                        "elements": [{
-                            "element_type": el.element_type,
-                            "cosh_ref": _resolve(el.cosh_ref),
-                            "value": el.value,
-                            "unit_cosh_id": _resolve(el.unit_cosh_id),
-                        } for el in p.elements],
-                    }
-                    for p in freq_filtered_practices
-                ],
+                "practices": tl_practices_out,
             }
             # Include BL-02 pending question for this timeline (if any)
             if tl.id in pending_questions_by_tl:
