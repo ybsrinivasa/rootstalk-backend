@@ -4347,6 +4347,16 @@ async def _today_advisory_for_user(
         # survives BL-03's dedup pass (which keeps the same `tl.id`).
         cha_meta_by_tl_id: dict[str, dict] = {}
 
+        # 2026-06-19 — Raw CHA timeline IDs the active loop adds to
+        # tl_windows (under synthetic ids `cha-{src}-{raw}`). The
+        # BL-03 context-only pass excludes these so the same CHA
+        # timeline isn't also added as a context-only entry — that
+        # would (a) double-include the timeline, and (b) make the
+        # context-only path wrongly anchor CHA offsets to
+        # crop_start_date instead of triggered_at. See the same-day
+        # fix in services/order_bundle.py for the order-side mirror.
+        active_cha_raw_tl_ids: set[str] = set()
+
         for cha in cha_entries:
             if cha.recommendation_type == "SP":
                 sp_timelines = (await db.execute(
@@ -4393,6 +4403,7 @@ async def _today_advisory_for_user(
                         "triggered_at": cha.triggered_at.isoformat()
                             if hasattr(cha.triggered_at, "isoformat") else None,
                     }
+                    active_cha_raw_tl_ids.add(sp_tl.id)
             elif cha.recommendation_type == "PG":
                 pg_timelines = (await db.execute(
                     select(Timeline).where(Timeline.pg_recommendation_id == cha.recommendation_id)
@@ -4436,6 +4447,7 @@ async def _today_advisory_for_user(
                         "triggered_at": cha.triggered_at.isoformat()
                             if hasattr(cha.triggered_at, "isoformat") else None,
                     }
+                    active_cha_raw_tl_ids.add(pg_tl.id)
             elif cha.recommendation_type == "QA":
                 # UCAT pipe-3: Q&A timelines live in pg_timelines via
                 # standard_response_id. Mirror PG branch but keyed
@@ -4481,6 +4493,7 @@ async def _today_advisory_for_user(
                         "triggered_at": cha.triggered_at.isoformat()
                             if hasattr(cha.triggered_at, "isoformat") else None,
                     }
+                    active_cha_raw_tl_ids.add(qa_tl.id)
 
         # ── BL-03 deduplication across CCA + CHA timelines ───────────────────
         # Includes a "context-only" pass: timelines referenced by APPROVED
@@ -4605,9 +4618,12 @@ async def _today_advisory_for_user(
             }
 
         active_tl_ids = {tl.id for tl, _, _ in active_timelines}
+        # Combine active CCA + active CHA raw IDs so neither flavour gets
+        # re-added by the context-only pass below.
+        all_active_raw_tl_ids = active_tl_ids | active_cha_raw_tl_ids
         context_tl_ids: set[str] = {
             it.timeline_id for it in approved_items
-            if it.timeline_id and it.timeline_id not in active_tl_ids
+            if it.timeline_id and it.timeline_id not in all_active_raw_tl_ids
         }
         context_render_ids: set[str] = set()  # mark for response-build skip
 
@@ -4615,28 +4631,116 @@ async def _today_advisory_for_user(
             context_tl_rows = (await db.execute(
                 select(Timeline).where(Timeline.id.in_(context_tl_ids))
             )).scalars().all()
-            for ctx_tl in context_tl_rows:
-                ctx_meta = metadata_from_master_cca(ctx_tl)
-                # Context-only path: timeline is out of window but referenced
-                # by APPROVED items, so the snapshot capture is PO-driven, not
-                # VIEWED. The label is observability-only; render behaviour is
-                # identical.
-                ctx_content, _ = await resolve_cca_content(
-                    db, sub.id, ctx_tl.id, lock_trigger="PURCHASE_ORDER",
+
+            # 2026-06-19 — discriminate CCA vs CHA in the context-only
+            # pass. Pre-fix this loop assumed every row was CCA and
+            # computed dates against crop_start_date — wrong for any
+            # CHA timeline whose offsets anchor to triggered_at. The
+            # bug made BL-03 step 12 (purchased rule) misfire for
+            # approved CHA-recommended inputs. Pre-load triggered_at
+            # for the CHA-flavoured rows; the most recent
+            # TriggeredCHAEntry on each recommendation wins (matches
+            # how the active loop iterates entries with most-recent
+            # last).
+            cha_recs_needed = {
+                rec_id for ctx_tl in context_tl_rows
+                for rec_id in (
+                    ctx_tl.sp_recommendation_id,
+                    ctx_tl.pg_recommendation_id,
+                    ctx_tl.standard_response_id,
                 )
-                ctx_rendered = render_cca_from_content(ctx_content, today_answers)
-                ctx_from_d, ctx_to_d = cca_calendar_dates(ctx_meta, crop_start, today)
-                tl_windows.append(TLWindow(
-                    id=ctx_tl.id,
-                    name=(ctx_content.get("timeline") or {}).get("name") or ctx_tl.name,
-                    from_date=ctx_from_d, to_date=ctx_to_d,
-                    created_at=(
-                        ctx_tl.created_at.date()
-                        if hasattr(ctx_tl.created_at, "date") else today
-                    ),
-                    practices=ctx_rendered.practice_stubs, source="CCA",
-                ))
-                context_render_ids.add(ctx_tl.id)
+                if rec_id
+            }
+            cha_triggered_at_by_rec: dict = {}
+            if cha_recs_needed:
+                ctx_cha_entries = (await db.execute(
+                    select(TriggeredCHAEntry).where(
+                        TriggeredCHAEntry.subscription_id == sub.id,
+                        TriggeredCHAEntry.recommendation_id.in_(cha_recs_needed),
+                    ).order_by(TriggeredCHAEntry.triggered_at.desc())
+                )).scalars().all()
+                for cce in ctx_cha_entries:
+                    if cce.recommendation_id not in cha_triggered_at_by_rec:
+                        cha_triggered_at_by_rec[cce.recommendation_id] = (
+                            cce.triggered_at.date()
+                            if hasattr(cce.triggered_at, "date")
+                            else cce.triggered_at
+                        )
+
+            for ctx_tl in context_tl_rows:
+                if ctx_tl.package_id:
+                    # CCA path — existing behaviour.
+                    ctx_meta = metadata_from_master_cca(ctx_tl)
+                    # Context-only path: timeline is out of window but
+                    # referenced by APPROVED items, so the snapshot capture
+                    # is PO-driven, not VIEWED. The label is
+                    # observability-only; render behaviour is identical.
+                    ctx_content, _ = await resolve_cca_content(
+                        db, sub.id, ctx_tl.id, lock_trigger="PURCHASE_ORDER",
+                    )
+                    ctx_rendered = render_cca_from_content(ctx_content, today_answers)
+                    ctx_from_d, ctx_to_d = cca_calendar_dates(ctx_meta, crop_start, today)
+                    tl_windows.append(TLWindow(
+                        id=ctx_tl.id,
+                        name=(ctx_content.get("timeline") or {}).get("name") or ctx_tl.name,
+                        from_date=ctx_from_d, to_date=ctx_to_d,
+                        created_at=(
+                            ctx_tl.created_at.date()
+                            if hasattr(ctx_tl.created_at, "date") else today
+                        ),
+                        practices=ctx_rendered.practice_stubs, source="CCA",
+                    ))
+                    context_render_ids.add(ctx_tl.id)
+                else:
+                    # CHA path — anchor to triggered_at, use synthetic ID
+                    # so the entry can't collide with any active CHA
+                    # already in tl_windows (excluded above) or a
+                    # context CCA.
+                    rec_id = (
+                        ctx_tl.sp_recommendation_id
+                        or ctx_tl.pg_recommendation_id
+                        or ctx_tl.standard_response_id
+                    )
+                    triggered_d = cha_triggered_at_by_rec.get(rec_id)
+                    if triggered_d is None:
+                        # No matching TriggeredCHAEntry — can't compute
+                        # window. Skip; purchased-rule won't fire for this
+                        # orphan, but the data isn't present to fire on
+                        # either.
+                        continue
+                    if ctx_tl.from_value is None or ctx_tl.to_value is None:
+                        continue
+                    if ctx_tl.sp_recommendation_id:
+                        cha_source = "SP"
+                        cha_tl_id_synth = f"cha-sp-{ctx_tl.id}"
+                    elif ctx_tl.pg_recommendation_id:
+                        cha_source = "PG"
+                        cha_tl_id_synth = f"cha-pg-{ctx_tl.id}"
+                    else:
+                        cha_source = "QA"
+                        cha_tl_id_synth = f"cha-qa-{ctx_tl.id}"
+                    ctx_content, _ = await resolve_cha_content(
+                        db, sub.id, ctx_tl.id, cha_source,
+                        lock_trigger="PURCHASE_ORDER",
+                    )
+                    ctx_stubs = render_cha_from_content(ctx_content)
+                    ctx_meta_inner = metadata_from_content({"timeline": {
+                        "from_type": "DAS",
+                        "from_value": int(ctx_tl.from_value),
+                        "to_value": int(ctx_tl.to_value),
+                    }})
+                    ctx_from_d, ctx_to_d = cha_calendar_dates(
+                        ctx_meta_inner, triggered_d,
+                    )
+                    tl_windows.append(TLWindow(
+                        id=cha_tl_id_synth,
+                        name=ctx_tl.name,
+                        from_date=ctx_from_d, to_date=ctx_to_d,
+                        created_at=triggered_d,
+                        practices=ctx_stubs,
+                        source="CHA" if cha_source != "QA" else "QA",
+                    ))
+                    context_render_ids.add(cha_tl_id_synth)
 
         deduped = deduplicate_advisory(tl_windows, approved_practice_ids=approved_ids)
 

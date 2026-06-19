@@ -232,19 +232,67 @@ async def _build_timeline_windows_for_dedup(
     }
     if context_tl_ids:
         # Most context timelines live in `timelines` (CCA / PG / SP / QA
-        # all share the same table). Load + add with their dates.
+        # all share the same table). Load + discriminate by source FK.
+        # 2026-06-19 — pre-fix this loop assumed every row was CCA and
+        # ran `_timeline_window` (which anchors DAS offsets to
+        # crop_start_date). That's wrong for CHA-flavoured rows whose
+        # offsets are relative to triggered_at — BL-03 step 12
+        # (purchased rule) misfired for approved CHA-recommended
+        # inputs. Mirror the same-day fix in
+        # `subscriptions/router.py::_today_advisory_for_user`.
         ctx_rows = (await db.execute(
             select(Timeline).where(Timeline.id.in_(context_tl_ids))
         )).scalars().all()
+
+        cha_recs_needed = {
+            rec_id for ctx_tl in ctx_rows
+            for rec_id in (
+                ctx_tl.sp_recommendation_id,
+                ctx_tl.pg_recommendation_id,
+                ctx_tl.standard_response_id,
+            )
+            if rec_id
+        }
+        cha_triggered_at_by_rec: dict = {}
+        if cha_recs_needed:
+            ctx_cha_entries = (await db.execute(
+                select(TriggeredCHAEntry).where(
+                    TriggeredCHAEntry.subscription_id == subscription.id,
+                    TriggeredCHAEntry.recommendation_id.in_(cha_recs_needed),
+                ).order_by(TriggeredCHAEntry.triggered_at.desc())
+            )).scalars().all()
+            for cce in ctx_cha_entries:
+                if cce.recommendation_id not in cha_triggered_at_by_rec:
+                    cha_triggered_at_by_rec[cce.recommendation_id] = (
+                        cce.triggered_at.date()
+                        if hasattr(cce.triggered_at, "date")
+                        else cce.triggered_at
+                    )
+
         for ctx_tl in ctx_rows:
-            # Use the shared `_timeline_window` so CALENDAR context
-            # timelines also resolve correctly. Anchor for DAS/DBS is
-            # crop_start; CALENDAR uses today.year (Batch 21).
-            cw = _timeline_window(ctx_tl, crop_start, today)
-            if cw is None:
-                continue
-            candidate_tls[ctx_tl.id] = (cw[0], cw[1], "CCA")
-            pkg_tl_by_id[ctx_tl.id] = ctx_tl
+            if ctx_tl.package_id:
+                # CCA — existing behaviour.
+                cw = _timeline_window(ctx_tl, crop_start, today)
+                if cw is None:
+                    continue
+                candidate_tls[ctx_tl.id] = (cw[0], cw[1], "CCA")
+                pkg_tl_by_id[ctx_tl.id] = ctx_tl
+            else:
+                # CHA — anchor offsets to triggered_at, not crop_start.
+                rec_id = (
+                    ctx_tl.sp_recommendation_id
+                    or ctx_tl.pg_recommendation_id
+                    or ctx_tl.standard_response_id
+                )
+                triggered_d = cha_triggered_at_by_rec.get(rec_id)
+                if triggered_d is None:
+                    continue
+                if ctx_tl.from_value is None or ctx_tl.to_value is None:
+                    continue
+                from_d = triggered_d + timedelta(days=int(ctx_tl.from_value))
+                to_d = triggered_d + timedelta(days=int(ctx_tl.to_value))
+                candidate_tls[ctx_tl.id] = (from_d, to_d, "CHA")
+                cha_tl_by_id[ctx_tl.id] = ctx_tl
 
     if not candidate_tls:
         return []
