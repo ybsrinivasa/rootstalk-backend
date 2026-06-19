@@ -61,6 +61,13 @@ class SeedOrderStatus(str, enum.Enum):
     POSTPONED = "POSTPONED"
     NOT_AVAILABLE = "NOT_AVAILABLE"
     SENT_FOR_APPROVAL = "SENT_FOR_APPROVAL"
+    # 2026-06-19 — Pre-fix, farmer-approval took the order straight
+    # to PURCHASED (terminal). The dealer had nothing left to act on
+    # and the seed packet sat on the shelf with no system signal.
+    # READY_FOR_PICKUP sits between approval and terminal: dealer
+    # sees the order in a "Packing / Hand over" pill, taps
+    # `/handover` once the farmer picks up → PURCHASED.
+    READY_FOR_PICKUP = "READY_FOR_PICKUP"
     PURCHASED = "PURCHASED"
     REJECTED = "REJECTED"
     CANCELLED = "CANCELLED"

@@ -857,6 +857,39 @@ async def approve_seed_order(
     order = await _get_seed_order(db, order_id, current_user.id, farmer=True)
     if order.status != SeedOrderStatus.SENT_FOR_APPROVAL:
         raise HTTPException(status_code=400, detail="Order is not awaiting approval")
+    # 2026-06-19 — Park at READY_FOR_PICKUP instead of jumping
+    # straight to PURCHASED. Dealer's "Packing / Hand over" pill
+    # surfaces the order so they know to physically prepare it +
+    # confirm pickup. Pre-fix the order vanished into Completed
+    # the moment the farmer tapped Approve, with no signal to the
+    # dealer.
+    order.status = SeedOrderStatus.READY_FOR_PICKUP
+    await db.commit()
+    return {"id": order_id, "status": order.status}
+
+
+@router.put("/dealer/seed-orders/{order_id}/handover")
+async def handover_seed_order(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Dealer marks the seed packet as physically handed over to
+    the farmer. Final step in the seed flow.
+
+    Allowed only from `READY_FOR_PICKUP`. Lands at `PURCHASED`
+    (terminal). Farmer doesn't have an equivalent endpoint — the
+    dealer is the one physically holding the packet so they are
+    the authority on handover.
+    """
+    from app.modules.orders.router import _assert_active_dealer
+    await _assert_active_dealer(db, current_user.id)
+    order = await _get_seed_order(db, order_id, current_user.id, farmer=False)
+    if order.status != SeedOrderStatus.READY_FOR_PICKUP:
+        raise HTTPException(
+            status_code=400,
+            detail="Seed order can only be handed over from READY_FOR_PICKUP",
+        )
     order.status = SeedOrderStatus.PURCHASED
     await db.commit()
     return {"id": order_id, "status": order.status}
@@ -901,9 +934,15 @@ async def cancel_seed_order(
     from app.services.order_events import record_event as _record_event
 
     order = await _get_seed_order(db, order_id, current_user.id, farmer=True)
+    # 2026-06-19 — READY_FOR_PICKUP joins the terminal-for-cancel
+    # set. Once the farmer has approved the purchase, the seed packet
+    # is committed; cancel-and-migrate would discard the commercial
+    # transaction without an item identity to preserve. Edge-cases
+    # where the dealer can't deliver should be handled outside the
+    # cancel path (admin intervention).
     terminal = {
         SeedOrderStatus.CANCELLED, SeedOrderStatus.PURCHASED,
-        SeedOrderStatus.REROUTED,
+        SeedOrderStatus.REROUTED, SeedOrderStatus.READY_FOR_PICKUP,
     }
     if order.status in terminal:
         raise HTTPException(
