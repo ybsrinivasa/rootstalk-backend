@@ -809,6 +809,7 @@ async def list_subscription_orders(
         seed_out.append({
             "kind": "SEED",
             "id": so.id,
+            "reference_number": so.reference_number,
             "status": so.status,
             "variety_name": variety.name if variety else None,
             "crop_cosh_id": variety.crop_cosh_id if variety else None,

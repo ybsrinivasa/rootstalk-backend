@@ -736,6 +736,11 @@ async def place_seed_order(
                 },
             )
 
+    # 2026-06-19 — Human-readable Order ID. Same RT-YY-NNNNNN
+    # format the regular Order uses, so the dealer's unified
+    # orders feed shows one consistent identifier.
+    from app.modules.orders.router import _generate_order_reference
+    reference_number = await _generate_order_reference(db)
     order = SeedOrderFull(
         subscription_id=data["subscription_id"],
         farmer_user_id=current_user.id,
@@ -743,11 +748,16 @@ async def place_seed_order(
         client_id=variety.client_id,
         dealer_user_id=dealer_user_id,
         facilitator_user_id=data.get("facilitator_user_id"),
+        reference_number=reference_number,
     )
     db.add(order)
     await db.commit()
     await db.refresh(order)
-    return {"id": order.id, "status": order.status, "variety_id": order.variety_id}
+    return {
+        "id": order.id, "status": order.status,
+        "variety_id": order.variety_id,
+        "reference_number": order.reference_number,
+    }
 
 
 @router.get("/farmer/seed-orders")
@@ -786,6 +796,7 @@ async def list_farmer_seed_orders(
         rcp = recipients.get(o.dealer_user_id) or recipients.get(o.facilitator_user_id)
         out.append({
             "id": o.id, "status": o.status,
+            "reference_number": o.reference_number,
             "variety_name": variety.name if variety else None,
             "crop_cosh_id": variety.crop_cosh_id if variety else None,
             "unit": o.unit, "quantity": float(o.quantity) if o.quantity else None,
@@ -821,6 +832,7 @@ async def get_farmer_seed_order(
     return {
         "id": order.id,
         "status": order.status,
+        "reference_number": order.reference_number,
         "variety_id": order.variety_id,
         "variety_name": variety.name if variety else None,
         "crop_cosh_id": variety.crop_cosh_id if variety else None,
@@ -913,6 +925,9 @@ async def cancel_seed_order(
         total_price=None,  # reset — next dealer prices afresh
         status=SeedOrderStatus.DRAFT,
         lineage_id=order.lineage_id,
+        # 2026-06-19 — Same human-readable Order ID across the
+        # cancel-and-migrate lineage.
+        reference_number=order.reference_number,
     )
     db.add(new_draft)
     await db.flush()
@@ -1121,6 +1136,7 @@ async def list_dealer_seed_orders(
         variety_hidden = o.status in PRE_ACCEPT_STATUSES
         out.append({
             "id": o.id, "status": o.status,
+            "reference_number": o.reference_number,
             "category": "SEED",
             "variety_name": (
                 None if variety_hidden

@@ -90,5 +90,9 @@ class SeedOrderFull(Base):
     # inherits the same lineage_id so reports can trace a seed
     # order across dealer hops.
     lineage_id: Mapped[str] = mapped_column(String(36), nullable=False, default=new_uuid)
+    # 2026-06-19 — Human-readable Order ID, parity with the
+    # `orders` table. RT-YY-NNNNNN format, lineage-shared.
+    # Backfilled for existing rows in migration `c4a91e07f3d6`.
+    reference_number: Mapped[str] = mapped_column(String(20), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
