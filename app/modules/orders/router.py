@@ -2447,7 +2447,13 @@ async def list_dealer_orders(
             select(User).where(User.id.in_(facilitator_ids))
         )).scalars().all()
         for f in f_rows:
-            facilitator_by_id[f.id] = {"name": f.name, "phone": f.phone}
+            facilitator_by_id[f.id] = {
+                "name": f.name,
+                "phone": f.phone,
+                # 2026-06-19 — Photo for the dealer's identify-confirm
+                # avatar (parity with farmer_photo_url).
+                "photo_url": f.photo_url,
+            }
 
     # Packing list rows for the same orders.
     pl_by_order: dict[str, PackingList] = {}
@@ -2579,6 +2585,7 @@ async def list_dealer_orders(
             "facilitator_user_id": o.facilitator_user_id,
             "facilitator_name": facilitator.get("name") if facilitator else None,
             "facilitator_phone": facilitator.get("phone") if facilitator else None,
+            "facilitator_photo_url": facilitator.get("photo_url") if facilitator else None,
             "client_id": o.client_id,
             "client_name": c.display_name or c.short_name,
             "category": o.category,
@@ -4677,6 +4684,7 @@ async def get_dealer_order(
     # the difference between the Planting year and current year),
     # Number of acres/Number of plants (as the case may be)."
     farmer_context = await _build_farmer_context(db, order, lang=lang)
+    facilitator_context = await _build_facilitator_context(db, order)
 
     return {
         "id": order.id, "status": order.status,
@@ -4689,6 +4697,10 @@ async def get_dealer_order(
         # the order. Hidden from the farmer's view by living on a
         # dealer-side endpoint only.
         "farmer_context": farmer_context,
+        # 2026-06-19 — When the order arrived via a facilitator, the
+        # dealer needs the same identify-confirm block for them.
+        # null otherwise.
+        "facilitator_context": facilitator_context,
         # Flat list (unchanged shape for backward compat)
         "items": [item_brief(i) for i in items],
         # New: Part-aware relation structure
@@ -4806,12 +4818,41 @@ async def _build_farmer_context(
     return {
         "farmer_name": farmer.name if farmer else None,
         "farmer_phone": farmer.phone if farmer else None,
+        # 2026-06-19 — Photo for the dealer's WhatsApp-style identity
+        # confirmation. Rendered as a tap-to-enlarge avatar.
+        "farmer_photo_url": farmer.photo_url if farmer else None,
         "crop_name": crop_name,
         "measure": measure,
         "age_value": age_value,
         "age_unit": age_unit,
         "farm_area_acres": float(sub.farm_area_acres) if (sub and sub.farm_area_acres) else None,
         "number_of_plants": int(sub.number_of_plants) if (sub and sub.number_of_plants) else None,
+    }
+
+
+async def _build_facilitator_context(
+    db: AsyncSession, order: Order,
+) -> Optional[dict]:
+    """Facilitator details for the dealer order-detail header.
+    Returns None when the order didn't come via a facilitator.
+
+    Symmetric with `_build_farmer_context` (name + phone + photo)
+    so the dealer can call and visually identify the person who
+    routed the order to them — same WhatsApp-style identity
+    confirmation as the farmer.
+    """
+    if not order.facilitator_user_id:
+        return None
+    fac = (await db.execute(
+        select(User).where(User.id == order.facilitator_user_id)
+    )).scalar_one_or_none()
+    if fac is None:
+        return None
+    return {
+        "facilitator_user_id": fac.id,
+        "facilitator_name": fac.name,
+        "facilitator_phone": fac.phone,
+        "facilitator_photo_url": fac.photo_url,
     }
 
 
