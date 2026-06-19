@@ -292,6 +292,7 @@ def render_cha_from_content(content: dict) -> list[PStub]:
 
 async def resolve_cca_content(
     db: AsyncSession, subscription_id: str, timeline_id: str,
+    lock_trigger: str = "VIEWED",
 ) -> tuple[dict, bool]:
     """Return (deserialised_content, locked) for a CCA timeline.
 
@@ -300,6 +301,14 @@ async def resolve_cca_content(
     locked=False  → snapshot capture failed; we are returning a fresh master
                     serialisation as a degraded fallback. The defensive
                     sweep retries on its next run.
+
+    `lock_trigger` labels the snapshot when one is taken inline. Default
+    "VIEWED" — caller is rendering an in-window timeline. Pass
+    "PURCHASE_ORDER" when the caller is the BL-03 context-only path
+    (timeline out of window but referenced by approved order items)
+    so the snapshot's audit trail reflects the true reason for capture.
+    Trigger labels are observability-only; render behaviour does not
+    depend on them.
     """
     snap = await get_snapshot(db, subscription_id, timeline_id, "CCA")
     if snap is not None:
@@ -307,7 +316,7 @@ async def resolve_cca_content(
 
     try:
         snap = await take_snapshot(
-            db, subscription_id, timeline_id, "VIEWED", source="CCA",
+            db, subscription_id, timeline_id, lock_trigger, source="CCA",
         )
         return deserialise_timeline(snap.content), True
     except Exception as exc:  # noqa: BLE001
@@ -327,15 +336,19 @@ async def resolve_cca_content(
 
 async def resolve_cha_content(
     db: AsyncSession, subscription_id: str, timeline_id: str, source: str,
+    lock_trigger: str = "VIEWED",
 ) -> tuple[dict, bool]:
-    """CHA equivalent of resolve_cca_content. `source` must be 'PG' or 'SP'."""
+    """CHA equivalent of resolve_cca_content. `source` must be 'PG' or 'SP'.
+
+    `lock_trigger` semantics match resolve_cca_content — label only.
+    """
     snap = await get_snapshot(db, subscription_id, timeline_id, source)
     if snap is not None:
         return deserialise_timeline(snap.content), True
 
     try:
         snap = await take_snapshot(
-            db, subscription_id, timeline_id, "VIEWED", source=source,
+            db, subscription_id, timeline_id, lock_trigger, source=source,
         )
         return deserialise_timeline(snap.content), True
     except Exception as exc:  # noqa: BLE001

@@ -1478,6 +1478,12 @@ async def set_start_date(
             TriggeredCHAEntry.status == "ACTIVE",
         )
     )).scalars().all()
+    # Batch 39O (2026-05-16) unified the timelines table — every Timeline
+    # row has a globally-unique id regardless of which parent FK is set.
+    # Earlier code used synthetic prefixes like f"sp_{id}" / f"pg_{id}" /
+    # f"qa_{id}" here, which made `detect_lock` unable to match
+    # OrderItem.timeline_id (which stores the raw id). With the unified
+    # table, the prefix is both unnecessary and harmful — use the raw id.
     for cha in cha_entries:
         triggered_d = cha.triggered_at.date() if hasattr(cha.triggered_at, 'date') else cha.triggered_at
         if cha.recommendation_type == "SP":
@@ -1488,7 +1494,7 @@ async def set_start_date(
                 from_d = triggered_d + timedelta(days=sp_tl.from_value)
                 to_d = triggered_d + timedelta(days=sp_tl.to_value)
                 tl_ranges.append(TimelineDateRange(
-                    id=f"sp_{sp_tl.id}", from_date=from_d, to_date=to_d, is_cha=True,
+                    id=sp_tl.id, from_date=from_d, to_date=to_d, is_cha=True,
                 ))
         elif cha.recommendation_type == "PG":
             pg_timelines = (await db.execute(
@@ -1498,7 +1504,7 @@ async def set_start_date(
                 from_d = triggered_d + timedelta(days=pg_tl.from_value)
                 to_d = triggered_d + timedelta(days=pg_tl.to_value)
                 tl_ranges.append(TimelineDateRange(
-                    id=f"pg_{pg_tl.id}", from_date=from_d, to_date=to_d, is_cha=True,
+                    id=pg_tl.id, from_date=from_d, to_date=to_d, is_cha=True,
                 ))
         elif cha.recommendation_type == "QA":
             # UCAT pipe-3: Q&A timelines live in pg_timelines too,
@@ -1512,7 +1518,7 @@ async def set_start_date(
                 from_d = triggered_d + timedelta(days=qa_tl.from_value)
                 to_d = triggered_d + timedelta(days=qa_tl.to_value)
                 tl_ranges.append(TimelineDateRange(
-                    id=f"qa_{qa_tl.id}", from_date=from_d, to_date=to_d, is_cha=True,
+                    id=qa_tl.id, from_date=from_d, to_date=to_d, is_cha=True,
                 ))
 
     # Compute shifts
@@ -4611,7 +4617,13 @@ async def _today_advisory_for_user(
             )).scalars().all()
             for ctx_tl in context_tl_rows:
                 ctx_meta = metadata_from_master_cca(ctx_tl)
-                ctx_content, _ = await resolve_cca_content(db, sub.id, ctx_tl.id)
+                # Context-only path: timeline is out of window but referenced
+                # by APPROVED items, so the snapshot capture is PO-driven, not
+                # VIEWED. The label is observability-only; render behaviour is
+                # identical.
+                ctx_content, _ = await resolve_cca_content(
+                    db, sub.id, ctx_tl.id, lock_trigger="PURCHASE_ORDER",
+                )
                 ctx_rendered = render_cca_from_content(ctx_content, today_answers)
                 ctx_from_d, ctx_to_d = cca_calendar_dates(ctx_meta, crop_start, today)
                 tl_windows.append(TLWindow(
