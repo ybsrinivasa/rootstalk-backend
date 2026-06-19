@@ -779,7 +779,9 @@ async def list_farmer_seed_orders(
     # Phase 1 of the farmer Orders restructure (2026-06-02): seed
     # cards get the same crop / company / start-date header rest of
     # the order surface uses, so the farmer reads them consistently.
-    lang = await get_locale(db, current_user)
+    # NB: get_locale is a FastAPI Depends, not a callable; resolve
+    # inline to match the rest of the codebase.
+    lang = current_user.language_code or "en"
     meta_by_sub = await load_meta_for_subscription_ids(
         db, [o.subscription_id for o in orders],
         lang=lang,
@@ -849,7 +851,7 @@ async def get_farmer_seed_order(
         select(SeedVariety).where(SeedVariety.id == order.variety_id)
     )).scalar_one_or_none()
     # 2026-06-19 — Resolve crop_name same way the list endpoint does.
-    lang = await get_locale(db, current_user)
+    lang = current_user.language_code or "en"
     crop_name = None
     if variety and variety.crop_cosh_id:
         names = await resolve_names_by_cosh_id(db, {variety.crop_cosh_id}, lang)
