@@ -308,9 +308,14 @@ async def take_snapshot(
     lock_trigger: str,
     source: str = "CCA",
 ) -> LockedTimelineSnapshot:
-    """Serialise + store. If a snapshot for (sub, timeline, source) already
-    exists, return it without overwriting — snapshots are immutable per
-    Rules 1 & 2.
+    """Serialise + store. If a snapshot for (sub, lineage_id, source)
+    already exists, return it without overwriting — snapshots are
+    immutable per Rules 1 & 2.
+
+    `timeline_id` is the physical Timeline row whose content we
+    serialise; the snapshot's uniqueness key is the Timeline's
+    `lineage_id` (added 2026-06-19) so the snapshot survives package
+    republishes that clone the Timeline row with a new id.
 
     Raises ValueError on invalid lock_trigger or source.
     """
@@ -324,7 +329,21 @@ async def take_snapshot(
             f"source must be one of {sorted(VALID_SOURCES)}, got {source!r}"
         )
 
-    existing = await get_snapshot(db, subscription_id, timeline_id, source)
+    # Look up the timeline's lineage_id once. The render-path callers
+    # already hold a Timeline row; we accept timeline_id for ergonomic
+    # parity with the pre-2026-06-19 signature and resolve lineage_id
+    # here.
+    from app.modules.advisory.models import Timeline as _TL
+    tl_row = (await db.execute(
+        select(_TL.lineage_id).where(_TL.id == timeline_id)
+    )).scalar_one_or_none()
+    if tl_row is None:
+        raise ValueError(f"Timeline not found: {timeline_id}")
+    lineage_id = tl_row
+
+    existing = await get_snapshot_by_lineage(
+        db, subscription_id, lineage_id, source,
+    )
     if existing is not None:
         return existing
 
@@ -336,6 +355,7 @@ async def take_snapshot(
     snapshot = LockedTimelineSnapshot(
         subscription_id=subscription_id,
         timeline_id=timeline_id,
+        lineage_id=lineage_id,
         source=source,
         content=content,
         locked_at=datetime.now(timezone.utc),
@@ -353,12 +373,39 @@ async def get_snapshot(
     timeline_id: str,
     source: str = "CCA",
 ) -> Optional[LockedTimelineSnapshot]:
-    """Return existing snapshot row for (sub, timeline, source), else None."""
+    """Return existing snapshot for the lineage of `timeline_id`,
+    scoped to this subscription + source. Accepts the physical
+    timeline_id for caller convenience; resolves the lineage_id
+    internally so callers don't have to thread it through.
+
+    Returns None when no snapshot exists OR when the timeline_id
+    has no matching row (defensive — caller's responsibility to
+    surface this if they care)."""
+    from app.modules.advisory.models import Timeline as _TL
+    lineage_id = (await db.execute(
+        select(_TL.lineage_id).where(_TL.id == timeline_id)
+    )).scalar_one_or_none()
+    if lineage_id is None:
+        return None
+    return await get_snapshot_by_lineage(
+        db, subscription_id, lineage_id, source,
+    )
+
+
+async def get_snapshot_by_lineage(
+    db: AsyncSession,
+    subscription_id: str,
+    lineage_id: str,
+    source: str = "CCA",
+) -> Optional[LockedTimelineSnapshot]:
+    """Lineage-keyed lookup. Use this when the caller already has the
+    lineage_id (e.g. it just queried a Timeline row) to avoid the
+    extra round-trip in `get_snapshot`."""
     return (
         await db.execute(
             select(LockedTimelineSnapshot).where(
                 LockedTimelineSnapshot.subscription_id == subscription_id,
-                LockedTimelineSnapshot.timeline_id == timeline_id,
+                LockedTimelineSnapshot.lineage_id == lineage_id,
                 LockedTimelineSnapshot.source == source,
             )
         )

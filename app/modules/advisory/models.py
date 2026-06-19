@@ -351,6 +351,19 @@ class Timeline(Base):
     __tablename__ = "timelines"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    # BL-13 step 4 + BL-05a 2-lock across publishes (2026-06-19):
+    # `lineage_id` is the stable identifier that survives publish
+    # clones. The publish flow's `_deep_copy_package_content` stamps
+    # the source row's lineage_id on the clone, so a Timeline and
+    # its successors across all package versions share one
+    # lineage_id. Snapshots are keyed by lineage_id so a farmer's
+    # frozen view survives the auto-migration of
+    # `Subscription.package_id` on republish. For rows that pre-date
+    # the column, the migration backfilled `lineage_id = id` so
+    # each is its own lineage origin.
+    lineage_id: Mapped[str] = mapped_column(
+        String(36), nullable=False, default=new_uuid, index=True,
+    )
     # Exactly one of the four parent FKs is set per row.
     package_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("packages.id"), nullable=True,

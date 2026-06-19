@@ -4244,11 +4244,17 @@ async def _today_advisory_for_user(
                 LockedTimelineSnapshot.source == "CCA",
             )
         )).scalars().all()
-        cca_snap_by_tl: dict = {s.timeline_id: s for s in existing_cca_snaps}
+        # 2026-06-19 — Key by lineage_id, not timeline_id. After a
+        # publish, the sub's package has new Timeline rows with new
+        # ids but the SAME lineage_id as their pre-publish ancestors.
+        # Looking up by lineage_id finds the snapshot stored from the
+        # ancestor view (BL-13 step 4: locked timelines stay frozen
+        # across publishes).
+        cca_snap_by_lineage: dict = {s.lineage_id: s for s in existing_cca_snaps}
 
         active_timelines = []
         for tl in timelines:
-            existing_snap = cca_snap_by_tl.get(tl.id)
+            existing_snap = cca_snap_by_lineage.get(tl.lineage_id)
             meta = (
                 metadata_from_content(existing_snap.content)
                 if existing_snap is not None
@@ -4364,11 +4370,13 @@ async def _today_advisory_for_user(
                 )).scalars().all()
                 for sp_tl in sp_timelines:
                     # CHA window check uses snapshot's frozen offsets if a
-                    # snapshot exists, else master.
+                    # snapshot exists, else master. Lookup by
+                    # lineage_id so snapshots survive publish clones
+                    # (2026-06-19).
                     sp_snap = (await db.execute(
                         select(LockedTimelineSnapshot).where(
                             LockedTimelineSnapshot.subscription_id == sub.id,
-                            LockedTimelineSnapshot.timeline_id == sp_tl.id,
+                            LockedTimelineSnapshot.lineage_id == sp_tl.lineage_id,
                             LockedTimelineSnapshot.source == "SP",
                         )
                     )).scalar_one_or_none()
@@ -4412,7 +4420,7 @@ async def _today_advisory_for_user(
                     pg_snap = (await db.execute(
                         select(LockedTimelineSnapshot).where(
                             LockedTimelineSnapshot.subscription_id == sub.id,
-                            LockedTimelineSnapshot.timeline_id == pg_tl.id,
+                            LockedTimelineSnapshot.lineage_id == pg_tl.lineage_id,
                             LockedTimelineSnapshot.source == "PG",
                         )
                     )).scalar_one_or_none()
@@ -4462,7 +4470,7 @@ async def _today_advisory_for_user(
                     qa_snap = (await db.execute(
                         select(LockedTimelineSnapshot).where(
                             LockedTimelineSnapshot.subscription_id == sub.id,
-                            LockedTimelineSnapshot.timeline_id == qa_tl.id,
+                            LockedTimelineSnapshot.lineage_id == qa_tl.lineage_id,
                             LockedTimelineSnapshot.source == "QA",
                         )
                     )).scalar_one_or_none()

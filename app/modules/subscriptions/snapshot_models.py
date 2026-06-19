@@ -35,7 +35,15 @@ class LockedTimelineSnapshot(Base):
     # UCAT unification, 2026-05-16); `source` records which pipe
     # (CCA / PG / SP / QA) produced the snapshot for downstream
     # renderers, even though all rows share the same physical table.
+    #
+    # 2026-06-19 — Uniqueness moved from (sub, timeline_id, source)
+    # to (sub, lineage_id, source). The `timeline_id` field stays
+    # as an audit trail of which physical Timeline row produced the
+    # snapshot's content; lookups go through lineage so the snapshot
+    # survives package republishes that clone the Timeline row with
+    # a new id.
     timeline_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    lineage_id: Mapped[str] = mapped_column(String(36), nullable=False)
     source: Mapped[str] = mapped_column(String(10), nullable=False, default="CCA")
     content: Mapped[dict] = mapped_column(JSONB, nullable=False)
     locked_at: Mapped[datetime] = mapped_column(
@@ -45,6 +53,7 @@ class LockedTimelineSnapshot(Base):
 
     __table_args__ = (
         UniqueConstraint(
-            "subscription_id", "timeline_id", "source", name="uq_lts_sub_tl_source"
+            "subscription_id", "lineage_id", "source",
+            name="uq_lts_sub_lineage_source",
         ),
     )

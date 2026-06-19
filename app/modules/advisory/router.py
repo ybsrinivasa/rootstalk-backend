@@ -6158,6 +6158,12 @@ async def _deep_copy_advisory_content(
             to_value=src_tl.to_value,
             display_order=src_tl.display_order,
             status=src_tl.status,
+            # 2026-06-19 — Propagate lineage_id from source so the
+            # cloned Timeline shares lineage with its ancestor. Snapshots
+            # keyed on (subscription_id, lineage_id, source) survive
+            # the clone, honouring BL-13 step 4: locked timelines keep
+            # their frozen content across publish events.
+            lineage_id=src_tl.lineage_id,
         )
         setattr(new_tl, dst_parent_attr, dst_parent_id)
         db.add(new_tl)
