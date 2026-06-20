@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import selectinload
@@ -2636,6 +2636,7 @@ async def list_practices(
 async def create_practice(
     client_id: str, timeline_id: str,
     request: PracticeCreate,
+    response: Response,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -2697,6 +2698,19 @@ async def create_practice(
 
     await db.commit()
     await db.refresh(practice)
+    # 2026-06-20 — Save-time defence in depth for the volume-formula
+    # validator. Adds an X-RT-Practice-Volume-Warning header when the
+    # composed practice has no matching formula row. The CA portal's
+    # modal calls the GET endpoint for live feedback; this header
+    # backs that up for direct-API users.
+    from app.services.volume_formula_validator import (
+        attach_volume_formula_warning_header,
+    )
+    await attach_volume_formula_warning_header(
+        response, db,
+        timeline_id=timeline_id, l2=request.l2_type,
+        elements=request.elements,
+    )
     return practice
 
 
@@ -2704,6 +2718,7 @@ async def create_practice(
 async def update_practice(
     client_id: str, timeline_id: str, practice_id: str,
     request: PracticeCreate,
+    response: Response,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -2764,6 +2779,15 @@ async def update_practice(
         db.add(Element(practice_id=practice_id, **data))
     await db.commit()
     await db.refresh(practice)
+    # 2026-06-20 — Volume-formula warning header (see create_practice).
+    from app.services.volume_formula_validator import (
+        attach_volume_formula_warning_header,
+    )
+    await attach_volume_formula_warning_header(
+        response, db,
+        timeline_id=timeline_id, l2=request.l2_type,
+        elements=request.elements,
+    )
     return practice
 
 
@@ -5394,6 +5418,35 @@ async def get_practice_taxonomy_endpoint(
     return get_practice_taxonomy()
 
 
+@router.get("/practice-taxonomy/check-volume-formula")
+async def check_volume_formula(
+    timeline_id: str,
+    l2: str,
+    method: str,
+    dosage_unit: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SE-authoring time check: does a `volume_formulas` row exist for the
+    combination the SE is composing? Three-tier verdict — see
+    `app.services.volume_formula_validator` for the rules.
+
+    The CA portal's `PracticeFormModal` fires this on a debounced change
+    whenever both APPLICATION_METHOD and DOSAGE_UNIT elements are populated,
+    and renders the verdict as an inline yellow banner. Save is not blocked
+    — the warning is informational. Mirrors the same 5-key lookup the
+    runtime estimated-volume endpoint runs at order time.
+    """
+    from app.services.volume_formula_validator import (
+        check_volume_formula_combination,
+    )
+    return await check_volume_formula_combination(
+        db,
+        timeline_id=timeline_id, l2=l2,
+        application_method=method, dosage_unit=dosage_unit,
+    )
+
+
 @router.get("/practice-taxonomy/elements/{l2_type}")
 async def get_l2_element_spec(
     l2_type: str,
@@ -5989,30 +6042,48 @@ async def _update_practice_at_global_timeline(
 async def create_global_practice(
     pkg_id: str, tl_id: str,
     request: PracticeCreate,
+    response: Response,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Create a Practice on a Global CCA Timeline. Body shared with
     CHA-PG sibling via `_create_practice_at_global_timeline`."""
     await _assert_sa_or_cm(db, current_user)
-    return await _create_practice_at_global_timeline(
+    practice = await _create_practice_at_global_timeline(
         db, timeline_id=tl_id, request=request,
     )
+    from app.services.volume_formula_validator import (
+        attach_volume_formula_warning_header,
+    )
+    await attach_volume_formula_warning_header(
+        response, db,
+        timeline_id=tl_id, l2=request.l2_type, elements=request.elements,
+    )
+    return practice
 
 
 @router.put("/advisory/global/packages/{pkg_id}/timelines/{tl_id}/practices/{practice_id}", response_model=PracticeOut)
 async def update_global_practice(
     pkg_id: str, tl_id: str, practice_id: str,
     request: PracticeCreate,
+    response: Response,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Atomic Practice update on a Global CCA Timeline. Body shared
     with CHA-PG sibling via `_update_practice_at_global_timeline`."""
     await _assert_sa_or_cm(db, current_user)
-    return await _update_practice_at_global_timeline(
+    practice = await _update_practice_at_global_timeline(
         db, timeline_id=tl_id, practice_id=practice_id, request=request,
     )
+    from app.services.volume_formula_validator import (
+        attach_volume_formula_warning_header,
+    )
+    await attach_volume_formula_warning_header(
+        response, db,
+        timeline_id=tl_id, l2=request.l2_type, elements=request.elements,
+    )
+    return practice
 
 
 async def _delete_practice_at_global_timeline(
@@ -7137,6 +7208,7 @@ async def add_global_pg_practice(
     pg_id: str,
     tl_id: str,
     request: PGPracticeCreate,
+    response: Response,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -7146,9 +7218,17 @@ async def add_global_pg_practice(
     2026-05-16)."""
     await _assert_sa_or_cm(db, current_user)
     await _get_global_pg_timeline(db, pg_id, tl_id)
-    return await _create_practice_at_global_timeline(
+    practice = await _create_practice_at_global_timeline(
         db, timeline_id=tl_id, request=request,
     )
+    from app.services.volume_formula_validator import (
+        attach_volume_formula_warning_header,
+    )
+    await attach_volume_formula_warning_header(
+        response, db,
+        timeline_id=tl_id, l2=request.l2_type, elements=request.elements,
+    )
+    return practice
 
 
 @router.put(
@@ -7158,6 +7238,7 @@ async def add_global_pg_practice(
 async def update_global_pg_practice(
     pg_id: str, tl_id: str, practice_id: str,
     request: PGPracticeCreate,
+    response: Response,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -7165,9 +7246,17 @@ async def update_global_pg_practice(
     the CCA sibling (Batch 39P-e, 2026-05-16)."""
     await _assert_sa_or_cm(db, current_user)
     await _get_global_pg_timeline(db, pg_id, tl_id)
-    return await _update_practice_at_global_timeline(
+    practice = await _update_practice_at_global_timeline(
         db, timeline_id=tl_id, practice_id=practice_id, request=request,
     )
+    from app.services.volume_formula_validator import (
+        attach_volume_formula_warning_header,
+    )
+    await attach_volume_formula_warning_header(
+        response, db,
+        timeline_id=tl_id, l2=request.l2_type, elements=request.elements,
+    )
+    return practice
 
 
 @router.delete(
