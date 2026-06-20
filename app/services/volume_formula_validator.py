@@ -227,8 +227,8 @@ async def attach_volume_formula_warning_header(
     )
     if verdict["verdict"] == VERDICT_OK:
         return
+    # Headers must be latin-1 encodable. The verdict code is ASCII; the
+    # message contains em-dashes / other unicode — only ship the verdict
+    # via header. Direct-API users call /practice-taxonomy/check-volume-formula
+    # if they want the full localised message.
     response.headers["X-RT-Practice-Volume-Warning"] = verdict["verdict"]
-    if verdict.get("message"):
-        # Header values must be ASCII-safe; the message is plain English
-        # currently but if i18n lands later we'll need encoding.
-        response.headers["X-RT-Practice-Volume-Warning-Message"] = verdict["message"]
