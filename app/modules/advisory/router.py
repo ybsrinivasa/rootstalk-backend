@@ -8363,6 +8363,7 @@ async def add_client_pg_practice(
     pg_id: str,
     tl_id: str,
     request: PGPracticeCreate,
+    response: Response,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -8406,6 +8407,15 @@ async def add_client_pg_practice(
         ))
     await db.commit()
     await db.refresh(practice)
+    # 2026-06-20 — Save-time defence-in-depth for the volume-formula
+    # validator. See create_practice for the CCA-side equivalent.
+    from app.services.volume_formula_validator import (
+        attach_volume_formula_warning_header,
+    )
+    await attach_volume_formula_warning_header(
+        response, db,
+        timeline_id=tl_id, l2=request.l2_type, elements=request.elements,
+    )
     return practice
 
 
@@ -8419,6 +8429,7 @@ async def update_client_pg_practice(
     tl_id: str,
     practice_id: str,
     request: PGPracticeCreate,
+    response: Response,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -8480,6 +8491,13 @@ async def update_client_pg_practice(
         ))
     await db.commit()
     await db.refresh(practice)
+    from app.services.volume_formula_validator import (
+        attach_volume_formula_warning_header,
+    )
+    await attach_volume_formula_warning_header(
+        response, db,
+        timeline_id=tl_id, l2=request.l2_type, elements=request.elements,
+    )
     return practice
 
 
@@ -8734,6 +8752,7 @@ async def add_sp_practice(
     sp_id: str,
     tl_id: str,
     request: SPPracticeCreate,
+    response: Response,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -8777,6 +8796,13 @@ async def add_sp_practice(
         ))
     await db.commit()
     await db.refresh(practice)
+    from app.services.volume_formula_validator import (
+        attach_volume_formula_warning_header,
+    )
+    await attach_volume_formula_warning_header(
+        response, db,
+        timeline_id=tl_id, l2=request.l2_type, elements=request.elements,
+    )
     return practice
 
 
@@ -8790,6 +8816,7 @@ async def update_sp_practice(
     tl_id: str,
     practice_id: str,
     request: SPPracticeCreate,
+    response: Response,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -8848,6 +8875,13 @@ async def update_sp_practice(
         ))
     await db.commit()
     await db.refresh(practice)
+    from app.services.volume_formula_validator import (
+        attach_volume_formula_warning_header,
+    )
+    await attach_volume_formula_warning_header(
+        response, db,
+        timeline_id=tl_id, l2=request.l2_type, elements=request.elements,
+    )
     return practice
 
 
@@ -9175,6 +9209,7 @@ async def add_qa_practice(
     sr_id: str,
     tl_id: str,
     request: QAPracticeCreate,
+    response: Response,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -9231,6 +9266,13 @@ async def add_qa_practice(
         ))
     await db.commit()
     await db.refresh(practice)
+    from app.services.volume_formula_validator import (
+        attach_volume_formula_warning_header,
+    )
+    await attach_volume_formula_warning_header(
+        response, db,
+        timeline_id=tl_id, l2=request.l2_type, elements=request.elements,
+    )
 
     elements = (await db.execute(
         select(Element).where(Element.practice_id == practice.id)
@@ -9268,6 +9310,7 @@ async def update_qa_practice(
     tl_id: str,
     practice_id: str,
     request: QAPracticeCreate,
+    response: Response,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -9326,6 +9369,13 @@ async def update_qa_practice(
         ))
     await db.commit()
     await db.refresh(practice)
+    from app.services.volume_formula_validator import (
+        attach_volume_formula_warning_header,
+    )
+    await attach_volume_formula_warning_header(
+        response, db,
+        timeline_id=tl_id, l2=request.l2_type, elements=request.elements,
+    )
 
     elements = (await db.execute(
         select(Element).where(Element.practice_id == practice.id)
