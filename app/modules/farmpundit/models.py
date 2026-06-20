@@ -224,6 +224,13 @@ class Query(Base):
     razorpay_payment_id: Mapped[str] = mapped_column(String(200), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # 2026-06-20 — Set when the farmer first opens their per-sub
+    # queries page on a RESPONDED row. Drives the dashboard-attention
+    # badge: a RESPONDED query with viewed_at NULL still counts;
+    # once read, it drops off the count. Migration: a1baba6ad6fd.
+    viewed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
 
     current_holder: Mapped["FarmPunditProfile"] = relationship("FarmPunditProfile", back_populates="queries_holding",
                                                                  foreign_keys=[current_holder_id])

@@ -4277,11 +4277,11 @@ async def get_dashboard_attention(
         )
     )).scalars().all()
 
-    # 2026-06-20 — RESPONDED queries per sub. Per user direction the
-    # badge counts "expert has answered, farmer hasn't acted." There's
-    # no viewed_at on Query yet, so the badge persists as long as the
-    # status stays RESPONDED — until the farmer takes some action that
-    # moves it forward (or a viewed_at column is added later).
+    # 2026-06-20 — RESPONDED-and-unviewed queries per sub. viewed_at
+    # gets stamped on the per-sub /farmer/queries fetch (the natural
+    # "I'm reading" moment), so the badge clears as soon as the farmer
+    # opens the queries page. Without this filter the badge persisted
+    # forever — the user noted "it loses its charm otherwise."
     sub_ids = [s.id for s in subs]
     responded_by_sub: dict[str, int] = {}
     if sub_ids:
@@ -4291,6 +4291,7 @@ async def get_dashboard_attention(
             .where(
                 PunditQuery.subscription_id.in_(sub_ids),
                 PunditQuery.status == QueryStatus.RESPONDED.value,
+                PunditQuery.viewed_at.is_(None),
             )
             .group_by(PunditQuery.subscription_id)
         )).all()
@@ -4315,14 +4316,16 @@ async def get_dashboard_attention(
         count = 0
         for tl in day.get("timelines") or []:
             for p in tl.get("practices") or []:
+                # 2026-06-20 — Count every unmarked + non-hidden practice
+                # visible today, INCLUDING INPUTs that haven't been
+                # purchased yet. Per user direction (2026-06-20): the
+                # not-yet-purchased input is the most important nudge
+                # for the company — losing it would hide the most
+                # commercially-relevant signal. Tick still only appears
+                # post-purchase on the advisory card; pre-purchase
+                # inputs count toward the badge but can only be cleared
+                # by ordering + completing the purchase flow.
                 if p.get("ack_status") == "ACTIVE":
-                    # Per user direction (2026-06-19): for INPUT
-                    # practices the tick only appears post-purchase.
-                    # An INPUT that's pre-purchase shouldn't count
-                    # toward "unmarked" since the farmer can't act
-                    # on it as a practice yet.
-                    if p.get("l0_type") == "INPUT" and not p.get("is_purchased"):
-                        continue
                     count += 1
         advisory_by_sub[sub_id] = count
 

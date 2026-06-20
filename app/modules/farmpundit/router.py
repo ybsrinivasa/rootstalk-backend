@@ -955,6 +955,22 @@ async def list_farmer_queries(
         select(Query).where(*where).order_by(Query.created_at.desc())
     )
     queries = result.scalars().all()
+
+    # 2026-06-20 — Auto-clear the dashboard badge by stamping viewed_at
+    # on any RESPONDED row that hasn't been viewed yet. Only when the
+    # farmer is on the per-sub queries page (subscription_id given) —
+    # the global /my-queries view shouldn't mark everything read just
+    # because it was rendered.
+    if subscription_id is not None:
+        now = datetime.now(timezone.utc)
+        touched = False
+        for q in queries:
+            if q.status == QueryStatus.RESPONDED.value and q.viewed_at is None:
+                q.viewed_at = now
+                touched = True
+        if touched:
+            await db.commit()
+
     return [{"id": q.id, "title": q.title, "status": q.status, "severity": q.severity,
              "subscription_id": q.subscription_id,
              "expires_at": q.expires_at, "created_at": q.created_at} for q in queries]
