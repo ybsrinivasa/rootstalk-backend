@@ -5547,6 +5547,18 @@ async def cosh_units_for_l2(
     return await list_units_for_l2(db, l2, unit_type)
 
 
+@router.get("/cosh/options/all-units")
+async def cosh_all_units(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Full Units Core, no L2 or unit_type filter. Used by the SA-portal
+    Volume Calculations modal — Brand Unit + Dosage Unit both feed from
+    this single canonical list."""
+    from app.services.cosh_options_view import list_all_units
+    return await list_all_units(db)
+
+
 @router.get("/cosh/options/trade-names")
 async def cosh_trade_names_for_common_name(
     common_name: str,

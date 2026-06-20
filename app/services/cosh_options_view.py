@@ -738,6 +738,13 @@ async def list_planting_materials(db: AsyncSession) -> list[dict]:
     return await _list_all_of_core_type(db, core_type="planting_material")
 
 
+async def list_all_units(db: AsyncSession) -> list[dict]:
+    """Full Units Core, no L2 / unit_type filter. Used by the SA-portal
+    Volume Calculations modal to populate Brand Unit + Dosage Unit
+    dropdowns from a single canonical list (2026-06-20)."""
+    return await _list_all_of_core_type(db, core_type=COSH_UNITS_DATA_CORE)
+
+
 async def list_itks(db: AsyncSession) -> list[dict]:
     return await _list_all_of_core_type(db, core_type="itk_data")
 
