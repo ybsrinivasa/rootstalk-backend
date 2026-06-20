@@ -6229,15 +6229,22 @@ async def get_volume_estimate(
 
     item = await _get_order_item(db, item_id, order_id)
 
-    # ── Farm area ──────────────────────────────────────────────────
-    if farm_area_acres is None:
-        sub = (await db.execute(
-            select(Subscription).where(Subscription.id == (
-                select(Order.subscription_id).where(Order.id == order_id).scalar_subquery()
-            ))
-        )).scalar_one_or_none()
-        if sub:
-            farm_area_acres = float(sub.farm_area_acres) if sub.farm_area_acres else None
+    # ── Subscription + farm area ───────────────────────────────────
+    # 2026-06-20 — Subscription is now loaded unconditionally (was
+    # lazy-loaded only for the farm-area branch) because it's also
+    # needed as the package fallback for CHA-triggered timelines
+    # (DAYS_AFTER_DETECTION), which have `package_id = None` by
+    # design — those practices belong to a diagnosis recommendation,
+    # not to a package's CCA. The sub's own package always has
+    # `crop_cosh_id` set, so the crop-measure lookup downstream can
+    # resolve cleanly even on CHA / SP / QA practices.
+    sub = (await db.execute(
+        select(Subscription).where(Subscription.id == (
+            select(Order.subscription_id).where(Order.id == order_id).scalar_subquery()
+        ))
+    )).scalar_one_or_none()
+    if farm_area_acres is None and sub:
+        farm_area_acres = float(sub.farm_area_acres) if sub.farm_area_acres else None
     if not farm_area_acres:
         return {"estimated_volume": None, "volume_unit": None, "message": "Farm area not set on subscription"}
 
@@ -6254,9 +6261,13 @@ async def get_volume_estimate(
     if timeline is None:
         return {"estimated_volume": None, "volume_unit": None, "message": "Timeline not found for practice"}
 
+    # Try the timeline's own package first (CCA case). If null
+    # (CHA / SP / QA timeline), fall back to the subscription's
+    # package — every active subscription has one.
+    pkg_id = timeline.package_id or (sub.package_id if sub else None)
     package = (await db.execute(
-        select(Package).where(Package.id == timeline.package_id)
-    )).scalar_one_or_none()
+        select(Package).where(Package.id == pkg_id)
+    )).scalar_one_or_none() if pkg_id else None
     if package is None or not package.crop_cosh_id:
         return {"estimated_volume": None, "volume_unit": None, "message": "Package or crop not found"}
 
