@@ -19,8 +19,16 @@ Rules:
   sowing).
 - DBS timeline → end = `crop_start_date - to_value` (pre-sowing
   window — closed even earlier).
-- CALENDAR → not date-anchored; we don't auto-archive. The 14-day
-  order_expiry sweep covers the order-level fallback.
+- CALENDAR timeline → end = the order item's creation-year Jan 1
+  plus `(to_value - 1)` days (DOY-anchored window). Captures the
+  intent that an order placed in year N for a DOY-band targets
+  that year's occurrence; once year N's window has passed, archive
+  even though the same band will re-open next year (perennial
+  re-occurrences create new advisory / order activity, they don't
+  resurrect last year's). Wrap-around windows (from > to) are
+  V1-unsupported — mirror of `order_bundle.py:_timeline_window`.
+  Pre-fix (2026-06-20): CALENDAR was skipped entirely; items
+  lingered until the 14-day order-level expiry.
 - Items in OrderItemStatus.REROUTED / REMOVED are already
   effectively archived; we skip them so we don't waste an event.
 - IST date is the reference, matching the alerts pipeline
@@ -31,7 +39,7 @@ Runs hourly at :50 — far enough from the postpone-expiry sweep at
 """
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy import and_, or_, select
 
@@ -45,19 +53,44 @@ from app.services.order_events import record_event
 logger = logging.getLogger(__name__)
 
 
-def _timeline_end_for(timeline: Timeline, sub_crop_start) -> "datetime | None":
+def _timeline_end_for(
+    timeline: Timeline,
+    sub_crop_start,
+    item: OrderItem,
+    today_ist: "date",
+) -> "date | None":
     """Mirror of `_timeline_end_date` in orders/router.py — duplicated
     here so the task doesn't import from the router module (avoids a
-    Celery-time circular import path)."""
-    if not sub_crop_start:
-        return None
-    start = sub_crop_start.date() if hasattr(sub_crop_start, "date") else sub_crop_start
+    Celery-time circular import path).
+
+    2026-06-20 — CALENDAR branch added. Uses the order item's
+    creation year as the reference year (see module docstring), so
+    a multi-year perennial doesn't trip over the same DOY window
+    re-opening every January.
+    """
     ft = timeline.from_type.value if hasattr(timeline.from_type, "value") else str(timeline.from_type)
-    if ft == "DAS":
-        return start + timedelta(days=int(timeline.to_value or 0))
-    if ft == "DBS":
-        # BL-17: DBS to=0 closes day BEFORE sowing — clamp upper bound.
+    if ft in ("DAS", "DBS"):
+        if not sub_crop_start:
+            return None
+        start = sub_crop_start.date() if hasattr(sub_crop_start, "date") else sub_crop_start
+        if ft == "DAS":
+            return start + timedelta(days=int(timeline.to_value or 0))
+        # DBS — BL-17: DBS to=0 closes day BEFORE sowing → clamp upper bound.
         return start - timedelta(days=max(int(timeline.to_value or 0), 1))
+    if ft == "CALENDAR":
+        if not timeline.to_value:
+            return None
+        # Wrap-around windows (Dec → Jan, from_value > to_value) are
+        # V1-unsupported per order_bundle.py:_timeline_window.
+        if timeline.from_value is not None and int(timeline.from_value) > int(timeline.to_value):
+            return None
+        ref_year = (
+            item.created_at.year
+            if getattr(item, "created_at", None) is not None
+            else today_ist.year
+        )
+        year_start = date(ref_year, 1, 1)
+        return year_start + timedelta(days=int(timeline.to_value) - 1)
     return None
 
 
@@ -89,10 +122,11 @@ async def _archive_expired_timeline_items_with_session(db, now=None) -> int:
 
     archived = 0
     for item, tl, sub in rows:
-        window_end = _timeline_end_for(tl, sub.crop_start_date)
+        window_end = _timeline_end_for(tl, sub.crop_start_date, item, ist_today)
         if window_end is None:
-            # CALENDAR timeline or unset crop_start_date — leave to
-            # order-level expiry.
+            # Reasons: DAS/DBS with no crop_start_date, CALENDAR
+            # wrap-around, CALENDAR with no to_value. Order-level
+            # 14-day expiry remains the fallback for these.
             continue
         if window_end >= ist_today:
             continue  # still in-window
