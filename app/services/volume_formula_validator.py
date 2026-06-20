@@ -51,6 +51,31 @@ async def _resolve_measure_for_timeline(
     return await get_measure(db, pkg.crop_cosh_id)
 
 
+async def _resolve_cosh_to_en(db: AsyncSession, value: str) -> str:
+    """If `value` looks like a 36-char UUID, look it up in CoshCoreItem
+    and return its English translation. Otherwise return as-is.
+
+    The PracticeFormModal stores cosh-driven element values as cosh_ids
+    (UUIDs) — that's what gets sent to this endpoint. The `volume_formulas`
+    table is keyed on the English name ("Dusting", "ml/L"), so we
+    resolve before querying. Mirrors the same resolution the runtime
+    estimated-volume endpoint does.
+    """
+    if not value:
+        return value
+    # Cheap UUID-shape check.
+    if len(value) != 36 or value.count("-") != 4:
+        return value
+    from app.modules.sync.models import CoshCoreItem
+    core = (await db.execute(
+        select(CoshCoreItem).where(CoshCoreItem.cosh_id == value)
+    )).scalar_one_or_none()
+    if not core:
+        return value
+    en = (core.translations or {}).get("en")
+    return en or value
+
+
 async def check_volume_formula_combination(
     db: AsyncSession,
     *,
@@ -65,9 +90,18 @@ async def check_volume_formula_combination(
     UI is expected to wait until both method and dosage_unit are
     populated before calling this. Belt-and-braces: if the SE somehow
     posts a partial form, we don't warn on every keystroke.
+
+    `application_method` and `dosage_unit` may arrive as either English
+    names ("Dusting", "ml/L") or Cosh UUIDs (the modal's element store
+    holds cosh_ids for cosh-driven fields). We normalise to English
+    before querying the formula table.
     """
     if not all([timeline_id, l2, application_method, dosage_unit]):
         return {"verdict": VERDICT_OK, "message": None, "measure": None}
+
+    # Normalise potential cosh_ids → English names.
+    application_method = await _resolve_cosh_to_en(db, application_method)
+    dosage_unit = await _resolve_cosh_to_en(db, dosage_unit)
 
     # Same suffix trim the order-time path does ("ml/L of water" → "ml/L").
     dosage_unit_alt = dosage_unit.replace(" of water", "")
