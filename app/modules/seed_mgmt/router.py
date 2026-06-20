@@ -710,6 +710,27 @@ async def place_seed_order(
     if not variety:
         raise HTTPException(status_code=404, detail="Variety not found")
 
+    # 2026-06-20 — Recipient guard. The POST endpoint defaults the
+    # order status to SENT, so a request without dealer_user_id AND
+    # without facilitator_user_id used to create an orphan SENT seed
+    # with no recipient (surfaces on the farmer's Manage tab as
+    # "Routed to: —"). DRAFT seed orders intentionally have both
+    # recipient IDs null — those land via cancel-and-migrate, not
+    # this endpoint. recipient = dealer XOR facilitator
+    # (memory: feedback_order_recipient_mutual_exclusion.md).
+    dealer_user_id = data.get("dealer_user_id")
+    facilitator_user_id = data.get("facilitator_user_id")
+    if not dealer_user_id and not facilitator_user_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Seed order must specify either dealer_user_id or facilitator_user_id",
+        )
+    if dealer_user_id and facilitator_user_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Seed order cannot specify both dealer_user_id and facilitator_user_id",
+        )
+
     # Brand-lock guard (Point 3a, 2026-06-18). Seed varieties are
     # always brand-locked: a SEED order can only be sent to a dealer
     # who is onboarded by the variety's owning client. Facilitators
@@ -718,7 +739,6 @@ async def place_seed_order(
     # until those endpoints get built; see Point 3c in the audit).
     # Mirrors the pesticide/fertiliser pattern at
     # `orders/router.py:1583-1601`.
-    dealer_user_id = data.get("dealer_user_id")
     if dealer_user_id:
         from app.modules.orders.router import _is_dealer_onboarded_by_client
         if not await _is_dealer_onboarded_by_client(
@@ -747,7 +767,7 @@ async def place_seed_order(
         variety_id=data["variety_id"],
         client_id=variety.client_id,
         dealer_user_id=dealer_user_id,
-        facilitator_user_id=data.get("facilitator_user_id"),
+        facilitator_user_id=facilitator_user_id,
         reference_number=reference_number,
     )
     db.add(order)
