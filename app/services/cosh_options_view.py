@@ -745,6 +745,14 @@ async def list_all_units(db: AsyncSession) -> list[dict]:
     return await _list_all_of_core_type(db, core_type=COSH_UNITS_DATA_CORE)
 
 
+async def list_all_application_methods(db: AsyncSession) -> list[dict]:
+    """Full Application Methods Core, no L2 filter. Used by the SA-portal
+    Volume Calculations page to flag legacy rows whose application_method
+    string no longer matches any Cosh-known method (2026-06-20)."""
+    from app.services.cosh_constants import COSH_APPLICATION_METHODS_CORE
+    return await _list_all_of_core_type(db, core_type=COSH_APPLICATION_METHODS_CORE)
+
+
 async def list_itks(db: AsyncSession) -> list[dict]:
     return await _list_all_of_core_type(db, core_type="itk_data")
 

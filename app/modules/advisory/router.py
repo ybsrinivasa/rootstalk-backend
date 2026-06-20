@@ -5559,6 +5559,18 @@ async def cosh_all_units(
     return await list_all_units(db)
 
 
+@router.get("/cosh/options/all-application-methods")
+async def cosh_all_application_methods(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Full Application Methods Core, no L2 filter. Used by the SA-portal
+    Volume Calculations page to flag rows whose stored method string is
+    no longer Cosh-known (legacy detection, 2026-06-20)."""
+    from app.services.cosh_options_view import list_all_application_methods
+    return await list_all_application_methods(db)
+
+
 @router.get("/cosh/options/trade-names")
 async def cosh_trade_names_for_common_name(
     common_name: str,
