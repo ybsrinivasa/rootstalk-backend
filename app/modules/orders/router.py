@@ -2986,6 +2986,7 @@ async def select_option(
 
     # TODO(FCM): when all options in a Part end up NOT_AVAILABLE, push notification
     # to farmer that this Part of the relation could not be fulfilled.
+    await _update_order_status(db, order_id)
     await db.commit()
     return {"part_index": part_index, "selected_option": option_index, **affected}
 
@@ -3122,6 +3123,7 @@ async def mark_option_not_available(
 
     # TODO(FCM): if this closes the last open Option in the Part, push notification
     # to farmer that this Part of the relation could not be fulfilled.
+    await _update_order_status(db, order_id)
     await db.commit()
     return {"part_index": part_index, "option_index": option_index, "not_available": affected}
 
@@ -3312,6 +3314,7 @@ async def mark_item_unavailable(
         order_id=order_id, order_item_id=item.id,
         prev_status=prev, new_status=OrderItemStatus.NOT_AVAILABLE.value,
     )
+    await _update_order_status(db, order_id)
     await db.commit()
     return {"item_id": item_id, "status": item.status}
 
@@ -8362,13 +8365,28 @@ async def _get_order_item(db: AsyncSession, item_id: str, order_id: str) -> Orde
     return item
 
 
+_ORDER_ITEM_ACTIVE_STATUSES = {
+    OrderItemStatus.PENDING,
+    OrderItemStatus.AVAILABLE,
+    OrderItemStatus.POSTPONED,
+    OrderItemStatus.SENT_FOR_APPROVAL,
+}
+
+
 async def _update_order_status(db: AsyncSession, order_id: str):
     result = await db.execute(select(OrderItem).where(OrderItem.order_id == order_id))
     items = result.scalars().all()
     approval_items = [i for i in items if i.status in [OrderItemStatus.SENT_FOR_APPROVAL, OrderItemStatus.APPROVED]]
     approved = [i for i in items if i.status == OrderItemStatus.APPROVED]
+    active = [i for i in items if i.status in _ORDER_ITEM_ACTIVE_STATUSES]
     order = (await db.execute(select(Order).where(Order.id == order_id))).scalar_one()
     if len(approved) == len(approval_items) and len(approved) > 0:
         order.status = OrderStatus.COMPLETED
     elif len(approved) > 0:
         order.status = OrderStatus.PARTIALLY_APPROVED
+    elif items and not active:
+        # Every item is in a terminal-non-approved state (NOT_AVAILABLE,
+        # REROUTED, REMOVED, REJECTED, NOT_NEEDED, SKIPPED). Nothing for
+        # the farmer to approve, nothing to pack. Move the order off the
+        # Pending feed silently.
+        order.status = OrderStatus.COMPLETED
