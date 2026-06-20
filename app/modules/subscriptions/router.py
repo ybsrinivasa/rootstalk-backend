@@ -4254,13 +4254,18 @@ async def get_dashboard_attention(
       - orders_pickup_ready: PackingList.shared, not yet received.
       - seeds_*: equivalents on SeedOrderFull (SENT_FOR_APPROVAL,
         NOT_AVAILABLE, READY_FOR_PICKUP).
-      - queries_responded: Query.status = RESPONDED, unread.
-      - payments_pending: PaymentRequest.status = PENDING.
+      - queries_responded: Query.status = RESPONDED. Persists while
+        status is RESPONDED — no viewed_at on Query yet.
+
+    Subscription payment-pending (WAITLISTED tile flow on /home) is
+    handled by its own first-class surface on the Main dashboard;
+    intentionally not counted in this aggregator.
 
     Hero-strip + per-tile badge sources. PWA computes its own total
     (sum of buckets) so we don't impose a tile model from here.
     """
     from app.modules.advisory.models import Practice
+    from app.modules.farmpundit.models import Query as PunditQuery, QueryStatus
     from app.modules.orders.models import Order, OrderItem, OrderItemStatus, PackingList
     from app.modules.seed_mgmt.models import SeedOrderFull, SeedOrderStatus
     from app.modules.subscriptions.models import Subscription, SubscriptionStatus
@@ -4271,6 +4276,26 @@ async def get_dashboard_attention(
             Subscription.status == SubscriptionStatus.ACTIVE,
         )
     )).scalars().all()
+
+    # 2026-06-20 — RESPONDED queries per sub. Per user direction the
+    # badge counts "expert has answered, farmer hasn't acted." There's
+    # no viewed_at on Query yet, so the badge persists as long as the
+    # status stays RESPONDED — until the farmer takes some action that
+    # moves it forward (or a viewed_at column is added later).
+    sub_ids = [s.id for s in subs]
+    responded_by_sub: dict[str, int] = {}
+    if sub_ids:
+        from sqlalchemy import func as sa_func
+        rows = (await db.execute(
+            select(PunditQuery.subscription_id, sa_func.count())
+            .where(
+                PunditQuery.subscription_id.in_(sub_ids),
+                PunditQuery.status == QueryStatus.RESPONDED.value,
+            )
+            .group_by(PunditQuery.subscription_id)
+        )).all()
+        for sid, n in rows:
+            responded_by_sub[sid] = n
 
     by_sub: dict[str, dict] = {}
     by_company: dict[str, dict] = {}
@@ -4312,8 +4337,8 @@ async def get_dashboard_attention(
             "seeds_awaiting_approval": 0,
             "seeds_returned": 0,
             "seeds_pickup_ready": 0,
-            "queries_responded": 0,
-            "payments_pending": 0,
+            # 2026-06-20 — RESPONDED-only count per user direction.
+            "queries_responded": responded_by_sub.get(sub.id, 0),
         }
 
         # Regular orders' attention items.
@@ -4377,7 +4402,6 @@ async def get_dashboard_attention(
             + bucket["seeds_returned"]
             + bucket["seeds_pickup_ready"]
             + bucket["queries_responded"]
-            + bucket["payments_pending"]
         )
         by_sub[sub.id] = bucket
         cid = sub.client_id
