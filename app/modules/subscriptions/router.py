@@ -4269,6 +4269,7 @@ async def get_dashboard_attention(
     from app.modules.orders.models import Order, OrderItem, OrderItemStatus, PackingList
     from app.modules.seed_mgmt.models import SeedOrderFull, SeedOrderStatus
     from app.modules.subscriptions.models import Subscription, SubscriptionStatus
+    from datetime import date as _date_cls
 
     subs = (await db.execute(
         select(Subscription).where(
@@ -4276,6 +4277,8 @@ async def get_dashboard_attention(
             Subscription.status == SubscriptionStatus.ACTIVE,
         )
     )).scalars().all()
+
+    today_date = _date_cls.today()
 
     # 2026-06-20 — RESPONDED-and-unviewed queries per sub. viewed_at
     # gets stamped on the per-sub /farmer/queries fetch (the natural
@@ -4309,13 +4312,27 @@ async def get_dashboard_attention(
         lang=current_user.language_code or "en",
     )
     advisory_by_sub: dict[str, int] = {}
+    # 2026-06-20 — Per-sub urgency tier derived from the timelines
+    # the farmer is actually seeing today.
+    #   RED    — at least one timeline with ≥1 ACTIVE practice ends
+    #            today (to_date == today). Last chance to act.
+    #   YELLOW — penultimate day (to_date == today + 1).
+    #   null   — neither.
+    # The advisory card-window is the natural source. Orders / seeds
+    # use it secondarily through the per-sub rollup below.
+    tomorrow = today_date + timedelta(days=1)
+    urgency_by_sub: dict[str, str] = {}
     for day in advisory:
         sub_id = day.get("subscription_id")
         if not sub_id:
             continue
         count = 0
+        has_red = False
+        has_yellow = False
         for tl in day.get("timelines") or []:
-            for p in tl.get("practices") or []:
+            tl_practices = tl.get("practices") or []
+            tl_has_active = False
+            for p in tl_practices:
                 # 2026-06-20 — Count every unmarked + non-hidden practice
                 # visible today, INCLUDING INPUTs that haven't been
                 # purchased yet. Per user direction (2026-06-20): the
@@ -4327,7 +4344,25 @@ async def get_dashboard_attention(
                 # by ordering + completing the purchase flow.
                 if p.get("ack_status") == "ACTIVE":
                     count += 1
+                    tl_has_active = True
+            if not tl_has_active:
+                continue
+            tl_to_str = tl.get("to_date")
+            if not tl_to_str:
+                continue
+            try:
+                tl_to = date.fromisoformat(tl_to_str)
+            except (TypeError, ValueError):
+                continue
+            if tl_to == today_date:
+                has_red = True
+            elif tl_to == tomorrow:
+                has_yellow = True
         advisory_by_sub[sub_id] = count
+        if has_red:
+            urgency_by_sub[sub_id] = "RED"
+        elif has_yellow:
+            urgency_by_sub[sub_id] = "YELLOW"
 
     for sub in subs:
         bucket = {
@@ -4342,6 +4377,12 @@ async def get_dashboard_attention(
             "seeds_pickup_ready": 0,
             # 2026-06-20 — RESPONDED-only count per user direction.
             "queries_responded": responded_by_sub.get(sub.id, 0),
+            # 2026-06-20 — Time-sensitive urgency tier for the badge.
+            # RED  = last day to act (timeline.to_date == today).
+            # YELLOW = penultimate day (timeline.to_date == today + 1).
+            # null = no urgency. Sourced from advisory windows for now;
+            # extending to orders/seeds expiry would happen here too.
+            "urgency": urgency_by_sub.get(sub.id),
         }
 
         # Regular orders' attention items.
@@ -4412,9 +4453,17 @@ async def get_dashboard_attention(
         cid = sub.client_id
         co = by_company.setdefault(cid, {
             "client_id": cid, "total": 0, "subscription_ids": [],
+            "urgency": None,
         })
         co["total"] += bucket["total"]
         co["subscription_ids"].append(sub.id)
+        # 2026-06-20 — Bubble highest urgency from subs up to company.
+        # RED > YELLOW > null. Sticky in that order.
+        sub_urgency = bucket["urgency"]
+        if sub_urgency == "RED":
+            co["urgency"] = "RED"
+        elif sub_urgency == "YELLOW" and co["urgency"] != "RED":
+            co["urgency"] = "YELLOW"
 
     grand_total = sum(b["total"] for b in by_sub.values())
     return {
