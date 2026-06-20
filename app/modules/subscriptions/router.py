@@ -4365,15 +4365,17 @@ async def get_dashboard_attention(
                 bucket["orders_returned"] += sum(
                     1 for i in items if i.status == OrderItemStatus.NOT_AVAILABLE
                 )
-            # Pickup ready = packing list shared + nothing received yet
-            # + at least one APPROVED item present.
+            # Pickup ready = packing list shared with the farmer +
+            # nothing received yet + at least one APPROVED item present
+            # + dealer hasn't voluntarily removed it from the pill.
             pl = (await db.execute(
                 select(PackingList).where(PackingList.order_id == o.id)
             )).scalar_one_or_none()
             if (
                 pl is not None
-                and pl.shared_at is not None
+                and pl.first_shared_at is not None
                 and pl.farmer_received_at is None
+                and pl.dealer_removed_at is None
                 and any(i.status == OrderItemStatus.APPROVED for i in items)
             ):
                 bucket["orders_pickup_ready"] += 1
