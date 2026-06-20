@@ -3570,22 +3570,41 @@ async def _generate_order_reference(db: AsyncSession) -> str:
     its 6-digit suffix, return prefix + (suffix + 1). Mirrors the
     BL-15 subscription-reference pattern.
 
+    2026-06-20 — Bug fix: pre-fix this helper only scanned
+    `Order.reference_number`, completely missing
+    `SeedOrderFull.reference_number`. Regular orders and seed orders
+    share the SAME RT-YY-NNNNNN namespace (per the 2026-06-19 seed
+    order ID parity work), so a regular-order POST could land on a
+    sequence number a seed had already taken. User saw the cross-
+    table collision as one dealer card grouping 5 unrelated lineages
+    under "RT-26-000097" with mixed sub-order statuses + a wrong
+    "Seed/Pesticide" badge depending on which table the head row
+    came from. Now scans both tables and takes the max.
+
     Concurrency note: under concurrent order creation in the same
     year, two transactions may compute the same next number and one
     will fail at commit. Caller retries are out of scope for V1 — the
     rate is low enough that a 500 + farmer retry is acceptable. V2
     will tighten via SELECT FOR UPDATE on a counter row.
     """
+    from app.modules.seed_mgmt.models import SeedOrderFull
     year = two_digit_year()
     prefix = reference_prefix(_ORDER_REFERENCE_PREFIX, year)
-    last = (await db.execute(
+    last_order = (await db.execute(
         select(Order.reference_number)
         .where(Order.reference_number.like(f"{prefix}%"))
         .order_by(Order.reference_number.desc())
         .limit(1)
     )).scalar_one_or_none()
-    if last:
-        prev_seq = parse_sequence(last)
+    last_seed = (await db.execute(
+        select(SeedOrderFull.reference_number)
+        .where(SeedOrderFull.reference_number.like(f"{prefix}%"))
+        .order_by(SeedOrderFull.reference_number.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+    candidates = [r for r in (last_order, last_seed) if r]
+    if candidates:
+        prev_seq = max(parse_sequence(r) for r in candidates)
         next_seq = prev_seq + 1 if prev_seq >= 0 else 1
     else:
         next_seq = 1
