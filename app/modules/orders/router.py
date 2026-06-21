@@ -3792,6 +3792,21 @@ async def list_facilitator_orders(
                 if name:
                     crop_name_by_cosh_id[cid] = name
 
+    # 2026-06-21 — Company name per client_id so the facilitator card
+    # can identify the order by farmer + crop + company (parity with
+    # dealer card; matches the BL-tier user-facing identifier rule —
+    # see `feedback_se_internal_labels_hidden.md`).
+    client_ids = {o.client_id for o in orders if o.client_id}
+    client_name_by_id: dict[str, str] = {}
+    if client_ids:
+        from app.modules.clients.models import Client
+        clrows = (await db.execute(
+            select(Client.id, Client.display_name, Client.short_name)
+            .where(Client.id.in_(client_ids))
+        )).all()
+        for cid, dname, sname in clrows:
+            client_name_by_id[cid] = dname or sname or ""
+
     # Packing rows for the Pickup / Completed pill membership.
     order_ids = [o.id for o in orders]
     pl_by_order: dict[str, PackingList] = {}
@@ -3872,6 +3887,9 @@ async def list_facilitator_orders(
             # header (per facilitator card spec).
             "crop_name": crop_name,
             "subscription_id": o.subscription_id,
+            # 2026-06-21 — Company name so the facilitator card can
+            # show farmer + crop + company (parity with dealer card).
+            "client_name": client_name_by_id.get(o.client_id),
             # 2026-06-06 — Packing fields drive the Pickup pill
             # (approved items the facilitator hasn't picked up yet)
             # and the Completed pill (farmer-confirmed receipt).
