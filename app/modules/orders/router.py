@@ -4648,6 +4648,27 @@ async def get_dealer_order(
     farmer_context = await _build_farmer_context(db, order, lang=lang)
     facilitator_context = await _build_facilitator_context(db, order)
 
+    # 2026-06-21 — Packing-state snapshot for the dealer detail
+    # page's post-share status banner. Same fields the list endpoint
+    # already ships; we resolve them here too so the detail page can
+    # render "Awaiting farmer pickup" / "Picked up by Facilitator …"
+    # / "Received by farmer …" without a second round-trip.
+    pl_row = (await db.execute(
+        select(PackingList).where(PackingList.order_id == order.id)
+    )).scalar_one_or_none()
+    pkg_picked_up_role: str | None = None
+    pkg_picked_up_name: str | None = None
+    if pl_row and pl_row.picked_up_at and pl_row.picked_up_by_user_id:
+        if pl_row.picked_up_by_user_id == order.facilitator_user_id:
+            pkg_picked_up_role = "FACILITATOR"
+            fac_user = (await db.execute(
+                select(User).where(User.id == pl_row.picked_up_by_user_id)
+            )).scalar_one_or_none()
+            if fac_user:
+                pkg_picked_up_name = fac_user.name
+        else:
+            pkg_picked_up_role = "FARMER"
+
     return {
         "id": order.id, "status": order.status,
         "reference_number": order.reference_number,
@@ -4678,6 +4699,19 @@ async def get_dealer_order(
         # line so the dealer enters Given Volume once. Per-timeline
         # quantities still go to the farmer untouched.
         "consolidated_brands": _consolidate_brands_across_items(items),
+        # 2026-06-21 — Packing-state for the post-share status banner.
+        "packing_code": pl_row.packing_code if pl_row else None,
+        "packing_list_shared_at": (
+            pl_row.first_shared_at.isoformat() if pl_row and pl_row.first_shared_at else None
+        ),
+        "packing_picked_up_at": (
+            pl_row.picked_up_at.isoformat() if pl_row and pl_row.picked_up_at else None
+        ),
+        "packing_picked_up_by_role": pkg_picked_up_role,
+        "packing_picked_up_by_name": pkg_picked_up_name,
+        "packing_farmer_received_at": (
+            pl_row.farmer_received_at.isoformat() if pl_row and pl_row.farmer_received_at else None
+        ),
     }
 
 
