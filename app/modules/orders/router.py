@@ -499,7 +499,18 @@ async def list_farmer_orders(
         cd = compute_count_display(structures, len(standalone_items))
 
         meta = meta_by_sub.get(o.subscription_id)
-        rcp = recipients.get(o.dealer_user_id) or recipients.get(o.facilitator_user_id)
+        # 2026-06-21 — Facilitator wins when both are set: a
+        # facilitator-routed order is always "with the facilitator"
+        # from the farmer's perspective, even after the facilitator
+        # has forwarded to a dealer. The dealer is the facilitator's
+        # choice; the farmer doesn't deal with the dealer directly
+        # on that flow. Direct-to-dealer orders still resolve to
+        # the dealer.
+        rcp = (
+            recipients.get(o.facilitator_user_id)
+            if o.facilitator_user_id
+            else recipients.get(o.dealer_user_id)
+        )
         out.append({
             "id": o.id,
             "status": o.status,
@@ -732,7 +743,18 @@ async def list_subscription_orders(
             1 for i in sfa_items_for_o
             if current_round_for_o is None or i.approval_round == current_round_for_o
         )
-        rcp = recipients.get(o.dealer_user_id) or recipients.get(o.facilitator_user_id)
+        # 2026-06-21 — Facilitator wins when both are set: a
+        # facilitator-routed order is always "with the facilitator"
+        # from the farmer's perspective, even after the facilitator
+        # has forwarded to a dealer. The dealer is the facilitator's
+        # choice; the farmer doesn't deal with the dealer directly
+        # on that flow. Direct-to-dealer orders still resolve to
+        # the dealer.
+        rcp = (
+            recipients.get(o.facilitator_user_id)
+            if o.facilitator_user_id
+            else recipients.get(o.dealer_user_id)
+        )
         regular_out.append({
             "kind": "REGULAR",
             "id": o.id,
@@ -805,7 +827,13 @@ async def list_subscription_orders(
         variety = (await db.execute(
             select(SeedVariety).where(SeedVariety.id == so.variety_id)
         )).scalar_one_or_none()
-        rcp = seed_recipients.get(so.dealer_user_id) or seed_recipients.get(so.facilitator_user_id)
+        # 2026-06-21 — Facilitator wins when both are set (parity
+        # with regular orders — see sibling rcp resolution above).
+        rcp = (
+            seed_recipients.get(so.facilitator_user_id)
+            if so.facilitator_user_id
+            else seed_recipients.get(so.dealer_user_id)
+        )
         seed_out.append({
             "kind": "SEED",
             "id": so.id,
