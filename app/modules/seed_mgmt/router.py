@@ -996,23 +996,26 @@ async def cancel_seed_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Farmer cancels a seed order and migrates it to a fresh DRAFT.
+    """Farmer cancels a seed order.
 
-    Orders V2 (2026-05-31) parity: seeds get the same cancel-and-
-    migrate flow as pesticide / fertiliser items. The husk goes
-    CANCELLED + REROUTED; a new DRAFT row inherits the same
-    `lineage_id`, the variety, quantity and unit, and waits for the
-    farmer to pick a new recipient via `/farmer/seed-orders/{id}/send`.
+    2026-06-21 — Release-not-migrate parity with the regular-order
+    cancel path. Cancel is a clean terminal action; status → CANCELLED
+    and that's it. No DRAFT continuation: if the farmer wants to re-
+    order the same variety they go through the seed-advisory pull in
+    their preferred window, the same way they'd raise a fresh
+    pesticide / fertilizer order.
+
+    A seed order is single-variety, so there's no per-item release
+    step to do — the order itself going CANCELLED is the release.
     """
     from app.services.order_events import record_event as _record_event
 
     order = await _get_seed_order(db, order_id, current_user.id, farmer=True)
     # 2026-06-19 — READY_FOR_PICKUP joins the terminal-for-cancel
     # set. Once the farmer has approved the purchase, the seed packet
-    # is committed; cancel-and-migrate would discard the commercial
-    # transaction without an item identity to preserve. Edge-cases
-    # where the dealer can't deliver should be handled outside the
-    # cancel path (admin intervention).
+    # is committed; cancelling here would void the commercial
+    # transaction. Edge-cases where the dealer can't deliver should
+    # be handled outside the cancel path (admin intervention).
     terminal = {
         SeedOrderStatus.CANCELLED, SeedOrderStatus.PURCHASED,
         SeedOrderStatus.REROUTED, SeedOrderStatus.READY_FOR_PICKUP,
@@ -1025,57 +1028,14 @@ async def cancel_seed_order(
 
     prev_status = order.status
 
-    new_draft = SeedOrderFull(
-        subscription_id=order.subscription_id,
-        farmer_user_id=order.farmer_user_id,
-        variety_id=order.variety_id,
-        client_id=order.client_id,
-        dealer_user_id=None,
-        facilitator_user_id=None,
-        unit=order.unit,
-        quantity=order.quantity,
-        total_price=None,  # reset — next dealer prices afresh
-        status=SeedOrderStatus.DRAFT,
-        lineage_id=order.lineage_id,
-        # 2026-06-19 — Same human-readable Order ID across the
-        # cancel-and-migrate lineage.
-        reference_number=order.reference_number,
-    )
-    db.add(new_draft)
-    await db.flush()
-
     await _record_event(
-        db, lineage_id=order.lineage_id,
-        event_type="REROUTED_FROM",
-        actor_user_id=current_user.id, actor_role="FARMER",
-        seed_order_id=order.id,
-        prev_status=prev_status,
-        new_status=SeedOrderStatus.REROUTED.value,
-        metadata={
-            "to_seed_order_id": new_draft.id,
-            "reason": "seed_cancel_migrate",
-        },
-    )
-    await _record_event(
-        db, lineage_id=order.lineage_id,
-        event_type="REROUTED_TO",
-        actor_user_id=current_user.id, actor_role="FARMER",
-        seed_order_id=new_draft.id,
-        prev_status=SeedOrderStatus.REROUTED.value,
-        new_status=SeedOrderStatus.DRAFT.value,
-        metadata={
-            "from_seed_order_id": order.id,
-            "reason": "seed_cancel_migrate",
-        },
-    )
-    await _record_event(
-        db, lineage_id=order.id,  # husk-level event keyed on husk.id
+        db, lineage_id=order.id,
         event_type="CANCELLED_BY_FARMER",
         actor_user_id=current_user.id, actor_role="FARMER",
         seed_order_id=order.id,
         prev_status=prev_status,
         new_status=SeedOrderStatus.CANCELLED.value,
-        metadata={"new_draft_seed_order_id": new_draft.id},
+        metadata={},
     )
 
     order.status = SeedOrderStatus.CANCELLED
@@ -1083,7 +1043,6 @@ async def cancel_seed_order(
     return {
         "id": order_id,
         "status": order.status,
-        "new_draft_seed_order_id": new_draft.id,
     }
 
 
