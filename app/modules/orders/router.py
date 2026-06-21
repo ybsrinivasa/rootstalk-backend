@@ -3875,7 +3875,12 @@ async def list_facilitator_orders(
             # 2026-06-06 — Packing fields drive the Pickup pill
             # (approved items the facilitator hasn't picked up yet)
             # and the Completed pill (farmer-confirmed receipt).
+            # 2026-06-21 — Added packing_list_shared_at so /facilitator/orders
+            # can render a Pickup pill (only shared lists are pickup-ready).
             "packing_code": pl.packing_code if pl else None,
+            "packing_list_shared_at": (
+                pl.first_shared_at.isoformat() if pl and pl.first_shared_at else None
+            ),
             "packing_picked_up_at": (
                 pl.picked_up_at.isoformat() if pl and pl.picked_up_at else None
             ),
