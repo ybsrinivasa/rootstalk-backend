@@ -1121,9 +1121,14 @@ async def discover_crops_and_companies(
     from app.modules.sync.models import CoshCoreItem
 
     # One query gets every (crop, client) pair active in the district.
-    # COMPANY_PAYS clients are excluded — they don't accept direct
-    # farmer subscriptions, so neither their crops nor their tile
-    # should ever appear on this discovery surface.
+    # 2026-06-22 — COMPANY_PAYS clients now SHOW here too, with a
+    # different CTA label on the PWA ("The company should assign
+    # advisories" vs FARMER_PAYS "Farmers can subscribe to
+    # advisories"). User wants the farmer to know which advisory
+    # programmes operate in their district, regardless of whether
+    # they can self-subscribe. The /farmer/discover/crops and
+    # /farmer/discover/companies endpoints (which feed the subscribe
+    # flow) keep the FARMER_PAYS filter.
     pkg_rows = (await db.execute(
         select(Package.crop_cosh_id, Package.client_id)
         .join(PackageLocation, PackageLocation.package_id == Package.id)
@@ -1132,7 +1137,6 @@ async def discover_crops_and_companies(
             Package.status == PackageStatus.ACTIVE,
             PackageLocation.district_cosh_id == district_cosh_id,
             Client.status == ClientStatus.ACTIVE,
-            Client.payment_model == PaymentModel.FARMER_PAYS,
         )
         .distinct()
     )).all()
@@ -1198,6 +1202,17 @@ async def discover_crops_and_companies(
                 "logo_url": c.logo_url,
                 "primary_colour": c.primary_colour,
                 "crop_cosh_ids": sorted(client_to_crops.get(c.id, set())),
+                # 2026-06-22 — payment_model drives the PWA's
+                # subscription-mode label; support_phone + website
+                # drive the inline call + globe buttons. support_phone
+                # falls back to office_phone so we surface SOME
+                # number when only one is set.
+                "payment_model": (
+                    c.payment_model.value
+                    if hasattr(c.payment_model, "value") else c.payment_model
+                ),
+                "support_phone": c.support_phone or c.office_phone,
+                "website": c.website,
             }
             for c in clients_by_id.values()
         ],
