@@ -2025,6 +2025,97 @@ async def lookup_recipient_for_new_order(
     }
 
 
+@router.get("/farmer/orders/{order_id}/lookup-recipient")
+async def lookup_recipient_for_forward(
+    order_id: str,
+    phone: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    lang: str = Depends(get_locale),
+):
+    """Phone-entry lookup for the forward-returned-items flow.
+
+    Same shape as `/farmer/subscriptions/{id}/lookup-recipient` so the
+    PWA reuses `RecipientLookupCard`. Differs in two ways:
+
+    1. Brand-lock is computed from the ORDER's items
+       (`_order_has_locked_brand_items`) — the items being forwarded
+       carry their own practice_ids; the caller doesn't need to pass
+       them.
+    2. Reuses the new-order role precedence (DEALER wins when
+       not has_locked or onboarded; FACILITATOR is permissive
+       passthrough); both roles allowed because the farmer can forward
+       to either.
+    """
+    from app.modules.auth.service import get_user_by_phone
+    from app.modules.clients.models import Client, ClientPromoter
+    from app.services.i18n_cosh import resolve_names_by_cosh_id
+
+    order = await _get_farmer_order(db, order_id, current_user.id)
+    has_locked = await _order_has_locked_brand_items(db, order.id)
+
+    digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+    if len(digits) < 10:
+        return {"found": False, "reason": "phone_not_registered", "phone": phone}
+    normalised = "+91" + digits[-10:]
+    target = await get_user_by_phone(db, normalised)
+    if target is None:
+        return {"found": False, "reason": "phone_not_registered", "phone": normalised}
+
+    if target.id == current_user.id:
+        return {
+            "found": True, "user_id": target.id, "phone": target.phone,
+            "name": target.name, "can_receive": False, "reason": "self",
+        }
+
+    cp_rows = (await db.execute(
+        select(ClientPromoter.promoter_type)
+        .where(
+            ClientPromoter.user_id == target.id,
+            ClientPromoter.promoter_type.in_(("FACILITATOR", "DEALER")),
+            ClientPromoter.status == "ACTIVE",
+        )
+    )).scalars().all()
+    roles_held = set(cp_rows)
+    is_active = bool(cp_rows)
+
+    company = (await db.execute(
+        select(Client).where(Client.id == order.client_id)
+    )).scalar_one_or_none()
+    client_name = (company.display_name or company.short_name) if company else None
+
+    loc_ids = {cid for cid in (target.state_cosh_id, target.district_cosh_id) if cid}
+    loc_names = await resolve_names_by_cosh_id(db, loc_ids, lang) if loc_ids else {}
+
+    base = {
+        "found": True,
+        "user_id": target.id,
+        "phone": target.phone,
+        "name": target.name,
+        "photo_url": target.photo_url,
+        "state_name": loc_names.get(target.state_cosh_id) if target.state_cosh_id else None,
+        "district_name": loc_names.get(target.district_cosh_id) if target.district_cosh_id else None,
+        "is_active": is_active,
+        "client_name": client_name,
+        "has_locked_brand": has_locked,
+    }
+
+    dealer_allowed = False
+    if "DEALER" in roles_held:
+        if not has_locked:
+            dealer_allowed = True
+        elif await _is_dealer_onboarded_by_client(db, target.id, order.client_id):
+            dealer_allowed = True
+
+    if dealer_allowed:
+        return {**base, "role": "DEALER", "can_receive": True, "reason": "ok"}
+    if "FACILITATOR" in roles_held:
+        return {**base, "role": "FACILITATOR", "can_receive": True, "reason": "ok"}
+    if "DEALER" in roles_held:
+        return {**base, "role": "DEALER", "can_receive": False, "reason": "dealer_not_onboarded"}
+    return {**base, "role": None, "can_receive": False, "reason": "not_dealer_or_facilitator"}
+
+
 @router.put("/farmer/orders/{order_id}/items/{item_id}/approve")
 async def approve_order_item(
     order_id: str, item_id: str,
