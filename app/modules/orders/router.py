@@ -3882,6 +3882,25 @@ async def list_facilitator_orders(
             "rejected": sum(1 for i in live_items if i.status == OrderItemStatus.REJECTED),
         }
         pl = pl_by_order.get(o.id)
+        # 2026-06-22 — Inline list of items the facilitator picks up
+        # (only APPROVED items count). User wants brand + qty + price
+        # for cross-check at the dealer's shop. Mirrors the
+        # `packing_items` shape /dealer/orders ships for its Packing
+        # pill, minus the locale-aware brand cache lookup (using the
+        # raw OrderItem.brand_name is fine here — the facilitator
+        # cross-checks the printed label, not a translation).
+        packing_items: list[dict] = []
+        if counts["approved"] > 0:
+            for i in live_items:
+                if i.status != OrderItemStatus.APPROVED:
+                    continue
+                packing_items.append({
+                    "id": i.id,
+                    "brand_name": i.brand_name,
+                    "given_volume": float(i.given_volume) if i.given_volume else None,
+                    "volume_unit": i.volume_unit,
+                    "price": float(i.price) if i.price else None,
+                })
         out.append({
             "id": o.id, "status": o.status,
             # 2026-06-07 — Order ID.
@@ -3933,6 +3952,7 @@ async def list_facilitator_orders(
             "packing_farmer_received_at": (
                 pl.farmer_received_at.isoformat() if pl and pl.farmer_received_at else None
             ),
+            "packing_items": packing_items,
         })
     return out
 
