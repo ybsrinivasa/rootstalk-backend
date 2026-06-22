@@ -1438,6 +1438,7 @@ def _seed_for_facilitator_payload(
     farmer: Optional[User] = None,
     sub: Optional[Subscription] = None,
     client: Optional["Client"] = None,
+    dealer: Optional[User] = None,
 ) -> dict:
     """Variety-blind response shape for the facilitator surface.
 
@@ -1446,10 +1447,16 @@ def _seed_for_facilitator_payload(
     crop name (via crop_cosh_id resolves to a generic Chilli / Tomato
     label), farmer contact info, the client (seed company) name, and
     farm area for context.
+
+    `reference_number` + `dealer_name` were added 2026-06-22 so the
+    seed card can be inlined into /facilitator/orders alongside
+    regular orders, matching the dealer-PWA parity. Both are null when
+    not yet assigned.
     """
     return {
         "id": o.id,
         "status": o.status,
+        "reference_number": o.reference_number,
         "category": "SEED",
         "crop_cosh_id": None,  # set by caller after variety lookup
         "farmer_user_id": o.farmer_user_id,
@@ -1460,6 +1467,7 @@ def _seed_for_facilitator_payload(
         "client_id": o.client_id,
         "client_name": (client.display_name or client.short_name) if client else None,
         "dealer_user_id": o.dealer_user_id,
+        "dealer_name": dealer.name if dealer else None,
         "created_at": o.created_at,
     }
 
@@ -1518,6 +1526,18 @@ async def list_facilitator_seed_orders(
             )).scalars().all()
         }
 
+    # Batch-fetch dealers for orders that have been routed onwards.
+    # The card's Routed pill shows "to <dealer name>" so the facilitator
+    # remembers where the order went.
+    dealer_ids = {o.dealer_user_id for o in orders if o.dealer_user_id}
+    dealers: dict[str, User] = {}
+    if dealer_ids:
+        dealers = {
+            u.id: u for u in (await db.execute(
+                select(User).where(User.id.in_(dealer_ids))
+            )).scalars().all()
+        }
+
     out = []
     for o in orders:
         variety = varieties.get(o.variety_id)
@@ -1526,6 +1546,7 @@ async def list_facilitator_seed_orders(
             farmer=farmers.get(o.farmer_user_id),
             sub=subs.get(o.subscription_id),
             client=clients.get(o.client_id),
+            dealer=dealers.get(o.dealer_user_id) if o.dealer_user_id else None,
         )
         payload["crop_cosh_id"] = variety.crop_cosh_id if variety else None
         out.append(payload)
