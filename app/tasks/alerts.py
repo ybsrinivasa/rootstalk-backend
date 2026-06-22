@@ -96,6 +96,33 @@ async def _alert_sent_today(db, subscription_id: str, alert_type: AlertType, tod
     return row is not None
 
 
+async def _supersede_prior_sent(
+    db, subscription_id: str, alert_type: AlertType,
+) -> int:
+    """Before firing today's alert for this (subscription, type),
+    flip any earlier SENT rows to READ so the recipient sees exactly
+    one pending alert per subscription — not one per day the alert
+    has been firing.
+
+    Pre-2026-06-22 the daily task could pile up N rows on the same
+    subscription if the input window stayed open and the farmer hadn't
+    placed every order yet (user report: dealer saw 5 INPUT alerts on
+    DE-26-000002 across 19–22 Jun, all for the same Chilli sub).
+    `clear_input_alerts_if_no_due_remaining` only clears when *all*
+    due practices are ordered; this helper handles the in-between
+    case where the alert is still relevant but yesterday's row is
+    redundant. Audit trail preserved as READ. Returns the rowcount."""
+    from sqlalchemy import update as sa_update
+    res = await db.execute(
+        sa_update(Alert).where(
+            Alert.subscription_id == subscription_id,
+            Alert.alert_type == alert_type,
+            Alert.status == AlertStatus.SENT,
+        ).values(status=AlertStatus.READ)
+    )
+    return res.rowcount or 0
+
+
 async def _load_configured_recipients(db, subscription_id: str) -> list[ConfiguredRecipient]:
     rows = (await db.execute(
         select(AlertRecipient).where(
@@ -293,6 +320,8 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
     # ── START_DATE alert ──────────────────────────────────────────────
     sd_sent_today = await _alert_sent_today(db, sub.id, AlertType.START_DATE, today)
     if not is_perennial and should_send_start_date_alert(sub_view, sent_today=sd_sent_today):
+        # Newest-only: supersede yesterday's SENT row before writing today's.
+        await _supersede_prior_sent(db, sub.id, AlertType.START_DATE)
         for recipient in recipients:
             user = user_by_id.get(recipient.user_id)
             if not user:
@@ -350,6 +379,11 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
         sub_view, due_practice_ids, ordered_pids, sent_today=in_sent_today,
     ):
         return
+
+    # Newest-only: supersede prior SENT INPUT rows on this sub so the
+    # recipient sees one pending alert per subscription, not one per
+    # firing day. See _supersede_prior_sent for context.
+    await _supersede_prior_sent(db, sub.id, AlertType.INPUT)
 
     for recipient in recipients:
         user = user_by_id.get(recipient.user_id)
