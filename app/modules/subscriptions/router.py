@@ -5049,10 +5049,22 @@ async def _today_advisory_for_user(
                 # 2026-06-06 — Packing receipt state. The PWA reads
                 # farmer_received_at to decide whether to show the
                 # "📦 Tap to confirm pickup" hint on this practice row.
+                # 2026-06-22 — Tightened: only propagate
+                # farmer_received_at when THIS item was actually on the
+                # packing list (status APPROVED). PackingList.farmer_received_at
+                # refers to the items on the list — siblings that were
+                # POSTPONED / PENDING / NOT_AVAILABLE never made it
+                # onto the list and so weren't received. Pre-fix, a
+                # POSTPONED item on an order whose APPROVED siblings
+                # were picked up rendered as "received" → "I've done
+                # this" tick appeared on practices the farmer never
+                # actually received (user report 2026-06-22 on
+                # DE-26-000002 Microbial pesticide).
                 "packing_code": pl.packing_code if pl else None,
                 "farmer_received_at": (
                     pl.farmer_received_at.isoformat()
-                    if pl and pl.farmer_received_at else None
+                    if pl and pl.farmer_received_at and status_str == "APPROVED"
+                    else None
                 ),
             }
 
