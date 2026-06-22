@@ -54,7 +54,10 @@ _TRANSITIONS: dict[tuple[str, str], frozenset[str]] = {
     ("WAITLISTED", "CANCELLED"):  frozenset({FARMER}),
 
     # Voluntary unsubscribe (SELF subs only — see is_self_unsubscribable).
-    ("ACTIVE", "CANCELLED"):      frozenset({FARMER}),
+    # 2026-06-22 — split from CANCELLED into its own terminal so the
+    # My Subscriptions history page can group them separately.
+    ("ACTIVE", "UNSUBSCRIBED"):     frozenset({FARMER}),
+    ("WAITLISTED", "UNSUBSCRIBED"): frozenset({FARMER}),
 
     # End-of-cycle terminal — currently unwired (no live writer); on
     # the table so the future sweep can be added without re-opening it.

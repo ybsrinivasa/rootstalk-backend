@@ -3939,6 +3939,14 @@ async def my_subscriptions(
             # response; surfaced per-row so the PWA doesn't need a
             # separate /profile fetch.
             "farmer_district_name": farmer_district_name,
+            # 2026-06-22 — Lifecycle end timestamps for the My
+            # Subscriptions page's Unsubscribed + Completed sections.
+            # `lapsed_at` is set by the end-of-cycle sweep (LAPSED);
+            # for UNSUBSCRIBED rows we read `updated_at` (the status
+            # flip is the row's last touch). ACTIVE rows leave both
+            # the way they already were.
+            "lapsed_at": s.lapsed_at,
+            "updated_at": s.updated_at,
         })
     return out
 
@@ -5319,7 +5327,13 @@ async def unsubscribe(
         )
 
     was_waitlisted = sub.status == SubscriptionStatus.WAITLISTED
-    sub.status = SubscriptionStatus.CANCELLED
+    # 2026-06-22 — voluntary farmer unsubscribe now flips to the
+    # distinct UNSUBSCRIBED terminal (was CANCELLED). CANCELLED stays
+    # exclusively for promoter-rejected assignments + SA-side cancels,
+    # which lets the My Subscriptions page group the three lifecycle
+    # buckets (Active / Unsubscribed / Completed) cleanly without a
+    # subscription_type cross-check.
+    sub.status = SubscriptionStatus.UNSUBSCRIBED
     await db.commit()
     return {
         "detail": ("Pending payment cancelled" if was_waitlisted else "Unsubscribed successfully"),

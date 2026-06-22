@@ -19,6 +19,11 @@ class SubscriptionStatus(str, enum.Enum):
     LAPSED = "LAPSED"
     CANCELLED = "CANCELLED"
     SUSPENDED = "SUSPENDED"
+    # 2026-06-22 — Voluntary unsubscribe by the farmer (vs CANCELLED
+    # which now exclusively means promoter-rejected assignment / SA
+    # cancel). Distinct so the My Subscriptions page can group them
+    # in the right history bucket.
+    UNSUBSCRIBED = "UNSUBSCRIBED"
 
 
 class SubscriptionType(str, enum.Enum):
