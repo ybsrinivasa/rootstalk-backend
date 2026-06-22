@@ -1974,9 +1974,11 @@ async def my_incoming_alerts(
     disappears from the promoter's list, matching the spec rule
     "alerts vanish once the task is over from the farmer's end").
 
-    Decorated with the farmer's name + phone for tap-to-call, the
-    crop's English name from Cosh, and the alert type label
-    (START_DATE / INPUT) so the PWA can render a typed chip.
+    Decorated with farmer identity + photo, the subscription's
+    reference number, the company display name, the crop's English
+    name from Cosh, plot discriminators (measure, acres / plants,
+    start date / planting year), and the alert type so the PWA
+    can render a rich card for each alert.
 
     No package_name in the response — the promoter doesn't need it.
     """
@@ -1984,6 +1986,8 @@ async def my_incoming_alerts(
         Alert, AlertStatus, AlertType,
     )
     from app.modules.sync.models import CoshCoreItem
+    from app.modules.clients.models import Client
+    from app.services.cosh_crop_view import get_measure_for_biological_name
 
     rows = (await db.execute(
         select(Alert, Subscription, Package, User)
@@ -2016,8 +2020,28 @@ async def my_incoming_alerts(
             else:
                 crop_name_by_id[r.cosh_id] = None
 
+    # Per-crop AREA_WISE / PLANT_WISE measure from Cosh — drives the
+    # acres-vs-plants discriminator on the card. Same single-source
+    # helper used by /farmer/my-subscriptions.
+    measure_by_crop: dict[str, str] = {}
+    for cid in crop_ids:
+        measure = await get_measure_for_biological_name(db, cid)
+        measure_by_crop[cid] = measure or "AREA_WISE"
+
+    # Resolve client display name in one batch — so the alert card
+    # can say "RT-26-000123 · ABC Agritech" without a per-row hop.
+    client_ids = {sub.client_id for _, sub, _, _ in rows}
+    client_display_by_id: dict[str, str | None] = {}
+    if client_ids:
+        for cid, display, full in (await db.execute(
+            select(Client.id, Client.display_name, Client.full_name)
+            .where(Client.id.in_(client_ids))
+        )).all():
+            client_display_by_id[cid] = display or full
+
     out = []
     for alert, sub, pkg, farmer in rows:
+        measure = measure_by_crop.get(pkg.crop_cosh_id, "AREA_WISE") if pkg.crop_cosh_id else "AREA_WISE"
         out.append({
             "alert_id": alert.id,
             "alert_type": (
@@ -2027,12 +2051,26 @@ async def my_incoming_alerts(
             ),
             "sent_at": alert.sent_at,
             "subscription_id": sub.id,
+            "subscription_reference_number": sub.reference_number,
             "client_id": sub.client_id,
+            "client_display_name": client_display_by_id.get(sub.client_id),
             "farmer_user_id": farmer.id,
             "farmer_name": farmer.name,
             "farmer_phone": farmer.phone,
+            "farmer_photo_url": farmer.photo_url,
             "crop_cosh_id": pkg.crop_cosh_id,
             "crop_name": crop_name_by_id.get(pkg.crop_cosh_id) if pkg.crop_cosh_id else None,
+            "crop_measure": measure,
+            # Plot discriminators. The PWA renders only the segments
+            # whose backing field is set; for START_DATE alerts the
+            # start_date / planting_year are intentionally suppressed
+            # on the card (showing them would mock the very alert
+            # asking the farmer to set them).
+            "crop_start_date": sub.crop_start_date,
+            "farm_area_acres": float(sub.farm_area_acres) if sub.farm_area_acres is not None else None,
+            "area_unit": sub.area_unit,
+            "number_of_plants": sub.number_of_plants,
+            "planting_year": sub.planting_year,
         })
     return out
 
