@@ -7087,7 +7087,7 @@ async def dealer_promoted_farmers(
     current_user: User = Depends(get_current_user),
 ):
     await _assert_active_dealer(db, current_user.id)
-    return await _promoted_farmers(db, current_user.id)
+    return await _promoted_farmers(db, current_user.id, current_user.language_code or "en")
 
 
 @router.get("/facilitator/promoted-farmers")
@@ -7096,7 +7096,7 @@ async def facilitator_promoted_farmers(
     current_user: User = Depends(get_current_user),
 ):
     await _assert_active_facilitator(db, current_user.id)
-    return await _promoted_farmers(db, current_user.id)
+    return await _promoted_farmers(db, current_user.id, current_user.language_code or "en")
 
 
 @router.get("/facilitator/promoter-invitations")
@@ -7614,7 +7614,12 @@ async def facilitator_onboarding_clients(
     ]
 
 
-async def _promoted_farmers(db, promoter_user_id: str):
+async def _promoted_farmers(db, promoter_user_id: str, lang: str = "en"):
+    """List of farmers the promoter (dealer or facilitator) actively
+    serves. 2026-06-23 — enriched for the card redesign: farmer photo
+    so the promoter recognises who they're calling, crop name resolved
+    from the package's crop_cosh_id, and area/plant context so the
+    promoter has the farmer's growing scale on hand."""
     result = await db.execute(
         select(PromoterAssignment).where(
             PromoterAssignment.promoter_user_id == promoter_user_id,
@@ -7622,22 +7627,72 @@ async def _promoted_farmers(db, promoter_user_id: str):
         )
     )
     assignments = result.scalars().all()
+    if not assignments:
+        return []
+
+    sub_ids = [a.subscription_id for a in assignments]
+    sub_rows = (await db.execute(
+        select(Subscription).where(Subscription.id.in_(sub_ids))
+    )).scalars().all()
+    sub_by_id = {s.id: s for s in sub_rows}
+
+    farmer_ids = {s.farmer_user_id for s in sub_rows}
+    farmer_rows = (await db.execute(
+        select(User).where(User.id.in_(farmer_ids))
+    )).scalars().all() if farmer_ids else []
+    farmer_by_id = {u.id: u for u in farmer_rows}
+
+    pkg_ids = {s.package_id for s in sub_rows if s.package_id}
+    pkg_by_id: dict[str, "Package"] = {}
+    if pkg_ids:
+        prows = (await db.execute(
+            select(Package).where(Package.id.in_(pkg_ids))
+        )).scalars().all()
+        pkg_by_id = {p.id: p for p in prows}
+
+    crop_cosh_ids = {p.crop_cosh_id for p in pkg_by_id.values() if p.crop_cosh_id}
+    crop_name_by_cosh_id: dict[str, str] = {}
+    if crop_cosh_ids:
+        from app.modules.sync.models import CoshCoreItem
+        crows = (await db.execute(
+            select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
+            .where(CoshCoreItem.cosh_id.in_(crop_cosh_ids))
+        )).all()
+        for cid, tr in crows:
+            if isinstance(tr, dict):
+                name = pick_translation(tr, lang, "")
+                if name:
+                    crop_name_by_cosh_id[cid] = name
+
     out = []
     for a in assignments:
-        sub = (await db.execute(select(Subscription).where(Subscription.id == a.subscription_id))).scalar_one_or_none()
+        sub = sub_by_id.get(a.subscription_id)
         if not sub:
             continue
-        farmer = (await db.execute(select(User).where(User.id == sub.farmer_user_id))).scalar_one_or_none()
+        farmer = farmer_by_id.get(sub.farmer_user_id)
+        pkg = pkg_by_id.get(sub.package_id) if sub.package_id else None
+        crop_name = (
+            crop_name_by_cosh_id.get(pkg.crop_cosh_id)
+            if (pkg and pkg.crop_cosh_id) else None
+        )
         out.append({
             "subscription_id": sub.id,
             "farmer_user_id": sub.farmer_user_id,
             "farmer_name": farmer.name if farmer else None,
             "farmer_phone": farmer.phone if farmer else None,
+            "farmer_photo_url": farmer.photo_url if farmer else None,
             "client_id": sub.client_id,
             "package_id": sub.package_id,
             "status": sub.status,
             "reference_number": sub.reference_number,
             "crop_start_date": sub.crop_start_date,
+            # 2026-06-23 — Card enrichment fields.
+            "crop_cosh_id": pkg.crop_cosh_id if pkg else None,
+            "crop_name": crop_name,
+            "farm_area_acres": float(sub.farm_area_acres) if sub.farm_area_acres else None,
+            "area_unit": sub.area_unit,
+            "number_of_plants": sub.number_of_plants,
+            "planting_year": sub.planting_year,
         })
     return out
 
