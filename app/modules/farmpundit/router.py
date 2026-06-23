@@ -1002,7 +1002,17 @@ async def list_pundit_queries(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """New, forwarded, returned queries — sorted by urgency (fewest days remaining first)."""
+    """New, forwarded, returned queries — sorted by urgency (fewest days remaining first).
+
+    2026-06-23 — payload enriched so the pundit's query card carries
+    enough context to triage without drilling in: farmer name +
+    photo, crop name (localised), crop start date, company name.
+    Mirrors the My Farmers card enrichment pattern from earlier
+    today — bulk-fetch related entities once, build dicts, attach.
+    """
+    from app.modules.clients.models import Client
+    from app.modules.sync.models import CoshCoreItem
+
     profile = await _get_pundit_profile(db, current_user.id)
     result = await db.execute(
         select(Query).where(
@@ -1011,9 +1021,75 @@ async def list_pundit_queries(
         ).order_by(Query.expires_at)
     )
     queries = result.scalars().all()
-    return [{"id": q.id, "title": q.title, "status": q.status, "severity": q.severity,
-             "client_id": q.client_id, "expires_at": q.expires_at,
-             "days_remaining": max(0, (q.expires_at.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).days)} for q in queries]
+    if not queries:
+        return []
+
+    farmer_ids = {q.farmer_user_id for q in queries if q.farmer_user_id}
+    sub_ids = {q.subscription_id for q in queries if q.subscription_id}
+    client_ids = {q.client_id for q in queries if q.client_id}
+    crop_cosh_ids = {q.crop_cosh_id for q in queries if q.crop_cosh_id}
+
+    farmer_by_id: dict[str, User] = {}
+    if farmer_ids:
+        rows = (await db.execute(
+            select(User).where(User.id.in_(farmer_ids))
+        )).scalars().all()
+        farmer_by_id = {u.id: u for u in rows}
+
+    sub_by_id: dict[str, Subscription] = {}
+    if sub_ids:
+        rows = (await db.execute(
+            select(Subscription).where(Subscription.id.in_(sub_ids))
+        )).scalars().all()
+        sub_by_id = {s.id: s for s in rows}
+
+    client_name_by_id: dict[str, str] = {}
+    if client_ids:
+        rows = (await db.execute(
+            select(Client.id, Client.display_name, Client.full_name)
+            .where(Client.id.in_(client_ids))
+        )).all()
+        for cid, disp, full in rows:
+            client_name_by_id[cid] = disp or full or ""
+
+    crop_name_by_cosh_id: dict[str, str] = {}
+    if crop_cosh_ids:
+        rows = (await db.execute(
+            select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
+            .where(CoshCoreItem.cosh_id.in_(crop_cosh_ids))
+        )).all()
+        lang = current_user.language_code or "en"
+        for cid, tr in rows:
+            if isinstance(tr, dict):
+                name = pick_translation(tr, lang, "")
+                if name:
+                    crop_name_by_cosh_id[cid] = name
+
+    now = datetime.now(timezone.utc)
+    out = []
+    for q in queries:
+        farmer = farmer_by_id.get(q.farmer_user_id)
+        sub = sub_by_id.get(q.subscription_id)
+        out.append({
+            "id": q.id,
+            "title": q.title,
+            "status": q.status,
+            "severity": q.severity,
+            "client_id": q.client_id,
+            "expires_at": q.expires_at,
+            "days_remaining": max(
+                0,
+                (q.expires_at.replace(tzinfo=timezone.utc) - now).days,
+            ),
+            # 2026-06-23 — card enrichment fields
+            "farmer_name": farmer.name if farmer else None,
+            "farmer_photo_url": farmer.photo_url if farmer else None,
+            "crop_cosh_id": q.crop_cosh_id,
+            "crop_name": crop_name_by_cosh_id.get(q.crop_cosh_id) if q.crop_cosh_id else None,
+            "crop_start_date": sub.crop_start_date if sub else None,
+            "client_name": client_name_by_id.get(q.client_id),
+        })
+    return out
 
 
 @router.put("/pundit/queries/{query_id}/respond")
