@@ -423,13 +423,24 @@ async def claim_role(
     }
     if role_type in CONFLICT:
         conflicting = CONFLICT[role_type]
-        has_conflict = (await db.execute(
+        has_conflict_role = (await db.execute(
             select(UserRole).where(
                 UserRole.user_id == current_user.id,
                 UserRole.role_type == conflicting,
             )
-        )).scalar_one_or_none()
-        if has_conflict is not None:
+        )).scalar_one_or_none() is not None
+        # 2026-06-23 — Widen past UserRole. Legacy sessions may have
+        # `dealer_profile_complete` true or `facilitator_declared_at`
+        # set without the corresponding UserRole row (e.g. row went
+        # INACTIVE, predates self-claim, or was created via a path
+        # that didn't write the role). Catch those too so the gate
+        # cannot be sidestepped.
+        has_conflict_legacy = False
+        if conflicting == RoleType.DEALER:
+            has_conflict_legacy = await _is_dealer_profile_complete(db, current_user.id)
+        elif conflicting == RoleType.FACILITATOR:
+            has_conflict_legacy = current_user.facilitator_declared_at is not None
+        if has_conflict_role or has_conflict_legacy:
             raise HTTPException(
                 status_code=409,
                 detail={
