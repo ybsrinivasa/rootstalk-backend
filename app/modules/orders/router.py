@@ -7320,6 +7320,150 @@ async def facilitator_step_down_promoter(
     }
 
 
+# ── Dealer-side Promoter invitations (2026-06-23) ─────────────────────────────
+# Mirror of the facilitator endpoints above. Dealers were auto-accepted
+# pre-2026-06-23; now they require explicit A/R like facilitators do.
+# Per §11.2 dealers remain multi-company Promoters — no exclusivity
+# check on accept, unlike facilitators.
+
+@router.get("/dealer/promoter-invitations")
+async def dealer_promoter_invitations(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List this Dealer's outstanding Promoter invitations —
+    ClientPromoter rows in `PENDING` state — with enough Client
+    branding to render an accept/decline card per invitation."""
+    from app.modules.clients.models import Client, ClientPromoter
+
+    rows = (await db.execute(
+        select(ClientPromoter, Client)
+        .join(Client, Client.id == ClientPromoter.client_id)
+        .where(
+            ClientPromoter.user_id == current_user.id,
+            ClientPromoter.promoter_type == "DEALER",
+            ClientPromoter.status == "ACTIVE",
+            ClientPromoter.promoter_request_status == "PENDING",
+        )
+        .order_by(ClientPromoter.promoter_request_sent_at.desc())
+    )).all()
+
+    return [
+        {
+            "client_promoter_id": cp.id,
+            "client_id": c.id,
+            "client_name": c.display_name or c.full_name,
+            "short_name": c.short_name,
+            "logo_url": c.logo_url,
+            "primary_colour": c.primary_colour,
+            "sent_at": cp.promoter_request_sent_at,
+        }
+        for cp, c in rows
+    ]
+
+
+@router.put("/dealer/promoter-invitations/{client_promoter_id}/accept")
+async def dealer_accept_promoter_invitation(
+    client_promoter_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Dealer-side accept. Transitions PENDING → ACCEPTED, sets
+    `is_promoter=True`, stamps `promoter_request_responded_at`.
+
+    Unlike the facilitator endpoint, NO exclusivity check —
+    dealers are multi-company Promoters per §11.2 (2026-06-23 user
+    confirmation: "I confirm that dealers are multi-company
+    promoters")."""
+    from app.modules.clients.models import ClientPromoter
+
+    cp = (await db.execute(
+        select(ClientPromoter).where(
+            ClientPromoter.id == client_promoter_id,
+            ClientPromoter.user_id == current_user.id,
+            ClientPromoter.promoter_type == "DEALER",
+            ClientPromoter.status == "ACTIVE",
+        )
+    )).scalar_one_or_none()
+    if not cp:
+        raise HTTPException(status_code=404, detail="Promoter invitation not found")
+    if cp.promoter_request_status != "PENDING":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "invitation_not_pending",
+                "message": (
+                    f"This invitation is in state "
+                    f"'{cp.promoter_request_status}', not 'PENDING'. "
+                    "It may have been revoked, declined earlier, or "
+                    "already accepted."
+                ),
+            },
+        )
+
+    from datetime import datetime, timezone
+    cp.is_promoter = True
+    cp.promoter_request_status = "ACCEPTED"
+    cp.promoter_request_responded_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(cp)
+    return {
+        "id": cp.id,
+        "client_id": cp.client_id,
+        "is_promoter": cp.is_promoter,
+        "promoter_request_status": cp.promoter_request_status,
+        "promoter_request_responded_at": cp.promoter_request_responded_at,
+    }
+
+
+@router.put("/dealer/promoter-invitations/{client_promoter_id}/decline")
+async def dealer_decline_promoter_invitation(
+    client_promoter_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Dealer-side decline. Transitions PENDING → DECLINED.
+    `is_promoter` stays False."""
+    from app.modules.clients.models import ClientPromoter
+
+    cp = (await db.execute(
+        select(ClientPromoter).where(
+            ClientPromoter.id == client_promoter_id,
+            ClientPromoter.user_id == current_user.id,
+            ClientPromoter.promoter_type == "DEALER",
+            ClientPromoter.status == "ACTIVE",
+        )
+    )).scalar_one_or_none()
+    if not cp:
+        raise HTTPException(status_code=404, detail="Promoter invitation not found")
+    if cp.promoter_request_status != "PENDING":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "invitation_not_pending",
+                "message": (
+                    f"This invitation is in state "
+                    f"'{cp.promoter_request_status}', not 'PENDING'. "
+                    "It may have been revoked, declined earlier, or "
+                    "already accepted."
+                ),
+            },
+        )
+
+    from datetime import datetime, timezone
+    cp.promoter_request_status = "DECLINED"
+    cp.promoter_request_responded_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(cp)
+    return {
+        "id": cp.id,
+        "client_id": cp.client_id,
+        "is_promoter": cp.is_promoter,
+        "promoter_request_status": cp.promoter_request_status,
+        "promoter_request_responded_at": cp.promoter_request_responded_at,
+    }
+
+
 @router.get("/facilitator/onboarding-clients")
 async def facilitator_onboarding_clients(
     db: AsyncSession = Depends(get_db),

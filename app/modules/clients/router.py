@@ -2195,26 +2195,24 @@ async def request_promoter(
     """R9 (2026-05-29): Client's Field Manager designates this
     onboarded user as a Promoter.
 
-    Two paths, branching on `promoter_type`:
+    Both `promoter_type` paths now use a two-sided handshake
+    (status: NONE | DECLINED → PENDING). The user accepts via
+    /{facilitator|dealer}/promoter-invitations/{id}/accept before
+    `is_promoter` flips True.
 
-      DEALER      → auto-accept (status: NONE → ACCEPTED, is_promoter
-                    → True). Dealers are multi-company by spec §11.2;
-                    no exclusivity check and no farmer-side consent
-                    needed.
+      FACILITATOR — §11.2 exclusivity split across request-time
+                    (here, refuse if already ACCEPTED elsewhere)
+                    and accept-time (final racy check).
+      DEALER      — multi-company per §11.2. No exclusivity check at
+                    either step. The handshake exists for explicit
+                    consent only (2026-06-23 user direction: dealers
+                    can be Promoter at multiple companies but each
+                    company must obtain consent).
 
-      FACILITATOR → two-sided handshake (status: NONE | DECLINED →
-                    PENDING). The Facilitator must accept via
-                    /facilitator/promoter-invitations/{id}/accept
-                    before `is_promoter` flips True. §11.2 splits the
-                    exclusivity check across request-time (here) and
-                    accept-time:
-                      • request-time: refuse if the Facilitator is
-                        already ACCEPTED at another Client.
-                      • accept-time: final racy check the moment they
-                        accept.
-                    Multiple PENDING invitations are allowed — the
-                    Facilitator can pick one, the others survive as
-                    options.
+    Multiple PENDING invitations are allowed in both cases — the
+    user can pick which to accept, the others survive as options
+    (for facilitator until one accepts; for dealer all may be
+    accepted independently).
     """
     cp = (await db.execute(
         select(ClientPromoter).where(
@@ -2274,11 +2272,12 @@ async def request_promoter(
         cp.promoter_request_sent_at = now
         cp.promoter_request_responded_at = None
     else:
-        # DEALER (or other): auto-accept, no Promoter-side consent.
-        cp.is_promoter = True
-        cp.promoter_request_status = "ACCEPTED"
+        # DEALER — two-sided handshake (2026-06-23, was auto-accept).
+        # No exclusivity check: dealers stay multi-company Promoters
+        # per §11.2; they just have to consent.
+        cp.promoter_request_status = "PENDING"
         cp.promoter_request_sent_at = now
-        cp.promoter_request_responded_at = now
+        cp.promoter_request_responded_at = None
 
     await db.commit()
     await db.refresh(cp)
