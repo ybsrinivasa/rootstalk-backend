@@ -17,10 +17,9 @@ from typing import Optional
 class ExpertSlot:
     """One row from client_farm_pundits."""
     pundit_id: str
-    role: str              # PRIMARY | PANEL
+    role: str              # PRIMARY | PANEL | PROMOTER_PUNDIT
     status: str            # ACTIVE | INACTIVE
     round_robin_sequence: int
-    is_promoter_pundit: bool
     onboarded_at: datetime
 
 
@@ -60,22 +59,22 @@ def route_query(
     if promoter_pundit_id:
         match = next(
             (e for e in experts
-             if e.pundit_id == promoter_pundit_id and e.status == "ACTIVE" and e.is_promoter_pundit),
+             if e.pundit_id == promoter_pundit_id and e.status == "ACTIVE"
+             and e.role == "PROMOTER_PUNDIT"),
             None,
         )
         if match:
             return RoutingResult(pundit_id=promoter_pundit_id, reason="PROMOTER_PUNDIT")
 
     # Priority 3: Round-robin among PRIMARY ACTIVE experts.
-    # PP V1 (2026-05-30): Promoter-Pundits are explicitly excluded from
-    # the pool — they receive queries only when a farmer has typed their
-    # phone number into the expert field (P1 path) or when they were the
-    # assigning F-P (P2 path). The pool is FarmPundits-only.
+    # PP V1 (2026-05-30): Promoter-Pundits are excluded from this pool by
+    # virtue of their role being PROMOTER_PUNDIT (not PRIMARY). They
+    # receive queries only via the farmer-preference path (P1) or the
+    # assigning-promoter path (P2 above).
     primaries = sorted(
         [e for e in experts
          if e.role == "PRIMARY"
-         and e.status == "ACTIVE"
-         and not e.is_promoter_pundit],
+         and e.status == "ACTIVE"],
         key=lambda e: (e.onboarded_at, e.round_robin_sequence or 0),
     )
 

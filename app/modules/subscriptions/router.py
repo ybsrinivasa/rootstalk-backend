@@ -5782,7 +5782,7 @@ async def get_expert_setting(
             .where(
                 _CFP.pundit_id == pref.pundit_id,
                 _CFP.client_id == sub.client_id,
-                _CFP.is_promoter_pundit == True,  # noqa: E712
+                _CFP.role == "PROMOTER_PUNDIT",
                 _CFP.status == "ACTIVE",
             )
         )).scalar_one_or_none()
@@ -5830,7 +5830,7 @@ async def get_expert_setting(
                     ClientPromoter.client_id == sub.client_id,
                 )
             )).scalar_one_or_none()
-            # Also find their FarmPundit profile and the ClientFarmPundit (is_promoter_pundit lives there)
+            # Also find their FarmPundit profile and the ClientFarmPundit (role=PROMOTER_PUNDIT designation)
             promoter_user = (await db.execute(
                 select(User).where(User.id == assignment.promoter_user_id)
             )).scalar_one_or_none()
@@ -5845,7 +5845,7 @@ async def get_expert_setting(
                     select(ClientFarmPundit).where(
                         ClientFarmPundit.client_id == sub.client_id,
                         ClientFarmPundit.pundit_id == pp_profile.id,
-                        ClientFarmPundit.is_promoter_pundit == True,  # noqa: E712
+                        ClientFarmPundit.role == "PROMOTER_PUNDIT",
                         ClientFarmPundit.status == "ACTIVE",
                     )
                 )).scalar_one_or_none()

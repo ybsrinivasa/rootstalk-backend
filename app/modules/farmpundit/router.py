@@ -441,7 +441,7 @@ async def get_pundit_profile_detail(
             "district_cosh_id": a.district_cosh_id,
             "district_name": name_by_cosh_id.get(a.district_cosh_id) if a.district_cosh_id else None,
         } for a in areas],
-        "companies": [{"client_id": c.client_id, "role": c.role, "is_promoter_pundit": c.is_promoter_pundit} for c in companies],
+        "companies": [{"client_id": c.client_id, "role": c.role} for c in companies],
     }
 
 
@@ -1105,15 +1105,17 @@ async def list_forward_candidates(
 ):
     """Colleagues at this client the current holder can forward TO.
 
-    Returns active FarmPundits at the query's client (Primary + Panel),
-    excluding the current holder themselves. Sorted PRIMARY first (by
-    round-robin sequence), then PANEL (by name). Phone follows the
-    profile's `phone_hidden` toggle — a Pundit who explicitly hid
-    their phone won't have it shown to colleagues either.
+    Returns active FarmPundits at the query's client, excluding the
+    current holder themselves. Sorted PRIMARY first (by round-robin
+    sequence), then PANEL (by name). Phone follows the profile's
+    `phone_hidden` toggle.
 
-    Auth: caller must be the query's current_holder. A Pundit who
-    isn't holding the query has no business listing potential
-    recipients.
+    Forward-chain rule (2026-06-23): a Promoter-Pundit may forward
+    upward to regular pundits (PRIMARY / PANEL). Regular pundits MAY
+    NOT forward back to a Promoter-Pundit — PP rows are excluded from
+    the candidate list when the caller is a regular pundit.
+
+    Auth: caller must be the query's current_holder.
     """
     profile = await _get_pundit_profile(db, current_user.id)
     query = await _get_query(db, query_id)
@@ -1123,12 +1125,25 @@ async def list_forward_candidates(
             detail="Only the current holder can list forward candidates.",
         )
 
-    rows = (await db.execute(
+    caller_cfp = (await db.execute(
         select(ClientFarmPundit).where(
             ClientFarmPundit.client_id == query.client_id,
-            ClientFarmPundit.status == "ACTIVE",
-            ClientFarmPundit.pundit_id != profile.id,
+            ClientFarmPundit.pundit_id == profile.id,
         )
+    )).scalar_one_or_none()
+    caller_is_pp = caller_cfp and caller_cfp.role == PunditRole.PROMOTER_PUNDIT
+
+    candidate_filter = [
+        ClientFarmPundit.client_id == query.client_id,
+        ClientFarmPundit.status == "ACTIVE",
+        ClientFarmPundit.pundit_id != profile.id,
+    ]
+    if not caller_is_pp:
+        # Regular pundit forwarding — exclude PPs from the recipient list.
+        candidate_filter.append(ClientFarmPundit.role != PunditRole.PROMOTER_PUNDIT)
+
+    rows = (await db.execute(
+        select(ClientFarmPundit).where(*candidate_filter)
     )).scalars().all()
     if not rows:
         return []
@@ -1205,6 +1220,37 @@ async def forward_query(
                 "message": "Panel Experts cannot forward queries. You can only Respond or Return.",
             },
         )
+
+    # Forward-chain rule (2026-06-23): regular pundits (Primary / Panel)
+    # cannot forward to a Promoter-Pundit. PP rows receive queries only
+    # from farmers (preference / promoter-assigned). Lookup the target's
+    # row at this client and reject if it's a PP.
+    caller_cfp = (await db.execute(
+        select(ClientFarmPundit).where(
+            ClientFarmPundit.client_id == query.client_id,
+            ClientFarmPundit.pundit_id == profile.id,
+        )
+    )).scalar_one_or_none()
+    caller_is_pp = caller_cfp and caller_cfp.role == PunditRole.PROMOTER_PUNDIT
+    if not caller_is_pp:
+        target_cfp = (await db.execute(
+            select(ClientFarmPundit).where(
+                ClientFarmPundit.client_id == query.client_id,
+                ClientFarmPundit.pundit_id == data["to_pundit_id"],
+            )
+        )).scalar_one_or_none()
+        if target_cfp and target_cfp.role == PunditRole.PROMOTER_PUNDIT:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "cannot_forward_to_promoter_pundit",
+                    "message": (
+                        "A regular pundit cannot forward a query to a "
+                        "Promoter-Pundit. Promoter-Pundits receive queries "
+                        "directly from farmers."
+                    ),
+                },
+            )
 
     db.add(QueryRemark(
         query_id=query_id,
@@ -1867,7 +1913,6 @@ async def list_company_pundits(
             "phone": user.phone if user else None,
             "role": cp.role,
             "status": cp.status,
-            "is_promoter_pundit": cp.is_promoter_pundit,
             "can_be_promoter_pundit": (
                 user is not None and user.id in pp_eligible_user_ids
             ),
@@ -2043,7 +2088,6 @@ async def get_company_pundit_profile(
         "role": cp.role,
         "status": cp.status,
         "round_robin_sequence": cp.round_robin_sequence,
-        "is_promoter_pundit": cp.is_promoter_pundit,
         "onboarded_at": cp.onboarded_at,
     }
 
@@ -2274,18 +2318,27 @@ async def toggle_promoter_pundit(
     current_user: User = Depends(get_current_user),
 ):
     """Field Manager designates a facilitator FarmPundit as a
-    Promoter-Pundit.
+    Promoter-Pundit (PP) — or removes that designation.
 
-    Spec §14.2: "Must be a Promoter first — being a facilitator alone
-    is not sufficient." Translated to data-model terms, the pundit's
-    user must already have an ACTIVE `ClientPromoter` row at this
-    client with `promoter_type=FACILITATOR`. Dealer-Promoters and
-    Company-designated Promoters are not eligible — the Promoter-
-    Pundit role is specifically for Facilitator-Promoters who are
-    additionally FarmPundits.
+    2026-06-23 rewrite: PROMOTER_PUNDIT is now a first-class role on
+    the `client_farm_pundits.role` column. The historical
+    `is_promoter_pundit` flag was dropped. Per user direction:
+    - A regular pundit (PRIMARY / PANEL) CANNOT be converted to a PP
+      and vice versa. The role designation is exclusive at the row level.
+    - A user can hold PROMOTER_PUNDIT at AT MOST ONE client across
+      the platform (DB-enforced via partial unique index).
 
-    Toggling OFF (removing the PP designation) is unconditionally
-    allowed — that's just clearing a flag.
+    Toggle ON (set role to PROMOTER_PUNDIT):
+      - 409 if the existing row's role is PRIMARY or PANEL
+        (regular → PP transition forbidden).
+      - 409 eligibility / cross-path checks below (unchanged).
+      - 409 if the user already holds PROMOTER_PUNDIT at another client.
+    Toggle OFF (clear the designation):
+      - We delete the cfp row entirely. Per the user's rule, a PP row
+        does not "downgrade" to PRIMARY/PANEL — removing the PP
+        designation removes the pundit-at-this-client relationship.
+        The user must re-onboard via /pundit/register if they later
+        want to act as a regular pundit at this client.
     """
     await _assert_portal_member(db, current_user.id, client_id)
     cp = (await db.execute(
@@ -2294,10 +2347,28 @@ async def toggle_promoter_pundit(
     if not cp:
         raise HTTPException(status_code=404, detail="Company pundit not found")
 
-    new_value = data.get("is_promoter_pundit", not cp.is_promoter_pundit)
-    if new_value and not cp.is_promoter_pundit:
-        # Eligibility check on enabling — skip on toggle-off and on
-        # idempotent toggle-on (already PP).
+    is_currently_pp = cp.role == PunditRole.PROMOTER_PUNDIT
+    new_value = data.get("is_promoter_pundit", not is_currently_pp)
+
+    if new_value and not is_currently_pp:
+        # Regular → PP transition is forbidden.
+        if cp.role in (PunditRole.PRIMARY, PunditRole.PANEL):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "regular_pundit_cannot_become_promoter_pundit",
+                    "message": (
+                        "A regular pundit (Primary / Panel) cannot become a "
+                        "Promoter-Pundit. Remove this pundit and re-add via "
+                        "the Promoter-Pundit designation flow if the role "
+                        "needs to change."
+                    ),
+                },
+            )
+
+    if new_value and not is_currently_pp:
+        # Eligibility check on enabling — skip on idempotent toggle-on
+        # (already PP) and on toggle-off.
         from app.modules.clients.models import ClientPromoter
 
         profile = (await db.execute(
@@ -2361,9 +2432,47 @@ async def toggle_promoter_pundit(
                 },
             )
 
-    cp.is_promoter_pundit = new_value
-    await db.commit()
-    return {"is_promoter_pundit": cp.is_promoter_pundit}
+        # Single-company PP constraint (2026-06-23): refuse if the user
+        # already has PROMOTER_PUNDIT at another client. The partial
+        # unique index would catch this at commit; raising here gives a
+        # cleaner error code to the portal.
+        other_pp = (await db.execute(
+            select(ClientFarmPundit.client_id).where(
+                ClientFarmPundit.pundit_id == cp.pundit_id,
+                ClientFarmPundit.role == PunditRole.PROMOTER_PUNDIT,
+                ClientFarmPundit.client_id != client_id,
+            ).limit(1)
+        )).scalar_one_or_none()
+        if other_pp is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "promoter_pundit_already_at_another_client",
+                    "message": (
+                        "This user is already designated as a "
+                        "Promoter-Pundit at another company. A "
+                        "Promoter-Pundit may serve only one company at a "
+                        "time."
+                    ),
+                },
+            )
+
+    if new_value and not is_currently_pp:
+        cp.role = PunditRole.PROMOTER_PUNDIT
+        await db.commit()
+        return {"role": cp.role.value, "is_promoter_pundit": True}
+
+    if not new_value and is_currently_pp:
+        # Remove the PP designation by deleting the cfp row. Per the
+        # user's rule, a PP row does not "downgrade" — the relationship
+        # is removed.
+        await db.delete(cp)
+        await db.commit()
+        return {"role": None, "is_promoter_pundit": False}
+
+    # Idempotent paths: nothing to change.
+    return {"role": cp.role.value if hasattr(cp.role, "value") else cp.role,
+            "is_promoter_pundit": is_currently_pp}
 
 
 # ── Promoter-Pundit auto-provision (V1, 2026-05-30) ──────────────────────────
@@ -2447,6 +2556,28 @@ async def add_promoter_pundit(
         db.add(profile)
         await db.flush()
 
+    # Single-company PP constraint (2026-06-23): refuse if the user is
+    # already a Promoter-Pundit at another client.
+    other_pp = (await db.execute(
+        select(ClientFarmPundit.client_id).where(
+            ClientFarmPundit.pundit_id == profile.id,
+            ClientFarmPundit.role == PunditRole.PROMOTER_PUNDIT,
+            ClientFarmPundit.client_id != client_id,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if other_pp is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "promoter_pundit_already_at_another_client",
+                "message": (
+                    "This user is already designated as a Promoter-Pundit "
+                    "at another company. A Promoter-Pundit may serve only "
+                    "one company at a time."
+                ),
+            },
+        )
+
     cfp = (await db.execute(
         select(ClientFarmPundit).where(
             ClientFarmPundit.client_id == client_id,
@@ -2457,21 +2588,34 @@ async def add_promoter_pundit(
         cfp = ClientFarmPundit(
             client_id=client_id,
             pundit_id=profile.id,
-            role=PunditRole.PANEL,
+            role=PunditRole.PROMOTER_PUNDIT,
             status="ACTIVE",
-            is_promoter_pundit=True,
             # Phantom PP rows are hidden from any farmer-facing list —
             # the farmer can only reach them by typing the phone.
             searchable=False,
         )
         db.add(cfp)
-    else:
-        # Re-add idempotent: flip flags + reactivate if needed. We
-        # deliberately do NOT toggle `searchable` back to False if the
-        # row pre-existed as a real FarmPundit — that would erase the
-        # CA's earlier decision to onboard them as a searchable pundit.
-        cfp.is_promoter_pundit = True
+    elif cfp.role == PunditRole.PROMOTER_PUNDIT:
+        # Idempotent re-add of an existing PP row — reactivate if
+        # needed. Don't flip `searchable` back to False (would erase
+        # the CA's earlier decision if this was a real FarmPundit).
         cfp.status = "ACTIVE"
+    else:
+        # Existing row is a regular pundit (PRIMARY / PANEL). Per the
+        # 2026-06-23 rule, regular pundits cannot become Promoter-
+        # Pundits at the same client — caller must remove the row
+        # first and then re-add as PP.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "regular_pundit_cannot_become_promoter_pundit",
+                "message": (
+                    "This user is already a regular pundit (Primary / "
+                    "Panel) at this company. Remove that designation "
+                    "before adding them as a Promoter-Pundit."
+                ),
+            },
+        )
 
     await db.commit()
     await db.refresh(cfp)
@@ -2484,7 +2628,6 @@ async def add_promoter_pundit(
         "phone": target.phone,
         "role": cfp.role.value if hasattr(cfp.role, "value") else cfp.role,
         "status": cfp.status,
-        "is_promoter_pundit": True,
         "searchable": cfp.searchable,
     }
 
@@ -2805,7 +2948,7 @@ async def set_pundit_preference(
                 select(ClientFarmPundit).where(
                     ClientFarmPundit.client_id == sub.client_id,
                     ClientFarmPundit.pundit_id == pp_profile.id,
-                    ClientFarmPundit.is_promoter_pundit == True,  # noqa: E712
+                    ClientFarmPundit.role == PunditRole.PROMOTER_PUNDIT,
                     ClientFarmPundit.status == "ACTIVE",
                 )
             )).scalar_one_or_none()
@@ -2950,7 +3093,6 @@ async def _get_next_pundit_for_query(
             role=cp.role.value if hasattr(cp.role, 'value') else str(cp.role),
             status=cp.status,
             round_robin_sequence=cp.round_robin_sequence or 0,
-            is_promoter_pundit=cp.is_promoter_pundit,
             onboarded_at=cp.onboarded_at,
         )
         for cp in all_cp
@@ -2979,7 +3121,8 @@ async def _get_next_pundit_for_query(
         )).scalar_one_or_none()
         if promoter_user:
             pp_slot = next(
-                (e for e in experts if e.pundit_id == promoter_user.id and e.is_promoter_pundit),
+                (e for e in experts
+                 if e.pundit_id == promoter_user.id and e.role == "PROMOTER_PUNDIT"),
                 None,
             )
             if pp_slot:

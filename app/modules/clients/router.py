@@ -2003,18 +2003,19 @@ async def fm_toggle_promoter_pundit(
 
     On toggle-ON the endpoint auto-provisions a shadow
     `FarmPunditProfile` + `ClientFarmPundit` row (searchable=False,
-    role=PANEL, is_promoter_pundit=True) so the existing query
-    routing chain works unmodified — it already knows how to pick a
-    P-P from the CFP table. On toggle-OFF it flips both flags off in
-    the same transaction so the routing stops picking them.
+    role=PROMOTER_PUNDIT) so the existing query routing chain works
+    unmodified. On toggle-OFF it deletes the shadow row so the
+    routing stops picking them.
 
     Mutual exclusion (per (user, client)): refuses with
     `pp_via_real_farmpundit_exists` if the user is already
     designated as a P-P via a *real* (searchable=True)
     ClientFarmPundit row at this client — that means the CA has
     already named them as a P-P through the registered-pundit path,
-    and V1 keeps the two non-overlapping. Toggle-off is
-    unconditional.
+    and V1 keeps the two non-overlapping.
+
+    Single-company PP constraint (2026-06-23): also refuses if the
+    user is already PROMOTER_PUNDIT at another client.
     """
     from app.modules.farmpundit.models import (
         ClientFarmPundit, FarmPunditProfile, PunditRole,
@@ -2058,7 +2059,7 @@ async def fm_toggle_promoter_pundit(
             )
             .where(
                 ClientFarmPundit.client_id == client_id,
-                ClientFarmPundit.is_promoter_pundit == True,  # noqa: E712
+                ClientFarmPundit.role == PunditRole.PROMOTER_PUNDIT,
                 ClientFarmPundit.searchable == True,  # noqa: E712
                 FarmPunditProfile.user_id == cp.user_id,
             )
@@ -2078,6 +2079,33 @@ async def fm_toggle_promoter_pundit(
                     ),
                 },
             )
+
+        # Single-company PP constraint (2026-06-23): also refuse if the
+        # user is already PROMOTER_PUNDIT at another client.
+        profile_for_check = (await db.execute(
+            select(FarmPunditProfile).where(FarmPunditProfile.user_id == cp.user_id)
+        )).scalar_one_or_none()
+        if profile_for_check is not None:
+            other_pp = (await db.execute(
+                select(ClientFarmPundit.client_id).where(
+                    ClientFarmPundit.pundit_id == profile_for_check.id,
+                    ClientFarmPundit.role == PunditRole.PROMOTER_PUNDIT,
+                    ClientFarmPundit.client_id != client_id,
+                ).limit(1)
+            )).scalar_one_or_none()
+            if other_pp is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "promoter_pundit_already_at_another_client",
+                        "message": (
+                            "This user is already designated as a "
+                            "Promoter-Pundit at another company. A "
+                            "Promoter-Pundit may serve only one company "
+                            "at a time."
+                        ),
+                    },
+                )
 
     cp.is_promoter_pundit = new_value
 
@@ -2102,32 +2130,45 @@ async def fm_toggle_promoter_pundit(
             cfp = ClientFarmPundit(
                 client_id=client_id,
                 pundit_id=profile.id,
-                role=PunditRole.PANEL,
+                role=PunditRole.PROMOTER_PUNDIT,
                 status="ACTIVE",
-                is_promoter_pundit=True,
                 # Phantom: hidden from any farmer-facing pundit picker.
-                # The CA's read-only P-P sub-tab still surfaces it
-                # because that view filters on `is_promoter_pundit=True`
-                # not `searchable=True`.
                 searchable=False,
             )
             db.add(cfp)
-        else:
-            cfp.is_promoter_pundit = True
+        elif cfp.role == PunditRole.PROMOTER_PUNDIT:
+            # Already PP — just reactivate idempotently.
             cfp.status = "ACTIVE"
+        else:
+            # Existing row is a regular pundit (PRIMARY/PANEL). The
+            # mutual-exclusion guard above only catches existing PP
+            # rows; here we forbid the regular → PP transition too,
+            # consistent with the user's 2026-06-23 rule.
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "regular_pundit_cannot_become_promoter_pundit",
+                    "message": (
+                        "This user is already a regular pundit (Primary / "
+                        "Panel) at this company. Remove that designation "
+                        "before adding them as a Promoter-Pundit."
+                    ),
+                },
+            )
     else:
-        # Toggle OFF — flip the shadow row's PP flag (if any) so the
-        # routing chain stops picking this user. Leave the row in
-        # place; it's harmless and re-toggling ON later is cheaper.
+        # Toggle OFF — delete the shadow row (searchable=False is the
+        # FM-provisioned phantom; safe to remove). Real-FarmPundit
+        # rows are never created here, so we only ever target the
+        # phantom.
         if profile is not None:
+            from sqlalchemy import delete as sa_delete
             await db.execute(
-                update(ClientFarmPundit)
-                .where(
+                sa_delete(ClientFarmPundit).where(
                     ClientFarmPundit.client_id == client_id,
                     ClientFarmPundit.pundit_id == profile.id,
+                    ClientFarmPundit.role == PunditRole.PROMOTER_PUNDIT,
                     ClientFarmPundit.searchable == False,  # noqa: E712
                 )
-                .values(is_promoter_pundit=False)
             )
 
     await db.commit()

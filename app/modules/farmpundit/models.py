@@ -33,6 +33,13 @@ class QueryRemarkAction(str, enum.Enum):
 class PunditRole(str, enum.Enum):
     PRIMARY = "PRIMARY"
     PANEL = "PANEL"
+    # Promoter-Pundit (2026-06-23). Distinct role designation — a
+    # promoter-pundit cannot also be a regular pundit (PRIMARY / PANEL)
+    # at the same client, and a user can only hold this role at one
+    # client at a time (because they are a Promoter for exactly one
+    # company). Pre-2026-06-23 was modelled as `is_promoter_pundit=True`
+    # flag on top of `role=PANEL` — removed in migration b8e4a72f3019.
+    PROMOTER_PUNDIT = "PROMOTER_PUNDIT"
 
 
 class FarmPunditProfile(Base):
@@ -43,7 +50,7 @@ class FarmPunditProfile(Base):
     support_areas) only apply to regular FarmPundits. Promoter-
     Pundits are designated through the CA portal (Promoter UI) and
     don't fill any of this — they skip the /pundit/register flow
-    entirely. See `client_farm_pundits.is_promoter_pundit`.
+    entirely. See `client_farm_pundits.role = PROMOTER_PUNDIT`.
 
     All single-value dropdowns store the selection as a Cosh
     `cosh_core_items.cosh_id`, against these `core_type` slugs:
@@ -173,7 +180,6 @@ class ClientFarmPundit(Base):
     role: Mapped[PunditRole] = mapped_column(String(20), nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
     round_robin_sequence: Mapped[int] = mapped_column(Integer, nullable=True)
-    is_promoter_pundit: Mapped[bool] = mapped_column(Boolean, default=False)
     # PP V1 (2026-05-30): phantom-pundit Option A. When the CA toggles
     # PP ON for a Facilitator-Promoter without a FarmPundit profile, we
     # auto-provision a row with `searchable=False` so the farmer never
