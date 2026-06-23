@@ -2141,13 +2141,13 @@ async def promoter_assignment_today(
         })
 
     day = days[0]
-    # Strip CQ fields per the F-P design: F-P shouldn't see the
-    # interactive prompts the farmer is being asked.
-    for tl in day.get("timelines", []):
-        tl.pop("pending_conditional_question", None)
-        tl.pop("blank_path_questions", None)
-        if "has_pending_question" in tl:
-            tl["has_pending_question"] = False
+    # 2026-06-23 — Per user direction, the F-P sees the same advisory
+    # state the farmer sees so the two stay aligned in phone calls.
+    # Previously this stripped pending_conditional_question /
+    # blank_path_questions / has_pending_question because the F-P
+    # shouldn't ACT on them; the PWA now renders them read-only
+    # (no Yes/No buttons) so the F-P knows what the farmer is being
+    # asked. Same shape, no stripping.
     return day
 
 
