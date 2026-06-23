@@ -7320,6 +7320,104 @@ async def facilitator_step_down_promoter(
     }
 
 
+@router.put("/dealer/promoter-status/{client_promoter_id}/step-down")
+async def dealer_step_down_promoter(
+    client_promoter_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Dealer side: step down from an accepted Promoter role at one
+    company. Transitions ACCEPTED → NONE, clears `is_promoter` on this
+    row.
+
+    Dealers are multi-company per §11.2 — stepping down from one
+    company doesn't touch any other Promoter row the dealer holds.
+    Symmetric to the Client-side `revoke-promoter`. The Dealer-
+    onboarding row itself (the ClientPromoter row's existence and
+    its `status='ACTIVE'`) is untouched."""
+    from app.modules.clients.models import ClientPromoter
+
+    cp = (await db.execute(
+        select(ClientPromoter).where(
+            ClientPromoter.id == client_promoter_id,
+            ClientPromoter.user_id == current_user.id,
+            ClientPromoter.promoter_type == "DEALER",
+            ClientPromoter.status == "ACTIVE",
+        )
+    )).scalar_one_or_none()
+    if not cp:
+        raise HTTPException(status_code=404, detail="Promoter row not found")
+    if not cp.is_promoter:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "not_currently_promoter",
+                "message": (
+                    "You are not currently a Promoter at this company. "
+                    "Nothing to step down from."
+                ),
+            },
+        )
+
+    from datetime import datetime, timezone
+    cp.is_promoter = False
+    cp.promoter_request_status = "NONE"
+    cp.promoter_request_responded_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(cp)
+    return {
+        "id": cp.id,
+        "is_promoter": cp.is_promoter,
+        "promoter_request_status": cp.promoter_request_status,
+        "promoter_request_responded_at": cp.promoter_request_responded_at,
+    }
+
+
+@router.get("/dealer/onboarding-clients")
+async def dealer_onboarding_clients(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List of Clients that have onboarded the caller as a Dealer.
+
+    Mirror of /facilitator/onboarding-clients with two differences:
+    - Filters on promoter_type=DEALER.
+    - Drops `is_promoter_pundit` from the payload — dealers cannot be
+      Promoter-Pundits (PP is facilitator-only).
+
+    Deliberately *not* gated on `_assert_active_dealer` — a Dealer who
+    has been deactivated (or never been onboarded) should see an empty
+    list, not a 403."""
+    from app.modules.clients.models import Client, ClientPromoter
+
+    rows = (await db.execute(
+        select(ClientPromoter, Client)
+        .join(Client, Client.id == ClientPromoter.client_id)
+        .where(
+            ClientPromoter.user_id == current_user.id,
+            ClientPromoter.promoter_type == "DEALER",
+            ClientPromoter.status == "ACTIVE",
+        )
+        .order_by(ClientPromoter.registered_at.desc())
+    )).all()
+
+    return [
+        {
+            "client_promoter_id": cp.id,
+            "client_id": c.id,
+            "client_name": c.display_name or c.full_name,
+            "short_name": c.short_name,
+            "logo_url": c.logo_url,
+            "primary_colour": c.primary_colour,
+            "is_promoter": cp.is_promoter,
+            "website": c.website,
+            "phone": c.support_phone or c.office_phone,
+            "onboarded_at": cp.registered_at,
+        }
+        for cp, c in rows
+    ]
+
+
 # ── Dealer-side Promoter invitations (2026-06-23) ─────────────────────────────
 # Mirror of the facilitator endpoints above. Dealers were auto-accepted
 # pre-2026-06-23; now they require explicit A/R like facilitators do.
