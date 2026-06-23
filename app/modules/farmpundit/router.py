@@ -997,32 +997,22 @@ async def list_farmer_queries(
 
 # ── Query Management (FarmPundit) ──────────────────────────────────────────────
 
-@router.get("/pundit/queries")
-async def list_pundit_queries(
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """New, forwarded, returned queries — sorted by urgency (fewest days remaining first).
+async def _serialise_pundit_query_cards(
+    db: AsyncSession, queries: list, lang: str,
+) -> list[dict]:
+    """Bulk-fetch farmer / sub / client / crop_name for a list of
+    Query rows and serialise to the card shape consumed by
+    /pundit/queries and /pundit/queries/history.
 
-    2026-06-23 — payload enriched so the pundit's query card carries
-    enough context to triage without drilling in: farmer name +
-    photo, crop name (localised), crop start date, company name.
-    Mirrors the My Farmers card enrichment pattern from earlier
-    today — bulk-fetch related entities once, build dicts, attach.
+    2026-06-23 — Pulled out of list_pundit_queries so the history
+    endpoint can reuse the same enrichment (user direction). One
+    query per related table; no N+1.
     """
-    from app.modules.clients.models import Client
-    from app.modules.sync.models import CoshCoreItem
-
-    profile = await _get_pundit_profile(db, current_user.id)
-    result = await db.execute(
-        select(Query).where(
-            Query.current_holder_id == profile.id,
-            Query.status.in_([QueryStatus.NEW, QueryStatus.FORWARDED, QueryStatus.RETURNED]),
-        ).order_by(Query.expires_at)
-    )
-    queries = result.scalars().all()
     if not queries:
         return []
+
+    from app.modules.clients.models import Client
+    from app.modules.sync.models import CoshCoreItem
 
     farmer_ids = {q.farmer_user_id for q in queries if q.farmer_user_id}
     sub_ids = {q.subscription_id for q in queries if q.subscription_id}
@@ -1058,7 +1048,6 @@ async def list_pundit_queries(
             select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
             .where(CoshCoreItem.cosh_id.in_(crop_cosh_ids))
         )).all()
-        lang = current_user.language_code or "en"
         for cid, tr in rows:
             if isinstance(tr, dict):
                 name = pick_translation(tr, lang, "")
@@ -1070,6 +1059,13 @@ async def list_pundit_queries(
     for q in queries:
         farmer = farmer_by_id.get(q.farmer_user_id)
         sub = sub_by_id.get(q.subscription_id)
+        # days_remaining is meaningful for live (non-terminal) queries.
+        # For history the expires_at is in the past or moot; we still
+        # compute it (could be negative pre-max) so the field shape
+        # stays identical across both endpoints.
+        days_remaining = max(
+            0, (q.expires_at.replace(tzinfo=timezone.utc) - now).days,
+        ) if q.expires_at else 0
         out.append({
             "id": q.id,
             "title": q.title,
@@ -1077,11 +1073,7 @@ async def list_pundit_queries(
             "severity": q.severity,
             "client_id": q.client_id,
             "expires_at": q.expires_at,
-            "days_remaining": max(
-                0,
-                (q.expires_at.replace(tzinfo=timezone.utc) - now).days,
-            ),
-            # 2026-06-23 — card enrichment fields
+            "days_remaining": days_remaining,
             "farmer_name": farmer.name if farmer else None,
             "farmer_photo_url": farmer.photo_url if farmer else None,
             "crop_cosh_id": q.crop_cosh_id,
@@ -1090,6 +1082,31 @@ async def list_pundit_queries(
             "client_name": client_name_by_id.get(q.client_id),
         })
     return out
+
+
+@router.get("/pundit/queries")
+async def list_pundit_queries(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """New, forwarded, returned queries — sorted by urgency (fewest days remaining first).
+
+    2026-06-23 — payload enriched (farmer name + photo, crop name,
+    crop start date, company name) via the shared
+    `_serialise_pundit_query_cards` helper so the pundit's triage
+    card carries enough context to act without drilling in. Same
+    shape served on /pundit/queries/history below.
+    """
+    profile = await _get_pundit_profile(db, current_user.id)
+    result = await db.execute(
+        select(Query).where(
+            Query.current_holder_id == profile.id,
+            Query.status.in_([QueryStatus.NEW, QueryStatus.FORWARDED, QueryStatus.RETURNED]),
+        ).order_by(Query.expires_at)
+    )
+    queries = result.scalars().all()
+    lang = current_user.language_code or "en"
+    return await _serialise_pundit_query_cards(db, list(queries), lang)
 
 
 @router.put("/pundit/queries/{query_id}/respond")
@@ -1482,7 +1499,12 @@ async def query_history(
             Query.status.in_([QueryStatus.RESPONDED, QueryStatus.REJECTED, QueryStatus.EXPIRED]),
         ).order_by(Query.created_at.desc())
     )
-    return result.scalars().all()
+    # 2026-06-23 — Same enrichment as /pundit/queries so the
+    # History tab card carries farmer + crop + start + company.
+    # Pre-fix this returned raw Query ORM objects; the PWA
+    # gracefully degraded but the new card fields stayed empty.
+    lang = current_user.language_code or "en"
+    return await _serialise_pundit_query_cards(db, list(result.scalars().all()), lang)
 
 
 # ── Standard Q&A Library ──────────────────────────────────────────────────────
