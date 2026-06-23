@@ -576,15 +576,20 @@ async def accept_invitation(
 @router.put("/pundit/invitations/{invitation_id}/reject")
 async def reject_invitation(
     invitation_id: str,
-    data: dict,
+    data: dict | None = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if not data.get("reason"):
-        raise HTTPException(status_code=422, detail="Rejection reason is mandatory")
+    """2026-06-23 — Mandatory reason dropped. A pundit declining a
+    company invitation needs a simple confirmation, not a forced
+    explanation. The `rejection_reason` column is retained for any
+    legacy callers that still send a reason; it stays null when not
+    provided.
+    """
     inv = await _get_invitation(db, invitation_id)
     inv.status = "REJECTED"
-    inv.rejection_reason = data["reason"]
+    if data and data.get("reason"):
+        inv.rejection_reason = data["reason"]
     await db.commit()
     return {"status": "REJECTED"}
 
