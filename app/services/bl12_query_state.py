@@ -31,6 +31,14 @@ from typing import Optional
 
 PRIMARY = "PRIMARY"
 PANEL = "PANEL"
+# 2026-06-23 — Promoter-Pundit is a first-class role on the queue
+# system. A PP receives queries directly from farmers (preference /
+# promoter-assigned) and forwards them into the regular pundit queue
+# at a Primary Expert. Functionally PP behaves like PRIMARY on
+# outgoing actions (forward / respond), with one carve-out: PP cannot
+# reject (PRIMARY-only per spec) — a PP shouldn't refuse a question
+# it was designated to receive.
+PROMOTER_PUNDIT = "PROMOTER_PUNDIT"
 SYSTEM = "SYSTEM"            # the hourly expiry sweep
 
 
@@ -39,10 +47,10 @@ SYSTEM = "SYSTEM"            # the hourly expiry sweep
 
 _TRANSITIONS: dict[tuple[str, str], frozenset[str]] = {
     # From NEW
-    ("NEW", "FORWARDED"):     frozenset({PRIMARY}),       # PANEL cannot forward
-    ("NEW", "RETURNED"):      frozenset({PRIMARY, PANEL}),
-    ("NEW", "RESPONDED"):     frozenset({PRIMARY, PANEL}),
-    ("NEW", "REJECTED"):      frozenset({PRIMARY}),       # PANEL cannot reject
+    ("NEW", "FORWARDED"):     frozenset({PRIMARY, PROMOTER_PUNDIT}),  # PANEL cannot forward
+    ("NEW", "RETURNED"):      frozenset({PRIMARY, PANEL}),            # PP receives from farmer, no upstream pundit
+    ("NEW", "RESPONDED"):     frozenset({PRIMARY, PANEL, PROMOTER_PUNDIT}),
+    ("NEW", "REJECTED"):      frozenset({PRIMARY}),       # PANEL + PP cannot reject
     ("NEW", "EXPIRED"):       frozenset({SYSTEM}),
 
     # From FORWARDED. Chained forwards (A→B, then B forwards onward) keep
@@ -51,13 +59,15 @@ _TRANSITIONS: dict[tuple[str, str], frozenset[str]] = {
     # router short-circuits validate_transition when current == target
     # for forwards, so a chained forward writes only the holder.
     ("FORWARDED", "RETURNED"):  frozenset({PRIMARY, PANEL}),
-    ("FORWARDED", "RESPONDED"): frozenset({PRIMARY, PANEL}),
+    ("FORWARDED", "RESPONDED"): frozenset({PRIMARY, PANEL, PROMOTER_PUNDIT}),
     ("FORWARDED", "REJECTED"):  frozenset({PRIMARY}),
     ("FORWARDED", "EXPIRED"):   frozenset({SYSTEM}),
 
-    # From RETURNED (the original sender now holds it again)
-    ("RETURNED", "FORWARDED"):  frozenset({PRIMARY}),
-    ("RETURNED", "RESPONDED"):  frozenset({PRIMARY, PANEL}),
+    # From RETURNED (the original sender now holds it again). If a
+    # Primary returned a PP-initiated query back to the PP, the PP
+    # should be able to forward to a different Primary or respond.
+    ("RETURNED", "FORWARDED"):  frozenset({PRIMARY, PROMOTER_PUNDIT}),
+    ("RETURNED", "RESPONDED"):  frozenset({PRIMARY, PANEL, PROMOTER_PUNDIT}),
     ("RETURNED", "REJECTED"):   frozenset({PRIMARY}),
     ("RETURNED", "EXPIRED"):    frozenset({SYSTEM}),
 
@@ -118,12 +128,15 @@ def validate_transition(
 # ── Convenience predicates (mirror the spec language) ─────────────────────────
 
 def can_forward(role: str) -> bool:
-    """PRIMARY-only — encodes TC-BL12-04 ("Panel Experts cannot forward")."""
-    return role == PRIMARY
+    """PRIMARY + PROMOTER_PUNDIT. Encodes TC-BL12-04 ("Panel Experts
+    cannot forward") and the 2026-06-23 PP queue-entry rule (PP
+    forwards into the regular Primary queue)."""
+    return role in (PRIMARY, PROMOTER_PUNDIT)
 
 
 def can_reject(role: str) -> bool:
     """PRIMARY-only per the spec. Live router's docstring already says
     'Primary Expert only', but the runtime check was missing — fixed
-    in batch 2."""
+    in batch 2. PROMOTER_PUNDIT also excluded: PP shouldn't refuse a
+    question they were designated to receive."""
     return role == PRIMARY

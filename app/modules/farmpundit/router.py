@@ -20,6 +20,7 @@ from app.services.i18n_cosh import pick_translation
 from app.services.bl12_query_routing import route_query, ExpertSlot
 from app.services.bl12_query_state import (
     PANEL as BL12_PANEL, PRIMARY as BL12_PRIMARY,
+    PROMOTER_PUNDIT as BL12_PROMOTER_PUNDIT,
     can_reject as bl12_can_reject,
     validate_transition as validate_query_transition,
 )
@@ -45,8 +46,17 @@ async def _holder_role(
     db: AsyncSession, profile: FarmPunditProfile, query: Query,
 ) -> str:
     """Return the holder's role on this query's client, as the BL-12
-    state-machine vocabulary expects ('PRIMARY' | 'PANEL'). Raises 403
-    if the pundit isn't holding the query at all."""
+    state-machine vocabulary expects ('PRIMARY' | 'PANEL' |
+    'PROMOTER_PUNDIT'). Raises 403 if the pundit isn't holding the
+    query at all.
+
+    2026-06-23 — PROMOTER_PUNDIT became a first-class PunditRole
+    (migration `b8e4a72f3019`). Pre-fix this function collapsed any
+    non-PRIMARY into PANEL, so a PP holding a NEW query failed the
+    forward transition (PANEL cannot forward) with a 400. The BL-12
+    table now treats PP as a forward-capable role; this lookup
+    surfaces it correctly.
+    """
     if query.current_holder_id != profile.id:
         raise HTTPException(
             status_code=403,
@@ -64,7 +74,11 @@ async def _holder_role(
             detail="You are not enrolled with this company.",
         )
     role = holder_slot.role.value if hasattr(holder_slot.role, "value") else str(holder_slot.role)
-    return BL12_PRIMARY if role == "PRIMARY" else BL12_PANEL
+    if role == "PRIMARY":
+        return BL12_PRIMARY
+    if role == "PROMOTER_PUNDIT":
+        return BL12_PROMOTER_PUNDIT
+    return BL12_PANEL
 
 # Expert response window. "2 days, leaving the date of submission"
 # per user direction 2026-05-27 — submitted on Day 0, expert has all
