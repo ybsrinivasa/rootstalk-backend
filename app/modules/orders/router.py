@@ -7357,6 +7357,15 @@ async def facilitator_onboarding_clients(
             "logo_url": c.logo_url,
             "primary_colour": c.primary_colour,
             "is_promoter": cp.is_promoter,
+            # 2026-06-23 — PP designation lives on the ClientPromoter
+            # row (FM-side flag). True means the Facilitator is acting
+            # as Promoter-Pundit at this client.
+            "is_promoter_pundit": cp.is_promoter_pundit,
+            # 2026-06-23 — contact + website surfaced so the
+            # /facilitator/onboarded-companies page can render Call +
+            # Website icons per company row.
+            "website": c.website,
+            "phone": c.support_phone or c.office_phone,
             "onboarded_at": cp.registered_at,
         }
         for cp, c in rows
