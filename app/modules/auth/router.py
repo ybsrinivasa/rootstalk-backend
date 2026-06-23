@@ -408,6 +408,44 @@ async def claim_role(
         )
 
     role_type = RoleType[role_str]
+
+    # 2026-06-23 — Dealer + Facilitator exclusivity. These two roles
+    # sit on opposite ends of the order-routing chain (facilitators
+    # route farmer orders to dealers). Letting the same user hold
+    # both creates a conflict of interest: every order they route as
+    # facilitator can land at their own dealer shop. All other role
+    # combinations are fine; only this pair is mutually exclusive.
+    # Per the "first deliberate exception" to
+    # feedback_users_wear_multiple_role_hats.md.
+    CONFLICT = {
+        RoleType.DEALER: RoleType.FACILITATOR,
+        RoleType.FACILITATOR: RoleType.DEALER,
+    }
+    if role_type in CONFLICT:
+        conflicting = CONFLICT[role_type]
+        has_conflict = (await db.execute(
+            select(UserRole).where(
+                UserRole.user_id == current_user.id,
+                UserRole.role_type == conflicting,
+            )
+        )).scalar_one_or_none()
+        if has_conflict is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "dealer_facilitator_exclusive",
+                    "message": (
+                        f"You already hold the {conflicting.value} role. "
+                        f"A single user cannot be both a Dealer and a "
+                        f"Facilitator — they sit on opposite ends of the "
+                        f"order-routing chain. Ability to end a role "
+                        f"voluntarily is coming in a future update."
+                    ),
+                    "current_role": conflicting.value,
+                    "requested_role": role_type.value,
+                },
+            )
+
     existing = (await db.execute(
         select(UserRole).where(
             UserRole.user_id == current_user.id,
