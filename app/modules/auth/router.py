@@ -638,6 +638,13 @@ async def get_me(request: Request, current_user: User = Depends(get_current_user
         # "Open my Shop / Set up →" instead of "Switch to my
         # Shop" until the setup is finished.
         "dealer_profile_complete": await _is_dealer_profile_complete(db, current_user.id),
+        # 2026-06-24 — Live pricing exposed so the PWA can render
+        # the actual amount in confirm / payment screens instead of
+        # the hardcoded "Rs. 199". Server is the source of truth;
+        # PWA reads these on /auth/me load and feeds them into the
+        # subscribe + ask-expert i18n templates.
+        "subscription_amount_inr": settings.subscription_amount_paise // 100,
+        "query_amount_inr": settings.query_amount_paise // 100,
     }
 
 

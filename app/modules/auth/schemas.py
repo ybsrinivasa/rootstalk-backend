@@ -75,6 +75,10 @@ class UserOut(BaseModel):
     # from the response — easy trap.
     facilitator_declared_at: Optional[datetime] = None
     dealer_profile_complete: bool = False
+    # 2026-06-24 — Server-driven price so PWA stops hardcoding "₹199" /
+    # "₹20" in i18n strings. Defaults match production values.
+    subscription_amount_inr: int = 199
+    query_amount_inr: int = 20
 
     class Config:
         from_attributes = True

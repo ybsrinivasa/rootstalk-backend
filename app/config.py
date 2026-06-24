@@ -43,19 +43,31 @@ class Settings(BaseSettings):
     # this secret. Set in the Razorpay dashboard → Webhooks → Secret.
     razorpay_webhook_secret: str = ""
     razorpay_webhook_secret_test: str = ""
+    # 2026-06-24 — Independent Razorpay-mode toggle. Production picks
+    # live keys automatically (environment == "production"). Setting
+    # RAZORPAY_LIVE_MODE=true on staging/dev forces live keys without
+    # turning the whole environment into "production" (so dev_otp,
+    # CORS, frontend_base_url defaults, etc. stay staging-flavoured).
+    # Use case: testing demos that need a real Razorpay sheet (no
+    # "Test Mode" banner) while keeping every other staging affordance.
+    razorpay_live_mode: bool = False
+
+    @property
+    def _razorpay_use_live(self) -> bool:
+        return self.environment == "production" or self.razorpay_live_mode
 
     @property
     def razorpay_active_key_id(self) -> str:
-        return self.razorpay_key_id if self.environment == "production" else self.razorpay_key_id_test
+        return self.razorpay_key_id if self._razorpay_use_live else self.razorpay_key_id_test
 
     @property
     def razorpay_active_key_secret(self) -> str:
-        return self.razorpay_key_secret if self.environment == "production" else self.razorpay_key_secret_test
+        return self.razorpay_key_secret if self._razorpay_use_live else self.razorpay_key_secret_test
 
     @property
     def razorpay_active_webhook_secret(self) -> str:
         return (
-            self.razorpay_webhook_secret if self.environment == "production"
+            self.razorpay_webhook_secret if self._razorpay_use_live
             else self.razorpay_webhook_secret_test
         )
 
