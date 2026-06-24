@@ -50,7 +50,8 @@ from app.services.bl11_subscription_state import (
     DEALER as BL11_DEALER, validate_transition as validate_sub_transition,
 )
 from app.services.fcm_service import send_fcm
-from app.services.payment_service import SUBSCRIPTION_AMOUNT_PAISE, _client
+from app.config import settings
+from app.services.payment_service import _client
 
 logger = logging.getLogger(__name__)
 
@@ -103,12 +104,13 @@ async def _reconcile_share_link_payments_with_session(
                 continue   # webhook arrived in parallel; nothing to do.
 
             # Amount sanity check — same defence as the webhook handler.
-            if int(link.get("amount", 0)) != SUBSCRIPTION_AMOUNT_PAISE:
+            expected_amount = settings.subscription_amount_paise
+            if int(link.get("amount", 0)) != expected_amount:
                 logger.warning(
                     "share-link reconcile: amount mismatch on link %s "
                     "(razorpay=%s, expected=%s) — skipping",
                     pr.razorpay_payment_link_id,
-                    link.get("amount"), SUBSCRIPTION_AMOUNT_PAISE,
+                    link.get("amount"), expected_amount,
                 )
                 continue
 

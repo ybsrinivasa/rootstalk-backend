@@ -87,10 +87,14 @@ async def _holder_role(
 QUERY_EXPIRE_DAYS = 2
 
 # Per-(farmer, client) free quota. The 7th and later queries cost
-# `QUERY_AMOUNT_PAISE` (₹20). Single source of truth lives in
-# `app.services.payment_service.QUERY_AMOUNT_PAISE`.
+# `settings.query_amount_paise` (₹20 prod, ₹1 testing via .env). Single
+# source of truth lives in `app.config.settings.query_amount_paise`.
 FREE_QUERIES_PER_COMPANY = 6
-from app.services.payment_service import QUERY_AMOUNT_PAISE as QUERY_PAID_PRICE_PAISE  # noqa: E402
+# Helper to keep call sites tight. Reads settings at call time so an
+# env edit + restart picks up cleanly (no module-load capture).
+def _query_paid_price_paise() -> int:
+    from app.config import settings as _s
+    return _s.query_amount_paise
 
 # IST offset for the end-of-Day-2 expiry calc. The farmer's calendar
 # day is what matters here, not UTC — a query submitted just before
@@ -664,7 +668,7 @@ async def init_query_payment(
     sheet in that case. The order is created with a receipt that
     binds the farmer + client; the verify path on POST
     /farmer/queries cross-checks the order amount matches
-    QUERY_AMOUNT_PAISE so a tampered front-end can't downgrade.
+    settings.query_amount_paise so a tampered front-end can't downgrade.
     """
     used = (await db.execute(
         select(func.count()).select_from(Query).where(
@@ -790,16 +794,17 @@ async def submit_query(
                 request.razorpay_signature,
             ])
             if not all_present:
+                paid_paise = _query_paid_price_paise()
                 raise HTTPException(
                     status_code=402,
                     detail={
                         "code": "payment_required",
                         "message": (
                             f"You've used all {FREE_QUERIES_PER_COMPANY} free queries "
-                            f"for this company. Pay ₹{QUERY_PAID_PRICE_PAISE // 100} "
+                            f"for this company. Pay ₹{paid_paise // 100} "
                             f"to rootsTALK.in to submit this query."
                         ),
-                        "price_paise": QUERY_PAID_PRICE_PAISE,
+                        "price_paise": paid_paise,
                     },
                 )
             from app.services.payment_service import (
@@ -816,13 +821,14 @@ async def submit_query(
                             "message": "Payment signature verification failed."},
                 )
             # Defence in depth: the order's amount on Razorpay's side must
-            # match our locked ₹20 — guards against a tampered front-end
+            # match our locked price — guards against a tampered front-end
             # that mints a cheaper order id.
-            if fetch_order_amount_paise(request.razorpay_order_id) != QUERY_PAID_PRICE_PAISE:
+            expected_paise = _query_paid_price_paise()
+            if fetch_order_amount_paise(request.razorpay_order_id) != expected_paise:
                 raise HTTPException(
                     status_code=400,
                     detail={"code": "payment_amount_mismatch",
-                            "message": f"Order must be for ₹{QUERY_PAID_PRICE_PAISE // 100}."},
+                            "message": f"Order must be for ₹{expected_paise // 100}."},
                 )
             is_paid = True
 
@@ -944,7 +950,7 @@ async def get_query_quota(
         "used": used,
         "free_limit": FREE_QUERIES_PER_COMPANY,
         "free_remaining": free_remaining,
-        "price_paise": QUERY_PAID_PRICE_PAISE,
+        "price_paise": _query_paid_price_paise(),
         "next_query_is_paid": free_remaining == 0,
     }
 

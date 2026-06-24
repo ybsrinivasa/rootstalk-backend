@@ -67,6 +67,14 @@ class Settings(BaseSettings):
     draft_sms_sender_id: str = "EYFARM"
     draft_sms_base_url: str = "https://text.draft4sms.com/vb/apikey.php?"
 
+    # ── Pricing (paise, integer) — env-driven 2026-06-24 ──
+    # Defaults match production spec: ₹199 / subscription, ₹20 / expert query.
+    # Testing overrides via .env so demos can transact for ₹1. All three live
+    # in one place so a single config edit moves all surfaces (Razorpay order
+    # amount, pool-formula per-unit, /assignment subscription_price echo).
+    subscription_amount_paise: int = 199_00
+    query_amount_paise: int = 20_00
+
     # Email (for portal user credentials)
     email_smtp_host: str = "smtp.gmail.com"
     email_smtp_port: int = 587

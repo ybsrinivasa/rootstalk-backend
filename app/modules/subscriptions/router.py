@@ -160,8 +160,9 @@ async def get_pool_quote(
     the purchase. No DB writes; safe to call repeatedly.
     """
     from app.services.subscription_pricing import (
-        MAX_UNITS, MIN_UNITS, PER_UNIT_GROSS_PAISE, quote_for,
+        MAX_UNITS, MIN_UNITS, quote_for,
     )
+    from app.config import settings as _s
     try:
         q = quote_for(units)
     except ValueError as exc:
@@ -170,7 +171,7 @@ async def get_pool_quote(
     return {
         "client_id": client_id,
         "units": q.units,
-        "per_unit_gross_paise": PER_UNIT_GROSS_PAISE,
+        "per_unit_gross_paise": _s.subscription_amount_paise,
         "gross_paise": q.gross_paise,
         "discount_paise": q.discount_paise,
         "total_paise": q.total_paise,
@@ -2353,6 +2354,7 @@ async def get_assignment_details(
     current_user: User = Depends(get_current_user),
 ):
     """Returns full details of a pending assignment for farmer review."""
+    from app.config import settings
     sub = await _get_subscription(db, subscription_id, current_user.id)
 
     assignment = (await db.execute(
@@ -2414,7 +2416,7 @@ async def get_assignment_details(
         "parameter_variables": pv_summary,
         "promoter": {"name": promoter.name, "phone": promoter.phone} if promoter else None,
         "promoter_type": assignment.promoter_type.value if hasattr(assignment.promoter_type, "value") else assignment.promoter_type,
-        "subscription_price": 199,  # hardcoded for now
+        "subscription_price": settings.subscription_amount_paise // 100,
         "paid_by_company": True,
     }
 
@@ -3592,12 +3594,13 @@ async def razorpay_webhook(
 
     Reconciliation: each Payment Link carries our row id in
     `notes.payment_request_id`, so the lookup is one-shot. We also
-    sanity-check the embedded amount matches `SUBSCRIPTION_AMOUNT_PAISE`
-    and fail (with 400 to skip activation) on mismatch — defends
-    against signed payloads that don't match our pricing.
+    sanity-check the embedded amount matches
+    `settings.subscription_amount_paise` and fail (with 400 to skip
+    activation) on mismatch — defends against signed payloads that
+    don't match our pricing.
     """
     from app.services.payment_service import verify_webhook_signature
-    from app.services.payment_service import SUBSCRIPTION_AMOUNT_PAISE
+    from app.config import settings as _s
     from app.modules.platform.models import User as PlatformUser
     from app.services.fcm_service import send_fcm
 
@@ -3638,10 +3641,11 @@ async def razorpay_webhook(
     if event == "payment_link.paid":
         # Defence: amount sanity check.
         link_amount = int(entity.get("amount", 0))
-        if link_amount != SUBSCRIPTION_AMOUNT_PAISE:
+        expected = _s.subscription_amount_paise
+        if link_amount != expected:
             raise HTTPException(
                 status_code=400,
-                detail=f"Amount mismatch: expected {SUBSCRIPTION_AMOUNT_PAISE}, got {link_amount}",
+                detail=f"Amount mismatch: expected {expected}, got {link_amount}",
             )
 
         payment_entity = (

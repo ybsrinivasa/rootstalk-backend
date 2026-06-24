@@ -21,9 +21,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 
+from app.config import settings
 
-# Per-unit gross price (₹199 = 19,900 paise).
-PER_UNIT_GROSS_PAISE: int = 199_00
+
+# Per-unit gross price — env-driven via settings.subscription_amount_paise.
+# Default ₹199 (= 19,900 paise) matches the production spec; testing .env
+# overrides to ₹1 so demos can transact without real money. Read at call
+# time (not module load) so .env changes pick up on container restart.
+def _per_unit_gross_paise() -> int:
+    return settings.subscription_amount_paise
 
 # Discount formula constants. Held as Decimal for stable rounding behaviour
 # across platforms / Python versions.
@@ -63,7 +69,7 @@ def quote_for(units: int) -> Quote:
     if units > MAX_UNITS:
         raise ValueError(f"units must not exceed {MAX_UNITS}")
 
-    gross_paise = units * PER_UNIT_GROSS_PAISE
+    gross_paise = units * _per_unit_gross_paise()
 
     # 0.5 × N^1.4887593, evaluated as Decimal then rounded to two decimal
     # places (paise). Decimal's `power` is exact-ish; convert to float only

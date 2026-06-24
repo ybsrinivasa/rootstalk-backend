@@ -4,8 +4,9 @@ import hashlib
 import razorpay
 from app.config import settings
 
-SUBSCRIPTION_AMOUNT_PAISE = 19900  # Rs. 199.00
-QUERY_AMOUNT_PAISE = 2000          # Rs. 20.00 (locked 2026-05-27 per spec)
+# 2026-06-24 — Amounts are env-driven via settings.
+# Production: ₹199 / ₹20. Testing: ₹1 / ₹1 via .env override.
+# See app/config.py::subscription_amount_paise + query_amount_paise.
 
 
 def _client() -> razorpay.Client:
@@ -16,17 +17,18 @@ def _client() -> razorpay.Client:
 
 
 def create_subscription_order(receipt: str) -> dict:
-    """Create a RazorPay order for Rs. 199 subscription fee. Returns order details."""
+    """Create a RazorPay order for the subscription fee. Returns order details."""
     client = _client()
+    amount = settings.subscription_amount_paise
     order = client.order.create({
-        "amount": SUBSCRIPTION_AMOUNT_PAISE,
+        "amount": amount,
         "currency": "INR",
         "receipt": receipt,
         "notes": {"purpose": "RootsTalk Subscription"},
     })
     return {
         "razorpay_order_id": order["id"],
-        "amount": SUBSCRIPTION_AMOUNT_PAISE,
+        "amount": amount,
         "currency": "INR",
         "key_id": settings.razorpay_active_key_id,
     }
@@ -72,17 +74,18 @@ def fetch_order_amount_paise(razorpay_order_id: str) -> int:
 
 
 def create_query_order(receipt: str) -> dict:
-    """Create a RazorPay order for Rs. 25 expert query fee."""
+    """Create a RazorPay order for the expert query fee."""
     client = _client()
+    amount = settings.query_amount_paise
     order = client.order.create({
-        "amount": QUERY_AMOUNT_PAISE,
+        "amount": amount,
         "currency": "INR",
         "receipt": receipt,
         "notes": {"purpose": "RootsTalk Expert Query"},
     })
     return {
         "razorpay_order_id": order["id"],
-        "amount": QUERY_AMOUNT_PAISE,
+        "amount": amount,
         "currency": "INR",
         "key_id": settings.razorpay_active_key_id,
     }
@@ -111,7 +114,7 @@ def create_subscription_payment_link(
     'https://rzp.io/i/xxx').
 
     Constraints encoded in the request:
-      • fixed amount of ₹199 (paise = SUBSCRIPTION_AMOUNT_PAISE)
+      • amount = settings.subscription_amount_paise (₹199 prod, ₹1 test)
       • accept_partial=false (no part-pays)
       • expire_by = now + expire_in_seconds (matches our
         SubscriptionPaymentRequest.expires_at so both sides time
@@ -122,7 +125,7 @@ def create_subscription_payment_link(
     import time
     client = _client()
     body = {
-        "amount": SUBSCRIPTION_AMOUNT_PAISE,
+        "amount": settings.subscription_amount_paise,
         "currency": "INR",
         "accept_partial": False,
         "description": "RootsTalk Subscription",
