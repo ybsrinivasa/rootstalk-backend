@@ -29,17 +29,20 @@ router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 def _surface_dev_otp() -> bool:
     """Return True when the OTP response should include the raw code
-    for test convenience. Production NEVER leaks codes; every other
-    environment (development, staging, anything not "production")
-    does — the testing server is team-only, SMS/SMTP gateways may
-    not be wired or may silently drop messages, and waiting on a
-    real SMS to test login is a perpetual blocker.
+    for test convenience. Production NEVER leaks codes regardless of
+    flag; every other environment defers to settings.surface_dev_otp
+    (default True for legacy staging behaviour).
 
     2026-05-20: broadened from `settings.environment == "development"`
-    so the testing server (ENVIRONMENT=staging) surfaces dev_otp
-    too. Production behaviour is unchanged.
+    to non-production so testing surfaced dev_otp.
+    2026-06-24: gated on settings.surface_dev_otp so testing can opt
+    out for demos (real SMS-only) without flipping ENVIRONMENT off
+    staging — keeps CORS, dev defaults, the staging-bypass button,
+    etc. intact.
     """
-    return settings.environment != "production"
+    if settings.environment == "production":
+        return False
+    return settings.surface_dev_otp
 
 
 async def _check_client_user(db: AsyncSession, user: User, short_name: str) -> Client:

@@ -131,6 +131,14 @@ class Settings(BaseSettings):
     # Environment
     environment: str = "development"
 
+    # 2026-06-24 — Opt-out for the staging dev_otp leak. Default True
+    # preserves legacy staging behaviour (dev_otp in response). Setting
+    # SURFACE_DEV_OTP=false on the testing .env makes staging behave
+    # like production for OTP only — SMS-only, no dev_otp in response —
+    # so demos read realistically. Production NEVER surfaces dev_otp
+    # regardless of this flag (see _surface_dev_otp).
+    surface_dev_otp: bool = True
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
