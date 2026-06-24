@@ -48,10 +48,17 @@ async def send_sms(phone: str, message: str) -> bool:
 
 async def send_otp_sms(phone: str, otp_code: str) -> bool:
     """
-    Send OTP via Draft4SMS. Wraps `send_sms` with the standard OTP body.
-    Phone should be a 10-digit Indian mobile number (without country code).
-    The API prepends +91 automatically for Indian numbers.
+    Send OTP via Draft4SMS. Wraps `send_sms` with the DLT-registered OTP
+    template body. The text below MUST stay byte-identical to the
+    template registered with Neytiri Eywafarm Agritech Private Limited
+    on the TRAI DLT registry — operators silently drop any message
+    whose body diverges from the registered template (single character
+    differences are enough to fail the match). The `{#var#}` slot in
+    the DLT-registered template is the OTP code.
+
+    Phone should be a 10-digit Indian mobile number (without country
+    code). The API prepends +91 automatically for Indian numbers.
     Returns True on success, False on failure.
     """
-    message = f"Your RootsTalk sign-in code is {otp_code}. Valid for 10 minutes. Do not share this code. -EYFARM"
+    message = f"Your mobile OTP is {otp_code} for registering on RootsTalk. Thank you! NEYTIRI EYWAFARM AGRITECH PRIVATE LIMITED"
     return await send_sms(phone, message)
