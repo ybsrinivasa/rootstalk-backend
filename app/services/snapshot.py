@@ -132,6 +132,22 @@ async def serialise_timeline(db: AsyncSession, timeline_id: str) -> dict:
             )
         ).scalars().all()
 
+    # 2026-06-26 — Capture RelationConditional bindings (BL-19 §6.4).
+    # When the SE binds an entire Relation to a CQ answer (rather than
+    # binding each member Practice individually via PracticeConditional),
+    # this is where the binding lives. The renderer expands each row
+    # into per-member virtual PracticeConditional links so the existing
+    # BL-02 filter gates the whole Relation uniformly.
+    relation_conditional_links = []
+    if relation_ids:
+        relation_conditional_links = (
+            await db.execute(
+                select(RelationConditional).where(
+                    RelationConditional.relation_id.in_(relation_ids)
+                )
+            )
+        ).scalars().all()
+
     return {
         "schema_version": SCHEMA_VERSION,
         "source": "CCA",
@@ -193,6 +209,15 @@ async def serialise_timeline(db: AsyncSession, timeline_id: str) -> dict:
                 "answer": _enum_value(pc.answer),
             }
             for pc in conditional_links
+        ],
+        # 2026-06-26 — Per-Relation CQ bindings (BL-19 §6.4 + audit 3).
+        "relation_conditional_links": [
+            {
+                "relation_id": rc.relation_id,
+                "question_id": rc.question_id,
+                "answer": _enum_value(rc.answer),
+            }
+            for rc in relation_conditional_links
         ],
     }
 

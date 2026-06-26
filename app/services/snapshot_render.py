@@ -186,6 +186,25 @@ def render_cca_from_content(
         if l.get("practice_id") and l.get("question_id")
     ]
 
+    # 2026-06-26 (BL-19 audit 3): Expand per-Relation CQ bindings into
+    # virtual per-Practice links so BL-02 gates every member of a
+    # bound Relation uniformly. The whole Relation goes on / off as a
+    # unit — consistent with the authoring stance that an AND / OR /
+    # complex Relation is a single conditional construct.
+    practices_by_relation: dict[str, list[str]] = {}
+    for p in practices:
+        rid = p.get("relation_id")
+        if rid and p.get("id"):
+            practices_by_relation.setdefault(rid, []).append(p["id"])
+    for rl in (content.get("relation_conditional_links") or []):
+        rid = rl.get("relation_id")
+        qid = rl.get("question_id")
+        ans = str(rl.get("answer", ""))
+        if not (rid and qid):
+            continue
+        for pid in practices_by_relation.get(rid, []):
+            practice_links.append(PCL(pid, qid, ans))
+
     bl02_result = filter_practices_by_conditionals(
         all_practice_ids=all_practice_ids,
         questions=questions,
