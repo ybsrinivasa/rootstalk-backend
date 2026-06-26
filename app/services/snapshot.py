@@ -31,7 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.advisory.models import (
     Timeline, Practice, Element, Relation,
-    ConditionalQuestion, PracticeConditional,
+    ConditionalQuestion, PracticeConditional, RelationConditional,
 )
 from app.modules.subscriptions.snapshot_models import LockedTimelineSnapshot
 
