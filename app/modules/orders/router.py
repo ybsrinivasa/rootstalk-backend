@@ -3126,6 +3126,93 @@ async def check_duplicate(
     }
 
 
+@router.post("/dealer/orders/{order_id}/relations/{relation_id}/parts/{part_index}/reset")
+async def reset_relation_part(
+    order_id: str, relation_id: str, part_index: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Reset every item in a (relation, part) back to PENDING.
+
+    Used by the per-item OR rendering on the dealer page: once the
+    dealer has marked an item AVAILABLE in an OR group (which cascades
+    siblings to NOT_AVAILABLE via `mark_item_available`), they can
+    tap "Change selection" to re-open the whole group for decision.
+
+    BL-10 already allows (AVAILABLE | POSTPONED | NOT_AVAILABLE) →
+    PENDING for DEALER on each item, so this is a thin wrapper that
+    walks the items in the part. Brand / volume / price on previously
+    AVAILABLE rows are cleared so the dealer starts from a clean
+    slate.
+
+    Only valid while the order is still in PROCESSING — once the
+    order has moved to SENT_FOR_APPROVAL the decisions are with the
+    farmer.
+    """
+    from app.services.relations import decode_role
+
+    await _assert_active_dealer(db, current_user.id)
+    order = await _get_dealer_order(db, order_id, current_user.id)
+    if order.status != OrderStatus.PROCESSING:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_code": "ORDER_NOT_PROCESSING",
+                "message": (
+                    "This order has already moved past the dealer's "
+                    "decision phase. The reset is only available while "
+                    "the order is being processed."
+                ),
+            },
+        )
+
+    items = (await db.execute(
+        select(OrderItem).where(
+            OrderItem.order_id == order_id,
+            OrderItem.relation_id == relation_id,
+        )
+    )).scalars().all()
+    if not items:
+        raise HTTPException(status_code=404, detail="Relation not in this order")
+
+    reset_count = 0
+    for item in items:
+        if not item.relation_role:
+            continue
+        try:
+            coords = decode_role(item.relation_role)
+        except ValueError:
+            continue
+        if coords.part != part_index:
+            continue
+        prev_status = item.status.value if hasattr(item.status, "value") else item.status
+        if prev_status not in ("AVAILABLE", "POSTPONED", "NOT_AVAILABLE"):
+            continue
+        res = validate_item_transition(item.status, OrderItemStatus.PENDING.value, DEALER)
+        if not res.allowed:
+            continue
+        if prev_status == "AVAILABLE":
+            item.brand_cosh_id = None
+            item.brand_name = None
+            item.given_volume = None
+            item.volume_unit = None
+            item.price = None
+        item.status = OrderItemStatus.PENDING
+        await _record_event(
+            db, lineage_id=item.lineage_id,
+            event_type="RESET_TO_PENDING",
+            actor_user_id=current_user.id, actor_role="DEALER",
+            order_id=order_id, order_item_id=item.id,
+            prev_status=prev_status, new_status=OrderItemStatus.PENDING.value,
+            metadata={"relation_id": relation_id, "part_index": part_index},
+        )
+        reset_count += 1
+
+    await _update_order_status(db, order_id)
+    await db.commit()
+    return {"relation_id": relation_id, "part_index": part_index, "reset": reset_count}
+
+
 @router.post("/dealer/orders/{order_id}/relations/{relation_id}/parts/{part_index}/mark-option-not-available")
 async def mark_option_not_available(
     order_id: str, relation_id: str, part_index: int,
