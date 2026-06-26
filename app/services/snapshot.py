@@ -205,9 +205,7 @@ async def serialise_cha_timeline(
     """Serialise a CHA / Q&A timeline + its children. `source` must be
     'PG', 'SP', or 'QA'.
 
-    CHA / QA practices currently have no relations / conditional
-    questions in the schema — only practices + elements. CHA / QA
-    snapshot dates anchor to triggered_at (stored on the
+    CHA / QA snapshot dates anchor to triggered_at (stored on the
     TriggeredCHAEntry, not in the snapshot) and do NOT shift with
     crop_start (Rule 3, second clause).
 
@@ -216,6 +214,17 @@ async def serialise_cha_timeline(
     LockedTimelineSnapshot's `source` discriminator distinguishes
     Q&A-rooted from PG-rooted snapshots even though they're stored
     in the same tables.
+
+    2026-06-26 (Phase 3 audit 1): CHA / QA timelines DO use Practice
+    Relations — the authoring side mounts `<RelationsSection>` on the
+    CHA editor pages. Earlier this serialiser stripped relation_id /
+    relation_role and shipped an empty relations array, so any
+    authored Relation on a CHA / QA timeline was invisible to the
+    farmer at render time (BL-19 violation). Now mirrored against the
+    CCA path: capture per-practice role + serialise the Relation rows
+    themselves. PracticeConditional bindings are still excluded for
+    CHA / QA — those pipes don't surface in-flow conditional questions
+    (CCA-only).
 
     Raises ValueError on bad source or missing timeline.
     """
@@ -257,6 +266,19 @@ async def serialise_cha_timeline(
     for e in elements:
         elements_by_practice.setdefault(e.practice_id, []).append(e)
 
+    # 2026-06-26 — Capture Practice Relations on CHA / QA timelines.
+    # Mirrors `serialise_timeline` (CCA). PracticeConditional links are
+    # intentionally NOT captured here — CHA / QA pipes don't run the
+    # in-flow conditional-question flow.
+    relation_ids = list({p.relation_id for p in practices if p.relation_id})
+    relations: list[Relation] = []
+    if relation_ids:
+        relations = (
+            await db.execute(
+                select(Relation).where(Relation.id.in_(relation_ids))
+            )
+        ).scalars().all()
+
     return {
         "schema_version": SCHEMA_VERSION,
         "source": source,  # "PG" or "SP"
@@ -277,6 +299,9 @@ async def serialise_cha_timeline(
                 "display_order": _int_or(p.display_order),
                 "is_special_input": bool(getattr(p, "is_special_input", False)),
                 "frequency_days": _int_or_none(getattr(p, "frequency_days", None)),
+                # 2026-06-26 — relation membership preserved
+                "relation_id": p.relation_id,
+                "relation_role": p.relation_role,
                 "elements": [
                     {
                         "id": e.id,
@@ -291,9 +316,17 @@ async def serialise_cha_timeline(
             }
             for p in practices
         ],
-        # CHA practices currently carry no relations / conditional questions.
-        # Kept as empty arrays so the renderer can use the same shape uniformly.
-        "relations": [],
+        # 2026-06-26 — Relations on CHA / QA timelines are now serialised.
+        # Conditional questions stay empty: CHA / QA pipes don't surface
+        # in-flow CQs (CCA-only).
+        "relations": [
+            {
+                "id": r.id,
+                "relation_type": _enum_value(r.relation_type),
+                "expression": r.expression,
+            }
+            for r in relations
+        ],
         "conditional_questions": [],
         "conditional_links": [],
     }

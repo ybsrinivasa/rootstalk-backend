@@ -261,9 +261,24 @@ def render_cca_from_content(
 
 
 def render_cha_from_content(content: dict) -> list[PStub]:
-    """CHA practices have no relations / conditional questions in the schema —
-    just convert each practice + its elements directly into a PStub."""
+    """Convert CHA / QA snapshot practices into PStubs.
+
+    2026-06-26 (BL-19 Phase 3 audit 1): CHA / QA timelines DO carry
+    Practice Relations (the authoring side mounts <RelationsSection>
+    on every CHA editor page). The serialiser now ships
+    `relation_id` / `relation_role` per practice + a top-level
+    `relations` array carrying each Relation's `relation_type`.
+    This renderer mirrors `render_cca_from_content` on that data so
+    the same RelationGroup rendering kicks in for CHA-authored and
+    QA-authored Relations. Conditional questions remain a CCA-only
+    concept — CHA / QA pipes don't surface them in-flow.
+    """
     practices = content.get("practices") or []
+    rel_type_map = {
+        r["id"]: r.get("relation_type")
+        for r in (content.get("relations") or [])
+        if "id" in r
+    }
     return [
         PStub(
             id=p["id"],
@@ -272,7 +287,12 @@ def render_cha_from_content(content: dict) -> list[PStub]:
             l2_type=p.get("l2_type"),
             display_order=int(p.get("display_order", 0)),
             is_special_input=bool(p.get("is_special_input", False)),
-            relation_id=None,
+            relation_id=p.get("relation_id"),
+            relation_role=p.get("relation_role"),
+            relation_type=(
+                rel_type_map.get(p["relation_id"])
+                if p.get("relation_id") else None
+            ),
             elements=[
                 PEl(
                     element_type=str(e.get("element_type", "")),
