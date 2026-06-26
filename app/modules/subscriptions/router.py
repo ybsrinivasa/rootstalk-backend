@@ -4397,6 +4397,14 @@ async def get_dashboard_attention(
         for tl in day.get("timelines") or []:
             tl_practices = tl.get("practices") or []
             tl_has_active = False
+            # 2026-06-26 — OR groups collapse to ONE card on the
+            # farmer's advisory page (OR is a dealer-side substitution
+            # path, not a farming choice), so the attention count must
+            # treat the whole OR group as a single action item. AND
+            # groups stay per-practice — the farmer has N items to
+            # receive / use even when they show under one "Apply
+            # together" card. Standalones unchanged.
+            or_groups_active: set[str] = set()
             for p in tl_practices:
                 # 2026-06-20 — Count every unmarked + non-hidden practice
                 # visible today, INCLUDING INPUTs that haven't been
@@ -4407,9 +4415,18 @@ async def get_dashboard_attention(
                 # post-purchase on the advisory card; pre-purchase
                 # inputs count toward the badge but can only be cleared
                 # by ordering + completing the purchase flow.
-                if p.get("ack_status") == "ACTIVE":
-                    count += 1
-                    tl_has_active = True
+                if p.get("ack_status") != "ACTIVE":
+                    continue
+                tl_has_active = True
+                rel_id = p.get("relation_id")
+                rel_type = p.get("relation_type")
+                if rel_id and rel_type == "OR":
+                    # Dedup: each OR relation contributes 1, regardless
+                    # of how many siblings are still ACTIVE.
+                    if rel_id in or_groups_active:
+                        continue
+                    or_groups_active.add(rel_id)
+                count += 1
             if not tl_has_active:
                 continue
             tl_to_str = tl.get("to_date")
