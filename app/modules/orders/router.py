@@ -4672,6 +4672,13 @@ async def get_dealer_order(
             "relation_id": i.relation_id,
             "relation_type": i.relation_type,
             "relation_role": i.relation_role,
+            # 2026-06-26 — Per-item brand-lock flag so the dealer
+            # surface can show a quiet "Locked brand" indicator next
+            # to the leg's status. Sourced from Practice.is_brand_locked
+            # (BL-07). Per-Option `has_locked_brand` already exists
+            # on the parent Option but isn't fine-grained enough when
+            # an AND group mixes locked + free positions.
+            "is_brand_locked": bool(practice and practice.is_brand_locked),
             # Batch 26 — SE's authored guidance the dealer reads after
             # picking a brand: recommended dosage + unit, application
             # method, volume per plant (plant-wise only).
