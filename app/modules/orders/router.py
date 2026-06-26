@@ -3457,6 +3457,76 @@ async def mark_item_unavailable(
     return {"item_id": item_id, "status": item.status}
 
 
+@router.put("/dealer/orders/{order_id}/items/{item_id}/reset")
+async def reset_item(
+    order_id: str, item_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Per-item Change-selection endpoint (2026-06-26).
+
+    Flips a single item back to PENDING and clears the brand /
+    volume / price the dealer entered. Used by the "Change
+    selection" button on AVAILABLE standalone or AND-member cards
+    where there's no relation cascade to revert — just this one
+    card's decision.
+
+    For OR-related items (pure-OR or COMPLEX_OR), the frontend
+    routes Change selection through the part-level reset endpoint
+    instead, so the auto-cascaded siblings come back too.
+
+    BL-10 already permits AVAILABLE → PENDING for DEALER; we only
+    accept that source state here (a PENDING item has nothing to
+    reset; POSTPONED items reset via the existing /postpone undo
+    flow on the order-abort path; NOT_AVAILABLE items use the
+    Change-decision flow). Guarded on order.status == PROCESSING.
+    """
+    await _assert_active_dealer(db, current_user.id)
+    order = await _get_dealer_order(db, order_id, current_user.id)
+    if order.status != OrderStatus.PROCESSING:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_code": "ORDER_NOT_PROCESSING",
+                "message": (
+                    "This order has already moved past the dealer's "
+                    "decision phase."
+                ),
+            },
+        )
+    item = await _get_order_item(db, item_id, order_id)
+    prev_status = item.status.value if hasattr(item.status, "value") else item.status
+    if prev_status != "AVAILABLE":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_code": "ITEM_NOT_AVAILABLE",
+                "message": (
+                    "Only AVAILABLE items can be reset via this endpoint."
+                ),
+            },
+        )
+    res = validate_item_transition(item.status, OrderItemStatus.PENDING.value, DEALER)
+    if not res.allowed:
+        _raise_transition(res)
+    item.brand_cosh_id = None
+    item.brand_name = None
+    item.given_volume = None
+    item.volume_unit = None
+    item.price = None
+    item.status = OrderItemStatus.PENDING
+    await _record_event(
+        db, lineage_id=item.lineage_id,
+        event_type="RESET_TO_PENDING",
+        actor_user_id=current_user.id, actor_role="DEALER",
+        order_id=order_id, order_item_id=item.id,
+        prev_status=prev_status, new_status=OrderItemStatus.PENDING.value,
+    )
+    await _update_order_status(db, order_id)
+    await db.commit()
+    return {"item_id": item_id, "status": item.status}
+
+
 @router.put("/dealer/orders/{order_id}/submit-for-approval")
 async def submit_for_approval(
     order_id: str,
