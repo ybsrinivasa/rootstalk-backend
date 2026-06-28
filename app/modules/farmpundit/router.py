@@ -1512,8 +1512,14 @@ async def query_history(
     if not query_ids:
         return []
 
+    # 2026-06-28 — Soft-delete defense: join through Subscription so
+    # the listener filters queries from soft-deleted subscriptions out
+    # of the pundit's history tab too (mirror of /pundit/queries).
+    from app.modules.subscriptions.models import Subscription
     result = await db.execute(
-        select(Query).where(
+        select(Query)
+        .join(Subscription, Subscription.id == Query.subscription_id)
+        .where(
             Query.id.in_(query_ids),
             Query.status.in_([QueryStatus.RESPONDED, QueryStatus.REJECTED, QueryStatus.EXPIRED]),
         ).order_by(Query.created_at.desc())
