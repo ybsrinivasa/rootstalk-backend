@@ -3091,7 +3091,7 @@ async def list_subscriptions_for_cleanup(
     # district_cosh_id. Localise per the caller's language. Falls back
     # to the cosh_id on missing translation so the column never reads
     # blank.
-    from app.services.cosh_resolver import resolve_names_by_cosh_id
+    from app.services.i18n_cosh import resolve_names_by_cosh_id
     cosh_ids_to_resolve: set[str] = set()
     for p in pkgs:
         cid = getattr(p, "crop_cosh_id", None)
