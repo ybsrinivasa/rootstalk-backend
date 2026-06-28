@@ -3,9 +3,16 @@ BL-03 — Advisory Deduplication Engine
 Pure function service. No database access. Runs at render time.
 Spec: RootsTalk_Dev_BusinessLogic.pdf §BL-03
 """
+import re
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Optional
+
+
+# Parse a Practice.relation_role of the form `PART_n__OPT_m__POS_p`.
+# Used by the AND-atomicity post-pass to group same-Option positions
+# across the active timelines so we can restore partial suppressions.
+_ROLE_PARSER = re.compile(r"PART_(\d+)__OPT_(\d+)__POS_(\d+)")
 
 
 @dataclass
@@ -205,6 +212,43 @@ def deduplicate_advisory(
                                 reason="OVERLAP",
                             )
                         break  # Found governing match — move to next p_later
+
+    # 2026-06-28 — AND-atomicity post-pass.
+    # A compound Option (multiple positions sharing the same Part /
+    # Option in the relation_role) is atomic — every member is
+    # required together. If the main loop suppressed some but not all
+    # positions of a compound Option, the renderer would surface a
+    # broken group (e.g. AND { A, B } shrunk to just B, or
+    # (A + B) OR (C + D)'s first Option reduced to just B). That's a
+    # spec-breaking move: AND members carry joint obligation, not
+    # individual. Generic across AND / IF / Complex relations because
+    # the check operates on the role encoding, not on relation_type.
+    #
+    # Walk every (relation_id, part, option) group across the active
+    # timelines. If it's compound (> 1 positions) and only some
+    # positions are in the suppression set, restore them all — keeping
+    # the SE's structure intact at the cost of carrying a redundant
+    # identity-match into the order. Single-position Options
+    # (pure OR alternatives) are independent and skip this check.
+    option_groups: dict[tuple[str, int, int], list[str]] = {}
+    for tl in active_timelines:
+        for p in tl.practices:
+            if not p.relation_id or not p.relation_role:
+                continue
+            m = _ROLE_PARSER.match(p.relation_role)
+            if not m:
+                continue
+            part_idx, opt_idx = int(m.group(1)), int(m.group(2))
+            option_groups.setdefault(
+                (p.relation_id, part_idx, opt_idx), []
+            ).append(p.id)
+    for practice_ids in option_groups.values():
+        if len(practice_ids) <= 1:
+            continue
+        suppressed_in_group = [pid for pid in practice_ids if pid in suppression]
+        if 0 < len(suppressed_in_group) < len(practice_ids):
+            for pid in suppressed_in_group:
+                suppression.pop(pid, None)
 
     # Build result per timeline
     result = []
