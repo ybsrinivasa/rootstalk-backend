@@ -142,6 +142,46 @@ def deduplicate_advisory(
                         continue
 
                     if earlier_ref == later_ref:
+                        # 2026-06-28 — Standalone vs in-relation dedup
+                        # asymmetry: when one side belongs to a Relation
+                        # (AND / OR / IF) and the other is standalone,
+                        # always suppress the STANDALONE — regardless of
+                        # timeline order. In-relation members carry
+                        # semantic obligation (AND = required together;
+                        # OR = substitution alternative; IF = gated on a
+                        # conditional question). Removing an OR member
+                        # to keep its standalone twin shrinks the
+                        # dealer's flexibility and breaks the spec the
+                        # SE wrote. Two-standalone and two-in-relation
+                        # cases still use the existing earlier-governs
+                        # rule below.
+                        earlier_in_rel = p_earlier.relation_id is not None
+                        later_in_rel = p_later.relation_id is not None
+                        if earlier_in_rel != later_in_rel:
+                            standalone_side = (
+                                "earlier" if not earlier_in_rel else "later"
+                            )
+                            if standalone_side == "later":
+                                # Existing direction: suppress later.
+                                # Keep the purchased / closed nuance
+                                # below — drop through to the standard
+                                # branch unchanged.
+                                pass
+                            else:
+                                # New: suppress the EARLIER standalone.
+                                # The in-relation later member wins.
+                                # Don't `break` — p_later might still
+                                # be matched by another earlier
+                                # candidate (chain prevention catches
+                                # the already-suppressed p_earlier on
+                                # later iterations).
+                                suppression[p_earlier.id] = SuppressedPractice(
+                                    practice_id=p_earlier.id,
+                                    timeline_id=tl_earlier.id,
+                                    governing_timeline_id=tl_later.id,
+                                    reason="OVERLAP",
+                                )
+                                continue
                         # Same input found in earlier timeline — suppress later
                         # Determine reason and check reinstatement
                         if p_earlier.id in approved_practice_ids:
