@@ -40,6 +40,17 @@ from app.modules.seed_mgmt.router import router as seed_mgmt_router
 from app.modules.media.router import router as media_router
 from app.modules.rm.router import router as rm_router
 
+# 2026-06-28 — Subscription soft-delete read-path filter. Installs a
+# session-level SQLAlchemy listener that appends
+# `Subscription.deleted_at IS NULL` to every ORM SELECT involving
+# Subscription. The admin cleanup endpoint opts out with
+# `execution_options(include_deleted=True)`. See
+# app/modules/subscriptions/soft_delete.py.
+from app.modules.subscriptions.soft_delete import (
+    install_subscription_soft_delete_listener,
+)
+install_subscription_soft_delete_listener()
+
 app = FastAPI(
     title="RootsTalk API",
     version="1.0.0",

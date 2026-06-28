@@ -2993,3 +2993,279 @@ async def sa_subscription_mgmt_view(
         "grants_history": grants_history,
         "licenses_history": licenses_history,
     }
+
+
+# ── CA Admin: subscription cleanup (test-data clearance) ──────────────────────
+#
+# Time-sensitive surface added 2026-06-28: clients begin training in the
+# next 5-7 days and need a way to clear practice subscriptions they
+# create during training before going live. Decision (yesterday's memo):
+# - Soft delete only — `deleted_at` flag, no scheduled purge.
+# - Bound to CA Admin's `client_id` — no cross-tenant reach.
+# - User accounts left alone (platform-wide identity).
+# - "Hide everywhere" handled by the soft-delete event listener +
+#   manual sweep of direct-subscription_id queries on cascade tables.
+# - DPDP-triggered user erasure is a separate future workflow.
+
+
+async def _assert_ca_admin_or_cm_for_client(
+    db: AsyncSession, user_id: str, client_id: str,
+) -> None:
+    """Gate the cleanup endpoints to CA-role (or CM-EDIT impersonating
+    the CA via the login-as flow). 403 with stable `ca_admin_only`."""
+    cus = (await db.execute(
+        select(ClientUser).where(
+            ClientUser.user_id == user_id,
+            ClientUser.client_id == client_id,
+            ClientUser.status == StatusEnum.ACTIVE,
+        )
+    )).scalars().all()
+    if any(cu.role == ClientUserRole.CA for cu in cus):
+        return
+    cm = (await db.execute(
+        select(CMClientAssignment.id).where(
+            CMClientAssignment.cm_user_id == user_id,
+            CMClientAssignment.client_id == client_id,
+            CMClientAssignment.status == StatusEnum.ACTIVE,
+            CMClientAssignment.rights == CMRights.EDIT,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if cm is not None:
+        return
+    raise HTTPException(status_code=403, detail={
+        "code": "ca_admin_only",
+        "message": (
+            "Only the CA Admin (or a CM with edit rights for this "
+            "company) can clear subscriptions."
+        ),
+    })
+
+
+@router.get("/admin/client/{client_id}/subscriptions/cleanup")
+async def list_subscriptions_for_cleanup(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Rich subscription list for the CA Admin's cleanup screen.
+
+    Shows ALL lifecycle states (ACTIVE / LAPSED / CANCELLED /
+    UNSUBSCRIBED / WAITLISTED / SUSPENDED) — already-soft-deleted rows
+    are excluded by the soft-delete event listener so the list is
+    always "the live set the CA could clear next." Per-row columns:
+    reference_number, package_name, crop_name, acreage-or-plants
+    (formatted by measure), district/state, farmer name + phone,
+    created_at, in-flight counts (orders + queries).
+
+    Auth: CA (or CM-EDIT impersonator). Tenant-scoped to client_id.
+    """
+    await _assert_ca_admin_or_cm_for_client(db, current_user.id, client_id)
+
+    # 1. Pull subscriptions for this client.
+    subs = (await db.execute(
+        select(Subscription)
+        .where(Subscription.client_id == client_id)
+        .order_by(Subscription.created_at.desc())
+    )).scalars().all()
+    if not subs:
+        return []
+
+    sub_ids = [s.id for s in subs]
+    user_ids = list({s.farmer_user_id for s in subs})
+    package_ids = list({s.package_id for s in subs})
+
+    # 2. Farmer User rows (name + phone + location for state/district).
+    users = (await db.execute(
+        select(User).where(User.id.in_(user_ids))
+    )).scalars().all()
+    user_by_id = {u.id: u for u in users}
+
+    # 3. Package rows for the package name (+ crop reference).
+    pkgs = (await db.execute(
+        select(Package).where(Package.id.in_(package_ids))
+    )).scalars().all()
+    pkg_by_id = {p.id: p for p in pkgs}
+
+    # 4. Resolve crop names + farmer state/district via Cosh. Packages
+    # reference crop_cosh_id; users reference state_cosh_id /
+    # district_cosh_id. Localise per the caller's language. Falls back
+    # to the cosh_id on missing translation so the column never reads
+    # blank.
+    from app.services.cosh_resolver import resolve_names_by_cosh_id
+    cosh_ids_to_resolve: set[str] = set()
+    for p in pkgs:
+        cid = getattr(p, "crop_cosh_id", None)
+        if cid:
+            cosh_ids_to_resolve.add(cid)
+    for u in users:
+        for fld in ("state_cosh_id", "district_cosh_id"):
+            cid = getattr(u, fld, None)
+            if cid:
+                cosh_ids_to_resolve.add(cid)
+    lang = current_user.language_code or "en"
+    cosh_loc = await resolve_names_by_cosh_id(
+        db, cosh_ids_to_resolve, lang,
+    ) if cosh_ids_to_resolve else {}
+
+    # 5. In-flight order counts (active items, not archived). Cheap
+    # group-by per subscription.
+    from app.modules.orders.models import Order, OrderItem, OrderItemStatus
+    from sqlalchemy import func as sa_func
+    in_flight_states = (
+        OrderItemStatus.PENDING, OrderItemStatus.AVAILABLE,
+        OrderItemStatus.POSTPONED, OrderItemStatus.SENT_FOR_APPROVAL,
+        OrderItemStatus.NOT_AVAILABLE,
+    )
+    order_counts_rows = (await db.execute(
+        select(Order.subscription_id, sa_func.count(OrderItem.id))
+        .join(OrderItem, OrderItem.order_id == Order.id)
+        .where(
+            Order.subscription_id.in_(sub_ids),
+            OrderItem.status.in_(in_flight_states),
+            OrderItem.archived_at.is_(None),
+        )
+        .group_by(Order.subscription_id)
+    )).all()
+    orders_by_sub = {sid: n for sid, n in order_counts_rows}
+
+    # 6. Open pundit queries per subscription. NEW / FORWARDED /
+    # RETURNED are "still in flight" from the farmer's POV; responded /
+    # closed don't need surfacing here.
+    from app.modules.farmpundit.models import Query as PunditQuery, QueryStatus
+    open_query_states = (
+        QueryStatus.NEW.value, QueryStatus.FORWARDED.value,
+        QueryStatus.RETURNED.value,
+    )
+    query_counts_rows = (await db.execute(
+        select(PunditQuery.subscription_id, sa_func.count())
+        .where(
+            PunditQuery.subscription_id.in_(sub_ids),
+            PunditQuery.status.in_(open_query_states),
+        )
+        .group_by(PunditQuery.subscription_id)
+    )).all()
+    queries_by_sub = {sid: n for sid, n in query_counts_rows}
+
+    # 7. Compose rows.
+    out: list[dict] = []
+    for sub in subs:
+        farmer = user_by_id.get(sub.farmer_user_id)
+        pkg = pkg_by_id.get(sub.package_id)
+        # Package may be deleted/published variant — fall back to name
+        # only if present.
+        package_name = getattr(pkg, "name", None) if pkg else None
+        crop_cosh = getattr(pkg, "crop_cosh_id", None) if pkg else None
+        crop_name = (cosh_loc.get(crop_cosh) if crop_cosh else None) or crop_cosh
+        # Plant-wise vs area-wise scale label.
+        if sub.number_of_plants is not None:
+            scale_label = f"{sub.number_of_plants} plants"
+            if sub.planting_year:
+                scale_label += f" · planted {sub.planting_year}"
+        elif sub.farm_area_acres is not None:
+            unit = sub.area_unit or "acres"
+            scale_label = f"{float(sub.farm_area_acres):g} {unit}"
+        else:
+            scale_label = None
+        # Farmer location (district / state) lives on User as Cosh
+        # ids. Resolve via the localised map; fall back to the raw
+        # cosh_id then to None.
+        district_cid = getattr(farmer, "district_cosh_id", None) if farmer else None
+        state_cid = getattr(farmer, "state_cosh_id", None) if farmer else None
+        district = (cosh_loc.get(district_cid) if district_cid else None) or district_cid
+        state = (cosh_loc.get(state_cid) if state_cid else None) or state_cid
+        location_parts = [p for p in (district, state) if p]
+        location = ", ".join(location_parts) if location_parts else None
+
+        out.append({
+            "subscription_id": sub.id,
+            "reference_number": sub.reference_number,
+            "status": sub.status.value if hasattr(sub.status, "value") else sub.status,
+            "package_id": sub.package_id,
+            "package_name": package_name,
+            "crop_name": crop_name,
+            "scale_label": scale_label,
+            "location": location,
+            "farmer_user_id": sub.farmer_user_id,
+            "farmer_name": getattr(farmer, "name", None) if farmer else None,
+            "farmer_phone": getattr(farmer, "phone", None) if farmer else None,
+            "created_at": sub.created_at,
+            "in_flight_orders": orders_by_sub.get(sub.id, 0),
+            "in_flight_queries": queries_by_sub.get(sub.id, 0),
+        })
+    return out
+
+
+class BulkSoftDeleteRequest(BaseModel):
+    subscription_ids: list[str]
+    reason: Optional[str] = None
+
+
+@router.post("/admin/client/{client_id}/subscriptions/bulk-soft-delete")
+async def bulk_soft_delete_subscriptions(
+    client_id: str,
+    request: BulkSoftDeleteRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Stamp `deleted_at` + `deleted_by_user_id` on the given
+    subscription rows. Validates that every requested id belongs to
+    `client_id` — silently skips any that don't to prevent cross-tenant
+    leak (and reports the skipped count so the UI can flag it).
+
+    Idempotent on already-soft-deleted rows (no double-stamping;
+    counted as "skipped"). Returns a summary the UI can confirm.
+
+    Cascade strategy: we soft-delete ONLY the Subscription row. The
+    session-level event listener + the hot-read-path sweep makes the
+    cascade invisible without touching individual order / query / ack
+    rows. No purge job is scheduled — flag-and-stay per yesterday's
+    decision.
+    """
+    await _assert_ca_admin_or_cm_for_client(db, current_user.id, client_id)
+
+    if not request.subscription_ids:
+        raise HTTPException(status_code=422, detail={
+            "code": "no_subscriptions_selected",
+            "message": "Pick at least one subscription to clear.",
+        })
+
+    # Fetch only the subscriptions in this client's tenant. Cross-
+    # tenant ids silently miss the filter and surface as `skipped`.
+    # Opt into `include_deleted=True` so the listener doesn't hide
+    # already-soft-deleted rows from us — we want to report them as
+    # "already deleted" rather than as cross-tenant skips.
+    subs = (await db.execute(
+        select(Subscription).where(
+            Subscription.id.in_(request.subscription_ids),
+            Subscription.client_id == client_id,
+        )
+        .execution_options(include_deleted=True)
+    )).scalars().all()
+    found_ids = {s.id for s in subs}
+    skipped_cross_tenant = [
+        sid for sid in request.subscription_ids if sid not in found_ids
+    ]
+
+    now = datetime.now(timezone.utc)
+    soft_deleted: list[str] = []
+    already_deleted: list[str] = []
+    for sub in subs:
+        if sub.deleted_at is not None:
+            already_deleted.append(sub.id)
+            continue
+        sub.deleted_at = now
+        sub.deleted_by_user_id = current_user.id
+        soft_deleted.append(sub.id)
+
+    await db.commit()
+    return {
+        "soft_deleted_count": len(soft_deleted),
+        "soft_deleted_ids": soft_deleted,
+        "already_deleted_count": len(already_deleted),
+        "already_deleted_ids": already_deleted,
+        "skipped_cross_tenant_count": len(skipped_cross_tenant),
+        "skipped_cross_tenant_ids": skipped_cross_tenant,
+        "deleted_by_user_id": current_user.id,
+        "deleted_at": now.isoformat(),
+        "reason": request.reason,
+    }

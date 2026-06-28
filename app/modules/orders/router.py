@@ -2461,6 +2461,7 @@ async def list_dealer_orders(
     """
     from app.modules.clients.models import Client
     from app.modules.orders.models import BrandLookupCache
+    from app.modules.subscriptions.models import Subscription
 
     await _assert_active_dealer(db, current_user.id)
     base_where = [Order.dealer_user_id == current_user.id]
@@ -2468,10 +2469,14 @@ async def list_dealer_orders(
         base_where.append(Order.status.notin_([
             OrderStatus.CANCELLED, OrderStatus.EXPIRED,
         ]))
+    # 2026-06-28 — Soft-delete defense: join through Subscription so
+    # the auto-listener filters orders on soft-deleted subscriptions
+    # out of the dealer's feed.
     rows = (await db.execute(
         select(Order, User, Client)
         .join(User, User.id == Order.farmer_user_id)
         .join(Client, Client.id == Order.client_id)
+        .join(Subscription, Subscription.id == Order.subscription_id)
         .where(*base_where)
         .order_by(Order.created_at.desc())
     )).all()
@@ -3999,7 +4004,16 @@ async def list_facilitator_orders(
     card numbers reflect the actionable work, not the history.
     """
     await _assert_active_facilitator(db, current_user.id)
-    q = select(Order).where(Order.facilitator_user_id == current_user.id).order_by(Order.created_at.desc())
+    # 2026-06-28 — Soft-delete defense: join through Subscription so
+    # the listener filters orders on soft-deleted subscriptions out
+    # of the facilitator's queue.
+    from app.modules.subscriptions.models import Subscription
+    q = (
+        select(Order)
+        .join(Subscription, Subscription.id == Order.subscription_id)
+        .where(Order.facilitator_user_id == current_user.id)
+        .order_by(Order.created_at.desc())
+    )
     if status_filter:
         q = q.where(Order.status == status_filter)
     result = await db.execute(q)

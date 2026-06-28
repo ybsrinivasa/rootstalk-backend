@@ -118,6 +118,21 @@ class Subscription(Base):
     )
     subscription_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     lapsed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    # CA Admin test-data cleanup (2026-06-28). NULL = active; non-NULL
+    # = soft-deleted at that time. Read paths automatically filter
+    # `deleted_at IS NULL` via the session-level event listener in
+    # `app/modules/subscriptions/soft_delete.py`. Opt out with
+    # `execution_options(include_deleted=True)` — only the admin
+    # cleanup endpoint uses that. Cascade tables (orders, queries,
+    # acks, snapshots, etc.) inherit the filter via subscription joins
+    # where present; direct subscription_id queries need explicit
+    # filtering at the call site.
+    deleted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    deleted_by_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 

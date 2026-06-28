@@ -973,11 +973,18 @@ async def list_farmer_queries(
     Option A: "let the farmer see waitlisted / responded / closed
     queries from inside the subscription drill-down").
     """
+    # 2026-06-28 — Soft-delete defense: join through Subscription so
+    # the auto-listener filters queries on soft-deleted subscriptions
+    # out of the farmer's view. Without the join the cascade leak
+    # would surface CA-Admin-cleared subs back to the farmer.
+    from app.modules.subscriptions.models import Subscription
     where = [Query.farmer_user_id == current_user.id]
     if subscription_id is not None:
         where.append(Query.subscription_id == subscription_id)
     result = await db.execute(
-        select(Query).where(*where).order_by(Query.created_at.desc())
+        select(Query)
+        .join(Subscription, Subscription.id == Query.subscription_id)
+        .where(*where).order_by(Query.created_at.desc())
     )
     queries = result.scalars().all()
 
@@ -1104,8 +1111,14 @@ async def list_pundit_queries(
     shape served on /pundit/queries/history below.
     """
     profile = await _get_pundit_profile(db, current_user.id)
+    # 2026-06-28 — Soft-delete defense: join through Subscription so
+    # the listener filters queries originating from soft-deleted
+    # subscriptions out of the pundit's queue.
+    from app.modules.subscriptions.models import Subscription
     result = await db.execute(
-        select(Query).where(
+        select(Query)
+        .join(Subscription, Subscription.id == Query.subscription_id)
+        .where(
             Query.current_holder_id == profile.id,
             Query.status.in_([QueryStatus.NEW, QueryStatus.FORWARDED, QueryStatus.RETURNED]),
         ).order_by(Query.expires_at)
