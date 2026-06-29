@@ -98,6 +98,22 @@ _ITEM_TRANSITIONS: dict[tuple[str, str], frozenset[str]] = {
     # NOT_AVAILABLE while marking the chosen one AVAILABLE.
     ("AVAILABLE", "NOT_AVAILABLE"):          frozenset({DEALER}),
 
+    # 2026-06-29 — OR-group sibling-cascade closure. When the dealer
+    # marks one leg AVAILABLE, the other legs in the same Part of
+    # the OR group are auto-flipped to NOT_NEEDED — these are the
+    # alternatives the dealer didn't pick, NOT items they couldn't
+    # supply. NOT_NEEDED keeps them out of the farmer's "returned"
+    # bucket (no reroute prompt; the OR was satisfied by the chosen
+    # leg). Both PENDING-source and AVAILABLE-source edges land here
+    # to cover the edit-decision case (dealer changes their mind
+    # about which OR leg to give, the new pick cascades the previously
+    # AVAILABLE one to NOT_NEEDED).
+    ("PENDING", "NOT_NEEDED"):               frozenset({DEALER}),
+    ("AVAILABLE", "NOT_NEEDED"):             frozenset({DEALER}),
+    # And the dealer's Change-selection reset flips NOT_NEEDED back to
+    # PENDING so the OR group reopens for a fresh pick.
+    ("NOT_NEEDED", "PENDING"):               frozenset({DEALER}),
+
     # Edit / change-decision self-edges. Allow the dealer to re-save
     # the same item (Edit details) or flip a NOT_AVAILABLE back to
     # AVAILABLE ("actually I do have it now") before submission. The

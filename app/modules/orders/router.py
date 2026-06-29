@@ -2905,13 +2905,21 @@ async def mark_item_available(
                     s_coords = decode_role(sibling.relation_role)
                 except ValueError:
                     continue
-                # Same Part, different Option -> mark NOT_AVAILABLE (returned to farmer)
+                # 2026-06-29 — Same Part, different Option → mark
+                # NOT_NEEDED (was NOT_AVAILABLE before). These are the
+                # OR alternatives the dealer didn't pick — semantically
+                # "not needed because the chosen leg covers this," NOT
+                # "returned because dealer couldn't supply." Using
+                # NOT_NEEDED keeps them out of the farmer's Returned
+                # bucket + reroute prompts. The dealer-side render
+                # already treats both as "locked" (dimmed, read-only)
+                # so the UX there is unchanged.
                 if (
                     s_coords.part == my_coords.part
                     and s_coords.option != my_coords.option
                     and sibling.status == OrderItemStatus.PENDING
                 ):
-                    sibling.status = OrderItemStatus.NOT_AVAILABLE
+                    sibling.status = OrderItemStatus.NOT_NEEDED
                 # Same Part, same Option (compound AND) -> leave alone, dealer fills these
                 # Different Part -> leave alone, dealer processes that Part separately
         except ValueError:
@@ -2926,7 +2934,7 @@ async def mark_item_available(
                     )
                 )
                 for sibling in fb_result.scalars().all():
-                    sibling.status = OrderItemStatus.NOT_AVAILABLE
+                    sibling.status = OrderItemStatus.NOT_NEEDED
     elif item.relation_id and item.relation_type == "OR":
         # No relation_role at all (legacy data) — preserve original flat OR closure
         fb_result = await db.execute(
@@ -2938,7 +2946,7 @@ async def mark_item_available(
             )
         )
         for sibling in fb_result.scalars().all():
-            sibling.status = OrderItemStatus.NOT_AVAILABLE
+            sibling.status = OrderItemStatus.NOT_NEEDED
 
     # Batch 28 — drop the draft entry now that the item is committed.
     # Whole-dict reassignment so SQLAlchemy detects the JSON change.
@@ -3191,7 +3199,10 @@ async def reset_relation_part(
         if coords.part != part_index:
             continue
         prev_status = item.status.value if hasattr(item.status, "value") else item.status
-        if prev_status not in ("AVAILABLE", "POSTPONED", "NOT_AVAILABLE"):
+        # 2026-06-29 — Also reset NOT_NEEDED siblings so the OR-Part
+        # change-selection flow unwinds the cascade-set NOT_NEEDED
+        # rows back to PENDING.
+        if prev_status not in ("AVAILABLE", "POSTPONED", "NOT_AVAILABLE", "NOT_NEEDED"):
             continue
         res = validate_item_transition(item.status, OrderItemStatus.PENDING.value, DEALER)
         if not res.allowed:
