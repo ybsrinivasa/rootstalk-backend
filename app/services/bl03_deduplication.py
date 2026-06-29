@@ -126,8 +126,76 @@ def deduplicate_advisory(
     # Sort by (from_date, created_at) — deterministic, earlier governs
     sorted_tls = sorted(active_timelines, key=lambda t: (t.from_date, t.created_at))
 
+    # 2026-06-29 — Phase 2 precomputation.
+    # Per-(timeline, relation_id), classify the relation's STRUCTURE
+    # (AND / PURE_OR / COMPLEX_OR) and collect the identity set the
+    # relation contributes. Both feed the new in-relation-vs-in-relation
+    # rules below: "AND covers pure-OR" needs to know which side is
+    # which; "AND vs AND subset" needs identity sets to compare.
+    #
+    # Structure inferred from the role encoding (PART_n__OPT_m__POS_p):
+    #   - AND        : single Option, regardless of how many positions
+    #                  (single member or compound AND group).
+    #   - PURE_OR    : ≥ 2 Options, each with exactly 1 position.
+    #   - COMPLEX_OR : ≥ 2 Options, at least one with > 1 position.
+    #   - UNKNOWN    : malformed roles or empty.
+    relation_structure: dict[tuple[str, str], str] = {}
+    relation_identities: dict[tuple[str, str], frozenset[str]] = {}
+    for tl in active_timelines:
+        rel_ids = {p.relation_id for p in tl.practices if p.relation_id}
+        for rid in rel_ids:
+            options: dict[int, set[int]] = {}
+            idents: set[str] = set()
+            for p in tl.practices:
+                if p.relation_id != rid:
+                    continue
+                ref = p.primary_identity_ref()
+                if ref:
+                    idents.add(ref)
+                if not p.relation_role:
+                    continue
+                m = _ROLE_PARSER.match(p.relation_role)
+                if not m:
+                    continue
+                _part, opt, pos = m.groups()
+                options.setdefault(int(opt), set()).add(int(pos))
+            if not options:
+                struct = "UNKNOWN"
+            elif len(options) == 1:
+                struct = "AND"
+            elif all(len(positions) == 1 for positions in options.values()):
+                struct = "PURE_OR"
+            else:
+                struct = "COMPLEX_OR"
+            relation_structure[(tl.id, rid)] = struct
+            relation_identities[(tl.id, rid)] = frozenset(idents)
+
     # Build suppression map: {practice_id_in_later_tl → SuppressedPractice}
     suppression: dict[str, SuppressedPractice] = {}
+
+    def _suppress_whole_relation(
+        tl_target: TimelineWindow, relation_id: str,
+        governing_tl_id: str, reason: str = "OVERLAP",
+    ) -> None:
+        """Mark every INPUT practice in (tl_target, relation_id) as
+        suppressed by governing_tl_id. Used by Phase 2 rules where the
+        winning side absorbs the *entire* losing relation, not just
+        the matching member (AND-covers-pure-OR, AND-vs-AND subset)."""
+        for p in tl_target.practices:
+            if p.relation_id != relation_id:
+                continue
+            if p.l0_type != "INPUT":
+                continue
+            if p.is_special_input:
+                continue
+            if p.id in suppression:
+                continue
+            suppression[p.id] = SuppressedPractice(
+                practice_id=p.id,
+                timeline_id=tl_target.id,
+                governing_timeline_id=governing_tl_id,
+                reason=reason,
+            )
 
     for i, tl_later in enumerate(sorted_tls):
         for tl_earlier in sorted_tls[:i]:
@@ -201,6 +269,95 @@ def deduplicate_advisory(
                                     reason="OVERLAP",
                                 )
                                 continue
+                        elif earlier_in_rel and later_in_rel:
+                            # 2026-06-29 — Phase 2 in-relation-vs-in-relation
+                            # rules. Both sides belong to relations and
+                            # share an identity; the matching-pair has
+                            # been found. Apply structure-aware rules:
+                            earlier_struct = relation_structure.get(
+                                (tl_earlier.id, p_earlier.relation_id),
+                                "UNKNOWN",
+                            )
+                            later_struct = relation_structure.get(
+                                (tl_later.id, p_later.relation_id),
+                                "UNKNOWN",
+                            )
+                            # Rule: AND covers pure-OR. When an AND
+                            # member's identity appears in a pure-OR's
+                            # options, the AND is delivering that
+                            # identity anyway — the OR's flexibility is
+                            # moot, suppress the *entire* OR group so
+                            # the farmer pays for one OR card less.
+                            # Conservative: only fires for pure-OR
+                            # (single-position Options). Compound OR
+                            # options have their own atomic semantics
+                            # (e.g. (A+E) OR (C+D) — E is a real input
+                            # the farmer needs even when A is covered
+                            # by another timeline), so leave those to
+                            # the existing per-practice rule + AND
+                            # atomicity post-pass.
+                            if earlier_struct == "AND" and later_struct == "PURE_OR":
+                                _suppress_whole_relation(
+                                    tl_later, p_later.relation_id,
+                                    tl_earlier.id,
+                                )
+                                break
+                            if earlier_struct == "PURE_OR" and later_struct == "AND":
+                                _suppress_whole_relation(
+                                    tl_earlier, p_earlier.relation_id,
+                                    tl_later.id,
+                                )
+                                # The earlier OR is now suppressed.
+                                # p_later might still match other
+                                # candidates — keep iterating earlier.
+                                continue
+                            # Rule: AND vs AND subset. When two AND
+                            # groups share an identity AND one's full
+                            # identity set is a strict subset of the
+                            # other's, the superset covers the subset
+                            # — suppress the subset's whole AND. This
+                            # is the case the user listed as
+                            # "(A+B) vs (A+B+C)". When neither is a
+                            # subset (e.g. "(A+B) vs (A+C)"), we
+                            # deliberately do NOT suppress here — fall
+                            # through to the standard branch, which
+                            # would individually suppress the later
+                            # match, and then the AND-atomicity
+                            # post-pass restores it so both ANDs stay
+                            # whole. (User rule: "we cannot stop the
+                            # dealer giving A two times.")
+                            if earlier_struct == "AND" and later_struct == "AND":
+                                e_idents = relation_identities.get(
+                                    (tl_earlier.id, p_earlier.relation_id),
+                                    frozenset(),
+                                )
+                                l_idents = relation_identities.get(
+                                    (tl_later.id, p_later.relation_id),
+                                    frozenset(),
+                                )
+                                if (
+                                    e_idents and l_idents
+                                    and e_idents != l_idents
+                                ):
+                                    if e_idents.issubset(l_idents):
+                                        _suppress_whole_relation(
+                                            tl_earlier, p_earlier.relation_id,
+                                            tl_later.id,
+                                        )
+                                        continue
+                                    if l_idents.issubset(e_idents):
+                                        _suppress_whole_relation(
+                                            tl_later, p_later.relation_id,
+                                            tl_earlier.id,
+                                        )
+                                        break
+                            # Fall through for: AND vs AND (no subset)
+                            # — single match suppressed, AND atomicity
+                            # restores both.
+                            # OR vs OR — handled in Phase 2C
+                            # (merge), not here.
+                            # COMPLEX_OR involvement — fall through
+                            # to existing per-practice rule.
                         # Same input found in earlier timeline — suppress later
                         # Determine reason and check reinstatement
                         if p_earlier.id in approved_practice_ids:
