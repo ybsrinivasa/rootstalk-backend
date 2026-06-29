@@ -84,6 +84,18 @@ class DeduplicatedTimeline:
     timeline: TimelineWindow
     visible_practices: list[PracticeStub]
     suppressed: list[SuppressedPractice]
+    # 2026-06-29 — Phase 1 window absorption. When set, every INPUT
+    # practice that this timeline contributed was suppressed by
+    # matches in a single other timeline (the absorbing one). The
+    # renderer skips this TL entirely and unions its date window
+    # into the absorbing TL — surfacing the absorbing TL's
+    # spec across the merged span so the farmer doesn't see an
+    # empty "covered elsewhere" section in place of useful guidance.
+    # Only set when:
+    #   - the visible_practices list is empty, AND
+    #   - every suppression points to the same governing_timeline_id.
+    # Mixed-governor or has-residual-practices TLs stay rendered.
+    absorbed_into_tl_id: Optional[str] = None
 
 
 def deduplicate_advisory(
@@ -275,10 +287,28 @@ def deduplicate_advisory(
             if p.relation_id is None or p.relation_id in surviving_relations
         ]
 
+        # 2026-06-29 — Phase 1 absorption detection.
+        # A timeline is "fully absorbed" when (a) it contributes zero
+        # visible practices, AND (b) every suppression on this TL
+        # points to the same governing timeline. That governor is
+        # the absorbing TL; its window will be unioned to cover this
+        # TL's span by the today-advisory renderer, and this TL will
+        # be skipped from the output.
+        # Mixed governors (different suppressions land on different
+        # other TLs) — leave absorbed_into_tl_id None; the existing
+        # "Covered elsewhere" empty section will continue to render.
+        # Anything still visible — also None; the TL renders normally.
+        absorbed_into: Optional[str] = None
+        if not final_visible and tl_suppressed:
+            governors = {sp.governing_timeline_id for sp in tl_suppressed}
+            if len(governors) == 1:
+                absorbed_into = next(iter(governors))
+
         result.append(DeduplicatedTimeline(
             timeline=tl,
             visible_practices=final_visible,
             suppressed=tl_suppressed,
+            absorbed_into_tl_id=absorbed_into,
         ))
 
     return result

@@ -5222,6 +5222,46 @@ async def _today_advisory_for_user(
 
         deduped = deduplicate_advisory(tl_windows, approved_practice_ids=approved_ids)
 
+        # 2026-06-29 — Phase 1 window absorption.
+        # When BL-03 marks a TL as fully absorbed by another TL (every
+        # practice it had got suppressed by matches in the same other
+        # TL), the absorbing TL's effective window stretches to cover
+        # this TL's span — and this TL drops from the rendered output
+        # entirely. The principle, per user 2026-06-29: trust the SE's
+        # broader spec to cover the narrower one, and don't surface
+        # an empty "Covered elsewhere" section in place of useful
+        # guidance. If the absorbing TL was a context-only entry
+        # (loaded only because an APPROVED order references it), the
+        # absorption pulls it back into the renderable set so the
+        # extended window actually shows the OR / AND group whose
+        # match drove the suppression.
+        absorbed_skip: set[str] = set()
+        for dedup_tl in deduped:
+            if not dedup_tl.absorbed_into_tl_id:
+                continue
+            absorbing_id = dedup_tl.absorbed_into_tl_id
+            absorbed_id = dedup_tl.timeline.id
+            if absorbing_id not in tl_date_map:
+                # Absorber not in renderable date-map for any reason;
+                # skip the absorption to keep the absorbed TL visible
+                # (its "Covered elsewhere" empty state still beats a
+                # silent black hole).
+                continue
+            absorbed_from, absorbed_to, _abs_day = tl_date_map.get(
+                absorbed_id, (None, None, None),
+            )
+            absorbing_from, absorbing_to, abs_day = tl_date_map[absorbing_id]
+            if absorbed_from is not None and absorbed_to is not None:
+                merged_from = min(absorbing_from, absorbed_from)
+                merged_to   = max(absorbing_to, absorbed_to)
+                tl_date_map[absorbing_id] = (merged_from, merged_to, abs_day)
+            # If the absorber was context-only (not in window today by
+            # its master from/to), lift it back into the renderable
+            # set so the merged window actually shows.
+            if absorbing_id in context_render_ids:
+                context_render_ids.discard(absorbing_id)
+            absorbed_skip.add(absorbed_id)
+
         # ── Resolve cosh_ref / unit_cosh_id UUIDs → friendly names. ──────────
         # Elements that point at a Cosh Core (COMMON_NAME, APPLICATION_METHOD,
         # ITK_NAME, *_UNIT, …) store the selection as a Cosh UUID in either
@@ -5262,6 +5302,13 @@ async def _today_advisory_for_user(
             # purchased rule — they are NOT in tl_date_map and must not
             # render to the farmer.
             if tl.id in context_render_ids:
+                continue
+            # 2026-06-29 — Phase 1 window absorption: this TL was fully
+            # absorbed by another TL; its window has been merged into
+            # the absorbing TL's entry above. Drop it from the render
+            # so the farmer sees one extended section instead of an
+            # empty "Covered elsewhere" sibling.
+            if tl.id in absorbed_skip:
                 continue
             from_d, to_d, day_num = tl_date_map[tl.id]
             # Frequency filter: hide frequency-based practices that aren't due today.
