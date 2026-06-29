@@ -4758,10 +4758,36 @@ async def get_dealer_order(
             if hasattr(crop_start_date, "date") else crop_start_date
         )
 
+    # 2026-06-29 (Phase 3) — BL-03 window absorption applied at the
+    # order surface. When an item's timeline absorbed another timeline
+    # at advisory time (e.g. TL2's OR group absorbing TL1's standalone
+    # A), the dealer / farmer / facilitator should see the merged
+    # window on the item, not just the master from/to of TL2. Match
+    # the farmer's advisory view exactly.
+    from app.services.order_bundle import compute_absorption_extended_windows
+    from datetime import date as _date_cls
+    abs_today = _date_cls.today()
+    abs_to_d = order.date_to.date() if order.date_to and hasattr(order.date_to, "date") else (order.date_to or abs_today)
+    extended_windows: dict[str, tuple[_date_cls, _date_cls]] = {}
+    if sub_for_dates is not None:
+        try:
+            extended_windows = await compute_absorption_extended_windows(
+                db, subscription=sub_for_dates, today=abs_today, to_date=abs_to_d,
+            )
+        except Exception:
+            # Defensive: absorption is best-effort enrichment; never
+            # block the dealer order detail if it errors.
+            extended_windows = {}
+
     def _per_item_dates(it: OrderItem) -> tuple[str | None, str | None]:
         """Resolve (date_from, date_to) ISO strings for a single item.
         Returns (None, None) when the window isn't computable (no
-        crop_start_date for DAS/DBS, or CALENDAR not yet wired)."""
+        crop_start_date for DAS/DBS, or CALENDAR not yet wired).
+        2026-06-29: prefers absorption-extended window when this
+        item's timeline absorbed another at advisory time."""
+        if it.timeline_id and it.timeline_id in extended_windows:
+            df, dt_ = extended_windows[it.timeline_id]
+            return (df.isoformat(), dt_.isoformat())
         tl = timeline_map.get(it.timeline_id) if it.timeline_id else None
         if tl is None or crop_start_d is None:
             return (None, None)

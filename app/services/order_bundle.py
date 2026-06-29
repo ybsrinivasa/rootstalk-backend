@@ -487,6 +487,73 @@ async def dedup_filter_practice_ids(
     return {pid for pid in candidate_practice_ids if pid in surviving_ids}
 
 
+async def compute_absorption_extended_windows(
+    db: AsyncSession, *,
+    subscription: Subscription,
+    today: date,
+    to_date: date,
+) -> dict[str, tuple[date, date]]:
+    """2026-06-29 (Phase 3) — Return absorption-extended date windows
+    per timeline_id, considering BL-03's full window absorption logic
+    over the subscription's package + CHA timelines that overlap
+    [today, to_date].
+
+    Used by the order-detail endpoints (dealer / farmer / facilitator)
+    to surface application_date_from / application_date_to on items
+    consistent with what the farmer sees on the advisory after Phase 1
+    absorption. Without this, the dealer would see TL2's master
+    window (Day 1-3 = Jun 30 - Jul 2 for the user's test case) even
+    though the farmer's advisory shows TL2's absorbed window
+    (Day 0-3 = Jun 29 - Jul 2 — extended because TL1's standalone A
+    was absorbed by TL2's OR).
+
+    Returns: {timeline_id: (merged_from, merged_to)} only for TLs
+    that ABSORBED another TL. TLs that didn't absorb are absent;
+    callers should fall back to the master window in that case.
+
+    Empty map when `crop_start_date` is unset (no anchor) or no
+    absorption fires.
+    """
+    from app.services.bl03_deduplication import deduplicate_advisory
+    tl_windows = await _build_timeline_windows_for_dedup(
+        db, subscription=subscription, today=today, to_date=to_date,
+    )
+    if not tl_windows:
+        return {}
+    approved_rows = (await db.execute(
+        select(OrderItem.practice_id)
+        .join(Order, Order.id == OrderItem.order_id)
+        .where(
+            Order.subscription_id == subscription.id,
+            OrderItem.status == "APPROVED",
+        )
+    )).all()
+    approved_ids: set[str] = {r[0] for r in approved_rows if r[0]}
+    deduped = deduplicate_advisory(tl_windows, approved_practice_ids=approved_ids)
+    # Build the absorption map. For every TL that's absorbed_into
+    # another, union its window into the absorbing TL's entry.
+    tl_window_by_id = {tw.id: tw for tw in tl_windows}
+    extended: dict[str, tuple[date, date]] = {}
+    for dt in deduped:
+        if not dt.absorbed_into_tl_id:
+            continue
+        absorbed_id = dt.timeline.id
+        absorbing_id = dt.absorbed_into_tl_id
+        absorbed_tw = tl_window_by_id.get(absorbed_id)
+        absorbing_tw = tl_window_by_id.get(absorbing_id)
+        if absorbed_tw is None or absorbing_tw is None:
+            continue
+        prev = extended.get(absorbing_id)
+        if prev is None:
+            merged_from = min(absorbing_tw.from_date, absorbed_tw.from_date)
+            merged_to = max(absorbing_tw.to_date, absorbed_tw.to_date)
+        else:
+            merged_from = min(prev[0], absorbed_tw.from_date)
+            merged_to = max(prev[1], absorbed_tw.to_date)
+        extended[absorbing_id] = (merged_from, merged_to)
+    return extended
+
+
 async def resolve_dbs_practices_for_category(
     db: AsyncSession, *, subscription: Subscription, category: str,
 ) -> list[str]:
