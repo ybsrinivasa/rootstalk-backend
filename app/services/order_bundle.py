@@ -43,6 +43,33 @@ CATEGORY_FERTILIZER = "FERTILIZER"
 ALL_CATEGORIES = {CATEGORY_PESTICIDE, CATEGORY_FERTILIZER}
 
 
+# 2026-06-29 — BL-03 "in-flight precedence" rule (extends the
+# original "purchased rule" which was APPROVED-only).
+#
+# Every OrderItem in one of these statuses is considered "the farmer
+# is likely to receive this input from this order." That signal is
+# passed to BL-03 as `committed_practice_ids` (renamed from
+# `approved_practice_ids` for clarity). BL-03 then keeps the same
+# practice identity suppressed on any overlapping timeline,
+# including the case where the original timeline has closed — so the
+# farmer never sees a re-recommendation for something they've already
+# ordered while the order is still in motion.
+#
+# Statuses NOT in this set — NOT_AVAILABLE, REJECTED, NOT_NEEDED,
+# SKIPPED, REMOVED, REROUTED — represent items the farmer is NOT
+# going to receive via this order (dealer can't supply, farmer
+# rejected, OR alternative not chosen, etc.). Those allow the
+# matching CHA/CCA recommendation to re-surface on the next advisory
+# load so the farmer can act.
+IN_FLIGHT_ITEM_STATUSES = (
+    "PENDING",
+    "AVAILABLE",
+    "POSTPONED",
+    "SENT_FOR_APPROVAL",
+    "APPROVED",
+)
+
+
 def l1_set_for_category(category: str) -> set[str]:
     cat = category.upper()
     if cat == CATEGORY_PESTICIDE:
@@ -212,22 +239,27 @@ async def _build_timeline_windows_for_dedup(
                 candidate_tls[cha_tl.id] = (from_d, to_d, "CHA")
                 cha_tl_by_id[cha_tl.id] = cha_tl
 
-    # ── Context timelines: past CCA/CHA timelines that own an
-    # APPROVED practice on this subscription. BL-03 step 12 (the
-    # purchased-input rule) requires them to participate in dedup
-    # so a later timeline's identical practice stays suppressed
-    # even after the governing timeline closed. Mirrors the
-    # advisory walk's `context_tl_ids` pass at /farmer/advisory/today.
-    approved_practice_to_tl = (await db.execute(
+    # ── Context timelines: past CCA/CHA timelines that own a
+    # committed (in-flight or approved) practice on this subscription.
+    # BL-03's purchased / in-flight-precedence rule requires them to
+    # participate in dedup so a later timeline's identical practice
+    # stays suppressed even after the governing timeline closed.
+    # 2026-06-29: broadened from APPROVED-only to the full
+    # IN_FLIGHT_ITEM_STATUSES set so an in-flight order
+    # (PENDING / AVAILABLE / SENT_FOR_APPROVAL / POSTPONED) also
+    # keeps its practice suppressed in overlapping CHA / CCA
+    # recommendations. Mirrors the advisory walk's `context_tl_ids`
+    # pass at /farmer/advisory/today.
+    committed_practice_to_tl = (await db.execute(
         select(OrderItem.practice_id, OrderItem.timeline_id)
         .join(Order, Order.id == OrderItem.order_id)
         .where(
             Order.subscription_id == subscription.id,
-            OrderItem.status == "APPROVED",
+            OrderItem.status.in_(IN_FLIGHT_ITEM_STATUSES),
         )
     )).all()
     context_tl_ids = {
-        tl_id for _pid, tl_id in approved_practice_to_tl
+        tl_id for _pid, tl_id in committed_practice_to_tl
         if tl_id and tl_id not in candidate_tls
     }
     if context_tl_ids:
@@ -464,20 +496,24 @@ async def dedup_filter_practice_ids(
     if not tl_windows:
         return set(candidate_practice_ids)
 
-    # Approved set — practices the farmer has already purchased.
-    # BL-03 step 12 says purchased inputs stay suppressed in
-    # overlapping timelines.
-    approved_rows = (await db.execute(
+    # 2026-06-29 — Committed set: practices that already have an
+    # in-flight or approved order on this subscription. BL-03's
+    # in-flight precedence rule keeps these suppressed in
+    # overlapping CCA / CHA timelines so the farmer doesn't re-order
+    # something they've already committed to.
+    committed_rows = (await db.execute(
         select(OrderItem.practice_id)
         .join(Order, Order.id == OrderItem.order_id)
         .where(
             Order.subscription_id == subscription.id,
-            OrderItem.status == "APPROVED",
+            OrderItem.status.in_(IN_FLIGHT_ITEM_STATUSES),
         )
     )).all()
-    approved_ids: set[str] = {r[0] for r in approved_rows if r[0]}
+    committed_ids: set[str] = {r[0] for r in committed_rows if r[0]}
 
-    deduped = deduplicate_advisory(tl_windows, approved_practice_ids=approved_ids)
+    deduped = deduplicate_advisory(
+        tl_windows, committed_practice_ids=committed_ids,
+    )
 
     surviving_ids: set[str] = set()
     for dt in deduped:
@@ -520,16 +556,18 @@ async def compute_absorption_extended_windows(
     )
     if not tl_windows:
         return {}
-    approved_rows = (await db.execute(
+    committed_rows = (await db.execute(
         select(OrderItem.practice_id)
         .join(Order, Order.id == OrderItem.order_id)
         .where(
             Order.subscription_id == subscription.id,
-            OrderItem.status == "APPROVED",
+            OrderItem.status.in_(IN_FLIGHT_ITEM_STATUSES),
         )
     )).all()
-    approved_ids: set[str] = {r[0] for r in approved_rows if r[0]}
-    deduped = deduplicate_advisory(tl_windows, approved_practice_ids=approved_ids)
+    committed_ids: set[str] = {r[0] for r in committed_rows if r[0]}
+    deduped = deduplicate_advisory(
+        tl_windows, committed_practice_ids=committed_ids,
+    )
     # Build the absorption map. For every TL that's absorbed_into
     # another, union its window into the absorbing TL's entry.
     tl_window_by_id = {tw.id: tw for tw in tl_windows}

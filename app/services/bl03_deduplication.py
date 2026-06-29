@@ -100,7 +100,7 @@ class DeduplicatedTimeline:
 
 def deduplicate_advisory(
     active_timelines: list[TimelineWindow],
-    approved_practice_ids: set[str],    # practice IDs that have APPROVED orders
+    committed_practice_ids: set[str],   # practice IDs the farmer has committed to via an in-flight or approved order
     today: date = None,                 # injectable for testing; defaults to date.today()
 ) -> list[DeduplicatedTimeline]:
     """
@@ -112,10 +112,17 @@ def deduplicate_advisory(
     - Identity check: same primary_identity_ref() on both practices.
     - Earlier start date governs; tie-break by created_at (earlier created_at governs).
     - Chain suppression NOT applied — direct overlap only.
-    - Purchased rule: if approved in any timeline, suppress the same input in any
-      overlapping timeline, even if the governing timeline has closed.
+    - In-flight precedence rule (formerly "purchased rule",
+      broadened 2026-06-29): if the practice already has a live
+      OrderItem on this subscription — status in
+      {PENDING, AVAILABLE, POSTPONED, SENT_FOR_APPROVAL, APPROVED} —
+      suppress the same input in any overlapping timeline, even if
+      the governing timeline has closed. This honours the principle
+      "what has been ordered gains precedence." Callers compute the
+      set via the `IN_FLIGHT_ITEM_STATUSES` constant in
+      `app.services.order_bundle`.
     - Reinstatement: if governing timeline is closed (today > to_date) AND the practice
-      was NOT approved (purchased), reinstate the later timeline's practice.
+      has NO live OrderItem, reinstate the later timeline's practice.
     """
     if not active_timelines:
         return []
@@ -360,8 +367,13 @@ def deduplicate_advisory(
                             # to existing per-practice rule.
                         # Same input found in earlier timeline — suppress later
                         # Determine reason and check reinstatement
-                        if p_earlier.id in approved_practice_ids:
-                            # Purchased rule: suppress permanently regardless of TL_A closure
+                        if p_earlier.id in committed_practice_ids:
+                            # In-flight / purchased rule: suppress
+                            # permanently regardless of TL_A closure.
+                            # The farmer already has an order moving
+                            # for this input — don't surface a
+                            # duplicate recommendation from a later
+                            # CCA / CHA timeline.
                             suppression[p_later.id] = SuppressedPractice(
                                 practice_id=p_later.id,
                                 timeline_id=tl_later.id,

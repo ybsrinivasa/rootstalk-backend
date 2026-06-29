@@ -4962,16 +4962,39 @@ async def _today_advisory_for_user(
         # dedup input — otherwise a farmer who bought Mancozeb in week 1
         # gets told to buy it again in week 4 when a later timeline also
         # recommends it.
-        approved_items_q = await db.execute(
+        # 2026-06-29 — Broadened from APPROVED-only to in-flight set.
+        # Any practice the farmer has a live order on (PENDING /
+        # AVAILABLE / SENT_FOR_APPROVAL / POSTPONED / APPROVED)
+        # gains BL-03's in-flight precedence — it suppresses
+        # matching recommendations in overlapping CCA / CHA
+        # timelines so the farmer doesn't see a re-recommendation
+        # while the order is still moving. NOT_AVAILABLE,
+        # REJECTED, NOT_NEEDED, SKIPPED, REMOVED, REROUTED are
+        # deliberately excluded — they represent items the farmer
+        # is NOT going to receive via this order, so the
+        # recommendation should re-surface so the farmer can act.
+        from app.services.order_bundle import IN_FLIGHT_ITEM_STATUSES
+        committed_items_q = await db.execute(
             select(OrderItem)
             .join(Order, Order.id == OrderItem.order_id)
             .where(
                 Order.subscription_id == sub.id,
-                OrderItem.status == "APPROVED",
+                OrderItem.status.in_(IN_FLIGHT_ITEM_STATUSES),
             )
         )
-        approved_items = approved_items_q.scalars().all()
-        approved_ids: set[str] = {it.practice_id for it in approved_items}
+        committed_items = committed_items_q.scalars().all()
+        committed_ids: set[str] = {it.practice_id for it in committed_items}
+        # `approved_ids` is the narrower set used to drive the
+        # PWA's `is_purchased` flag on each practice card — that
+        # flag means "farmer has actually committed to receiving
+        # this brand from the dealer," which only happens at
+        # APPROVED. The broader committed_ids drives BL-03's
+        # in-flight precedence rule + context_tl_ids; these two
+        # consumers want different thresholds.
+        approved_ids: set[str] = {
+            it.practice_id for it in committed_items
+            if (it.status.value if hasattr(it.status, "value") else it.status) == "APPROVED"
+        }
 
         # ── Orders V2 Batch 11: tappable per-practice fulfilment ──
         # For each practice the farmer sees on the advisory, surface
@@ -5093,8 +5116,13 @@ async def _today_advisory_for_user(
         # Combine active CCA + active CHA raw IDs so neither flavour gets
         # re-added by the context-only pass below.
         all_active_raw_tl_ids = active_tl_ids | active_cha_raw_tl_ids
+        # 2026-06-29 — Broadened context-TL collection: include any
+        # timeline that owns an in-flight item, not just APPROVED.
+        # Mirrors the `IN_FLIGHT_ITEM_STATUSES` widening above so
+        # BL-03's in-flight precedence rule has the right context
+        # TLs to work with.
         context_tl_ids: set[str] = {
-            it.timeline_id for it in approved_items
+            it.timeline_id for it in committed_items
             if it.timeline_id and it.timeline_id not in all_active_raw_tl_ids
         }
         context_render_ids: set[str] = set()  # mark for response-build skip
@@ -5220,7 +5248,9 @@ async def _today_advisory_for_user(
                     ))
                     context_render_ids.add(cha_tl_id_synth)
 
-        deduped = deduplicate_advisory(tl_windows, approved_practice_ids=approved_ids)
+        deduped = deduplicate_advisory(
+            tl_windows, committed_practice_ids=committed_ids,
+        )
 
         # 2026-06-29 — Phase 1 window absorption.
         # When BL-03 marks a TL as fully absorbed by another TL (every
