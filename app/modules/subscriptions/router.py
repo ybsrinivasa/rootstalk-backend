@@ -5232,29 +5232,48 @@ async def _today_advisory_for_user(
         # an empty "Covered elsewhere" section in place of useful
         # guidance. If the absorbing TL was a context-only entry
         # (loaded only because an APPROVED order references it), the
-        # absorption pulls it back into the renderable set so the
-        # extended window actually shows the OR / AND group whose
-        # match drove the suppression.
+        # absorption pulls it back into the renderable set, populates
+        # its dates in tl_date_map (which context-only TLs deliberately
+        # don't enter), and extends the window across the merged span.
+        dedup_by_id = {d.timeline.id: d for d in deduped}
         absorbed_skip: set[str] = set()
         for dedup_tl in deduped:
             if not dedup_tl.absorbed_into_tl_id:
                 continue
             absorbing_id = dedup_tl.absorbed_into_tl_id
             absorbed_id = dedup_tl.timeline.id
-            if absorbing_id not in tl_date_map:
-                # Absorber not in renderable date-map for any reason;
-                # skip the absorption to keep the absorbed TL visible
-                # (its "Covered elsewhere" empty state still beats a
-                # silent black hole).
+            absorbing_dedup = dedup_by_id.get(absorbing_id)
+            if absorbing_dedup is None:
+                # Defensive: absorber not even in the dedup output.
+                # Skip to keep absorbed TL visible.
                 continue
-            absorbed_from, absorbed_to, _abs_day = tl_date_map.get(
-                absorbed_id, (None, None, None),
-            )
-            absorbing_from, absorbing_to, abs_day = tl_date_map[absorbing_id]
+            # Absorbed TL's dates: prefer tl_date_map if present
+            # (active TLs), fall back to TimelineWindow attributes
+            # (context-only TLs aren't in tl_date_map by design).
+            if absorbed_id in tl_date_map:
+                absorbed_from, absorbed_to, _abs_day = tl_date_map[absorbed_id]
+            else:
+                absorbed_from = dedup_tl.timeline.from_date
+                absorbed_to = dedup_tl.timeline.to_date
+            # Absorbing TL's dates + day_num — same fallback.
+            if absorbing_id in tl_date_map:
+                absorbing_from, absorbing_to, abs_day = tl_date_map[absorbing_id]
+            else:
+                absorbing_from = absorbing_dedup.timeline.from_date
+                absorbing_to = absorbing_dedup.timeline.to_date
+                # Context TLs have no native day_offset on the
+                # subscription axis; pick the absorbed TL's day_num
+                # because the absorbing window now covers today via
+                # the absorbed TL's anchor.
+                abs_day = tl_date_map.get(
+                    absorbed_id, (None, None, 0),
+                )[2]
             if absorbed_from is not None and absorbed_to is not None:
                 merged_from = min(absorbing_from, absorbed_from)
                 merged_to   = max(absorbing_to, absorbed_to)
                 tl_date_map[absorbing_id] = (merged_from, merged_to, abs_day)
+            else:
+                tl_date_map[absorbing_id] = (absorbing_from, absorbing_to, abs_day)
             # If the absorber was context-only (not in window today by
             # its master from/to), lift it back into the renderable
             # set so the merged window actually shows.
