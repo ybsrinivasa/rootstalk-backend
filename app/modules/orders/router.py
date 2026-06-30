@@ -105,6 +105,15 @@ async def create_order(
         raise HTTPException(status_code=404, detail="Subscription not found")
 
     # ── Timeline-type integrity: orders must NOT mix DBS / DAS / CALENDAR ─
+    # 2026-06-30 — CHA / QA timelines (DAYS_AFTER_DETECTION /
+    # DAYS_AFTER_RESPONSE) are EXCLUDED from this rule per user
+    # direction: "don't associate the CHA-PG, CHA-SP, and QA timelines
+    # with any DBS, DAS, or Calendar." Those pipes are pest-driven and
+    # anchored to events outside the CCA calendar, so they should be
+    # combinable with any CCA selection. The check now only fires when
+    # the order mixes two or more of {DBS, DAS, CALENDAR}; any number
+    # of CHA / QA items can ride alongside without tripping it.
+    CCA_TIMING_TYPES = {"DBS", "DAS", "CALENDAR"}
     if request.practice_ids:
         practices_with_tl = (await db.execute(
             select(Practice, Timeline)
@@ -115,7 +124,8 @@ async def create_order(
             raise HTTPException(status_code=422, detail="No valid practices selected")
         timing_types = {tl.from_type.value if hasattr(tl.from_type, 'value') else str(tl.from_type)
                         for _, tl in practices_with_tl}
-        if len(timing_types) > 1:
+        cca_timing_types = timing_types & CCA_TIMING_TYPES
+        if len(cca_timing_types) > 1:
             raise HTTPException(
                 status_code=422,
                 detail="Cannot mix timing types in one order. Please order DBS, DAS, and Calendar items separately.",
