@@ -2520,27 +2520,49 @@ async def assign_cm_to_client(
     if not cm_role:
         raise HTTPException(status_code=400, detail="User is not a Content Manager")
 
-    # Deactivate any existing assignment for this client
-    existing = (await db.execute(
+    # 2026-06-30 — Bug fix: the UniqueConstraint on
+    # (cm_user_id, client_id) doesn't include `status`, so an older
+    # INACTIVE row for the same (cm_user_id, client_id) blocked the
+    # INSERT path when reassigning to a previously-used CM. The
+    # error was raised at commit time and not caught — the page
+    # reload then refetched the unchanged state, looking like a
+    # silent no-op. Fix: mass-deactivate any ACTIVE assignment for
+    # this client first, then either reactivate the existing
+    # (cm_user_id, client_id) row or INSERT a fresh one.
+    existing_active = (await db.execute(
         select(CMClientAssignment).where(
             CMClientAssignment.client_id == client_id,
             CMClientAssignment.status == StatusEnum.ACTIVE,
         )
     )).scalar_one_or_none()
-    if existing:
-        if existing.cm_user_id == cm_user_id:
-            existing.rights = CMRights(rights)
-            await db.commit()
-            return {"detail": "Rights updated", "cm_user_id": cm_user_id, "rights": rights}
-        existing.status = StatusEnum.INACTIVE
+    if existing_active and existing_active.cm_user_id == cm_user_id:
+        # Same CM, possibly different rights. Just update.
+        existing_active.rights = CMRights(rights)
+        await db.commit()
+        return {"detail": "Rights updated", "cm_user_id": cm_user_id, "rights": rights}
 
-    assignment = CMClientAssignment(
-        cm_user_id=cm_user_id,
-        client_id=client_id,
-        rights=CMRights(rights),
-        status=StatusEnum.ACTIVE,
-    )
-    db.add(assignment)
+    if existing_active:
+        existing_active.status = StatusEnum.INACTIVE
+
+    # Either reactivate a prior (cm_user_id, client_id) row or insert
+    # a new one. The lookup ignores status so we find any prior row.
+    prior = (await db.execute(
+        select(CMClientAssignment).where(
+            CMClientAssignment.cm_user_id == cm_user_id,
+            CMClientAssignment.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if prior is not None:
+        prior.status = StatusEnum.ACTIVE
+        prior.rights = CMRights(rights)
+        prior.assigned_at = datetime.now(timezone.utc)
+    else:
+        db.add(CMClientAssignment(
+            cm_user_id=cm_user_id,
+            client_id=client_id,
+            rights=CMRights(rights),
+            status=StatusEnum.ACTIVE,
+        ))
     await db.commit()
     return {"detail": "CM assigned", "cm_user_id": cm_user_id, "rights": rights}
 
