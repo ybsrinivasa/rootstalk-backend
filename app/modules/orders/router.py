@@ -4320,6 +4320,63 @@ async def get_facilitator_order(
         select(PackingList).where(PackingList.order_id == order.id)
     )).scalar_one_or_none()
     packing_fields = await _farmer_packing_fields(db, order, pl, approved_count)
+
+    # 2026-06-30 — Affected-plants count per approved item. Mirrors the
+    # dealer endpoint's resolution so the facilitator sees the same
+    # "Treatment for N of M palms" context on the items they're about
+    # to pick up.
+    sub_fac = (await db.execute(
+        select(Subscription).where(Subscription.id == order.subscription_id)
+    )).scalar_one_or_none()
+    fac_number_of_plants = (
+        int(sub_fac.number_of_plants)
+        if sub_fac and sub_fac.number_of_plants else None
+    )
+    affected_count_by_item: dict[str, Optional[int]] = {}
+    if fac_number_of_plants:
+        from app.modules.subscriptions.models import TriggeredCHAEntry
+        item_tl_ids = [i.timeline_id for i in items if i.timeline_id]
+        timelines_fac: dict[str, Timeline] = {}
+        if item_tl_ids:
+            tlrows = (await db.execute(
+                select(Timeline).where(Timeline.id.in_(item_tl_ids))
+            )).scalars().all()
+            timelines_fac = {t.id: t for t in tlrows}
+        tl_rec_ids: set[str] = set()
+        for _t in timelines_fac.values():
+            r = (
+                _t.sp_recommendation_id
+                or _t.pg_recommendation_id
+                or _t.standard_response_id
+            )
+            if r:
+                tl_rec_ids.add(r)
+        latest_count_by_rec: dict[str, Optional[int]] = {}
+        if tl_rec_ids:
+            crows = (await db.execute(
+                select(TriggeredCHAEntry).where(
+                    TriggeredCHAEntry.subscription_id == sub_fac.id,
+                    TriggeredCHAEntry.recommendation_id.in_(tl_rec_ids),
+                    TriggeredCHAEntry.status == "ACTIVE",
+                ).order_by(TriggeredCHAEntry.triggered_at.desc())
+            )).scalars().all()
+            for cr in crows:
+                if cr.recommendation_id not in latest_count_by_rec:
+                    latest_count_by_rec[cr.recommendation_id] = cr.affected_plants_count
+        for it in items:
+            tl = timelines_fac.get(it.timeline_id) if it.timeline_id else None
+            if tl is None:
+                continue
+            rec = (
+                tl.sp_recommendation_id
+                or tl.pg_recommendation_id
+                or tl.standard_response_id
+            )
+            if rec:
+                affected_count_by_item[it.id] = latest_count_by_rec.get(rec)
+            else:
+                affected_count_by_item[it.id] = fac_number_of_plants
+
     return {
         "id": order.id, "status": order.status,
         "reference_number": order.reference_number,
@@ -4331,6 +4388,7 @@ async def get_facilitator_order(
         "dealer_user_id": order.dealer_user_id,
         "date_from": order.date_from, "date_to": order.date_to,
         "created_at": order.created_at,
+        "number_of_plants": fac_number_of_plants,
         # 2026-06-07 — Anti-manipulation rule: facilitator sees per-
         # item brand / qty / cost ONLY for items in APPROVED status
         # (post farmer-approval, needed for the pickup at the
@@ -4360,6 +4418,13 @@ async def get_facilitator_order(
                     float(i.price)
                     if i.status == OrderItemStatus.APPROVED and i.price
                     else None
+                ),
+                # 2026-06-30 — Affected-plants count for plant-wise
+                # context. Surfaces only on APPROVED items to stay
+                # consistent with the anti-manipulation rule.
+                "affected_plants_count": (
+                    affected_count_by_item.get(i.id)
+                    if i.status == OrderItemStatus.APPROVED else None
                 ),
             }
             for i in items
@@ -4710,6 +4775,15 @@ async def get_dealer_order(
             "element_block": element_block_for_item(i.id),
             "application_date_from": item_df,
             "application_date_to": item_dt,
+            # 2026-06-30 — Affected-plants count captured at pest
+            # diagnosis (PG/SP/QA paths). NULL when:
+            #   • crop is area-wise (irrelevant),
+            #   • timeline is CCA on area-wise crop,
+            #   • QA path where farmer didn't fill the optional field.
+            # For plant-wise CHA items where this is NULL, the PWA shows
+            # "Please check with the farmer" alongside an empty volume
+            # input; the dealer enters volume manually.
+            "affected_plants_count": affected_count_by_item.get(i.id),
         }
 
     # Group items by relation
@@ -4750,6 +4824,56 @@ async def get_dealer_order(
     sub_for_dates = (await db.execute(
         select(Subscription).where(Subscription.id == order.subscription_id)
     )).scalar_one_or_none()
+
+    # 2026-06-30 — Per-item affected_plants_count map for plant-wise
+    # CHA timelines. Resolves Practice → Timeline → recommendation_id
+    # → TriggeredCHAEntry → affected_plants_count. CCA items (no
+    # rec_id) fall back to the farmer's declared total; QA items
+    # without a count stay None and the PWA renders a "check with the
+    # farmer" hint.
+    affected_count_by_item: dict[str, Optional[int]] = {}
+    if sub_for_dates and (sub_for_dates.number_of_plants or False):
+        from app.modules.subscriptions.models import TriggeredCHAEntry
+        # Distinct rec_ids referenced by timelines in this order.
+        tl_rec_ids: set[str] = set()
+        for _t in timeline_map.values():
+            r = (
+                _t.sp_recommendation_id
+                or _t.pg_recommendation_id
+                or _t.standard_response_id
+            )
+            if r:
+                tl_rec_ids.add(r)
+        # Latest active TriggeredCHAEntry per rec_id (most recent wins
+        # when re-diagnosis happened after a prior timeline closed).
+        latest_count_by_rec: dict[str, Optional[int]] = {}
+        if tl_rec_ids:
+            cha_rows = (await db.execute(
+                select(TriggeredCHAEntry).where(
+                    TriggeredCHAEntry.subscription_id == sub_for_dates.id,
+                    TriggeredCHAEntry.recommendation_id.in_(tl_rec_ids),
+                    TriggeredCHAEntry.status == "ACTIVE",
+                ).order_by(TriggeredCHAEntry.triggered_at.desc())
+            )).scalars().all()
+            for cr in cha_rows:
+                if cr.recommendation_id not in latest_count_by_rec:
+                    latest_count_by_rec[cr.recommendation_id] = cr.affected_plants_count
+        for it in items:
+            tl = timeline_map.get(it.timeline_id) if it.timeline_id else None
+            if tl is None:
+                continue
+            rec = (
+                tl.sp_recommendation_id
+                or tl.pg_recommendation_id
+                or tl.standard_response_id
+            )
+            if rec:
+                # CHA item — count may be set or None (QA blank case).
+                affected_count_by_item[it.id] = latest_count_by_rec.get(rec)
+            else:
+                # CCA item on a plant-wise crop — full orchard.
+                affected_count_by_item[it.id] = int(sub_for_dates.number_of_plants)
+
     crop_start_date = sub_for_dates.crop_start_date if sub_for_dates else None
     crop_start_d = None
     if crop_start_date is not None:
@@ -6591,8 +6715,11 @@ async def get_volume_estimate(
     )).scalar_one_or_none()
     if farm_area_acres is None and sub:
         farm_area_acres = float(sub.farm_area_acres) if sub.farm_area_acres else None
-    if not farm_area_acres:
-        return {"estimated_volume": None, "volume_unit": None, "message": "Farm area not set on subscription"}
+    # Farm-area is no longer a hard gate — plant-wise crops bind `Count`
+    # via the timeline's TriggeredCHAEntry (CHA) or sub.number_of_plants
+    # (CCA) instead. The downstream calculate_volume() decides whether
+    # `Total_area` or `Count` is the required input based on the
+    # formula text.
 
     # ── Practice + Timeline + Package + Measure ────────────────────
     practice = (await db.execute(
@@ -6606,6 +6733,39 @@ async def get_volume_estimate(
     )).scalar_one_or_none()
     if timeline is None:
         return {"estimated_volume": None, "volume_unit": None, "message": "Timeline not found for practice"}
+
+    # ── Plant count resolution (2026-06-30) ────────────────────────
+    # For plant-wise crops, BL-06's `Count` variable binds the
+    # treatable plant count. Rules:
+    #   • CHA timeline (sp/pg/qa rec set): look up the most recent
+    #     active TriggeredCHAEntry for this subscription + recommendation
+    #     and use its `affected_plants_count`. NULL on QA paths where
+    #     the farmer didn't fill the optional field at query submission.
+    #   • CCA timeline (none of the rec fields set): use the farmer's
+    #     declared total (`sub.number_of_plants`). CCA treatments are
+    #     scheduled across the whole crop; the damaged-plants principle
+    #     only kicks in when a pest has been diagnosed.
+    #   • Area-wise crops: stays None; formula uses Total_area.
+    plant_count: Optional[int] = None
+    rec_id = (
+        timeline.sp_recommendation_id
+        or timeline.pg_recommendation_id
+        or timeline.standard_response_id
+    )
+    if rec_id and sub:
+        from app.modules.subscriptions.models import TriggeredCHAEntry
+        cha_entry = (await db.execute(
+            select(TriggeredCHAEntry).where(
+                TriggeredCHAEntry.subscription_id == sub.id,
+                TriggeredCHAEntry.recommendation_id == rec_id,
+                TriggeredCHAEntry.status == "ACTIVE",
+            ).order_by(TriggeredCHAEntry.triggered_at.desc())
+        )).scalars().first()
+        if cha_entry:
+            plant_count = cha_entry.affected_plants_count
+    elif sub and sub.number_of_plants:
+        # CCA on a plant-wise crop — full orchard treatment.
+        plant_count = int(sub.number_of_plants)
 
     # Try the timeline's own package first (CCA case). If null
     # (CHA / SP / QA timeline), fall back to the subscription's
@@ -6820,8 +6980,22 @@ async def get_volume_estimate(
         frequency_days=practice.frequency_days,
         timeline_duration_days=timeline_duration_days,
         applications=applications,
+        plant_count=plant_count,
     )
     if result is None:
+        # Targeted message for the common plant-wise-CHA-without-count
+        # case (QA path where the farmer left the optional field blank).
+        # The dealer UI shows a "Please check with the farmer" hint
+        # alongside the blank volume field.
+        if measure == "PLANT_WISE" and "Count" in (formula_row.formula or "") and plant_count is None:
+            return {
+                "estimated_volume": None, "volume_unit": None,
+                "message": (
+                    "Please check with the farmer how many plants are "
+                    "affected, then enter the volume manually."
+                ),
+                "error_code": "PLANT_COUNT_MISSING",
+            }
         return {"estimated_volume": None, "volume_unit": None, "message": "Could not calculate estimate"}
     volume, unit = result
     return {

@@ -304,6 +304,12 @@ class TriggeredCHAEntry(Base):
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
     problem_name: Mapped[str] = mapped_column(String(500), nullable=True)    # display name; CHA: problem; QA: question text
     parent_pg_cosh_id: Mapped[str] = mapped_column(String(200), nullable=True)  # resolved parent PG (CHA only)
+    # Per-event count of damaged plants captured at diagnosis-acceptance for
+    # plant-wise crops. PG/SP: mandatory PWA prompt populates this. QA: stays
+    # NULL — pundit doesn't know, farmer isn't in the loop at trigger time.
+    # Drives `Count` in BL-06's volume formula; NULL → no volume estimate,
+    # dealer enters manually after checking with farmer.
+    affected_plants_count: Mapped[int] = mapped_column(Integer, nullable=True)
 
 
 class EnterpriseLicense(Base):

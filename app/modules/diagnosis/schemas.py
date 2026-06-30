@@ -81,6 +81,17 @@ class AIDirectDiagnoseRequest(BaseModel):
     language_code: str = "en"
 
 
+class CommitToAdvisoryRequest(BaseModel):
+    """Body of POST /diagnosis/{session_id}/commit-to-advisory.
+
+    `affected_plants_count` is mandatory for plant-wise crops and
+    ignored (allowed but unused) for area-wise crops. The PWA's
+    plant-wise diagnose flow gates the commit CTA on a valid integer
+    entry; this server-side validation is the second wall.
+    """
+    affected_plants_count: Optional[int] = None
+
+
 class ReferenceImagesRequest(BaseModel):
     crop_cosh_id: str
     crop_stage_cosh_id: Optional[str] = None

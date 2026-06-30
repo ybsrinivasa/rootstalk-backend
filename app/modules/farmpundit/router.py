@@ -649,6 +649,13 @@ class QueryCreate(BaseModel):
     # testing past the 6th free. Server-side `settings.environment
     # == "production"` check refuses the flag on prod.
     staging_bypass: bool = False
+    # 2026-06-30 — Optional for plant-wise crops. Propagates into the
+    # QA-triggered TriggeredCHAEntry's `affected_plants_count` when the
+    # pundit's chosen Standard Response fires a CHA timeline. Optional
+    # because the query may not be about a pest at all — we can't know
+    # at submit time. Validated 1 ≤ n ≤ subscription.number_of_plants
+    # when present.
+    affected_plants_count: Optional[int] = None
 
 
 class QueryPaymentInit(BaseModel):
@@ -856,6 +863,39 @@ async def submit_query(
             },
         )
 
+    # 2026-06-30 — Validate optional affected_plants_count against the
+    # farmer's declared `number_of_plants` when provided. Plant-wise
+    # crops only; left blank or area-wise: ignore. We don't enforce
+    # PLANT_WISE measure here because the PWA hides the input on
+    # area-wise subs, and a stray value sent up should be treated as
+    # noise rather than rejected.
+    apc: Optional[int] = request.affected_plants_count
+    if apc is not None:
+        if apc < 1:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "affected_plants_count_min",
+                    "message": "Affected-plants count must be at least 1.",
+                },
+            )
+        from app.modules.subscriptions.models import Subscription
+        _sub = (await db.execute(
+            select(Subscription).where(Subscription.id == request.subscription_id)
+        )).scalar_one_or_none()
+        if _sub and _sub.number_of_plants and apc > _sub.number_of_plants:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "affected_plants_count_max",
+                    "message": (
+                        f"Affected-plants count cannot exceed your "
+                        f"declared {_sub.number_of_plants} plants."
+                    ),
+                    "max": _sub.number_of_plants,
+                },
+            )
+
     now_utc = datetime.now(timezone.utc)
     expires_at = _compute_query_expiry(now_utc)
 
@@ -873,6 +913,7 @@ async def submit_query(
         expires_at=expires_at,
         is_paid=is_paid,
         razorpay_payment_id=request.razorpay_payment_id if is_paid else None,
+        affected_plants_count=apc,
     )
     db.add(query)
     await db.flush()
@@ -3429,4 +3470,8 @@ async def _trigger_qa_for_query(
         triggered_by="QUERY",
         problem_name=label,
         parent_pg_cosh_id=None,
+        # 2026-06-30 — Carry the optional count the farmer entered at
+        # query submission. NULL when blank — dealer surface renders
+        # "Please check with the farmer" and the volume estimate skips.
+        affected_plants_count=query.affected_plants_count,
     ))

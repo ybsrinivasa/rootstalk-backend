@@ -237,6 +237,13 @@ class Query(Base):
     viewed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )
+    # 2026-06-30 — Optional at query submission for plant-wise crops.
+    # Propagates into a QA-triggered TriggeredCHAEntry's
+    # `affected_plants_count` when the pundit's chosen Standard
+    # Response fires a CHA timeline. NULL when the farmer left the
+    # field blank — the dealer sees a "Please check with the farmer"
+    # hint and enters volume manually.
+    affected_plants_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     current_holder: Mapped["FarmPunditProfile"] = relationship("FarmPunditProfile", back_populates="queries_holding",
                                                                  foreign_keys=[current_holder_id])

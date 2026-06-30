@@ -61,6 +61,7 @@ def calculate_volume(
     frequency_days: Optional[int] = None,
     timeline_duration_days: Optional[int] = None,
     applications: Optional[int] = None,
+    plant_count: Optional[int] = None,
 ) -> Optional[tuple[float, str]]:
     """
     Returns (estimated_volume, brand_unit) or None if inputs are insufficient.
@@ -77,10 +78,32 @@ def calculate_volume(
     The element-first path means the SE sees and confirms the count once,
     and that fixed value flows downstream — no risk of re-computation drift
     when frequency or timeline shifts later. The legacy compute remains for
-    practices created before Applications-as-element rolled out.
+    practices created before Applications-as-ele ment rolled out.
+
+    Count resolution (2026-06-30):
+    `plant_count` binds the `Count` formula variable for plant-wise crops.
+    Per the damaged-plants principle, this is the count of *affected*
+    plants captured at diagnosis-acceptance — not the farmer's declared
+    total. If the formula references Count but plant_count is None
+    (e.g. QA-triggered timelines where the count couldn't be captured),
+    return None so the dealer surface routes the item through manual
+    volume entry after checking with the farmer.
+
+    For backwards compatibility, area-wise formulas that don't reference
+    Count are unaffected — `farm_area_acres` remains the only required
+    input.
     """
-    if farm_area_acres is None:
-        return None
+    formula_uses_count = bool(formula) and "Count" in formula
+
+    if formula_uses_count:
+        # Plant-wise formula. `Count` is the binding for affected-plants
+        # count from the TriggeredCHAEntry. Missing → no estimate.
+        if plant_count is None or plant_count < 1:
+            return None
+    else:
+        # Area-wise (legacy) formula. `Total_area` is required.
+        if farm_area_acres is None:
+            return None
 
     # Element-first; legacy compute is the fallback.
     if applications is not None and applications >= 1:
@@ -91,11 +114,12 @@ def calculate_volume(
         resolved_applications = 1
 
     variables: dict[str, float] = {
-        "Total_area": float(farm_area_acres),
+        "Total_area": float(farm_area_acres) if farm_area_acres is not None else 0.0,
         "Dosage": float(dosage) if dosage else 0.0,
         "Concentration": float(concentration) if concentration else 1.0,
         "Volume_water": float(volume_water_per_acre) if volume_water_per_acre else 200.0,
         "Applications": float(resolved_applications),
+        "Count": float(plant_count) if plant_count is not None else 0.0,
     }
     try:
         volume = evaluate_formula(formula, variables)

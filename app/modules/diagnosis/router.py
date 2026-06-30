@@ -40,6 +40,7 @@ from app.modules.diagnosis.models import DiagnosisSession
 from app.modules.diagnosis.schemas import (
     AIDirectDiagnoseRequest,
     AnswerRequest,
+    CommitToAdvisoryRequest,
     ExplainSymptomRequest,
     ImageCheckSymptomRequest,
     ImageAnalysisRequest,
@@ -314,10 +315,16 @@ async def _format_question(question, db: AsyncSession, lang: str = "en"):
 
 async def _trigger_cha_from_diagnosis(
     db: AsyncSession, session: DiagnosisSession, problem_cosh_id: str,
+    affected_plants_count: Optional[int] = None,
 ):
     """Create a TriggeredCHAEntry so the farmer's advisory/today
     includes CHA timelines. Uses full SP→PG hierarchy: SP client →
-    PG client → PG global."""
+    PG client → PG global.
+
+    `affected_plants_count` is persisted on the new entry for
+    plant-wise crops (drives BL-06's `Count` variable downstream).
+    Area-wise crops pass None.
+    """
     from app.modules.advisory.models import Package as _Pkg
     from app.modules.subscriptions.models import (
         Subscription, TriggeredCHAEntry,
@@ -355,6 +362,7 @@ async def _trigger_cha_from_diagnosis(
         triggered_by="DIAGNOSIS",
         problem_name=resolved.problem_name,
         parent_pg_cosh_id=resolved.parent_pg_cosh_id,
+        affected_plants_count=affected_plants_count,
     ))
 
 
@@ -489,7 +497,16 @@ async def get_diagnosis_eligibility(
                 "crop yet. Check back later or ask your company."
             ),
         }
-    return {"eligible": True}
+    # 2026-06-30 — Surface measure + declared plant count so the PWA
+    # diagnose flow can render the mandatory "How many plants are
+    # affected?" prompt before commit-to-advisory on plant-wise crops.
+    from app.services.cosh_crop_view import get_measure_for_biological_name
+    measure = await get_measure_for_biological_name(db, package.crop_cosh_id)
+    return {
+        "eligible": True,
+        "measure": measure,
+        "number_of_plants": int(sub.number_of_plants) if sub.number_of_plants else None,
+    }
 
 
 @router.post("/diagnosis/start", status_code=201)
@@ -787,6 +804,7 @@ async def abort_diagnosis(
 @router.post("/diagnosis/{session_id}/commit-to-advisory")
 async def commit_diagnosis_to_advisory(
     session_id: str,
+    body: Optional[CommitToAdvisoryRequest] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -804,6 +822,12 @@ async def commit_diagnosis_to_advisory(
     Refuses (422 `not_diagnosed`) if the session hasn't reached the
     DIAGNOSED state; the caller shouldn't have surfaced the CTA in
     that case but we guard server-side anyway.
+
+    `affected_plants_count` (2026-06-30): mandatory for plant-wise
+    crops. Drives BL-06's `Count` variable downstream so volume sizes
+    to the count of affected plants rather than the farmer's declared
+    total — the principle being that treating 200 palms when 10 are
+    infested wastes money and resources. Ignored for area-wise crops.
     """
     session = (await db.execute(
         select(DiagnosisSession).where(
@@ -837,9 +861,67 @@ async def commit_diagnosis_to_advisory(
             "subscription_id": session.subscription_id,
         }
 
+    # Validate `affected_plants_count` for plant-wise crops.
+    from app.modules.subscriptions.models import Subscription
+    from app.services.cosh_crop_view import get_measure_for_biological_name
+    from app.modules.advisory.models import Package as _Pkg
+
+    sub = (await db.execute(
+        select(Subscription).where(Subscription.id == session.subscription_id)
+    )).scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    package = (await db.execute(
+        select(_Pkg).where(_Pkg.id == sub.package_id)
+    )).scalar_one_or_none()
+    crop_cosh_id = package.crop_cosh_id if package else None
+    measure = (
+        await get_measure_for_biological_name(db, crop_cosh_id)
+        if crop_cosh_id else None
+    )
+
+    affected_count: Optional[int] = body.affected_plants_count if body else None
+    if measure == "PLANT_WISE":
+        if affected_count is None:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "affected_plants_count_required",
+                    "message": (
+                        "How many plants are affected? Required for "
+                        "plant-wise crops."
+                    ),
+                },
+            )
+        if affected_count < 1:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "affected_plants_count_min",
+                    "message": "Affected-plants count must be at least 1.",
+                },
+            )
+        if sub.number_of_plants and affected_count > sub.number_of_plants:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "affected_plants_count_max",
+                    "message": (
+                        f"Affected-plants count cannot exceed your "
+                        f"declared {sub.number_of_plants} plants."
+                    ),
+                    "max": sub.number_of_plants,
+                },
+            )
+    else:
+        # Area-wise: silently ignore even if the client sent a value.
+        affected_count = None
+
     from datetime import datetime, timezone
     await _trigger_cha_from_diagnosis(
         db, session, session.diagnosed_problem_cosh_id,
+        affected_plants_count=affected_count,
     )
     session.committed_at = datetime.now(timezone.utc)
     await db.commit()
