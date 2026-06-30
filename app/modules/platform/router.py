@@ -120,7 +120,17 @@ async def list_neytiri_users(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """SA: list all CM/RM/BM users."""
+    """SA: list all CM/RM/BM users.
+
+    2026-06-30 — Suppress the SA from this list. The SA holds implicit
+    view rights across every client (whether assigned or not), so they
+    should never appear as a selectable CM in the SA portal's "Assign
+    CM" dropdown. The data side carries a historical SA-also-has-CM-
+    role row that this filter neutralises in code; the migration
+    script removes the row itself.
+    """
+    from app.config import settings as _settings
+
     result = await db.execute(
         select(UserRole).where(UserRole.role_type.in_(list(NEYTIRI_ROLES)))
     )
@@ -131,6 +141,14 @@ async def list_neytiri_users(
 
     users_result = await db.execute(select(User).where(User.id.in_(user_ids)))
     users_map = {u.id: u for u in users_result.scalars().all()}
+
+    # Strip the SA identity from both the index and the role list.
+    sa_email = (_settings.sa_email or "").lower()
+    if sa_email:
+        for uid, u in list(users_map.items()):
+            if (u.email or "").lower() == sa_email:
+                users_map.pop(uid, None)
+        role_rows = [r for r in role_rows if r.user_id in users_map]
 
     privs_result = await db.execute(
         select(CMPrivilegeModel).where(CMPrivilegeModel.cm_user_id.in_(user_ids))

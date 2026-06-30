@@ -2520,6 +2520,28 @@ async def assign_cm_to_client(
     if not cm_role:
         raise HTTPException(status_code=400, detail="User is not a Content Manager")
 
+    # 2026-06-30 — Refuse to assign the Super Admin as a CM. SA already
+    # holds implicit view rights to every client; assigning them adds
+    # nothing, and historically a stray SA-also-CM role on the SA user
+    # let them surface in the dropdown. Defence in depth — the list
+    # endpoint also filters them out, but a hand-rolled PUT could
+    # bypass that.
+    target_user = (await db.execute(
+        select(User).where(User.id == cm_user_id)
+    )).scalar_one_or_none()
+    sa_email = (settings.sa_email or "").lower()
+    if target_user and sa_email and (target_user.email or "").lower() == sa_email:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "sa_not_assignable",
+                "message": (
+                    "The Super Admin has implicit view rights to every "
+                    "client and cannot be assigned as a Content Manager."
+                ),
+            },
+        )
+
     # 2026-06-30 — Bug fix: the UniqueConstraint on
     # (cm_user_id, client_id) doesn't include `status`, so an older
     # INACTIVE row for the same (cm_user_id, client_id) blocked the
