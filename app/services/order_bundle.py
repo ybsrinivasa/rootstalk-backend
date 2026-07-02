@@ -589,6 +589,23 @@ async def compute_absorption_extended_windows(
             merged_from = min(prev[0], absorbed_tw.from_date)
             merged_to = max(prev[1], absorbed_tw.to_date)
         extended[absorbing_id] = (merged_from, merged_to)
+    # 2026-07-02 (Phase 2C) — Merge-group windows extend the anchor's
+    # per-item application dates just like absorption does. When BL-03
+    # merges TL2 into TL1's OR (shared identity + united window), the
+    # dealer's order-detail card should show items in the merged
+    # relation with the extended window, matching what the farmer sees
+    # on their advisory.
+    for dt in deduped:
+        mg = dt.merge_group
+        if mg is None:
+            continue
+        prev = extended.get(dt.timeline.id)
+        merged_from = mg.merged_window_from
+        merged_to = mg.merged_window_to
+        if prev is not None:
+            merged_from = min(prev[0], merged_from)
+            merged_to = max(prev[1], merged_to)
+        extended[dt.timeline.id] = (merged_from, merged_to)
     return extended
 
 
