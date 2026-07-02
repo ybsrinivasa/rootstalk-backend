@@ -80,6 +80,79 @@ class SuppressedPractice:
 
 
 @dataclass
+class MergeGroup:
+    """Phase 2C (2026-07-02) — OR-merge across overlapping timelines.
+
+    Emitted after the standard dedup + AND-atomicity passes when two
+    or more survivors carry OR relations that share at least one
+    identity. The anchor's relation gets extended with residual
+    options from each member; members render nothing on their own
+    (skipped via `merged_into_tl_id`). The union of member windows
+    stretches over the anchor.
+
+    Shapes covered by 2C.1 → 2C.4:
+      - Pure-OR vs Pure-OR with shared identity           (2C.1)
+      - AND-of-(OR Part, shared singleton) mutual         (2C.2)
+      - COMPLEX_OR vs COMPLEX_OR, shared single-pos Opt   (2C.4)
+
+    Semantic: merged relation shape is
+        (shared_choice OR (residual_1 AND residual_2 …)) AND shared_singletons
+    so that picking the shared atom satisfies every member's window,
+    while the residual fallback requires applying each member's
+    non-shared options together.
+    """
+    anchor_tl_id: str
+    anchor_relation_id: str
+    member_tl_ids: list[str]                             # excludes the anchor
+    merged_window_from: date
+    merged_window_to: date
+    # Shared atoms — practice ids on the anchor whose identity appears
+    # in every member's counterpart relation. Rendered as the "one
+    # covers all" head option(s) of the merged card.
+    shared_option_practice_ids: list[str]
+    # Anchor's own non-shared OR-Part options. These join the members'
+    # residuals in the merged fallback compound.
+    anchor_residual_practice_ids: list[str]
+    # Residual atoms per member — practice ids of options the member's
+    # OR carries but the anchor's doesn't. Together with the anchor's
+    # residuals, these form ONE compound fallback Option: apply all of
+    # them together to cover every member's window.
+    # Keys are member TL ids; values are practice ids from that member.
+    residual_practice_ids_by_member: dict[str, list[str]]
+    # Shared singletons (for 2C.2) — atoms outside the OR Part that
+    # every member requires. Rendered as an outer AND alongside the
+    # OR choice. Empty for 2C.1 / 2C.4.
+    shared_singleton_practice_ids: list[str]
+
+    def build_merged_options(self) -> list[list[str]]:
+        """Return the merged relation's OR Options list.
+
+        Each element is one Option — a list of practice ids that must
+        be applied together to satisfy that Option.
+
+        Shape produced:
+          - N head options, one per shared identity (each is a
+            single-position alternative that covers every member).
+          - 1 compound fallback option combining anchor's + every
+            member's non-shared residuals — apply all together.
+
+        For 2C.1 (A/B) vs (A/C) → [[A], [B, C]].
+        For 2C.4 A OR (X+Y) vs A OR (P+Q) → [[A], [X, Y, P, Q]].
+        The outer AND with `shared_singleton_practice_ids` is applied
+        alongside this Options list by the renderer (2C.2 case).
+        """
+        options: list[list[str]] = []
+        for pid in self.shared_option_practice_ids:
+            options.append([pid])
+        compound = list(self.anchor_residual_practice_ids)
+        for member_pids in self.residual_practice_ids_by_member.values():
+            compound.extend(member_pids)
+        if compound:
+            options.append(compound)
+        return options
+
+
+@dataclass
 class DeduplicatedTimeline:
     timeline: TimelineWindow
     visible_practices: list[PracticeStub]
@@ -96,6 +169,14 @@ class DeduplicatedTimeline:
     #   - every suppression points to the same governing_timeline_id.
     # Mixed-governor or has-residual-practices TLs stay rendered.
     absorbed_into_tl_id: Optional[str] = None
+    # 2026-07-02 — Phase 2C merge. When set on a survivor, this TL is
+    # the anchor of a MergeGroup — its OR relation carries extended
+    # options + a stretched window sourced from members. When set on
+    # a member (as `merged_into_tl_id`), the TL is skipped from the
+    # standalone render; its residual options are lifted into the
+    # anchor's merged card by the subscription router.
+    merge_group: Optional[MergeGroup] = None
+    merged_into_tl_id: Optional[str] = None
 
 
 def deduplicate_advisory(
@@ -480,7 +561,296 @@ def deduplicate_advisory(
             absorbed_into_tl_id=absorbed_into,
         ))
 
+    # 2026-07-02 — Phase 2C merge detection.
+    # Runs on survivors (post-Phase-1 absorption, post-Phase-2
+    # suppression, post-AND-atomicity). Composition order per user
+    # design: absorption first, then merge on what's left. Prevents
+    # merge from cascading into already-absorbed rows.
+    _detect_merge_groups(
+        result,
+        relation_structure=relation_structure,
+        relation_identities=relation_identities,
+    )
+
     return result
+
+
+def _detect_merge_groups(
+    result: list["DeduplicatedTimeline"],
+    *,
+    relation_structure: dict[tuple[str, str], str],
+    relation_identities: dict[tuple[str, str], frozenset[str]],
+) -> None:
+    """Phase 2C — detect + build MergeGroups over the dedup survivors.
+
+    Mutates the input list in place: anchors get `merge_group` set,
+    members get `merged_into_tl_id` set. No new TLs are added.
+
+    Detection is symmetric — we walk pairs of surviving TLs, sorted by
+    (from_date, created_at), so the earlier TL becomes the anchor. If
+    a third TL merges into the same anchor, it joins the existing
+    MergeGroup as another member.
+
+    Rules covered:
+      2C.1 — pure-OR vs pure-OR, share ≥1 identity.
+      2C.2 — AND-of-(OR Part, shared singleton) mutual share
+             (implemented alongside 2C.1 using the same primitive).
+      2C.4 — COMPLEX_OR vs COMPLEX_OR, shared single-position Option.
+             (implemented in the same pass — the merge shape is the
+             same as 2C.1: the shared atom becomes the head option,
+             non-shared members' Options become residuals.)
+    """
+    # Filter to survivors that are still standalone-render candidates.
+    # Anything absorbed by Phase 1 is out of the running.
+    standalone_survivors = [
+        d for d in result
+        if d.absorbed_into_tl_id is None and d.visible_practices
+    ]
+    if len(standalone_survivors) < 2:
+        return
+
+    # Sort by (from_date, created_at) to make anchor selection deterministic.
+    standalone_survivors.sort(
+        key=lambda d: (d.timeline.from_date, d.timeline.created_at)
+    )
+
+    # Track which TL ids are already merged (as anchor or member) so we
+    # don't try to merge them twice this pass.
+    already_anchored: set[str] = set()
+    already_a_member: set[str] = set()
+
+    for i, anchor_dt in enumerate(standalone_survivors):
+        if anchor_dt.timeline.id in already_a_member:
+            continue
+        anchor_tl = anchor_dt.timeline
+        # Consider each of the anchor's OR-shaped relations in turn.
+        anchor_or_rels = _or_relations_on_tl(
+            anchor_dt, relation_structure=relation_structure,
+        )
+        if not anchor_or_rels:
+            continue
+
+        for anchor_rid in anchor_or_rels:
+            anchor_idents = relation_identities.get(
+                (anchor_tl.id, anchor_rid), frozenset(),
+            )
+            if not anchor_idents:
+                continue
+
+            # Look for later survivors that share ≥ 1 identity with this
+            # anchor relation on one of THEIR OR-shaped relations.
+            for member_dt in standalone_survivors[i + 1:]:
+                if member_dt.timeline.id in already_a_member:
+                    continue
+                if not _tls_overlap_windows(anchor_tl, member_dt.timeline):
+                    continue
+                member_or_rels = _or_relations_on_tl(
+                    member_dt, relation_structure=relation_structure,
+                )
+                for member_rid in member_or_rels:
+                    member_idents = relation_identities.get(
+                        (member_dt.timeline.id, member_rid), frozenset(),
+                    )
+                    shared = anchor_idents & member_idents
+                    if not shared:
+                        continue
+                    # Match — record the merge.
+                    _extend_or_create_merge_group(
+                        anchor_dt=anchor_dt,
+                        anchor_rid=anchor_rid,
+                        member_dt=member_dt,
+                        member_rid=member_rid,
+                        shared_idents=shared,
+                    )
+                    already_anchored.add(anchor_tl.id)
+                    already_a_member.add(member_dt.timeline.id)
+                    break  # one merge per member-anchor pair
+
+
+def _or_relations_on_tl(
+    dt: "DeduplicatedTimeline",
+    *,
+    relation_structure: dict[tuple[str, str], str],
+) -> list[str]:
+    """Return the relation ids on this TL whose structure is any OR
+    flavour (PURE_OR or COMPLEX_OR). Excludes AND — those don't
+    participate in 2C.1 / 2C.4 merges. (2C.2's AND-with-OR-Part case
+    is handled by looking at the OR sub-Part identities — we treat
+    the whole AND relation as OR-mergeable when at least one of its
+    Parts is an OR shape carrying shared identity.)"""
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in dt.visible_practices:
+        if not p.relation_id or p.relation_id in seen:
+            continue
+        seen.add(p.relation_id)
+        struct = relation_structure.get((dt.timeline.id, p.relation_id))
+        if struct in ("PURE_OR", "COMPLEX_OR", "AND"):
+            # Include AND so 2C.2 (AND-with-OR-Part) has a chance to
+            # match. The identity comparison at the caller handles
+            # whether the OR sub-Part actually shares.
+            out.append(p.relation_id)
+    return out
+
+
+def _tls_overlap_windows(a: TimelineWindow, b: TimelineWindow) -> bool:
+    return a.from_date <= b.to_date and b.from_date <= a.to_date
+
+
+def _extend_or_create_merge_group(
+    *,
+    anchor_dt: "DeduplicatedTimeline",
+    anchor_rid: str,
+    member_dt: "DeduplicatedTimeline",
+    member_rid: str,
+    shared_idents: frozenset[str],
+) -> None:
+    """Attach (or extend) a MergeGroup on the anchor and mark the
+    member as merged. Splits the anchor's + member's practices into
+    shared / residual / singleton buckets."""
+    # Split anchor's practices by Part shape. Structure inferred from
+    # the FULL original practices list so a suppressed Option (e.g.
+    # the shared identity that got dedup'd) doesn't collapse an OR
+    # Part into a singleton.
+    #  • Part is a singleton iff it has exactly one Option with exactly
+    #    one position — the atom is required (AND wrt outer relation).
+    #  • Otherwise it's an OR Part.
+    # Shared identities in OR Parts → head choice on the merged card.
+    # Shared identities in singleton Parts → outer AND (only when the
+    # member also has a singleton on the same identity).
+    anchor_full_by_part = _group_by_part(
+        anchor_dt.timeline.practices, anchor_rid,
+    )
+    visible_anchor_ids = {p.id for p in anchor_dt.visible_practices}
+    anchor_singleton_pids: dict[str, str] = {}
+    anchor_or_part_shared_pids: dict[str, str] = {}
+    anchor_or_part_residual_pids: list[str] = []
+    for _part_idx, opt_map in anchor_full_by_part.items():
+        is_singleton = len(opt_map) == 1 and all(len(ps) == 1 for ps in opt_map.values())
+        for _opt_idx, ps in opt_map.items():
+            for p in ps:
+                if p.id not in visible_anchor_ids:
+                    continue
+                ref = p.primary_identity_ref()
+                if not ref:
+                    continue
+                if is_singleton:
+                    if ref in shared_idents:
+                        anchor_singleton_pids[ref] = p.id
+                    # Non-shared singletons on the anchor stay in the
+                    # anchor's own render — they're not part of the
+                    # merge shape.
+                else:
+                    if ref in shared_idents:
+                        anchor_or_part_shared_pids[ref] = p.id
+                    else:
+                        # Anchor's non-shared OR-Part option — joins
+                        # the fallback compound.
+                        anchor_or_part_residual_pids.append(p.id)
+
+    member_singleton_refs = _singleton_identity_refs(member_dt, member_rid)
+    shared_singletons = [
+        pid for ref, pid in anchor_singleton_pids.items()
+        if ref in member_singleton_refs
+    ]
+    shared_on_anchor = list(anchor_or_part_shared_pids.values())
+
+    # Residual practices on the member — non-shared options in the
+    # member's OR Part(s). Structure from full practices, content
+    # filtered to survivors.
+    member_full_by_part = _group_by_part(
+        member_dt.timeline.practices, member_rid,
+    )
+    visible_member_ids = {p.id for p in member_dt.visible_practices}
+    residuals_on_member: list[str] = []
+    for _part_idx, opt_map in member_full_by_part.items():
+        is_singleton = len(opt_map) == 1 and all(len(ps) == 1 for ps in opt_map.values())
+        if is_singleton:
+            continue  # non-shared singletons aren't merged in 2C.1-4
+        for _opt_idx, ps in opt_map.items():
+            for p in ps:
+                if p.id not in visible_member_ids:
+                    continue
+                ref = p.primary_identity_ref()
+                if ref and ref not in shared_idents:
+                    residuals_on_member.append(p.id)
+
+    # Compute merged window (union).
+    from_date = min(anchor_dt.timeline.from_date, member_dt.timeline.from_date)
+    to_date = max(anchor_dt.timeline.to_date, member_dt.timeline.to_date)
+
+    if anchor_dt.merge_group is None:
+        anchor_dt.merge_group = MergeGroup(
+            anchor_tl_id=anchor_dt.timeline.id,
+            anchor_relation_id=anchor_rid,
+            member_tl_ids=[member_dt.timeline.id],
+            merged_window_from=from_date,
+            merged_window_to=to_date,
+            shared_option_practice_ids=shared_on_anchor,
+            anchor_residual_practice_ids=anchor_or_part_residual_pids,
+            residual_practice_ids_by_member={
+                member_dt.timeline.id: residuals_on_member,
+            },
+            shared_singleton_practice_ids=shared_singletons,
+        )
+    else:
+        # Third+ member — extend the existing group.
+        mg = anchor_dt.merge_group
+        mg.member_tl_ids.append(member_dt.timeline.id)
+        mg.merged_window_from = min(mg.merged_window_from, from_date)
+        mg.merged_window_to = max(mg.merged_window_to, to_date)
+        mg.residual_practice_ids_by_member[member_dt.timeline.id] = (
+            residuals_on_member
+        )
+        # Shared singletons: intersection tightens. If a third member
+        # doesn't carry one of the previously-shared singletons, drop
+        # it from the merged set.
+        mg.shared_singleton_practice_ids = [
+            pid for pid in mg.shared_singleton_practice_ids
+            if pid in shared_singletons
+        ]
+
+    member_dt.merged_into_tl_id = anchor_dt.timeline.id
+
+
+def _group_by_part(
+    practices: list[PracticeStub], rid: str,
+) -> dict[int, dict[int, list[PracticeStub]]]:
+    """Return {part_idx → {opt_idx → [practices in that Option]}} for
+    a given relation. Callers pass the FULL original practices list
+    when they need structural inference (a Part with a suppressed
+    Option is still an OR Part), or `visible_practices` when they
+    need to filter to survivors."""
+    out: dict[int, dict[int, list[PracticeStub]]] = {}
+    for p in practices:
+        if p.relation_id != rid or not p.relation_role:
+            continue
+        m = _ROLE_PARSER.match(p.relation_role)
+        if not m:
+            continue
+        part_idx, opt_idx = int(m.group(1)), int(m.group(2))
+        out.setdefault(part_idx, {}).setdefault(opt_idx, []).append(p)
+    return out
+
+
+def _singleton_identity_refs(
+    dt: "DeduplicatedTimeline", rid: str,
+) -> set[str]:
+    """Identity refs that occupy a singleton Part in this relation.
+    Structure inferred from the ORIGINAL practices so a suppressed
+    Option in an OR Part doesn't reduce that Part to a singleton."""
+    grouped = _group_by_part(dt.timeline.practices, rid)
+    out: set[str] = set()
+    for _part_idx, opt_map in grouped.items():
+        if len(opt_map) != 1:
+            continue
+        (only_opt,) = opt_map.values()
+        if len(only_opt) != 1:
+            continue
+        ref = only_opt[0].primary_identity_ref()
+        if ref:
+            out.add(ref)
+    return out
 
 
 def timelines_overlap(a: TimelineWindow, b: TimelineWindow) -> bool:

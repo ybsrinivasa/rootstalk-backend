@@ -60,7 +60,7 @@ def test_bl03_01_same_input_overlapping_timelines():
     tl_a = tl("TL_A", d(-10), d(5),  [p_a], d(-12))  # earlier created_at
     tl_b = tl("TL_B", d(-5),  d(20), [p_b], d(-4))
 
-    result = dedup([tl_a, tl_b], approved_practice_ids=set())
+    result = dedup([tl_a, tl_b], committed_practice_ids=set())
 
     r_a = next(r for r in result if r.timeline.id == "TL_A")
     r_b = next(r for r in result if r.timeline.id == "TL_B")
@@ -80,7 +80,7 @@ def test_bl03_02_same_input_non_overlapping_timelines():
     tl_a = tl("TL_A", d(-20), d(-10), [p_a])
     tl_b = tl("TL_B", d(5),   d(20),  [p_b])
 
-    result = dedup([tl_a, tl_b], approved_practice_ids=set())
+    result = dedup([tl_a, tl_b], committed_practice_ids=set())
 
     for r in result:
         assert len(r.visible_practices) == 1
@@ -97,7 +97,7 @@ def test_bl03_03_special_input_never_suppressed():
     tl_a = tl("TL_A", d(-5), d(10), [adj_a])
     tl_b = tl("TL_B", d(0),  d(20), [adj_b])
 
-    result = dedup([tl_a, tl_b], approved_practice_ids=set())
+    result = dedup([tl_a, tl_b], committed_practice_ids=set())
 
     for r in result:
         assert len(r.visible_practices) == 1  # Both appear
@@ -119,7 +119,7 @@ def test_bl03_04_chain_suppression_not_applied():
     tl_b = tl("TL_B", d(0),   d(15), [p_b], d(-5))
     tl_c = tl("TL_C", d(10),  d(25), [p_c], d(-3))
 
-    result = dedup([tl_a, tl_b, tl_c], approved_practice_ids=set())
+    result = dedup([tl_a, tl_b, tl_c], committed_practice_ids=set())
 
     r_a = next(r for r in result if r.timeline.id == "TL_A")
     r_b = next(r for r in result if r.timeline.id == "TL_B")
@@ -141,7 +141,7 @@ def test_bl03_05_purchased_suppression_survives_tl_closure():
     tl_a = tl("TL_A", d(-20), d(-1),  [p_a], d(-22))
     tl_b = tl("TL_B", d(-10), d(10),  [p_b], d(-12))
 
-    result = dedup([tl_a, tl_b], approved_practice_ids={"pA"})  # pA was purchased
+    result = dedup([tl_a, tl_b], committed_practice_ids={"pA"})  # pA was purchased
 
     r_b = next(r for r in result if r.timeline.id == "TL_B")
     assert len(r_b.visible_practices) == 0
@@ -158,7 +158,7 @@ def test_bl03_06_unpurchased_closed_timeline_reinstated():
     tl_a = tl("TL_A", d(-20), d(-1),  [p_a], d(-22))  # CLOSED
     tl_b = tl("TL_B", d(-10), d(10),  [p_b], d(-12))  # active
 
-    result = dedup([tl_a, tl_b], approved_practice_ids=set())  # NOT purchased
+    result = dedup([tl_a, tl_b], committed_practice_ids=set())  # NOT purchased
 
     r_b = next(r for r in result if r.timeline.id == "TL_B")
     assert len(r_b.visible_practices) == 1  # reinstated
@@ -177,7 +177,7 @@ def test_bl03_07_cha_cca_same_rules():
     tl_cha = tl("TL_CHA", d(-5),  d(15), [p_b], d(-7))
     tl_cha.source = "CHA"
 
-    result = dedup([tl_cca, tl_cha], approved_practice_ids=set())
+    result = dedup([tl_cca, tl_cha], committed_practice_ids=set())
 
     r_cca = next(r for r in result if r.timeline.id == "TL_CCA")
     r_cha = next(r for r in result if r.timeline.id == "TL_CHA")
@@ -197,7 +197,7 @@ def test_bl03_08_surviving_practices_not_merged():
     tl_a = tl("TL_A", d(-10), d(10), [p_a, p_b])
     tl_b = tl("TL_B", d(-5),  d(20), [p_c])
 
-    result = dedup([tl_a, tl_b], approved_practice_ids=set())
+    result = dedup([tl_a, tl_b], committed_practice_ids=set())
 
     r_a = next(r for r in result if r.timeline.id == "TL_A")
     r_b = next(r for r in result if r.timeline.id == "TL_B")
@@ -217,7 +217,7 @@ def test_bl03_09_all_tl_b_practices_suppressed_relation_removed():
     tl_a = tl("TL_A", d(-10), d(10), [p_a], d(-12))  # earlier → governs
     tl_b = tl("TL_B", d(-5),  d(20), [p_b], d(-7))
 
-    result = dedup([tl_a, tl_b], approved_practice_ids=set())
+    result = dedup([tl_a, tl_b], committed_practice_ids=set())
 
     r_b = next(r for r in result if r.timeline.id == "TL_B")
     assert len(r_b.visible_practices) == 0  # relation entirely gone
@@ -234,8 +234,8 @@ def test_bl03_10_equal_start_dates_tie_breaking():
     tl_a = tl("TL_A", same_from, d(20), [p_a], d(-10))   # older created_at → governs
     tl_b = tl("TL_B", same_from, d(25), [p_b], d(-5))    # newer created_at → suppressed
 
-    r1 = dedup([tl_a, tl_b], approved_practice_ids=set())
-    r2 = dedup([tl_b, tl_a], approved_practice_ids=set())  # reversed order
+    r1 = dedup([tl_a, tl_b], committed_practice_ids=set())
+    r2 = dedup([tl_b, tl_a], committed_practice_ids=set())  # reversed order
 
     def suppressed_count(results, tl_id):
         return len(next(r for r in results if r.timeline.id == tl_id).suppressed)
@@ -256,7 +256,7 @@ def test_bl03_extra_non_input_practices_never_suppressed():
     tl_a = tl("TL_A", d(-5), d(10), [inst_a])
     tl_b = tl("TL_B", d(0),  d(20), [inst_b])
 
-    result = dedup([tl_a, tl_b], approved_practice_ids=set())
+    result = dedup([tl_a, tl_b], committed_practice_ids=set())
 
     for r in result:
         assert len(r.visible_practices) == 1
