@@ -654,17 +654,21 @@ def _detect_merge_groups(
                     shared = anchor_idents & member_idents
                     if not shared:
                         continue
-                    # Match — record the merge.
-                    _extend_or_create_merge_group(
+                    # Candidate — attempt the merge. It may be rejected
+                    # by the OR-Part gate (e.g. pure-AND vs pure-AND
+                    # sharing an atom). Only mark the member as merged
+                    # if the merge actually fired.
+                    merged = _extend_or_create_merge_group(
                         anchor_dt=anchor_dt,
                         anchor_rid=anchor_rid,
                         member_dt=member_dt,
                         member_rid=member_rid,
                         shared_idents=shared,
                     )
-                    already_anchored.add(anchor_tl.id)
-                    already_a_member.add(member_dt.timeline.id)
-                    break  # one merge per member-anchor pair
+                    if merged:
+                        already_anchored.add(anchor_tl.id)
+                        already_a_member.add(member_dt.timeline.id)
+                        break  # one merge per member-anchor pair
 
 
 def _or_relations_on_tl(
@@ -704,10 +708,26 @@ def _extend_or_create_merge_group(
     member_dt: "DeduplicatedTimeline",
     member_rid: str,
     shared_idents: frozenset[str],
-) -> None:
+) -> bool:
     """Attach (or extend) a MergeGroup on the anchor and mark the
     member as merged. Splits the anchor's + member's practices into
-    shared / residual / singleton buckets."""
+    shared / residual / singleton buckets.
+
+    Returns True when the merge fired, False when it was rejected
+    because the shared identity does not live in an OR Part on both
+    sides. The caller uses this to decide whether to mark the member
+    as `merged_into_tl_id`.
+
+    Why the OR-Part gate matters: for pure-AND vs pure-AND like
+    (A+B) vs (A+C), atom A is REQUIRED on each side — not an
+    alternative. Applying A once does NOT relieve either TL's
+    demand for the OTHER atom, so the merge shape "A OR (B AND C)"
+    would misrepresent the SE's intent. Per the user's locked rule
+    ("we cannot stop the dealer giving A two times"), pure-AND
+    duplicates stay. The merge only makes sense when the shared
+    atom lives in an OR Part on both sides — it's a genuine
+    alternative, and applying it once satisfies both windows.
+    """
     # Split anchor's practices by Part shape. Structure inferred from
     # the FULL original practices list so a suppressed Option (e.g.
     # the shared identity that got dedup'd) doesn't collapse an OR
@@ -754,6 +774,18 @@ def _extend_or_create_merge_group(
         if ref in member_singleton_refs
     ]
     shared_on_anchor = list(anchor_or_part_shared_pids.values())
+
+    # OR-Part gate — the shared identity must live in an OR Part on
+    # BOTH sides. Otherwise this is a pure-AND-vs-pure-AND overlap
+    # (or one side is AND-only) and we must NOT merge. Even when A is
+    # the same molecule, (A+B) and (A+C) are different mixtures with
+    # potentially different tank behaviour — the farmer applies them
+    # separately, dealer sells A twice. Per locked user rule.
+    if not shared_on_anchor:
+        return False
+    member_or_shared_refs = _or_part_identity_refs(member_dt, member_rid) & shared_idents
+    if not member_or_shared_refs:
+        return False
 
     # Residual practices on the member — non-shared options in the
     # member's OR Part(s). Structure from full practices, content
@@ -811,6 +843,7 @@ def _extend_or_create_merge_group(
         ]
 
     member_dt.merged_into_tl_id = anchor_dt.timeline.id
+    return True
 
 
 def _group_by_part(
@@ -850,6 +883,26 @@ def _singleton_identity_refs(
         ref = only_opt[0].primary_identity_ref()
         if ref:
             out.add(ref)
+    return out
+
+
+def _or_part_identity_refs(
+    dt: "DeduplicatedTimeline", rid: str,
+) -> set[str]:
+    """Identity refs that occupy a Part with more than one Option in
+    this relation — i.e. the identity is an authored alternative, not
+    a mandatory AND member. Structure inferred from the ORIGINAL
+    practices so a suppressed Option doesn't collapse the Part shape."""
+    grouped = _group_by_part(dt.timeline.practices, rid)
+    out: set[str] = set()
+    for _part_idx, opt_map in grouped.items():
+        if len(opt_map) < 2:
+            continue  # singleton Part — not an OR alternative
+        for _opt_idx, ps in opt_map.items():
+            for p in ps:
+                ref = p.primary_identity_ref()
+                if ref:
+                    out.add(ref)
     return out
 
 
