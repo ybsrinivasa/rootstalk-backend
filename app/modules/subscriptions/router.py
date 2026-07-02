@@ -50,6 +50,106 @@ def _raise_sub_transition(res, status_code: int = 400) -> None:
     )
 
 
+def _apply_merge_group(
+    *,
+    anchor_dt,
+    member_dts: dict,
+    mg,
+) -> list:
+    """Phase 2C — rewrite an anchor TL's visible practices to reflect
+    the merged shape from a MergeGroup.
+
+    Returns a NEW practices list where:
+      - Practices unrelated to the anchor's merged relation are copied
+        through unchanged (other relations on the same TL, standalones,
+        NON_INPUT rows, etc.).
+      - Practices in the anchor's merged relation are REBUILT with new
+        relation_role coords that encode the merged Options structure.
+      - Members' non-shared residual practices are LIFTED into the
+        anchor's relation with adjusted coords. Their `id` remains
+        stable so orders + acks reference the original practice row.
+
+    Merged shape produced (part indexing 1-based):
+      Part 1  = OR head — one Option per shared identity + one compound
+                fallback Option (concatenated non-shared residuals).
+      Part 2+ = one Part per shared singleton (outer AND alongside OR).
+    """
+    from app.services.bl03_deduplication import PracticeStub
+
+    # Build a lookup across anchor + members so we can find any lifted
+    # practice by its id.
+    all_practices_by_id = {p.id: p for p in anchor_dt.visible_practices}
+    for mdt in member_dts.values():
+        for p in mdt.visible_practices:
+            all_practices_by_id[p.id] = p
+
+    # Identify the anchor's relation id — the one being merged.
+    anchor_rid = mg.anchor_relation_id
+
+    # 1. Copy through everything NOT in the merged relation.
+    out: list = [
+        p for p in anchor_dt.visible_practices
+        if p.relation_id != anchor_rid
+    ]
+
+    # 2. Rebuild Part 1: OR options.
+    options = mg.build_merged_options()
+    # If there's only one Option (e.g., every identity shared, no
+    # residuals), fall back to a degenerate AND — the "OR" of one
+    # option means "just apply it." relation_type still says OR for
+    # backward compat with the PWA's OR renderer.
+    outer_relation_type = "OR" if len(options) > 1 else "AND"
+    for opt_idx, opt_pids in enumerate(options, start=1):
+        for pos_idx, pid in enumerate(opt_pids, start=1):
+            base = all_practices_by_id.get(pid)
+            if not base:
+                continue
+            out.append(PracticeStub(
+                id=base.id, l0_type=base.l0_type,
+                l1_type=base.l1_type, l2_type=base.l2_type,
+                display_order=base.display_order,
+                is_special_input=base.is_special_input,
+                relation_id=anchor_rid,
+                relation_role=f"PART_1__OPT_{opt_idx}__POS_{pos_idx}",
+                relation_type=outer_relation_type,
+                elements=base.elements,
+                frequency_days=base.frequency_days,
+            ))
+
+    # 3. Rebuild Part 2+: shared singletons — each singleton becomes
+    #    its own Part.
+    next_part = 2
+    for pid in mg.shared_singleton_practice_ids:
+        base = all_practices_by_id.get(pid)
+        if not base:
+            continue
+        out.append(PracticeStub(
+            id=base.id, l0_type=base.l0_type,
+            l1_type=base.l1_type, l2_type=base.l2_type,
+            display_order=base.display_order,
+            is_special_input=base.is_special_input,
+            relation_id=anchor_rid,
+            relation_role=f"PART_{next_part}__OPT_1__POS_1",
+            # The presence of a singleton Part alongside an OR Part
+            # makes the outer relation an AND-of-OR-and-singleton
+            # shape. Report AND at the top-level so the PWA's
+            # multi-Part renderer takes over.
+            relation_type="AND",
+            elements=base.elements,
+            frequency_days=base.frequency_days,
+        ))
+        next_part += 1
+    # When singletons exist, the outer relation type should be AND
+    # (Part-level joiner). Retag the head-Part practices we just
+    # emitted.
+    if mg.shared_singleton_practice_ids:
+        for p in out:
+            if p.relation_id == anchor_rid and p.relation_role and p.relation_role.startswith("PART_1__"):
+                p.relation_type = "AND"
+
+    return out
+
+
 def _is_frequency_due_today(frequency_days, timeline_from_date, today_date) -> bool:
     """Frequency-based practice display filter.
 
@@ -5311,6 +5411,48 @@ async def _today_advisory_for_user(
                 context_render_ids.discard(absorbing_id)
             absorbed_skip.add(absorbed_id)
 
+        # ── Phase 2C merge lift (2026-07-02) ───────────────────────────
+        # For each anchor with a MergeGroup: rewrite the anchor's OR
+        # relation to the merged shape (shared head Options + one
+        # compound fallback + shared singletons), lifting member
+        # residual practices into the anchor's relation with new
+        # (part, option, position) coords so the PWA's existing OR
+        # renderer picks up the merged card without special-casing.
+        # Members drop from render via absorbed_skip; the anchor's
+        # window unions across every member.
+        merge_origin_names_by_anchor: dict[str, list[str]] = {}
+        for dedup_tl in deduped:
+            mg = dedup_tl.merge_group
+            if mg is None:
+                continue
+            anchor_id = dedup_tl.timeline.id
+            member_dedups = {
+                mid: dedup_by_id[mid] for mid in mg.member_tl_ids
+                if mid in dedup_by_id
+            }
+            dedup_tl.visible_practices = _apply_merge_group(
+                anchor_dt=dedup_tl,
+                member_dts=member_dedups,
+                mg=mg,
+            )
+            # Members: skip standalone render + union their windows.
+            for mid, member_dedup in member_dedups.items():
+                absorbed_skip.add(mid)
+                m_from, m_to = (
+                    tl_date_map[mid][:2] if mid in tl_date_map
+                    else (member_dedup.timeline.from_date, member_dedup.timeline.to_date)
+                )
+                if anchor_id in tl_date_map:
+                    a_from, a_to, a_day = tl_date_map[anchor_id]
+                    tl_date_map[anchor_id] = (
+                        min(a_from, m_from), max(a_to, m_to), a_day,
+                    )
+            # "+N more" chip data.
+            merge_origin_names_by_anchor[anchor_id] = [
+                member_dedups[mid].timeline.name for mid in mg.member_tl_ids
+                if mid in member_dedups
+            ]
+
         # ── Resolve cosh_ref / unit_cosh_id UUIDs → friendly names. ──────────
         # Elements that point at a Cosh Core (COMMON_NAME, APPLICATION_METHOD,
         # ITK_NAME, *_UNIT, …) store the selection as a Cosh UUID in either
@@ -5412,6 +5554,12 @@ async def _today_advisory_for_user(
                 "suppressed_count": len(dedup_tl.suppressed),
                 "practices": tl_practices_out,
             }
+            # 2026-07-02 — Phase 2C: expose the member origins that got
+            # merged into this anchor so the PWA can render a subtle
+            # "covers TL2, TL3" chip explaining why the window is wider.
+            merged_origins = merge_origin_names_by_anchor.get(tl.id)
+            if merged_origins:
+                tl_entry["merged_from_tl_names"] = merged_origins
             # Include BL-02 pending question for this timeline (if any)
             if tl.id in pending_questions_by_tl:
                 tl_entry["pending_conditional_question"] = pending_questions_by_tl[tl.id]
