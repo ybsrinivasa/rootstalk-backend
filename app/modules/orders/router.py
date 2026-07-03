@@ -7614,6 +7614,19 @@ async def facilitator_accept_promoter_invitation(
     cp.promoter_request_responded_at = datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(cp)
+    # 2026-07-03 — Post-commit consistency guard. Rohan on Testorg
+    # ended up with req_status=ACCEPTED but is_promoter=False after
+    # a single accept call — a state no current code path should
+    # produce. Log a warning if the flush somehow desynced the two
+    # fields so we can spot recurrences.
+    if bool(cp.is_promoter) is not True or cp.promoter_request_status != "ACCEPTED":
+        import logging
+        logging.getLogger(__name__).warning(
+            "facilitator_accept post-commit state inconsistent: "
+            "cp_id=%s is_promoter=%s req_status=%s user_id=%s",
+            cp.id, cp.is_promoter, cp.promoter_request_status,
+            current_user.id,
+        )
     return {
         "id": cp.id,
         "client_id": cp.client_id,
@@ -7904,6 +7917,15 @@ async def dealer_accept_promoter_invitation(
     cp.promoter_request_responded_at = datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(cp)
+    # 2026-07-03 — Same consistency guard as the facilitator accept.
+    if bool(cp.is_promoter) is not True or cp.promoter_request_status != "ACCEPTED":
+        import logging
+        logging.getLogger(__name__).warning(
+            "dealer_accept post-commit state inconsistent: "
+            "cp_id=%s is_promoter=%s req_status=%s user_id=%s",
+            cp.id, cp.is_promoter, cp.promoter_request_status,
+            current_user.id,
+        )
     return {
         "id": cp.id,
         "client_id": cp.client_id,
