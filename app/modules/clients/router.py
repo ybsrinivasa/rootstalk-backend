@@ -587,6 +587,31 @@ async def edit_client(
 
     data = request.model_dump(exclude_unset=True)
 
+    # 2026-07-04 — hidden_from_discovery is COMPANY_PAYS-only. FARMER_PAYS
+    # clients must remain discoverable by definition; hiding one would
+    # create a client with no path for farmers to find it. Refuse the
+    # write cleanly if the SA tries. Also blocked when the effective
+    # payment_model AFTER this edit is FARMER_PAYS (e.g. flipping model
+    # + setting hidden in one PUT).
+    if data.get("hidden_from_discovery") is True:
+        effective_model = data.get("payment_model", client.payment_model)
+        effective_model_val = (
+            effective_model.value if hasattr(effective_model, "value")
+            else str(effective_model)
+        )
+        if effective_model_val != "COMPANY_PAYS":
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "hidden_from_discovery_requires_company_pays",
+                    "message": (
+                        "hidden_from_discovery can be enabled only for "
+                        "COMPANY_PAYS clients. FARMER_PAYS clients must "
+                        "remain discoverable so farmers can subscribe."
+                    ),
+                },
+            )
+
     # Handle org_type_cosh_ids separately — replace the existing list
     new_org_types = data.pop("org_type_cosh_ids", None)
     if new_org_types is not None:

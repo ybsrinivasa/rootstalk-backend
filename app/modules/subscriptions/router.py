@@ -1238,6 +1238,12 @@ async def discover_crops_and_companies(
             Package.status == PackageStatus.ACTIVE,
             PackageLocation.district_cosh_id == district_cosh_id,
             Client.status == ClientStatus.ACTIVE,
+            # 2026-07-04 — SA can flag internal / testing / demo
+            # COMPANY_PAYS clients (e.g. Testorg on prod) as hidden
+            # from farmer discovery. Only surface applies; the
+            # subscribe-flow endpoints already filter to FARMER_PAYS
+            # so they're naturally unaffected.
+            Client.hidden_from_discovery.is_(False),
         )
         .distinct()
     )).all()

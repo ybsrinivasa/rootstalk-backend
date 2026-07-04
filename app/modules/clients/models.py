@@ -109,6 +109,16 @@ class Client(Base):
     payment_model: Mapped[PaymentModel] = mapped_column(
         SAEnum(PaymentModel), nullable=False,
     )
+    # 2026-07-04 — SA-only "hide from farmer discovery" flag. When True,
+    # the Client is excluded from `/farmer/discover/crops-and-companies`
+    # (the Crops & Companies drawer surface). Enforced allowed only for
+    # COMPANY_PAYS clients — FARMER_PAYS clients need to be discoverable
+    # by definition. Used to hide internal/testing/demo clients (e.g.,
+    # Testorg on prod) that were created for staff use but must not
+    # appear on a farmer's district-scoped discovery list.
+    hidden_from_discovery: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false", default=False,
+    )
     status: Mapped[ClientStatus] = mapped_column(SAEnum(ClientStatus), default=ClientStatus.PENDING_REVIEW)
     onboarding_link_token: Mapped[str] = mapped_column(Text, nullable=True)
     onboarding_link_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)

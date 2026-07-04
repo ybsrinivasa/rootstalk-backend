@@ -67,6 +67,10 @@ class ClientEdit(BaseModel):
     support_phone: Optional[str] = None
     office_phone: Optional[str] = None
     social_links: Optional[dict] = None
+    # 2026-07-04 — SA-only flag to hide COMPANY_PAYS clients from
+    # farmer discovery. Backend refuses to set True when the
+    # (effective) payment_model is FARMER_PAYS.
+    hidden_from_discovery: Optional[bool] = None
     # Org types — replaces the existing list when provided
     org_type_cosh_ids: Optional[List[str]] = None
 
@@ -105,6 +109,9 @@ class ClientOut(BaseModel):
     office_phone: Optional[str] = None
     is_manufacturer: bool
     payment_model: PaymentModel
+    # 2026-07-04 — surfaced on the SA client-detail response so the
+    # portal can render + edit the checkbox.
+    hidden_from_discovery: bool = False
     status: ClientStatus
     ca_name: str
     ca_phone: str
