@@ -386,16 +386,53 @@ class BrandLookupCache(Base):
 
 
 class MissingBrandReport(Base):
+    """Dealer-authored submission for a brand that isn't in RootsTalk's
+    catalogue yet. Historical name preserved for compatibility with the
+    existing SA-portal /brand-handling surface; user-facing terminology
+    is "Brand Form" or "Brand Submission" (see 2026-07-04 rework).
+
+    Two flavours share the row:
+      • ORDER-CONTEXT (legacy) — `order_item_id` set; created from the
+        dealer's order-fulfilment brand-picker.
+      • STANDALONE (2026-07-04) — `order_item_id` NULL; created via
+        the dealer's dashboard "Brand Submissions" tile. Photos +
+        L1/L2 required. Sends an email to the SA on create.
+    """
     __tablename__ = "missing_brand_reports"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     dealer_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
-    order_item_id: Mapped[str] = mapped_column(String(36), ForeignKey("order_items.id"), nullable=False)
+    # 2026-07-04 — nullable for standalone dashboard-launched submissions.
+    order_item_id: Mapped[str] = mapped_column(String(36), ForeignKey("order_items.id"), nullable=True)
     brand_name_reported: Mapped[str] = mapped_column(String(500), nullable=False)
     manufacturer_name: Mapped[str] = mapped_column(String(500), nullable=True)
+    # 2026-07-04 — new L1 category (PESTICIDE / FERTILIZER / SEED / …).
+    # Standalone submissions require it; legacy order-context rows may
+    # leave it NULL (l2_practice was the only category signal there).
+    l1_type: Mapped[str] = mapped_column(String(100), nullable=True)
     l2_practice: Mapped[str] = mapped_column(String(100), nullable=True)
     additional_info: Mapped[str] = mapped_column(Text, nullable=True)
+    # 2026-07-04 — 2-4 product photos uploaded via the existing media
+    # pipeline. Stored as a JSON array of S3 URLs.
+    photos: Mapped[list] = mapped_column(JSON, nullable=False, default=list, server_default="[]")
     status: Mapped[str] = mapped_column(String(30), default="PENDING")
     cm_notes: Mapped[str] = mapped_column(Text, nullable=True)
+    # 2026-07-04 — badge + dealer-history soft-delete.
+    # dealer_seen_status_at drives the unread-count badge on the
+    # dashboard tile: any row where reviewed_at > dealer_seen_status_at
+    # counts as "unseen update". Cleared on mark-seen.
+    # hidden_from_dealer_at is the soft-delete flag — filters the row
+    # out of the dealer's /dealer/brand-forms list. SA still sees it.
+    # Only allowed when status is APPROVED / REJECTED (i.e. the SA has
+    # responded); enforced at endpoint level.
+    dealer_seen_status_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    hidden_from_dealer_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    reviewed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

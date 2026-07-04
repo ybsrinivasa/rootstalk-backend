@@ -5637,8 +5637,41 @@ async def list_missing_brand_reports(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    result = await db.execute(select(MissingBrandReport).order_by(MissingBrandReport.created_at.desc()))
-    return result.scalars().all()
+    """SA / privileged CM: list every brand submission. Response is
+    enriched with the dealer's name + phone so the SA can call for
+    clarification without a second round-trip.
+    """
+    rows = (await db.execute(
+        select(MissingBrandReport).order_by(MissingBrandReport.created_at.desc())
+    )).scalars().all()
+    if not rows:
+        return []
+    dealer_ids = list({r.dealer_user_id for r in rows})
+    users = (await db.execute(
+        select(User).where(User.id.in_(dealer_ids))
+    )).scalars().all()
+    u_by_id = {u.id: u for u in users}
+    out = []
+    for r in rows:
+        u = u_by_id.get(r.dealer_user_id)
+        out.append({
+            "id": r.id,
+            "dealer_user_id": r.dealer_user_id,
+            "dealer_name": u.name if u else None,
+            "dealer_phone": u.phone if u else None,
+            "order_item_id": r.order_item_id,
+            "brand_name_reported": r.brand_name_reported,
+            "manufacturer_name": r.manufacturer_name,
+            "l1_type": r.l1_type,
+            "l2_practice": r.l2_practice,
+            "additional_info": r.additional_info,
+            "photos": r.photos or [],
+            "status": r.status,
+            "cm_notes": r.cm_notes,
+            "reviewed_at": r.reviewed_at,
+            "created_at": r.created_at,
+        })
+    return out
 
 
 @router.put("/admin/missing-brand-reports/{report_id}")
@@ -5651,8 +5684,14 @@ async def update_brand_report(
     """SA or the CM with BRAND_HANDLING privilege: review and
     approve/reject a missing brand report. Batch U (2026-05-18) —
     privilege actually enforced now (previously the docstring
-    claimed it but the function body didn't check)."""
+    claimed it but the function body didn't check).
+
+    2026-07-04 — Stamp `reviewed_at` on any transition INTO a terminal
+    status (APPROVED / REJECTED). Drives the dealer's "unseen update"
+    badge on the dashboard tile.
+    """
     from app.modules.advisory.router import _assert_sa_or_privileged_cm
+    from datetime import datetime, timezone
     await _assert_sa_or_privileged_cm(db, current_user, "BRAND_HANDLING")
     report = (await db.execute(
         select(MissingBrandReport).where(MissingBrandReport.id == report_id)
@@ -5660,11 +5699,252 @@ async def update_brand_report(
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
     if "status" in data:
-        report.status = data["status"]
+        new_status = data["status"]
+        report.status = new_status
+        if new_status in ("APPROVED", "REJECTED"):
+            report.reviewed_at = datetime.now(timezone.utc)
     if "cm_notes" in data:
         report.cm_notes = data["cm_notes"]
     await db.commit()
     return {"id": report_id, "status": report.status}
+
+
+# ── Dealer Brand Forms — dashboard-launched standalone submissions ──
+
+def _brand_form_to_dict(r: MissingBrandReport) -> dict:
+    """Serialise a MissingBrandReport row for the dealer PWA. Excludes
+    dealer PII since the dealer already knows their own info."""
+    return {
+        "id": r.id,
+        "brand_name_reported": r.brand_name_reported,
+        "manufacturer_name": r.manufacturer_name,
+        "l1_type": r.l1_type,
+        "l2_practice": r.l2_practice,
+        "additional_info": r.additional_info,
+        "photos": r.photos or [],
+        "status": r.status,
+        "cm_notes": r.cm_notes,
+        "reviewed_at": r.reviewed_at,
+        "created_at": r.created_at,
+        "dealer_seen_status_at": r.dealer_seen_status_at,
+    }
+
+
+def _send_sa_brand_form_email(
+    dealer: User, brand: str, manufacturer: str | None,
+    l1_type: str | None, l2_practice: str | None,
+):
+    """Nudge the SA that a new Brand Form landed. Failures are logged
+    but never block the create — the row is already committed by the
+    time this runs. Uses the existing sync `_send_email` helper from
+    clients.service (same SMTP path CA-welcome / onboarding-link
+    emails travel through)."""
+    import logging
+    from app.config import settings
+    from app.modules.clients.service import _send_email
+
+    sa_email = (settings.sa_email or "").strip()
+    if not sa_email:
+        return
+    subject = f"[RootsTalk] New Brand submission: {brand}"
+    plain_lines = [
+        "A dealer has submitted a new Brand Form for review.",
+        "",
+        f"Brand:        {brand}",
+        f"Manufacturer: {manufacturer or '—'}",
+        f"L1 category:  {l1_type or '—'}",
+        f"L2 category:  {l2_practice or '—'}",
+        "",
+        f"Dealer:       {dealer.name or '—'}",
+        f"Phone:        {dealer.phone or '—'}",
+        "",
+        "Open the SA portal → Brand Handling to review.",
+    ]
+    plain = "\n".join(plain_lines)
+    html = (
+        "<p>A dealer has submitted a new Brand Form for review.</p>"
+        f"<p><b>Brand:</b> {brand}<br>"
+        f"<b>Manufacturer:</b> {manufacturer or '—'}<br>"
+        f"<b>L1 category:</b> {l1_type or '—'}<br>"
+        f"<b>L2 category:</b> {l2_practice or '—'}</p>"
+        f"<p><b>Dealer:</b> {dealer.name or '—'}<br>"
+        f"<b>Phone:</b> {dealer.phone or '—'}</p>"
+        "<p>Open the SA portal → Brand Handling to review.</p>"
+    )
+    try:
+        _send_email(sa_email, subject, html, plain)
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            "SA brand-form email failed for report by dealer %s: %s",
+            dealer.id, e,
+        )
+
+
+@router.post("/dealer/brand-forms", status_code=201)
+async def create_brand_form(
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Dealer creates a standalone Brand Form from the dashboard tile.
+
+    Required: `brand_name_reported`, `manufacturer_name`, `l1_type`,
+    `l2_practice`, `photos` (2-4 S3 URLs). Optional:
+    `additional_info` (dealer's free-text notes).
+
+    Fires an email to `settings.sa_email` after commit so the SA
+    picks up the new submission even when they aren't at the portal.
+    """
+    await _assert_active_dealer(db, current_user.id)
+
+    brand = (data.get("brand_name_reported") or "").strip()
+    manufacturer = (data.get("manufacturer_name") or "").strip()
+    l1_type = (data.get("l1_type") or "").strip()
+    l2_practice = (data.get("l2_practice") or "").strip()
+    photos = data.get("photos") or []
+    additional_info = (data.get("additional_info") or "").strip() or None
+
+    if not brand:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "brand_required", "message": "Brand name is required."},
+        )
+    if not manufacturer:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "manufacturer_required", "message": "Manufacturer name is required."},
+        )
+    if not l1_type or not l2_practice:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "category_required", "message": "Input category (L1) and sub-category (L2) are required."},
+        )
+    if not isinstance(photos, list) or len(photos) < 2 or len(photos) > 4:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "photo_count", "message": "Please upload between 2 and 4 product photos."},
+        )
+
+    report = MissingBrandReport(
+        dealer_user_id=current_user.id,
+        order_item_id=None,
+        brand_name_reported=brand,
+        manufacturer_name=manufacturer,
+        l1_type=l1_type,
+        l2_practice=l2_practice,
+        additional_info=additional_info,
+        photos=list(photos),
+    )
+    db.add(report)
+    await db.commit()
+    await db.refresh(report)
+
+    # Fire-and-forget SA email — failures don't affect the create.
+    _send_sa_brand_form_email(
+        current_user, brand, manufacturer, l1_type, l2_practice,
+    )
+    return _brand_form_to_dict(report)
+
+
+@router.get("/dealer/brand-forms")
+async def list_dealer_brand_forms(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Dealer's own Brand Form history. Excludes rows the dealer has
+    hidden from their view via /hide (SA still sees those on the
+    admin surface). Newest first."""
+    await _assert_active_dealer(db, current_user.id)
+    rows = (await db.execute(
+        select(MissingBrandReport)
+        .where(
+            MissingBrandReport.dealer_user_id == current_user.id,
+            MissingBrandReport.hidden_from_dealer_at.is_(None),
+        )
+        .order_by(MissingBrandReport.created_at.desc())
+    )).scalars().all()
+    return [_brand_form_to_dict(r) for r in rows]
+
+
+@router.put("/dealer/brand-forms/{form_id}/hide")
+async def hide_dealer_brand_form(
+    form_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Dealer soft-deletes a Brand Form from their history view. Only
+    allowed after the SA has responded (status APPROVED or REJECTED)
+    — a PENDING / REVIEWED submission is still live, hiding it would
+    be a footgun. SA continues to see the row in the admin surface."""
+    from datetime import datetime, timezone
+    await _assert_active_dealer(db, current_user.id)
+    report = (await db.execute(
+        select(MissingBrandReport).where(
+            MissingBrandReport.id == form_id,
+            MissingBrandReport.dealer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not report:
+        raise HTTPException(status_code=404, detail="Brand Form not found")
+    if report.status not in ("APPROVED", "REJECTED"):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "not_responded",
+                "message": "You can hide a Brand Form only after we've responded to it.",
+            },
+        )
+    report.hidden_from_dealer_at = datetime.now(timezone.utc)
+    await db.commit()
+    return {"id": form_id, "hidden": True}
+
+
+@router.put("/dealer/brand-forms/{form_id}/mark-seen")
+async def mark_dealer_brand_form_seen(
+    form_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Dealer viewed a form's status. Stamp `dealer_seen_status_at`
+    so the unread-count badge on the dashboard tile clears for this
+    row."""
+    from datetime import datetime, timezone
+    await _assert_active_dealer(db, current_user.id)
+    report = (await db.execute(
+        select(MissingBrandReport).where(
+            MissingBrandReport.id == form_id,
+            MissingBrandReport.dealer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not report:
+        raise HTTPException(status_code=404, detail="Brand Form not found")
+    report.dealer_seen_status_at = datetime.now(timezone.utc)
+    await db.commit()
+    return {"id": form_id, "seen_at": report.dealer_seen_status_at}
+
+
+@router.get("/dealer/brand-forms/unread-count")
+async def dealer_brand_form_unread_count(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Count of dealer's Brand Forms whose SA response is newer than
+    the dealer's last-seen timestamp. Drives the dashboard tile
+    badge."""
+    await _assert_active_dealer(db, current_user.id)
+    rows = (await db.execute(
+        select(MissingBrandReport).where(
+            MissingBrandReport.dealer_user_id == current_user.id,
+            MissingBrandReport.hidden_from_dealer_at.is_(None),
+            MissingBrandReport.reviewed_at.is_not(None),
+        )
+    )).scalars().all()
+    unseen = sum(
+        1 for r in rows
+        if r.dealer_seen_status_at is None
+        or r.reviewed_at > r.dealer_seen_status_at
+    )
+    return {"count": unseen}
 
 
 # ── BL-07: Brand options for an order item ───────────────────────────────────
