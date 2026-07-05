@@ -1238,12 +1238,22 @@ async def get_crop_history_qr(
 
 
 @router.get("/public/qr-verify/{qr_id}")
-async def public_qr_verify(qr_id: str, db: AsyncSession = Depends(get_db)):
+async def public_qr_verify(
+    qr_id: str,
+    lang: str = "en",
+    db: AsyncSession = Depends(get_db),
+):
     """PUBLIC — no auth. Backing endpoint for the /verify/{qr_id}
     public page rendered by the PWA. When a farmer scans a rootsTALK
     QR with a generic camera / QR app, their browser opens
     <base>/verify/<qr_id>; that page calls this endpoint to render
     the full "genuine + who + product + how-to-grow" landing.
+
+    Phase T-4: SeedVariety.description_points is served in the
+    requested locale when an APPROVED translation exists; falls back
+    to English otherwise. The PWA verify page passes `?lang=` from
+    `useLocale()` so a farmer whose browser locale is Hindi lands
+    on Hindi bullets.
 
     This is the unscoped verify: it doesn't compare against a
     farmer's order — that requires the scoped /farmer/qr/scan
@@ -1309,15 +1319,32 @@ async def public_qr_verify(qr_id: str, db: AsyncSession = Depends(get_db)):
     }
     if qr.variety_id:
         from app.modules.seed_mgmt.router import _localise_dus_rows
+        from app.services.translation_reader import (
+            resolve_translations_batch, decode_seed_description_translation,
+        )
+        from app.modules.translations.models import EntityType
         variety = (await db.execute(
             select(SeedVariety).where(SeedVariety.id == qr.variety_id)
         )).scalar_one_or_none()
         if variety:
             seed_extras["cultivation_notes"] = variety.cultivation_notes
-            seed_extras["description_points"] = variety.description_points or []
             seed_extras["photos"] = variety.photos or []
             # _localise_dus_rows with None dict returns English fallback names.
             seed_extras["dus_characters"] = _localise_dus_rows(variety.dus_characters, None) or []
+            # Description points — swap to farmer's language when a
+            # translation exists. Translation stored as JSON-encoded
+            # list; decode to Python list before returning.
+            english_pts = variety.description_points or []
+            translated_pts: list[str] | None = None
+            if lang != "en" and english_pts:
+                tmap = await resolve_translations_batch(
+                    db, lang,
+                    [(EntityType.SEED_VARIETY_DESCRIPTION_POINTS, variety.id)],
+                )
+                translated_pts = decode_seed_description_translation(
+                    tmap.get((EntityType.SEED_VARIETY_DESCRIPTION_POINTS, variety.id)),
+                )
+            seed_extras["description_points"] = translated_pts or english_pts
 
     return {
         "verified": qr.status == "ACTIVE",

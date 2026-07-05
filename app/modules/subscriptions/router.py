@@ -2504,6 +2504,22 @@ async def get_assignment_details(
         if isinstance(row, dict):
             crop_name = pick_translation(row, lang, "") or None
 
+    # Phase T-4: SE-authored package description surfaced in the
+    # farmer's language when a translation exists; falls through to
+    # the English source otherwise.
+    localised_pkg_description = package.description if package else None
+    if package and package.description:
+        from app.services.translation_reader import resolve_translations_batch
+        from app.modules.translations.models import EntityType
+        translation_map = await resolve_translations_batch(
+            db, current_user.language_code or "en",
+            [(EntityType.PACKAGE_DESCRIPTION, package.id)],
+        )
+        localised_pkg_description = (
+            translation_map.get((EntityType.PACKAGE_DESCRIPTION, package.id))
+            or package.description
+        )
+
     return {
         "subscription_id": sub.id,
         "company": {
@@ -2516,7 +2532,7 @@ async def get_assignment_details(
         "crop_cosh_id": package.crop_cosh_id if package else None,
         "crop_name": crop_name,
         "package_name": package.name if package else None,
-        "package_description": package.description if package else None,
+        "package_description": localised_pkg_description,
         "duration_days": package.duration_days if package else None,
         "package_type": package.package_type.value if package and package.package_type else None,
         "parameter_variables": pv_summary,
@@ -5491,6 +5507,31 @@ async def _today_advisory_for_user(
                 return uuid_or_label
             return name_by_cosh_id.get(uuid_or_label, uuid_or_label)
 
+        # ── Phase T-4: SE-authored translations. ────────────────────────────
+        # Batch-load Element.value + Package.description translations
+        # for the farmer's locale in one round-trip. Callers of
+        # `_element_value_localised()` / `_package_desc_localised()`
+        # fall through to the English source when no APPROVED
+        # translation exists.
+        from app.services.translation_reader import resolve_translations_batch
+        from app.modules.translations.models import EntityType
+        translatable_pairs: set[tuple[str, str]] = set()
+        translatable_pairs.add((EntityType.PACKAGE_DESCRIPTION, pkg.id))
+        for dedup_tl in deduped:
+            for p in dedup_tl.visible_practices:
+                for el in p.elements:
+                    if el.value:
+                        translatable_pairs.add((EntityType.ELEMENT_VALUE, el.id))
+        translation_map = await resolve_translations_batch(
+            db, lang, translatable_pairs,
+        )
+
+        def _element_value_localised(el) -> str | None:
+            if not el.value:
+                return el.value
+            localised = translation_map.get((EntityType.ELEMENT_VALUE, el.id))
+            return localised or el.value
+
         # ── Build response ────────────────────────────────────────────────────
         timeline_data = []
         for dedup_tl in deduped:
@@ -5540,7 +5581,7 @@ async def _today_advisory_for_user(
                     "elements": [{
                         "element_type": el.element_type,
                         "cosh_ref": _resolve(el.cosh_ref),
-                        "value": el.value,
+                        "value": _element_value_localised(el),
                         "unit_cosh_id": _resolve(el.unit_cosh_id),
                     } for el in p.elements],
                     # Practice ack state + the occurrence_date the PWA
