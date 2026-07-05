@@ -256,6 +256,10 @@ class ElementWithLabelOut(BaseModel):
     server-resolved English name for `cosh_ref` references, or the
     raw `value` for free-text / numeric fields. Frontend renders
     `{label}: {display_value}` without any further lookups."""
+    # Phase T-3 (2026-07-05): optional Element.id so the CA-portal
+    # TranslationReview widget can bind per-element translations.
+    # Backward-compatible — legacy callers see None and ignore it.
+    id: Optional[str] = None
     element_type: str
     label: str
     cosh_ref: Optional[str] = None

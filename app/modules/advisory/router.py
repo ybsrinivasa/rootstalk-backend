@@ -5934,6 +5934,10 @@ async def _attach_elements_with_labels(
         else:
             display = e.value
         by_practice.setdefault(e.practice_id, []).append({
+            # Phase T-3 (2026-07-05): expose Element.id so the CA-portal
+            # TranslationReview widget can bind per-element translations.
+            # Optional in the schema — nothing else consumes it today.
+            "id": e.id,
             "element_type": e.element_type,
             "label": _label_from_id(e.element_type),
             "cosh_ref": e.cosh_ref,
