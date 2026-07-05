@@ -1,7 +1,10 @@
 import csv
 import io
 import json
+import os
+from pathlib import Path
 import qrcode
+from PIL import Image, ImageDraw, ImageFont
 from datetime import datetime, timezone, date
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile, File
@@ -73,6 +76,92 @@ def _public_base_url() -> str:
 
 
 PRODUCT_TYPE_SIZES = {"SMALL": 2.0, "MEDIUM": 3.5, "LARGE": 5.0}
+
+# 2026-07-05 — QR branding.
+# Farmer often sees multiple QRs on the same package (batch, marketing,
+# CE mark, etc). Ours needs to be instantly recognisable so they don't
+# scan the wrong one. Recipe:
+#   1. Error correction level H (30% redundancy) so the centred logo
+#      overlay doesn't degrade scan reliability.
+#   2. eywa logo (colored, text-stripped) inset at ~22% of the QR side.
+#   3. "rootsTALK.in" label rendered below the QR both in PNG and PDF
+#      outputs — the farmer opens the app under the same brand.
+_LOGO_PATH = Path(__file__).parent.parent.parent / "static" / "logos" / "eywa-logo-notext-square.png"
+_BRAND_LABEL = "rootsTALK.in"
+
+
+def _build_branded_qr_png(payload: str, px_size: int) -> Image.Image:
+    """Render a QR with the eywa logo overlaid in the center and the
+    rootsTALK.in brand label rendered below. Returns a PIL RGBA image
+    sized so `px_size` refers to the QR square (label sits below in
+    additional canvas). Used by both the PNG download and the PDF
+    composer so the two outputs stay visually identical."""
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_H,
+        box_size=max(3, px_size // 37),
+        border=3,
+    )
+    qr.add_data(payload)
+    qr.make(fit=True)
+    qr_img = qr.make_image(fill_color="#0F2A0F", back_color="white").convert("RGBA")
+
+    # Resize the raw QR to match the requested px_size (approximate —
+    # qrcode's box_size math is discrete). Nearest neighbour keeps the
+    # module edges crisp instead of blurring them.
+    if qr_img.size[0] != px_size:
+        qr_img = qr_img.resize((px_size, px_size), Image.NEAREST)
+
+    if _LOGO_PATH.exists():
+        logo = Image.open(_LOGO_PATH).convert("RGBA")
+        logo_side = int(px_size * 0.22)
+        # White backing so the logo isn't fighting QR modules behind it.
+        # Slightly larger than the logo itself so anti-aliased edges have
+        # room to breathe. Even with error correction H, a stark backing
+        # keeps the visual read cleaner from any scanning distance.
+        backing_side = int(logo_side * 1.15)
+        backing = Image.new("RGBA", (backing_side, backing_side), (255, 255, 255, 255))
+        bx = (px_size - backing_side) // 2
+        by = (px_size - backing_side) // 2
+        qr_img.paste(backing, (bx, by), backing)
+        logo = logo.resize((logo_side, logo_side), Image.LANCZOS)
+        lx = (px_size - logo_side) // 2
+        ly = (px_size - logo_side) // 2
+        qr_img.paste(logo, (lx, ly), logo)
+
+    # Below the QR: brand label. Height ≈ 12% of the QR side; leaves a
+    # tiny gap so the label reads as a separate line, not part of the
+    # QR frame.
+    label_height = max(24, int(px_size * 0.14))
+    gap = max(4, int(px_size * 0.02))
+    canvas = Image.new(
+        "RGBA",
+        (px_size, px_size + gap + label_height),
+        (255, 255, 255, 255),
+    )
+    canvas.paste(qr_img, (0, 0))
+    draw = ImageDraw.Draw(canvas)
+    font = None
+    for candidate in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/HelveticaNeue.ttc",
+    ):
+        if os.path.exists(candidate):
+            try:
+                font = ImageFont.truetype(candidate, size=int(label_height * 0.72))
+                break
+            except Exception:
+                continue
+    if font is None:
+        font = ImageFont.load_default()
+    text_bbox = draw.textbbox((0, 0), _BRAND_LABEL, font=font)
+    text_w = text_bbox[2] - text_bbox[0]
+    text_h = text_bbox[3] - text_bbox[1]
+    text_x = (px_size - text_w) // 2
+    text_y = px_size + gap + (label_height - text_h) // 2 - text_bbox[1]
+    draw.text((text_x, text_y), _BRAND_LABEL, fill="#0F2A0F", font=font)
+    return canvas
 
 
 # 2026-07-05 — Seed org_type is the same cosh_id the seed_mgmt module
@@ -569,12 +658,62 @@ async def bulk_create_qr_codes(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """BL-18 Bulk: validate CSV rows, skip duplicates, generate valid rows."""
+    """BL-18 Bulk: validate CSV rows, skip duplicates, generate valid rows.
+
+    2026-07-05 — Portfolio-anchored. Each CSV row's Trade / Variety
+    Name must resolve to a Portfolio entry — otherwise the resulting
+    QR would have no brand_cosh_id / variety_id in its payload and
+    every scan would mismatch. Unmatched names come back as FAILED
+    with a "not in Portfolio — add it first" message.
+    """
+    from app.modules.seed_mgmt.models import SeedVariety
+
     await _assert_client_can_qr(db, client_id)
     content = await file.read()
     reader = csv.DictReader(io.StringIO(content.decode("utf-8-sig")))
 
     client = (await db.execute(select(Client).where(Client.id == client_id))).scalar_one_or_none()
+
+    # Build a display_name → (brand_cosh_id, variety_id) resolver from
+    # the client's active portfolio. Case-insensitive on the name so
+    # small CSV typos ("Bt Cotton XYZ-42" vs "bt cotton xyz-42") match.
+    portfolio_rows = (await db.execute(
+        select(ManufacturerBrandPortfolio).where(
+            ManufacturerBrandPortfolio.client_id == client_id,
+            ManufacturerBrandPortfolio.status == "ACTIVE",
+        )
+    )).scalars().all()
+    resolver: dict[str, tuple[Optional[str], Optional[str]]] = {}
+    # Brand names come from Cosh trade_names; variety names come from
+    # seed_varieties. Batch-resolve both.
+    brand_ids = [p.brand_cosh_id for p in portfolio_rows if p.brand_cosh_id]
+    var_ids = [p.variety_id for p in portfolio_rows if p.variety_id]
+    brand_name_by_id: dict[str, str] = {}
+    var_name_by_id: dict[str, str] = {}
+    if brand_ids:
+        brand_rows = (await db.execute(
+            select(CoshCoreItem.cosh_id, CoshCoreItem.translations).where(
+                CoshCoreItem.cosh_id.in_(brand_ids),
+            )
+        )).all()
+        for cid, tr in brand_rows:
+            if isinstance(tr, dict):
+                brand_name_by_id[cid] = (tr.get("en") or next(
+                    (v for v in tr.values() if v), cid,
+                ))
+    if var_ids:
+        var_rows = (await db.execute(
+            select(SeedVariety.id, SeedVariety.name).where(
+                SeedVariety.id.in_(var_ids),
+            )
+        )).all()
+        var_name_by_id = {vid: vname for vid, vname in var_rows}
+    for p in portfolio_rows:
+        if p.brand_cosh_id and p.brand_cosh_id in brand_name_by_id:
+            resolver[brand_name_by_id[p.brand_cosh_id].strip().lower()] = (p.brand_cosh_id, None)
+        elif p.variety_id and p.variety_id in var_name_by_id:
+            resolver[var_name_by_id[p.variety_id].strip().lower()] = (None, p.variety_id)
+
     results = []
     generated = 0
     skipped_dup = 0
@@ -582,8 +721,8 @@ async def bulk_create_qr_codes(
 
     for i, row in enumerate(reader, start=2):
         product_type = (row.get("Product Type") or "").strip()
-        display_name = (row.get("Trade Name / Variety Name") or row.get("Trade Name") or "").strip()
-        mfr_date = (row.get("Manufacture or Production Date") or row.get("Manufacture Date") or "").strip()
+        display_name = (row.get("Trade Name / Variety Name") or row.get("Trade Name") or row.get("Variety Name") or "").strip()
+        mfr_date = (row.get("Manufacture or Production Date") or row.get("Manufacture Date") or row.get("Production Date") or "").strip()
         exp_date = (row.get("Expiry Date") or "").strip()
         batch_lot = (row.get("Batch/Lot Number") or row.get("Batch Number") or row.get("Lot Number") or "").strip()
 
@@ -612,17 +751,21 @@ async def bulk_create_qr_codes(
             failed += 1
             continue
 
-        # BL-18 audit (2026-05-06): use the shared dedup-key helper.
-        # The CSV today has no brand_cosh_id / variety_id columns
-        # (V2 follow-up — see project_rootstalk_v2_ideas.md), so the
-        # helper falls back to (client, display_name, batch). Single
-        # path uses the same helper, so a bulk row with the same
-        # display_name + batch as a single-created row is now caught
-        # by this in-app check (cross-path dedup).
+        resolved = resolver.get(display_name.strip().lower())
+        if not resolved:
+            results.append({
+                "row": i, "status": "FAILED",
+                "reason": "Not in Portfolio — add this Trade/Variety name to your Portfolio first.",
+                "display_name": display_name,
+            })
+            failed += 1
+            continue
+        row_brand_cosh_id, row_variety_id = resolved
+
         try:
             key = dedup_key(
-                brand_cosh_id=None,
-                variety_id=None,
+                brand_cosh_id=row_brand_cosh_id,
+                variety_id=row_variety_id,
                 product_display_name=display_name,
                 batch_lot_number=batch_lot,
             )
@@ -630,14 +773,6 @@ async def bulk_create_qr_codes(
             results.append({"row": i, "status": "FAILED", "reason": str(exc), "display_name": display_name})
             failed += 1
             continue
-
-        if key.is_fallback:
-            _logger.warning(
-                "Bulk QR import row %d using display_name fallback "
-                "(no brand_cosh_id / variety_id from CSV) — V2 should "
-                "add those columns. row display_name=%r batch=%r",
-                i, display_name, batch_lot,
-            )
 
         existing = await _find_qr_dupe(db, client_id, key)
         if existing:
@@ -656,6 +791,8 @@ async def bulk_create_qr_codes(
             "client_id": client_id,
             "company_name": client.full_name if client else "",
             "product_type": product_type,
+            "brand_cosh_id": row_brand_cosh_id,
+            "variety_id": row_variety_id,
             "display_name": display_name,
             "batch_lot": batch_lot,
             "mfr_date": mfr_date,
@@ -671,6 +808,8 @@ async def bulk_create_qr_codes(
             async with db.begin_nested():
                 qr = ProductQRCode(
                     client_id=client_id, product_type=product_type,
+                    brand_cosh_id=row_brand_cosh_id,
+                    variety_id=row_variety_id,
                     product_display_name=display_name,
                     manufacture_date=mfr_date_obj, expiry_date=exp_date_obj,
                     batch_lot_number=batch_lot, qr_payload=payload,
@@ -693,14 +832,33 @@ async def bulk_create_qr_codes(
 
 
 @router.get("/client/{client_id}/qr/bulk-template")
-async def download_bulk_template(client_id: str):
-    """Return CSV template with headers and one sample row."""
-    header = "Product Type,Trade Name / Variety Name,Manufacture or Production Date,Expiry Date,Batch/Lot Number\n"
-    sample = "Pesticide,BrandXYZ Gold,01-01-2026,31-12-2026,BATCH001\n"
+async def download_bulk_template(client_id: str, kind: str = "pesticide"):
+    """Return a CSV template with headers and one sample row. Split
+    by `kind` — 'pesticide' (default, covers pesticide + fertilizer)
+    or 'seed'. Column labels + sample rows differ so the CA doesn't
+    have to hunt for the right one:
+
+      pesticide.csv → Trade Name column, Manufacture Date phrasing.
+      seed.csv      → Variety Name column, Production Date phrasing,
+                       Lot Number instead of Batch Number.
+
+    The upload endpoint accepts both header variants (it reads any
+    of "Trade Name / Variety Name" | "Trade Name" | "Variety Name"
+    and any of "Manufacture..." | "Production..." | "Batch..." |
+    "Lot..."), so mixing rows still works — the split is just to
+    make the download step less confusing."""
+    if kind == "seed":
+        header = "Product Type,Variety Name,Production Date,Expiry Date,Lot Number\n"
+        sample = "Seed,Bt Cotton XYZ-42,01-01-2026,31-12-2026,LOT001\n"
+        fname = "qr_bulk_template_seed.csv"
+    else:
+        header = "Product Type,Trade Name,Manufacture Date,Expiry Date,Batch Number\n"
+        sample = "Pesticide,BrandXYZ Gold,01-01-2026,31-12-2026,BATCH001\n"
+        fname = "qr_bulk_template_pesticide.csv"
     return Response(
         content=(header + sample).encode(),
         media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=qr_bulk_template.csv"},
+        headers={"Content-Disposition": f"attachment; filename={fname}"},
     )
 
 
@@ -724,35 +882,39 @@ async def download_qr_code(
         raise HTTPException(status_code=404)
 
     px_size = int((size_cm or PRODUCT_TYPE_SIZES.get(size.upper(), 3.5)) * 37.8)
-    box_size = max(3, px_size // 37)
 
-    qr = qrcode.QRCode(version=1, box_size=box_size, border=3)
-    qr.add_data(qr_record.qr_payload or qr_id)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
+    branded = _build_branded_qr_png(qr_record.qr_payload or qr_id, px_size)
 
     if format.upper() == "PNG":
         buf = io.BytesIO()
-        img.save(buf, format="PNG")
+        branded.save(buf, format="PNG")
         buf.seek(0)
         fname = f"{qr_record.product_display_name}_{qr_record.batch_lot_number}.png"
         return Response(content=buf.read(), media_type="image/png",
                         headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
-    # PDF single
+    # PDF single. The branded PNG already carries the rootsTALK.in
+    # label baked in, so the PDF just drops it onto a page + adds the
+    # product / batch / date metadata below.
     pdf_buf = io.BytesIO()
     c = pdf_canvas.Canvas(pdf_buf, pagesize=A4)
     w, h = A4
     dim_cm = size_cm or PRODUCT_TYPE_SIZES.get(size.upper(), 3.5)
     dim_pt = dim_cm * cm
+    # Branded PNG is a taller-than-wide rectangle (QR + label). Preserve
+    # aspect ratio in the PDF so the label doesn't get squished.
+    aspect = branded.size[1] / branded.size[0]
+    img_w = dim_pt
+    img_h = dim_pt * aspect
 
     img_buf = io.BytesIO()
-    img.save(img_buf, format="PNG")
+    branded.save(img_buf, format="PNG")
     img_buf.seek(0)
     from reportlab.lib.utils import ImageReader
-    c.drawImage(ImageReader(img_buf), (w - dim_pt) / 2, h - dim_pt - 100, dim_pt, dim_pt)
+    top_y = h - img_h - 90
+    c.drawImage(ImageReader(img_buf), (w - img_w) / 2, top_y, img_w, img_h)
     c.setFont("Helvetica-Bold", 11)
-    y = h - dim_pt - 130
+    y = top_y - 22
     c.drawCentredString(w / 2, y, qr_record.product_display_name)
     c.setFont("Helvetica", 9)
     c.drawCentredString(w / 2, y - 14, f"Batch/Lot: {qr_record.batch_lot_number}")
