@@ -1655,6 +1655,7 @@ async def create_standard_response(
     db.add(sr)
     await db.commit()
     await db.refresh(sr)
+    _enqueue_sr_question_translation(sr.id)
     return _serialise_standard_response(sr)
 
 
@@ -1682,11 +1683,25 @@ async def update_standard_response(
     if not sr:
         raise HTTPException(status_code=404, detail="Standard response not found")
 
-    sr.question_text = str(data["question_text"]).strip()
+    new_q = str(data["question_text"]).strip()
+    question_changed = sr.question_text != new_q
+    sr.question_text = new_q
     sr.crop_cosh_id = data.get("crop_cosh_id") or None
     await db.commit()
     await db.refresh(sr)
+    if question_changed:
+        _enqueue_sr_question_translation(sr.id)
     return _serialise_standard_response(sr)
+
+
+def _enqueue_sr_question_translation(sr_id: str) -> None:
+    """Best-effort Celery enqueue — never raise."""
+    try:
+        from app.tasks.translate_content import translate_field
+        from app.modules.translations.models import EntityType
+        translate_field.delay(EntityType.STANDARD_RESPONSE_QUESTION, sr_id, "")
+    except Exception:
+        pass
 
 
 def _sr_state_error(sr: StandardResponse, expected: str, code: str, action: str) -> HTTPException:

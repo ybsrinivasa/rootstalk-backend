@@ -968,6 +968,10 @@ async def _add_practice_element(db, *, practice, element_model, body):
     db.add(new_row)
     await db.commit()
     await db.refresh(new_row)
+    # Phase T-3: fire-and-forget translation for text-shaped elements.
+    # The task filters by TRANSLATABLE_ELEMENT_TYPES internally, so
+    # numeric / URL / cosh-ref elements no-op inside the task.
+    _enqueue_element_translation(new_row)
     return new_row
 
 
@@ -991,6 +995,7 @@ async def _update_practice_element(
     expected = [_element_row_to_in(s) for s in siblings] + [body]
     await _revalidate_practice_elements(db, practice, expected)
 
+    value_changed = element.value != body.value or element.element_type != body.element_type
     element.element_type = body.element_type
     element.cosh_ref = body.cosh_ref
     element.value = body.value
@@ -998,7 +1003,21 @@ async def _update_practice_element(
     element.display_order = body.display_order
     await db.commit()
     await db.refresh(element)
+    if value_changed:
+        _enqueue_element_translation(element)
     return element
+
+
+def _enqueue_element_translation(element) -> None:
+    """Best-effort enqueue — never raise. The Celery task filters by
+    element_type inside; feeding a non-translatable one just no-ops.
+    Wrapped so both add + update callsites stay one-liners."""
+    try:
+        from app.tasks.translate_content import translate_field
+        from app.modules.translations.models import EntityType
+        translate_field.delay(EntityType.ELEMENT_VALUE, element.id, "")
+    except Exception:
+        pass
 
 
 async def _delete_practice_element(

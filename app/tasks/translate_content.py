@@ -23,6 +23,9 @@ from app.services.translation_service import (
 from app.services.translation_ancestry import (
     build_ancestry_for_package_description,
     build_ancestry_for_seed_variety_description,
+    build_ancestry_for_element_value,
+    build_ancestry_for_standard_response_question,
+    TRANSLATABLE_ELEMENT_TYPES,
 )
 from app.modules.translations.models import EntityType
 
@@ -30,18 +33,27 @@ logger = logging.getLogger(__name__)
 
 
 @celery_app.task(name="app.tasks.translate_content.translate_field")
-def translate_field(entity_type: str, entity_id: str, field_path: str = "") -> dict:
+def translate_field(
+    entity_type: str, entity_id: str, field_path: str = "",
+    force: bool = False,
+) -> dict:
     """Translate one (entity_type, entity_id, field_path) into all 12
     target locales. Fetches the current English source from the row,
     builds ancestry, calls Claude, persists.
 
+    `force=True` bypasses the hash-skip guard — used by the CA
+    portal's "Regenerate" button. Save-time triggers pass force=False
+    (the default) so no-op saves don't spend Claude credits.
+
     Returns {"written": N} on success, {"skipped": true} when hash
     unchanged, {"error": "..."} on failure.
     """
-    return asyncio.run(_run(entity_type, entity_id, field_path))
+    return asyncio.run(_run(entity_type, entity_id, field_path, force))
 
 
-async def _run(entity_type: str, entity_id: str, field_path: str) -> dict:
+async def _run(
+    entity_type: str, entity_id: str, field_path: str, force: bool,
+) -> dict:
     async with AsyncSessionLocal() as db:
         source_text, ancestry = await _fetch_source_and_ancestry(
             db, entity_type, entity_id, field_path,
@@ -53,6 +65,7 @@ async def _run(entity_type: str, entity_id: str, field_path: str) -> dict:
         try:
             written = await translate_and_persist(
                 db, entity_type, entity_id, field_path, source_text, ancestry,
+                force=force,
             )
         except Exception as e:  # noqa: BLE001
             logger.exception(
@@ -96,5 +109,22 @@ async def _fetch_source_and_ancestry(
         ancestry = await build_ancestry_for_seed_variety_description(db, entity_id)
         return source_json, ancestry
 
-    # T-3 additions land here (element.value, standard_response.question_text)
+    if entity_type == EntityType.ELEMENT_VALUE:
+        from app.modules.advisory.models import Element
+        ancestry, element_type = await build_ancestry_for_element_value(db, entity_id)
+        if ancestry is None or element_type not in TRANSLATABLE_ELEMENT_TYPES:
+            return None, AncestryContext()
+        value = (await db.execute(
+            select(Element.value).where(Element.id == entity_id)
+        )).scalar_one_or_none()
+        return value, ancestry
+
+    if entity_type == EntityType.STANDARD_RESPONSE_QUESTION:
+        from app.modules.farmpundit.models import StandardResponse
+        q = (await db.execute(
+            select(StandardResponse.question_text).where(StandardResponse.id == entity_id)
+        )).scalar_one_or_none()
+        ancestry = await build_ancestry_for_standard_response_question(db, entity_id)
+        return q, ancestry
+
     return None, AncestryContext()
