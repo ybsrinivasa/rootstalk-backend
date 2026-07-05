@@ -390,6 +390,17 @@ async def create_variety(
     # loaded so _variety_out doesn't trigger a lazy-load during
     # serialization. refresh() alone doesn't populate relationships.
     await db.refresh(variety, attribute_names=["pop_assignments"])
+    # Phase T-2: description_points fan out to 12 locales via Claude.
+    # Best-effort — never block the save.
+    if variety.description_points:
+        try:
+            from app.tasks.translate_content import translate_field
+            from app.modules.translations.models import EntityType
+            translate_field.delay(
+                EntityType.SEED_VARIETY_DESCRIPTION_POINTS, variety.id, "",
+            )
+        except Exception:
+            pass
     return _variety_out(variety)
 
 
@@ -404,10 +415,23 @@ async def update_variety(
     if "photos" in data:
         _validate_photos(data["photos"])
     variety = await _get_variety(db, variety_id, client_id)
+    description_changed = "description_points" in data
     for field in ["name", "variety_type", "description_points", "dus_characters", "photos", "cultivation_notes", "status"]:
         if field in data:
             setattr(variety, field, data[field])
     await db.commit()
+    # Phase T-2: description_points fan out to 12 locales when the
+    # bullets change. Hash check inside the task no-ops when the
+    # content is unchanged (e.g. photos-only save).
+    if description_changed and variety.description_points:
+        try:
+            from app.tasks.translate_content import translate_field
+            from app.modules.translations.models import EntityType
+            translate_field.delay(
+                EntityType.SEED_VARIETY_DESCRIPTION_POINTS, variety.id, "",
+            )
+        except Exception:
+            pass
     return _variety_out(variety)
 
 

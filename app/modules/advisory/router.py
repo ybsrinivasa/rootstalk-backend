@@ -1322,10 +1322,22 @@ async def update_package(
             exclude_package_id=pkg.id,
         )
 
+    description_changed = "description" in update_data
     for field, value in update_data.items():
         setattr(pkg, field, value)
     await db.commit()
     await db.refresh(pkg)
+    if description_changed:
+        # Phase T-2: SE-authored description gets async-translated to
+        # the 12 target locales via Claude. Task is a no-op when the
+        # description text hasn't drifted (hash check inside).
+        try:
+            from app.tasks.translate_content import translate_field
+            from app.modules.translations.models import EntityType
+            translate_field.delay(EntityType.PACKAGE_DESCRIPTION, pkg.id, "")
+        except Exception:
+            # Best-effort — never block the SE save on the queue.
+            pass
     return pkg
 
 

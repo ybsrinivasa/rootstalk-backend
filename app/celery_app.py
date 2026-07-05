@@ -19,6 +19,7 @@ celery_app = Celery(
         "app.tasks.enterprise_license_lifecycle",
         "app.tasks.postpone_expiry",
         "app.tasks.timeline_archive",
+        "app.tasks.translate_content",
     ],
 )
 
