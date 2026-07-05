@@ -1295,14 +1295,29 @@ async def public_qr_verify(qr_id: str, db: AsyncSession = Depends(get_db)):
             "office_phone": client.office_phone,
         }
 
-    cultivation_notes = None
+    # Seed-only extras: photos, description points, DUS characters,
+    # cultivation write-up. Every scan of a seed pouch doubles as a
+    # marketing surface for the variety, so we lean into showing
+    # what's already in the RootsTalk catalog. English fallback for
+    # the DUS names — public verify has no user locale to key off,
+    # and English coverage is universal on the descriptor tables.
+    seed_extras: dict = {
+        "cultivation_notes": None,
+        "description_points": [],
+        "photos": [],
+        "dus_characters": [],
+    }
     if qr.variety_id:
+        from app.modules.seed_mgmt.router import _localise_dus_rows
         variety = (await db.execute(
-            select(SeedVariety.cultivation_notes).where(
-                SeedVariety.id == qr.variety_id,
-            )
+            select(SeedVariety).where(SeedVariety.id == qr.variety_id)
         )).scalar_one_or_none()
-        cultivation_notes = variety
+        if variety:
+            seed_extras["cultivation_notes"] = variety.cultivation_notes
+            seed_extras["description_points"] = variety.description_points or []
+            seed_extras["photos"] = variety.photos or []
+            # _localise_dus_rows with None dict returns English fallback names.
+            seed_extras["dus_characters"] = _localise_dus_rows(variety.dus_characters, None) or []
 
     return {
         "verified": qr.status == "ACTIVE",
@@ -1319,8 +1334,11 @@ async def public_qr_verify(qr_id: str, db: AsyncSession = Depends(get_db)):
         "expiry_date": str(qr.expiry_date),
         # Company block — for the brand-coloured landing.
         "company": company,
-        # Seed-only cultivation write-up.
-        "cultivation_notes": cultivation_notes,
+        # Seed-only sections (empty lists / None for non-seed QRs)
+        "cultivation_notes": seed_extras["cultivation_notes"],
+        "description_points": seed_extras["description_points"],
+        "photos": seed_extras["photos"],
+        "dus_characters": seed_extras["dus_characters"],
     }
 
 
