@@ -82,6 +82,20 @@ PRODUCT_TYPE_SIZES = {"SMALL": 2.0, "MEDIUM": 3.5, "LARGE": 5.0}
 _SEED_COMPANY_COSH_ID = "4b0847f9-a590-452f-9129-ee0e2d946dd9"
 
 
+async def _is_seed_client(db: AsyncSession, client_id: str) -> bool:
+    """True when the client carries the seed-company org-type marker.
+    Independent of `is_manufacturer` — a Bayer-shaped client can be
+    both. Used by the QR gate and by the seed-variety candidates
+    endpoint to decide whether to surface the seed flow at all."""
+    from app.modules.clients.models import ClientOrganisationType
+    rows = (await db.execute(
+        select(ClientOrganisationType.org_type_cosh_id).where(
+            ClientOrganisationType.client_id == client_id,
+        )
+    )).scalars().all()
+    return _SEED_COMPANY_COSH_ID in rows
+
+
 async def _assert_client_can_qr(db: AsyncSession, client_id: str) -> Client:
     """QR module gate — passes if the Client is a Manufacturer (has
     branded pesticide/fertilizer products via Cosh) OR a Seed Company
@@ -92,7 +106,6 @@ async def _assert_client_can_qr(db: AsyncSession, client_id: str) -> Client:
     Returns the loaded Client so callers can reuse without a second
     hop. Raises 404 for missing client, 403 for ineligible.
     """
-    from app.modules.clients.models import ClientOrganisationType
     client = (await db.execute(
         select(Client).where(Client.id == client_id)
     )).scalar_one_or_none()
@@ -100,14 +113,7 @@ async def _assert_client_can_qr(db: AsyncSession, client_id: str) -> Client:
         raise HTTPException(status_code=404, detail="Client not found")
     is_seed = False
     if not client.is_manufacturer:
-        # Skip the seed check when is_manufacturer already passes —
-        # cheap short-circuit.
-        rows = (await db.execute(
-            select(ClientOrganisationType.org_type_cosh_id).where(
-                ClientOrganisationType.client_id == client_id,
-            )
-        )).scalars().all()
-        is_seed = _SEED_COMPANY_COSH_ID in rows
+        is_seed = await _is_seed_client(db, client_id)
     if not (client.is_manufacturer or is_seed):
         raise HTTPException(
             status_code=403,
@@ -134,6 +140,8 @@ async def list_brand_portfolio(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    from app.modules.seed_mgmt.models import SeedVariety
+
     await _assert_client_can_qr(db, client_id)
     result = await db.execute(
         select(ManufacturerBrandPortfolio).where(
@@ -142,15 +150,37 @@ async def list_brand_portfolio(
         ).order_by(ManufacturerBrandPortfolio.product_type)
     )
     rows = result.scalars().all()
+    # Batch-resolve names in two lookups instead of N+1: brand names
+    # from Cosh, variety names from RootsTalk's seed_varieties.
+    brand_ids = [r.brand_cosh_id for r in rows if r.brand_cosh_id]
+    variety_ids = [r.variety_id for r in rows if r.variety_id]
+    brand_name_by_id: dict[str, str] = {}
+    variety_name_by_id: dict[str, str] = {}
+    if brand_ids:
+        brand_rows = (await db.execute(
+            select(CoshCoreItem.cosh_id, CoshCoreItem.translations).where(
+                CoshCoreItem.cosh_id.in_(brand_ids),
+            )
+        )).all()
+        for cid, tr in brand_rows:
+            if isinstance(tr, dict):
+                brand_name_by_id[cid] = tr.get("en") or next(
+                    (v for v in tr.values() if v), cid,
+                )
+    if variety_ids:
+        var_rows = (await db.execute(
+            select(SeedVariety.id, SeedVariety.name).where(
+                SeedVariety.id.in_(variety_ids),
+            )
+        )).all()
+        variety_name_by_id = {vid: vname for vid, vname in var_rows}
     out = []
     for r in rows:
         name = None
         if r.brand_cosh_id:
-            entry = (await db.execute(
-                select(CoshCoreItem).where(CoshCoreItem.cosh_id == r.brand_cosh_id)
-            )).scalar_one_or_none()
-            if entry:
-                name = (entry.translations or {}).get("en") or r.brand_cosh_id
+            name = brand_name_by_id.get(r.brand_cosh_id)
+        elif r.variety_id:
+            name = variety_name_by_id.get(r.variety_id)
         out.append({
             "id": r.id,
             "product_type": r.product_type,
@@ -241,6 +271,100 @@ async def list_portfolio_candidates(
     return {"brands": brands, "cosh_manufacturer_linked": True}
 
 
+@router.get("/client/{client_id}/qr/portfolio/varieties/candidates")
+async def list_variety_candidates(
+    client_id: str,
+    crop_cosh_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """2026-07-05 — Seed-side companion to
+    `/qr/portfolio/candidates`. Seed varieties come from RootsTalk
+    (`seed_varieties`), not Cosh — so the picker is scoped to the
+    client's own variety catalog.
+
+    Two-axis response:
+      {
+        "crops": [{cosh_id, name, variety_count}, ...],  # populated only
+        "varieties": [{id, name, crop_cosh_id}, ...],    # empty until crop chosen
+        "is_seed_client": bool,
+      }
+
+    - `crops`: alphabetical, includes only crops with ≥1 ACTIVE
+      variety saved by this client. If the CA hasn't entered any
+      varieties yet, this is empty and the frontend renders a
+      pointer to the Seed → Varieties page.
+    - `?crop_cosh_id=<id>`: filters `varieties` to that crop only;
+      without the query param, `varieties` is `[]` (crop-first
+      selection).
+    - Non-seed clients (Manufacturer-only): `is_seed_client=false` +
+      empty payload — the frontend suppresses the tab entirely.
+      Kept as a 200 (not 403) so a Bayer-shaped client can hit both
+      candidate endpoints on load without one erroring.
+    """
+    from app.modules.seed_mgmt.models import SeedVariety
+
+    await _assert_client_can_qr(db, client_id)
+    is_seed = await _is_seed_client(db, client_id)
+    if not is_seed:
+        return {"crops": [], "varieties": [], "is_seed_client": False}
+
+    # Populated-crops list — one row per crop_cosh_id with the count of
+    # ACTIVE varieties this client has entered under it.
+    from sqlalchemy import func
+    crop_rows = (await db.execute(
+        select(
+            SeedVariety.crop_cosh_id,
+            func.count(SeedVariety.id).label("variety_count"),
+        ).where(
+            SeedVariety.client_id == client_id,
+            SeedVariety.status == "ACTIVE",
+        ).group_by(SeedVariety.crop_cosh_id)
+    )).all()
+    crop_ids = [r[0] for r in crop_rows]
+    crop_name_by_id: dict[str, str] = {}
+    if crop_ids:
+        name_rows = (await db.execute(
+            select(CoshCoreItem.cosh_id, CoshCoreItem.translations).where(
+                CoshCoreItem.cosh_id.in_(crop_ids),
+            )
+        )).all()
+        for cid, tr in name_rows:
+            if isinstance(tr, dict):
+                crop_name_by_id[cid] = tr.get("en") or next(
+                    (v for v in tr.values() if v), cid,
+                )
+    crops = [
+        {
+            "cosh_id": cid,
+            "name": crop_name_by_id.get(cid, cid),
+            "variety_count": vc,
+        }
+        for cid, vc in crop_rows
+    ]
+    crops.sort(key=lambda r: (r["name"] or "").lower())
+
+    varieties: list[dict] = []
+    if crop_cosh_id:
+        var_rows = (await db.execute(
+            select(SeedVariety.id, SeedVariety.name, SeedVariety.crop_cosh_id).where(
+                SeedVariety.client_id == client_id,
+                SeedVariety.crop_cosh_id == crop_cosh_id,
+                SeedVariety.status == "ACTIVE",
+            ).order_by(SeedVariety.name)
+        )).all()
+        varieties = [
+            {"id": vid, "name": vname, "crop_cosh_id": vcrop}
+            for vid, vname, vcrop in var_rows
+        ]
+
+    return {
+        "crops": crops,
+        "varieties": varieties,
+        "is_seed_client": True,
+    }
+
+
 @router.post("/client/{client_id}/qr/portfolio", status_code=201)
 async def add_to_portfolio(
     client_id: str,
@@ -248,13 +372,35 @@ async def add_to_portfolio(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Add a brand (Cosh) or seed variety (RootsTalk) to the client's
+    QR portfolio. The two paths share a table with the same product_type
+    discriminator + one identifier column each (`brand_cosh_id` XOR
+    `variety_id`)."""
     await _assert_client_can_qr(db, client_id)
-    existing = (await db.execute(
-        select(ManufacturerBrandPortfolio).where(
-            ManufacturerBrandPortfolio.client_id == client_id,
-            ManufacturerBrandPortfolio.brand_cosh_id == data.get("brand_cosh_id"),
+    brand_cosh_id = data.get("brand_cosh_id")
+    variety_id = data.get("variety_id")
+    if not brand_cosh_id and not variety_id:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "portfolio_identifier_required",
+                "message": "Either brand_cosh_id or variety_id must be provided.",
+            },
         )
-    )).scalar_one_or_none()
+    if brand_cosh_id:
+        existing = (await db.execute(
+            select(ManufacturerBrandPortfolio).where(
+                ManufacturerBrandPortfolio.client_id == client_id,
+                ManufacturerBrandPortfolio.brand_cosh_id == brand_cosh_id,
+            )
+        )).scalar_one_or_none()
+    else:
+        existing = (await db.execute(
+            select(ManufacturerBrandPortfolio).where(
+                ManufacturerBrandPortfolio.client_id == client_id,
+                ManufacturerBrandPortfolio.variety_id == variety_id,
+            )
+        )).scalar_one_or_none()
     if existing:
         if existing.status == "INACTIVE":
             existing.status = "ACTIVE"
@@ -263,8 +409,8 @@ async def add_to_portfolio(
     entry = ManufacturerBrandPortfolio(
         client_id=client_id,
         product_type=data.get("product_type", "PESTICIDE"),
-        brand_cosh_id=data.get("brand_cosh_id"),
-        variety_id=data.get("variety_id"),
+        brand_cosh_id=brand_cosh_id,
+        variety_id=variety_id,
     )
     db.add(entry)
     await db.commit()
