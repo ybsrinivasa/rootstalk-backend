@@ -876,6 +876,21 @@ async def get_farmer_seed_order(
     if variety and variety.crop_cosh_id:
         names = await resolve_names_by_cosh_id(db, {variety.crop_cosh_id}, lang)
         crop_name = names.get(variety.crop_cosh_id)
+    # 2026-07-05 — Gate the PWA Scan CTA on whether the client has
+    # actually generated at least one ACTIVE ProductQRCode for this
+    # seed variety. Otherwise the farmer scans a package without a
+    # rootsTALK QR, always mismatches, and gets confused.
+    from app.modules.qr.models import ProductQRCode as _ProductQRCode
+    qr_available = False
+    if order.variety_id:
+        qr_present = (await db.execute(
+            select(_ProductQRCode.id).where(
+                _ProductQRCode.client_id == order.client_id,
+                _ProductQRCode.variety_id == order.variety_id,
+                _ProductQRCode.status == "ACTIVE",
+            ).limit(1)
+        )).scalar_one_or_none()
+        qr_available = qr_present is not None
     return {
         "id": order.id,
         "status": order.status,
@@ -893,6 +908,7 @@ async def get_farmer_seed_order(
         "client_id": order.client_id,
         "postponed_until": order.postponed_until,
         "scan_verified": order.scan_verified,
+        "qr_available": qr_available,
         "created_at": order.created_at,
     }
 

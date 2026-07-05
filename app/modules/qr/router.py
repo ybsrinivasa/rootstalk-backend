@@ -2,7 +2,9 @@ import csv
 import io
 import json
 import os
+import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 import qrcode
 from PIL import Image, ImageDraw, ImageFont
 from datetime import datetime, timezone, date
@@ -612,26 +614,22 @@ async def create_qr_code(
                 detail=f"A QR code for this product and batch already exists. ID: {existing.id}")
         return {"warning": "An inactive QR code for this batch exists.", "existing_id": existing.id}
 
-    client = (await db.execute(select(Client).where(Client.id == client_id))).scalar_one_or_none()
-    payload = json.dumps({
-        "rt_qr": True,
-        "v": "1",
-        "client_id": client_id,
-        "company_name": client.full_name if client else "",
-        "product_type": request.product_type,
-        "brand_cosh_id": request.brand_cosh_id,
-        "variety_id": request.variety_id,
-        "batch_lot": request.batch_lot_number,
-        "display_name": request.product_display_name,
-        "mfr_date": request.manufacture_date,
-        "exp_date": request.expiry_date,
-    })
-    # BL-18 audit (2026-05-06): parse date strings before assigning to
-    # the Date columns. asyncpg rejects raw strings on Date params with
-    # 'str object has no attribute toordinal' — bug pre-existed; first
-    # surfaced when the audit added end-to-end integration tests
-    # (the route had no tests before).
+    # 2026-07-05 — QR payload is now a URL, not JSON. Rationale:
+    # a farmer scanning with a native camera / Google Lens / any
+    # generic QR app previously saw the JSON blob as raw text
+    # (unusable). URL routes them to a public verify page on the
+    # rootsTALK domain — friendly landing that confirms authenticity
+    # even for farmers without the PWA installed. The PWA scanner
+    # extracts the qr_id from the URL and calls the scoped scan
+    # endpoint.
+    # UUID is client-side default (SQLAlchemy default=new_uuid runs
+    # in Python), so we can build the URL before flush.
+    # Pre-generate the UUID so we can embed it in the payload URL
+    # before insert. SA's `default=new_uuid` runs at INSERT time, not
+    # at __init__ — so `qr.id` is None right after instantiation.
+    qr_id = str(uuid.uuid4())
     qr = ProductQRCode(
+        id=qr_id,
         client_id=client_id,
         product_type=request.product_type,
         brand_cosh_id=request.brand_cosh_id,
@@ -640,7 +638,7 @@ async def create_qr_code(
         manufacture_date=date.fromisoformat(request.manufacture_date),
         expiry_date=date.fromisoformat(request.expiry_date),
         batch_lot_number=request.batch_lot_number,
-        qr_payload=payload,
+        qr_payload=f"{_public_base_url()}/verify/{qr_id}",
         created_by=current_user.id,
     )
     db.add(qr)
@@ -786,18 +784,10 @@ async def bulk_create_qr_codes(
         # path had no tests before this audit.
         mfr_date_obj = datetime.strptime(mfr_date, "%d-%m-%Y").date()
         exp_date_obj = datetime.strptime(exp_date, "%d-%m-%Y").date()
-        payload = json.dumps({
-            "rt_qr": True, "v": "1",
-            "client_id": client_id,
-            "company_name": client.full_name if client else "",
-            "product_type": product_type,
-            "brand_cosh_id": row_brand_cosh_id,
-            "variety_id": row_variety_id,
-            "display_name": display_name,
-            "batch_lot": batch_lot,
-            "mfr_date": mfr_date,
-            "exp_date": exp_date,
-        })
+        # URL-encoded payload — matches the single-generation path.
+        # Pre-generate qr_id so it's baked into the URL at insert.
+        qr_id = str(uuid.uuid4())
+        payload = f"{_public_base_url()}/verify/{qr_id}"
         # BL-18 audit (2026-05-06): wrap each insert in a SAVEPOINT
         # so an IntegrityError on one row (e.g. a race against a
         # concurrent insert that the in-app check missed) marks just
@@ -807,6 +797,7 @@ async def bulk_create_qr_codes(
         try:
             async with db.begin_nested():
                 qr = ProductQRCode(
+                    id=qr_id,
                     client_id=client_id, product_type=product_type,
                     brand_cosh_id=row_brand_cosh_id,
                     variety_id=row_variety_id,
@@ -974,25 +965,48 @@ async def scan_qr_code(
             },
         )
 
-    try:
-        payload_data = json.loads(qr_payload)
-    except Exception:
-        payload_data = {}
-
-    client_id = payload_data.get("client_id")
-    batch_lot = payload_data.get("batch_lot")
-    scanned_brand_cosh_id = payload_data.get("brand_cosh_id")
-    scanned_variety_id = payload_data.get("variety_id")
-    display_name = payload_data.get("display_name", "")
-
+    # Payload lookup — supports two formats:
+    #   1. New (2026-07-05+): URL "<base>/verify/<qr_id>". Extract
+    #      qr_id and look up the row by ID directly. Farmer scanning
+    #      via native camera lands on the same URL as a public
+    #      verify page; PWA scanner extracts the ID and POSTs here.
+    #   2. Legacy JSON blob (pre-2026-07-05 QRs, if any exist by the
+    #      time this ships): still parseable for compat.
     qr_record = None
-    if client_id and batch_lot:
-        qr_record = (await db.execute(
-            select(ProductQRCode).where(
-                ProductQRCode.client_id == client_id,
-                ProductQRCode.batch_lot_number == batch_lot,
-            )
-        )).scalar_one_or_none()
+    scanned_brand_cosh_id = None
+    scanned_variety_id = None
+    display_name = ""
+    if qr_payload.startswith(("http://", "https://")):
+        try:
+            path_parts = [p for p in urlparse(qr_payload).path.split("/") if p]
+            if path_parts and path_parts[-2:-1] == ["verify"]:
+                scan_qr_id = path_parts[-1]
+                qr_record = (await db.execute(
+                    select(ProductQRCode).where(ProductQRCode.id == scan_qr_id)
+                )).scalar_one_or_none()
+                if qr_record:
+                    scanned_brand_cosh_id = qr_record.brand_cosh_id
+                    scanned_variety_id = qr_record.variety_id
+                    display_name = qr_record.product_display_name
+        except Exception:
+            pass
+    else:
+        try:
+            payload_data = json.loads(qr_payload)
+        except Exception:
+            payload_data = {}
+        legacy_client_id = payload_data.get("client_id")
+        batch_lot = payload_data.get("batch_lot")
+        scanned_brand_cosh_id = payload_data.get("brand_cosh_id")
+        scanned_variety_id = payload_data.get("variety_id")
+        display_name = payload_data.get("display_name", "")
+        if legacy_client_id and batch_lot:
+            qr_record = (await db.execute(
+                select(ProductQRCode).where(
+                    ProductQRCode.client_id == legacy_client_id,
+                    ProductQRCode.batch_lot_number == batch_lot,
+                )
+            )).scalar_one_or_none()
 
     # Fetch the appropriate target row and derive the expected match
     # value + column. Kept in a small tuple so the persist / compare
@@ -1168,6 +1182,61 @@ async def get_crop_history_qr(
     buf.seek(0)
     return Response(content=buf.read(), media_type="image/png",
                     headers={"Content-Disposition": f'inline; filename="crop-{sub.reference_number}.png"'})
+
+
+@router.get("/public/qr-verify/{qr_id}")
+async def public_qr_verify(qr_id: str, db: AsyncSession = Depends(get_db)):
+    """PUBLIC — no auth. Backing endpoint for the /verify/{qr_id}
+    public page rendered by the PWA. When a farmer scans a rootsTALK
+    QR with a generic camera / QR app, their browser opens
+    <base>/verify/<qr_id>; that page calls this endpoint to render
+    the "genuine / not-genuine" verdict + product details.
+
+    This is the unscoped verify: it doesn't compare against a
+    farmer's order — that requires the scoped /farmer/qr/scan
+    endpoint from inside the PWA (auth'd, matches against
+    OrderItem or SeedOrderFull).
+
+    Response shape:
+      {
+        verified: bool,
+        reason: str | null,       # populated when verified=false
+        company_name, product_display_name, batch_lot_number,
+        product_type, manufacture_date, expiry_date,
+        status: 'ACTIVE' | 'INACTIVE',
+      }
+    """
+    qr = (await db.execute(
+        select(ProductQRCode).where(ProductQRCode.id == qr_id)
+    )).scalar_one_or_none()
+    if not qr:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "verified": False,
+                "reason": "This is not a valid rootsTALK QR code.",
+            },
+        )
+    client = (await db.execute(
+        select(Client).where(Client.id == qr.client_id)
+    )).scalar_one_or_none()
+    company_name = None
+    if client:
+        company_name = client.display_name or client.full_name
+    return {
+        "verified": qr.status == "ACTIVE",
+        "reason": (
+            None if qr.status == "ACTIVE"
+            else "This QR code has been deactivated by the manufacturer. Please contact your dealer."
+        ),
+        "company_name": company_name,
+        "product_display_name": qr.product_display_name,
+        "batch_lot_number": qr.batch_lot_number,
+        "product_type": qr.product_type,
+        "manufacture_date": str(qr.manufacture_date),
+        "expiry_date": str(qr.expiry_date),
+        "status": qr.status,
+    }
 
 
 @router.get("/public/crop-record/{reference_number}")

@@ -2284,6 +2284,28 @@ async def list_purchased_items(
         for did, sname in srows:
             shop_by_dealer_id[did] = sname
 
+    # 2026-07-05 — QR-availability check. Only surface the "Scan to
+    # Verify" CTA in the PWA when the item's (client, brand) pair
+    # has at least one ACTIVE ProductQRCode registered. Otherwise
+    # the farmer taps Scan for a company that hasn't rolled out QR
+    # yet, mismatches, and gets confused. Batched here so the whole
+    # response comes in one round-trip.
+    from app.modules.qr.models import ProductQRCode as _ProductQRCode
+    qr_ready_pairs: set[tuple[str, str]] = set()
+    pairs_to_check = {(r[4].client_id, r[0].brand_cosh_id) for r in rows if r[0].brand_cosh_id}
+    if pairs_to_check:
+        brand_ids_c = {b for _, b in pairs_to_check}
+        client_ids_c = {c for c, _ in pairs_to_check}
+        qr_check_rows = (await db.execute(
+            select(_ProductQRCode.client_id, _ProductQRCode.brand_cosh_id).where(
+                _ProductQRCode.status == "ACTIVE",
+                _ProductQRCode.client_id.in_(client_ids_c),
+                _ProductQRCode.brand_cosh_id.in_(brand_ids_c),
+            ).distinct()
+        )).all()
+        for cid, bid in qr_check_rows:
+            qr_ready_pairs.add((cid, bid))
+
     # Manufacturer + brand lookup batched across all rows, locale-aware.
     brand_ids = {r[0].brand_cosh_id for r in rows if r[0].brand_cosh_id}
     lang = current_user.language_code or "en"
@@ -2363,6 +2385,10 @@ async def list_purchased_items(
             "volume_unit": item.volume_unit,
             "price": float(item.price) if item.price is not None else None,
             "scan_verified": bool(item.scan_verified),
+            "qr_available": (
+                bool(item.brand_cosh_id)
+                and (sub.client_id, item.brand_cosh_id) in qr_ready_pairs
+            ),
             "order_id": item.order_id,
             "created_at": item.created_at,
             "timeline_name": tl.name,
