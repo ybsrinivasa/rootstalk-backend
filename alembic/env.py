@@ -41,6 +41,7 @@ from app.modules.farmpundit.models import (
     QueryRemark, QueryResponse, StandardResponse,
 )
 from app.modules.diagnosis.models import DiagnosisSession  # noqa: F401
+from app.modules.translations.models import ContentTranslation  # noqa: F401
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.database_url_sync)
