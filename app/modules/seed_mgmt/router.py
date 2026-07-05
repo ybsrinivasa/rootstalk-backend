@@ -892,6 +892,7 @@ async def get_farmer_seed_order(
         "subscription_id": order.subscription_id,
         "client_id": order.client_id,
         "postponed_until": order.postponed_until,
+        "scan_verified": order.scan_verified,
         "created_at": order.created_at,
     }
 
