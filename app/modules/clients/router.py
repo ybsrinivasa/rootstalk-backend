@@ -587,6 +587,39 @@ async def edit_client(
 
     data = request.model_dump(exclude_unset=True)
 
+    # 2026-07-05 — cosh_manufacturer_id is meaningful only for
+    # is_manufacturer clients. Non-manufacturer clients can't be linked
+    # to a Cosh input_manufacturers row; the pair would break QR
+    # portfolio queries. Coerce empty-string to None (clears the link).
+    # Refuse if the (effective) is_manufacturer is False and the SA
+    # tries to set a non-null value.
+    if "cosh_manufacturer_id" in data:
+        val = data["cosh_manufacturer_id"]
+        if val == "":
+            data["cosh_manufacturer_id"] = None
+            val = None
+        if val is not None:
+            effective_is_mfg = data.get(
+                "is_manufacturer", client.is_manufacturer,
+            )
+            if not bool(effective_is_mfg):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "manufacturer_id_requires_is_manufacturer",
+                        "message": (
+                            "Cosh Manufacturer can be linked only when "
+                            "the client is marked as a Manufacturer."
+                        ),
+                    },
+                )
+
+    # Auto-clear the linked Cosh manufacturer if is_manufacturer is
+    # being turned OFF. Prevents a stale link surviving the flip and
+    # then re-appearing if is_manufacturer is toggled back on later.
+    if data.get("is_manufacturer") is False and "cosh_manufacturer_id" not in data:
+        data["cosh_manufacturer_id"] = None
+
     # 2026-07-04 — hidden_from_discovery is COMPANY_PAYS-only. FARMER_PAYS
     # clients must remain discoverable by definition; hiding one would
     # create a client with no path for farmers to find it. Refuse the
@@ -629,6 +662,42 @@ async def edit_client(
     await db.commit()
     await db.refresh(client)
     return await _client_to_out(db, client)
+
+
+@router.get("/admin/cosh/manufacturers")
+async def list_cosh_input_manufacturers(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SA-only: list every active Cosh `input_manufacturers` Core row,
+    for the client-edit-modal dropdown that populates
+    `Client.cosh_manufacturer_id`. Each row is `{cosh_id, name}`,
+    sorted by name.
+
+    Powers the QR Brand Portfolio picker: once the SA sets
+    `cosh_manufacturer_id` on a client, the CA's
+    `/client/{id}/qr/portfolio/candidates` walks the
+    `tradename_manufacturer` Cosh Connect to list brands under that
+    manufacturer — no free-text search, no fuzzy match.
+    """
+    _require_sa(current_user)
+    from app.modules.sync.models import CoshCoreItem
+    rows = (await db.execute(
+        select(CoshCoreItem.cosh_id, CoshCoreItem.translations).where(
+            CoshCoreItem.core_type == "input_manufacturers",
+            CoshCoreItem.status == "active",
+        )
+    )).all()
+    out: list[dict] = []
+    for cosh_id, translations in rows:
+        name = None
+        if isinstance(translations, dict):
+            name = translations.get("en") or next(
+                (v for v in translations.values() if v), None,
+            )
+        out.append({"cosh_id": cosh_id, "name": name or cosh_id})
+    out.sort(key=lambda r: (r["name"] or "").lower())
+    return out
 
 
 @router.put("/admin/clients/{client_id}/status", response_model=ClientOut)
@@ -702,6 +771,13 @@ async def get_portal_branding(short_name: str, db: AsyncSession = Depends(get_db
         "org_type_cosh_ids": list(org_types),
         "payment_model": client.payment_model.value
             if hasattr(client.payment_model, "value") else client.payment_model,
+        # 2026-07-05 — Manufacturer flag + Cosh manufacturer link.
+        # CA-portal sidebar gates /qr on (is_manufacturer OR seed
+        # org_type); Brand Portfolio page reads cosh_manufacturer_id
+        # to know whether to render "Ask SA to link" or the auto-
+        # loaded candidate list.
+        "is_manufacturer": bool(client.is_manufacturer),
+        "cosh_manufacturer_id": client.cosh_manufacturer_id,
     }
 
 

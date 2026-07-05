@@ -71,6 +71,11 @@ class ClientEdit(BaseModel):
     # farmer discovery. Backend refuses to set True when the
     # (effective) payment_model is FARMER_PAYS.
     hidden_from_discovery: Optional[bool] = None
+    # 2026-07-05 — Cosh input_manufacturers cosh_id — deterministic
+    # link for the QR Brand Portfolio picker. Backend refuses to set
+    # non-null when is_manufacturer is False. `""` (empty string)
+    # clears the link.
+    cosh_manufacturer_id: Optional[str] = None
     # Org types — replaces the existing list when provided
     org_type_cosh_ids: Optional[List[str]] = None
 
@@ -112,6 +117,9 @@ class ClientOut(BaseModel):
     # 2026-07-04 — surfaced on the SA client-detail response so the
     # portal can render + edit the checkbox.
     hidden_from_discovery: bool = False
+    # 2026-07-05 — Cosh input_manufacturers cosh_id for the QR
+    # portfolio picker. NULL until SA links it via the edit modal.
+    cosh_manufacturer_id: Optional[str] = None
     status: ClientStatus
     ca_name: str
     ca_phone: str

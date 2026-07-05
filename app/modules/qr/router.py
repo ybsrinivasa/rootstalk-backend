@@ -75,6 +75,53 @@ def _public_base_url() -> str:
 PRODUCT_TYPE_SIZES = {"SMALL": 2.0, "MEDIUM": 3.5, "LARGE": 5.0}
 
 
+# 2026-07-05 — Seed org_type is the same cosh_id the seed_mgmt module
+# uses to decide "is seed company". Kept in sync with
+# app.modules.seed_mgmt.router.SEED_COMPANY_COSH_ID; if it ever
+# changes, both must move together.
+_SEED_COMPANY_COSH_ID = "4b0847f9-a590-452f-9129-ee0e2d946dd9"
+
+
+async def _assert_client_can_qr(db: AsyncSession, client_id: str) -> Client:
+    """QR module gate — passes if the Client is a Manufacturer (has
+    branded pesticide/fertilizer products via Cosh) OR a Seed Company
+    (has RootsTalk seed varieties). Both axes are independent:
+    Bayer-shaped clients pass on both. Advisory-only clients pass on
+    neither and get a 403.
+
+    Returns the loaded Client so callers can reuse without a second
+    hop. Raises 404 for missing client, 403 for ineligible.
+    """
+    from app.modules.clients.models import ClientOrganisationType
+    client = (await db.execute(
+        select(Client).where(Client.id == client_id)
+    )).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status_code=404, detail="Client not found")
+    is_seed = False
+    if not client.is_manufacturer:
+        # Skip the seed check when is_manufacturer already passes —
+        # cheap short-circuit.
+        rows = (await db.execute(
+            select(ClientOrganisationType.org_type_cosh_id).where(
+                ClientOrganisationType.client_id == client_id,
+            )
+        )).scalars().all()
+        is_seed = _SEED_COMPANY_COSH_ID in rows
+    if not (client.is_manufacturer or is_seed):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "client_not_qr_eligible",
+                "message": (
+                    "QR Product Authentication is available only for "
+                    "Manufacturer or Seed-Company clients."
+                ),
+            },
+        )
+    return client
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # PRODUCT AUTHENTICATION QR
 # ════════════════════════════════════════════════════���══════════════════════════
@@ -87,6 +134,7 @@ async def list_brand_portfolio(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_client_can_qr(db, client_id)
     result = await db.execute(
         select(ManufacturerBrandPortfolio).where(
             ManufacturerBrandPortfolio.client_id == client_id,
@@ -113,36 +161,84 @@ async def list_brand_portfolio(
     return out
 
 
-@router.post("/client/{client_id}/qr/portfolio/search")
-async def search_portfolio_brands(
+@router.get("/client/{client_id}/qr/portfolio/candidates")
+async def list_portfolio_candidates(
     client_id: str,
-    data: dict,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Search cosh_core_items for brands matching a manufacturer name."""
-    manufacturer_name = data.get("manufacturer_name", "").strip().lower()
-    if not manufacturer_name:
-        raise HTTPException(status_code=422, detail="manufacturer_name required")
-    result = await db.execute(
-        select(CoshCoreItem).where(
-            CoshCoreItem.core_type == "brand",
+    """2026-07-05 — Replaces the fragile free-text
+    `POST /qr/portfolio/search`. Auto-loads the pesticide/fertilizer
+    brand candidates for this client using the deterministic
+    Client.cosh_manufacturer_id link the SA set at approval time.
+
+    Response shape:
+      {
+        "brands": [{cosh_id, name, product_type}],
+        "cosh_manufacturer_linked": bool,
+      }
+
+    - `is_manufacturer=False` → 403 via `_assert_client_can_qr`.
+    - `is_manufacturer=True` but `cosh_manufacturer_id` NULL →
+      409 `cosh_manufacturer_not_linked` so the CA gets a clear
+      "ask the SA to link your Cosh manufacturer" message.
+    - Otherwise walks the `tradename_manufacturer` Cosh Connect,
+      resolves trade-name names from `trade_names` Cosh Core.
+
+    Seed varieties are NOT surfaced here — they come from RootsTalk
+    (seed_varieties table), not Cosh, per the user's product model
+    (2026-07-05). Seed-flavour clients use their existing variety
+    portfolio surface for the QR flow's seed leg.
+    """
+    from app.services.cosh_options_view import _trade_names_for_manufacturer
+    from app.services.cosh_constants import COSH_TRADE_NAMES_CORE
+
+    client = await _assert_client_can_qr(db, client_id)
+    if not client.is_manufacturer:
+        # Pure seed-only client — no brand candidates by design.
+        return {"brands": [], "cosh_manufacturer_linked": False}
+    if not client.cosh_manufacturer_id:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "cosh_manufacturer_not_linked",
+                "message": (
+                    "This client isn't linked to a Cosh Manufacturer yet. "
+                    "Ask the Super Admin to link it from the Company "
+                    "Profile edit modal."
+                ),
+            },
+        )
+    tn_ids = await _trade_names_for_manufacturer(
+        db, client.cosh_manufacturer_id,
+    )
+    if not tn_ids:
+        return {"brands": [], "cosh_manufacturer_linked": True}
+    tn_rows = (await db.execute(
+        select(CoshCoreItem.cosh_id, CoshCoreItem.translations).where(
+            CoshCoreItem.core_type == COSH_TRADE_NAMES_CORE,
+            CoshCoreItem.cosh_id.in_(tn_ids),
             CoshCoreItem.status == "active",
         )
-    )
-    all_brands = result.scalars().all()
-    matches = []
-    for b in all_brands:
-        meta = b.metadata_ or {}
-        mfr = (meta.get("manufacturer_name") or "").lower()
-        if manufacturer_name in mfr or mfr in manufacturer_name:
-            matches.append({
-                "cosh_id": b.cosh_id,
-                "name": (b.translations or {}).get("en") or b.cosh_id,
-                "manufacturer": meta.get("manufacturer_name"),
-                "product_type": meta.get("product_type", "PESTICIDE"),
-            })
-    return matches
+    )).all()
+    brands = []
+    for cosh_id, translations in tn_rows:
+        name = None
+        if isinstance(translations, dict):
+            name = translations.get("en") or next(
+                (v for v in translations.values() if v), None,
+            )
+        brands.append({
+            "cosh_id": cosh_id,
+            "name": name or cosh_id,
+            # v1: product_type stays a per-brand-add choice on the
+            # CA side. The taxonomy walk to derive it from the
+            # common_name → L2 chain is a follow-up if the CA finds
+            # the manual pick tedious.
+            "product_type": None,
+        })
+    brands.sort(key=lambda r: (r["name"] or "").lower())
+    return {"brands": brands, "cosh_manufacturer_linked": True}
 
 
 @router.post("/client/{client_id}/qr/portfolio", status_code=201)
@@ -152,6 +248,7 @@ async def add_to_portfolio(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_client_can_qr(db, client_id)
     existing = (await db.execute(
         select(ManufacturerBrandPortfolio).where(
             ManufacturerBrandPortfolio.client_id == client_id,
@@ -180,6 +277,7 @@ async def remove_from_portfolio(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_client_can_qr(db, client_id)
     entry = (await db.execute(
         select(ManufacturerBrandPortfolio).where(
             ManufacturerBrandPortfolio.id == portfolio_id,
@@ -203,6 +301,7 @@ async def list_qr_codes(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_client_can_qr(db, client_id)
     q = select(ProductQRCode).where(ProductQRCode.client_id == client_id).order_by(ProductQRCode.created_at.desc())
     if product_type:
         q = q.where(ProductQRCode.product_type == product_type)
@@ -251,10 +350,14 @@ async def create_qr_code(
 ):
     """BL-18: Duplicate check. Generate and store QR code record.
 
+    2026-07-05 — Gated on `_assert_client_can_qr`: only manufacturer
+    or seed-company clients can generate QR codes.
+
     BL-18 audit (2026-05-06): dedup-key derivation moved to the
     bl18_qr_dedup service — same helper drives the bulk path so the
     two writers can never disagree on what counts as a duplicate.
     """
+    await _assert_client_can_qr(db, client_id)
     _validate_dates(request.manufacture_date, request.expiry_date)
 
     try:
@@ -321,6 +424,7 @@ async def bulk_create_qr_codes(
     current_user: User = Depends(get_current_user),
 ):
     """BL-18 Bulk: validate CSV rows, skip duplicates, generate valid rows."""
+    await _assert_client_can_qr(db, client_id)
     content = await file.read()
     reader = csv.DictReader(io.StringIO(content.decode("utf-8-sig")))
 
@@ -466,6 +570,7 @@ async def download_qr_code(
     current_user: User = Depends(get_current_user),
 ):
     """Download QR code as PNG or print-ready PDF."""
+    await _assert_client_can_qr(db, client_id)
     qr_record = (await db.execute(
         select(ProductQRCode).where(ProductQRCode.id == qr_id, ProductQRCode.client_id == client_id)
     )).scalar_one_or_none()
@@ -520,6 +625,7 @@ async def toggle_qr_status(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_client_can_qr(db, client_id)
     qr = (await db.execute(
         select(ProductQRCode).where(ProductQRCode.id == qr_id, ProductQRCode.client_id == client_id)
     )).scalar_one_or_none()
@@ -623,6 +729,7 @@ async def list_mismatches(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_client_can_qr(db, client_id)
     result = await db.execute(
         select(QRScan, ProductQRCode)
         .join(ProductQRCode, ProductQRCode.id == QRScan.qr_code_id)

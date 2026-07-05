@@ -119,6 +119,19 @@ class Client(Base):
     hidden_from_discovery: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="false", default=False,
     )
+    # 2026-07-05 — QR Product Authentication: the Cosh
+    # `input_manufacturers` cosh_id this client corresponds to. Set
+    # by the SA at approval or via the edit modal — deterministic
+    # link, no fuzzy string matching. Only meaningful when
+    # is_manufacturer=True (backend guard refuses otherwise).
+    # Powers `/client/{id}/qr/portfolio/candidates`: walks the
+    # `tradename_manufacturer` Cosh Connect to list this
+    # manufacturer's brands for the CA's Brand Portfolio picker.
+    # Seed varieties come from RootsTalk, not Cosh, so this field
+    # is orthogonal to seed-flavour clients.
+    cosh_manufacturer_id: Mapped[str] = mapped_column(
+        String(200), nullable=True,
+    )
     status: Mapped[ClientStatus] = mapped_column(SAEnum(ClientStatus), default=ClientStatus.PENDING_REVIEW)
     onboarding_link_token: Mapped[str] = mapped_column(Text, nullable=True)
     onboarding_link_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
