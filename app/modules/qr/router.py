@@ -92,12 +92,49 @@ _LOGO_PATH = Path(__file__).parent.parent.parent / "static" / "logos" / "eywa-lo
 _BRAND_LABEL = "rootsTALK.in"
 
 
-def _build_branded_qr_png(payload: str, px_size: int) -> Image.Image:
-    """Render a QR with the eywa logo overlaid in the center and the
-    rootsTALK.in brand label rendered below. Returns a PIL RGBA image
-    sized so `px_size` refers to the QR square (label sits below in
-    additional canvas). Used by both the PNG download and the PDF
-    composer so the two outputs stay visually identical."""
+def _blacken_logo(logo: Image.Image) -> Image.Image:
+    """Convert the cream / colored eywa logo to a pure-black
+    silhouette for mono-brand mode. Preserves the alpha channel so
+    the outline and internal shape stay recognizable; just recolours
+    every non-transparent pixel to (0, 0, 0). Called only when
+    style='mono'."""
+    logo = logo.convert("RGBA")
+    pixels = logo.load()
+    w, h = logo.size
+    for y in range(h):
+        for x in range(w):
+            r, g, b, a = pixels[x, y]
+            if a > 0:
+                pixels[x, y] = (0, 0, 0, a)
+    return logo
+
+
+def _build_branded_qr_png(
+    payload: str,
+    px_size: int,
+    style: str = "color",
+    label: bool = True,
+) -> Image.Image:
+    """Render a QR for print or screen. Three modes via `style`:
+
+      color — dark green modules + colored eywa logo overlay
+              (default; for glossy printed labels).
+      mono  — pure black modules + black eywa silhouette overlay
+              (for mono printers that can render bitmap + text).
+      raw   — pure black modules, NO logo overlay, NO label
+              (for CIJ / dot-matrix printers that only rasterise
+              black dots on seed pouches — govt-mandated QR use).
+
+    `label` controls whether "rootsTALK.in" is baked in below the QR.
+    Ignored (always False) when style='raw'. In color/mono mode the
+    label carries the brand identity when a farmer scans multiple
+    QRs from the same package (govt seed vs marketing vs ours).
+
+    Error correction is always H (30% redundancy) so the logo
+    overlay never degrades scan reliability even at low print DPI.
+    """
+    module_colour = "#0F2A0F" if style == "color" else "black"
+
     qr = qrcode.QRCode(
         version=None,
         error_correction=qrcode.constants.ERROR_CORRECT_H,
@@ -106,21 +143,21 @@ def _build_branded_qr_png(payload: str, px_size: int) -> Image.Image:
     )
     qr.add_data(payload)
     qr.make(fit=True)
-    qr_img = qr.make_image(fill_color="#0F2A0F", back_color="white").convert("RGBA")
+    qr_img = qr.make_image(fill_color=module_colour, back_color="white").convert("RGBA")
 
-    # Resize the raw QR to match the requested px_size (approximate —
-    # qrcode's box_size math is discrete). Nearest neighbour keeps the
-    # module edges crisp instead of blurring them.
     if qr_img.size[0] != px_size:
         qr_img = qr_img.resize((px_size, px_size), Image.NEAREST)
 
+    # Raw mode: no logo overlay, no label, done.
+    if style == "raw":
+        return qr_img
+
+    # Logo overlay for color / mono modes.
     if _LOGO_PATH.exists():
         logo = Image.open(_LOGO_PATH).convert("RGBA")
+        if style == "mono":
+            logo = _blacken_logo(logo)
         logo_side = int(px_size * 0.22)
-        # White backing so the logo isn't fighting QR modules behind it.
-        # Slightly larger than the logo itself so anti-aliased edges have
-        # room to breathe. Even with error correction H, a stark backing
-        # keeps the visual read cleaner from any scanning distance.
         backing_side = int(logo_side * 1.15)
         backing = Image.new("RGBA", (backing_side, backing_side), (255, 255, 255, 255))
         bx = (px_size - backing_side) // 2
@@ -131,9 +168,10 @@ def _build_branded_qr_png(payload: str, px_size: int) -> Image.Image:
         ly = (px_size - logo_side) // 2
         qr_img.paste(logo, (lx, ly), logo)
 
-    # Below the QR: brand label. Height ≈ 12% of the QR side; leaves a
-    # tiny gap so the label reads as a separate line, not part of the
-    # QR frame.
+    if not label:
+        return qr_img
+
+    # Label baked in below.
     label_height = max(24, int(px_size * 0.14))
     gap = max(4, int(px_size * 0.02))
     canvas = Image.new(
@@ -162,7 +200,8 @@ def _build_branded_qr_png(payload: str, px_size: int) -> Image.Image:
     text_h = text_bbox[3] - text_bbox[1]
     text_x = (px_size - text_w) // 2
     text_y = px_size + gap + (label_height - text_h) // 2 - text_bbox[1]
-    draw.text((text_x, text_y), _BRAND_LABEL, fill="#0F2A0F", font=font)
+    text_colour = "#0F2A0F" if style == "color" else "black"
+    draw.text((text_x, text_y), _BRAND_LABEL, fill=text_colour, font=font)
     return canvas
 
 
@@ -861,10 +900,19 @@ async def download_qr_code(
     format: str = "PNG",
     size: str = "MEDIUM",
     size_cm: Optional[float] = None,
+    style: str = "color",
+    label: bool = True,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Download QR code as PNG or print-ready PDF."""
+    """Download QR code as PNG or print-ready PDF.
+
+    Print modes via `style`:
+      color (default) — dark-green modules + colored logo + label.
+      mono            — pure-black modules + black-silhouette logo + label.
+      raw             — pure-black modules, no logo, no label (dot-matrix / CIJ).
+    `label` toggles the "rootsTALK.in" line under the QR — auto False when style=raw.
+    """
     await _assert_client_can_qr(db, client_id)
     qr_record = (await db.execute(
         select(ProductQRCode).where(ProductQRCode.id == qr_id, ProductQRCode.client_id == client_id)
@@ -874,7 +922,12 @@ async def download_qr_code(
 
     px_size = int((size_cm or PRODUCT_TYPE_SIZES.get(size.upper(), 3.5)) * 37.8)
 
-    branded = _build_branded_qr_png(qr_record.qr_payload or qr_id, px_size)
+    branded = _build_branded_qr_png(
+        qr_record.qr_payload or qr_id,
+        px_size,
+        style=style if style in ("color", "mono", "raw") else "color",
+        label=label,
+    )
 
     if format.upper() == "PNG":
         buf = io.BytesIO()
@@ -1190,22 +1243,24 @@ async def public_qr_verify(qr_id: str, db: AsyncSession = Depends(get_db)):
     public page rendered by the PWA. When a farmer scans a rootsTALK
     QR with a generic camera / QR app, their browser opens
     <base>/verify/<qr_id>; that page calls this endpoint to render
-    the "genuine / not-genuine" verdict + product details.
+    the full "genuine + who + product + how-to-grow" landing.
 
     This is the unscoped verify: it doesn't compare against a
     farmer's order — that requires the scoped /farmer/qr/scan
     endpoint from inside the PWA (auth'd, matches against
     OrderItem or SeedOrderFull).
 
-    Response shape:
-      {
-        verified: bool,
-        reason: str | null,       # populated when verified=false
-        company_name, product_display_name, batch_lot_number,
-        product_type, manufacture_date, expiry_date,
-        status: 'ACTIVE' | 'INACTIVE',
-      }
+    2026-07-05 (Phase 7) — response expanded to power a full,
+    brand-coloured landing:
+      product: display name + type + batch/lot + mfr/exp
+      company: name + logo + tagline + brand primary+secondary
+               colours + office address + phone + website
+      seed:    cultivation_notes (when the QR resolves to a
+               SeedVariety with notes populated — satisfies the
+               govt-mandated seed-pouch QR write-up)
     """
+    from app.modules.seed_mgmt.models import SeedVariety
+
     qr = (await db.execute(
         select(ProductQRCode).where(ProductQRCode.id == qr_id)
     )).scalar_one_or_none()
@@ -1220,22 +1275,52 @@ async def public_qr_verify(qr_id: str, db: AsyncSession = Depends(get_db)):
     client = (await db.execute(
         select(Client).where(Client.id == qr.client_id)
     )).scalar_one_or_none()
-    company_name = None
+
+    company: dict[str, str | None] = {
+        "name": None, "tagline": None, "logo_url": None,
+        "primary_colour": None, "secondary_colour": None,
+        "hq_address": None, "website": None,
+        "support_phone": None, "office_phone": None,
+    }
     if client:
-        company_name = client.display_name or client.full_name
+        company = {
+            "name": client.display_name or client.full_name,
+            "tagline": client.tagline,
+            "logo_url": client.logo_url,
+            "primary_colour": client.primary_colour,
+            "secondary_colour": client.secondary_colour,
+            "hq_address": client.hq_address,
+            "website": client.website,
+            "support_phone": client.support_phone,
+            "office_phone": client.office_phone,
+        }
+
+    cultivation_notes = None
+    if qr.variety_id:
+        variety = (await db.execute(
+            select(SeedVariety.cultivation_notes).where(
+                SeedVariety.id == qr.variety_id,
+            )
+        )).scalar_one_or_none()
+        cultivation_notes = variety
+
     return {
         "verified": qr.status == "ACTIVE",
         "reason": (
             None if qr.status == "ACTIVE"
             else "This QR code has been deactivated by the manufacturer. Please contact your dealer."
         ),
-        "company_name": company_name,
+        "status": qr.status,
+        # Product block
         "product_display_name": qr.product_display_name,
-        "batch_lot_number": qr.batch_lot_number,
         "product_type": qr.product_type,
+        "batch_lot_number": qr.batch_lot_number,
         "manufacture_date": str(qr.manufacture_date),
         "expiry_date": str(qr.expiry_date),
-        "status": qr.status,
+        # Company block — for the brand-coloured landing.
+        "company": company,
+        # Seed-only cultivation write-up.
+        "cultivation_notes": cultivation_notes,
     }
 
 

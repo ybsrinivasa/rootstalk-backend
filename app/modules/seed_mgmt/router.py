@@ -381,6 +381,7 @@ async def create_variety(
         description_points=data.get("description_points", []),
         dus_characters=data.get("dus_characters"),
         photos=data.get("photos", []),
+        cultivation_notes=data.get("cultivation_notes"),
         created_by_user_id=current_user.id,
     )
     db.add(variety)
@@ -403,7 +404,7 @@ async def update_variety(
     if "photos" in data:
         _validate_photos(data["photos"])
     variety = await _get_variety(db, variety_id, client_id)
-    for field in ["name", "variety_type", "description_points", "dus_characters", "photos", "status"]:
+    for field in ["name", "variety_type", "description_points", "dus_characters", "photos", "cultivation_notes", "status"]:
         if field in data:
             setattr(variety, field, data[field])
     await db.commit()
@@ -1855,6 +1856,7 @@ def _variety_out(v: SeedVariety, dus_names: Optional[dict[str, str]] = None) -> 
         "description_points": v.description_points or [],
         "dus_characters": _localise_dus_rows(v.dus_characters, dus_names),
         "photos": v.photos or [],
+        "cultivation_notes": v.cultivation_notes,
         "status": v.status,
         "pop_assignments": [{"package_id": a.package_id, "status": a.status}
                             for a in (v.pop_assignments or [])],

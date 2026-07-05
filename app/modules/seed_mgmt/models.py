@@ -25,6 +25,10 @@ class SeedVariety(Base):
     description_points: Mapped[list] = mapped_column(JSON, nullable=True)
     dus_characters: Mapped[dict] = mapped_column(JSON, nullable=True)
     photos: Mapped[list] = mapped_column(JSON, nullable=True)
+    # 2026-07-05 — Govt-mandated seed-pouch QR write-up. Plain text,
+    # rendered on the public verify page below the product details
+    # when the QR resolves to a seed variety.
+    cultivation_notes: Mapped[str] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
     created_by_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
