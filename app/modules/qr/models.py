@@ -53,7 +53,11 @@ class QRScan(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     qr_code_id: Mapped[str] = mapped_column(String(36), ForeignKey("product_qr_codes.id"), nullable=True)
     farmer_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
-    order_item_id: Mapped[str] = mapped_column(String(36), ForeignKey("order_items.id"), nullable=False)
+    order_item_id: Mapped[str] = mapped_column(String(36), ForeignKey("order_items.id"), nullable=True)
+    # 2026-07-05 — Seed scan parity. Exactly one of order_item_id /
+    # seed_order_id is populated per row (app-level XOR guard). Seed
+    # orders live in seed_orders_full.
+    seed_order_id: Mapped[str] = mapped_column(String(36), ForeignKey("seed_orders_full.id"), nullable=True)
     match_status: Mapped[str] = mapped_column(String(20), nullable=False)
     expected_brand_cosh_id: Mapped[str] = mapped_column(String(200), nullable=True)
     scanned_brand_cosh_id: Mapped[str] = mapped_column(String(200), nullable=True)

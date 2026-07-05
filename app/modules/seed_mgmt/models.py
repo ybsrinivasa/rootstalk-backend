@@ -1,7 +1,7 @@
 import uuid
 import enum
 from datetime import datetime, timezone
-from sqlalchemy import String, Text, Boolean, Integer, DateTime, ForeignKey, DECIMAL, JSON, UniqueConstraint
+from sqlalchemy import String, Text, Boolean, Integer, DateTime, ForeignKey, DECIMAL, JSON, UniqueConstraint, false as sa_false
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database import Base
 
@@ -101,5 +101,12 @@ class SeedOrderFull(Base):
     # `orders` table. RT-YY-NNNNNN format, lineage-shared.
     # Backfilled for existing rows in migration `c4a91e07f3d6`.
     reference_number: Mapped[str] = mapped_column(String(20), nullable=True)
+    # 2026-07-05 — Parity with OrderItem.scan_verified. Flipped by
+    # `/farmer/qr/scan` when a matching seed QR is scanned against
+    # this seed order. PWA farmer surface renders a "✓ Verified"
+    # chip on the seed order card when true.
+    scan_verified: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_false(),
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

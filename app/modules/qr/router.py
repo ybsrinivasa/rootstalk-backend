@@ -790,11 +790,28 @@ async def scan_qr_code(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Farmer scans QR code from Purchased Items. Returns MATCH / MISMATCH / INACTIVE."""
+    """Farmer scans QR code from Purchased Items. Returns MATCH / MISMATCH / INACTIVE.
+
+    Accepts EITHER `order_item_id` (pesticide/fertilizer path, matches
+    against OrderItem.brand_cosh_id) OR `seed_order_id` (seed path,
+    matches against SeedOrderFull.variety_id). Exactly one must be
+    provided — 422 otherwise.
+    """
+    from app.modules.seed_mgmt.models import SeedOrderFull
+
     qr_payload = data.get("qr_payload", "")
     order_item_id = data.get("order_item_id")
+    seed_order_id = data.get("seed_order_id")
 
-    # Decode payload to find qr_code_id
+    if bool(order_item_id) == bool(seed_order_id):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "scan_target_required",
+                "message": "Exactly one of order_item_id / seed_order_id is required.",
+            },
+        )
+
     try:
         payload_data = json.loads(qr_payload)
     except Exception:
@@ -803,6 +820,7 @@ async def scan_qr_code(
     client_id = payload_data.get("client_id")
     batch_lot = payload_data.get("batch_lot")
     scanned_brand_cosh_id = payload_data.get("brand_cosh_id")
+    scanned_variety_id = payload_data.get("variety_id")
     display_name = payload_data.get("display_name", "")
 
     qr_record = None
@@ -814,15 +832,30 @@ async def scan_qr_code(
             )
         )).scalar_one_or_none()
 
-    item = (await db.execute(
-        select(OrderItem).where(OrderItem.id == order_item_id)
-    )).scalar_one_or_none()
+    # Fetch the appropriate target row and derive the expected match
+    # value + column. Kept in a small tuple so the persist / compare
+    # code below is uniform across both paths.
+    item = None
+    seed_order = None
+    expected_brand = None
+    expected_variety = None
+    if order_item_id:
+        item = (await db.execute(
+            select(OrderItem).where(OrderItem.id == order_item_id)
+        )).scalar_one_or_none()
+        expected_brand = item.brand_cosh_id if item else None
+    else:
+        seed_order = (await db.execute(
+            select(SeedOrderFull).where(SeedOrderFull.id == seed_order_id)
+        )).scalar_one_or_none()
+        expected_variety = seed_order.variety_id if seed_order else None
 
     if not qr_record or qr_record.status == "INACTIVE":
         scan = QRScan(
             qr_code_id=qr_record.id if qr_record else None,
             farmer_user_id=current_user.id,
             order_item_id=order_item_id,
+            seed_order_id=seed_order_id,
             match_status="INACTIVE_CODE",
         )
         db.add(scan)
@@ -830,20 +863,30 @@ async def scan_qr_code(
         return {"match_status": "INACTIVE_CODE",
                 "message": "This product code is no longer active. Please contact your dealer."}
 
-    expected_brand = item.brand_cosh_id if item else None
-    is_match = (scanned_brand_cosh_id and expected_brand and
-                scanned_brand_cosh_id == expected_brand)
+    is_match = False
+    if order_item_id:
+        is_match = bool(scanned_brand_cosh_id and expected_brand
+                        and scanned_brand_cosh_id == expected_brand)
+    else:
+        is_match = bool(scanned_variety_id and expected_variety
+                        and scanned_variety_id == expected_variety)
 
-    # Count previous scan attempts for this item
-    prev_scans = (await db.execute(
-        select(QRScan).where(QRScan.order_item_id == order_item_id)
-    )).scalars().all()
+    # Count previous scan attempts for this target
+    if order_item_id:
+        prev_scans = (await db.execute(
+            select(QRScan).where(QRScan.order_item_id == order_item_id)
+        )).scalars().all()
+    else:
+        prev_scans = (await db.execute(
+            select(QRScan).where(QRScan.seed_order_id == seed_order_id)
+        )).scalars().all()
     attempt_num = len(prev_scans) + 1
 
     scan = QRScan(
         qr_code_id=qr_record.id,
         farmer_user_id=current_user.id,
         order_item_id=order_item_id,
+        seed_order_id=seed_order_id,
         match_status="MATCH" if is_match else "MISMATCH",
         expected_brand_cosh_id=expected_brand,
         scanned_brand_cosh_id=scanned_brand_cosh_id,
@@ -851,8 +894,11 @@ async def scan_qr_code(
     )
     db.add(scan)
 
-    if is_match and item:
-        item.scan_verified = True
+    if is_match:
+        if item:
+            item.scan_verified = True
+        elif seed_order:
+            seed_order.scan_verified = True
 
     await db.commit()
 
@@ -875,6 +921,12 @@ async def list_mismatches(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Mismatch log for the CA. Includes scans of both pesticide/
+    fertilizer (OrderItem-anchored) and seed (SeedOrderFull-anchored)
+    QRs — the CA's view of "farmer scanned something that didn't
+    match their order" is unified across both product paths."""
+    from app.modules.seed_mgmt.models import SeedOrderFull
+
     await _assert_client_can_qr(db, client_id)
     result = await db.execute(
         select(QRScan, ProductQRCode)
@@ -888,9 +940,19 @@ async def list_mismatches(
         farmer = (await db.execute(
             select(User).where(User.id == scan.farmer_user_id)
         )).scalar_one_or_none()
-        item = (await db.execute(
-            select(OrderItem).where(OrderItem.id == scan.order_item_id)
-        )).scalar_one_or_none()
+        dealer_user_id = None
+        if scan.order_item_id:
+            item = (await db.execute(
+                select(OrderItem).where(OrderItem.id == scan.order_item_id)
+            )).scalar_one_or_none()
+            if item and hasattr(item, 'order') and item.order:
+                dealer_user_id = item.order.dealer_user_id
+        elif scan.seed_order_id:
+            seed_order = (await db.execute(
+                select(SeedOrderFull).where(SeedOrderFull.id == scan.seed_order_id)
+            )).scalar_one_or_none()
+            if seed_order:
+                dealer_user_id = seed_order.dealer_user_id
         out.append({
             "scan_id": scan.id,
             "scanned_at": scan.scanned_at,
@@ -901,7 +963,8 @@ async def list_mismatches(
             "expected_brand_cosh_id": scan.expected_brand_cosh_id,
             "scanned_brand_cosh_id": scan.scanned_brand_cosh_id,
             "batch_lot_number": qr_code.batch_lot_number,
-            "dealer_user_id": item.order.dealer_user_id if item and hasattr(item, 'order') else None,
+            "product_type": qr_code.product_type,
+            "dealer_user_id": dealer_user_id,
             "scan_attempt": scan.scan_attempt_number,
         })
     return out
