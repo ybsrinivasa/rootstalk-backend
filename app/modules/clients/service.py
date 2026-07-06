@@ -177,6 +177,45 @@ RootsTalk — Neytiri Eywafarm Agritech"""
     _send_email(ca_email, subject, html, plain)
 
 
+async def send_ca_reassignment_email(
+    ca_email: str, ca_name: str, client_display_name: str, login_url: str,
+):
+    """Notify a new CA who already has a RootsTalk account.
+
+    Rotation case (2026-07-06): when the SA hands the CA role to an
+    existing platform user, we don't rotate their password — they
+    sign in with what they already have. But they still need to
+    know they've been appointed. Sent alongside the credentials
+    email for fresh accounts (`send_ca_credentials_email`) — the
+    two are mutually exclusive per rotation, so the new CA always
+    gets exactly one notification.
+    """
+    subject = f"You are now the RootsTalk admin for {client_display_name}"
+    plain = f"""Hi {ca_name},
+
+You have been designated the Client Admin for {client_display_name} on RootsTalk.
+
+Login URL: {login_url}
+
+Use your existing RootsTalk email + password to sign in. If you
+have forgotten your password, use the OTP option on the login page.
+
+RootsTalk — Neytiri Eywafarm Agritech"""
+    html = f"""
+<body style="font-family:sans-serif;padding:32px">
+  <h2>You are now the admin for {client_display_name}</h2>
+  <p>Hi {ca_name}, the Super Admin has appointed you as the Client
+  Admin for <strong>{client_display_name}</strong> on RootsTalk.</p>
+  <table style="background:#f8fafc;border-radius:8px;padding:16px;margin:16px 0">
+    <tr><td><strong>Login URL:</strong></td><td><a href="{login_url}">{login_url}</a></td></tr>
+    <tr><td><strong>Email:</strong></td><td>{ca_email}</td></tr>
+  </table>
+  <p style="color:#333;font-size:14px">Use your existing RootsTalk email + password to sign in.</p>
+  <p style="color:#666;font-size:12px">Forgotten your password? Use the OTP option on the login page.</p>
+</body>"""
+    _send_email(ca_email, subject, html, plain)
+
+
 async def get_client_by_token(db: AsyncSession, token: str) -> Client | None:
     result = await db.execute(
         select(Client).where(Client.onboarding_link_token == token)
