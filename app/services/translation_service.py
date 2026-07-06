@@ -66,6 +66,16 @@ class AncestryContext:
     field_notes: Optional[str] = None
 
 
+def _is_list_source_entity(entity_type: str) -> bool:
+    """Return True when the source for this entity type is a JSON
+    array of strings (each element a bullet / sentence). Currently
+    only `seed_variety.description_points`. Callers include the
+    prompt builder (different response shape) and the response
+    parser (list values → JSON-encoded string in storage)."""
+    from app.modules.translations.models import EntityType
+    return entity_type == EntityType.SEED_VARIETY_DESCRIPTION_POINTS
+
+
 def _build_prompt(
     source_text: str,
     entity_type: str,
@@ -84,6 +94,39 @@ def _build_prompt(
     ancestry_block = "\n".join(ancestry_lines) if ancestry_lines else "- (no additional context available)"
 
     locales_json = json.dumps(list(TARGET_LOCALES))
+
+    if _is_list_source_entity(entity_type):
+        # 2026-07-06 — List-source path. Backfill caught Claude
+        # returning `{"hi": "["item1", "item2"]", ...}` — inner
+        # double-quotes not escaped, breaks the outer JSON. Instruct
+        # the model to return the array as a proper nested list
+        # (values are arrays of strings), which is trivially valid
+        # JSON. Read-path re-encodes to a JSON string for storage.
+        return f"""You are a professional agricultural translator specialising in crop advisory content for Indian farmers.
+
+You translate content that reaches the farmer through a mobile app. The register should match how a village-level extension worker would speak to the farmer — practical, clear, imperative when the source is imperative, respectful. Do NOT explain, expand, or add caveats.
+
+Preserve literally (do NOT translate):
+- Proper nouns: brand names, chemical names, molecule names, place names, company names, farmer names.
+- Numerical values and units (kg, ml, ha, °C, days, %).
+- Product codes, batch numbers, formula tokens.
+- English text inside quotes if the author quoted a brand or slogan.
+
+This item is: {field_kind}. The English source is a JSON array of short bullet strings — translate each bullet, keeping the array shape and order.
+
+Context:
+{ancestry_block}
+
+English source (JSON array):
+{source_text}
+
+Translate the source into each of these {len(TARGET_LOCALES)} Indian locales:
+{locales_json}
+
+Return ONLY a valid JSON object. Keys are the language codes above; each VALUE IS A JSON ARRAY OF STRINGS with the same number of elements as the English source, in the same order. Do not add explanations, notes, or any other keys.
+
+Example shape (values shown for illustration only, respond with real translations):
+{{"hi": ["translated_bullet_1", "translated_bullet_2"], "ta": ["…", "…"], "te": ["…", "…"], "kn": ["…", "…"], "ml": ["…", "…"], "mr": ["…", "…"], "gu": ["…", "…"], "pa": ["…", "…"], "or": ["…", "…"], "bn": ["…", "…"], "as": ["…", "…"], "ur": ["…", "…"]}}"""
 
     return f"""You are a professional agricultural translator specialising in crop advisory content for Indian farmers.
 
@@ -139,7 +182,13 @@ async def translate_content(
     # switch to AsyncAnthropic; kept sync to match claude_service.py.
     response = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=2048,
+        # 2026-07-06 — bumped from 2048 to 6144. Backfill caught
+        # long-ish INSTRUCTIONS elements truncating: 12 locales of
+        # translation output overflow 2048 output tokens for source
+        # texts around 200+ chars, producing "Unterminated string"
+        # JSON parse errors. 6144 gives comfortable headroom for
+        # any real-world SE-authored bullet or instruction.
+        max_tokens=6144,
         messages=[{"role": "user", "content": prompt}],
     )
     raw = response.content[0].text.strip()
@@ -161,12 +210,20 @@ async def translate_content(
     if not isinstance(parsed, dict):
         raise RuntimeError(f"Translation response is not a JSON object: {type(parsed)}")
 
-    # Filter to expected locales, coerce values to str.
+    is_list_source = _is_list_source_entity(entity_type)
     out: dict[str, str] = {}
     for loc in TARGET_LOCALES:
         val = parsed.get(loc)
-        if isinstance(val, str) and val.strip():
-            out[loc] = val
+        if is_list_source:
+            # Expect array of strings. Re-encode as JSON string for
+            # storage — the read-path decoder in translation_reader.py
+            # (`decode_seed_description_translation`) already knows
+            # how to unwrap this shape.
+            if isinstance(val, list) and val and all(isinstance(x, str) for x in val):
+                out[loc] = json.dumps(val, ensure_ascii=False)
+        else:
+            if isinstance(val, str) and val.strip():
+                out[loc] = val
     if not out:
         raise RuntimeError("Translation returned no usable locale values")
     return out
