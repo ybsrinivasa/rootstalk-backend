@@ -171,36 +171,66 @@ def _build_branded_qr_png(
     if not label:
         return qr_img
 
-    # Label baked in below.
+    # Label baked in below. Font size scales with px_size but is
+    # also constrained to fit within the QR width (with padding) so
+    # "rootsTALK.in" never gets clipped at small sizes — bug caught
+    # 2026-07-06 where SMALL (2 cm ≈ 76 px) rendered as "otsTALK".
+    # Font path is remembered so the shrink loop can rebuild the
+    # face at a smaller size.
     label_height = max(24, int(px_size * 0.14))
     gap = max(4, int(px_size * 0.02))
-    canvas = Image.new(
-        "RGBA",
-        (px_size, px_size + gap + label_height),
-        (255, 255, 255, 255),
-    )
-    canvas.paste(qr_img, (0, 0))
-    draw = ImageDraw.Draw(canvas)
-    font = None
+    text_colour = "#0F2A0F" if style == "color" else "black"
+    font_path = None
     for candidate in (
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/System/Library/Fonts/Helvetica.ttc",
         "/System/Library/Fonts/HelveticaNeue.ttc",
     ):
         if os.path.exists(candidate):
-            try:
-                font = ImageFont.truetype(candidate, size=int(label_height * 0.72))
-                break
-            except Exception:
-                continue
-    if font is None:
-        font = ImageFont.load_default()
-    text_bbox = draw.textbbox((0, 0), _BRAND_LABEL, font=font)
-    text_w = text_bbox[2] - text_bbox[0]
-    text_h = text_bbox[3] - text_bbox[1]
-    text_x = (px_size - text_w) // 2
-    text_y = px_size + gap + (label_height - text_h) // 2 - text_bbox[1]
-    text_colour = "#0F2A0F" if style == "color" else "black"
+            font_path = candidate
+            break
+
+    def _build_font(size: int):
+        if font_path is None:
+            return ImageFont.load_default()
+        try:
+            return ImageFont.truetype(font_path, size=max(6, size))
+        except Exception:
+            return ImageFont.load_default()
+
+    # Start at the desired font size, shrink if it overflows.
+    max_label_w = px_size - 2 * gap
+    font_size = int(label_height * 0.72)
+    font = _build_font(font_size)
+    tmp_draw = ImageDraw.Draw(qr_img)
+    bbox = tmp_draw.textbbox((0, 0), _BRAND_LABEL, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    # Shrink until the label fits, with a floor of 8 px so it stays
+    # legible even for very small QRs. If we can't fit even at the
+    # floor, widen the canvas so the label overhangs the QR — better
+    # than clipping the wordmark.
+    while text_w > max_label_w and font_size > 8:
+        font_size -= 1
+        font = _build_font(font_size)
+        bbox = tmp_draw.textbbox((0, 0), _BRAND_LABEL, font=font)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+    # Also cap label_height to at least the text height + padding
+    # so the shrunken font doesn't sit in an oversized strip.
+    label_height = max(label_height, text_h + 4)
+
+    canvas_w = max(px_size, text_w + 2 * gap)
+    canvas = Image.new(
+        "RGBA",
+        (canvas_w, px_size + gap + label_height),
+        (255, 255, 255, 255),
+    )
+    qr_x = (canvas_w - px_size) // 2
+    canvas.paste(qr_img, (qr_x, 0))
+    draw = ImageDraw.Draw(canvas)
+    text_x = (canvas_w - text_w) // 2
+    text_y = px_size + gap + (label_height - text_h) // 2 - bbox[1]
     draw.text((text_x, text_y), _BRAND_LABEL, fill=text_colour, font=font)
     return canvas
 
@@ -921,15 +951,15 @@ async def download_qr_code(
         raise HTTPException(status_code=404)
 
     px_size = int((size_cm or PRODUCT_TYPE_SIZES.get(size.upper(), 3.5)) * 37.8)
-
-    branded = _build_branded_qr_png(
-        qr_record.qr_payload or qr_id,
-        px_size,
-        style=style if style in ("color", "mono", "raw") else "color",
-        label=label,
-    )
+    resolved_style = style if style in ("color", "mono", "raw") else "color"
 
     if format.upper() == "PNG":
+        branded = _build_branded_qr_png(
+            qr_record.qr_payload or qr_id,
+            px_size,
+            style=resolved_style,
+            label=label,
+        )
         buf = io.BytesIO()
         branded.save(buf, format="PNG")
         buf.seek(0)
@@ -937,33 +967,49 @@ async def download_qr_code(
         return Response(content=buf.read(), media_type="image/png",
                         headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
-    # PDF single. The branded PNG already carries the rootsTALK.in
-    # label baked in, so the PDF just drops it onto a page + adds the
-    # product / batch / date metadata below.
+    # PDF single. Draw the QR image at its exact physical size, then
+    # render "rootsTALK.in" as PDF text below — this keeps the QR at
+    # the requested cm regardless of how wide the wordmark would be
+    # (baked-in labels at small sizes were getting clipped, see
+    # 2026-07-06 bug). label=False gives us a square QR-only image.
+    qr_only = _build_branded_qr_png(
+        qr_record.qr_payload or qr_id,
+        px_size,
+        style=resolved_style,
+        label=False,
+    )
     pdf_buf = io.BytesIO()
     c = pdf_canvas.Canvas(pdf_buf, pagesize=A4)
     w, h = A4
     dim_cm = size_cm or PRODUCT_TYPE_SIZES.get(size.upper(), 3.5)
     dim_pt = dim_cm * cm
-    # Branded PNG is a taller-than-wide rectangle (QR + label). Preserve
-    # aspect ratio in the PDF so the label doesn't get squished.
-    aspect = branded.size[1] / branded.size[0]
-    img_w = dim_pt
-    img_h = dim_pt * aspect
-
     img_buf = io.BytesIO()
-    branded.save(img_buf, format="PNG")
+    qr_only.save(img_buf, format="PNG")
     img_buf.seek(0)
     from reportlab.lib.utils import ImageReader
-    top_y = h - img_h - 90
-    c.drawImage(ImageReader(img_buf), (w - img_w) / 2, top_y, img_w, img_h)
+    top_y = h - dim_pt - 90
+    # QR-only image is square, draw at exact dim_pt × dim_pt.
+    c.drawImage(ImageReader(img_buf), (w - dim_pt) / 2, top_y, dim_pt, dim_pt)
+    # rootsTALK.in wordmark under the QR. PDF font scales with the
+    # QR size — matches how the print looks in real life. Only drawn
+    # when label=True and style is not raw (raw prints QR only).
+    y_below = top_y - 4
+    if label and resolved_style != "raw":
+        wordmark_font_size = max(9, int(dim_pt * 0.18))
+        c.setFont("Helvetica-Bold", wordmark_font_size)
+        text_colour_rgb = (0.059, 0.165, 0.059) if resolved_style == "color" else (0, 0, 0)
+        c.setFillColorRGB(*text_colour_rgb)
+        y_below -= wordmark_font_size + 2
+        c.drawCentredString(w / 2, y_below, _BRAND_LABEL)
+        # Reset fill for metadata text below.
+        c.setFillColorRGB(0, 0, 0)
+    y_below -= 18
     c.setFont("Helvetica-Bold", 11)
-    y = top_y - 22
-    c.drawCentredString(w / 2, y, qr_record.product_display_name)
+    c.drawCentredString(w / 2, y_below, qr_record.product_display_name)
     c.setFont("Helvetica", 9)
-    c.drawCentredString(w / 2, y - 14, f"Batch/Lot: {qr_record.batch_lot_number}")
-    c.drawCentredString(w / 2, y - 26, f"Mfr: {qr_record.manufacture_date}  |  Exp: {qr_record.expiry_date}")
-    c.drawCentredString(w / 2, y - 38, f"Type: {qr_record.product_type}")
+    c.drawCentredString(w / 2, y_below - 14, f"Batch/Lot: {qr_record.batch_lot_number}")
+    c.drawCentredString(w / 2, y_below - 26, f"Mfr: {qr_record.manufacture_date}  |  Exp: {qr_record.expiry_date}")
+    c.drawCentredString(w / 2, y_below - 38, f"Type: {qr_record.product_type}")
     c.save()
     pdf_buf.seek(0)
     fname = f"{qr_record.product_display_name}_{qr_record.batch_lot_number}.pdf"
