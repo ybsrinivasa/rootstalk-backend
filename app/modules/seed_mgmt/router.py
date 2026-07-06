@@ -851,6 +851,28 @@ async def list_farmer_seed_orders(
     crop_cosh_ids = {v.crop_cosh_id for v in variety_by_id.values() if v.crop_cosh_id}
     crop_name_by_id = await resolve_names_by_cosh_id(db, crop_cosh_ids, lang) if crop_cosh_ids else {}
 
+    # 2026-07-06 — QR availability per row. Farmer's crop-detail
+    # Received tab needs to render a Scan-to-Verify CTA on
+    # PURCHASED seed cards, mirroring the pesticide/fertilizer path.
+    # Batch-check whether at least one ACTIVE ProductQRCode exists
+    # for (client_id, variety_id) so the whole list resolves in a
+    # single query.
+    from app.modules.qr.models import ProductQRCode as _ProductQRCode
+    qr_ready_pairs: set[tuple[str, str]] = set()
+    pairs_to_check = {(o.client_id, o.variety_id) for o in orders if o.variety_id}
+    if pairs_to_check:
+        client_ids_c = {c for c, _ in pairs_to_check}
+        variety_ids_c = {v for _, v in pairs_to_check}
+        qr_rows = (await db.execute(
+            select(_ProductQRCode.client_id, _ProductQRCode.variety_id).where(
+                _ProductQRCode.status == "ACTIVE",
+                _ProductQRCode.client_id.in_(client_ids_c),
+                _ProductQRCode.variety_id.in_(variety_ids_c),
+            ).distinct()
+        )).all()
+        for cid, vid in qr_rows:
+            qr_ready_pairs.add((cid, vid))
+
     out = []
     for o in orders:
         variety = variety_by_id.get(o.variety_id)
@@ -860,6 +882,7 @@ async def list_farmer_seed_orders(
             "id": o.id, "status": o.status,
             "reference_number": o.reference_number,
             "variety_name": variety.name if variety else None,
+            "variety_id": o.variety_id,
             "crop_cosh_id": variety.crop_cosh_id if variety else None,
             "crop_name": (
                 crop_name_by_id.get(variety.crop_cosh_id)
@@ -874,6 +897,13 @@ async def list_farmer_seed_orders(
             "dealer_user_id": o.dealer_user_id,
             "facilitator_user_id": o.facilitator_user_id,
             "subscription_id": o.subscription_id,
+            # 2026-07-06 — Scan-verify state so the Received tab can
+            # render the same chip/CTA pair as the pesticide side.
+            "scan_verified": bool(o.scan_verified),
+            "qr_available": (
+                bool(o.variety_id)
+                and (o.client_id, o.variety_id) in qr_ready_pairs
+            ),
             **(meta.to_dict() if meta else {}),
             **(rcp.to_dict() if rcp else {}),
         })
