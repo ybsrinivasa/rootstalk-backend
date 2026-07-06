@@ -3,7 +3,6 @@ import io
 import json
 import os
 import uuid
-from pathlib import Path
 from urllib.parse import urlparse
 import qrcode
 from PIL import Image, ImageDraw, ImageFont
@@ -79,34 +78,15 @@ def _public_base_url() -> str:
 
 PRODUCT_TYPE_SIZES = {"SMALL": 2.0, "MEDIUM": 3.5, "LARGE": 5.0}
 
-# 2026-07-05 — QR branding.
-# Farmer often sees multiple QRs on the same package (batch, marketing,
-# CE mark, etc). Ours needs to be instantly recognisable so they don't
-# scan the wrong one. Recipe:
-#   1. Error correction level H (30% redundancy) so the centred logo
-#      overlay doesn't degrade scan reliability.
-#   2. eywa logo (colored, text-stripped) inset at ~22% of the QR side.
-#   3. "rootsTALK.in" label rendered below the QR both in PNG and PDF
-#      outputs — the farmer opens the app under the same brand.
-_LOGO_PATH = Path(__file__).parent.parent.parent / "static" / "logos" / "eywa-logo-notext-square.png"
+# QR branding.
+# 2026-07-05 — Original design used ECC-H + centered eywa logo overlay.
+# 2026-07-06 — Client's real-world constraint (10 g seed packets +
+# CIJ / dot-matrix printers) meant the logo overlay was eating the
+# error correction budget we needed for print noise. Logo removed;
+# ECC dropped to M for the extra module density. Brand identity
+# now lives entirely in the "rootsTALK.in" wordmark below the QR.
+# Logo file kept on disk for future non-QR uses; not read here.
 _BRAND_LABEL = "rootsTALK.in"
-
-
-def _blacken_logo(logo: Image.Image) -> Image.Image:
-    """Convert the cream / colored eywa logo to a pure-black
-    silhouette for mono-brand mode. Preserves the alpha channel so
-    the outline and internal shape stay recognizable; just recolours
-    every non-transparent pixel to (0, 0, 0). Called only when
-    style='mono'."""
-    logo = logo.convert("RGBA")
-    pixels = logo.load()
-    w, h = logo.size
-    for y in range(h):
-        for x in range(w):
-            r, g, b, a = pixels[x, y]
-            if a > 0:
-                pixels[x, y] = (0, 0, 0, a)
-    return logo
 
 
 def _build_branded_qr_png(
@@ -117,36 +97,34 @@ def _build_branded_qr_png(
 ) -> Image.Image:
     """Render a QR for print or screen. Three modes via `style`:
 
-      color — dark green modules + colored eywa logo overlay
-              (default; for glossy printed labels).
-      mono  — pure black modules + black eywa silhouette overlay
-              (for mono printers that can render bitmap + text).
-      raw   — pure black modules, NO logo overlay, NO label
-              (for CIJ / dot-matrix printers that only rasterise
-              black dots on seed pouches — govt-mandated QR use).
+      color — dark green modules + "rootsTALK.in" label below.
+              For glossy printed labels.
+      mono  — pure black modules + label. For mono printers that
+              can print bitmap + text.
+      raw   — pure black modules, no label at all. For CIJ /
+              dot-matrix printers that only rasterise black dots
+              on seed pouches — govt-mandated QR use.
 
-    `label` controls whether "rootsTALK.in" is baked in below the QR.
-    Ignored (always False) when style='raw'. In color/mono mode the
-    label carries the brand identity when a farmer scans multiple
-    QRs from the same package (govt seed vs marketing vs ours).
+    2026-07-06 — logo overlay removed across all styles. The eywa
+    logo in the center of the QR was consuming ~22% of the module
+    area, which meant we needed ECC-H (30% redundancy) just to
+    survive it. On low-DPI printers (CIJ / dot-matrix) at small
+    physical sizes (10 g seed packets, 1.5–2 cm), that error
+    correction budget wasn't enough — the QR was scanning
+    unreliably. Dropping the logo lets us drop to ECC-M (15%
+    redundancy), which shrinks the QR version and grows each
+    physical module by ~20% at the same print size. Brand identity
+    still comes through via the "rootsTALK.in" wordmark below the
+    QR (which sits outside the module area, doesn't affect scan).
 
-    Error correction is always H (30% redundancy) so the logo
-    overlay never degrades scan reliability even at low print DPI.
+    `label` controls whether the wordmark is baked in below the
+    QR. Ignored (always False) when style='raw'.
     """
     module_colour = "#0F2A0F" if style == "color" else "black"
 
-    # 2026-07-06 — box_size fixed at 10 px per module so every
-    # module renders as a chunky, unambiguous block. Pre-fix used
-    # `max(3, px_size // 37)` which produced 3-px modules at SMALL —
-    # then the whole QR was resized DOWN to px_size (76 for 2 cm)
-    # with NEAREST, blurring modules to ~1.77 px on average. Phone
-    # cameras couldn't decode it. Now we never downscale — the PNG
-    # is at natural QR-lib resolution (~470 px for our URL length),
-    # and the PDF composer sizes the physical print via drawImage at
-    # exact dim_pt × dim_pt, decoupling PNG pixels from print cm.
     qr = qrcode.QRCode(
         version=None,
-        error_correction=qrcode.constants.ERROR_CORRECT_H,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
         box_size=10,
         border=3,
     )
@@ -156,33 +134,17 @@ def _build_branded_qr_png(
 
     # Never downscale. Upscale to the requested px_size only when
     # the caller wants a bigger preview than the natural render;
-    # otherwise keep the natural resolution for the subsequent logo
-    # and label math.
+    # otherwise keep the natural resolution for the subsequent
+    # label math.
     natural = qr_img.size[0]
     if px_size > natural:
         qr_img = qr_img.resize((px_size, px_size), Image.NEAREST)
     else:
         px_size = natural
 
-    # Raw mode: no logo overlay, no label, done.
+    # Raw mode: no label, done.
     if style == "raw":
         return qr_img
-
-    # Logo overlay for color / mono modes.
-    if _LOGO_PATH.exists():
-        logo = Image.open(_LOGO_PATH).convert("RGBA")
-        if style == "mono":
-            logo = _blacken_logo(logo)
-        logo_side = int(px_size * 0.22)
-        backing_side = int(logo_side * 1.15)
-        backing = Image.new("RGBA", (backing_side, backing_side), (255, 255, 255, 255))
-        bx = (px_size - backing_side) // 2
-        by = (px_size - backing_side) // 2
-        qr_img.paste(backing, (bx, by), backing)
-        logo = logo.resize((logo_side, logo_side), Image.LANCZOS)
-        lx = (px_size - logo_side) // 2
-        ly = (px_size - logo_side) // 2
-        qr_img.paste(logo, (lx, ly), logo)
 
     if not label:
         return qr_img
