@@ -36,6 +36,13 @@ Rules:
 
 Runs hourly at :50 — far enough from the postpone-expiry sweep at
 :45 that the per-minute event log stays readable.
+
+2026-07-06 addendum — ghost-order sweep. After the item pass,
+Orders whose every live item has been archived get flipped to
+EXPIRED. Without this, an order sat on the dealer's Pending pill
+(status PROCESSING) for 5-13 days until the 14-day Order.expires_at
+fallback caught it — even though every underlying item's window
+had already closed. User caught 5 such orders on prod 2026-07-06.
 """
 import asyncio
 import logging
@@ -46,9 +53,12 @@ from sqlalchemy import and_, or_, select
 from app.celery_app import celery_app
 from app.database import AsyncSessionLocal
 from app.modules.advisory.models import Timeline
-from app.modules.orders.models import OrderItem, OrderItemStatus, Order
+from app.modules.orders.models import (
+    OrderItem, OrderItemStatus, Order, OrderStatus,
+)
 from app.modules.subscriptions.models import Subscription
 from app.services.order_events import record_event
+from sqlalchemy import func
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +162,73 @@ async def _archive_expired_timeline_items_with_session(db, now=None) -> int:
     if archived:
         await db.commit()
         logger.info(f"Orders V2: archived {archived} timeline-expired items")
+
+    # 2026-07-06 — Ghost-order sweep. When every live item on an
+    # order is archived (their timeline windows all passed), the
+    # order shell keeps showing on the dealer's Pending pill + the
+    # farmer's active orders list until the 14-day Order.expires_at
+    # fallback kicks in. That's 5-13 days of "why is this still here?"
+    # per user 2026-07-06. Flip the order to EXPIRED right after the
+    # last item archives so it disappears from active surfaces in
+    # tandem. Runs same task, same hour so the dealer + farmer see
+    # the removal together with the advisory hiding.
+    #
+    # Predicate: (a) order is non-terminal, (b) at least one live-non-
+    # rerouted-non-removed item exists, (c) every such item has
+    # archived_at set. Live-status check is critical — an order with
+    # no items at all shouldn't get swept here (that's what the 14-day
+    # Order.expires_at is for). REROUTED / REMOVED items are treated
+    # as effectively dead — the dealer feed excludes them already.
+    live_item_statuses = [
+        s for s in OrderItemStatus
+        if s not in (OrderItemStatus.REROUTED, OrderItemStatus.REMOVED)
+    ]
+    ghost_order_ids = (await db.execute(
+        select(Order.id)
+        .join(OrderItem, OrderItem.order_id == Order.id)
+        .where(
+            Order.status.notin_([
+                OrderStatus.COMPLETED,
+                OrderStatus.CANCELLED,
+                OrderStatus.EXPIRED,
+            ]),
+            OrderItem.status.in_(live_item_statuses),
+        )
+        .group_by(Order.id)
+        # count(*) == count(archived_at) means every live item has
+        # been archived — Postgres COUNT(col) skips NULLs.
+        .having(func.count() == func.count(OrderItem.archived_at))
+    )).scalars().all()
+
+    ghost_orders_flipped = 0
+    if ghost_order_ids:
+        for order in (await db.execute(
+            select(Order).where(Order.id.in_(ghost_order_ids))
+        )).scalars().all():
+            prev_status = (
+                order.status.value if hasattr(order.status, "value")
+                else str(order.status)
+            )
+            order.status = OrderStatus.EXPIRED
+            await record_event(
+                db,
+                lineage_id=order.lineage_id or order.id,
+                event_type="ORDER_TIMELINE_EXPIRED",
+                actor_role="SYSTEM",
+                order_id=order.id,
+                prev_status=prev_status,
+                new_status=OrderStatus.EXPIRED.value,
+                metadata={
+                    "reason": "all_live_items_archived",
+                    "ist_today": ist_today.isoformat(),
+                },
+            )
+            ghost_orders_flipped += 1
+        await db.commit()
+        logger.info(
+            f"Orders V2: flipped {ghost_orders_flipped} ghost orders to EXPIRED"
+        )
+
     return archived
 
 
