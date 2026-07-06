@@ -179,26 +179,40 @@ RootsTalk — Neytiri Eywafarm Agritech"""
 
 async def send_ca_reassignment_email(
     ca_email: str, ca_name: str, client_display_name: str, login_url: str,
+    ca_phone: str | None = None,
 ):
     """Notify a new CA who already has a RootsTalk account.
 
     Rotation case (2026-07-06): when the SA hands the CA role to an
     existing platform user, we don't rotate their password — they
-    sign in with what they already have. But they still need to
-    know they've been appointed. Sent alongside the credentials
-    email for fresh accounts (`send_ca_credentials_email`) — the
-    two are mutually exclusive per rotation, so the new CA always
-    gets exactly one notification.
+    sign in with what they already have. But: we can't reliably tell
+    whether the reused User even has a working password (they may
+    have been created via a flow that skipped credentials email —
+    e.g. SMTP off in an earlier environment). So the body leads with
+    OTP as the primary path — enter phone, receive OTP, sign in —
+    and mentions email+password as the fallback for those who set
+    one up. Includes the phone on file so the user knows which
+    number the OTP will hit.
+
+    Sent as an alternative to `send_ca_credentials_email`. The two
+    are mutually exclusive per rotation.
     """
     subject = f"You are now the RootsTalk admin for {client_display_name}"
+    phone_line = f"Phone on file (for OTP): {ca_phone}\n" if ca_phone else ""
+    phone_row = (
+        f'<tr><td><strong>Phone (for OTP):</strong></td><td>{ca_phone}</td></tr>'
+        if ca_phone else ""
+    )
     plain = f"""Hi {ca_name},
 
 You have been designated the Client Admin for {client_display_name} on RootsTalk.
 
 Login URL: {login_url}
-
-Use your existing RootsTalk email + password to sign in. If you
-have forgotten your password, use the OTP option on the login page.
+Email: {ca_email}
+{phone_line}
+Sign in with the OTP option — enter your phone, receive a one-time
+code, and you're in. If you have set up a password earlier on
+RootsTalk, email + password also works.
 
 RootsTalk — Neytiri Eywafarm Agritech"""
     html = f"""
@@ -209,9 +223,16 @@ RootsTalk — Neytiri Eywafarm Agritech"""
   <table style="background:#f8fafc;border-radius:8px;padding:16px;margin:16px 0">
     <tr><td><strong>Login URL:</strong></td><td><a href="{login_url}">{login_url}</a></td></tr>
     <tr><td><strong>Email:</strong></td><td>{ca_email}</td></tr>
+    {phone_row}
   </table>
-  <p style="color:#333;font-size:14px">Use your existing RootsTalk email + password to sign in.</p>
-  <p style="color:#666;font-size:12px">Forgotten your password? Use the OTP option on the login page.</p>
+  <p style="color:#333;font-size:14px">
+    Sign in with the <strong>OTP option</strong> — enter your phone,
+    receive a one-time code, and you're in.
+  </p>
+  <p style="color:#666;font-size:12px">
+    If you have set up a password earlier on RootsTalk, email +
+    password also works.
+  </p>
 </body>"""
     _send_email(ca_email, subject, html, plain)
 
@@ -251,7 +272,7 @@ async def create_ca_user(db: AsyncSession, client: Client) -> tuple[User, str]:
 
 async def rotate_ca_admin(
     db: AsyncSession, client: Client,
-) -> tuple[bool, str | None]:
+) -> tuple[bool, str | None, str | None]:
     """Rotate a client's CA admin after the SA changes ca_email.
 
     Behaviour:
@@ -262,18 +283,21 @@ async def rotate_ca_admin(
       2. If a `User` with the new `client.ca_email` already exists,
          reuse it — create a fresh CA `ClientUser` row pointing at it.
          No password rotation; the existing user signs in with their
-         existing credentials.
+         existing credentials OR via OTP against their phone.
       3. Otherwise, create a new `User` with a freshly-generated
          password and link via a new CA `ClientUser` row.
 
-    Returns `(created_new_user, plain_password)`. `plain_password` is
-    `None` when we reused an existing `User` — nothing to email in
-    that case. Caller commits.
+    Returns `(created_new_user, plain_password, reused_user_phone)`.
+      - `plain_password` is set only when a new User was created.
+      - `reused_user_phone` is set only when we reused an existing
+        User; the router passes it into the reassignment email so
+        the new CA sees the phone number OTP will hit.
 
     Idempotency: if `client.ca_email` still matches the currently-
-    ACTIVE CA's email, this returns `(False, None)` and does nothing —
-    the router-side change-detection is the primary gate, but this
-    guard prevents accidental double-rotation on a no-op edit.
+    ACTIVE CA's email, this returns `(False, None, None)` and does
+    nothing — the router-side change-detection is the primary gate,
+    but this guard prevents accidental double-rotation on a no-op
+    edit.
     """
     current_ca = (await db.execute(
         select(ClientUser).where(
@@ -288,7 +312,7 @@ async def rotate_ca_admin(
             select(User).where(User.id == current_ca.user_id)
         )).scalar_one_or_none()
         if current_user_row and (current_user_row.email or "").lower() == (client.ca_email or "").lower():
-            return False, None
+            return False, None, None
         current_ca.status = StatusEnum.INACTIVE
 
     existing_user = (await db.execute(
@@ -302,7 +326,7 @@ async def rotate_ca_admin(
             role=ClientUserRole.CA,
             status=StatusEnum.ACTIVE,
         ))
-        return False, None
+        return False, None, existing_user.phone
 
     plain_password = secrets.token_urlsafe(12)
     new_user = User(
@@ -319,4 +343,4 @@ async def rotate_ca_admin(
         role=ClientUserRole.CA,
         status=StatusEnum.ACTIVE,
     ))
-    return True, plain_password
+    return True, plain_password, None

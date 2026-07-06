@@ -685,7 +685,7 @@ async def edit_client(
             rotate_ca_admin, send_ca_credentials_email,
             send_ca_reassignment_email,
         )
-        created_new, plain_password = await rotate_ca_admin(db, client)
+        created_new, plain_password, reused_phone = await rotate_ca_admin(db, client)
         await db.commit()
         if settings.email_smtp_user:
             login_url = f"{_base_url()}/login/{client.short_name}"
@@ -695,14 +695,17 @@ async def edit_client(
                     client.ca_email, client.ca_name, login_url, plain_password,
                 )
             else:
-                # Existing User re-assigned. No password to send;
-                # notify them of the appointment so they know to log
-                # in with what they already have.
+                # Existing User re-assigned. No password to rotate
+                # (would break their existing sign-in flow); notify
+                # them of the appointment and lead with OTP as the
+                # primary path since we can't verify their password
+                # is set up.
                 await send_ca_reassignment_email(
                     client.ca_email,
                     client.ca_name,
                     client.display_name or client.full_name,
                     login_url,
+                    ca_phone=reused_phone,
                 )
 
     return await _client_to_out(db, client)
