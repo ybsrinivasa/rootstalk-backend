@@ -5510,9 +5510,16 @@ async def _today_advisory_for_user(
         # ── Phase T-4: SE-authored translations. ────────────────────────────
         # Batch-load Element.value + Package.description translations
         # for the farmer's locale in one round-trip. Callers of
-        # `_element_value_localised()` / `_package_desc_localised()`
-        # fall through to the English source when no APPROVED
-        # translation exists.
+        # `_element_value_localised()` fall through to the English
+        # source when no APPROVED translation exists.
+        #
+        # `deduped` yields PracticeElement dataclasses (see
+        # bl03_deduplication.py) which don't carry an `id` field —
+        # the dedup layer strips it because it works purely by
+        # value/type. Elements coming through the snapshot path
+        # similarly have no id (the snapshot is a frozen JSON blob).
+        # Use getattr with a default; when id is unavailable we
+        # skip the lookup and let English fall through cleanly.
         from app.services.translation_reader import resolve_translations_batch
         from app.modules.translations.models import EntityType
         translatable_pairs: set[tuple[str, str]] = set()
@@ -5520,8 +5527,9 @@ async def _today_advisory_for_user(
         for dedup_tl in deduped:
             for p in dedup_tl.visible_practices:
                 for el in p.elements:
-                    if el.value:
-                        translatable_pairs.add((EntityType.ELEMENT_VALUE, el.id))
+                    el_id = getattr(el, "id", None)
+                    if el.value and el_id:
+                        translatable_pairs.add((EntityType.ELEMENT_VALUE, el_id))
         translation_map = await resolve_translations_batch(
             db, lang, translatable_pairs,
         )
@@ -5529,7 +5537,10 @@ async def _today_advisory_for_user(
         def _element_value_localised(el) -> str | None:
             if not el.value:
                 return el.value
-            localised = translation_map.get((EntityType.ELEMENT_VALUE, el.id))
+            el_id = getattr(el, "id", None)
+            if el_id is None:
+                return el.value
+            localised = translation_map.get((EntityType.ELEMENT_VALUE, el_id))
             return localised or el.value
 
         # ── Build response ────────────────────────────────────────────────────
