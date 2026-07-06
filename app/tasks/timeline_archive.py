@@ -212,7 +212,12 @@ async def _archive_expired_timeline_items_with_session(db, now=None) -> int:
             order.status = OrderStatus.EXPIRED
             await record_event(
                 db,
-                lineage_id=order.lineage_id or order.id,
+                # 2026-07-06 — Order has no `lineage_id` column
+                # (only OrderItem + SeedOrderFull do). Per the
+                # record_event docstring, pass the order's own id
+                # when there's no item context — order ids and item
+                # lineage ids share the UUID namespace.
+                lineage_id=order.id,
                 event_type="ORDER_TIMELINE_EXPIRED",
                 actor_role="SYSTEM",
                 order_id=order.id,
