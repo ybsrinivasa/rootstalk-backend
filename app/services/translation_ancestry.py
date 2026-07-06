@@ -130,9 +130,11 @@ async def build_ancestry_for_element_value(
         )).scalar_one_or_none()
     elif pg_id:
         parent_kind = "CHA problem-group advisory"
-        crop_cosh_id = (await db.execute(
-            select(PGRecommendation.crop_cosh_id).where(PGRecommendation.id == pg_id)
-        )).scalar_one_or_none()
+        # PGRecommendation is crop-agnostic by design — no
+        # crop_cosh_id column. Prompt just carries the parent_kind
+        # hint; crop_name stays None which the read-path handles
+        # ("no additional context available" line in the prompt).
+        crop_cosh_id = None
     elif sp_id:
         parent_kind = "CHA specific-problem advisory"
         crop_cosh_id = (await db.execute(
