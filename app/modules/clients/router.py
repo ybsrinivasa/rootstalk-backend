@@ -587,6 +587,19 @@ async def edit_client(
 
     data = request.model_dump(exclude_unset=True)
 
+    # 2026-07-06 — CA-admin rotation trigger. If the SA is changing
+    # ca_email AND the client is past approval (has an actual CA user
+    # backing the login), we need to rotate the User account, not just
+    # relabel the Client row. Detect the change BEFORE we mutate
+    # client.ca_email in the setattr loop below. See `rotate_ca_admin`
+    # in `service.py` for the workflow.
+    old_ca_email = (client.ca_email or "").lower()
+    incoming_ca_email = data.get("ca_email")
+    ca_email_will_change = (
+        incoming_ca_email is not None
+        and str(incoming_ca_email).lower() != old_ca_email
+    )
+
     # 2026-07-05 — cosh_manufacturer_id is meaningful only for
     # is_manufacturer clients. Non-manufacturer clients can't be linked
     # to a Cosh input_manufacturers row; the pair would break QR
@@ -661,6 +674,24 @@ async def edit_client(
 
     await db.commit()
     await db.refresh(client)
+
+    # 2026-07-06 — Rotate the CA user if the SA changed ca_email and
+    # the client is past approval. For PENDING_REVIEW clients the CA
+    # User doesn't exist yet — the approve endpoint (`create_ca_user`)
+    # will pick up whatever ca_email is on the Client row at that
+    # time. Idempotent guard also inside `rotate_ca_admin`.
+    if ca_email_will_change and client.status == ClientStatus.ACTIVE:
+        from app.modules.clients.service import (
+            rotate_ca_admin, send_ca_credentials_email,
+        )
+        created_new, plain_password = await rotate_ca_admin(db, client)
+        await db.commit()
+        if created_new and plain_password and settings.email_smtp_user:
+            login_url = f"{_base_url()}/login/{client.short_name}"
+            await send_ca_credentials_email(
+                client.ca_email, client.ca_name, login_url, plain_password,
+            )
+
     return await _client_to_out(db, client)
 
 

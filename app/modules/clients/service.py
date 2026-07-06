@@ -208,3 +208,76 @@ async def create_ca_user(db: AsyncSession, client: Client) -> tuple[User, str]:
         status=StatusEnum.ACTIVE,
     ))
     return user, plain_password
+
+
+async def rotate_ca_admin(
+    db: AsyncSession, client: Client,
+) -> tuple[bool, str | None]:
+    """Rotate a client's CA admin after the SA changes ca_email.
+
+    Behaviour:
+      1. Deactivate the currently ACTIVE CA `ClientUser` row for this
+         client (if any). The old admin loses login access to this
+         client on next request. Their `User` row and any other
+         ClientUser rows at OTHER clients are untouched.
+      2. If a `User` with the new `client.ca_email` already exists,
+         reuse it — create a fresh CA `ClientUser` row pointing at it.
+         No password rotation; the existing user signs in with their
+         existing credentials.
+      3. Otherwise, create a new `User` with a freshly-generated
+         password and link via a new CA `ClientUser` row.
+
+    Returns `(created_new_user, plain_password)`. `plain_password` is
+    `None` when we reused an existing `User` — nothing to email in
+    that case. Caller commits.
+
+    Idempotency: if `client.ca_email` still matches the currently-
+    ACTIVE CA's email, this returns `(False, None)` and does nothing —
+    the router-side change-detection is the primary gate, but this
+    guard prevents accidental double-rotation on a no-op edit.
+    """
+    current_ca = (await db.execute(
+        select(ClientUser).where(
+            ClientUser.client_id == client.id,
+            ClientUser.role == ClientUserRole.CA,
+            ClientUser.status == StatusEnum.ACTIVE,
+        )
+    )).scalar_one_or_none()
+
+    if current_ca is not None:
+        current_user_row = (await db.execute(
+            select(User).where(User.id == current_ca.user_id)
+        )).scalar_one_or_none()
+        if current_user_row and (current_user_row.email or "").lower() == (client.ca_email or "").lower():
+            return False, None
+        current_ca.status = StatusEnum.INACTIVE
+
+    existing_user = (await db.execute(
+        select(User).where(User.email == client.ca_email)
+    )).scalar_one_or_none()
+
+    if existing_user is not None:
+        db.add(ClientUser(
+            client_id=client.id,
+            user_id=existing_user.id,
+            role=ClientUserRole.CA,
+            status=StatusEnum.ACTIVE,
+        ))
+        return False, None
+
+    plain_password = secrets.token_urlsafe(12)
+    new_user = User(
+        email=client.ca_email,
+        name=client.ca_name,
+        password_hash=hash_password(plain_password),
+        language_code="en",
+    )
+    db.add(new_user)
+    await db.flush()
+    db.add(ClientUser(
+        client_id=client.id,
+        user_id=new_user.id,
+        role=ClientUserRole.CA,
+        status=StatusEnum.ACTIVE,
+    ))
+    return True, plain_password
