@@ -135,18 +135,34 @@ def _build_branded_qr_png(
     """
     module_colour = "#0F2A0F" if style == "color" else "black"
 
+    # 2026-07-06 — box_size fixed at 10 px per module so every
+    # module renders as a chunky, unambiguous block. Pre-fix used
+    # `max(3, px_size // 37)` which produced 3-px modules at SMALL —
+    # then the whole QR was resized DOWN to px_size (76 for 2 cm)
+    # with NEAREST, blurring modules to ~1.77 px on average. Phone
+    # cameras couldn't decode it. Now we never downscale — the PNG
+    # is at natural QR-lib resolution (~470 px for our URL length),
+    # and the PDF composer sizes the physical print via drawImage at
+    # exact dim_pt × dim_pt, decoupling PNG pixels from print cm.
     qr = qrcode.QRCode(
         version=None,
         error_correction=qrcode.constants.ERROR_CORRECT_H,
-        box_size=max(3, px_size // 37),
+        box_size=10,
         border=3,
     )
     qr.add_data(payload)
     qr.make(fit=True)
     qr_img = qr.make_image(fill_color=module_colour, back_color="white").convert("RGBA")
 
-    if qr_img.size[0] != px_size:
+    # Never downscale. Upscale to the requested px_size only when
+    # the caller wants a bigger preview than the natural render;
+    # otherwise keep the natural resolution for the subsequent logo
+    # and label math.
+    natural = qr_img.size[0]
+    if px_size > natural:
         qr_img = qr_img.resize((px_size, px_size), Image.NEAREST)
+    else:
+        px_size = natural
 
     # Raw mode: no logo overlay, no label, done.
     if style == "raw":
