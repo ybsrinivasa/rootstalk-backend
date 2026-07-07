@@ -173,6 +173,13 @@ class ClientUser(Base):
         default=StatusEnum.ACTIVE,
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # 2026-07-07 — stamped when a row flips ACTIVE→INACTIVE (SA
+    # rotates the CA to someone else, or explicitly deactivates
+    # from the per-client CA table). Cleared on reactivation. Used
+    # by the CA-history list for chronological ordering.
+    deactivated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
 
     client: Mapped["Client"] = relationship("Client", back_populates="client_users")
 

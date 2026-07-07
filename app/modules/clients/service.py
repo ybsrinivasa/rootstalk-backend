@@ -314,6 +314,7 @@ async def rotate_ca_admin(
         if current_user_row and (current_user_row.email or "").lower() == (client.ca_email or "").lower():
             return False, None, None
         current_ca.status = StatusEnum.INACTIVE
+        current_ca.deactivated_at = datetime.now(timezone.utc)
 
     existing_user = (await db.execute(
         select(User).where(User.email == client.ca_email)
@@ -338,6 +339,7 @@ async def rotate_ca_admin(
         )).scalar_one_or_none()
         if prior_ca_row is not None:
             prior_ca_row.status = StatusEnum.ACTIVE
+            prior_ca_row.deactivated_at = None
         else:
             db.add(ClientUser(
                 client_id=client.id,
@@ -363,3 +365,60 @@ async def rotate_ca_admin(
         status=StatusEnum.ACTIVE,
     ))
     return True, plain_password, None
+
+
+async def activate_ca_by_client_user_id(
+    db: AsyncSession, client: Client, target_client_user_id: str,
+) -> tuple[User, User | None]:
+    """Flip a specific past CA (identified by its `ClientUser.id`) to
+    ACTIVE, demoting whoever is currently the active CA.
+
+    Used by the SA-facing per-client CA table's "Activate" action.
+    Returns `(new_active_ca_user, previous_active_ca_user_or_none)`
+    so the caller can (a) sync `client.ca_email` / `ca_name` to the
+    reactivated User's row and (b) drive the reassignment email.
+
+    Raises HTTPException so the router doesn't need to translate.
+
+    Idempotent: if the target row is already ACTIVE, returns the
+    same user for both slots and touches nothing.
+    """
+    from fastapi import HTTPException
+    target = (await db.execute(
+        select(ClientUser).where(
+            ClientUser.id == target_client_user_id,
+            ClientUser.client_id == client.id,
+            ClientUser.role == ClientUserRole.CA,
+        )
+    )).scalar_one_or_none()
+    if target is None:
+        raise HTTPException(status_code=404, detail="CA record not found for this client")
+
+    target_user = (await db.execute(
+        select(User).where(User.id == target.user_id)
+    )).scalar_one_or_none()
+    if target_user is None:
+        raise HTTPException(status_code=500, detail="CA record points to a missing user")
+
+    if target.status == StatusEnum.ACTIVE:
+        return target_user, target_user
+
+    current_ca = (await db.execute(
+        select(ClientUser).where(
+            ClientUser.client_id == client.id,
+            ClientUser.role == ClientUserRole.CA,
+            ClientUser.status == StatusEnum.ACTIVE,
+        )
+    )).scalar_one_or_none()
+    previous_user = None
+    if current_ca is not None:
+        current_ca.status = StatusEnum.INACTIVE
+        current_ca.deactivated_at = datetime.now(timezone.utc)
+        previous_user = (await db.execute(
+            select(User).where(User.id == current_ca.user_id)
+        )).scalar_one_or_none()
+
+    target.status = StatusEnum.ACTIVE
+    target.deactivated_at = None
+
+    return target_user, previous_user

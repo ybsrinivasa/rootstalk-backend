@@ -24,7 +24,9 @@ from app.modules.clients.schemas import (
 from app.modules.clients.service import (
     generate_token, send_onboarding_email, send_ca_credentials_email,
     send_portal_user_welcome_email,
-    get_client_by_token, create_ca_user
+    get_client_by_token, create_ca_user,
+    rotate_ca_admin, activate_ca_by_client_user_id,
+    send_ca_reassignment_email,
 )
 from app.modules.advisory.models import Package, PackageStatus
 from app.services.crop_lifecycle import (
@@ -709,6 +711,192 @@ async def edit_client(
                 )
 
     return await _client_to_out(db, client)
+
+
+# ── Per-client CA table (2026-07-07) ────────────────────────────────────────
+#
+# SA-facing surface for managing the CA history of a single client.
+# The old flow (SA edits `ca_email` on the client-edit modal) still
+# works and rotates the CA correctly, but this table view makes the
+# history visible and lets the SA reactivate a previously-CA user
+# without re-typing their email. Backend model didn't change — every
+# rotate has always left the old CA row as INACTIVE; these endpoints
+# just surface + curate that history.
+
+
+class NewCAIn(BaseModel):
+    ca_email: str
+    ca_name: str
+
+
+async def _serialise_ca_rows(db: AsyncSession, client_id: str) -> list[dict]:
+    """List every CA `ClientUser` row for the given client, joined with
+    the backing User so the SA sees name/email/phone alongside status
+    and timestamps. Sorted: ACTIVE first, then most-recent
+    deactivated_at, then falling back to created_at."""
+    rows = (await db.execute(
+        select(ClientUser, User)
+        .join(User, User.id == ClientUser.user_id)
+        .where(
+            ClientUser.client_id == client_id,
+            ClientUser.role == ClientUserRole.CA,
+        )
+    )).all()
+    out = []
+    for cu, u in rows:
+        out.append({
+            "id": cu.id,
+            "user_id": u.id,
+            "name": u.name,
+            "email": u.email,
+            "phone": u.phone,
+            "status": cu.status.value if hasattr(cu.status, "value") else str(cu.status),
+            "activated_at": cu.created_at,
+            "deactivated_at": cu.deactivated_at,
+        })
+    out.sort(key=lambda r: (
+        0 if r["status"] == "ACTIVE" else 1,
+        # For inactive rows, most-recent-deactivation first. Fall
+        # back to activated_at when deactivated_at is NULL (pre-
+        # migration rows that were already inactive).
+        -(r["deactivated_at"] or r["activated_at"]).timestamp()
+        if r["status"] != "ACTIVE" else 0,
+    ))
+    return out
+
+
+@router.get("/admin/clients/{client_id}/cas")
+async def list_client_cas(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_sa(current_user)
+    client = (await db.execute(
+        select(Client).where(Client.id == client_id)
+    )).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status_code=404, detail="Client not found")
+    return await _serialise_ca_rows(db, client_id)
+
+
+@router.post("/admin/clients/{client_id}/cas", status_code=201)
+async def add_client_ca(
+    client_id: str,
+    payload: NewCAIn,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Add a new CA to a client. Mirrors what the edit-client modal
+    does when SA changes `ca_email`, but exposed as an explicit
+    action on the CA table. Deactivates the current CA (if any),
+    reuses or creates the new CA's User row, and sends credentials
+    (fresh User) or a reassignment email (reused User)."""
+    _require_sa(current_user)
+    client = (await db.execute(
+        select(Client).where(Client.id == client_id)
+    )).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status_code=404, detail="Client not found")
+    if client.status != ClientStatus.ACTIVE:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "client_not_active",
+                "message": (
+                    "CA table is only editable on ACTIVE clients. "
+                    "Approve the client first."
+                ),
+            },
+        )
+
+    new_email = (payload.ca_email or "").strip()
+    new_name = (payload.ca_name or "").strip()
+    if not new_email or not new_name:
+        raise HTTPException(
+            status_code=422,
+            detail="ca_email and ca_name are required",
+        )
+
+    # Mirror the ca_email / ca_name onto the Client row first so
+    # `rotate_ca_admin` (which reads from client) picks up the new
+    # values. `edit_client` uses the same shape.
+    client.ca_email = new_email
+    client.ca_name = new_name
+    await db.commit()
+
+    created_new, plain_password, reused_phone = await rotate_ca_admin(db, client)
+    await db.commit()
+
+    if settings.email_smtp_user:
+        login_url = f"{_base_url()}/login/{client.short_name}"
+        if created_new and plain_password:
+            await send_ca_credentials_email(
+                client.ca_email, client.ca_name, login_url, plain_password,
+            )
+        else:
+            await send_ca_reassignment_email(
+                client.ca_email,
+                client.ca_name,
+                client.display_name or client.full_name,
+                login_url,
+                ca_phone=reused_phone,
+            )
+
+    return await _serialise_ca_rows(db, client_id)
+
+
+@router.post("/admin/clients/{client_id}/cas/{client_user_id}/activate")
+async def activate_client_ca(
+    client_id: str,
+    client_user_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Flip a specific past CA (identified by ClientUser.id) back to
+    ACTIVE. Deactivates whoever is currently the active CA and
+    updates the Client row's mirrored `ca_email` / `ca_name` to the
+    reactivated user's values."""
+    _require_sa(current_user)
+    client = (await db.execute(
+        select(Client).where(Client.id == client_id)
+    )).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status_code=404, detail="Client not found")
+    if client.status != ClientStatus.ACTIVE:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "client_not_active",
+                "message": "CA table is only editable on ACTIVE clients.",
+            },
+        )
+
+    new_active_user, previous_user = await activate_ca_by_client_user_id(
+        db, client, client_user_id,
+    )
+
+    # Sync mirror on Client row so downstream reads (login page,
+    # branding, etc.) match the active CA.
+    client.ca_email = new_active_user.email
+    client.ca_name = new_active_user.name
+    await db.commit()
+
+    if (
+        settings.email_smtp_user
+        and previous_user is not None
+        and previous_user.id != new_active_user.id
+    ):
+        login_url = f"{_base_url()}/login/{client.short_name}"
+        await send_ca_reassignment_email(
+            new_active_user.email,
+            new_active_user.name,
+            client.display_name or client.full_name,
+            login_url,
+            ca_phone=new_active_user.phone,
+        )
+
+    return await _serialise_ca_rows(db, client_id)
 
 
 @router.get("/admin/cosh/manufacturers")
