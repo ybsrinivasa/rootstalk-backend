@@ -30,8 +30,20 @@ from app.modules.translations.models import (
 logger = logging.getLogger(__name__)
 
 
-# 12 non-English PWA locales. Matches app/scripts/translate-messages.mjs.
-TARGET_LOCALES = ("hi", "ta", "te", "kn", "ml", "mr", "gu", "pa", "or", "bn", "as", "ur")
+# 2026-07-07 — Narrowed from 12 → 3 (hi, ta, kn) for the v1 prod
+# push. Rationale: the PWA UI (app/scripts/translate-messages.mjs)
+# still covers all 12 static-string locales, but SE-authored dynamic
+# content is only exercised by the three farmer-language cohorts in
+# active field use. Narrowing cuts Claude cost + backfill wall-time
+# by ~4x.
+#
+# To add a locale later:
+#   1. Append the language code here.
+#   2. Push, rebuild the api/celery_worker image, restart the worker.
+#   3. Re-run scripts/backfill_content_translations.py — the source-
+#      hash check will skip already-covered entities; the new locale
+#      will fan out as an additive translate.
+TARGET_LOCALES = ("hi", "ta", "kn")
 
 
 # Human-friendly labels used in prompt construction. Not the same as
