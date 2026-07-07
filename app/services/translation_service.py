@@ -79,6 +79,98 @@ class AncestryContext:
     field_notes: Optional[str] = None
 
 
+def _google_translate_fallback(
+    source_text: str,
+    entity_type: str,
+    locales: tuple[str, ...],
+) -> dict[str, str]:
+    """Google Translate v2 API — ultimate fallback when both Sonnet 4.6
+    and Opus 4.7 refuse.
+
+    Called for the ~4% of prod entities where Claude's pesticide-
+    application guardrail false-positives ("Apply, Beauveria bassiana
+    mix with jaggery 0.5%" and similar biological-control instructions).
+    Google Translate has no such guardrail; it translates benign content
+    without refusing.
+
+    Quality is lower than Claude — no village-extension-worker register,
+    no ancestry-aware terminology — but "clumsy Hindi" beats "raw
+    English in the middle of a Hindi UI" as an outcome for the farmer.
+
+    Returns {locale: translated_text} for every locale that resolved.
+    Missing locales caller-side become the English source (existing
+    fallback). Empty dict when the API key isn't configured OR every
+    per-locale call failed.
+
+    List-source entities (seed_variety.description_points) are handled
+    by unpacking the JSON array, translating each bullet in one v2
+    call per locale (v2 accepts multiple `q` values), then re-encoding
+    as a JSON string for storage — the read-path decoder already
+    handles that shape.
+    """
+    if not settings.google_translate_api_key:
+        logger.warning(
+            "Both Sonnet + Opus refused and GOOGLE_TRANSLATE_API_KEY "
+            "is not configured — English fallback. Source: %s",
+            source_text[:200],
+        )
+        return {}
+
+    is_list_source = _is_list_source_entity(entity_type)
+    if is_list_source:
+        try:
+            items = json.loads(source_text)
+            if not isinstance(items, list):
+                items = [source_text]
+        except json.JSONDecodeError:
+            items = [source_text]
+    else:
+        items = [source_text]
+
+    import httpx
+    out: dict[str, str] = {}
+    with httpx.Client(timeout=15.0) as client:
+        for locale in locales:
+            try:
+                resp = client.post(
+                    "https://translation.googleapis.com/language/translate/v2",
+                    params={"key": settings.google_translate_api_key},
+                    json={
+                        "q": items,
+                        "source": "en",
+                        "target": locale,
+                        "format": "text",
+                    },
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+                translated_items = [
+                    t.get("translatedText", "")
+                    for t in payload.get("data", {}).get("translations", [])
+                ]
+                if not translated_items or any(not t for t in translated_items):
+                    logger.error(
+                        "Google Translate returned empty for %s: %s",
+                        locale, payload,
+                    )
+                    continue
+                if is_list_source:
+                    out[locale] = json.dumps(translated_items, ensure_ascii=False)
+                else:
+                    out[locale] = translated_items[0]
+            except Exception as e:  # noqa: BLE001
+                logger.error(
+                    "Google Translate failed for locale=%s: %s. Source: %s",
+                    locale, e, source_text[:120],
+                )
+    if out:
+        logger.info(
+            "Google Translate fallback covered %d/%d locales for %s",
+            len(out), len(locales), entity_type,
+        )
+    return out
+
+
 def _is_list_source_entity(entity_type: str) -> bool:
     """Return True when the source for this entity type is a JSON
     array of strings (each element a bullet / sentence). Currently
@@ -242,12 +334,29 @@ async def translate_content(
         )
         response = _call("claude-opus-4-7")
         if not response.content:
+            # 2026-07-07 — Ultimate fallback: Google Translate v2.
+            # Prod backfill showed Opus also refuses the same 94% of
+            # what Sonnet refuses (biocontrol-with-dosage pattern is
+            # a Claude-family guardrail, not model-specific). Google
+            # has no such guardrail and translates benign content
+            # cleanly. Quality is lower than Claude — no register /
+            # ancestry — but "clumsy Hindi" beats "raw English" as
+            # the farmer-facing outcome.
             stop_reason = getattr(response, "stop_reason", "unknown")
-            logger.error(
-                "Both Sonnet and Opus refused %s (stop_reason=%s). Source: %s",
+            logger.warning(
+                "Both Sonnet and Opus refused %s (stop_reason=%s) — falling back to Google Translate. Source: %s",
                 entity_type, stop_reason, source_text[:200],
             )
-            raise RuntimeError(f"empty_content stop_reason={stop_reason}")
+            google_out = _google_translate_fallback(
+                source_text, entity_type, TARGET_LOCALES,
+            )
+            if google_out:
+                return google_out
+            logger.error(
+                "Google Translate fallback also empty for %s. Farmer sees English.",
+                entity_type,
+            )
+            raise RuntimeError(f"empty_content_all_providers stop_reason={stop_reason}")
     raw = response.content[0].text.strip()
 
     # Model sometimes wraps JSON in a code fence despite instructions.
