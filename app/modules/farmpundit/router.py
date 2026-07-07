@@ -17,6 +17,8 @@ from app.modules.farmpundit.models import (
     StandardResponse, QueryStatus, QueryRemarkAction,
 )
 from app.services.i18n_cosh import pick_translation
+from app.services.translation_reader import resolve_translations_batch
+from app.modules.translations.models import EntityType
 from app.services.bl12_query_routing import route_query, ExpertSlot
 from app.services.bl12_query_state import (
     PANEL as BL12_PANEL, PRIMARY as BL12_PRIMARY,
@@ -1838,7 +1840,24 @@ async def search_standard_responses(
     if search:
         q = q.where(StandardResponse.question_text.ilike(f"%{search}%"))
     rows = (await db.execute(q)).scalars().all()
-    return [_serialise_standard_response(r) for r in rows]
+
+    # Localise question_text to the pundit's own language (usually the
+    # farmer's, since Promoter-Pundits share a locale with the farmers
+    # they serve). English source stays as the fallback when no
+    # translation is stored.
+    lang = current_user.language_code or "en"
+    tr_map = await resolve_translations_batch(
+        db, lang,
+        [(EntityType.STANDARD_RESPONSE_QUESTION, r.id) for r in rows],
+    )
+    out = []
+    for r in rows:
+        payload = _serialise_standard_response(r)
+        localised = tr_map.get((EntityType.STANDARD_RESPONSE_QUESTION, r.id))
+        if localised:
+            payload["question_text"] = localised
+        out.append(payload)
+    return out
 
 
 # ── FarmPundit search (Client Portal CA) ──────────────────────────────────────
@@ -2874,6 +2893,16 @@ async def get_query_detail_pundit(
             )
         )).scalar_one_or_none()
         standard_response_question = sr_row.question_text if sr_row else None
+        if sr_row and standard_response_question:
+            tr_map = await resolve_translations_batch(
+                db, current_user.language_code or "en",
+                [(EntityType.STANDARD_RESPONSE_QUESTION, sr_row.id)],
+            )
+            localised = tr_map.get(
+                (EntityType.STANDARD_RESPONSE_QUESTION, sr_row.id)
+            )
+            if localised:
+                standard_response_question = localised
 
     # Resolve the picked Crop Health problem (if any) to its English
     # name so the Pundit's response card reads "Fruit Fly" instead of
