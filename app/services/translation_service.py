@@ -54,6 +54,7 @@ FIELD_KIND_LABELS = {
     "element.value": "a piece of instructional content inside a farming practice",
     "standard_response.question_text": "the question a farmer would ask (used in a curated Q&A library)",
     "seed_variety.description_points": "bullet points describing a seed variety's qualities",
+    "conditional_question.question_text": "a short yes/no question the farmer answers to steer the advisory (e.g. 'Has it rained in the last 2 days?')",
 }
 
 

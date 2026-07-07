@@ -1020,6 +1020,19 @@ def _enqueue_element_translation(element) -> None:
         pass
 
 
+def _enqueue_cq_translation(cq_id: str) -> None:
+    """Best-effort translation enqueue for a ConditionalQuestion.
+    Fires on both client-side create/update and the shared global
+    create helper. Farmer sees English fallback until the Celery
+    task lands the localised text."""
+    try:
+        from app.tasks.translate_content import translate_field
+        from app.modules.translations.models import EntityType
+        translate_field.delay(EntityType.CONDITIONAL_QUESTION_TEXT, cq_id, "")
+    except Exception:
+        pass
+
+
 async def _delete_practice_element(
     db, *, practice, element_model, element_id,
 ):
@@ -3067,6 +3080,7 @@ async def create_conditional_question(
     db.add(q)
     await db.commit()
     await db.refresh(q)
+    _enqueue_cq_translation(q.id)
     return q
 
 
@@ -3434,6 +3448,7 @@ async def update_client_conditional_question(
     cq.question_text = request.question_text.strip()
     await db.commit()
     await db.refresh(cq)
+    _enqueue_cq_translation(cq.id)
     return {
         "id": cq.id,
         "timeline_id": cq.timeline_id,
@@ -3916,6 +3931,7 @@ async def _create_cq_for_global_timeline(
     db.add(q)
     await db.commit()
     await db.refresh(q)
+    _enqueue_cq_translation(q.id)
     return q
 
 
@@ -4191,6 +4207,7 @@ async def update_global_conditional_question(
     cq.question_text = request.question_text.strip()
     await db.commit()
     await db.refresh(cq)
+    _enqueue_cq_translation(cq.id)
     return {
         "id": cq.id,
         "timeline_id": cq.timeline_id,

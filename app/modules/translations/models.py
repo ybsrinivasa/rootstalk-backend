@@ -41,6 +41,11 @@ class EntityType:
     ELEMENT_VALUE = "element.value"
     STANDARD_RESPONSE_QUESTION = "standard_response.question_text"
     SEED_VARIETY_DESCRIPTION_POINTS = "seed_variety.description_points"
+    # 2026-07-07 — CQ question_text ("Has it rained last 2 days?"-style
+    # quick checks the farmer answers before an advisory operation).
+    # Save-time trigger on client-side + global CQ create/update; read
+    # path swaps in the today advisory endpoint.
+    CONDITIONAL_QUESTION_TEXT = "conditional_question.question_text"
 
 
 def hash_source(text: str | None) -> str:

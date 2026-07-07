@@ -25,6 +25,7 @@ from app.services.translation_ancestry import (
     build_ancestry_for_seed_variety_description,
     build_ancestry_for_element_value,
     build_ancestry_for_standard_response_question,
+    build_ancestry_for_conditional_question,
     TRANSLATABLE_ELEMENT_TYPES,
 )
 from app.modules.translations.models import EntityType
@@ -125,6 +126,14 @@ async def _fetch_source_and_ancestry(
             select(StandardResponse.question_text).where(StandardResponse.id == entity_id)
         )).scalar_one_or_none()
         ancestry = await build_ancestry_for_standard_response_question(db, entity_id)
+        return q, ancestry
+
+    if entity_type == EntityType.CONDITIONAL_QUESTION_TEXT:
+        from app.modules.advisory.models import ConditionalQuestion
+        q = (await db.execute(
+            select(ConditionalQuestion.question_text).where(ConditionalQuestion.id == entity_id)
+        )).scalar_one_or_none()
+        ancestry = await build_ancestry_for_conditional_question(db, entity_id)
         return q, ancestry
 
     return None, AncestryContext()

@@ -5530,6 +5530,20 @@ async def _today_advisory_for_user(
                     el_id = getattr(el, "id", None)
                     if el.value and el_id:
                         translatable_pairs.add((EntityType.ELEMENT_VALUE, el_id))
+        # 2026-07-07 — CQ text swap. Both pending question + blank
+        # path questions carry their `question_id`; enqueue them for
+        # translation lookup here. English fallback via the resolver's
+        # default None → serialise the English source.
+        for _pq in pending_questions_by_tl.values():
+            qid = _pq.get("question_id") if isinstance(_pq, dict) else None
+            if qid:
+                translatable_pairs.add((EntityType.CONDITIONAL_QUESTION_TEXT, qid))
+        for _bps in blank_paths_by_tl.values():
+            if isinstance(_bps, list):
+                for _bp in _bps:
+                    qid = _bp.get("question_id") if isinstance(_bp, dict) else None
+                    if qid:
+                        translatable_pairs.add((EntityType.CONDITIONAL_QUESTION_TEXT, qid))
         translation_map = await resolve_translations_batch(
             db, lang, translatable_pairs,
         )
@@ -5542,6 +5556,14 @@ async def _today_advisory_for_user(
                 return el.value
             localised = translation_map.get((EntityType.ELEMENT_VALUE, el_id))
             return localised or el.value
+
+        def _cq_question_text_localised(qid: str | None, english: str) -> str:
+            if not qid or not english:
+                return english
+            localised = translation_map.get(
+                (EntityType.CONDITIONAL_QUESTION_TEXT, qid),
+            )
+            return localised or english
 
         # ── Build response ────────────────────────────────────────────────────
         timeline_data = []
@@ -5620,11 +5642,31 @@ async def _today_advisory_for_user(
                 tl_entry["merged_from_tl_names"] = merged_origins
             # Include BL-02 pending question for this timeline (if any)
             if tl.id in pending_questions_by_tl:
-                tl_entry["pending_conditional_question"] = pending_questions_by_tl[tl.id]
+                _pq = pending_questions_by_tl[tl.id]
+                _pq_out = dict(_pq) if isinstance(_pq, dict) else _pq
+                if isinstance(_pq_out, dict):
+                    _pq_out["question_text"] = _cq_question_text_localised(
+                        _pq_out.get("question_id"),
+                        _pq_out.get("question_text", ""),
+                    )
+                tl_entry["pending_conditional_question"] = _pq_out
                 tl_entry["has_pending_question"] = True
             # Per spec §6.4: blank-path questions for this timeline (named, with farmer's answer)
             if tl.id in blank_paths_by_tl:
-                tl_entry["blank_path_questions"] = blank_paths_by_tl[tl.id]
+                _bps = blank_paths_by_tl[tl.id]
+                if isinstance(_bps, list):
+                    _bps_out = []
+                    for _bp in _bps:
+                        _bp_out = dict(_bp) if isinstance(_bp, dict) else _bp
+                        if isinstance(_bp_out, dict):
+                            _bp_out["question_text"] = _cq_question_text_localised(
+                                _bp_out.get("question_id"),
+                                _bp_out.get("question_text", ""),
+                            )
+                        _bps_out.append(_bp_out)
+                    tl_entry["blank_path_questions"] = _bps_out
+                else:
+                    tl_entry["blank_path_questions"] = _bps
             # CHA / QA metadata so the PWA can show "FruitFly" alongside
             # the date band and sort fresh diagnoses to the top of the
             # list. Only set on CHA/QA-source timelines; CCA gets nothing.

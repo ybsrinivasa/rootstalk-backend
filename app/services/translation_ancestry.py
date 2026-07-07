@@ -161,6 +161,68 @@ async def build_ancestry_for_element_value(
     return AncestryContext(crop_name=crop_name, field_notes=field_notes), element_type
 
 
+async def build_ancestry_for_conditional_question(
+    db: AsyncSession, cq_id: str,
+) -> AncestryContext:
+    """CQ ancestry — walk timeline → parent (package / PG / SP) →
+    crop_cosh_id → crop name. Same shape as element ancestry minus
+    the practice hop. PG parent is intentionally crop-agnostic
+    (matches the element-value case; discriminator is `area_or_plant`,
+    not crop). CQs never sit under a StandardResponse-only timeline
+    at V1 — but structurally the parent could be one, so we handle
+    that branch too."""
+    from app.modules.advisory.models import (
+        ConditionalQuestion, Timeline, Package,
+        PGRecommendation, SPRecommendation,
+    )
+    from app.modules.farmpundit.models import StandardResponse
+
+    row = (await db.execute(
+        select(
+            Timeline.package_id, Timeline.pg_recommendation_id,
+            Timeline.sp_recommendation_id, Timeline.standard_response_id,
+        )
+        .join(ConditionalQuestion, ConditionalQuestion.timeline_id == Timeline.id)
+        .where(ConditionalQuestion.id == cq_id)
+    )).one_or_none()
+    if not row:
+        return AncestryContext(
+            field_notes="Farmer-facing yes/no gate before the day's advisory",
+        )
+
+    package_id, pg_id, sp_id, sr_id = row
+    crop_cosh_id: Optional[str] = None
+    parent_kind: Optional[str] = None
+    if package_id:
+        parent_kind = "CCA package"
+        crop_cosh_id = (await db.execute(
+            select(Package.crop_cosh_id).where(Package.id == package_id)
+        )).scalar_one_or_none()
+    elif pg_id:
+        parent_kind = "CHA problem-group advisory"
+        # PGRecommendation is crop-agnostic (mirror of element-value
+        # branch — no crop_cosh_id column). Prompt uses parent hint
+        # only; the "no crop context" line handles it cleanly.
+        crop_cosh_id = None
+    elif sp_id:
+        parent_kind = "CHA specific-problem advisory"
+        crop_cosh_id = (await db.execute(
+            select(SPRecommendation.crop_cosh_id).where(SPRecommendation.id == sp_id)
+        )).scalar_one_or_none()
+    elif sr_id:
+        parent_kind = "Q&A standard response"
+        crop_cosh_id = (await db.execute(
+            select(StandardResponse.crop_cosh_id).where(StandardResponse.id == sr_id)
+        )).scalar_one_or_none()
+
+    crop_name = await _resolve_crop_name(db, crop_cosh_id)
+    field_notes = (
+        f"Farmer-facing yes/no gate before the day's advisory · "
+        f"Parent: {parent_kind or 'unknown'}"
+    )
+    return AncestryContext(crop_name=crop_name, field_notes=field_notes)
+
+
 async def build_ancestry_for_standard_response_question(
     db: AsyncSession, sr_id: str,
 ) -> AncestryContext:
