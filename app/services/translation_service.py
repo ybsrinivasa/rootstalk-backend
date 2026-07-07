@@ -212,29 +212,41 @@ async def translate_content(
     # SDK's sync client is safe here because we're inside a Celery
     # task worker thread. If invoked from an ASGI request path we'd
     # switch to AsyncAnthropic; kept sync to match claude_service.py.
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        system=system_prompt,
-        # 2026-07-06 — bumped from 2048 to 6144. Backfill caught
-        # long-ish INSTRUCTIONS elements truncating: 12 locales of
-        # translation output overflow 2048 output tokens for source
-        # texts around 200+ chars, producing "Unterminated string"
-        # JSON parse errors. 6144 gives comfortable headroom for
-        # any real-world SE-authored bullet or instruction.
-        max_tokens=6144,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    def _call(model_name: str):
+        return client.messages.create(
+            model=model_name,
+            system=system_prompt,
+            # 2026-07-06 — bumped from 2048 to 6144. Backfill caught
+            # long-ish INSTRUCTIONS elements truncating: 12 locales of
+            # translation output overflow 2048 output tokens for source
+            # texts around 200+ chars, producing "Unterminated string"
+            # JSON parse errors. 6144 gives comfortable headroom for
+            # any real-world SE-authored bullet or instruction.
+            max_tokens=6144,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+    response = _call("claude-sonnet-4-6")
     if not response.content:
-        # Defensive path — Claude returned HTTP 200 with no content
-        # blocks. Usually a stop_reason='refusal' or safety-filter
-        # short-circuit. Log the stop_reason + source excerpt so we
-        # can adjust the system frame or prompt if the pattern recurs.
+        # 2026-07-07 — Sonnet 4.6 false-positive refuses translations
+        # of beneficial biocontrol instructions ("Apply, Beauveria
+        # bassiana mix with jaggery 0.5%") on a pesticide-application
+        # guardrail. Retry the same prompt against Opus 4.7 which has
+        # a different guardrail profile. Only ~4% of translations hit
+        # this path; cost impact is negligible.
         stop_reason = getattr(response, "stop_reason", "unknown")
-        logger.error(
-            "Claude returned empty content (stop_reason=%s) for %s: %s",
+        logger.warning(
+            "Sonnet returned empty content (stop_reason=%s) for %s — retrying with Opus. Source: %s",
             stop_reason, entity_type, source_text[:200],
         )
-        raise RuntimeError(f"empty_content stop_reason={stop_reason}")
+        response = _call("claude-opus-4-7")
+        if not response.content:
+            stop_reason = getattr(response, "stop_reason", "unknown")
+            logger.error(
+                "Both Sonnet and Opus refused %s (stop_reason=%s). Source: %s",
+                entity_type, stop_reason, source_text[:200],
+            )
+            raise RuntimeError(f"empty_content stop_reason={stop_reason}")
     raw = response.content[0].text.strip()
 
     # Model sometimes wraps JSON in a code fence despite instructions.
