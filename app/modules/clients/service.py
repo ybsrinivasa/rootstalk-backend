@@ -320,12 +320,31 @@ async def rotate_ca_admin(
     )).scalar_one_or_none()
 
     if existing_user is not None:
-        db.add(ClientUser(
-            client_id=client.id,
-            user_id=existing_user.id,
-            role=ClientUserRole.CA,
-            status=StatusEnum.ACTIVE,
-        ))
+        # 2026-07-07 — Reactivation path. When the SA rotates back to
+        # a previously-CA user (User1 → User2 → User1 again), the
+        # (client_id, user_id, role=CA) triple already exists on the
+        # first stint's INACTIVE row. Blind INSERT hits the
+        # UniqueConstraint and the whole rotation transaction rolls
+        # back — SA sees "no change" with no clear error. Look up the
+        # row regardless of status: flip to ACTIVE if found, else
+        # insert. Same-bug-different-table as the 2026-06-30 CM
+        # reassignment fix.
+        prior_ca_row = (await db.execute(
+            select(ClientUser).where(
+                ClientUser.client_id == client.id,
+                ClientUser.user_id == existing_user.id,
+                ClientUser.role == ClientUserRole.CA,
+            )
+        )).scalar_one_or_none()
+        if prior_ca_row is not None:
+            prior_ca_row.status = StatusEnum.ACTIVE
+        else:
+            db.add(ClientUser(
+                client_id=client.id,
+                user_id=existing_user.id,
+                role=ClientUserRole.CA,
+                status=StatusEnum.ACTIVE,
+            ))
         return False, None, existing_user.phone
 
     plain_password = secrets.token_urlsafe(12)
