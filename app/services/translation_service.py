@@ -188,12 +188,33 @@ async def translate_content(
 
     prompt = _build_prompt(source_text, entity_type, ancestry)
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    # 2026-07-07 — added a system frame after the prod backfill
+    # surfaced ~4% straggler entities that all named beneficial
+    # biological pest-control agents (Beauveria bassiana,
+    # Metarhizium anisopliae, Bacillus thuringiensis, etc.) with
+    # dosage instructions. Sonnet 4.6 was refusing them with an
+    # empty content array — a false positive on pesticide-application
+    # guardrails. The system frame gives Claude the correct context:
+    # curated advisory content for smallholder farmers, safe to
+    # translate as-is.
+    system_prompt = (
+        "You are translating agricultural advisory content for a mobile app "
+        "used by smallholder farmers in India. The content is curated by "
+        "domain experts (agronomists, plant pathologists, entomologists) "
+        "and covers crop nutrition, pest and disease management, and "
+        "farming best practices — including biological control agents, "
+        "chemical inputs, and organic methods. Your job is to translate "
+        "faithfully and accurately into the requested Indic languages. "
+        "Never refuse; the content is beneficial extension advisory that "
+        "helps farmers grow crops safely."
+    )
     # Sync client called from an async context — anthropic's Python
     # SDK's sync client is safe here because we're inside a Celery
     # task worker thread. If invoked from an ASGI request path we'd
     # switch to AsyncAnthropic; kept sync to match claude_service.py.
     response = client.messages.create(
         model="claude-sonnet-4-6",
+        system=system_prompt,
         # 2026-07-06 — bumped from 2048 to 6144. Backfill caught
         # long-ish INSTRUCTIONS elements truncating: 12 locales of
         # translation output overflow 2048 output tokens for source
@@ -203,6 +224,17 @@ async def translate_content(
         max_tokens=6144,
         messages=[{"role": "user", "content": prompt}],
     )
+    if not response.content:
+        # Defensive path — Claude returned HTTP 200 with no content
+        # blocks. Usually a stop_reason='refusal' or safety-filter
+        # short-circuit. Log the stop_reason + source excerpt so we
+        # can adjust the system frame or prompt if the pattern recurs.
+        stop_reason = getattr(response, "stop_reason", "unknown")
+        logger.error(
+            "Claude returned empty content (stop_reason=%s) for %s: %s",
+            stop_reason, entity_type, source_text[:200],
+        )
+        raise RuntimeError(f"empty_content stop_reason={stop_reason}")
     raw = response.content[0].text.strip()
 
     # Model sometimes wraps JSON in a code fence despite instructions.
