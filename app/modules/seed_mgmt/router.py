@@ -1271,6 +1271,18 @@ async def list_dealer_seed_orders(
         db, crop_cosh_ids, lang,
     ) if crop_cosh_ids else {}
 
+    # 2026-07-08 — Resolve each variety's crop_cosh_id to its
+    # AREA_WISE vs PLANT_WISE measure so the dealer card can render
+    # acreage vs plant count consistently with the farmer-side crop
+    # dashboard. Bulk lookup — one query per unique crop_cosh_id
+    # keeps the N+1 gone from this endpoint.
+    from app.services.cosh_crop_view import get_measure_for_biological_name
+    from app.modules.subscriptions.router import _compute_crop_age
+    measure_by_cosh_id: dict[str, str] = {}
+    for cid in crop_cosh_ids:
+        m = await get_measure_for_biological_name(db, cid)
+        measure_by_cosh_id[cid] = m or "AREA_WISE"
+
     # Point 4a (2026-06-18): the dealer cannot see the variety name
     # until they accept the order. Seed varieties are brand-locked,
     # and exposing the name pre-accept would let a non-onboarded
@@ -1288,6 +1300,13 @@ async def list_dealer_seed_orders(
         sub = subs.get(o.subscription_id)
         client = clients.get(o.client_id)
         variety_hidden = o.status in PRE_ACCEPT_STATUSES
+        crop_cosh_id = variety.crop_cosh_id if variety else None
+        crop_measure = (
+            measure_by_cosh_id.get(crop_cosh_id) if crop_cosh_id else None
+        )
+        computed_crop_age = (
+            _compute_crop_age(sub, crop_measure) if sub and crop_measure else None
+        )
         out.append({
             "id": o.id, "status": o.status,
             "reference_number": o.reference_number,
@@ -1297,16 +1316,24 @@ async def list_dealer_seed_orders(
                 else (variety.name if variety else None)
             ),
             "variety_name_hidden": variety_hidden,
-            "crop_cosh_id": variety.crop_cosh_id if variety else None,
+            "crop_cosh_id": crop_cosh_id,
             "crop_name": (
-                crop_name_by_id.get(variety.crop_cosh_id)
-                if variety and variety.crop_cosh_id else None
+                crop_name_by_id.get(crop_cosh_id) if crop_cosh_id else None
             ),
+            # 2026-07-08 — Farmer-side crop context surfaced to the
+            # dealer so they can confirm the order against the crop
+            # before packing. `crop_measure` drives whether the PWA
+            # renders acreage or plant count; `computed_crop_age`
+            # matches the envelope shape the crop dashboard already
+            # uses (source-agnostic; PWA renders `value unit`).
+            "crop_measure": crop_measure,
+            "computed_crop_age": computed_crop_age,
             "farmer_user_id": o.farmer_user_id,
             "farmer_name": farmer.name if farmer else None,
             "farmer_phone": farmer.phone if farmer else None,
             "farmer_photo_url": farmer.photo_url if farmer else None,
             "farm_area_acres": float(sub.farm_area_acres) if sub and sub.farm_area_acres else None,
+            "number_of_plants": int(sub.number_of_plants) if sub and sub.number_of_plants else None,
             "client_id": o.client_id,
             "client_name": (client.display_name or client.short_name) if client else None,
             "unit": o.unit,
