@@ -2700,14 +2700,82 @@ async def list_client_farmers(
 
 # ── Client Portal: Alerts dashboard ───────────────────────────────────────────
 
+async def _bulk_resolve_enrichment(
+    db: AsyncSession, subs: list, users: list, lang: str,
+) -> dict:
+    """Batched Cosh lookups for the enrichment pass. Returns dicts
+    keyed by cosh_id for state/district/crop names + a measure map
+    keyed by crop_cosh_id. Every alert row uses these; batching keeps
+    the whole page at a small fixed number of queries."""
+    from app.services.i18n_cosh import resolve_names_by_cosh_id
+    from app.services.cosh_crop_view import get_measure_for_biological_name
+    state_ids = {u.state_cosh_id for u in users if u.state_cosh_id}
+    district_ids = {u.district_cosh_id for u in users if u.district_cosh_id}
+    crop_ids = {s.crop_cosh_id for s in subs if s.crop_cosh_id}
+    name_by_id = await resolve_names_by_cosh_id(
+        db, state_ids | district_ids | crop_ids, lang,
+    ) if (state_ids or district_ids or crop_ids) else {}
+    measure_by_crop: dict[str, str] = {}
+    for cid in crop_ids:
+        m = await get_measure_for_biological_name(db, cid)
+        measure_by_crop[cid] = m or "AREA_WISE"
+    return {"name_by_id": name_by_id, "measure_by_crop": measure_by_crop}
+
+
+def _base_alert_row(sub, user, enrich: dict) -> dict:
+    """Shared row shape for both alert types — enrichment plumbed
+    identically across pending-start-dates and overdue-inputs so the
+    CA UI can render location + crop context without branching."""
+    name_by_id = enrich["name_by_id"]
+    measure_by_crop = enrich["measure_by_crop"]
+    crop_measure = (
+        measure_by_crop.get(sub.crop_cosh_id) if sub.crop_cosh_id else None
+    )
+    return {
+        "subscription_id": sub.id,
+        "subscription_ref": sub.reference_number,
+        "farmer_name": user.name,
+        "farmer_phone": user.phone,
+        "state_cosh_id": user.state_cosh_id,
+        "state_name": (
+            name_by_id.get(user.state_cosh_id) if user.state_cosh_id else None
+        ),
+        "district_cosh_id": user.district_cosh_id,
+        "district_name": (
+            name_by_id.get(user.district_cosh_id) if user.district_cosh_id else None
+        ),
+        "crop_cosh_id": sub.crop_cosh_id,
+        "crop_name": (
+            name_by_id.get(sub.crop_cosh_id) if sub.crop_cosh_id else None
+        ),
+        "crop_measure": crop_measure,
+        "farm_area_acres": (
+            float(sub.farm_area_acres) if sub.farm_area_acres else None
+        ),
+        "number_of_plants": (
+            int(sub.number_of_plants) if sub.number_of_plants else None
+        ),
+    }
+
+
 @router.get("/client/{client_id}/alerts/pending-start-dates")
 async def get_pending_start_dates(
     client_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Farmers with ACTIVE subscriptions but no crop start date set."""
+    """Farmers with ACTIVE subscriptions but no crop start date set.
+
+    2026-07-08 — Auth added (was open to any authenticated user across
+    tenants). Enrichment: state / district / crop / area or plants /
+    subscription_ref plumbed for the CA-portal Alerts screen.
+
+    Soft-deleted subscriptions are auto-filtered by the session-level
+    listener in `app/modules/subscriptions/soft_delete.py`."""
+    from app.modules.farmpundit.router import _assert_portal_member
     from app.modules.subscriptions.models import Subscription, SubscriptionStatus
+    await _assert_portal_member(db, current_user.id, client_id)
+
     result = await db.execute(
         select(Subscription, User)
         .join(User, User.id == Subscription.farmer_user_id)
@@ -2718,15 +2786,17 @@ async def get_pending_start_dates(
         )
         .order_by(Subscription.created_at)
     )
+    rows = result.all()
+    subs = [s for s, _u in rows]
+    users = [u for _s, u in rows]
+    lang = current_user.language_code or "en"
+    enrich = await _bulk_resolve_enrichment(db, subs, users, lang)
     return [
         {
-            "subscription_id": sub.id,
-            "farmer_name": user.name,
-            "farmer_phone": user.phone,
-            "package_id": sub.package_id,
+            **_base_alert_row(sub, user, enrich),
             "subscribed_at": sub.subscription_date,
         }
-        for sub, user in result.all()
+        for sub, user in rows
     ]
 
 
@@ -2736,11 +2806,34 @@ async def get_overdue_inputs(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Farmers whose input practices are due today but have no active order (simplified check)."""
+    """Farmers whose input practices are due today but have no active
+    order **for that specific timeline**.
+
+    2026-07-08 audit + rewrite:
+    - Auth added (was open across tenants).
+    - Order-active check is now per-timeline. Pre-fix, ANY non-
+      cancelled order on the subscription suppressed alerts for ALL
+      of its timelines, hiding real work. Now checks
+      `order_items.timeline_id == tl.id` so only orders touching this
+      timeline count.
+    - CALENDAR from_type handled (day-of-year window vs
+      crop_start_date year). Pre-fix, CALENDAR timelines never fired.
+    - Enrichment: state / district / crop / area or plants / crop age /
+      subscription_ref.
+    - Kept "one entry per subscription" behaviour (first overdue
+      timeline wins) to keep the CA alerts table compact — user will
+      call whether to surface all overdue timelines separately.
+
+    Soft-delete filtering: auto via session listener.
+    """
+    from app.modules.farmpundit.router import _assert_portal_member
     from app.modules.subscriptions.models import Subscription, SubscriptionStatus
-    from app.modules.orders.models import Order, OrderStatus
+    from app.modules.orders.models import Order, OrderItem
     from app.modules.advisory.models import Timeline, Practice, PracticeL0
-    from datetime import date
+    from app.modules.subscriptions.router import _compute_crop_age
+    from datetime import date, timedelta
+    await _assert_portal_member(db, current_user.id, client_id)
+
     today = date.today()
 
     result = await db.execute(
@@ -2753,48 +2846,80 @@ async def get_overdue_inputs(
         )
     )
     rows = result.all()
+    subs = [s for s, _u in rows]
+    users = [u for _s, u in rows]
+    lang = current_user.language_code or "en"
+    enrich = await _bulk_resolve_enrichment(db, subs, users, lang)
 
     overdue = []
     for sub, user in rows:
-        crop_start = sub.crop_start_date.date() if hasattr(sub.crop_start_date, 'date') else sub.crop_start_date
+        crop_start = (
+            sub.crop_start_date.date()
+            if hasattr(sub.crop_start_date, "date") else sub.crop_start_date
+        )
         day_offset = (today - crop_start).days
 
         tl_result = await db.execute(
             select(Timeline).where(Timeline.package_id == sub.package_id)
         )
         for tl in tl_result.scalars().all():
-            from_type = tl.from_type.value if hasattr(tl.from_type, 'value') else str(tl.from_type)
+            from_type = tl.from_type.value if hasattr(tl.from_type, "value") else str(tl.from_type)
             active = False
             if from_type == "DAS" and tl.from_value <= day_offset <= tl.to_value:
                 active = True
             elif from_type == "DBS" and -tl.to_value <= day_offset <= -tl.from_value:
                 active = True
+            elif from_type == "CALENDAR" and tl.from_value is not None and tl.to_value is not None:
+                # DOY window resolved against crop_start's year (mirror of
+                # order_bundle._timeline_window). Wrap-around windows
+                # (from > to) are V1-unsupported; skip cleanly.
+                if int(tl.from_value) <= int(tl.to_value):
+                    year_start = date(crop_start.year, 1, 1)
+                    win_from = year_start + timedelta(days=int(tl.from_value) - 1)
+                    win_to = year_start + timedelta(days=int(tl.to_value) - 1)
+                    if win_from <= today <= win_to:
+                        active = True
 
-            if active:
-                p_result = await db.execute(
-                    select(Practice).where(
-                        Practice.timeline_id == tl.id,
-                        Practice.l0_type == PracticeL0.INPUT,
-                    )
+            if not active:
+                continue
+
+            p_result = await db.execute(
+                select(Practice.id).where(
+                    Practice.timeline_id == tl.id,
+                    Practice.l0_type == PracticeL0.INPUT,
                 )
-                if p_result.scalars().first():
-                    # Check if there's an active (non-cancelled) order
-                    order_result = await db.execute(
-                        select(Order).where(
-                            Order.subscription_id == sub.id,
-                            Order.status.notin_(["CANCELLED", "EXPIRED"]),
-                        )
-                    )
-                    if not order_result.scalar_one_or_none():
-                        overdue.append({
-                            "subscription_id": sub.id,
-                            "farmer_name": user.name,
-                            "farmer_phone": user.phone,
-                            "day_offset": day_offset,
-                            "timeline_name": tl.name,
-                            "package_id": sub.package_id,
-                        })
-                        break  # One entry per subscription
+            )
+            if not p_result.scalars().first():
+                continue
+
+            # Per-timeline order check: any live OrderItem tied to
+            # THIS timeline on THIS subscription short-circuits the
+            # alert. Pre-fix this was subscription-wide.
+            item_row = (await db.execute(
+                select(OrderItem.id)
+                .join(Order, Order.id == OrderItem.order_id)
+                .where(
+                    Order.subscription_id == sub.id,
+                    Order.status.notin_(["CANCELLED", "EXPIRED"]),
+                    OrderItem.timeline_id == tl.id,
+                    OrderItem.archived_at.is_(None),
+                )
+            )).scalars().first()
+            if item_row is not None:
+                continue
+
+            crop_measure = enrich["measure_by_crop"].get(sub.crop_cosh_id) if sub.crop_cosh_id else None
+            computed_crop_age = (
+                _compute_crop_age(sub, crop_measure) if crop_measure else None
+            )
+            overdue.append({
+                **_base_alert_row(sub, user, enrich),
+                "crop_start_date": crop_start,
+                "computed_crop_age": computed_crop_age,
+                "day_offset": day_offset,
+                "timeline_name": tl.name,
+            })
+            break  # One entry per subscription — first overdue tl wins
 
     return overdue
 
