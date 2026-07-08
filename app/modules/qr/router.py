@@ -234,21 +234,88 @@ async def _is_seed_client(db: AsyncSession, client_id: str) -> bool:
     return _SEED_COMPANY_COSH_ID in rows
 
 
-async def _assert_client_can_qr(db: AsyncSession, client_id: str) -> Client:
-    """QR module gate — passes if the Client is a Manufacturer (has
-    branded pesticide/fertilizer products via Cosh) OR a Seed Company
-    (has RootsTalk seed varieties). Both axes are independent:
-    Bayer-shaped clients pass on both. Advisory-only clients pass on
-    neither and get a 403.
+async def _assert_client_can_qr(
+    db: AsyncSession, client_id: str, current_user: "User | None" = None,
+) -> Client:
+    """QR module gate — three checks:
+
+    1. **Tenant + role membership** (2026-07-08). The user must be one
+       of: SA (settings.sa_email), CA of this client, PRODUCT_MANAGER
+       of this client, or a CM with ACTIVE EDIT-rights on this client.
+       Pre-fix, this endpoint took NO current_user at all — every
+       authenticated user on the platform could hit QR endpoints for
+       any manufacturer / seed client (cross-tenant leak) and every
+       role within a tenant could operate QR (no PM-role enforcement).
+       Per user rule: "Only CA + PM can touch QR."
+
+    2. **Client eligibility**: the Client must be a Manufacturer (has
+       branded pesticide/fertilizer products via Cosh) OR a Seed
+       Company (has RootsTalk seed varieties). Both axes independent;
+       Bayer-shaped clients pass on both. Advisory-only clients get
+       403 `client_not_qr_eligible`.
+
+    3. **Existence**: 404 for missing client.
+
+    `current_user` default `None` is a transitional courtesy —
+    callers should always pass it. Skipping the auth check when None
+    would reintroduce the leak, so `None` triggers a 500 to fail
+    loudly during migration.
 
     Returns the loaded Client so callers can reuse without a second
-    hop. Raises 404 for missing client, 403 for ineligible.
+    hop.
     """
+    from app.modules.clients.models import (
+        ClientUser, ClientUserRole, CMClientAssignment, CMRights,
+    )
+    from app.modules.platform.models import StatusEnum
+
+    if current_user is None:
+        raise HTTPException(
+            status_code=500,
+            detail="QR endpoint invoked without current_user — auth bypass guard",
+        )
+
     client = (await db.execute(
         select(Client).where(Client.id == client_id)
     )).scalar_one_or_none()
     if client is None:
         raise HTTPException(status_code=404, detail="Client not found")
+
+    # Role gate — SA / CA of this client / PM of this client / CM-EDIT.
+    is_sa = bool(settings.sa_email) and current_user.email == settings.sa_email
+    if not is_sa:
+        role_row = (await db.execute(
+            select(ClientUser.role).where(
+                ClientUser.client_id == client_id,
+                ClientUser.user_id == current_user.id,
+                ClientUser.status == StatusEnum.ACTIVE,
+                ClientUser.role.in_([
+                    ClientUserRole.CA, ClientUserRole.PRODUCT_MANAGER,
+                ]),
+            ).limit(1)
+        )).scalar_one_or_none()
+        if role_row is None:
+            cm_edit = (await db.execute(
+                select(CMClientAssignment.id).where(
+                    CMClientAssignment.cm_user_id == current_user.id,
+                    CMClientAssignment.client_id == client_id,
+                    CMClientAssignment.status == StatusEnum.ACTIVE,
+                    CMClientAssignment.rights == CMRights.EDIT,
+                ).limit(1)
+            )).scalar_one_or_none()
+            if cm_edit is None:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "qr_role_required",
+                        "message": (
+                            "QR module is restricted to Customer Admin, "
+                            "Product Manager, or CM (edit). Ask your CA "
+                            "to assign one of these roles at this client."
+                        ),
+                    },
+                )
+
     is_seed = False
     if not client.is_manufacturer:
         is_seed = await _is_seed_client(db, client_id)
@@ -280,7 +347,7 @@ async def list_brand_portfolio(
 ):
     from app.modules.seed_mgmt.models import SeedVariety
 
-    await _assert_client_can_qr(db, client_id)
+    await _assert_client_can_qr(db, client_id, current_user)
     result = await db.execute(
         select(ManufacturerBrandPortfolio).where(
             ManufacturerBrandPortfolio.client_id == client_id,
@@ -361,7 +428,7 @@ async def list_portfolio_candidates(
     from app.services.cosh_options_view import _trade_names_for_manufacturer
     from app.services.cosh_constants import COSH_TRADE_NAMES_CORE
 
-    client = await _assert_client_can_qr(db, client_id)
+    client = await _assert_client_can_qr(db, client_id, current_user)
     if not client.is_manufacturer:
         # Pure seed-only client — no brand candidates by design.
         return {"brands": [], "cosh_manufacturer_linked": False}
@@ -442,7 +509,7 @@ async def list_variety_candidates(
     """
     from app.modules.seed_mgmt.models import SeedVariety
 
-    await _assert_client_can_qr(db, client_id)
+    await _assert_client_can_qr(db, client_id, current_user)
     is_seed = await _is_seed_client(db, client_id)
     if not is_seed:
         return {"crops": [], "varieties": [], "is_seed_client": False}
@@ -514,7 +581,7 @@ async def add_to_portfolio(
     QR portfolio. The two paths share a table with the same product_type
     discriminator + one identifier column each (`brand_cosh_id` XOR
     `variety_id`)."""
-    await _assert_client_can_qr(db, client_id)
+    await _assert_client_can_qr(db, client_id, current_user)
     brand_cosh_id = data.get("brand_cosh_id")
     variety_id = data.get("variety_id")
     if not brand_cosh_id and not variety_id:
@@ -561,7 +628,7 @@ async def remove_from_portfolio(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    await _assert_client_can_qr(db, client_id)
+    await _assert_client_can_qr(db, client_id, current_user)
     entry = (await db.execute(
         select(ManufacturerBrandPortfolio).where(
             ManufacturerBrandPortfolio.id == portfolio_id,
@@ -585,7 +652,7 @@ async def list_qr_codes(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    await _assert_client_can_qr(db, client_id)
+    await _assert_client_can_qr(db, client_id, current_user)
     q = select(ProductQRCode).where(ProductQRCode.client_id == client_id).order_by(ProductQRCode.created_at.desc())
     if product_type:
         q = q.where(ProductQRCode.product_type == product_type)
@@ -641,7 +708,7 @@ async def create_qr_code(
     bl18_qr_dedup service — same helper drives the bulk path so the
     two writers can never disagree on what counts as a duplicate.
     """
-    await _assert_client_can_qr(db, client_id)
+    await _assert_client_can_qr(db, client_id, current_user)
     _validate_dates(request.manufacture_date, request.expiry_date)
 
     try:
@@ -713,7 +780,7 @@ async def bulk_create_qr_codes(
     """
     from app.modules.seed_mgmt.models import SeedVariety
 
-    await _assert_client_can_qr(db, client_id)
+    await _assert_client_can_qr(db, client_id, current_user)
     content = await file.read()
     reader = csv.DictReader(io.StringIO(content.decode("utf-8-sig")))
 
@@ -921,7 +988,7 @@ async def download_qr_code(
       raw             — pure-black modules, no logo, no label (dot-matrix / CIJ).
     `label` toggles the "rootsTALK.in" line under the QR — auto False when style=raw.
     """
-    await _assert_client_can_qr(db, client_id)
+    await _assert_client_can_qr(db, client_id, current_user)
     qr_record = (await db.execute(
         select(ProductQRCode).where(ProductQRCode.id == qr_id, ProductQRCode.client_id == client_id)
     )).scalar_one_or_none()
@@ -1001,7 +1068,7 @@ async def toggle_qr_status(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    await _assert_client_can_qr(db, client_id)
+    await _assert_client_can_qr(db, client_id, current_user)
     qr = (await db.execute(
         select(ProductQRCode).where(ProductQRCode.id == qr_id, ProductQRCode.client_id == client_id)
     )).scalar_one_or_none()
@@ -1180,7 +1247,7 @@ async def list_mismatches(
     match their order" is unified across both product paths."""
     from app.modules.seed_mgmt.models import SeedOrderFull
 
-    await _assert_client_can_qr(db, client_id)
+    await _assert_client_can_qr(db, client_id, current_user)
     result = await db.execute(
         select(QRScan, ProductQRCode)
         .join(ProductQRCode, ProductQRCode.id == QRScan.qr_code_id)
