@@ -2705,13 +2705,30 @@ async def _bulk_resolve_enrichment(
 ) -> dict:
     """Batched Cosh lookups for the enrichment pass. Returns dicts
     keyed by cosh_id for state/district/crop names + a measure map
-    keyed by crop_cosh_id. Every alert row uses these; batching keeps
-    the whole page at a small fixed number of queries."""
+    keyed by crop_cosh_id, plus a `crop_by_sub` map keyed by
+    subscription id → crop_cosh_id (crop lives on Package, not
+    Subscription — bulk-loaded here so the callsites stay clean).
+    Every alert row uses these; batching keeps the whole page at a
+    small fixed number of queries."""
     from app.services.i18n_cosh import resolve_names_by_cosh_id
     from app.services.cosh_crop_view import get_measure_for_biological_name
+    from app.modules.advisory.models import Package
+
+    package_ids = {s.package_id for s in subs if s.package_id}
+    pkg_crop_by_id: dict[str, str] = {}
+    if package_ids:
+        pkg_rows = (await db.execute(
+            select(Package.id, Package.crop_cosh_id)
+            .where(Package.id.in_(package_ids))
+        )).all()
+        pkg_crop_by_id = {pid: cid for pid, cid in pkg_rows if cid}
+    crop_by_sub: dict[str, str | None] = {
+        s.id: pkg_crop_by_id.get(s.package_id) for s in subs
+    }
+
     state_ids = {u.state_cosh_id for u in users if u.state_cosh_id}
     district_ids = {u.district_cosh_id for u in users if u.district_cosh_id}
-    crop_ids = {s.crop_cosh_id for s in subs if s.crop_cosh_id}
+    crop_ids = {c for c in crop_by_sub.values() if c}
     name_by_id = await resolve_names_by_cosh_id(
         db, state_ids | district_ids | crop_ids, lang,
     ) if (state_ids or district_ids or crop_ids) else {}
@@ -2719,7 +2736,11 @@ async def _bulk_resolve_enrichment(
     for cid in crop_ids:
         m = await get_measure_for_biological_name(db, cid)
         measure_by_crop[cid] = m or "AREA_WISE"
-    return {"name_by_id": name_by_id, "measure_by_crop": measure_by_crop}
+    return {
+        "name_by_id": name_by_id,
+        "measure_by_crop": measure_by_crop,
+        "crop_by_sub": crop_by_sub,
+    }
 
 
 def _base_alert_row(sub, user, enrich: dict) -> dict:
@@ -2728,8 +2749,10 @@ def _base_alert_row(sub, user, enrich: dict) -> dict:
     CA UI can render location + crop context without branching."""
     name_by_id = enrich["name_by_id"]
     measure_by_crop = enrich["measure_by_crop"]
+    crop_by_sub = enrich["crop_by_sub"]
+    crop_cosh_id = crop_by_sub.get(sub.id)
     crop_measure = (
-        measure_by_crop.get(sub.crop_cosh_id) if sub.crop_cosh_id else None
+        measure_by_crop.get(crop_cosh_id) if crop_cosh_id else None
     )
     return {
         "subscription_id": sub.id,
@@ -2744,9 +2767,9 @@ def _base_alert_row(sub, user, enrich: dict) -> dict:
         "district_name": (
             name_by_id.get(user.district_cosh_id) if user.district_cosh_id else None
         ),
-        "crop_cosh_id": sub.crop_cosh_id,
+        "crop_cosh_id": crop_cosh_id,
         "crop_name": (
-            name_by_id.get(sub.crop_cosh_id) if sub.crop_cosh_id else None
+            name_by_id.get(crop_cosh_id) if crop_cosh_id else None
         ),
         "crop_measure": crop_measure,
         "farm_area_acres": (
@@ -2908,7 +2931,8 @@ async def get_overdue_inputs(
             if item_row is not None:
                 continue
 
-            crop_measure = enrich["measure_by_crop"].get(sub.crop_cosh_id) if sub.crop_cosh_id else None
+            crop_cosh_id = enrich["crop_by_sub"].get(sub.id)
+            crop_measure = enrich["measure_by_crop"].get(crop_cosh_id) if crop_cosh_id else None
             computed_crop_age = (
                 _compute_crop_age(sub, crop_measure) if crop_measure else None
             )
