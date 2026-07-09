@@ -3,6 +3,28 @@ from celery import Celery
 from celery.schedules import crontab
 from app.config import settings
 
+# 2026-07-09 — Force-register every model module BEFORE the Celery
+# app is created so SQLAlchemy's mapper cache resolves all cross-
+# module relationships up front. Root cause of a silent worker bug
+# on staging: `translate_field(PACKAGE_DESCRIPTION, ...)` reached the
+# Package mapper, which has Timeline → ConditionalQuestion relations
+# that reference StandardResponse. When StandardResponse's module
+# wasn't loaded yet, `_configure_registries` raised
+# `InvalidRequestError: expression 'StandardResponse' failed to
+# locate a name`, the task caught it silently and returned
+# {"error": ...}. Zero rows written; farmer sees English forever.
+# Loading every models module here means the first task the worker
+# picks up doesn't race on lazy imports.
+import app.modules.platform.models  # noqa: F401
+import app.modules.clients.models  # noqa: F401
+import app.modules.advisory.models  # noqa: F401
+import app.modules.subscriptions.models  # noqa: F401
+import app.modules.orders.models  # noqa: F401
+import app.modules.farmpundit.models  # noqa: F401
+import app.modules.seed_mgmt.models  # noqa: F401
+import app.modules.translations.models  # noqa: F401
+import app.modules.qr.models  # noqa: F401
+
 celery_app = Celery(
     "rootstalk",
     broker=settings.celery_broker_url,
