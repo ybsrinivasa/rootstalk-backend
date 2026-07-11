@@ -946,6 +946,8 @@ async def get_available_packages(
 ):
     """Returns all ACTIVE packages for a crop+district+client."""
     from app.modules.advisory.models import PackageLocation, PackageStatus
+    from app.services.translation_reader import resolve_translations_batch
+    from app.modules.translations.models import EntityType
     result = await db.execute(
         select(Package)
         .join(PackageLocation, PackageLocation.package_id == Package.id)
@@ -957,7 +959,26 @@ async def get_available_packages(
         )
     )
     packages = result.scalars().all()
-    return [{"id": p.id, "name": p.name, "description": p.description, "package_type": p.package_type} for p in packages]
+    # 2026-07-11 — Localise Package.description for the subscribe
+    # flow. Same batch resolver as /farmer/advisory/today. Pre-fix
+    # this shipped raw English inside an otherwise-Hindi/Tamil/
+    # Kannada review card. Read-path parity with T-4.
+    lang = current_user.language_code or "en"
+    tr_map = await resolve_translations_batch(
+        db, lang,
+        [(EntityType.PACKAGE_DESCRIPTION, p.id) for p in packages if p.description],
+    )
+    return [
+        {
+            "id": p.id,
+            "name": p.name,
+            "description": (
+                tr_map.get((EntityType.PACKAGE_DESCRIPTION, p.id)) or p.description
+            ),
+            "package_type": p.package_type,
+        }
+        for p in packages
+    ]
 
 
 @router.get("/farmer/packages/guided-step")
@@ -1123,12 +1144,27 @@ async def guided_elimination_step(
         return {"done": False, "error": step.error}
 
     if step.done and step.package is not None:
+        # 2026-07-11 — Localise the resolved package's description
+        # for the subscribe-flow review card. Same one-entry batch
+        # pattern as the other T-4 read paths.
+        from app.services.translation_reader import resolve_translations_batch
+        from app.modules.translations.models import EntityType
+        localised_description = step.package.description
+        if step.package.description:
+            tr_map = await resolve_translations_batch(
+                db, lang,
+                [(EntityType.PACKAGE_DESCRIPTION, step.package.id)],
+            )
+            localised_description = (
+                tr_map.get((EntityType.PACKAGE_DESCRIPTION, step.package.id))
+                or step.package.description
+            )
         return {
             "done": True,
             "package": {
                 "id": step.package.id,
                 "name": step.package.name,
-                "description": step.package.description,
+                "description": localised_description,
             },
             "summary": step.summary,        # plain-language variable names
             "auto_selected": step.auto_selected,
