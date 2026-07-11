@@ -4947,13 +4947,37 @@ async def _today_advisory_for_user(
         # before the 2026-06-18 fix), and existing rows still carry
         # the English snapshot. Resolve each `problem_cosh_id` against
         # the current farmer's locale via `pick_translation`, falling
-        # back to the snapshot so QA rows (which store the farmer's
-        # own question text, not a cosh_id) keep their label.
+        # back to the snapshot so QA rows keep their label.
         cha_problem_loc: dict[str, str] = await resolve_names_by_cosh_id(
             db,
             {c.problem_cosh_id for c in cha_entries if c.problem_cosh_id},
             lang,
         ) if cha_entries else {}
+
+        # 2026-07-11 — QA-source labels ALSO need localising. Pre-fix,
+        # QA rows carried the SR question_text as an English snapshot
+        # in `cha.problem_name` (set at `_trigger_qa_for_query` time).
+        # The QA branch below picked it up unchanged, so the advisory
+        # timeline label rendered as "Q&A — <English question>: <tl>"
+        # on Hindi/Tamil/Kannada farmers. Now that we have the SR
+        # question in `content_translations`, resolve here so the
+        # farmer sees the label in their own language.
+        qa_cha_entries = [c for c in cha_entries if c.recommendation_type == "QA"]
+        qa_sr_ids = {c.recommendation_id for c in qa_cha_entries if c.recommendation_id}
+        cha_qa_question_loc: dict[str, str] = {}
+        if qa_sr_ids:
+            from app.services.translation_reader import resolve_translations_batch
+            from app.modules.translations.models import EntityType
+            qa_tr_map = await resolve_translations_batch(
+                db, lang,
+                [(EntityType.STANDARD_RESPONSE_QUESTION, sr_id) for sr_id in qa_sr_ids],
+            )
+            for sr_id in qa_sr_ids:
+                localised = qa_tr_map.get(
+                    (EntityType.STANDARD_RESPONSE_QUESTION, sr_id)
+                )
+                if localised:
+                    cha_qa_question_loc[sr_id] = localised
 
         # Per-timeline CHA/QA metadata for the response composer.
         # Keyed by the synthetic `cha_tl_id` we build below so it
@@ -5097,7 +5121,13 @@ async def _today_advisory_for_user(
                     content, _locked = await resolve_cha_content(db, sub.id, qa_tl.id, "QA")
                     stubs = render_cha_from_content(content)
                     cha_tl_id = f"cha-qa-{qa_tl.id}"
-                    question_label = cha.problem_name or "Pundit response"
+                    # 2026-07-11 — Prefer the locale-resolved SR question
+                    # over the English snapshot in cha.problem_name.
+                    question_label = (
+                        cha_qa_question_loc.get(cha.recommendation_id)
+                        or cha.problem_name
+                        or "Pundit response"
+                    )
                     tl_windows.append(TLWindow(
                         id=cha_tl_id, name=f"Q&A — {question_label}: {qa_tl.name}",
                         from_date=from_d, to_date=to_d,
