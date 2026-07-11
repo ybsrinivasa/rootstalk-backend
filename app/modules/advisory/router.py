@@ -1363,33 +1363,19 @@ async def update_package(
         # Phase T-2: SE-authored description gets async-translated to
         # the target locales via Claude. Task is a no-op when the
         # description text hasn't drifted (hash check inside).
-        #
-        # 2026-07-11 — Debug telemetry added because a staging test
-        # showed a DRAFT edit that appeared to save cleanly but no
-        # translation row landed. Silent try/except was hiding the
-        # failure mode; log both paths so the next save leaves a
-        # trace we can grep for.
+        # 2026-07-11 — Kept ERROR-level log on the exception branch
+        # (previously silent) so a future regression is grep-able.
         import logging
         _log = logging.getLogger(__name__)
         try:
             from app.tasks.translate_content import translate_field
             from app.modules.translations.models import EntityType
-            r = translate_field.delay(EntityType.PACKAGE_DESCRIPTION, pkg.id, "")
-            _log.warning(
-                "T-2 pkg trigger enqueued: pkg_id=%s task_id=%s status=%s",
-                pkg.id, r.id, pkg.status,
-            )
+            translate_field.delay(EntityType.PACKAGE_DESCRIPTION, pkg.id, "")
         except Exception as _tex:
             _log.exception(
                 "T-2 pkg trigger FAILED: pkg_id=%s status=%s err=%r",
                 pkg.id, pkg.status, _tex,
             )
-    else:
-        import logging
-        logging.getLogger(__name__).warning(
-            "T-2 pkg trigger SKIPPED (description not in payload): pkg_id=%s update_keys=%s",
-            pkg.id, list(update_data.keys()),
-        )
     return pkg
 
 
