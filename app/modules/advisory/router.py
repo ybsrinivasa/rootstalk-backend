@@ -1020,6 +1020,28 @@ def _enqueue_element_translation(element) -> None:
         pass
 
 
+async def _enqueue_element_translations_for_practice(db, practice_id: str) -> None:
+    """Fire translation triggers for every element under a practice.
+    Used by the bulk create / atomic-replace endpoints
+    (create_practice, update_practice + their global variants), where
+    elements are added via a `db.add(Element(...))` loop that
+    bypassed the individual add-element trigger. Best-effort — swallow
+    any exception; the SE save never blocks on the translation queue.
+
+    Root cause of the 2026-07-11 "new element authored via CA portal
+    lands untranslated" bug: only the per-element endpoints wired the
+    trigger; the practice-scoped bulk endpoints (the ones the CA
+    portal actually calls when the SE adds a whole practice) didn't."""
+    try:
+        rows = (await db.execute(
+            select(Element).where(Element.practice_id == practice_id)
+        )).scalars().all()
+        for e in rows:
+            _enqueue_element_translation(e)
+    except Exception:
+        pass
+
+
 def _enqueue_cq_translation(cq_id: str) -> None:
     """Best-effort translation enqueue for a ConditionalQuestion.
     Fires on both client-side create/update and the shared global
@@ -2748,6 +2770,7 @@ async def create_practice(
 
     await db.commit()
     await db.refresh(practice)
+    await _enqueue_element_translations_for_practice(db, practice.id)
     # 2026-06-20 — Save-time defence in depth for the volume-formula
     # validator. Adds an X-RT-Practice-Volume-Warning header when the
     # composed practice has no matching formula row. The CA portal's
@@ -2829,6 +2852,7 @@ async def update_practice(
         db.add(Element(practice_id=practice_id, **data))
     await db.commit()
     await db.refresh(practice)
+    await _enqueue_element_translations_for_practice(db, practice_id)
     # 2026-06-20 — Volume-formula warning header (see create_practice).
     from app.services.volume_formula_validator import (
         attach_volume_formula_warning_header,
@@ -6054,6 +6078,7 @@ async def _create_practice_at_global_timeline(
         db.add(Element(practice_id=practice.id, **data))
     await db.commit()
     await db.refresh(practice)
+    await _enqueue_element_translations_for_practice(db, practice.id)
     return practice
 
 
@@ -6117,6 +6142,7 @@ async def _update_practice_at_global_timeline(
         db.add(Element(practice_id=practice_id, **data))
     await db.commit()
     await db.refresh(practice)
+    await _enqueue_element_translations_for_practice(db, practice_id)
     return practice
 
 
