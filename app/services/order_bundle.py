@@ -356,6 +356,7 @@ async def _build_timeline_windows_for_dedup(
     for p in practices:
         stub_els = [
             PracticeElement(
+                id=el.id,
                 element_type=el.element_type,
                 cosh_ref=el.cosh_ref,
                 value=el.value,

@@ -260,6 +260,7 @@ def render_cca_from_content(
             ),
             elements=[
                 PEl(
+                    id=e.get("id"),
                     element_type=str(e.get("element_type", "")),
                     cosh_ref=e.get("cosh_ref"),
                     value=e.get("value"),
@@ -314,6 +315,7 @@ def render_cha_from_content(content: dict) -> list[PStub]:
             ),
             elements=[
                 PEl(
+                    id=e.get("id"),
                     element_type=str(e.get("element_type", "")),
                     cosh_ref=e.get("cosh_ref"),
                     value=e.get("value"),

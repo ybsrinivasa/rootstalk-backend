@@ -21,6 +21,14 @@ class PracticeElement:
     cosh_ref: Optional[str]
     value: Optional[str]
     unit_cosh_id: Optional[str]
+    # 2026-07-11 — Element id preserved through dedup so the T-4
+    # read-path translation swap (`_element_value_localised`) can
+    # look up `content_translations` by entity_id. Pre-fix, this
+    # was stripped and every element rendered in English regardless
+    # of the farmer's locale, because the swap silently fell through
+    # on `getattr(el, "id", None) is None`. Optional/nullable to keep
+    # the dataclass tolerant of test-authored PracticeElements.
+    id: Optional[str] = None
 
 
 @dataclass
