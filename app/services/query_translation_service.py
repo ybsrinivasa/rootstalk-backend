@@ -142,6 +142,65 @@ def _call_claude(
     return text or None
 
 
+def detect_source_locale(text: Optional[str], fallback: str) -> str:
+    """Detect the actual language of a piece of user-typed text.
+
+    Uses Google Translate v2 `detect` endpoint — one HTTP call, ~100-
+    200ms typical. Called from write-time stamping (submit_query,
+    respond, forward/return/reject) so `_locale` reflects the language
+    of the TEXT the user actually typed rather than the user's UI
+    language (which is what `current_user.language_code` reports).
+
+    Root cause of the "farmer stuck in English" bug (2026-07-12):
+    a Hindi-speaking Primary Expert typed a reply in English but
+    their `User.language_code` was 'hi', so we stamped
+    `text_locale='hi'`. Read-path then tried to translate
+    English→English-via-Hindi and returned nonsense.
+
+    Behaviour:
+    - Empty/short text (< 8 chars) → `fallback` (too short to detect
+      reliably).
+    - Detection succeeds + result is one of our supported locales →
+      detected code.
+    - Detection fails, uncertain, or returns an unsupported locale →
+      `fallback`.
+    - Silent on failure — never blocks the save on a detection round-
+      trip. Fallback preserves the previous behaviour on error.
+
+    Supported locales mirror our translation-target set; anything
+    outside falls back so an odd detection (e.g. a farmer whose
+    keyboard produced Marathi-looking Hindi getting flagged as 'mr')
+    doesn't corrupt the tag.
+    """
+    if not text or not text.strip() or len(text.strip()) < 8:
+        return fallback
+    if not settings.google_translate_api_key:
+        return fallback
+    import httpx
+    try:
+        with httpx.Client(timeout=8.0) as client:
+            resp = client.post(
+                "https://translation.googleapis.com/language/translate/v2/detect",
+                params={"key": settings.google_translate_api_key},
+                json={"q": text[:1000]},  # cap at 1k chars for detection
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            detections = (
+                payload.get("data", {}).get("detections", [[]])[0]
+            )
+            if not detections:
+                return fallback
+            top = detections[0]
+            detected = top.get("language", "").split("-")[0]
+            if detected in _LOCALE_DISPLAY:
+                return detected
+            return fallback
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Query translate: detect failed, using fallback=%s: %s", fallback, e)
+        return fallback
+
+
 def _call_google(
     source_text: str, source_locale: str, target_locale: str,
 ) -> Optional[str]:

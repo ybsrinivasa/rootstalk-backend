@@ -17,6 +17,7 @@ from app.modules.farmpundit.models import (
     StandardResponse, QueryStatus, QueryRemarkAction,
 )
 from app.services.i18n_cosh import pick_translation
+from app.services.query_translation_service import detect_source_locale
 from app.services.translation_reader import resolve_translations_batch
 from app.modules.translations.models import EntityType
 from app.services.bl12_query_routing import route_query, ExpertSlot
@@ -910,10 +911,15 @@ async def submit_query(
         query_type_cosh_id=request.query_type_cosh_id,
         title=title,
         description=request.description,
-        # 2026-07-12 — Stamp source locale from farmer's User.language_code
-        # so the pundit-side read path can decide whether translation is
-        # needed. Trust language_code as source-of-truth; no auto-detect.
-        description_locale=current_user.language_code or "en",
+        # 2026-07-12 — Detect language of the typed text via Google
+        # Translate detect. Fall back to farmer's User.language_code
+        # on empty/short text or detection failure. Trusting
+        # language_code alone was the root cause of the "pundit typed
+        # English while their UI was Hindi" bug we caught same day —
+        # keyboards let users type in any script regardless of UI lang.
+        description_locale=detect_source_locale(
+            request.description, current_user.language_code or "en",
+        ),
         severity=request.severity,
         status=QueryStatus.NEW,
         expires_at=expires_at,
@@ -1240,12 +1246,12 @@ async def respond_to_query(
         pundit_id=profile.id,
         problem_cosh_id=data.get("problem_cosh_id"),
         text=data.get("text"),
-        # 2026-07-12 — Stamp source locale from the pundit's
-        # User.language_code so the farmer-side read path can decide
-        # whether translation is needed. Empty response.text (SR-only
-        # picks) still gets a locale stamp — harmless, resolver
-        # short-circuits on empty text.
-        text_locale=current_user.language_code or "en",
+        # 2026-07-12 — Detect from the actual text (see submit_query
+        # comment). Empty response.text (SR-only picks) short-circuits
+        # detection to the fallback, harmless.
+        text_locale=detect_source_locale(
+            data.get("text"), current_user.language_code or "en",
+        ),
         standard_response_id=data.get("standard_response_id"),
     )
     db.add(response)
@@ -1442,7 +1448,9 @@ async def forward_query(
         action=QueryRemarkAction.FORWARDED,
         forwarded_to_pundit_id=data["to_pundit_id"],
         remark=data["remarks"],
-        remark_locale=current_user.language_code or "en",
+        remark_locale=detect_source_locale(
+            data.get("remarks"), current_user.language_code or "en",
+        ),
     ))
 
     query.status = QueryStatus.FORWARDED
@@ -1487,7 +1495,9 @@ async def return_query(
         pundit_id=profile.id,
         action=QueryRemarkAction.RETURNED,
         remark=data["remarks"],
-        remark_locale=current_user.language_code or "en",
+        remark_locale=detect_source_locale(
+            data.get("remarks"), current_user.language_code or "en",
+        ),
     ))
     query.status = QueryStatus.RETURNED
     query.current_holder_id = original_sender_id
@@ -1523,7 +1533,9 @@ async def reject_query(
     db.add(QueryRemark(
         query_id=query_id, pundit_id=profile.id,
         action=QueryRemarkAction.REJECTED, remark=data["remarks"],
-        remark_locale=current_user.language_code or "en",
+        remark_locale=detect_source_locale(
+            data.get("remarks"), current_user.language_code or "en",
+        ),
     ))
     query.status = QueryStatus.REJECTED
     query.current_holder_id = None
