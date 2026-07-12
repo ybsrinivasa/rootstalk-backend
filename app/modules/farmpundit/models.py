@@ -223,6 +223,10 @@ class Query(Base):
     # rewiring. The farmer no longer types a title.
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=True)
+    # 2026-07-12 — Stamped at write time from `User.language_code`.
+    # Powers the read-side resolver: when the pundit's locale != this,
+    # translate + cache. English source → no translation ever.
+    description_locale: Mapped[str] = mapped_column(String(10), nullable=True)
     severity: Mapped[str] = mapped_column(String(20), nullable=False)
     current_holder_id: Mapped[str] = mapped_column(String(36), ForeignKey("farm_pundit_profiles.id"), nullable=True)
     status: Mapped[QueryStatus] = mapped_column(String(20), default=QueryStatus.NEW)
@@ -269,6 +273,9 @@ class QueryRemark(Base):
     action: Mapped[QueryRemarkAction] = mapped_column(String(20), nullable=False)
     forwarded_to_pundit_id: Mapped[str] = mapped_column(String(36), ForeignKey("farm_pundit_profiles.id"), nullable=True)
     remark: Mapped[str] = mapped_column(Text, nullable=True)
+    # 2026-07-12 — Source locale for the remark author; drives the
+    # farmer/pundit read-side translation swap.
+    remark_locale: Mapped[str] = mapped_column(String(10), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     query: Mapped["Query"] = relationship("Query", back_populates="remarks")
@@ -282,6 +289,9 @@ class QueryResponse(Base):
     pundit_id: Mapped[str] = mapped_column(String(36), ForeignKey("farm_pundit_profiles.id"), nullable=False)
     problem_cosh_id: Mapped[str] = mapped_column(String(200), nullable=True)
     text: Mapped[str] = mapped_column(Text, nullable=True)
+    # 2026-07-12 — Source locale for the pundit's free-text response;
+    # drives the farmer read-side translation swap.
+    text_locale: Mapped[str] = mapped_column(String(10), nullable=True)
     standard_response_id: Mapped[str] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -336,4 +346,54 @@ class StandardResponse(Base):
     timelines: Mapped[list["Timeline"]] = relationship(
         "Timeline", back_populates="standard_response",
         foreign_keys="Timeline.standard_response_id",
+    )
+
+
+# ── 2026-07-12: Farmer↔Pundit free-text translation ─────────────────────────
+# Distinct from `content_translations` (SE-authored content, English source,
+# fan-out to a fixed target-locale set) because query/response text has a
+# variable source locale (whatever the author's User.language_code was at
+# write time) and a variable target locale (whatever the reader's is).
+# English-pivot design locked with user 2026-07-12: every translation is
+# farmer_lang↔English, no Indic-to-Indic pairs stored.
+
+class QueryTranslationEntityType:
+    """String constants for `query_translations.entity_type`. Kept as a
+    class rather than an enum to match the shape used elsewhere in the
+    translations module and to keep the migration-time strings hand-
+    readable."""
+    QUERY_DESCRIPTION = "query.description"
+    QUERY_RESPONSE_TEXT = "query_response.text"
+    QUERY_REMARK_REMARK = "query_remark.remark"
+
+
+class QueryTranslation(Base):
+    """Cached translations of free-text Q&A fields. One row per
+    (entity_type, entity_id, target_locale). Written by
+    `query_translation_service.translate_query_field` on cache miss;
+    read by the pundit/farmer query-detail endpoints and by the sync
+    /queries/{id}/translate toggle.
+
+    Never populated when source_locale == target_locale (short-circuit
+    at the service layer) or when the source field itself is empty."""
+    __tablename__ = "query_translations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    entity_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    entity_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    source_locale: Mapped[str] = mapped_column(String(10), nullable=False)
+    target_locale: Mapped[str] = mapped_column(String(10), nullable=False)
+    translated_text: Mapped[str] = mapped_column(Text, nullable=False)
+    translated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False,
+    )
+    # Provider label for post-hoc quality debugging: `sonnet`, `opus`,
+    # `google`. Not queried on the read path.
+    provider: Mapped[str] = mapped_column(String(20), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "entity_type", "entity_id", "target_locale",
+            name="uq_query_translations_entity_target",
+        ),
     )

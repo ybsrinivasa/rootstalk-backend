@@ -910,6 +910,10 @@ async def submit_query(
         query_type_cosh_id=request.query_type_cosh_id,
         title=title,
         description=request.description,
+        # 2026-07-12 — Stamp source locale from farmer's User.language_code
+        # so the pundit-side read path can decide whether translation is
+        # needed. Trust language_code as source-of-truth; no auto-detect.
+        description_locale=current_user.language_code or "en",
         severity=request.severity,
         status=QueryStatus.NEW,
         expires_at=expires_at,
@@ -1236,6 +1240,12 @@ async def respond_to_query(
         pundit_id=profile.id,
         problem_cosh_id=data.get("problem_cosh_id"),
         text=data.get("text"),
+        # 2026-07-12 — Stamp source locale from the pundit's
+        # User.language_code so the farmer-side read path can decide
+        # whether translation is needed. Empty response.text (SR-only
+        # picks) still gets a locale stamp — harmless, resolver
+        # short-circuits on empty text.
+        text_locale=current_user.language_code or "en",
         standard_response_id=data.get("standard_response_id"),
     )
     db.add(response)
@@ -1432,6 +1442,7 @@ async def forward_query(
         action=QueryRemarkAction.FORWARDED,
         forwarded_to_pundit_id=data["to_pundit_id"],
         remark=data["remarks"],
+        remark_locale=current_user.language_code or "en",
     ))
 
     query.status = QueryStatus.FORWARDED
@@ -1476,6 +1487,7 @@ async def return_query(
         pundit_id=profile.id,
         action=QueryRemarkAction.RETURNED,
         remark=data["remarks"],
+        remark_locale=current_user.language_code or "en",
     ))
     query.status = QueryStatus.RETURNED
     query.current_holder_id = original_sender_id
@@ -1508,8 +1520,11 @@ async def reject_query(
     if not res.allowed:
         _raise_query_transition(res)
 
-    db.add(QueryRemark(query_id=query_id, pundit_id=profile.id,
-                       action=QueryRemarkAction.REJECTED, remark=data["remarks"]))
+    db.add(QueryRemark(
+        query_id=query_id, pundit_id=profile.id,
+        action=QueryRemarkAction.REJECTED, remark=data["remarks"],
+        remark_locale=current_user.language_code or "en",
+    ))
     query.status = QueryStatus.REJECTED
     query.current_holder_id = None
     await db.commit()
@@ -3017,6 +3032,10 @@ async def get_query_detail_pundit(
         # the new UI.
         "crop_age": query.crop_age,
         "computed_crop_age": computed_crop_age,
+        # 2026-07-12 — description_locale is the farmer's language
+        # when they submitted. Pundit view is toggle-driven — original
+        # by default, "View in English" toggle when the locales differ.
+        "description_locale": query.description_locale,
         "farmer": farmer_block,
         "status": query.status,
         "created_at": query.created_at,
@@ -3026,9 +3045,16 @@ async def get_query_detail_pundit(
         "media": [{"media_type": m.media_type, "url": m.url} for m in media_result],
         "remarks": [
             {
+                "id": r.id,
                 "action": r.action, "pundit_id": r.pundit_id,
                 "forwarded_to_pundit_id": r.forwarded_to_pundit_id,
-                "remark": r.remark, "created_at": r.created_at,
+                "remark": r.remark,
+                # 2026-07-12 — Locale of whoever wrote the remark.
+                # Pundit view is toggle-driven (not auto-translated);
+                # PWA shows a "View in English" affordance when this
+                # differs from the reader's locale.
+                "remark_locale": r.remark_locale,
+                "created_at": r.created_at,
             }
             for r in remarks
         ],
@@ -3085,10 +3111,38 @@ async def get_query_detail_farmer(
                 prow.translations, current_user.language_code or "en", ""
             ) or None
 
+    # 2026-07-12 — Auto-translate pundit's response text into the
+    # farmer's locale on read when the pundit wrote in a different
+    # language. English-pivot: any language↔English only. Cache-first,
+    # falls back to source on failure so the farmer sees SOMETHING.
+    localised_response_text = response.text if response else None
+    response_text_translated = False
+    farmer_locale = current_user.language_code or "en"
+    if (
+        response is not None
+        and response.text
+        and response.text.strip()
+        and response.text_locale
+        and response.text_locale != farmer_locale
+    ):
+        from app.services.query_translation_service import (
+            translate_query_field,
+        )
+        localised_response_text = await translate_query_field(
+            db,
+            entity_type="query_response.text",
+            entity_id=response.id,
+            source_text=response.text,
+            source_locale=response.text_locale,
+            target_locale=farmer_locale,
+        )
+        response_text_translated = localised_response_text != response.text
+
     return {
         "id": query.id,
         "title": query.title,
         "description": query.description,
+        "description_locale": query.description_locale,
         "severity": query.severity,
         "crop_cosh_id": query.crop_cosh_id,
         "crop_age": query.crop_age,
@@ -3097,13 +3151,149 @@ async def get_query_detail_farmer(
         "expires_at": query.expires_at,
         "media": [{"media_type": m.media_type, "url": m.url} for m in media_result],
         "response": {
-            "text": response.text,
+            # 2026-07-12 — `text` is already localised to the farmer's
+            # locale when a translation was needed and available.
+            # `text_original` + `text_source_locale` are exposed so the
+            # PWA can render a "view original" toggle back to whatever
+            # the pundit typed.
+            "text": localised_response_text,
+            "text_original": response.text,
+            "text_source_locale": response.text_locale,
+            "text_translated": response_text_translated,
             "problem_cosh_id": response.problem_cosh_id,
             "problem_name": problem_name,
             "media": response_media,
             "created_at": response.created_at,
             "has_cha_recommendation": bool(response.problem_cosh_id),
         } if response else None,
+    }
+
+
+# ── Q&A translation toggle (2026-07-12) ──────────────────────────────────────
+#
+# Single sync endpoint used by the PWA when the reader taps a "View in
+# English" or "View in original" toggle. Everything happens on the read
+# — cache-first, Sonnet → Opus → Google chain on miss. Same endpoint
+# serves both pundit-side query.description / remark toggles and
+# farmer-side response.text toggles; caller specifies field + target.
+
+class QueryTranslateRequest(BaseModel):
+    field: str  # "description" | "response_text" | "remark:<remark_id>"
+    target_locale: str
+
+
+@router.post("/queries/{query_id}/translate")
+async def translate_query_message(
+    query_id: str,
+    request: QueryTranslateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Toggle-driven sync translation of one Q&A message field.
+
+    Authorisation:
+    - `description` + `remark:*` — reader must be a pundit currently
+      or previously holding this query, or the farmer who owns it
+      (viewing their own submitted description in a different locale
+      is unusual but allowed).
+    - `response_text` — reader must be the farmer who owns the query,
+      OR the responding pundit, OR any pundit in the chain.
+
+    Returns `{ translated_text, source_locale, target_locale, cached }`.
+    Never raises on translation failure — falls back to source text
+    with `translated_text == source_text`.
+    """
+    from app.services.query_translation_service import translate_query_field
+    from app.modules.farmpundit.models import QueryTranslationEntityType
+
+    query = (await db.execute(
+        select(Query).where(Query.id == query_id)
+    )).scalar_one_or_none()
+    if not query:
+        raise HTTPException(status_code=404, detail="Query not found")
+
+    # Authz — permissive on read: farmer owner OR any pundit who ever
+    # touched the query. Same shape as the existing detail endpoints.
+    is_farmer_owner = query.farmer_user_id == current_user.id
+    is_pundit_involved = False
+    if not is_farmer_owner:
+        pundit_profile = (await db.execute(
+            select(FarmPunditProfile).where(
+                FarmPunditProfile.user_id == current_user.id,
+            )
+        )).scalar_one_or_none()
+        if pundit_profile:
+            # Any remark by / to this pundit → they were involved.
+            touch = (await db.execute(
+                select(QueryRemark.id).where(
+                    QueryRemark.query_id == query_id,
+                    (
+                        (QueryRemark.pundit_id == pundit_profile.id)
+                        | (QueryRemark.forwarded_to_pundit_id == pundit_profile.id)
+                    ),
+                ).limit(1)
+            )).scalar_one_or_none()
+            is_pundit_involved = touch is not None or query.current_holder_id == pundit_profile.id
+    if not (is_farmer_owner or is_pundit_involved):
+        raise HTTPException(status_code=403, detail="Not authorised for this query")
+
+    # Resolve source_text + source_locale + entity_type from `field`.
+    entity_type: str
+    entity_id: str
+    source_text: str
+    source_locale: str
+    if request.field == "description":
+        entity_type = QueryTranslationEntityType.QUERY_DESCRIPTION
+        entity_id = query.id
+        source_text = query.description or ""
+        source_locale = query.description_locale or "en"
+    elif request.field == "response_text":
+        response = (await db.execute(
+            select(QueryResponse).where(QueryResponse.query_id == query_id)
+        )).scalar_one_or_none()
+        if not response or not response.text:
+            raise HTTPException(status_code=404, detail="No response text to translate")
+        entity_type = QueryTranslationEntityType.QUERY_RESPONSE_TEXT
+        entity_id = response.id
+        source_text = response.text
+        source_locale = response.text_locale or "en"
+    elif request.field.startswith("remark:"):
+        remark_id = request.field.split(":", 1)[1]
+        remark = (await db.execute(
+            select(QueryRemark).where(
+                QueryRemark.id == remark_id,
+                QueryRemark.query_id == query_id,
+            )
+        )).scalar_one_or_none()
+        if not remark or not remark.remark:
+            raise HTTPException(status_code=404, detail="No remark text to translate")
+        entity_type = QueryTranslationEntityType.QUERY_REMARK_REMARK
+        entity_id = remark.id
+        source_text = remark.remark
+        source_locale = remark.remark_locale or "en"
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown field: {request.field!r}",
+        )
+
+    translated = await translate_query_field(
+        db,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        source_text=source_text,
+        source_locale=source_locale,
+        target_locale=request.target_locale,
+    )
+    return {
+        "translated_text": translated,
+        "source_locale": source_locale,
+        "target_locale": request.target_locale,
+        # True whenever the cache already had the row; a caller who wants
+        # to distinguish "used cache" from "fresh Claude call" can look
+        # at this. Set to `False` if source == target (short-circuit)
+        # or if translation failed and we returned the source.
+        "translated": translated != source_text,
     }
 
 
