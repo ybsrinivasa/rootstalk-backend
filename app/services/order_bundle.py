@@ -10,8 +10,17 @@ The user-facing model (locked 2026-05-21):
   - One practice can be in AT MOST ONE order over the
     subscription's lifetime. The bundle excludes any practice
     already ordered (in any non-CANCELLED order).
-  - NPK-dosage L2s are calculation-only — no trade names exist
-    so dealers can't fulfil them. Excluded from bundles.
+
+Historical note (2026-07-13): NPK-dosage L2s used to be excluded
+here — the design in early 2026 treated them as calculation-only
+because they didn't have direct trade names. The NPK Handling
+design (Apr 2026, RootsTalk_NPK_Handling.pdf) added the Mixed +
+Straight fertiliser selection flow (see orders/router.py
+/npk-options + /npk-select) which lets the dealer fulfil an NPK
+dosage practice by picking one Mixed common name + zero-to-three
+Straights and their trade names. NPK dosage L2s therefore
+re-enter the bundle so the OrderItem exists for the dealer flow
+to operate on.
 """
 from __future__ import annotations
 
@@ -30,13 +39,16 @@ from app.modules.subscriptions.models import Subscription
 PESTICIDE_L1S = {"PESTICIDE", "SPECIAL_INPUT"}
 FERTILIZER_L1S = {"FERTILIZER"}
 
-# L2s under L1=FERTILIZER that are calculation aids only (no trade
-# names → no dealer products). Excluded from bundles per
-# cosh_options_view.L2_TYPES_WITHOUT_TRADE_NAMES.
-FERTILIZER_L2_BUNDLE_EXCLUDE = {
-    "CHEMICAL_FERTILIZERS_NPK_DOSAGES",
-    "FERTIGATION_NPK_DOSAGES",
-}
+# L2s under L1=FERTILIZER that must NOT enter the order bundle.
+# Kept as an extension point; NPK dosage L2s used to live here
+# but the NPK Handling design (see module docstring) added dealer
+# fulfilment via /npk-select, so they now belong on Fertilizer
+# orders alongside Chemical Fertilizer Products / Manures etc.
+# cosh_options_view.L2_TYPES_WITHOUT_TRADE_NAMES stays as-is
+# because NPK dosages still don't use the direct trade-name
+# picker — that check is about the SE-authoring flow, not order
+# bundling.
+FERTILIZER_L2_BUNDLE_EXCLUDE: set[str] = set()
 
 CATEGORY_PESTICIDE = "PESTICIDE"
 CATEGORY_FERTILIZER = "FERTILIZER"

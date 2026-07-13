@@ -342,9 +342,11 @@ async def order_preview(
     farmer adjusts the TO date, this endpoint returns the count
     and list of practices that would go into the order.
 
-    Bundling rule (locked 2026-05-21):
+    Bundling rule (locked 2026-05-21, NPK re-included 2026-07-13):
       - category PESTICIDE → L1 in {PESTICIDE, SPECIAL_INPUT}
-      - category FERTILIZER → L1 in {FERTILIZER}, minus NPK-dosage L2s
+      - category FERTILIZER → L1 in {FERTILIZER} (NPK dosages
+        included — the /npk-options + /npk-select dealer flow
+        handles their fulfilment)
       - practice's timeline window must overlap [today, to_date]
         by at least one day (inclusive)
       - practice must NOT already be in any non-CANCELLED order

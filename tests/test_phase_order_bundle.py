@@ -89,7 +89,19 @@ async def test_pesticide_bundle_includes_overlapping_pesticides_and_adjuvants(db
 
 @requires_docker
 @pytest.mark.asyncio
-async def test_fertilizer_bundle_excludes_npk_dosages(db):
+async def test_fertilizer_bundle_includes_npk_dosages(db):
+    """NPK dosage L2s (Chemical + Fertigation) must land on a
+    FERTILIZER order alongside standard fertiliser practices.
+    Fulfilment then flows through the /npk-options + /npk-select
+    dealer endpoints (Mixed + Straight picker) rather than the
+    direct trade-name picker used by non-NPK L2s.
+
+    Historical note (2026-07-13): this test previously asserted
+    NPK dosages were EXCLUDED — that was during the interim where
+    dealer fulfilment for NPK didn't exist yet. NPK Handling
+    (Apr 2026) shipped the ranking + selection flow; the
+    inclusion is now correct.
+    """
     user = await make_user(db, name="Farmer Bundle F")
     client = await make_client(db)
     pkg = await make_package(db, client)
@@ -103,8 +115,10 @@ async def test_fertilizer_bundle_excludes_npk_dosages(db):
     )
     chem_fert = await make_practice(db, tl, l0=PracticeL0.INPUT,
         l1="FERTILIZER", l2="CHEMICAL_FERTILIZER_PRODUCTS")
-    npk = await make_practice(db, tl, l0=PracticeL0.INPUT,
+    npk_chem = await make_practice(db, tl, l0=PracticeL0.INPUT,
         l1="FERTILIZER", l2="CHEMICAL_FERTILIZERS_NPK_DOSAGES")
+    npk_fert = await make_practice(db, tl, l0=PracticeL0.INPUT,
+        l1="FERTILIZER", l2="FERTIGATION_NPK_DOSAGES")
     await db.commit()
 
     bundle = await compute_bundle(
@@ -113,7 +127,14 @@ async def test_fertilizer_bundle_excludes_npk_dosages(db):
     )
     ids = {p["id"] for p in bundle["practices"]}
     assert chem_fert.id in ids
-    assert npk.id not in ids, "NPK dosage L2 must be excluded (no trade names → no dealer products)"
+    assert npk_chem.id in ids, (
+        "Chemical NPK dosage must land on the FERTILIZER order — "
+        "dealer fulfils via /npk-options + /npk-select."
+    )
+    assert npk_fert.id in ids, (
+        "Fertigation NPK dosage must land on the FERTILIZER order — "
+        "dealer fulfils via /npk-options + /npk-select."
+    )
 
 
 @requires_docker
