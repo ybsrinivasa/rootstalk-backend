@@ -3563,22 +3563,71 @@ async def reset_item(
     res = validate_item_transition(item.status, OrderItemStatus.PENDING.value, DEALER)
     if not res.allowed:
         _raise_transition(res)
+
+    # 2026-07-13 — NPK AND-sibling detection. When the dealer picked an
+    # NPK Mixed + Straight combo via /npk-select, the resulting
+    # OrderItems all share `practice_id` + `relation_id` + `relation_type='AND'`.
+    # "Change selection" on any one of them must reset the WHOLE group:
+    # archive the other siblings and clear the AND relation off THIS
+    # item so the practice re-enters the pipeline as a single PENDING
+    # NPK item the dealer can re-pick from scratch. Without this the
+    # farmer would see the reset Mixed + the leftover AVAILABLE
+    # Straight siblings as separate items — the duplication reported
+    # 2026-07-13.
+    #
+    # Non-NPK AND (Practice-authored) uses Practice.relation_id (FK to
+    # `relations`), NOT OrderItem-level fields alone, so the discriminator
+    # is: `relation_type == 'AND'` AND at least one OTHER non-archived
+    # item on the same order shares practice_id. Only NPK auto-AND
+    # matches that shape.
+    npk_siblings: list[OrderItem] = []
+    if (item.relation_type or "").upper() == "AND" and item.relation_id:
+        npk_siblings = (await db.execute(
+            select(OrderItem).where(
+                OrderItem.order_id == order_id,
+                OrderItem.practice_id == item.practice_id,
+                OrderItem.id != item.id,
+                OrderItem.archived_at.is_(None),
+                OrderItem.relation_id == item.relation_id,
+            )
+        )).scalars().all()
+
+    from datetime import datetime as _dt_reset, timezone as _tz_reset
+    now_utc = _dt_reset.now(_tz_reset.utc)
+    for sib in npk_siblings:
+        sib.archived_at = now_utc
+
     item.brand_cosh_id = None
     item.brand_name = None
     item.given_volume = None
     item.volume_unit = None
     item.price = None
     item.status = OrderItemStatus.PENDING
+    # When this was an NPK anchor, drop the AND stamp so the item
+    # reads as a fresh standalone PENDING and the dealer's next tap
+    # opens the NPK form clean.
+    if npk_siblings:
+        item.relation_id = None
+        item.relation_type = None
+        item.relation_role = None
+
     await _record_event(
         db, lineage_id=item.lineage_id,
         event_type="RESET_TO_PENDING",
         actor_user_id=current_user.id, actor_role="DEALER",
         order_id=order_id, order_item_id=item.id,
         prev_status=prev_status, new_status=OrderItemStatus.PENDING.value,
+        metadata={
+            "npk_siblings_archived": [s.id for s in npk_siblings],
+        } if npk_siblings else None,
     )
     await _update_order_status(db, order_id)
     await db.commit()
-    return {"item_id": item_id, "status": item.status}
+    return {
+        "item_id": item_id,
+        "status": item.status,
+        "npk_siblings_archived": [s.id for s in npk_siblings],
+    }
 
 
 @router.put("/dealer/orders/{order_id}/submit-for-approval")
