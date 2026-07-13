@@ -5235,7 +5235,9 @@ async def get_dealer_order(
         # NPK practices on this order is summed into one consolidated
         # line so the dealer enters Given Volume once. Per-timeline
         # quantities still go to the farmer untouched.
-        "consolidated_brands": _consolidate_brands_across_items(items),
+        # 2026-07-13 — Narrowed to NPK practices per literal §4.2
+        # scope (was: all brand-sharing items across any practice).
+        "consolidated_brands": _consolidate_brands_across_items(items, practice_map),
         # 2026-06-21 — Packing-state for the post-share status banner.
         "packing_code": pl_row.packing_code if pl_row else None,
         "packing_list_shared_at": (
@@ -5252,7 +5254,10 @@ async def get_dealer_order(
     }
 
 
-def _consolidate_brands_across_items(items: list[OrderItem]) -> list[dict]:
+def _consolidate_brands_across_items(
+    items: list[OrderItem],
+    practice_map: dict[str, Practice],
+) -> list[dict]:
     """Spec §4.2 — brand consolidation. NPK practices can produce many
     OrderItems for the same trade name across timelines (e.g. Urea in
     basal + top dressing). The dealer cares about the total to procure;
@@ -5260,23 +5265,40 @@ def _consolidate_brands_across_items(items: list[OrderItem]) -> list[dict]:
     `brand_cosh_id` across active items and surface a small list the
     PWA can render as a Volume/Price summary card.
 
-    Only counts items with a brand committed and a volume set; status
-    is restricted to dealer-actionable states so already-skipped or
-    farmer-rejected items don't pollute the total.
+    Only counts:
+    - Items with a brand committed and a volume set.
+    - Items in dealer-actionable states (already-skipped or
+      farmer-rejected items would inflate the total wrongly).
+    - Items whose practice.l2_type is an NPK dosage type. Spec §4.2
+      is explicit that consolidation is for NPK screens; non-NPK
+      cross-timeline totals (e.g. same pesticide brand on two spray
+      timelines) can arrive as a separate feature if needed.
+
+    Groups by (brand_cosh_id, volume_unit) so a rare unit mismatch
+    (kg vs g) never silently sums. In practice NPK is always kg
+    (npk_select pins `volume_unit = 'kg'`) so this is belt-and-braces.
     """
+    npk_l2_types = {
+        "CHEMICAL_FERTILIZERS_NPK_DOSAGES",
+        "FERTIGATION_NPK_DOSAGES",
+    }
     actionable = {
         OrderItemStatus.AVAILABLE,
         OrderItemStatus.PENDING,
         OrderItemStatus.SENT_FOR_APPROVAL,
         OrderItemStatus.APPROVED,
     }
-    totals: dict[str, dict] = {}
+    totals: dict[tuple[str, str | None], dict] = {}
     for it in items:
         if it.brand_cosh_id is None or it.given_volume is None:
             continue
         if it.status not in actionable:
             continue
-        bucket = totals.setdefault(it.brand_cosh_id, {
+        practice = practice_map.get(it.practice_id) if it.practice_id else None
+        if practice is None or practice.l2_type not in npk_l2_types:
+            continue
+        key = (it.brand_cosh_id, it.volume_unit)
+        bucket = totals.setdefault(key, {
             "brand_cosh_id": it.brand_cosh_id,
             "brand_name": it.brand_name,
             "volume_unit": it.volume_unit,
