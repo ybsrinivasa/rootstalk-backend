@@ -221,3 +221,101 @@ async def test_rerouted_item_is_hidden_from_fulfilment(db):
     # un-ordered on the advisory walk (the farmer's DRAFT carries
     # the live story now).
     assert p["fulfilment"] is None
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_npk_and_siblings_surface_on_fulfilment(db):
+    """Spec §3.2 — an NPK Chemical/Fertigation practice with a Mixed +
+    Straight pair rendered as an AND group. Both OrderItems share
+    the same `practice_id`, `relation_id`, and `relation_type='AND'`
+    (stamped by /npk-select). Advisory read must surface the
+    non-primary AND siblings on `fulfilment.siblings[]` so the
+    farmer sees "Iffco NPK 10:26:26 + GSFC Urea — Apply together"
+    instead of just the primary picked by ORDER BY updated_at.
+    """
+    user, sub, tl, practice = await _sub_with_practice(db)
+    dealer = await make_onboarded_dealer(db, name="D-NPK")
+    await db.commit()
+    order = Order(
+        subscription_id=sub.id, farmer_user_id=user.id, client_id=sub.client_id,
+        category="FERTILIZER",
+        date_from=datetime.now(timezone.utc),
+        date_to=datetime.now(timezone.utc) + timedelta(days=10),
+        status=OrderStatus.COMPLETED,
+        dealer_user_id=dealer.id,
+    )
+    db.add(order)
+    await db.flush()
+    rel_id = "rel-npk-test-1"
+    db.add(OrderItem(
+        order_id=order.id, practice_id=practice.id, timeline_id=tl.id,
+        status=OrderItemStatus.APPROVED,
+        brand_name="Iffco NPK 10:26:26", brand_cosh_id="tn-mixed-1",
+        given_volume=385, volume_unit="kg", price=15400,
+        relation_id=rel_id, relation_type="AND",
+        relation_role="PART_1__OPT_1__POS_1",
+    ))
+    db.add(OrderItem(
+        order_id=order.id, practice_id=practice.id, timeline_id=tl.id,
+        status=OrderItemStatus.APPROVED,
+        brand_name="GSFC Urea", brand_cosh_id="tn-straight-1",
+        given_volume=109, volume_unit="kg", price=1200,
+        relation_id=rel_id, relation_type="AND",
+        relation_role="PART_1__OPT_1__POS_2",
+    ))
+    await db.commit()
+
+    out = await get_today_advisory(db=db, current_user=user)
+    p = _find_practice_in(out, practice.id)
+    f = p["fulfilment"]
+    assert f is not None and f["status"] == "APPROVED"
+    # Primary is one of the two brands; the other lands in siblings[].
+    primary_brand = f["brand_name"]
+    assert primary_brand in ("Iffco NPK 10:26:26", "GSFC Urea")
+    sibs = f.get("siblings") or []
+    assert len(sibs) == 1
+    sib = sibs[0]
+    assert sib["brand_name"] in ("Iffco NPK 10:26:26", "GSFC Urea")
+    assert sib["brand_name"] != primary_brand
+    assert sib["given_volume"] in (385.0, 109.0)
+    assert sib["volume_unit"] == "kg"
+    assert sib["relation_role"] in (
+        "PART_1__OPT_1__POS_1", "PART_1__OPT_1__POS_2",
+    )
+
+
+@requires_docker
+@pytest.mark.asyncio
+async def test_non_npk_practice_gets_no_siblings_field(db):
+    """Legacy non-NPK practices (or NPK practices with only a single
+    pick — Mixed alone or Straight alone) must not sprout a `siblings`
+    key on the fulfilment payload. Regression guard: the new sibling
+    attach block should be a no-op when there's no AND stamp.
+    """
+    user, sub, tl, practice = await _sub_with_practice(db)
+    dealer = await make_onboarded_dealer(db, name="D-Solo")
+    await db.commit()
+    order = Order(
+        subscription_id=sub.id, farmer_user_id=user.id, client_id=sub.client_id,
+        category="PESTICIDE",
+        date_from=datetime.now(timezone.utc),
+        date_to=datetime.now(timezone.utc) + timedelta(days=10),
+        status=OrderStatus.COMPLETED,
+        dealer_user_id=dealer.id,
+    )
+    db.add(order)
+    await db.flush()
+    db.add(OrderItem(
+        order_id=order.id, practice_id=practice.id, timeline_id=tl.id,
+        status=OrderItemStatus.APPROVED,
+        brand_name="SoloBrand", brand_cosh_id="tn-solo",
+        given_volume=1.0, volume_unit="l", price=99,
+    ))
+    await db.commit()
+
+    out = await get_today_advisory(db=db, current_user=user)
+    p = _find_practice_in(out, practice.id)
+    f = p["fulfilment"]
+    assert f["status"] == "APPROVED"
+    assert "siblings" not in f or not f["siblings"]

@@ -5243,6 +5243,39 @@ async def _today_advisory_for_user(
                     brand_loc[tn_id] = pick_translation(
                         tn_tr or {}, lang, tn_en,
                     )
+        # 2026-07-13 — NPK auto-AND sibling index. Chemical NPK /
+        # Fertigation NPK practices produce N OrderItems (Mixed +
+        # Straights) that share `practice_id` + `relation_id` +
+        # `relation_type='AND'`, stamped at `npk_select` time
+        # (spec §3.2 — "AND Relation by Default"). The primary
+        # fulfilment loop below picks one of them as the practice's
+        # fulfilment, so we build this index first and attach the
+        # remaining APPROVED siblings to the primary's payload as
+        # `siblings[]`. The PWA renders all of them in the
+        # PurchasedSummary "Apply together" block.
+        # Only APPROVED siblings are exposed; brand identity is gated
+        # on APPROVED across the whole surface for dealer-mediation
+        # reasons.
+        siblings_by_relation: dict[str, list[dict]] = {}
+        for it_s, _, _ in active_items_rows:
+            rid_s = getattr(it_s, "relation_id", None)
+            rtype_s = getattr(it_s, "relation_type", None)
+            if not rid_s or (rtype_s or "").upper() != "AND":
+                continue
+            stat_s = it_s.status.value if hasattr(it_s.status, "value") else it_s.status
+            if stat_s != "APPROVED" or not it_s.brand_cosh_id:
+                continue
+            siblings_by_relation.setdefault(rid_s, []).append({
+                "order_item_id": it_s.id,
+                "relation_role": it_s.relation_role,
+                "brand_name": (
+                    brand_loc.get(it_s.brand_cosh_id) or it_s.brand_name
+                ),
+                "manufacturer_name": manufacturer_by_brand.get(it_s.brand_cosh_id),
+                "given_volume": float(it_s.given_volume) if it_s.given_volume else None,
+                "volume_unit": it_s.volume_unit,
+            })
+
         # Take the first (most recent) row per practice_id.
         fulfilment_by_practice: dict[str, dict] = {}
         for it, ord_row, pl in active_items_rows:
@@ -5299,6 +5332,17 @@ async def _today_advisory_for_user(
                     else None
                 ),
             }
+
+            # NPK auto-AND sibling attach (spec §3.2).
+            rid = getattr(it, "relation_id", None)
+            rtype = getattr(it, "relation_type", None)
+            if show_money and rid and (rtype or "").upper() == "AND":
+                siblings_payload = [
+                    s for s in siblings_by_relation.get(rid, [])
+                    if s["order_item_id"] != it.id
+                ]
+                if siblings_payload:
+                    fulfilment_by_practice[it.practice_id]["siblings"] = siblings_payload
 
         active_tl_ids = {tl.id for tl, _, _ in active_timelines}
         # Combine active CCA + active CHA raw IDs so neither flavour gets
