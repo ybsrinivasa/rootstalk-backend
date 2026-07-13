@@ -4,14 +4,19 @@ Given a volume_formula record and input variables, evaluates the formula
 expression and returns (estimated_volume, brand_unit).
 
 Variables present in formula expressions:
-  Dosage        — dosage rate (e.g. mL/L or g/L from the PoP element)
-  Total_area    — farm area in acres (from subscription.farm_area_acres)
-  Concentration — product concentration, if applicable
-  Volume_water  — water volume per pump/acre, application-method specific
-  Count         — plant count or row count, for per-plant formulas
-  Applications  — number of times the practice will be applied across the timeline.
-                  Defaults to 1 for one-time practices (backwards compatible).
-                  For frequency-based practices: ceil(timeline_duration_days / frequency_days).
+  Dosage             — dosage rate (e.g. mL/L or g/L from the PoP element)
+  Total_area         — farm area in acres (from subscription.farm_area_acres)
+  Concentration      — product concentration, if applicable
+  Volume_water       — water volume per pump/acre, application-method specific
+  Count              — plant count for per-plant formulas (legacy name; new
+                       reference-doc-aligned formulas use Total_No_of_plants).
+  Total_No_of_plants — reference-doc name for plant count. Aliased to the
+                       same value as Count so both work.
+  Vol_per_plant      — per-plant volume element (VOLUME_PER_PLANT on the
+                       Practice), used by plant-wise formulas.
+  Applications       — number of times the practice will be applied across the timeline.
+                       Defaults to 1 for one-time practices (backwards compatible).
+                       For frequency-based practices: ceil(timeline_duration_days / frequency_days).
 
 The evaluator is sandboxed (no builtins) to prevent injection.
 
@@ -62,6 +67,7 @@ def calculate_volume(
     timeline_duration_days: Optional[int] = None,
     applications: Optional[int] = None,
     plant_count: Optional[int] = None,
+    vol_per_plant: Optional[float] = None,
 ) -> Optional[tuple[float, str]]:
     """
     Returns (estimated_volume, brand_unit) or None if inputs are insufficient.
@@ -93,12 +99,24 @@ def calculate_volume(
     Count are unaffected — `farm_area_acres` remains the only required
     input.
     """
-    formula_uses_count = bool(formula) and "Count" in formula
+    # 2026-07-13 — Plant-wise formula variable set widened. The seeded
+    # formulas (from RootsTalk_VolCalc_Reference.pdf, April 2026) use
+    # `Total_No_of_plants` and `Vol_per_plant`. The legacy evaluator
+    # only defined `Count`, so 139 PLANT_WISE formulas were silently
+    # returning None ("Could not calculate estimate") on every dealer
+    # tap. Fix: treat any of `Count`, `Total_No_of_plants`, or
+    # `Vol_per_plant` as a plant-wise marker; require `plant_count`
+    # when the formula needs a plant-count binding.
+    formula_uses_plant_scoped_vars = bool(formula) and any(
+        var in formula for var in ("Count", "Total_No_of_plants", "Vol_per_plant")
+    )
 
-    if formula_uses_count:
-        # Plant-wise formula. `Count` is the binding for affected-plants
-        # count from the TriggeredCHAEntry. Missing → no estimate.
+    if formula_uses_plant_scoped_vars:
+        # Plant-wise formula. `plant_count` binds Count + Total_No_of_plants;
+        # `vol_per_plant` binds Vol_per_plant.
         if plant_count is None or plant_count < 1:
+            return None
+        if "Vol_per_plant" in formula and (vol_per_plant is None or vol_per_plant <= 0):
             return None
     else:
         # Area-wise (legacy) formula. `Total_area` is required.
@@ -113,13 +131,20 @@ def calculate_volume(
     else:
         resolved_applications = 1
 
+    _plant_count_val = float(plant_count) if plant_count is not None else 0.0
     variables: dict[str, float] = {
         "Total_area": float(farm_area_acres) if farm_area_acres is not None else 0.0,
         "Dosage": float(dosage) if dosage else 0.0,
         "Concentration": float(concentration) if concentration else 1.0,
         "Volume_water": float(volume_water_per_acre) if volume_water_per_acre else 200.0,
         "Applications": float(resolved_applications),
-        "Count": float(plant_count) if plant_count is not None else 0.0,
+        "Count": _plant_count_val,
+        # 2026-07-13 — Reference-doc variable names used by every
+        # seeded PLANT_WISE formula. Total_No_of_plants aliases Count;
+        # Vol_per_plant is a distinct dose-per-plant value the endpoint
+        # resolves from the VOLUME_PER_PLANT Practice element.
+        "Total_No_of_plants": _plant_count_val,
+        "Vol_per_plant": float(vol_per_plant) if vol_per_plant is not None else 0.0,
     }
     try:
         volume = evaluate_formula(formula, variables)

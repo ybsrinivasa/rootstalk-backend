@@ -7521,6 +7521,21 @@ async def get_volume_estimate(
     else:
         timeline_duration_days = timeline.to_value - timeline.from_value + 1
 
+    # 2026-07-13 — Vol_per_plant reads from the VOLUME_PER_PLANT element
+    # on the practice. Present on every plant-wise input L2 that ships a
+    # per-plant dose. When absent, the seeded plant-wise formulas that
+    # reference Vol_per_plant will short-circuit to None inside
+    # calculate_volume — the endpoint then returns "Could not calculate
+    # estimate" (rare; VOLUME_PER_PLANT is mandatory in the L2 spec for
+    # the practices whose formulas use it).
+    vol_per_plant_el = elements_by_type.get("volume_per_plant")
+    vol_per_plant: Optional[float] = None
+    if vol_per_plant_el and vol_per_plant_el.value:
+        try:
+            vol_per_plant = float(vol_per_plant_el.value)
+        except (TypeError, ValueError):
+            pass
+
     result = calculate_volume(
         formula=formula_row.formula,
         brand_unit=formula_row.brand_unit,
@@ -7530,13 +7545,18 @@ async def get_volume_estimate(
         timeline_duration_days=timeline_duration_days,
         applications=applications,
         plant_count=plant_count,
+        vol_per_plant=vol_per_plant,
     )
     if result is None:
         # Targeted message for the common plant-wise-CHA-without-count
         # case (QA path where the farmer left the optional field blank).
-        # The dealer UI shows a "Please check with the farmer" hint
-        # alongside the blank volume field.
-        if measure == "PLANT_WISE" and "Count" in (formula_row.formula or "") and plant_count is None:
+        # 2026-07-13 — Cover both legacy `Count` and the reference-doc
+        # `Total_No_of_plants` variable names.
+        needs_plant_count = any(
+            var in (formula_row.formula or "")
+            for var in ("Count", "Total_No_of_plants")
+        )
+        if measure == "PLANT_WISE" and needs_plant_count and plant_count is None:
             return {
                 "estimated_volume": None, "volume_unit": None,
                 "message": (
