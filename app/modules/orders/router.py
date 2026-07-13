@@ -7523,18 +7523,46 @@ async def get_volume_estimate(
 
     # 2026-07-13 — Vol_per_plant reads from the VOLUME_PER_PLANT element
     # on the practice. Present on every plant-wise input L2 that ships a
-    # per-plant dose. When absent, the seeded plant-wise formulas that
-    # reference Vol_per_plant will short-circuit to None inside
-    # calculate_volume — the endpoint then returns "Could not calculate
-    # estimate" (rare; VOLUME_PER_PLANT is mandatory in the L2 spec for
-    # the practices whose formulas use it).
+    # per-plant dose.
+    #
+    # Unit normalisation (2026-07-13 evening): the seeded plant-wise
+    # formulas were written assuming Vol_per_plant is in LITRES
+    # (mirroring the AREA_WISE convention where `Volume_water=150`
+    # is spray-solution litres per acre). But SEs enter physically-
+    # realistic values in millilitres — a coconut palm gets ~1.5 mL
+    # of spray solution per plant, not 1.5 L. Without normalisation
+    # the estimate comes out 1000× too high — reported 2026-07-13 on
+    # RT-26-000169 · Sun Bio Verbatim (got 1050 ml, correct is
+    # 1.05 ml). Fix: resolve VOLUME_PER_PLANT_UNIT via Cosh core and
+    # divide by 1000 when the unit is millilitres (ml/plant, mL/plant).
+    # Non-volume units (g/plant, kg/plant) pass through as-is because
+    # those formulas — Direct Soil Application etc — reuse
+    # Vol_per_plant to mean "mass per plant" and expect the raw value.
     vol_per_plant_el = elements_by_type.get("volume_per_plant")
     vol_per_plant: Optional[float] = None
     if vol_per_plant_el and vol_per_plant_el.value:
         try:
-            vol_per_plant = float(vol_per_plant_el.value)
+            raw_vpp = float(vol_per_plant_el.value)
         except (TypeError, ValueError):
-            pass
+            raw_vpp = None
+        if raw_vpp is not None:
+            vpu_el = elements_by_type.get("volume_per_plant_unit")
+            vpu_name: Optional[str] = None
+            if vpu_el and vpu_el.cosh_ref:
+                vpu_core = (await db.execute(
+                    select(_BL06CoshCore).where(_BL06CoshCore.cosh_id == vpu_el.cosh_ref)
+                )).scalar_one_or_none()
+                if vpu_core:
+                    vpu_name = (vpu_core.translations or {}).get("en")
+            # Case-insensitive prefix match on the resolved English
+            # unit name. "ml/plant", "mL/plant" → factor 1/1000
+            # (millilitres → litres). Everything else passes through.
+            factor = 1.0
+            if vpu_name:
+                n = vpu_name.strip().lower()
+                if n.startswith("ml"):
+                    factor = 1.0 / 1000.0
+            vol_per_plant = raw_vpp * factor
 
     result = calculate_volume(
         formula=formula_row.formula,
