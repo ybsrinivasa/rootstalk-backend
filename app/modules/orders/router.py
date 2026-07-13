@@ -6874,9 +6874,22 @@ async def npk_select(
     ranked = rank_mixed(candidates, dose, water_soluble_only=fertigation)
     ranked_by_cn = {r.candidate.cosh_id: r for r in ranked}
 
-    # Build (common_name_cosh_id, trade_name_cosh_id, kg_product) tuples
-    # for every pick, in fixed order: Mixed first, then Straights N, P, K.
-    picks: list[tuple[str, str, float]] = []
+    # 2026-07-13 — Dealer can override the auto-computed kg and enter
+    # a price per pick. Both fields optional; when absent the ranking-
+    # derived kg is used and price stays NULL (dealer can still tweak
+    # via Edit Details post-commit). Values arrive as strings from JSON
+    # via the PWA input; coerce defensively.
+    def _opt_float(v) -> Optional[float]:
+        if v is None or v == "":
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    # Build (common_name_cosh_id, trade_name_cosh_id, kg_product, price)
+    # tuples for every pick, in fixed order: Mixed first, then Straights N, P, K.
+    picks: list[tuple[str, str, float, Optional[float]]] = []
     if mixed:
         cn_id = mixed.get("common_name_cosh_id")
         tn_id = mixed.get("trade_name_cosh_id")
@@ -6893,7 +6906,10 @@ async def npk_select(
                 detail={"error_code": "NPK_MIXED_NOT_RANKED",
                         "message": f"Mixed {cn_id} not in the ranked list."},
             )
-        picks.append((cn_id, tn_id, round(r.kg_product * applications_multiplier, 2)))
+        override_kg = _opt_float(mixed.get("given_volume"))
+        kg_val = override_kg if override_kg is not None and override_kg > 0 \
+            else round(r.kg_product * applications_multiplier, 2)
+        picks.append((cn_id, tn_id, kg_val, _opt_float(mixed.get("price"))))
 
     # Gap after Mixed (if any). Straights are sized against this gap.
     picked_mixed_ranking = ranked_by_cn.get(mixed["common_name_cosh_id"]) if mixed else None
@@ -6923,7 +6939,10 @@ async def npk_select(
                 detail={"error_code": "NPK_STRAIGHT_NO_GAP",
                         "message": f"No remaining gap for {target} — Straight {cn_id} not needed."},
             )
-        picks.append((cn_id, tn_id, round(kg * applications_multiplier, 2)))
+        override_kg = _opt_float(s.get("given_volume"))
+        kg_val = override_kg if override_kg is not None and override_kg > 0 \
+            else round(kg * applications_multiplier, 2)
+        picks.append((cn_id, tn_id, kg_val, _opt_float(s.get("price"))))
 
     # 2026-07-13 — Hard block: dealer must cover every non-zero
     # recommended nutrient (spec §2.3). Each Straight-X fully fills
@@ -7014,7 +7033,7 @@ async def npk_select(
     # together; per spec §3.2 it's automatic — no expert involvement.
     relation_id = str(_uuid_npk.uuid4())
     created_items: list[str] = []
-    for i, (cn_id, tn_id, kg) in enumerate(picks):
+    for i, (cn_id, tn_id, kg, price_val) in enumerate(picks):
         # First pick reuses the original PENDING item; subsequent picks
         # spawn new OrderItem rows on the same practice_id.
         target_item = item if i == 0 else OrderItem(
@@ -7032,6 +7051,10 @@ async def npk_select(
             target_item.brand_name = (tn_core.translations or {}).get("en") or tn_id
         target_item.given_volume = kg
         target_item.estimated_volume = kg
+        # 2026-07-13 — Dealer-entered price flows through from the NPK
+        # form. Optional; NULL when not entered (dealer can fill via
+        # Edit Details later).
+        target_item.price = price_val
         # NPK quantities are kg of product per spec §1.1; pin the unit.
         target_item.volume_unit = "kg"
         target_item.status = OrderItemStatus.AVAILABLE
@@ -7055,6 +7078,7 @@ async def npk_select(
                 "brand_cosh_id": tn_id,
                 "common_name_cosh_id": cn_id,
                 "given_volume": kg,
+                "price": price_val,
                 "volume_unit": "kg",
                 "npk_relation_id": relation_id,
             },
@@ -7069,8 +7093,9 @@ async def npk_select(
                 "common_name_cosh_id": cn_id,
                 "trade_name_cosh_id": tn_id,
                 "kg_product": kg,
+                "price": price_val,
             }
-            for cn_id, tn_id, kg in picks
+            for cn_id, tn_id, kg, price_val in picks
         ],
     }
 
