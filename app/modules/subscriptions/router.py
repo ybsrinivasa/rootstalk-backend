@@ -5256,6 +5256,37 @@ async def _today_advisory_for_user(
         # Only APPROVED siblings are exposed; brand identity is gated
         # on APPROVED across the whole surface for dealer-mediation
         # reasons.
+        # 2026-07-13 — Fertigation NPK per-application volume. On a
+        # Fertigation NPK item, `given_volume` is the total (per-app ×
+        # N applications across the timeline) — what the dealer sold —
+        # and `estimated_volume` is the per-application dose that the
+        # farmer applies on each scheduled day (spec §5.3
+        # "Apply 2 kg today"). We expose the per-app value only when
+        # the practice is FERTIGATION_NPK_DOSAGES so the PWA can
+        # render per-day rather than the misleading total. Non-
+        # fertigation items keep their estimated_volume off the wire —
+        # it has different semantics elsewhere (BL-06 auto-estimate,
+        # not per-application) and would confuse the PWA.
+        item_practice_ids = {
+            it_s.practice_id for it_s, _, _ in active_items_rows if it_s.practice_id
+        }
+        practice_l2_by_id: dict[str, str] = {}
+        if item_practice_ids:
+            l2_rows = (await db.execute(
+                select(Practice.id, Practice.l2_type).where(
+                    Practice.id.in_(item_practice_ids),
+                )
+            )).all()
+            practice_l2_by_id = {pid: l2 for pid, l2 in l2_rows}
+
+        def _per_app_kg(it_x: OrderItem) -> float | None:
+            l2 = practice_l2_by_id.get(it_x.practice_id)
+            if l2 != "FERTIGATION_NPK_DOSAGES":
+                return None
+            if it_x.estimated_volume is None:
+                return None
+            return float(it_x.estimated_volume)
+
         siblings_by_relation: dict[str, list[dict]] = {}
         for it_s, _, _ in active_items_rows:
             rid_s = getattr(it_s, "relation_id", None)
@@ -5273,6 +5304,7 @@ async def _today_advisory_for_user(
                 ),
                 "manufacturer_name": manufacturer_by_brand.get(it_s.brand_cosh_id),
                 "given_volume": float(it_s.given_volume) if it_s.given_volume else None,
+                "per_application_volume": _per_app_kg(it_s),
                 "volume_unit": it_s.volume_unit,
             })
 
@@ -5307,6 +5339,7 @@ async def _today_advisory_for_user(
                     if (show_money and it.brand_cosh_id) else None
                 ),
                 "given_volume": float(it.given_volume) if (show_money and it.given_volume) else None,
+                "per_application_volume": _per_app_kg(it) if show_money else None,
                 "volume_unit": it.volume_unit if show_money else None,
                 "price": float(it.price) if (show_money and it.price) else None,
                 "postponed_until": it.postponed_until.isoformat() if it.postponed_until else None,

@@ -6638,6 +6638,55 @@ _NPK_L2_TYPES = {
 }
 
 
+async def _fertigation_multiplier_from_practice(
+    db: AsyncSession, practice: Practice, by_type: dict,
+) -> int:
+    """Compute the total number of applications across a Fertigation
+    NPK practice's timeline given its `FERTIGATION_INTERVAL` element.
+
+    Spec §5.2: "Total purchase quantity = dosage per application ×
+    number of remaining applications from order date to timeline end."
+    MVP uses TOTAL applications across the timeline (from timeline
+    start, not from order date) — simpler and only over-purchases when
+    the farmer orders mid-timeline. "From order date" is a follow-up
+    refinement.
+
+    Returns 1 (no multiplier) when:
+    - Interval element is missing / blank / unparseable (SE meant a
+      single application).
+    - Timeline data is unresolvable (defensive fallback).
+
+    Pre-existing bug this replaces (flagged 2026-07-13 in commit
+    `bf26e11`): both `/npk-options` and `/npk-select` used to read
+    `by_type.get("applications")` — lowercase, singular — which never
+    matched the L2 spec's actual `NUMBER_OF_APPLICATIONS` element
+    name. And `NUMBER_OF_APPLICATIONS` is `auto_calculated`, i.e. it
+    was never actually stored as an Element row by SE authoring. So
+    the multiplier silently stayed at 1, `given_volume` came out as
+    per-application kg (not total × N), and farmers under-purchased
+    for the timeline.
+    """
+    interval_el = by_type.get("FERTIGATION_INTERVAL")
+    if interval_el is None or interval_el.value is None:
+        return 1
+    try:
+        interval = int(str(interval_el.value).strip())
+    except (TypeError, ValueError):
+        return 1
+    if interval < 1:
+        return 1
+    tl = (await db.execute(
+        select(Timeline).where(Timeline.id == practice.timeline_id)
+    )).scalar_one_or_none()
+    if tl is None or tl.from_value is None or tl.to_value is None:
+        return 1
+    from app.modules.advisory.router import compute_number_of_applications
+    n = compute_number_of_applications(
+        int(tl.from_value), int(tl.to_value), interval,
+    )
+    return max(1, n)
+
+
 def _candidate_to_dict(
     cand: NPKCandidate,
 ) -> dict:
@@ -6709,19 +6758,14 @@ async def get_item_npk_options(
     dose = Dose(n=_val("N_DOSAGE"), p=_val("P_DOSAGE"), k=_val("K_DOSAGE"))
     fertigation = practice.l2_type == "FERTIGATION_NPK_DOSAGES"
 
-    # Spec §5.2 fertigation multiplier — surfaces alongside the ranking
-    # so the PWA can render "per app × N apps = total kg" without a
-    # second round-trip. Same source the npk-select endpoint uses.
+    # 2026-07-13 — Real fertigation multiplier (spec §5.2). Replaces
+    # the pre-existing `by_type.get("applications")` lookup that
+    # never matched a real Element (see helper docstring).
     applications_multiplier = 1
     if fertigation:
-        apps_el = by_type.get("applications")
-        if apps_el and apps_el.value:
-            try:
-                n = int(apps_el.value)
-                if n >= 1:
-                    applications_multiplier = n
-            except (TypeError, ValueError):
-                pass
+        applications_multiplier = await _fertigation_multiplier_from_practice(
+            db, practice, by_type,
+        )
 
     # Fertigation gate happens in the candidate loader (filters common
     # names down to those with a trade name in `npk_fertigation_products`).
@@ -6903,20 +6947,16 @@ async def npk_select(
     dose = Dose(n=_val("N_DOSAGE"), p=_val("P_DOSAGE"), k=_val("K_DOSAGE"))
     fertigation = practice.l2_type == "FERTIGATION_NPK_DOSAGES"
 
-    # Spec §5.2 — for Fertigation, total purchase = per-application
-    # dose × number of remaining applications. The SE pins the count
-    # via the `applications` element (Phase D.3 of BL-06). Default 1
-    # if unset, matching the same fallback BL-06 already uses.
+    # 2026-07-13 — Real fertigation multiplier via
+    # `_fertigation_multiplier_from_practice` (spec §5.2). Total
+    # purchase = per-application dose × N applications across the
+    # timeline. See helper docstring for the pre-existing lookup bug
+    # this replaces.
     applications_multiplier = 1
     if fertigation:
-        apps_el = by_type.get("applications")
-        if apps_el and apps_el.value:
-            try:
-                n = int(apps_el.value)
-                if n >= 1:
-                    applications_multiplier = n
-            except (TypeError, ValueError):
-                pass
+        applications_multiplier = await _fertigation_multiplier_from_practice(
+            db, practice, by_type,
+        )
 
     candidates, _ = await load_fertiliser_candidates(db, fertigation=fertigation)
     by_cn = {c.cosh_id: c for c in candidates}
@@ -6936,9 +6976,22 @@ async def npk_select(
         except (TypeError, ValueError):
             return None
 
-    # Build (common_name_cosh_id, trade_name_cosh_id, kg_product, price)
-    # tuples for every pick, in fixed order: Mixed first, then Straights N, P, K.
-    picks: list[tuple[str, str, float, Optional[float]]] = []
+    # Build (common_name_cosh_id, trade_name_cosh_id, total_kg,
+    # per_application_kg, price) tuples for every pick, in fixed
+    # order: Mixed first, then Straights N, P, K.
+    # 2026-07-13 — Split per-app kg from total kg. For fertigation
+    # NPK the dealer procures TOTAL (per-app × N applications) but the
+    # farmer's advisory displays PER-APP on each scheduled day per
+    # spec §5.3 ("Apply 2 kg today"). Both get persisted:
+    #   given_volume     = total kg (what dealer sold)
+    #   estimated_volume = per-application kg (what farmer applies)
+    # For chemical NPK (multiplier=1) they collapse to the same value.
+    #
+    # Dealer volume override applies to the TOTAL only — the per-app
+    # dose stays at the SE-recommended per-application amount so a
+    # dealer rounding up to pack sizes doesn't drift the farmer's
+    # daily dose.
+    picks: list[tuple[str, str, float, float, Optional[float]]] = []
     if mixed:
         cn_id = mixed.get("common_name_cosh_id")
         tn_id = mixed.get("trade_name_cosh_id")
@@ -6955,10 +7008,14 @@ async def npk_select(
                 detail={"error_code": "NPK_MIXED_NOT_RANKED",
                         "message": f"Mixed {cn_id} not in the ranked list."},
             )
+        per_app_kg = round(r.kg_product, 2)
         override_kg = _opt_float(mixed.get("given_volume"))
-        kg_val = override_kg if override_kg is not None and override_kg > 0 \
-            else round(r.kg_product * applications_multiplier, 2)
-        picks.append((cn_id, tn_id, kg_val, _opt_float(mixed.get("price"))))
+        total_kg = override_kg if override_kg is not None and override_kg > 0 \
+            else round(per_app_kg * applications_multiplier, 2)
+        picks.append((
+            cn_id, tn_id, total_kg, per_app_kg,
+            _opt_float(mixed.get("price")),
+        ))
 
     # Gap after Mixed (if any). Straights are sized against this gap.
     picked_mixed_ranking = ranked_by_cn.get(mixed["common_name_cosh_id"]) if mixed else None
@@ -6988,10 +7045,14 @@ async def npk_select(
                 detail={"error_code": "NPK_STRAIGHT_NO_GAP",
                         "message": f"No remaining gap for {target} — Straight {cn_id} not needed."},
             )
+        per_app_kg = round(kg, 2)
         override_kg = _opt_float(s.get("given_volume"))
-        kg_val = override_kg if override_kg is not None and override_kg > 0 \
-            else round(kg * applications_multiplier, 2)
-        picks.append((cn_id, tn_id, kg_val, _opt_float(s.get("price"))))
+        total_kg = override_kg if override_kg is not None and override_kg > 0 \
+            else round(per_app_kg * applications_multiplier, 2)
+        picks.append((
+            cn_id, tn_id, total_kg, per_app_kg,
+            _opt_float(s.get("price")),
+        ))
 
     # 2026-07-13 — Hard block: dealer must cover every non-zero
     # recommended nutrient (spec §2.3). Each Straight-X fully fills
@@ -7035,7 +7096,7 @@ async def npk_select(
     # Validate each picked trade name actually belongs to its common name
     # (chemical chain or fertigation chain, depending on L2). Stops bogus
     # client-supplied trade_name_cosh_ids slipping through.
-    for cn_id, tn_id, _kg, _price in picks:
+    for cn_id, tn_id, _total, _per_app, _price in picks:
         rows = (
             await trade_names_for_fertigation_npk(db, cn_id)
             if fertigation
@@ -7082,7 +7143,7 @@ async def npk_select(
     # together; per spec §3.2 it's automatic — no expert involvement.
     relation_id = str(_uuid_npk.uuid4())
     created_items: list[str] = []
-    for i, (cn_id, tn_id, kg, price_val) in enumerate(picks):
+    for i, (cn_id, tn_id, kg_total, kg_per_app, price_val) in enumerate(picks):
         # First pick reuses the original PENDING item; subsequent picks
         # spawn new OrderItem rows on the same practice_id.
         target_item = item if i == 0 else OrderItem(
@@ -7098,8 +7159,12 @@ async def npk_select(
         )).scalar_one_or_none()
         if tn_core is not None:
             target_item.brand_name = (tn_core.translations or {}).get("en") or tn_id
-        target_item.given_volume = kg
-        target_item.estimated_volume = kg
+        # given_volume = total across the timeline (dealer procures);
+        # estimated_volume = per-application dose (farmer applies each
+        # scheduled day). For chemical NPK both collapse to the same
+        # value because the multiplier is 1.
+        target_item.given_volume = kg_total
+        target_item.estimated_volume = kg_per_app
         # 2026-07-13 — Dealer-entered price flows through from the NPK
         # form. Optional; NULL when not entered (dealer can fill via
         # Edit Details later).
@@ -7126,7 +7191,8 @@ async def npk_select(
             metadata={
                 "brand_cosh_id": tn_id,
                 "common_name_cosh_id": cn_id,
-                "given_volume": kg,
+                "given_volume": kg_total,
+                "per_application_volume": kg_per_app,
                 "price": price_val,
                 "volume_unit": "kg",
                 "npk_relation_id": relation_id,
@@ -7141,10 +7207,11 @@ async def npk_select(
             {
                 "common_name_cosh_id": cn_id,
                 "trade_name_cosh_id": tn_id,
-                "kg_product": kg,
+                "kg_product": kg_total,
+                "kg_per_application": kg_per_app,
                 "price": price_val,
             }
-            for cn_id, tn_id, kg, price_val in picks
+            for cn_id, tn_id, kg_total, kg_per_app, price_val in picks
         ],
     }
 
