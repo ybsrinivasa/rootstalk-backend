@@ -6901,6 +6901,45 @@ async def npk_select(
             )
         picks.append((cn_id, tn_id, round(kg * applications_multiplier, 2)))
 
+    # 2026-07-13 — Hard block: dealer must cover every non-zero
+    # recommended nutrient (spec §2.3). Each Straight-X fully fills
+    # its class's gap by construction (straight_kg_for_gap returns
+    # exactly `gap.[nutrient]`). So the "not covered" set = every
+    # nutrient with dose > 0, gap > 0 after Mixed, and no Straight
+    # of that class picked. Fires 422 with which nutrients are
+    # unfilled so the dealer can either add the missing Straight or
+    # mark the whole item NOT_AVAILABLE.
+    picked_straight_classes: set[str] = set()
+    for s in straights:
+        cn_id = s.get("common_name_cosh_id")
+        if not cn_id or cn_id not in by_cn:
+            continue
+        cls = classify_fertiliser(by_cn[cn_id].concentration)
+        if cls in ("STRAIGHT_N", "STRAIGHT_P", "STRAIGHT_K"):
+            picked_straight_classes.add(cls)
+    eps = 1e-6
+    unfilled: list[str] = []
+    if dose.n > eps and gap.n > eps and "STRAIGHT_N" not in picked_straight_classes:
+        unfilled.append("N")
+    if dose.p > eps and gap.p > eps and "STRAIGHT_P" not in picked_straight_classes:
+        unfilled.append("P")
+    if dose.k > eps and gap.k > eps and "STRAIGHT_K" not in picked_straight_classes:
+        unfilled.append("K")
+    if unfilled:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error_code": "NPK_UNFILLED_GAP",
+                "message": (
+                    "Recommendation not fully covered — "
+                    + ", ".join(unfilled)
+                    + " still needs a fertiliser. Fill the remaining gap or"
+                    " mark this item unavailable."
+                ),
+                "unfilled": unfilled,
+            },
+        )
+
     # Validate each picked trade name actually belongs to its common name
     # (chemical chain or fertigation chain, depending on L2). Stops bogus
     # client-supplied trade_name_cosh_ids slipping through.
