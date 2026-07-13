@@ -6981,6 +6981,35 @@ async def npk_select(
                         "message": f"Trade name {tn_id} not approved for common name {cn_id}."},
             )
 
+    # 2026-07-13 — Archive orphans from a previous /npk-select call for
+    # this practice. Each call reuses the passed-in `item` for picks[0]
+    # but creates fresh OrderItems for picks[1..N] with a NEW relation_id.
+    # On re-submit (dealer taps "Edit details" / re-runs the flow), the
+    # PREVIOUS submit's sibling items become orphans — their relation_id
+    # no longer matches the reused item's — and stay in the DB as
+    # duplicate AVAILABLE rows. Farmer/dealer both then see the same
+    # brand twice, once in the new AND group and once standalone.
+    # Fix: soft-archive any OTHER OrderItem for this practice on this
+    # order that's still in a dealer-editable state (PENDING / AVAILABLE).
+    # Items that have moved past the dealer's hands (SENT_FOR_APPROVAL /
+    # APPROVED / POSTPONED / NOT_AVAILABLE / REJECTED) stay untouched —
+    # re-selection shouldn't rewrite the farmer's decisions.
+    from datetime import datetime as _dt_orphan, timezone as _tz_orphan
+    orphans = (await db.execute(
+        select(OrderItem).where(
+            OrderItem.order_id == order_id,
+            OrderItem.practice_id == item.practice_id,
+            OrderItem.id != item.id,
+            OrderItem.archived_at.is_(None),
+            OrderItem.status.in_(
+                [OrderItemStatus.PENDING, OrderItemStatus.AVAILABLE]
+            ),
+        )
+    )).scalars().all()
+    now_utc = _dt_orphan.now(_tz_orphan.utc)
+    for orphan in orphans:
+        orphan.archived_at = now_utc
+
     # AND-relation glue. The synthesised relation_id ties all picks
     # together; per spec §3.2 it's automatic — no expert involvement.
     relation_id = str(_uuid_npk.uuid4())
