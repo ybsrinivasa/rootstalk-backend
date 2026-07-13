@@ -7035,7 +7035,7 @@ async def npk_select(
     # Validate each picked trade name actually belongs to its common name
     # (chemical chain or fertigation chain, depending on L2). Stops bogus
     # client-supplied trade_name_cosh_ids slipping through.
-    for cn_id, tn_id, _ in picks:
+    for cn_id, tn_id, _kg, _price in picks:
         rows = (
             await trade_names_for_fertigation_npk(db, cn_id)
             if fertigation
