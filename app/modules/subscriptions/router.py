@@ -228,12 +228,15 @@ async def get_pool_summary(
 ):
     """Lifetime rollup for the CA Subscriptions page — three headline
     numbers that stay uniform whether units came in via Razorpay top-up
-    or an SA grant. `purchased_total` sums every SubscriptionPool row,
-    `consumed_total` sums PromoterAllocation.consumed_total (the phase-C
-    canonical consumption ledger — same source the unallocated-balance
-    formula uses so the two views reconcile), `active_subscriptions`
-    counts live Subscription rows (soft-delete already filtered by the
-    session listener)."""
+    or an SA grant. `purchased_total` sums every SubscriptionPool row.
+    `consumed_total` is *net* — gross assignments (consumed) minus
+    refunds — so it reconciles cleanly with the pool math the CA sees:
+        purchased − currently-allocated − consumed = available.
+    Without this net-out, the same 2-unit refund shows up twice on
+    screen (once in the promoter's rebounded balance, once as a
+    stubborn "consumed" figure) and the arithmetic looks broken.
+    `active_subscriptions` counts live Subscription rows (soft-delete
+    already filtered by the session listener)."""
     from app.modules.subscriptions.promoter_allocation_models import PromoterAllocation
 
     purchased_total = (await db.execute(
@@ -241,8 +244,13 @@ async def get_pool_summary(
         .where(SubscriptionPool.client_id == client_id)
     )).scalar() or 0
 
-    consumed_total = (await db.execute(
+    consumed_gross = (await db.execute(
         select(func.coalesce(func.sum(PromoterAllocation.consumed_total), 0))
+        .where(PromoterAllocation.client_id == client_id)
+    )).scalar() or 0
+
+    refunded_total = (await db.execute(
+        select(func.coalesce(func.sum(PromoterAllocation.refunded_total), 0))
         .where(PromoterAllocation.client_id == client_id)
     )).scalar() or 0
 
@@ -257,7 +265,9 @@ async def get_pool_summary(
     return {
         "client_id": client_id,
         "purchased_total": int(purchased_total),
-        "consumed_total": int(consumed_total),
+        "consumed_total": int(consumed_gross) - int(refunded_total),
+        "consumed_gross": int(consumed_gross),
+        "refunded_total": int(refunded_total),
         "active_subscriptions": int(active_subscriptions),
     }
 
@@ -381,18 +391,27 @@ async def list_promoter_allocations(
     # non-zero units_balance stranded on their PromoterAllocation row —
     # the row would keep depressing the company unallocated balance
     # while the promoter could no longer assign. The revoke path now
-    # reclaims first, and this filter is the belt.
+    # reclaims first, and this EXISTS is the belt.
+    #
+    # EXISTS (not JOIN) because ClientPromoter is unique on
+    # (client_id, user_id, promoter_type), so a user who is both
+    # Dealer and Facilitator for the same client has two rows.
+    # A JOIN duplicates the PromoterAllocation output row; EXISTS
+    # returns each PromoterAllocation exactly once regardless of
+    # how many active promoter_types the user holds.
+    cp_active_subq = (
+        select(ClientPromoter.id).where(
+            ClientPromoter.user_id == PromoterAllocation.promoter_user_id,
+            ClientPromoter.client_id == PromoterAllocation.client_id,
+            ClientPromoter.is_promoter == True,  # noqa: E712
+        )
+    ).exists()
     rows = (await db.execute(
         select(PromoterAllocation, User)
         .join(User, User.id == PromoterAllocation.promoter_user_id)
-        .join(
-            ClientPromoter,
-            (ClientPromoter.user_id == PromoterAllocation.promoter_user_id) &
-            (ClientPromoter.client_id == PromoterAllocation.client_id),
-        )
         .where(
             PromoterAllocation.client_id == client_id,
-            ClientPromoter.is_promoter == True,  # noqa: E712
+            cp_active_subq,
         )
         .order_by(User.name)
     )).all()
