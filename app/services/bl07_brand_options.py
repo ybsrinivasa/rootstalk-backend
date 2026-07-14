@@ -71,27 +71,99 @@ class BrandOption:
 
 _LIQUID_KEYWORDS = (
     "liquid", "suspension", "emulsion", "solution",
-    "soluble liquid", "flowable", "(sc)", "(ec)", "(sl)", "(ew)", "(soluble",
+    "soluble liquid", "flowable", "dispersion",
+    "(soluble",
 )
 _DISCRETE_KEYWORDS = (
-    "trap", "lure", "sachet", "tablet", "capsule",
+    "trap", "lure", "sachet", "tablet",
+    # "capsule" removed 2026-07-14 — every currently-live "capsule"
+    # formulation in Cosh is actually a LIQUID (Capsule Suspension
+    # (CS), Zeon Concentrate (ZC)). The abbreviation map below routes
+    # those to `liquid` explicitly. If a genuine slow-release capsule
+    # product ships to Cosh later, add its abbreviation to the map.
 )
+
+
+# 2026-07-14 — Explicit formulation-code → family map. Wins over keyword
+# scan below. Rows populated from the top-30 brand_lookup_cache cohorts on
+# staging as of 2026-07-14 (which cover ~99% of active brand rows) plus
+# common pesticide-industry abbreviations.
+#
+# Reported bugs the map addresses:
+#   - "Oil Dispersion (OD)" was returning `solid` (11 brands including
+#     Benevia + Diamide under Cyantraniliprole) → now `liquid`.
+#   - "Capsule Suspensions (CS)" was returning `discrete` because the
+#     "capsule" keyword fired ahead of "(cs)" (74 brands) → now `liquid`.
+#   - "Dispersible Concentrate (DC)" was returning `solid` → `liquid`.
+#   - "Zeon Concentrate (ZC)" was returning `solid` (40 brands) → `liquid`.
+#   - "Dry Flowable (DF)" would have matched "flowable" → `liquid`, but DF
+#     is actually a solid dry-granule formulation → explicit `solid`.
+_FORMULATION_CODE_TO_FAMILY = {
+    # Liquid
+    "sc":   "liquid",  # Suspension Concentrate
+    "ec":   "liquid",  # Emulsifiable Concentrate
+    "sl":   "liquid",  # Soluble Liquid
+    "ew":   "liquid",  # Emulsion Oil-in-Water
+    "od":   "liquid",  # Oil Dispersion
+    "cs":   "liquid",  # Capsule Suspension
+    "dc":   "liquid",  # Dispersible Concentrate
+    "zc":   "liquid",  # Zeon Concentrate (capsule-suspension variant)
+    "me":   "liquid",  # Micro Emulsion
+    "mec":  "liquid",  # Micro-Emulsion Concentrate
+    "se":   "liquid",  # Suspo-Emulsion
+    "as":   "liquid",  # Aqueous Suspension
+    "ff":   "liquid",  # Flowable Formulation
+    "fs":   "liquid",  # Flowable Concentrate for Seed
+    "ulv":  "liquid",  # Ultra Low Volume Liquid
+    # Solid
+    "wp":   "solid",   # Wettable Powder
+    "wg":   "solid",   # Wettable Granules
+    "wdg":  "solid",   # Water Dispersible Granules
+    "wdgs": "solid",
+    "sg":   "solid",   # Water Soluble Granules
+    "sp":   "solid",   # Soluble Powder
+    "gr":   "solid",   # Granules
+    "wdp":  "solid",   # Water Dispersible Powder
+    "ws":   "solid",   # Water Dispersible Powder (slurry)
+    "dp":   "solid",   # Dustable Powder
+    "p":    "solid",   # Powder
+    "ds":   "solid",   # Soluble Dust
+    "cg":   "solid",   # Encapsulated Granule
+    "df":   "solid",   # Dry Flowable (solid despite the name)
+    "tc":   "solid",   # Technical concentrate
+}
+
+
+import re as _fmt_re
+_FORMULATION_CODE_RE = _fmt_re.compile(r"\(([a-z]{1,5})\)")
 
 
 def _classify_formulation_to_unit_family(formulation_name: Optional[str]) -> str:
     """`solid` | `liquid` | `discrete` based on the formulation core's
     English name. Defaults to `solid` when unknown (matches the dominant
     Cosh formulation set + the safer-misclassification choice for
-    granular fertilisers, which are the largest brand cohort)."""
+    granular fertilisers, which are the largest brand cohort).
+
+    2026-07-14 — Rewritten: pesticide-industry formulation codes are
+    the authoritative signal (they encode the phase directly). Scan
+    for a "(<code>)" pattern first and consult the explicit family
+    map; only fall through to keyword search when no code matches.
+    Liquid keywords checked before discrete so shape-like matches
+    (e.g. "Capsule Suspension" without its (CS) code) still land
+    correctly on liquid via "suspension".
+    """
     if not formulation_name:
         return "solid"
     fmt = formulation_name.lower()
-    for kw in _DISCRETE_KEYWORDS:
-        if kw in fmt:
-            return "discrete"
+    m = _FORMULATION_CODE_RE.search(fmt)
+    if m and m.group(1) in _FORMULATION_CODE_TO_FAMILY:
+        return _FORMULATION_CODE_TO_FAMILY[m.group(1)]
     for kw in _LIQUID_KEYWORDS:
         if kw in fmt:
             return "liquid"
+    for kw in _DISCRETE_KEYWORDS:
+        if kw in fmt:
+            return "discrete"
     return "solid"
 
 
