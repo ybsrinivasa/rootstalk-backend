@@ -102,6 +102,32 @@ UNIT_OPTIONS_BY_FAMILY = {
 }
 
 
+def _dosage_unit_phase(dosage_unit_en: Optional[str]) -> Optional[str]:
+    """Map a dosage unit's numerator to a brand-unit family (2026-07-14).
+
+    "ml/L", "ml/plant", "ml/acre" → 'liquid'
+    "g/L", "g/plant", "g/acre"    → 'solid'
+    "L/L", "L/acre"               → 'liquid'
+    "kg/acre", "kg/plant"         → 'solid'
+    "numbers/acre"                → 'discrete'
+
+    Returns None when the unit is missing or the numerator doesn't
+    resolve to one of our three families (defensive — callers treat
+    None as "don't filter"). Case-insensitive on the numerator so
+    stray SE authoring like "Ml/L" doesn't break the mapping.
+    """
+    if not dosage_unit_en:
+        return None
+    numerator = dosage_unit_en.split("/", 1)[0].strip().lower()
+    if numerator in ("ml", "l"):
+        return "liquid"
+    if numerator in ("g", "kg", "gm"):
+        return "solid"
+    if "number" in numerator:
+        return "discrete"
+    return None
+
+
 @dataclass
 class BrandOptionsResult:
     is_locked: bool
@@ -376,6 +402,40 @@ async def get_brand_options(
     group_recommended.sort(key=lambda b: (b.name or "").lower())
     group_my.sort(key=lambda b: (b.name or "").lower())
     group_other.sort(key=lambda b: (b.name or "").lower())
+
+    # 2026-07-14 — Phase filter (option 1 from the 2026-07-14 discussion).
+    # Filter every brand group by unit-phase compatibility with the
+    # practice's dosage-unit numerator. `2 ml/L` dosage → keep only
+    # liquid brands (ml/L unit family). `2 g/L` → keep only solid
+    # brands. This eliminates the UNIT_PAIR_MISMATCH surface that used
+    # to show up on the dealer's item form when they picked, say, a
+    # solid Acephate 75 SP brand against a ml/L dosage. Save-time
+    # authoring warnings still catch the upstream error (SE picked
+    # a mismatched dosage unit for the L2's brand family) via the
+    # volume_formula_validator; this filter just spares the dealer
+    # from tripping over the same problem downstream.
+    #
+    # When the dosage unit doesn't resolve to one of our three
+    # families (unusual unit strings, missing DOSAGE_UNIT element,
+    # etc.) `_dosage_unit_phase` returns None and no filter runs —
+    # dealer sees the full brand list, same as before.
+    from app.services.volume_formula_validator import (
+        resolve_method_and_dosage_unit_from_elements,
+    )
+    _method, dosage_unit_en = await resolve_method_and_dosage_unit_from_elements(
+        db, elements,
+    )
+    phase = _dosage_unit_phase(dosage_unit_en)
+    if phase is not None:
+        def _phase_ok(b: BrandOption) -> bool:
+            return brand_unit_family.get(b.cosh_id) == phase
+        group_recommended = [b for b in group_recommended if _phase_ok(b)]
+        group_my = [b for b in group_my if _phase_ok(b)]
+        group_other = [b for b in group_other if _phase_ok(b)]
+        kept = {b.cosh_id for b in
+                group_recommended + group_my + group_other}
+        brand_unit_family = {k: v for k, v in brand_unit_family.items() if k in kept}
+        units_by_brand = {k: v for k, v in units_by_brand.items() if k in kept}
 
     return BrandOptionsResult(
         is_locked=False,

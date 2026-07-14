@@ -5502,12 +5502,22 @@ async def check_volume_formula(
     l2: str,
     method: str,
     dosage_unit: str,
+    common_name: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """SE-authoring time check: does a `volume_formulas` row exist for the
     combination the SE is composing? Three-tier verdict — see
     `app.services.volume_formula_validator` for the rules.
+
+    2026-07-14 — Optional `common_name` (a Cosh UUID) enables the
+    phase-mismatch check on top of the formula-existence check. When
+    passed and the (dosage_unit's phase, common_name's brand phases)
+    pair has no overlap, the verdict flips to `phase_mismatch` — the
+    SE has authored a dosage unit whose phase doesn't fit any brand
+    under this common name, so the dealer's brand picker will be
+    empty at order time. Save-time hook does the same check via
+    element resolution when it fires.
 
     The CA portal's `PracticeFormModal` fires this on a debounced change
     whenever both APPLICATION_METHOD and DOSAGE_UNIT elements are populated,
@@ -5517,12 +5527,29 @@ async def check_volume_formula(
     """
     from app.services.volume_formula_validator import (
         check_volume_formula_combination,
+        check_dosage_phase_vs_common_name_brands,
+        VERDICT_OK,
     )
-    return await check_volume_formula_combination(
+    verdict = await check_volume_formula_combination(
         db,
         timeline_id=timeline_id, l2=l2,
         application_method=method, dosage_unit=dosage_unit,
     )
+    if verdict["verdict"] != VERDICT_OK:
+        return verdict
+    # Formula-existence passed; run phase check when common_name was
+    # supplied. Silent on missing common_name — older callers see the
+    # same three-tier verdict they always did.
+    if common_name:
+        phase_v = await check_dosage_phase_vs_common_name_brands(
+            db,
+            common_name_cosh_id=common_name,
+            dosage_unit_en=dosage_unit,
+        )
+        if phase_v["verdict"] != VERDICT_OK:
+            phase_v["measure"] = verdict.get("measure")
+            return phase_v
+    return verdict
 
 
 @router.get("/practice-taxonomy/elements/{l2_type}")

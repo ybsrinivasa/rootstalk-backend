@@ -27,6 +27,7 @@ VERDICT_OK = "ok"                              # formula row exists
 VERDICT_UNSUPPORTED_COMBO = "unsupported_combo"  # method+dose_unit pair has no row
 VERDICT_METHOD_UNSEEDED = "method_unseeded"      # no rows with this method at all
 VERDICT_L2_UNSEEDED = "l2_unseeded"              # nothing exists for this (measure, l2)
+VERDICT_PHASE_MISMATCH = "phase_mismatch"        # 2026-07-14 — dosage-unit phase doesn't fit any brand under this common name
 
 
 async def _resolve_measure_for_timeline(
@@ -166,6 +167,79 @@ async def check_volume_formula_combination(
     }
 
 
+def resolve_common_name_cosh_id_from_elements(elements: list) -> Optional[str]:
+    """Extract COMMON_NAME's cosh_ref from a Practice's element list.
+    Returns the UUID; the caller downstream resolves brand rows via
+    `brand_cache.get_brands_for_common_name`. Returns None when the
+    element is absent (rare — most Input L2s make COMMON_NAME
+    mandatory) OR present without a cosh_ref (SE typed free text
+    instead of picking from Cosh).
+    """
+    def _get(e, k):
+        if isinstance(e, dict):
+            return e.get(k)
+        return getattr(e, k, None)
+    for el in elements or []:
+        et = (_get(el, "element_type") or "").upper()
+        if et == "COMMON_NAME":
+            return _get(el, "cosh_ref")
+    return None
+
+
+async def check_dosage_phase_vs_common_name_brands(
+    db: AsyncSession,
+    *,
+    common_name_cosh_id: Optional[str],
+    dosage_unit_en: Optional[str],
+) -> dict:
+    """Phase-mismatch check (2026-07-14).
+
+    Verifies that at least one Cosh brand under the practice's
+    common name has a formulation whose unit family (solid / liquid
+    / discrete) matches the dosage unit's numerator phase. If none
+    do, warn the SE — otherwise the dealer's brand list will be
+    empty after the runtime phase filter runs.
+
+    Returns `{verdict, message}`. `VERDICT_OK` when either input is
+    missing (defensive — can't judge without both), when the dosage
+    unit's numerator doesn't map to a family, when the common name
+    has no cached brand rows, or when at least one brand fits.
+    """
+    if not common_name_cosh_id or not dosage_unit_en:
+        return {"verdict": VERDICT_OK, "message": None}
+
+    from app.services.bl07_brand_options import (
+        _dosage_unit_phase, _classify_formulation_to_unit_family,
+    )
+    dosage_phase = _dosage_unit_phase(dosage_unit_en)
+    if dosage_phase is None:
+        return {"verdict": VERDICT_OK, "message": None}
+
+    from app.services.brand_cache import get_brands_for_common_name
+    brands = await get_brands_for_common_name(db, common_name_cosh_id)
+    if not brands:
+        # No brand rows yet — can't decide. Silent to avoid alarming
+        # on Cosh gaps that the SA is still filling in.
+        return {"verdict": VERDICT_OK, "message": None}
+
+    any_match = any(
+        _classify_formulation_to_unit_family(b.formulation_name) == dosage_phase
+        for b in brands
+    )
+    if any_match:
+        return {"verdict": VERDICT_OK, "message": None}
+
+    return {
+        "verdict": VERDICT_PHASE_MISMATCH,
+        "message": (
+            f"No brand under this common name has a {dosage_phase} unit that "
+            f"fits your dosage unit '{dosage_unit_en}'. Either pick a dosage "
+            f"unit whose phase matches an available brand, or check that "
+            f"the common name has the right formulations in Cosh."
+        ),
+    }
+
+
 async def resolve_method_and_dosage_unit_from_elements(
     db: AsyncSession,
     elements: list,
@@ -259,10 +333,24 @@ async def attach_volume_formula_warning_header(
         db, timeline_id=timeline_id, l2=l2,
         application_method=method, dosage_unit=dosage_unit,
     )
-    if verdict["verdict"] == VERDICT_OK:
+    if verdict["verdict"] != VERDICT_OK:
+        # Headers must be latin-1 encodable. The verdict code is ASCII;
+        # the message contains em-dashes / other unicode — only ship
+        # the verdict via header. Direct-API users call
+        # /practice-taxonomy/check-volume-formula if they want the
+        # full localised message.
+        response.headers["X-RT-Practice-Volume-Warning"] = verdict["verdict"]
         return
-    # Headers must be latin-1 encodable. The verdict code is ASCII; the
-    # message contains em-dashes / other unicode — only ship the verdict
-    # via header. Direct-API users call /practice-taxonomy/check-volume-formula
-    # if they want the full localised message.
-    response.headers["X-RT-Practice-Volume-Warning"] = verdict["verdict"]
+
+    # 2026-07-14 — Formula existence check passed. Also run the phase-
+    # mismatch check: if no brand under this practice's common name
+    # has a unit family matching the dosage unit's phase, the dealer
+    # will see an empty brand list at order time. Warn the SE now.
+    common_name_cosh_id = resolve_common_name_cosh_id_from_elements(elements)
+    phase_v = await check_dosage_phase_vs_common_name_brands(
+        db,
+        common_name_cosh_id=common_name_cosh_id,
+        dosage_unit_en=dosage_unit,
+    )
+    if phase_v["verdict"] != VERDICT_OK:
+        response.headers["X-RT-Practice-Volume-Warning"] = phase_v["verdict"]
