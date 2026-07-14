@@ -2652,6 +2652,30 @@ async def revoke_promoter(
     if not cp:
         raise HTTPException(status_code=404, detail="Promoter row not found")
 
+    # 2026-07-14: auto-reclaim any un-consumed units before flipping
+    # is_promoter=False. Before this, the promoter's PromoterAllocation
+    # row was left untouched — the row kept subtracting from company
+    # unallocated balance while the promoter could no longer assign,
+    # stranding units. Staging sweep 2026-07-14 found 7,334 stranded
+    # units across 11 rows on 6 clients from this exact pattern.
+    from app.modules.subscriptions.promoter_allocation_models import (
+        PromoterAllocation,
+    )
+    from app.services.promoter_pool import reclaim_from_promoter
+    alloc = (await db.execute(
+        select(PromoterAllocation).where(
+            PromoterAllocation.client_id == client_id,
+            PromoterAllocation.promoter_user_id == cp.user_id,
+        )
+    )).scalar_one_or_none()
+    if alloc is not None and alloc.units_balance > 0:
+        await reclaim_from_promoter(
+            db,
+            client_id=client_id,
+            promoter_user_id=cp.user_id,
+            units=int(alloc.units_balance),
+        )
+
     cp.is_promoter = False
     cp.promoter_request_status = "NONE"
     cp.promoter_request_responded_at = datetime.now(timezone.utc)

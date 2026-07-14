@@ -20,7 +20,7 @@ from app.modules.advisory.models import (
     Package, Parameter, Variable, PackageVariable, Timeline, Practice, Element,
     ConditionalQuestion, PracticeConditional,
 )
-from app.modules.clients.models import Client
+from app.modules.clients.models import Client, ClientPromoter
 from app.modules.advisory.models import PGRecommendation, SPRecommendation, Timeline
 from app.modules.platform.models import UserRole, RoleType
 from app.modules.orders.models import DealerProfile, OrderItem, OrderItemStatus
@@ -220,6 +220,76 @@ async def get_pool_balance(
     }
 
 
+@router.get("/client/{client_id}/subscription-pool/summary")
+async def get_pool_summary(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Lifetime rollup for the CA Subscriptions page — three headline
+    numbers that stay uniform whether units came in via Razorpay top-up
+    or an SA grant. `purchased_total` sums every SubscriptionPool row,
+    `consumed_total` sums PromoterAllocation.consumed_total (the phase-C
+    canonical consumption ledger — same source the unallocated-balance
+    formula uses so the two views reconcile), `active_subscriptions`
+    counts live Subscription rows (soft-delete already filtered by the
+    session listener)."""
+    from app.modules.subscriptions.promoter_allocation_models import PromoterAllocation
+
+    purchased_total = (await db.execute(
+        select(func.coalesce(func.sum(SubscriptionPool.units_purchased), 0))
+        .where(SubscriptionPool.client_id == client_id)
+    )).scalar() or 0
+
+    consumed_total = (await db.execute(
+        select(func.coalesce(func.sum(PromoterAllocation.consumed_total), 0))
+        .where(PromoterAllocation.client_id == client_id)
+    )).scalar() or 0
+
+    active_subscriptions = (await db.execute(
+        select(func.count(Subscription.id))
+        .where(
+            Subscription.client_id == client_id,
+            Subscription.status == SubscriptionStatus.ACTIVE,
+        )
+    )).scalar() or 0
+
+    return {
+        "client_id": client_id,
+        "purchased_total": int(purchased_total),
+        "consumed_total": int(consumed_total),
+        "active_subscriptions": int(active_subscriptions),
+    }
+
+
+@router.get("/client/{client_id}/subscription-pool/history")
+async def get_pool_history(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Date-wise ledger of every units-in event for the CA subscriptions
+    page. Includes both Razorpay top-ups (razorpay_* columns populated)
+    and SA-side grants (razorpay_* NULL, `note` carries the invoice /
+    PO reference). Per user 2026-07-14: don't distinguish source here —
+    it's just a purchase history."""
+    rows = (await db.execute(
+        select(SubscriptionPool)
+        .where(SubscriptionPool.client_id == client_id)
+        .order_by(SubscriptionPool.purchased_at.desc())
+    )).scalars().all()
+    return [
+        {
+            "id": r.id,
+            "purchased_at": r.purchased_at,
+            "units_purchased": int(r.units_purchased),
+            "amount_paid_paise": r.amount_paid_paise,
+            "note": r.note,
+        }
+        for r in rows
+    ]
+
+
 @router.get("/client/{client_id}/subscription-pool/can-assign")
 async def get_pool_can_assign(
     client_id: str,
@@ -305,10 +375,25 @@ async def list_promoter_allocations(
         get_company_unallocated_balance, is_enterprise_licensed,
     )
 
+    # 2026-07-14: filter to promoters who are still marked is_promoter=True
+    # on their ClientPromoter row. Before `revoke_promoter` learned to
+    # auto-reclaim (also today), a revoked promoter could leave a
+    # non-zero units_balance stranded on their PromoterAllocation row —
+    # the row would keep depressing the company unallocated balance
+    # while the promoter could no longer assign. The revoke path now
+    # reclaims first, and this filter is the belt.
     rows = (await db.execute(
         select(PromoterAllocation, User)
         .join(User, User.id == PromoterAllocation.promoter_user_id)
-        .where(PromoterAllocation.client_id == client_id)
+        .join(
+            ClientPromoter,
+            (ClientPromoter.user_id == PromoterAllocation.promoter_user_id) &
+            (ClientPromoter.client_id == PromoterAllocation.client_id),
+        )
+        .where(
+            PromoterAllocation.client_id == client_id,
+            ClientPromoter.is_promoter == True,  # noqa: E712
+        )
         .order_by(User.name)
     )).all()
 
@@ -3285,13 +3370,21 @@ async def decline_payment(
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 async def _get_pool_balance(db: AsyncSession, client_id: str) -> int:
-    result = await db.execute(
-        select(
-            func.coalesce(func.sum(SubscriptionPool.units_purchased), 0) -
-            func.coalesce(func.sum(SubscriptionPool.units_consumed), 0)
-        ).where(SubscriptionPool.client_id == client_id)
-    )
-    return result.scalar() or 0
+    """Company unallocated balance — what the CA can still spend on new
+    promoter allocations. 2026-07-14: rewired to delegate to the Phase-C
+    canonical helper. Before this, the old body computed
+    `SUM(units_purchased) - SUM(units_consumed)` on SubscriptionPool
+    directly; `units_consumed` is a legacy Phase-B counter that is no
+    longer incremented (all Phase-C consumption flows through
+    `PromoterAllocation.consumed_total`), so the number silently drifted
+    into "everything ever purchased" — misleading on the CA Subscription
+    page's headline "Available Units" tile. Every remaining caller of
+    this helper — the `/subscription-pool/balance` endpoint AND the
+    balance echo in the Razorpay verify response — now reads the same
+    unallocated figure the Promoter Allocations header already shows,
+    so the two views on that page reconcile."""
+    from app.services.promoter_pool import get_company_unallocated_balance
+    return await get_company_unallocated_balance(db, client_id)
 
 
 async def _consume_pool_unit(db: AsyncSession, client_id: str):
