@@ -2289,6 +2289,14 @@ async def deactivate_promoter(
     # be re-assigned as Promoter explicitly, not via a hidden
     # side-effect of reactivation.
     cp.is_promoter = False
+    # 2026-07-14: same cascade for Promoter-Pundit — PP requires being
+    # an active Promoter (enforced at assign-time by the
+    # `promoter_pundit_requires_facilitator_promoter` gate). If we
+    # leave PP=True while Promoter=False, the CA Promoters list keeps
+    # showing the person as a functional Pundit even though queries
+    # can no longer route to them, and the flag would silently
+    # re-activate on re-onboarding.
+    cp.is_promoter_pundit = False
     await db.commit()
     return {"status": "INACTIVE"}
 
@@ -2677,6 +2685,11 @@ async def revoke_promoter(
         )
 
     cp.is_promoter = False
+    # 2026-07-14: PP requires being an active Promoter, so cascade the
+    # flag off here too. Otherwise the CA Promoters list keeps showing
+    # the person as a functional Pundit even though the Promoter role
+    # (its prerequisite) is gone.
+    cp.is_promoter_pundit = False
     cp.promoter_request_status = "NONE"
     cp.promoter_request_responded_at = datetime.now(timezone.utc)
     await db.commit()

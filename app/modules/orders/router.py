@@ -8307,6 +8307,9 @@ async def facilitator_step_down_promoter(
 
     from datetime import datetime, timezone
     cp.is_promoter = False
+    # 2026-07-14: PP requires being an active Promoter — cascade off.
+    # See the CA-side revoke_promoter for the full rationale.
+    cp.is_promoter_pundit = False
     cp.promoter_request_status = "NONE"
     cp.promoter_request_responded_at = datetime.now(timezone.utc)
     await db.commit()
@@ -8360,6 +8363,9 @@ async def dealer_step_down_promoter(
 
     from datetime import datetime, timezone
     cp.is_promoter = False
+    # 2026-07-14: PP requires being an active Promoter — cascade off.
+    # See the CA-side revoke_promoter for the full rationale.
+    cp.is_promoter_pundit = False
     cp.promoter_request_status = "NONE"
     cp.promoter_request_responded_at = datetime.now(timezone.utc)
     await db.commit()
