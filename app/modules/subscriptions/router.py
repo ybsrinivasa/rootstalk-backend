@@ -424,6 +424,7 @@ async def list_promoter_allocations(
                 "allocated_total": int(alloc.allocated_total),
                 "reclaimed_total": int(alloc.reclaimed_total),
                 "consumed_total": int(alloc.consumed_total),
+                "refunded_total": int(alloc.refunded_total or 0),
             }
             for alloc, user in rows
         ],
