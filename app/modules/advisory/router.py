@@ -2319,14 +2319,19 @@ async def list_package_variables(
     await _assert_can_view_client_advisory(db, current_user.id, client_id)
     await _get_package(db, package_id, client_id)
     rows = (await db.execute(
-        select(PackageVariable).where(PackageVariable.package_id == package_id)
-    )).scalars().all()
+        select(PackageVariable, Parameter.name, Variable.name)
+        .join(Parameter, Parameter.id == PackageVariable.parameter_id)
+        .join(Variable, Variable.id == PackageVariable.variable_id)
+        .where(PackageVariable.package_id == package_id)
+    )).all()
     return [
         {
             "parameter_id": pv.parameter_id,
+            "parameter_name": param_name,
             "variable_id": pv.variable_id,
+            "variable_name": var_name,
         }
-        for pv in rows
+        for pv, param_name, var_name in rows
     ]
 
 
@@ -5216,14 +5221,19 @@ async def list_global_package_variables(
     if pkg is None:
         raise HTTPException(status_code=404, detail="Global package not found")
     rows = (await db.execute(
-        select(PackageVariable).where(PackageVariable.package_id == pkg_id)
-    )).scalars().all()
+        select(PackageVariable, Parameter.name, Variable.name)
+        .join(Parameter, Parameter.id == PackageVariable.parameter_id)
+        .join(Variable, Variable.id == PackageVariable.variable_id)
+        .where(PackageVariable.package_id == pkg_id)
+    )).all()
     return [
         {
             "parameter_id": pv.parameter_id,
+            "parameter_name": param_name,
             "variable_id": pv.variable_id,
+            "variable_name": var_name,
         }
-        for pv in rows
+        for pv, param_name, var_name in rows
     ]
 
 
