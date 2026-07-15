@@ -501,13 +501,25 @@ async def get_brand_options(
     if phase is not None:
         def _phase_ok(b: BrandOption) -> bool:
             return brand_unit_family.get(b.cosh_id) == phase
-        group_recommended = [b for b in group_recommended if _phase_ok(b)]
-        group_my = [b for b in group_my if _phase_ok(b)]
-        group_other = [b for b in group_other if _phase_ok(b)]
-        kept = {b.cosh_id for b in
-                group_recommended + group_my + group_other}
-        brand_unit_family = {k: v for k, v in brand_unit_family.items() if k in kept}
-        units_by_brand = {k: v for k, v in units_by_brand.items() if k in kept}
+        f_recommended = [b for b in group_recommended if _phase_ok(b)]
+        f_my = [b for b in group_my if _phase_ok(b)]
+        f_other = [b for b in group_other if _phase_ok(b)]
+        # 2026-07-15 — Empty-result safety net. ~28% of brand_lookup_cache
+        # rows have NULL formulation_name (Cosh gaps), and the classifier
+        # defaults those to 'solid'. When the practice dosage is 'ml/L'
+        # (phase='liquid'), a common-name whose brands are all NULL-
+        # formulation ends up with an empty post-filter list — dealer
+        # sees no brands and can't fulfill the order. If the filter
+        # would strand the dealer, revert to unfiltered. The upstream
+        # phase-mismatch is still caught at authoring time by the
+        # volume_formula_validator; this is defence-in-depth without
+        # blocking real-world fulfillment.
+        if f_recommended or f_my or f_other:
+            group_recommended, group_my, group_other = f_recommended, f_my, f_other
+            kept = {b.cosh_id for b in
+                    group_recommended + group_my + group_other}
+            brand_unit_family = {k: v for k, v in brand_unit_family.items() if k in kept}
+            units_by_brand = {k: v for k, v in units_by_brand.items() if k in kept}
 
     return BrandOptionsResult(
         is_locked=False,
