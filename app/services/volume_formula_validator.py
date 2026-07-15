@@ -222,11 +222,18 @@ async def check_dosage_phase_vs_common_name_brands(
         # on Cosh gaps that the SA is still filling in.
         return {"verdict": VERDICT_OK, "message": None}
 
-    any_match = any(
-        _classify_formulation_to_unit_family(b.formulation_name) == dosage_phase
+    # 2026-07-15 — Passes if any brand's family matches OR is None
+    # (unclassifiable — Microbial / Botanical / Biocontrol brands
+    # have no formulation on the Cosh side, and this is authored
+    # not accidental). Only warn when every brand is a known
+    # different phase — that's the real "SE picked the wrong
+    # dosage unit for this L2's brand family" case the warning
+    # was designed to catch.
+    ok = any(
+        _classify_formulation_to_unit_family(b.formulation_name) in (dosage_phase, None)
         for b in brands
     )
-    if any_match:
+    if ok:
         return {"verdict": VERDICT_OK, "message": None}
 
     return {

@@ -138,14 +138,29 @@ import re as _fmt_re
 _FORMULATION_CODE_RE = _fmt_re.compile(r"\(([a-z]{1,5})\)")
 
 
-def _classify_formulation_to_unit_family(formulation_name: Optional[str]) -> str:
-    """`solid` | `liquid` | `discrete` based on the formulation core's
-    English name. Defaults to `solid` when unknown (matches the dominant
-    Cosh formulation set + the safer-misclassification choice for
-    granular fertilisers, which are the largest brand cohort).
+def _classify_formulation_to_unit_family(formulation_name: Optional[str]) -> Optional[str]:
+    """`solid` | `liquid` | `discrete` — or `None` when the brand
+    genuinely has no formulation to classify.
 
-    2026-07-14 — Rewritten: pesticide-industry formulation codes are
-    the authoritative signal (they encode the phase directly). Scan
+    2026-07-15 — None-return added. A large cohort of brands
+    (Microbial Pesticides, Botanical Pesticides, Insect Biocontrol
+    Agents, and similar) are authored WITHOUT a formulation on the
+    Cosh side because "formulation" as a chemistry concept doesn't
+    apply to them. Returning `solid` for those was a footgun — the
+    downstream phase filter (brand-options) and save-time warning
+    (volume_formula_validator) both compared brand family to dosage
+    phase strictly, and a `ml/L` dosage on a common-name whose
+    brands were mostly microbial dropped every one of them off the
+    dealer's screen.
+
+    The `solid` default is retained ONLY for the case where a
+    formulation NAME exists but we can't parse it (unusual / new
+    code, no keyword match) — there we bias toward the dominant
+    Cosh cohort. When the name is genuinely absent, we return None
+    and callers treat it as "unknown, don't judge".
+
+    2026-07-14 — Pesticide-industry formulation codes are the
+    authoritative signal (they encode the phase directly). Scan
     for a "(<code>)" pattern first and consult the explicit family
     map; only fall through to keyword search when no code matches.
     Liquid keywords checked before discrete so shape-like matches
@@ -153,7 +168,7 @@ def _classify_formulation_to_unit_family(formulation_name: Optional[str]) -> str
     correctly on liquid via "suspension".
     """
     if not formulation_name:
-        return "solid"
+        return None
     fmt = formulation_name.lower()
     m = _FORMULATION_CODE_RE.search(fmt)
     if m and m.group(1) in _FORMULATION_CODE_TO_FAMILY:
@@ -499,21 +514,23 @@ async def get_brand_options(
     )
     phase = _dosage_unit_phase(dosage_unit_en)
     if phase is not None:
+        # 2026-07-15 — Accept unknown-family brands (family is None)
+        # as pass-through, not drop. Microbial / Botanical / Insect
+        # Biocontrol brands legitimately have no formulation on the
+        # Cosh side; classifying them as 'solid' by default (as we
+        # did until today) was silently removing an entire cohort
+        # from the dealer's view whenever the dosage phase happened
+        # to be 'liquid'. Only strict disagreement (known family
+        # that differs from the dosage phase) filters a brand out.
         def _phase_ok(b: BrandOption) -> bool:
-            return brand_unit_family.get(b.cosh_id) == phase
+            fam = brand_unit_family.get(b.cosh_id)
+            return fam is None or fam == phase
         f_recommended = [b for b in group_recommended if _phase_ok(b)]
         f_my = [b for b in group_my if _phase_ok(b)]
         f_other = [b for b in group_other if _phase_ok(b)]
-        # 2026-07-15 — Empty-result safety net. ~28% of brand_lookup_cache
-        # rows have NULL formulation_name (Cosh gaps), and the classifier
-        # defaults those to 'solid'. When the practice dosage is 'ml/L'
-        # (phase='liquid'), a common-name whose brands are all NULL-
-        # formulation ends up with an empty post-filter list — dealer
-        # sees no brands and can't fulfill the order. If the filter
-        # would strand the dealer, revert to unfiltered. The upstream
-        # phase-mismatch is still caught at authoring time by the
-        # volume_formula_validator; this is defence-in-depth without
-        # blocking real-world fulfillment.
+        # Empty-result safety net kept as belt-and-braces — if some
+        # future data pattern still empties the list, revert to
+        # unfiltered rather than strand the dealer.
         if f_recommended or f_my or f_other:
             group_recommended, group_my, group_other = f_recommended, f_my, f_other
             kept = {b.cosh_id for b in
