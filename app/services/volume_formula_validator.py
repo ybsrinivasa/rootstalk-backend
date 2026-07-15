@@ -191,6 +191,7 @@ async def check_dosage_phase_vs_common_name_brands(
     *,
     common_name_cosh_id: Optional[str],
     dosage_unit_en: Optional[str],
+    l2: Optional[str] = None,
 ) -> dict:
     """Phase-mismatch check (2026-07-14).
 
@@ -203,10 +204,23 @@ async def check_dosage_phase_vs_common_name_brands(
     Returns `{verdict, message}`. `VERDICT_OK` when either input is
     missing (defensive — can't judge without both), when the dosage
     unit's numerator doesn't map to a family, when the common name
-    has no cached brand rows, or when at least one brand fits.
+    has no cached brand rows, when the L2 doesn't require formulation
+    at all (Microbial / Botanical / Biocontrol / Insect Traps /
+    Manures / Biofertilizers / PGR Tonics / Soil Amendments /
+    Adjuvants / Other Pesticides — 2026-07-15), or when at least
+    one brand fits.
     """
     if not common_name_cosh_id or not dosage_unit_en:
         return {"verdict": VERDICT_OK, "message": None}
+
+    # 2026-07-15 — Skip when the L2 doesn't require formulation on
+    # the Cosh side; the phase concept doesn't apply for those
+    # categories (see cosh_options_view.L2_COMPLETENESS_REQUIREMENTS).
+    if l2:
+        from app.services.cosh_options_view import L2_COMPLETENESS_REQUIREMENTS
+        l2_reqs = L2_COMPLETENESS_REQUIREMENTS.get(l2, frozenset())
+        if "formulation" not in l2_reqs:
+            return {"verdict": VERDICT_OK, "message": None}
 
     from app.services.bl07_brand_options import (
         _dosage_unit_phase, _classify_formulation_to_unit_family,
@@ -358,6 +372,7 @@ async def attach_volume_formula_warning_header(
         db,
         common_name_cosh_id=common_name_cosh_id,
         dosage_unit_en=dosage_unit,
+        l2=l2,
     )
     if phase_v["verdict"] != VERDICT_OK:
         response.headers["X-RT-Practice-Volume-Warning"] = phase_v["verdict"]

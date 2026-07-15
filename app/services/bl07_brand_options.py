@@ -513,6 +513,18 @@ async def get_brand_options(
         db, elements,
     )
     phase = _dosage_unit_phase(dosage_unit_en)
+    # 2026-07-15 — Skip the phase filter entirely for L2 categories
+    # where formulation is not a Cosh requirement (Microbial /
+    # Botanical Pesticides, Insect Biocontrol Agents, Insect Traps,
+    # Other Pesticides, Adjuvants, Manures, Biofertilizers, PGR
+    # Tonics, Soil Amendments). Under those L2s the SE cannot assign
+    # a formulation in Cosh, so the phase concept doesn't apply —
+    # the filter should never run. Even brands with legacy-populated
+    # formulation_name under these categories should be shown.
+    from app.services.cosh_options_view import L2_COMPLETENESS_REQUIREMENTS
+    l2_reqs = L2_COMPLETENESS_REQUIREMENTS.get(practice.l2_type or "", frozenset())
+    if "formulation" not in l2_reqs:
+        phase = None
     if phase is not None:
         # 2026-07-15 — Accept unknown-family brands (family is None)
         # as pass-through, not drop. Microbial / Botanical / Insect

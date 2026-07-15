@@ -5555,6 +5555,7 @@ async def check_volume_formula(
             db,
             common_name_cosh_id=common_name,
             dosage_unit_en=dosage_unit,
+            l2=l2,
         )
         if phase_v["verdict"] != VERDICT_OK:
             phase_v["measure"] = verdict.get("measure")
