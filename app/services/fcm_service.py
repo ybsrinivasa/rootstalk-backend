@@ -50,13 +50,34 @@ def _get_app():
             return None
         _app_init_attempted = True
         try:
+            import os
             import firebase_admin
+            from firebase_admin import credentials
             if firebase_admin._apps:
                 _app = firebase_admin.get_app()
-            else:
-                # initialize_app() with no args uses GOOGLE_APPLICATION_CREDENTIALS.
-                _app = firebase_admin.initialize_app()
-            logger.info("FCM initialised (Firebase Admin SDK ready).")
+                logger.info("FCM initialised (reusing existing app).")
+                return _app
+            # 2026-07-16 — Load the service-account JSON explicitly via
+            # credentials.Certificate() rather than the bare
+            # initialize_app() default. Both paths respect
+            # GOOGLE_APPLICATION_CREDENTIALS, but only Certificate
+            # extracts project_id from the JSON — the default
+            # ApplicationDefault credential leaves project_id unset
+            # and Firebase Admin errors out at send-time with
+            # "Project ID is required to access Cloud Messaging".
+            cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+            if not cred_path:
+                logger.warning(
+                    "FCM not initialised — GOOGLE_APPLICATION_CREDENTIALS "
+                    "is unset. Push notifications disabled."
+                )
+                return None
+            cred = credentials.Certificate(cred_path)
+            _app = firebase_admin.initialize_app(cred)
+            logger.info(
+                "FCM initialised (project_id=%s).",
+                cred.project_id if hasattr(cred, "project_id") else "unknown",
+            )
             return _app
         except Exception as exc:
             logger.warning(
