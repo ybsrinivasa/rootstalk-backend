@@ -119,8 +119,19 @@ async def send_fcm(
         # FCM data values must be strings. Coerce defensively so callers
         # can pass int / UUID / datetime without thinking about it.
         coerced_data = {k: str(v) for k, v in (data or {}).items()}
+        # 2026-07-16 — Data-only payload. If we include a `notification`
+        # field alongside data, some browsers render the notification
+        # automatically (using a default icon) AND also invoke our
+        # firebase-messaging-sw.js onBackgroundMessage handler which
+        # then renders a second notification with our custom icon.
+        # Result on Android Samsung Internet: two notifications per
+        # push (caught 2026-07-16, RT-26-000266). Data-only keeps the
+        # browser out of the render path so our SW is the single
+        # source of truth. The SW pulls title/body/click_action from
+        # data.* — see public/firebase-messaging-sw.js.
+        coerced_data.setdefault("title", title)
+        coerced_data.setdefault("body", body)
         message = messaging.Message(
-            notification=messaging.Notification(title=title, body=body),
             data=coerced_data,
             token=token,
         )
