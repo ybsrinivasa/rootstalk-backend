@@ -2764,6 +2764,33 @@ async def respond_to_assignment(
             pass
 
     await db.commit()
+    # 2026-07-16 — Push the promoter so they know how the farmer
+    # decided (accept unblocks advisory, reject refunds the unit).
+    # Fire-and-forget; skipped silently if promoter hasn't registered
+    # a token yet.
+    from app.services.fcm_service import send_fcm
+    promoter = (await db.execute(
+        select(User).where(User.id == assignment.promoter_user_id)
+    )).scalar_one_or_none()
+    if promoter and promoter.fcm_token:
+        if approved:
+            title = "Farmer accepted your assignment"
+            body = "The farmer accepted the subscription you offered. They can now receive advisory."
+        else:
+            title = "Farmer declined your assignment"
+            body = "The farmer declined the subscription. The unit is back in your allocation."
+        try:
+            await send_fcm(
+                token=promoter.fcm_token,
+                title=title, body=body,
+                data={
+                    "type": "ASSIGNMENT_ACCEPTED" if approved else "ASSIGNMENT_REJECTED",
+                    "subscription_id": subscription_id,
+                    "click_action": "/promoter/farmers",
+                },
+            )
+        except Exception:
+            pass
     return {"status": sub.status, "reference_number": sub.reference_number}
 
 

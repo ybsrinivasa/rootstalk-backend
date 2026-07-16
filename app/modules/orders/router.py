@@ -66,6 +66,29 @@ SUBMIT_FOR_APPROVAL_FACILITATOR_FCM_BODY = (
     "to nudge the farmer if needed."
 )
 
+# 2026-07-16 — Additional order-flow pushes (see sweep in the same
+# commit). All fire-and-forget, all skipped silently when the target
+# hasn't registered an fcm_token yet.
+DEALER_ACCEPT_FARMER_FCM_TITLE = "Your order has been accepted"
+DEALER_ACCEPT_FARMER_FCM_BODY = (
+    "The dealer has accepted your order and started processing it. "
+    "You'll be notified when it's ready for pickup."
+)
+FACILITATOR_ACCEPT_FARMER_FCM_TITLE = "Your order has been accepted"
+FACILITATOR_ACCEPT_FARMER_FCM_BODY = (
+    "The facilitator has accepted your order. They'll coordinate with "
+    "the dealer and let you know when it's ready."
+)
+PACKING_PICKED_UP_FARMER_FCM_TITLE = "Your order is on the way"
+PACKING_PICKED_UP_FARMER_FCM_BODY = (
+    "The facilitator has picked up your order from the dealer. Confirm "
+    "in RootsTalk when you receive it."
+)
+PACKING_RECEIVED_DEALER_FCM_TITLE = "Order marked received"
+PACKING_RECEIVED_DEALER_FCM_BODY = (
+    "The farmer has confirmed they received the order."
+)
+
 router = APIRouter(tags=["Orders"])
 
 
@@ -4044,10 +4067,33 @@ async def facilitator_mark_packing_picked_up(
     if not order:
         raise HTTPException(status_code=404, detail="Order not found or not yours")
     pl = await _ensure_packing_list(db, order_id)
-    if pl.picked_up_at is None:
+    was_first_pickup = pl.picked_up_at is None
+    if was_first_pickup:
         pl.picked_up_at = datetime.now(timezone.utc)
         pl.picked_up_by_user_id = current_user.id
     await db.commit()
+    # Only push on the first pickup mark — repeat calls are idempotent
+    # and shouldn't spam the farmer with duplicate notifications.
+    if was_first_pickup:
+        farmer = (await db.execute(
+            select(User).where(User.id == order.farmer_user_id)
+        )).scalar_one_or_none()
+        if farmer and farmer.fcm_token:
+            try:
+                await send_fcm(
+                    token=farmer.fcm_token,
+                    title=PACKING_PICKED_UP_FARMER_FCM_TITLE,
+                    body=PACKING_PICKED_UP_FARMER_FCM_BODY,
+                    data={
+                        "type": "ORDER_PICKED_UP_BY_FACILITATOR",
+                        "order_id": order.id,
+                        "click_action": f"/crop-detail/{order.subscription_id}/orders",
+                    },
+                )
+            except Exception as e:
+                _orders_logger.error(
+                    f"FCM send raised unexpectedly for farmer {farmer.id}: {e}"
+                )
     return {
         "order_id": order_id,
         "picked_up_at": pl.picked_up_at.isoformat() if pl.picked_up_at else None,
@@ -4080,12 +4126,38 @@ async def farmer_mark_packing_received(
         raise HTTPException(status_code=404, detail="Order not found or not yours")
     pl = await _ensure_packing_list(db, order_id)
     now_utc = datetime.now(timezone.utc)
+    was_first_receive = pl.farmer_received_at is None
     if pl.picked_up_at is None:
         pl.picked_up_at = now_utc
         pl.picked_up_by_user_id = current_user.id
-    if pl.farmer_received_at is None:
+    if was_first_receive:
         pl.farmer_received_at = now_utc
     await db.commit()
+    # Close the loop by pushing the dealer (and facilitator if there
+    # is one). Idempotent on farmer_received_at so re-taps don't spam.
+    if was_first_receive:
+        recipient_user_ids = [uid for uid in (order.dealer_user_id, order.facilitator_user_id) if uid]
+        if recipient_user_ids:
+            recipients = (await db.execute(
+                select(User).where(User.id.in_(recipient_user_ids))
+            )).scalars().all()
+            for u in recipients:
+                if not u.fcm_token:
+                    continue
+                try:
+                    await send_fcm(
+                        token=u.fcm_token,
+                        title=PACKING_RECEIVED_DEALER_FCM_TITLE,
+                        body=PACKING_RECEIVED_DEALER_FCM_BODY,
+                        data={
+                            "type": "ORDER_RECEIVED_BY_FARMER",
+                            "order_id": order.id,
+                        },
+                    )
+                except Exception as e:
+                    _orders_logger.error(
+                        f"FCM send raised unexpectedly for user {u.id}: {e}"
+                    )
     return {
         "order_id": order_id,
         "picked_up_at": pl.picked_up_at.isoformat() if pl.picked_up_at else None,
@@ -6436,6 +6508,27 @@ async def accept_order(
         new_status=OrderStatus.PROCESSING.value,
     )
     await db.commit()
+    # Push the farmer that dealer has accepted; the farmer's next
+    # action is to wait for packing / pickup so no CTA in the body.
+    farmer = (await db.execute(
+        select(User).where(User.id == order.farmer_user_id)
+    )).scalar_one_or_none()
+    if farmer and farmer.fcm_token:
+        try:
+            await send_fcm(
+                token=farmer.fcm_token,
+                title=DEALER_ACCEPT_FARMER_FCM_TITLE,
+                body=DEALER_ACCEPT_FARMER_FCM_BODY,
+                data={
+                    "type": "ORDER_ACCEPTED_BY_DEALER",
+                    "order_id": order.id,
+                    "click_action": f"/crop-detail/{order.subscription_id}/orders",
+                },
+            )
+        except Exception as e:
+            _orders_logger.error(
+                f"FCM send raised unexpectedly for farmer {farmer.id}: {e}"
+            )
     return {"order_id": order_id, "status": order.status}
 
 
@@ -8754,6 +8847,26 @@ async def facilitator_accept_order(
         raise HTTPException(status_code=400, detail="Order can only be accepted when in SENT status")
     order.status = OrderStatus.ACCEPTED
     await db.commit()
+    # Push farmer so they know the facilitator picked up their order.
+    farmer = (await db.execute(
+        select(User).where(User.id == order.farmer_user_id)
+    )).scalar_one_or_none()
+    if farmer and farmer.fcm_token:
+        try:
+            await send_fcm(
+                token=farmer.fcm_token,
+                title=FACILITATOR_ACCEPT_FARMER_FCM_TITLE,
+                body=FACILITATOR_ACCEPT_FARMER_FCM_BODY,
+                data={
+                    "type": "ORDER_ACCEPTED_BY_FACILITATOR",
+                    "order_id": order.id,
+                    "click_action": f"/crop-detail/{order.subscription_id}/orders",
+                },
+            )
+        except Exception as e:
+            _orders_logger.error(
+                f"FCM send raised unexpectedly for farmer {farmer.id}: {e}"
+            )
     return {"order_id": order_id, "status": order.status}
 
 

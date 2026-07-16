@@ -1284,6 +1284,29 @@ async def respond_to_query(
         await _trigger_qa_for_query(db, query, data["standard_response_id"])
 
     await db.commit()
+    # 2026-07-16 — Push the farmer that an expert has replied. This is
+    # the high-signal moment in the query loop — without it, farmers
+    # end up checking the Queries tile repeatedly. Fire-and-forget;
+    # skipped silently when the farmer hasn't registered a token yet.
+    from app.services.fcm_service import send_fcm
+    farmer = (await db.execute(
+        select(User).where(User.id == query.farmer_user_id)
+    )).scalar_one_or_none()
+    if farmer and farmer.fcm_token:
+        try:
+            await send_fcm(
+                token=farmer.fcm_token,
+                title="An expert replied to your query",
+                body="Tap to read the response.",
+                data={
+                    "type": "QUERY_RESPONDED",
+                    "query_id": query.id,
+                    "subscription_id": query.subscription_id,
+                    "click_action": f"/crop-detail/{query.subscription_id}/queries",
+                },
+            )
+        except Exception:
+            pass
     return {"status": "RESPONDED", "response_id": response.id}
 
 
@@ -1456,6 +1479,31 @@ async def forward_query(
     query.status = QueryStatus.FORWARDED
     query.current_holder_id = data["to_pundit_id"]
     await db.commit()
+    # 2026-07-16 — Push the receiving pundit — the query is now
+    # sitting on their plate. Without this, a forward silently lands
+    # in their /pundit/queries list and they may not check for hours.
+    from app.services.fcm_service import send_fcm
+    to_profile = (await db.execute(
+        select(FarmPunditProfile).where(FarmPunditProfile.id == data["to_pundit_id"])
+    )).scalar_one_or_none()
+    if to_profile:
+        to_user = (await db.execute(
+            select(User).where(User.id == to_profile.user_id)
+        )).scalar_one_or_none()
+        if to_user and to_user.fcm_token:
+            try:
+                await send_fcm(
+                    token=to_user.fcm_token,
+                    title="A query was forwarded to you",
+                    body="Tap to review and respond.",
+                    data={
+                        "type": "QUERY_FORWARDED",
+                        "query_id": query.id,
+                        "click_action": f"/pundit/queries/{query.id}",
+                    },
+                )
+            except Exception:
+                pass
     return {"status": "FORWARDED"}
 
 

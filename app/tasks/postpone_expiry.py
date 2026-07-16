@@ -27,12 +27,23 @@ from sqlalchemy import select
 from app.celery_app import celery_app
 from app.database import AsyncSessionLocal
 from app.modules.orders.models import (
-    OrderItem, OrderItemEvent, OrderItemStatus,
+    Order, OrderItem, OrderItemEvent, OrderItemStatus,
 )
+from app.modules.platform.models import User
 from app.modules.seed_mgmt.models import SeedOrderFull, SeedOrderStatus
+from app.services.fcm_service import send_fcm
 from app.services.order_events import record_event
 
 logger = logging.getLogger(__name__)
+
+# 2026-07-16 — Push the farmer that a postponed item's clock ran
+# out, so they know to visit the Returned & Rerouting list before
+# the crop stage passes.
+POSTPONE_EXPIRED_FCM_TITLE = "A postponed item is now unavailable"
+POSTPONE_EXPIRED_FCM_BODY = (
+    "The dealer didn't fulfill a postponed item in time. Reroute it "
+    "in RootsTalk to keep the item moving."
+)
 
 
 async def _sweep_expired_postpones_with_session(db, now=None) -> int:
@@ -102,6 +113,38 @@ async def _sweep_expired_postpones_with_session(db, now=None) -> int:
     if flipped:
         await db.commit()
         logger.info(f"Orders V2: flipped {flipped} expired postpones to NOT_AVAILABLE")
+        # Push each affected farmer once per sweep. Dedupe by
+        # order/seed-order → farmer so a batch flip on the same
+        # order doesn't multi-push.
+        order_ids = list({i.order_id for i in items}) if items else []
+        seed_farmer_ids = list({so.farmer_user_id for so in seed_rows}) if seed_rows else []
+        item_farmer_ids: list[str] = []
+        if order_ids:
+            orders_by_id = {
+                o.id: o for o in (await db.execute(
+                    select(Order).where(Order.id.in_(order_ids))
+                )).scalars().all()
+            }
+            item_farmer_ids = list({
+                o.farmer_user_id for o in orders_by_id.values() if o
+            })
+        farmer_ids = list({*item_farmer_ids, *seed_farmer_ids})
+        if farmer_ids:
+            farmers = (await db.execute(
+                select(User).where(User.id.in_(farmer_ids))
+            )).scalars().all()
+            for f in farmers:
+                if not f.fcm_token:
+                    continue
+                try:
+                    await send_fcm(
+                        token=f.fcm_token,
+                        title=POSTPONE_EXPIRED_FCM_TITLE,
+                        body=POSTPONE_EXPIRED_FCM_BODY,
+                        data={"type": "POSTPONE_EXPIRED"},
+                    )
+                except Exception as e:
+                    logger.error(f"FCM send raised for farmer {f.id}: {e}")
     return flipped
 
 
