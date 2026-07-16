@@ -53,10 +53,15 @@ _orders_logger = logging.getLogger(__name__)
 
 # BL-14 spec: facilitator gets the FCM "your farmer needs to approve"
 # alert when the dealer submits volumes/prices for farmer approval.
-# The farmer drives the actual approve/reject decision; the
-# facilitator's role is to nudge the farmer if they delay.
-SUBMIT_FOR_APPROVAL_FCM_TITLE = "Your farmer needs to approve"
-SUBMIT_FOR_APPROVAL_FCM_BODY = (
+# The farmer is the actor (they approve/reject); the facilitator
+# gets a courtesy nudge to help follow up if the farmer delays.
+SUBMIT_FOR_APPROVAL_FARMER_FCM_TITLE = "Your order needs your approval"
+SUBMIT_FOR_APPROVAL_FARMER_FCM_BODY = (
+    "The dealer has sent volumes and prices for your review. "
+    "Open RootsTalk to approve or return items."
+)
+SUBMIT_FOR_APPROVAL_FACILITATOR_FCM_TITLE = "Your farmer needs to approve"
+SUBMIT_FOR_APPROVAL_FACILITATOR_FCM_BODY = (
     "The dealer has sent volume and pricing for an order. Open RootsTalk "
     "to nudge the farmer if needed."
 )
@@ -3716,13 +3721,33 @@ async def submit_for_approval(
     order.status = OrderStatus.SENT_FOR_APPROVAL
     await db.commit()
 
-    # BL-14 / FCM Batch 4 (2026-05-06): notify the facilitator that
-    # the farmer needs to approve. Skipped silently if no facilitator
-    # is assigned to the order (direct dealer ↔ farmer flow with no
-    # intermediary), or if the facilitator hasn't registered an
-    # fcm_token. Spec is explicit that the FCM goes to the
-    # facilitator only — the farmer drives the actual approve /
-    # reject through the PWA.
+    # BL-14: push the farmer first — they're the actor whose
+    # approval is required. If a facilitator is assigned, push them
+    # too as a courtesy nudge. Both branches are skipped silently
+    # if the target hasn't registered an fcm_token yet. 2026-07-16:
+    # farmer branch added; previously only the facilitator was
+    # notified, which meant direct dealer↔farmer orders (no
+    # facilitator on the order) sent no push at all and the farmer
+    # never knew there was something to approve.
+    farmer = (await db.execute(
+        select(User).where(User.id == order.farmer_user_id)
+    )).scalar_one_or_none()
+    if farmer and farmer.fcm_token:
+        try:
+            await send_fcm(
+                token=farmer.fcm_token,
+                title=SUBMIT_FOR_APPROVAL_FARMER_FCM_TITLE,
+                body=SUBMIT_FOR_APPROVAL_FARMER_FCM_BODY,
+                data={
+                    "type": "ORDER_AWAITING_FARMER_APPROVAL",
+                    "order_id": order.id,
+                    "click_action": f"/crop-detail/{order.subscription_id}/orders",
+                },
+            )
+        except Exception as e:
+            _orders_logger.error(
+                f"FCM send raised unexpectedly for farmer {farmer.id}: {e}"
+            )
     if order.facilitator_user_id:
         facilitator = (await db.execute(
             select(User).where(User.id == order.facilitator_user_id)
@@ -3731,8 +3756,8 @@ async def submit_for_approval(
             try:
                 await send_fcm(
                     token=facilitator.fcm_token,
-                    title=SUBMIT_FOR_APPROVAL_FCM_TITLE,
-                    body=SUBMIT_FOR_APPROVAL_FCM_BODY,
+                    title=SUBMIT_FOR_APPROVAL_FACILITATOR_FCM_TITLE,
+                    body=SUBMIT_FOR_APPROVAL_FACILITATOR_FCM_BODY,
                     data={
                         "type": "ORDER_AWAITING_FARMER_APPROVAL",
                         "order_id": order.id,
