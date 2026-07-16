@@ -56,38 +56,49 @@ _orders_logger = logging.getLogger(__name__)
 # The farmer is the actor (they approve/reject); the facilitator
 # gets a courtesy nudge to help follow up if the farmer delays.
 SUBMIT_FOR_APPROVAL_FARMER_FCM_TITLE = "Your order needs your approval"
-SUBMIT_FOR_APPROVAL_FARMER_FCM_BODY = (
-    "The dealer has sent volumes and prices for your review. "
+SUBMIT_FOR_APPROVAL_FARMER_FCM_BODY_TPL = (
+    "The dealer has sent volumes and prices for order {ref}. "
     "Open RootsTalk to approve or return items."
 )
 SUBMIT_FOR_APPROVAL_FACILITATOR_FCM_TITLE = "Your farmer needs to approve"
-SUBMIT_FOR_APPROVAL_FACILITATOR_FCM_BODY = (
-    "The dealer has sent volume and pricing for an order. Open RootsTalk "
-    "to nudge the farmer if needed."
+SUBMIT_FOR_APPROVAL_FACILITATOR_FCM_BODY_TPL = (
+    "The dealer has sent volume and pricing for order {ref}. "
+    "Open RootsTalk to nudge the farmer if needed."
 )
 
 # 2026-07-16 — Additional order-flow pushes (see sweep in the same
 # commit). All fire-and-forget, all skipped silently when the target
 # hasn't registered an fcm_token yet.
+# Templates use {ref} for the order's reference_number so every
+# push identifies WHICH order it's about — a farmer or dealer with
+# several open orders would otherwise not be able to tell them
+# apart from the title alone.
 DEALER_ACCEPT_FARMER_FCM_TITLE = "Your order has been accepted"
-DEALER_ACCEPT_FARMER_FCM_BODY = (
-    "The dealer has accepted your order and started processing it. "
+DEALER_ACCEPT_FARMER_FCM_BODY_TPL = (
+    "The dealer has accepted order {ref} and started processing it. "
     "You'll be notified when it's ready for pickup."
 )
 FACILITATOR_ACCEPT_FARMER_FCM_TITLE = "Your order has been accepted"
-FACILITATOR_ACCEPT_FARMER_FCM_BODY = (
-    "The facilitator has accepted your order. They'll coordinate with "
-    "the dealer and let you know when it's ready."
+FACILITATOR_ACCEPT_FARMER_FCM_BODY_TPL = (
+    "The facilitator has accepted order {ref}. They'll coordinate "
+    "with the dealer and let you know when it's ready."
 )
 PACKING_PICKED_UP_FARMER_FCM_TITLE = "Your order is on the way"
-PACKING_PICKED_UP_FARMER_FCM_BODY = (
-    "The facilitator has picked up your order from the dealer. Confirm "
-    "in RootsTalk when you receive it."
+PACKING_PICKED_UP_FARMER_FCM_BODY_TPL = (
+    "The facilitator has picked up order {ref} from the dealer. "
+    "Confirm in RootsTalk when you receive it."
 )
 PACKING_RECEIVED_DEALER_FCM_TITLE = "Order marked received"
-PACKING_RECEIVED_DEALER_FCM_BODY = (
-    "The farmer has confirmed they received the order."
+PACKING_RECEIVED_DEALER_FCM_BODY_TPL = (
+    "The farmer has confirmed they received order {ref}."
 )
+
+
+def _fmt_order_body(template: str, order) -> str:
+    """Fill {ref} with the order's reference_number when present;
+    otherwise drop the placeholder cleanly (older orders may not
+    have a reference)."""
+    return template.format(ref=order.reference_number or "").replace(" .", ".").replace("  ", " ").strip()
 
 router = APIRouter(tags=["Orders"])
 
@@ -1853,6 +1864,42 @@ async def send_draft_order(
     )
 
     await db.commit()
+    # 2026-07-16 — Push the recipient (dealer OR facilitator, whichever
+    # the farmer just routed to). Copy includes farmer name + reference
+    # number so the recipient recognises WHICH farmer / WHICH order the
+    # push refers to — a bare "New order" would be ambiguous for a
+    # dealer serving many farmers.
+    recipient_id = order.dealer_user_id or order.facilitator_user_id
+    if recipient_id:
+        recipient = (await db.execute(
+            select(User).where(User.id == recipient_id)
+        )).scalar_one_or_none()
+        if recipient and recipient.fcm_token:
+            farmer_name = current_user.name or "a farmer"
+            ref = order.reference_number or ""
+            try:
+                await send_fcm(
+                    token=recipient.fcm_token,
+                    title=f"New order from {farmer_name}",
+                    body=(
+                        f"{ref}. Review the items and share volumes and prices."
+                        if ref else "Review the items and share volumes and prices."
+                    ),
+                    data={
+                        "type": "ORDER_SENT_TO_RECIPIENT",
+                        "order_id": order.id,
+                        "farmer_name": farmer_name,
+                        "click_action": (
+                            f"/dealer/orders/{order.id}"
+                            if order.dealer_user_id
+                            else f"/facilitator/orders/{order.id}"
+                        ),
+                    },
+                )
+            except Exception as e:
+                _orders_logger.error(
+                    f"FCM send raised unexpectedly for recipient {recipient.id}: {e}"
+                )
     return {
         "status": order.status,
         "dealer_user_id": order.dealer_user_id,
@@ -3760,7 +3807,7 @@ async def submit_for_approval(
             await send_fcm(
                 token=farmer.fcm_token,
                 title=SUBMIT_FOR_APPROVAL_FARMER_FCM_TITLE,
-                body=SUBMIT_FOR_APPROVAL_FARMER_FCM_BODY,
+                body=_fmt_order_body(SUBMIT_FOR_APPROVAL_FARMER_FCM_BODY_TPL, order),
                 data={
                     "type": "ORDER_AWAITING_FARMER_APPROVAL",
                     "order_id": order.id,
@@ -3780,7 +3827,7 @@ async def submit_for_approval(
                 await send_fcm(
                     token=facilitator.fcm_token,
                     title=SUBMIT_FOR_APPROVAL_FACILITATOR_FCM_TITLE,
-                    body=SUBMIT_FOR_APPROVAL_FACILITATOR_FCM_BODY,
+                    body=_fmt_order_body(SUBMIT_FOR_APPROVAL_FACILITATOR_FCM_BODY_TPL, order),
                     data={
                         "type": "ORDER_AWAITING_FARMER_APPROVAL",
                         "order_id": order.id,
@@ -4083,7 +4130,7 @@ async def facilitator_mark_packing_picked_up(
                 await send_fcm(
                     token=farmer.fcm_token,
                     title=PACKING_PICKED_UP_FARMER_FCM_TITLE,
-                    body=PACKING_PICKED_UP_FARMER_FCM_BODY,
+                    body=_fmt_order_body(PACKING_PICKED_UP_FARMER_FCM_BODY_TPL, order),
                     data={
                         "type": "ORDER_PICKED_UP_BY_FACILITATOR",
                         "order_id": order.id,
@@ -4148,7 +4195,7 @@ async def farmer_mark_packing_received(
                     await send_fcm(
                         token=u.fcm_token,
                         title=PACKING_RECEIVED_DEALER_FCM_TITLE,
-                        body=PACKING_RECEIVED_DEALER_FCM_BODY,
+                        body=_fmt_order_body(PACKING_RECEIVED_DEALER_FCM_BODY_TPL, order),
                         data={
                             "type": "ORDER_RECEIVED_BY_FARMER",
                             "order_id": order.id,
@@ -6518,7 +6565,7 @@ async def accept_order(
             await send_fcm(
                 token=farmer.fcm_token,
                 title=DEALER_ACCEPT_FARMER_FCM_TITLE,
-                body=DEALER_ACCEPT_FARMER_FCM_BODY,
+                body=_fmt_order_body(DEALER_ACCEPT_FARMER_FCM_BODY_TPL, order),
                 data={
                     "type": "ORDER_ACCEPTED_BY_DEALER",
                     "order_id": order.id,
@@ -8856,7 +8903,7 @@ async def facilitator_accept_order(
             await send_fcm(
                 token=farmer.fcm_token,
                 title=FACILITATOR_ACCEPT_FARMER_FCM_TITLE,
-                body=FACILITATOR_ACCEPT_FARMER_FCM_BODY,
+                body=_fmt_order_body(FACILITATOR_ACCEPT_FARMER_FCM_BODY_TPL, order),
                 data={
                     "type": "ORDER_ACCEPTED_BY_FACILITATOR",
                     "order_id": order.id,

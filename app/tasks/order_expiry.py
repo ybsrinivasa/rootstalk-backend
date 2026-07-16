@@ -61,10 +61,16 @@ async def _run():
                 if not farmer or not farmer.fcm_token:
                     continue
                 try:
+                    ref = order.reference_number or ""
+                    body = (
+                        f"Order {ref} has expired after 14 days without dealer action. "
+                        "Re-route the items in RootsTalk to keep them moving."
+                        if ref else EXPIRY_FCM_BODY
+                    )
                     await send_fcm(
                         token=farmer.fcm_token,
                         title=EXPIRY_FCM_TITLE,
-                        body=EXPIRY_FCM_BODY,
+                        body=body,
                         data={
                             "type": "ORDER_EXPIRED",
                             "order_id": order.id,
