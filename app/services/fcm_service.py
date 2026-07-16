@@ -65,7 +65,13 @@ def _get_app():
             # ApplicationDefault credential leaves project_id unset
             # and Firebase Admin errors out at send-time with
             # "Project ID is required to access Cloud Messaging".
+            # Try os.environ first (Docker / systemd usually inject
+            # here), fall back to Settings.google_application_credentials
+            # which reads .env directly via pydantic-settings.
             cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+            if not cred_path:
+                from app.config import settings
+                cred_path = settings.google_application_credentials or None
             if not cred_path:
                 logger.warning(
                     "FCM not initialised — GOOGLE_APPLICATION_CREDENTIALS "

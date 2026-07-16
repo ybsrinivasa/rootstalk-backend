@@ -73,6 +73,12 @@ class Settings(BaseSettings):
 
     # FCM
     fcm_server_key: str = ""
+    # 2026-07-16 — Path to the Firebase service-account JSON. Declared
+    # here (not just left as a raw .env line) so pydantic-settings
+    # actually reads it — undeclared .env keys are silently dropped
+    # and never reach os.environ, which is what firebase_admin needs
+    # to auto-discover the credential.
+    google_application_credentials: str = ""
 
     # SMS (Draft4SMS — phone OTP for PWA)
     draft_sms_key: str = ""
