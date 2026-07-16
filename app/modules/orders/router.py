@@ -100,6 +100,48 @@ def _fmt_order_body(template: str, order) -> str:
     have a reference)."""
     return template.format(ref=order.reference_number or "").replace(" .", ".").replace("  ", " ").strip()
 
+
+async def _push_order_sent_recipient(db, order, farmer_name: str) -> None:
+    """Notify whichever party — dealer or facilitator — the farmer
+    routed this order to. Called from every code path that transitions
+    an order INTO OrderStatus.SENT (three born-SENT create paths plus
+    the DRAFT → SENT endpoint), so a bare `POST /farmer/orders` push
+    reaches the recipient the same way `/farmer/orders/{id}/send`
+    does. Fire-and-forget; skipped silently if the recipient hasn't
+    registered an fcm_token."""
+    recipient_id = order.dealer_user_id or order.facilitator_user_id
+    if not recipient_id:
+        return
+    recipient = (await db.execute(
+        select(User).where(User.id == recipient_id)
+    )).scalar_one_or_none()
+    if not recipient or not recipient.fcm_token:
+        return
+    ref = order.reference_number or ""
+    try:
+        await send_fcm(
+            token=recipient.fcm_token,
+            title=f"New order from {farmer_name or 'a farmer'}",
+            body=(
+                f"{ref}. Review the items and share volumes and prices."
+                if ref else "Review the items and share volumes and prices."
+            ),
+            data={
+                "type": "ORDER_SENT_TO_RECIPIENT",
+                "order_id": order.id,
+                "farmer_name": farmer_name or "",
+                "click_action": (
+                    f"/dealer/orders/{order.id}"
+                    if order.dealer_user_id
+                    else f"/facilitator/orders/{order.id}"
+                ),
+            },
+        )
+    except Exception as e:
+        _orders_logger.error(
+            f"FCM send raised unexpectedly for recipient {recipient.id}: {e}"
+        )
+
 router = APIRouter(tags=["Orders"])
 
 
@@ -365,6 +407,10 @@ async def create_order(
     except Exception:
         pass
 
+    # This create endpoint births the order directly in SENT — the
+    # PWA calls it with dealer_user_id / facilitator_user_id set, no
+    # DRAFT step. Push the recipient the same way /send does.
+    await _push_order_sent_recipient(db, order, current_user.name or "a farmer")
     return {"id": order.id, "status": order.status}
 
 
@@ -1718,6 +1764,9 @@ async def create_dbs_bulk_order(
 
     await db.commit()
     await db.refresh(order)
+    # DBS-bulk endpoint also births the order in SENT (like
+    # create_order); same recipient push applies.
+    await _push_order_sent_recipient(db, order, current_user.name or "a farmer")
     return {
         "id": order.id,
         "status": order.status,
@@ -1864,42 +1913,7 @@ async def send_draft_order(
     )
 
     await db.commit()
-    # 2026-07-16 — Push the recipient (dealer OR facilitator, whichever
-    # the farmer just routed to). Copy includes farmer name + reference
-    # number so the recipient recognises WHICH farmer / WHICH order the
-    # push refers to — a bare "New order" would be ambiguous for a
-    # dealer serving many farmers.
-    recipient_id = order.dealer_user_id or order.facilitator_user_id
-    if recipient_id:
-        recipient = (await db.execute(
-            select(User).where(User.id == recipient_id)
-        )).scalar_one_or_none()
-        if recipient and recipient.fcm_token:
-            farmer_name = current_user.name or "a farmer"
-            ref = order.reference_number or ""
-            try:
-                await send_fcm(
-                    token=recipient.fcm_token,
-                    title=f"New order from {farmer_name}",
-                    body=(
-                        f"{ref}. Review the items and share volumes and prices."
-                        if ref else "Review the items and share volumes and prices."
-                    ),
-                    data={
-                        "type": "ORDER_SENT_TO_RECIPIENT",
-                        "order_id": order.id,
-                        "farmer_name": farmer_name,
-                        "click_action": (
-                            f"/dealer/orders/{order.id}"
-                            if order.dealer_user_id
-                            else f"/facilitator/orders/{order.id}"
-                        ),
-                    },
-                )
-            except Exception as e:
-                _orders_logger.error(
-                    f"FCM send raised unexpectedly for recipient {recipient.id}: {e}"
-                )
+    await _push_order_sent_recipient(db, order, current_user.name or "a farmer")
     return {
         "status": order.status,
         "dealer_user_id": order.dealer_user_id,
@@ -9348,6 +9362,16 @@ async def facilitator_reroute_returned(
 
     await _update_order_status(db, order.id)
     await db.commit()
+    # Facilitator-driven reroute births a new order in SENT with the
+    # picked dealer as recipient; farmer name lookup keeps the copy
+    # consistent with the farmer-initiated push.
+    farmer = (await db.execute(
+        select(User).where(User.id == new_order.farmer_user_id)
+    )).scalar_one_or_none()
+    await _push_order_sent_recipient(
+        db, new_order,
+        (farmer.name if farmer else None) or "a farmer",
+    )
     return {
         "new_order_id": new_order.id,
         "rerouted_count": len(items_to_reroute),
