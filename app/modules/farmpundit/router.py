@@ -2388,13 +2388,45 @@ async def deactivate_company_pundit(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Deactivate a FarmPundit from this company. They keep active queries until resolved."""
+    """Deactivate a FarmPundit from this company. They keep active queries until resolved.
+
+    2026-07-16 — Refuses the request when this Pundit is the last ACTIVE
+    Primary at the client. The farmer PWA needs at least one Primary to
+    route new queries to; if a client's last Primary silently went
+    INACTIVE, every farmer query would 422 with
+    `no_primary_expert_available` and the query-tile would render as
+    "No expert yet". Enforced here rather than only in the UI so a
+    tampered client / a race between two portal users can't slip past.
+    Change-role Primary→Panel and delete are both gated on INACTIVE
+    already, so this single check covers all three surfaces.
+    """
     await _assert_portal_member(db, current_user.id, client_id)
     cp = (await db.execute(
         select(ClientFarmPundit).where(ClientFarmPundit.id == cp_id, ClientFarmPundit.client_id == client_id)
     )).scalar_one_or_none()
     if not cp:
         raise HTTPException(status_code=404, detail="Company pundit not found")
+    if cp.role == PunditRole.PRIMARY and cp.status == "ACTIVE":
+        other_active_primary = (await db.execute(
+            select(ClientFarmPundit.id).where(
+                ClientFarmPundit.client_id == client_id,
+                ClientFarmPundit.role == PunditRole.PRIMARY,
+                ClientFarmPundit.status == "ACTIVE",
+                ClientFarmPundit.id != cp_id,
+            ).limit(1)
+        )).scalar_one_or_none()
+        if other_active_primary is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "last_primary_expert_required",
+                    "message": (
+                        "This is your company's only active Primary expert. "
+                        "Onboard another Primary before deactivating this one — "
+                        "your farmers need at least one Primary to send queries to."
+                    ),
+                },
+            )
     cp.status = "INACTIVE"
     await db.commit()
     return {"status": "INACTIVE"}
