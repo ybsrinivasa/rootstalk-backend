@@ -1928,6 +1928,67 @@ async def update_client_profile(
 
 # ── Field Manager: Dealers and Facilitators ────────────────────────────────────
 
+async def _assert_ca_or_field_manager(
+    db: AsyncSession, user: User, client_id: str,
+) -> None:
+    """Role gate on every /client/{cid}/field-manager/* endpoint.
+
+    2026-07-20 — Before this, the FM endpoints had NO auth check at
+    all: any authenticated user (PM, SE, REPORT_USER, even users
+    not enrolled on this client) could hit them if they knew the
+    URL. Caught during the "PM has FM privileges too" audit.
+
+    Allowed:
+      - SA (global email match) — always.
+      - CA of this client — always; supersedes every other role.
+      - FIELD_MANAGER of this client — the intended role.
+      - CM with EDIT rights on this client — per project convention
+        "CM has all privileges inside the client (CA, SE, and all
+        other roles)"; same shape as the QR gate.
+
+    Rejected (403 field_manager_role_required):
+      - PRODUCT_MANAGER, SUBJECT_EXPERT, CLIENT_RM, REPORT_USER,
+        SEED_DATA_MANAGER (legacy), anyone not enrolled on this
+        client. CLIENT_RM was scoped to Alerts only per user
+        direction 2026-07-20 — they no longer manage dealers.
+    """
+    if bool(settings.sa_email) and user.email == settings.sa_email:
+        return
+    role_row = (await db.execute(
+        select(ClientUser.role).where(
+            ClientUser.client_id == client_id,
+            ClientUser.user_id == user.id,
+            ClientUser.status == StatusEnum.ACTIVE,
+            ClientUser.role.in_([
+                ClientUserRole.CA, ClientUserRole.FIELD_MANAGER,
+            ]),
+        ).limit(1)
+    )).scalar_one_or_none()
+    if role_row is not None:
+        return
+    cm_edit = (await db.execute(
+        select(CMClientAssignment.id).where(
+            CMClientAssignment.cm_user_id == user.id,
+            CMClientAssignment.client_id == client_id,
+            CMClientAssignment.status == StatusEnum.ACTIVE,
+            CMClientAssignment.rights == CMRights.EDIT,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if cm_edit is not None:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "code": "field_manager_role_required",
+            "message": (
+                "Dealer and Facilitator management is restricted to "
+                "Customer Admin, Field Manager, or CM (edit). Ask "
+                "your CA to assign one of these roles at this client."
+            ),
+        },
+    )
+
+
 @router.get("/client/{client_id}/field-manager/promoters")
 async def list_promoters(
     client_id: str,
@@ -1935,6 +1996,7 @@ async def list_promoters(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_ca_or_field_manager(db, current_user, client_id)
     from app.modules.orders.models import DealerProfile
 
     q = select(ClientPromoter, User).join(User, User.id == ClientPromoter.user_id).where(
@@ -2020,6 +2082,7 @@ async def register_promoter(
       - The Facilitator-Promoter exclusivity rule from §11.2 still
         applies (see block below).
     """
+    await _assert_ca_or_field_manager(db, current_user, client_id)
     from app.modules.platform.models import RoleType, UserRole
 
     phone = request.get("phone")
@@ -2275,6 +2338,7 @@ async def deactivate_promoter(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _assert_ca_or_field_manager(db, current_user, client_id)
     cp = (await db.execute(
         select(ClientPromoter).where(ClientPromoter.id == promoter_id, ClientPromoter.client_id == client_id)
     )).scalar_one_or_none()
@@ -2311,6 +2375,7 @@ async def reactivate_promoter(
     """Inverse of deactivate — flip status back to ACTIVE so the
     promoter can resume assigning packages. Same Promoter user_id;
     same ClientPromoter row, no re-onboarding needed."""
+    await _assert_ca_or_field_manager(db, current_user, client_id)
     cp = (await db.execute(
         select(ClientPromoter).where(
             ClientPromoter.id == promoter_id,
@@ -2361,6 +2426,7 @@ async def fm_toggle_promoter_pundit(
     Single-company PP constraint (2026-06-23): also refuses if the
     user is already PROMOTER_PUNDIT at another client.
     """
+    await _assert_ca_or_field_manager(db, current_user, client_id)
     from app.modules.farmpundit.models import (
         ClientFarmPundit, FarmPunditProfile, PunditRole,
     )
@@ -2558,6 +2624,7 @@ async def request_promoter(
     (for facilitator until one accepts; for dealer all may be
     accepted independently).
     """
+    await _assert_ca_or_field_manager(db, current_user, client_id)
     cp = (await db.execute(
         select(ClientPromoter).where(
             ClientPromoter.id == promoter_id,
@@ -2651,6 +2718,7 @@ async def revoke_promoter(
     The Facilitator-onboarding link itself (the row's existence and
     its `status='ACTIVE'`) is NOT touched. To end the onboarding
     relationship, use the `deactivate_promoter` endpoint."""
+    await _assert_ca_or_field_manager(db, current_user, client_id)
     cp = (await db.execute(
         select(ClientPromoter).where(
             ClientPromoter.id == promoter_id,
@@ -2712,6 +2780,7 @@ async def list_client_farmers(
     current_user: User = Depends(get_current_user),
 ):
     """List all farmers who have subscriptions with this client."""
+    await _assert_ca_or_field_manager(db, current_user, client_id)
     from app.modules.subscriptions.models import Subscription
     result = await db.execute(
         select(Subscription, User)
