@@ -51,7 +51,17 @@ async def _check_client_user(db: AsyncSession, user: User, short_name: str) -> C
     the issued JWT to this client_id (tenant isolation — see
     `_build_token` and `get_current_user`)."""
     client = (await db.execute(
-        select(Client).where(Client.short_name == short_name.lower(), Client.status == ClientStatus.ACTIVE)
+        select(Client).where(
+            Client.short_name == short_name.lower(),
+            Client.status == ClientStatus.ACTIVE,
+            # 2026-07-24 — Portal login must never resolve to a training
+            # child. Training clients have synthetic short_names like
+            # 'TR<hex>' and no ClientUser rows (the parent's CA acts on
+            # them via CA endpoints), so a match is either accidental
+            # or an attack surface. Real login flows use the parent's
+            # short_name.
+            Client.is_training.is_(False),
+        )
     )).scalar_one_or_none()
     if not client:
         raise HTTPException(status_code=403, detail="This company account is inactive or not found")

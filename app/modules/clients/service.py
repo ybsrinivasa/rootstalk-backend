@@ -239,7 +239,13 @@ RootsTalk — Neytiri Eywafarm Agritech"""
 
 async def get_client_by_token(db: AsyncSession, token: str) -> Client | None:
     result = await db.execute(
-        select(Client).where(Client.onboarding_link_token == token)
+        select(Client).where(
+            Client.onboarding_link_token == token,
+            # 2026-07-24 — Training children are born without an
+            # onboarding_link_token, so the equality above already
+            # excludes them. Explicit filter as defensive belt.
+            Client.is_training.is_(False),
+        )
     )
     client = result.scalar_one_or_none()
     if not client:

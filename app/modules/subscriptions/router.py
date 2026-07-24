@@ -1330,6 +1330,10 @@ async def discover_crops(
             Package.status == PackageStatus.ACTIVE,
             PackageLocation.district_cosh_id == district_cosh_id,
             Client.payment_model == PaymentModel.FARMER_PAYS,
+            # 2026-07-24 — Training children are COMPANY_PAYS so the
+            # line above already excludes them. Explicit is_training
+            # filter as defensive belt for any future refactor.
+            Client.is_training.is_(False),
         )
         .distinct()
     )
@@ -1399,6 +1403,13 @@ async def discover_crops_and_companies(
             # subscribe-flow endpoints already filter to FARMER_PAYS
             # so they're naturally unaffected.
             Client.hidden_from_discovery.is_(False),
+            # 2026-07-24 — Training children are hidden_from_discovery=True
+            # by default (set at start_training_session), so the line
+            # above already excludes them. Explicit is_training=False
+            # here is belt-and-braces so a future default change on
+            # hidden_from_discovery doesn't silently leak training
+            # clients into farmer discovery.
+            Client.is_training.is_(False),
         )
         .distinct()
     )).all()
@@ -1514,6 +1525,9 @@ async def discover_companies(
             Package.status == PackageStatus.ACTIVE,
             PackageLocation.district_cosh_id == district_cosh_id,
             Client.payment_model == PaymentModel.FARMER_PAYS,
+            # 2026-07-24 — Defensive belt; training is COMPANY_PAYS so
+            # the line above already excludes them.
+            Client.is_training.is_(False),
         )
         .distinct()
     )
@@ -1522,7 +1536,11 @@ async def discover_companies(
     companies = []
     for client_id in client_ids:
         client = (await db.execute(
-            select(Client).where(Client.id == client_id, Client.status == ClientStatus.ACTIVE)
+            select(Client).where(
+                Client.id == client_id,
+                Client.status == ClientStatus.ACTIVE,
+                Client.is_training.is_(False),
+            )
         )).scalar_one_or_none()
         if client:
             companies.append({
