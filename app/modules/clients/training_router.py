@@ -207,6 +207,54 @@ def _serialise_training(child: Client) -> dict:
     }
 
 
+async def _training_counts(db: AsyncSession, training_client_id: str) -> dict:
+    """Summary counts for the CA portal training page — one query per
+    entity. Cheap (all indexed by client_id) and CAs open this page
+    once a session; no need for a materialised view yet."""
+    from sqlalchemy import func
+    from app.modules.subscriptions.models import (
+        PromoterAssignment, Subscription, SubscriptionStatus,
+    )
+    from app.modules.orders.models import Order
+    from app.modules.farmpundit.models import Query
+    subs_total = (await db.execute(
+        select(func.count(Subscription.id))
+        .where(Subscription.client_id == training_client_id)
+    )).scalar() or 0
+    subs_active = (await db.execute(
+        select(func.count(Subscription.id))
+        .where(
+            Subscription.client_id == training_client_id,
+            Subscription.status == SubscriptionStatus.ACTIVE,
+        )
+    )).scalar() or 0
+    farmers = (await db.execute(
+        select(func.count(func.distinct(Subscription.farmer_user_id)))
+        .where(Subscription.client_id == training_client_id)
+    )).scalar() or 0
+    promoters = (await db.execute(
+        select(func.count(func.distinct(PromoterAssignment.promoter_user_id)))
+        .join(Subscription, Subscription.id == PromoterAssignment.subscription_id)
+        .where(Subscription.client_id == training_client_id)
+    )).scalar() or 0
+    orders_total = (await db.execute(
+        select(func.count(Order.id))
+        .where(Order.client_id == training_client_id)
+    )).scalar() or 0
+    queries_total = (await db.execute(
+        select(func.count(Query.id))
+        .where(Query.client_id == training_client_id)
+    )).scalar() or 0
+    return {
+        "subscriptions_total": int(subs_total),
+        "subscriptions_active": int(subs_active),
+        "farmers": int(farmers),
+        "promoters": int(promoters),
+        "orders_total": int(orders_total),
+        "queries_total": int(queries_total),
+    }
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.post("/client/{client_id}/training/start", status_code=201)
@@ -332,7 +380,9 @@ async def get_current_training_session(
     child = await _current_training_child(db, parent.id)
     if child is None:
         return {}
-    return _serialise_training(child)
+    out = _serialise_training(child)
+    out["counts"] = await _training_counts(db, child.id)
+    return out
 
 
 @router.post("/client/{client_id}/training/end")
