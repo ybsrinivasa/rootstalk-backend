@@ -1571,6 +1571,23 @@ async def create_subscription(
     )).scalar_one_or_none()
     if client is None:
         raise HTTPException(status_code=404, detail="Client not found")
+    # 2026-07-24 — Training Sandbox: farmers can never self-subscribe to
+    # a training client. They enter a training session only via a
+    # Promoter invitation (Commit G). Explicit refusal with a training-
+    # specific code so the PWA can show the right message rather than
+    # the generic "Company Pays" one that the COMPANY_PAYS check below
+    # would otherwise deliver (training clients are COMPANY_PAYS too).
+    if client.is_training:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "training_client_no_self_subscribe",
+                "message": (
+                    "This is a training sandbox — farmers can join only "
+                    "via a Promoter invitation."
+                ),
+            },
+        )
     if client.payment_model == _PaymentModel.COMPANY_PAYS:
         raise HTTPException(
             status_code=422,

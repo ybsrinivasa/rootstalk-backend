@@ -251,6 +251,11 @@ async def consume_for_assignment(
     suppressed (per user spec "avoid assigning subscriptions to
     promoters for EL").
 
+    Training bypass (2026-07-24): when the client is a training
+    child, this is a no-op. Trainees practise against real content
+    without consuming the promoter's real allocation. Same shape as
+    the EL bypass above.
+
     Otherwise raises ValueError if the promoter has no balance (the
     route should have already short-circuited via
     `get_promoter_balance` before reaching this point, but the guard
@@ -258,6 +263,9 @@ async def consume_for_assignment(
     over-consumption).
     """
     if await is_enterprise_licensed(db, client_id):
+        return None
+    from app.services.training import is_training_client
+    if await is_training_client(db, client_id):
         return None
 
     row = (await db.execute(
@@ -302,6 +310,10 @@ async def refund_to_promoter(
     pre-EL allocations stay untouched. Same idempotency story as
     consume — the upstream transition guard prevents double-calls.
 
+    Training bypass (2026-07-24): symmetrical no-op with the consume
+    path — training subs never consumed a unit, so there's nothing
+    to refund.
+
     Idempotency is the caller's responsibility: refund should only be
     invoked exactly once per terminating transition. The BL-11
     transition guard on the farmer-respond path already prevents
@@ -310,6 +322,9 @@ async def refund_to_promoter(
     check before calling.
     """
     if await is_enterprise_licensed(db, client_id):
+        return None
+    from app.services.training import is_training_client
+    if await is_training_client(db, client_id):
         return None
 
     row = (await db.execute(
