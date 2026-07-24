@@ -27,8 +27,10 @@ still needs the following commits.
 """
 from datetime import datetime, timedelta, timezone
 from secrets import token_hex
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,7 +39,7 @@ from app.config import settings
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.modules.clients.models import (
-    CMClientAssignment, CMRights, Client, ClientStatus,
+    CMClientAssignment, CMRights, Client, ClientPromoter, ClientStatus,
     ClientUser, ClientUserRole, PaymentModel,
 )
 from app.modules.platform.models import StatusEnum, User
@@ -370,3 +372,289 @@ async def end_training_session(
     await db.commit()
     await db.refresh(child)
     return _serialise_training(child)
+
+
+# ── Promoter: invite a farmer into a training session ────────────────────────
+
+class TrainingInviteRequest(BaseModel):
+    """Farmer + package the promoter is inviting into training. Same
+    shape as the real PromoterAssignRequest in subscriptions/router.py
+    minus client_id (derived from the URL) and minus the P-V measure
+    fields (training subs never need the volume-calc context — the
+    farmer's real measures still live on their real subs). If we ever
+    want farmers to practise the plant-count / area-wise flow inside
+    training, add the fields here and mirror the write logic."""
+    farmer_phone: str
+    package_id: str
+    promoter_type: str = "DEALER"  # DEALER or FACILITATOR
+
+
+async def _assert_promoter_at_parent(
+    db: AsyncSession, user: User, parent_client_id: str, promoter_type: str,
+) -> ClientPromoter:
+    """Verify caller has an ACTIVE ClientPromoter binding at the
+    PARENT client (not the training child — training children carry
+    no promoter rows of their own). Real F-P is single-parent per
+    §11.2 exclusivity; D-P is multi-parent. Either way, the check
+    is the same shape: ACTIVE binding on the parent with is_promoter
+    True and the requested role.
+    """
+    row = (await db.execute(
+        select(ClientPromoter).where(
+            ClientPromoter.user_id == user.id,
+            ClientPromoter.client_id == parent_client_id,
+            ClientPromoter.promoter_type == promoter_type.upper(),
+            ClientPromoter.is_promoter.is_(True),
+            ClientPromoter.status == "ACTIVE",
+        ).limit(1)
+    )).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "not_a_promoter_at_parent",
+                "message": (
+                    f"You don't have an active {promoter_type.title()}-"
+                    f"Promoter role at this company's parent client. "
+                    f"Only real promoters can invite farmers into "
+                    f"training."
+                ),
+            },
+        )
+    return row
+
+
+@router.post(
+    "/promoter/training/{training_client_id}/invite-farmer",
+    status_code=201,
+)
+async def invite_farmer_to_training(
+    training_client_id: str,
+    request: TrainingInviteRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Promoter invites a real farmer into a training session.
+
+    The farmer receives a normal PromoterAssignment PENDING_FARMER_APPROVAL
+    (with a [Training]-prefixed FCM), accepts or rejects via the
+    standard flow, and the Subscription lands under the training
+    child's client_id — carrying the training marker to every
+    downstream Order / Query.
+
+    Money invariants (Commit D): consume_for_assignment is a no-op
+    for training clients, so the promoter's real allocation kitty
+    is untouched by this invite. Symmetric refund_to_promoter on
+    farmer reject is also a no-op — nothing was consumed, nothing
+    to refund.
+
+    Refusals:
+    - training_client_not_found  (404) — id doesn't resolve.
+    - not_a_training_client      (409) — id is a real client.
+    - training_not_active        (409) — training is WINDING_DOWN
+      or the row's state is invalid. New invites blocked once the
+      12-day clock has passed; in-flight subs can still complete.
+    - farmer_not_registered      (404) — phone has no User row.
+      Farmer must self-register in the PWA first.
+    - not_a_promoter_at_parent   (403) — see helper docstring.
+    - package_not_in_parent      (409) — package_id belongs to
+      a different client. Training children borrow the parent's
+      Package catalogue (Commit C); packages from other companies
+      are not eligible even by URL manipulation.
+    - farmer_already_in_training (409) — dedupe: the same farmer
+      already holds an ACTIVE / PENDING training sub under this
+      training client. User can end the earlier sub or wait for
+      it to complete first.
+    """
+    # Load the training child + its parent in one hop.
+    child = (await db.execute(
+        select(Client).where(Client.id == training_client_id)
+    )).scalar_one_or_none()
+    if child is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "training_client_not_found",
+                    "message": "Training client not found."},
+        )
+    if not child.is_training or not child.parent_client_id:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "not_a_training_client",
+                    "message": "This client is not a training sandbox."},
+        )
+    if child.training_status != "ACTIVE":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "training_not_active",
+                "message": (
+                    "This training session is no longer accepting new "
+                    "invitations. It has either ended or is winding down."
+                ),
+                "training_status": child.training_status,
+            },
+        )
+
+    # Caller must be a real promoter at the PARENT.
+    await _assert_promoter_at_parent(
+        db, current_user, child.parent_client_id,
+        request.promoter_type,
+    )
+
+    # Farmer must be a registered user.
+    from app.modules.auth.service import get_user_by_phone
+    farmer = await get_user_by_phone(db, request.farmer_phone)
+    if farmer is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "farmer_not_registered",
+                "message": (
+                    "That phone number isn't registered on RootsTalk. "
+                    "Ask the farmer to install and open the app first, "
+                    "then try again."
+                ),
+            },
+        )
+
+    # Package must belong to the PARENT (training children borrow
+    # the parent's Package catalogue — see Commit C).
+    from app.modules.advisory.models import Package
+    pkg_client_id = (await db.execute(
+        select(Package.client_id).where(Package.id == request.package_id)
+    )).scalar_one_or_none()
+    if pkg_client_id is None:
+        raise HTTPException(status_code=404, detail="Package not found.")
+    if pkg_client_id != child.parent_client_id:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "package_not_in_parent",
+                "message": (
+                    "That package belongs to a different company. Pick "
+                    "a package authored by this company's parent client."
+                ),
+            },
+        )
+
+    # Dedupe — one live training sub per farmer per training client.
+    from app.modules.subscriptions.models import (
+        AssignmentStatus, PromoterAssignment, Subscription,
+        SubscriptionStatus, SubscriptionType,
+    )
+    existing = (await db.execute(
+        select(Subscription.id).where(
+            Subscription.client_id == training_client_id,
+            Subscription.farmer_user_id == farmer.id,
+            Subscription.status.in_([
+                SubscriptionStatus.ACTIVE,
+                SubscriptionStatus.WAITLISTED,
+            ]),
+        ).limit(1)
+    )).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "farmer_already_in_training",
+                "message": (
+                    "This farmer already has a live subscription in "
+                    "this training session."
+                ),
+                "existing_subscription_id": existing,
+            },
+        )
+
+    # ── Create the Sub + PromoterAssignment. ──────────────────────
+    # consume_for_assignment auto-bypasses for training clients
+    # (Commit D), so the promoter's real kitty is untouched. Kept
+    # in the call chain for parity with the real initiate_assignment
+    # flow so any future audit sees the same code path.
+    from app.services.promoter_pool import consume_for_assignment
+    try:
+        await consume_for_assignment(
+            db,
+            client_id=training_client_id,
+            promoter_user_id=current_user.id,
+        )
+    except ValueError:
+        # Shouldn't happen for training (bypass returns None), but
+        # if it ever does, surface the underlying kitty error.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "consume_failed",
+                "message": "Unable to open a training slot right now.",
+            },
+        )
+
+    now = datetime.now(timezone.utc)
+    sub = Subscription(
+        farmer_user_id=farmer.id,
+        client_id=training_client_id,
+        package_id=request.package_id,
+        promoter_user_id=current_user.id,
+        subscription_type=SubscriptionType.ASSIGNED,
+        status=SubscriptionStatus.ACTIVE,
+        subscription_date=now,
+    )
+    db.add(sub)
+    await db.flush()
+    # reference_number generation reuses the real helper — the
+    # training sub gets a normal reference so all downstream code
+    # that renders it works unchanged.
+    from app.modules.subscriptions.router import _generate_reference_for_sub
+    sub.reference_number = await _generate_reference_for_sub(
+        db, sub.client_id,
+    )
+
+    assignment = PromoterAssignment(
+        subscription_id=sub.id,
+        promoter_user_id=current_user.id,
+        promoter_type=request.promoter_type.upper(),
+        status=AssignmentStatus.PENDING_FARMER_APPROVAL,
+    )
+    db.add(assignment)
+    await db.commit()
+
+    # [Training]-prefixed FCM to the farmer. Same shape as the real
+    # PROMOTER_ASSIGNMENT_RECEIVED push so the PWA's existing
+    # handler can render it — the training marker travels via
+    # data.is_training so the accept-screen banner reads it.
+    if farmer.fcm_token:
+        try:
+            from app.services.fcm_service import send_fcm
+            parent = (await db.execute(
+                select(Client).where(Client.id == child.parent_client_id)
+            )).scalar_one_or_none()
+            parent_name = (
+                parent.display_name or parent.full_name
+                if parent else "a company"
+            )
+            promoter_label = (
+                "Dealer" if request.promoter_type.upper() == "DEALER"
+                else "Facilitator"
+            )
+            await send_fcm(
+                token=farmer.fcm_token,
+                title=f"[Training] Invitation from {parent_name}",
+                body=(
+                    f"{promoter_label} {current_user.name or 'a promoter'} "
+                    f"is running a training session and has invited you "
+                    f"to practise. Open the app to accept or decline."
+                ),
+                data={
+                    "type": "PROMOTER_ASSIGNMENT_RECEIVED",
+                    "subscription_id": sub.id,
+                    "assignment_id": assignment.id,
+                    "is_training": "true",
+                },
+            )
+        except Exception:
+            pass
+
+    return {
+        "subscription_id": sub.id,
+        "assignment_id": assignment.id,
+        "status": "Awaiting farmer approval",
+    }
