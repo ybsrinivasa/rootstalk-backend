@@ -1100,13 +1100,15 @@ async def _serialise_pundit_query_cards(
         sub_by_id = {s.id: s for s in rows}
 
     client_name_by_id: dict[str, str] = {}
+    client_is_training_by_id: dict[str, bool] = {}
     if client_ids:
         rows = (await db.execute(
-            select(Client.id, Client.display_name, Client.full_name)
+            select(Client.id, Client.display_name, Client.full_name, Client.is_training)
             .where(Client.id.in_(client_ids))
         )).all()
-        for cid, disp, full in rows:
+        for cid, disp, full, is_training in rows:
             client_name_by_id[cid] = disp or full or ""
+            client_is_training_by_id[cid] = bool(is_training)
 
     crop_name_by_cosh_id: dict[str, str] = {}
     if crop_cosh_ids:
@@ -1146,6 +1148,11 @@ async def _serialise_pundit_query_cards(
             "crop_name": crop_name_by_cosh_id.get(q.crop_cosh_id) if q.crop_cosh_id else None,
             "crop_start_date": sub.crop_start_date if sub else None,
             "client_name": client_name_by_id.get(q.client_id),
+            # 2026-07-24 — Training Sandbox marker. Pundit PWA
+            # reads this to render the "TRAINING" chip on the
+            # query card and to route matching queries to the
+            # Training pill on the tab list.
+            "client_is_training": client_is_training_by_id.get(q.client_id, False),
         })
     return out
 

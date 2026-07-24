@@ -2772,6 +2772,11 @@ async def list_dealer_orders(
             "facilitator_photo_url": facilitator.get("photo_url") if facilitator else None,
             "client_id": o.client_id,
             "client_name": c.display_name or c.short_name,
+            # 2026-07-24 — Training Sandbox marker. Dealer PWA reads
+            # this to render the "TRAINING" chip on the order card
+            # and to route matching orders to the Training pill on
+            # the tab list.
+            "client_is_training": bool(getattr(c, "is_training", False)),
             "category": o.category,
             "date_from": o.date_from, "date_to": o.date_to,
             "created_at": o.created_at,
@@ -4344,14 +4349,16 @@ async def list_facilitator_orders(
     # see `feedback_se_internal_labels_hidden.md`).
     client_ids = {o.client_id for o in orders if o.client_id}
     client_name_by_id: dict[str, str] = {}
+    client_is_training_by_id: dict[str, bool] = {}
     if client_ids:
         from app.modules.clients.models import Client
         clrows = (await db.execute(
-            select(Client.id, Client.display_name, Client.short_name)
+            select(Client.id, Client.display_name, Client.short_name, Client.is_training)
             .where(Client.id.in_(client_ids))
         )).all()
-        for cid, dname, sname in clrows:
+        for cid, dname, sname, is_training in clrows:
             client_name_by_id[cid] = dname or sname or ""
+            client_is_training_by_id[cid] = bool(is_training)
 
     # Packing rows for the Pickup / Completed pill membership.
     order_ids = [o.id for o in orders]
@@ -4455,6 +4462,7 @@ async def list_facilitator_orders(
             # 2026-06-21 — Company name so the facilitator card can
             # show farmer + crop + company (parity with dealer card).
             "client_name": client_name_by_id.get(o.client_id),
+            "client_is_training": client_is_training_by_id.get(o.client_id, False),
             # 2026-06-06 — Packing fields drive the Pickup pill
             # (approved items the facilitator hasn't picked up yet)
             # and the Completed pill (farmer-confirmed receipt).
