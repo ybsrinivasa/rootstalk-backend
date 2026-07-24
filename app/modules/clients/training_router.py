@@ -1,0 +1,372 @@
+"""Training Sandbox lifecycle endpoints — Commit B of the 2026-07-24
+build plan.
+
+Three endpoints, all scoped to a real client_id:
+    POST /client/{cid}/training/start    → creates the shadow child.
+    GET  /client/{cid}/training/current  → returns the active child, or null.
+    POST /client/{cid}/training/end      → force-ends the active child now.
+
+Rules enforced here (not just in the UI):
+- Parent client must be real (is_training=False). No training-of-
+  training; the shadow-of-shadow shape would confuse cascade delete.
+- Parent client status must be ACTIVE. A PENDING_REVIEW or INACTIVE
+  parent shouldn't host a training session.
+- One active session per parent. Belt-and-braces to the DB partial
+  unique index — surfaced as a friendly 409 with a specific code
+  rather than an IntegrityError leak.
+- start / end are CA-only (or SA / CM-EDIT via the standard
+  project convention). The GET is CA + FM view-permitted so a
+  Field Manager can see "is there a training right now?" from
+  their own screen too.
+
+Money and allocation invariants (Razorpay bypass, PromoterAllocation
+bypass, discovery filter) live in Commits D and E. This commit just
+births the training client and lets the CA end it. Everything else
+downstream (Package inheritance, promoter invites, expiry sweep)
+still needs the following commits.
+"""
+from datetime import datetime, timedelta, timezone
+from secrets import token_hex
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import settings
+from app.database import get_db
+from app.dependencies import get_current_user
+from app.modules.clients.models import (
+    CMClientAssignment, CMRights, Client, ClientStatus,
+    ClientUser, ClientUserRole, PaymentModel,
+)
+from app.modules.platform.models import StatusEnum, User
+
+
+router = APIRouter(tags=["Training Sandbox"])
+
+
+# Session length. 12 days per user 2026-07-24; extending is
+# deliberate — CA has to explicitly start a fresh session, they
+# can't drift the clock.
+TRAINING_SESSION_DAYS = 12
+# After training_ends_at, the child sits in WINDING_DOWN for this
+# window so in-flight orders/queries can complete. The expiry
+# sweep (Commit F) hard-deletes anything still standing after this.
+TRAINING_WIND_DOWN_HOURS = 24
+
+
+# ── Role gates ────────────────────────────────────────────────────────────────
+
+async def _assert_ca(db: AsyncSession, user: User, client_id: str) -> None:
+    """CA-only for start / end. Same shape as _assert_ca_or_field_manager
+    (see clients/router.py line 1931 comment for the full rationale)
+    minus FIELD_MANAGER — starting/ending a training session is a CA
+    decision, not an FM one. CM(EDIT) still allowed per project
+    convention ("CM has all privileges inside the client")."""
+    if bool(settings.sa_email) and user.email == settings.sa_email:
+        return
+    role_row = (await db.execute(
+        select(ClientUser.role).where(
+            ClientUser.client_id == client_id,
+            ClientUser.user_id == user.id,
+            ClientUser.status == StatusEnum.ACTIVE,
+            ClientUser.role == ClientUserRole.CA,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if role_row is not None:
+        return
+    cm_edit = (await db.execute(
+        select(CMClientAssignment.id).where(
+            CMClientAssignment.cm_user_id == user.id,
+            CMClientAssignment.client_id == client_id,
+            CMClientAssignment.status == StatusEnum.ACTIVE,
+            CMClientAssignment.rights == CMRights.EDIT,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if cm_edit is not None:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "code": "ca_role_required",
+            "message": (
+                "Only the Customer Admin can start or end a training "
+                "session. Ask your CA to open the Training Sandbox."
+            ),
+        },
+    )
+
+
+async def _assert_ca_or_fm(db: AsyncSession, user: User, client_id: str) -> None:
+    """View gate for GET /training/current — either CA or FM can peek."""
+    if bool(settings.sa_email) and user.email == settings.sa_email:
+        return
+    role_row = (await db.execute(
+        select(ClientUser.role).where(
+            ClientUser.client_id == client_id,
+            ClientUser.user_id == user.id,
+            ClientUser.status == StatusEnum.ACTIVE,
+            ClientUser.role.in_([
+                ClientUserRole.CA, ClientUserRole.FIELD_MANAGER,
+            ]),
+        ).limit(1)
+    )).scalar_one_or_none()
+    if role_row is not None:
+        return
+    cm_edit = (await db.execute(
+        select(CMClientAssignment.id).where(
+            CMClientAssignment.cm_user_id == user.id,
+            CMClientAssignment.client_id == client_id,
+            CMClientAssignment.status == StatusEnum.ACTIVE,
+            CMClientAssignment.rights == CMRights.EDIT,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if cm_edit is not None:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "code": "client_membership_required",
+            "message": (
+                "Only portal users enrolled at this client can view "
+                "training-session state."
+            ),
+        },
+    )
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+async def _load_parent_client(db: AsyncSession, client_id: str) -> Client:
+    parent = (await db.execute(
+        select(Client).where(Client.id == client_id)
+    )).scalar_one_or_none()
+    if parent is None:
+        raise HTTPException(status_code=404, detail="Client not found")
+    if parent.is_training:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "training_of_training_forbidden",
+                "message": (
+                    "Cannot start a training session under an existing "
+                    "training client. Use the real parent client."
+                ),
+            },
+        )
+    if parent.status != ClientStatus.ACTIVE:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "parent_client_not_active",
+                "message": (
+                    "The parent client must be ACTIVE to host a training "
+                    f"session (currently {parent.status.value if hasattr(parent.status, 'value') else parent.status})."
+                ),
+            },
+        )
+    return parent
+
+
+async def _current_training_child(db: AsyncSession, parent_id: str) -> Client | None:
+    """The one training child that's still 'live' — either ACTIVE or
+    WINDING_DOWN. Cleaned-up children are hard-deleted, so a NULL
+    result means the parent has no session in flight and can start
+    a fresh one."""
+    return (await db.execute(
+        select(Client).where(
+            Client.parent_client_id == parent_id,
+            Client.is_training == True,  # noqa: E712
+            Client.training_status.in_(["ACTIVE", "WINDING_DOWN"]),
+        ).limit(1)
+    )).scalar_one_or_none()
+
+
+def _training_child_short_name() -> str:
+    """Short-name generator for training children. Not user-visible
+    (CAs read display_name), so a stable 'TR<hex>' pattern is enough
+    and keeps well under the 12-char column limit. Random-suffix
+    dodges collisions across the parent's lifetime."""
+    return f"TR{token_hex(4).upper()}"
+
+
+def _serialise_training(child: Client) -> dict:
+    """Response shape shared across start / current."""
+    return {
+        "id": child.id,
+        "parent_client_id": child.parent_client_id,
+        "display_name": child.display_name,
+        "primary_colour": child.primary_colour,
+        "logo_url": child.logo_url,
+        "training_started_at": child.training_started_at,
+        "training_ends_at": child.training_ends_at,
+        "training_status": child.training_status,
+    }
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@router.post("/client/{client_id}/training/start", status_code=201)
+async def start_training_session(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CA starts a fresh 12-day training session under this client.
+
+    Refusals (409):
+    - `training_of_training_forbidden` — caller passed a training id.
+    - `parent_client_not_active` — parent isn't ACTIVE.
+    - `training_session_already_active` — there's already an
+      ACTIVE/WINDING_DOWN child. The DB partial unique index would
+      raise IntegrityError otherwise; we check first for a clean
+      error message.
+    """
+    await _assert_ca(db, current_user, client_id)
+    parent = await _load_parent_client(db, client_id)
+
+    existing = await _current_training_child(db, parent.id)
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "training_session_already_active",
+                "message": (
+                    "A training session is already in progress for this "
+                    "client. End it first, or wait for it to finish, "
+                    "before starting a new one."
+                ),
+                "current_training_id": existing.id,
+                "training_status": existing.training_status,
+                "training_ends_at": (
+                    existing.training_ends_at.isoformat()
+                    if existing.training_ends_at else None
+                ),
+            },
+        )
+
+    now = datetime.now(timezone.utc)
+    ends_at = now + timedelta(days=TRAINING_SESSION_DAYS)
+
+    # display_name: parent's display + " · Training" so the CA and
+    # every downstream PWA immediately reads it as a training tile.
+    # Falls back to full_name when the parent has no display_name
+    # (they're not required to have one).
+    parent_display = parent.display_name or parent.full_name
+    display_name = f"{parent_display} · Training"[:255]
+    full_name = f"{parent.full_name} (Training)"[:500]
+
+    child = Client(
+        full_name=full_name,
+        short_name=_training_child_short_name(),
+        display_name=display_name,
+        # Brand carry-over so the trainee sees the familiar look.
+        tagline=parent.tagline,
+        logo_url=parent.logo_url,
+        primary_colour=parent.primary_colour,
+        secondary_colour=parent.secondary_colour,
+        # Contact fields — inherit so downstream code that reads
+        # them doesn't hit NOT NULL violations. CAs never see these
+        # on the training child; they're only ever surfaced on the
+        # real client.
+        ca_name=parent.ca_name,
+        ca_phone=parent.ca_phone,
+        ca_email=parent.ca_email,
+        # 2026-07-24 — Training subs always bypass Razorpay + real
+        # promoter allocations (see Commit D). COMPANY_PAYS is the
+        # safest payment_model to carry so any legacy path reading
+        # it during a training flow doesn't try to bill the farmer.
+        payment_model=PaymentModel.COMPANY_PAYS,
+        # Never surface a training client on the farmer discovery
+        # drawer or nearby-dealers — trainees enter via Promoter
+        # invitation only. The discovery-filter sweep (Commit E)
+        # is the belt on top of this suspender.
+        hidden_from_discovery=True,
+        # ACTIVE so downstream endpoints that already filter on
+        # status treat the training child as live (Package lookups,
+        # etc.). The training_status field is the training-specific
+        # lifecycle marker.
+        status=ClientStatus.ACTIVE,
+        # Training-lifecycle fields.
+        is_training=True,
+        parent_client_id=parent.id,
+        training_started_at=now,
+        training_ends_at=ends_at,
+        training_status="ACTIVE",
+    )
+    db.add(child)
+    try:
+        await db.commit()
+    except IntegrityError:
+        # Race — someone else created a training child between our
+        # existence check and the insert. Surface the same 409.
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "training_session_already_active",
+                "message": (
+                    "A training session was just started by someone "
+                    "else. Refresh and try again."
+                ),
+            },
+        )
+    await db.refresh(child)
+    return _serialise_training(child)
+
+
+@router.get("/client/{client_id}/training/current")
+async def get_current_training_session(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Returns the parent's active training child, or `{}` if none.
+    CA + FM view-permitted (FM sees the session running for
+    situational awareness, but can't start/end it — that's the CA)."""
+    await _assert_ca_or_fm(db, current_user, client_id)
+    parent = await _load_parent_client(db, client_id)
+    child = await _current_training_child(db, parent.id)
+    if child is None:
+        return {}
+    return _serialise_training(child)
+
+
+@router.post("/client/{client_id}/training/end")
+async def end_training_session(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CA force-ends the active session now.
+
+    Transitions the training child from ACTIVE (or already-
+    WINDING_DOWN) to WINDING_DOWN with an ends_at set to now — so
+    the standard 24h grace still applies (in-flight orders can
+    complete) and the hourly expiry sweep will hard-delete the
+    cascade after that. Returns the updated shape.
+
+    404 if there's no active training session for this client.
+    """
+    await _assert_ca(db, current_user, client_id)
+    parent = await _load_parent_client(db, client_id)
+    child = await _current_training_child(db, parent.id)
+    if child is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "no_active_training_session",
+                "message": "No training session is currently active for this client.",
+            },
+        )
+    now = datetime.now(timezone.utc)
+    # Move ends_at to now — same 24h grace pattern applies from here.
+    # The expiry sweep (Commit F) reads ends_at + 24h to decide when
+    # to hard-delete; setting ends_at to now short-circuits the
+    # 12-day clock without special-casing the sweep.
+    child.training_status = "WINDING_DOWN"
+    child.training_ends_at = now
+    await db.commit()
+    await db.refresh(child)
+    return _serialise_training(child)

@@ -28,6 +28,7 @@ if settings.environment != "development" and not settings.frontend_base_url:
 from app.modules.auth.router import router as auth_router
 from app.modules.platform.router import router as platform_router
 from app.modules.clients.router import router as clients_router
+from app.modules.clients.training_router import router as training_router
 from app.modules.sync.router import router as sync_router
 from app.modules.advisory.router import router as advisory_router
 from app.modules.subscriptions.router import router as subscriptions_router
@@ -69,6 +70,7 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(platform_router)
 app.include_router(clients_router)
+app.include_router(training_router)
 app.include_router(sync_router)
 app.include_router(advisory_router)
 app.include_router(subscriptions_router)
