@@ -1041,6 +1041,10 @@ async def get_client_info_by_id(
         "org_type_cosh_ids": list(org_types),
         "payment_model": client.payment_model.value
             if hasattr(client.payment_model, "value") else client.payment_model,
+        # 2026-07-24 — Training Sandbox marker. Farmer PWA reads this
+        # on /home/[clientId] to render the training banner + suppress
+        # any "real world" affordances.
+        "is_training": bool(client.is_training),
     }
 
 

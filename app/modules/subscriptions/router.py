@@ -2718,6 +2718,11 @@ async def get_assignment_details(
             "logo_url": client.logo_url,
             "primary_colour": client.primary_colour,
             "tagline": client.tagline,
+            # 2026-07-24 — Training Sandbox marker so the farmer's
+            # assignment-accept screen can render the practice banner
+            # and copy explaining that acceptance won't affect any
+            # real subscriptions.
+            "is_training": bool(client.is_training),
         } if client else None,
         "crop_cosh_id": package.crop_cosh_id if package else None,
         "crop_name": crop_name,
@@ -4140,14 +4145,20 @@ async def my_subscriptions(
             select(
                 Client.id, Client.display_name, Client.full_name,
                 Client.logo_url, Client.primary_colour, Client.short_name,
+                Client.is_training,
             ).where(Client.id.in_(client_ids))
         )).all()
-        for cid, display, full, logo, colour, short in client_rows:
+        for cid, display, full, logo, colour, short, is_training in client_rows:
             client_info_by_id[cid] = {
                 "client_display_name": display or full,
                 "client_logo_url": logo,
                 "client_primary_colour": colour,
                 "client_short_name": short,
+                # 2026-07-24 — Training Sandbox marker. Farmer PWA
+                # reads this to render the yellow "TRAINING" ribbon
+                # on the company/crop tiles and the training banner
+                # on the assignment-accept + crop-detail screens.
+                "client_is_training": bool(is_training),
             }
 
     # ── Pending-delegation resolution for WAITLISTED rows. ──────────
@@ -4333,6 +4344,7 @@ async def my_subscriptions(
             "client_logo_url": client.get("client_logo_url"),
             "client_primary_colour": client.get("client_primary_colour"),
             "client_short_name": client.get("client_short_name"),
+            "client_is_training": client.get("client_is_training", False),
             # Drives the Ask Expert button + Diagnose-IDK gateway gate
             # on the PWA. False → no PRIMARY pundit is available to
             # receive a query at this client.
