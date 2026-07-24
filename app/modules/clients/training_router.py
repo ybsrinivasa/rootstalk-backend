@@ -424,6 +424,60 @@ async def end_training_session(
     return _serialise_training(child)
 
 
+# ── Promoter: list active training sessions the caller can join ──────────────
+
+@router.get("/promoter/training/available-clients")
+async def list_available_training_clients(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Every ACTIVE training session where the caller has an ACTIVE
+    ClientPromoter binding on the PARENT client. Used by the dealer
+    / facilitator PWA to render the "Training Session" tile (only
+    when this returns non-empty) and to populate the picker on the
+    invite-farmer form.
+
+    F-P sees at most one training session (they're locked to a
+    single parent per §11.2); D-P may see several.
+
+    WINDING_DOWN sessions are excluded — the invite endpoint
+    refuses them anyway (Commit G training_not_active), so no
+    point showing them in the picker.
+    """
+    parent_ids = (await db.execute(
+        select(ClientPromoter.client_id).where(
+            ClientPromoter.user_id == current_user.id,
+            ClientPromoter.is_promoter.is_(True),
+            ClientPromoter.status == "ACTIVE",
+        )
+    )).scalars().all()
+    if not parent_ids:
+        return []
+    rows = (await db.execute(
+        select(Client, Client.parent_client_id).where(
+            Client.is_training == True,  # noqa: E712
+            Client.training_status == "ACTIVE",
+            Client.parent_client_id.in_(list(set(parent_ids))),
+        )
+    )).all()
+    # Join in each parent's display_name for the picker label.
+    parent_names: dict[str, str] = {}
+    if rows:
+        parents = (await db.execute(
+            select(Client.id, Client.display_name, Client.full_name)
+            .where(Client.id.in_([r[1] for r in rows]))
+        )).all()
+        for pid, pdisp, pfull in parents:
+            parent_names[pid] = pdisp or pfull or ""
+    return [
+        {
+            **_serialise_training(child),
+            "parent_display_name": parent_names.get(parent_client_id, ""),
+        }
+        for child, parent_client_id in rows
+    ]
+
+
 # ── Promoter: invite a farmer into a training session ────────────────────────
 
 class TrainingInviteRequest(BaseModel):
