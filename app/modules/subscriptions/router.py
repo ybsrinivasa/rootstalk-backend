@@ -837,15 +837,21 @@ async def promoter_crops(
     from app.modules.advisory.models import PackageLocation, PackageStatus
     from app.modules.sync.models import CoshCoreItem
     from app.services.cosh_crop_view import get_measure_for_biological_name
+    from app.services.training import resolve_package_client_id
     if client_id is None:
         client = await _resolve_promoter_locked_client(db, current_user)
     else:
         client = await _resolve_promoter_at_client(db, current_user, client_id)
+    # Training children don't own Packages — practise against the
+    # parent's real content. resolve_package_client_id returns the
+    # input for real clients (passthrough) and parent_client_id
+    # for training children.
+    pkg_client_id = await resolve_package_client_id(db, client.id)
     result = await db.execute(
         select(Package.crop_cosh_id)
         .join(PackageLocation, PackageLocation.package_id == Package.id)
         .where(
-            Package.client_id == client.id,
+            Package.client_id == pkg_client_id,
             Package.status == PackageStatus.ACTIVE,
             PackageLocation.district_cosh_id == district_cosh_id,
         )
@@ -1052,12 +1058,16 @@ async def get_available_packages(
     """Returns all ACTIVE packages for a crop+district+client."""
     from app.modules.advisory.models import PackageLocation, PackageStatus
     from app.services.translation_reader import resolve_translations_batch
+    from app.services.training import resolve_package_client_id
     from app.modules.translations.models import EntityType
+    # See training/C rationale: training children practise against
+    # the real parent's Package catalogue.
+    pkg_client_id = await resolve_package_client_id(db, client_id)
     result = await db.execute(
         select(Package)
         .join(PackageLocation, PackageLocation.package_id == Package.id)
         .where(
-            Package.client_id == client_id,
+            Package.client_id == pkg_client_id,
             Package.crop_cosh_id == crop_cosh_id,
             Package.status == PackageStatus.ACTIVE,
             PackageLocation.district_cosh_id == district_cosh_id,
@@ -1114,6 +1124,7 @@ async def guided_elimination_step(
         PackageStub as ServicePackageStub,
         ParameterOption as ServiceParameterOption,
     )
+    from app.services.training import resolve_package_client_id
 
     # ── Parse caller-supplied previous answers ───────────────────────────
     parsed_answers: dict[str, str] = {}
@@ -1124,11 +1135,14 @@ async def guided_elimination_step(
                 parsed_answers[param_id] = var_id
 
     # ── Load the candidate pool ───────────────────────────────────────────
+    # See training/C: training children practise against the parent's
+    # Package catalogue; passthrough for real clients.
+    pkg_client_id = await resolve_package_client_id(db, client_id)
     pkg_rows = (await db.execute(
         select(Package)
         .join(PackageLocation, PackageLocation.package_id == Package.id)
         .where(
-            Package.client_id == client_id,
+            Package.client_id == pkg_client_id,
             Package.crop_cosh_id == crop_cosh_id,
             Package.status == PackageStatus.ACTIVE,
             PackageLocation.district_cosh_id == district_cosh_id,
