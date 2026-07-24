@@ -119,6 +119,34 @@ class Client(Base):
     hidden_from_discovery: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="false", default=False,
     )
+    # 2026-07-24 — Training Sandbox V1. When True, this Client is a
+    # shadow training child of `parent_client_id` — created by the CA
+    # via POST /client/{cid}/training/start, lives for 12 days, then
+    # 24h WINDING_DOWN grace, then hard-cascade-deleted by the hourly
+    # `training_expiry` celery task. Everything under a training
+    # client (Subscriptions, Orders, Queries, PromoterAssignments)
+    # inherits the training marker via `client_id` — no per-entity
+    # flag needed. See project_rootstalk_training_sandbox_2026_07_24.md
+    # (once the memory lands) for the full design.
+    is_training: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false", default=False,
+    )
+    parent_client_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("clients.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    training_started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    training_ends_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    # 'ACTIVE' during the 12-day window, 'WINDING_DOWN' for the 24h
+    # grace after training_ends_at (no new writes, in-flight can
+    # complete), then the row is hard-deleted.
+    training_status: Mapped[str] = mapped_column(
+        String(20), nullable=True,
+    )
     # 2026-07-05 — QR Product Authentication: the Cosh
     # `input_manufacturers` cosh_id this client corresponds to. Set
     # by the SA at approval or via the edit modal — deterministic
