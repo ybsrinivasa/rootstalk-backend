@@ -391,16 +391,31 @@ async def end_training_session(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """CA force-ends the active session now.
+    """CA force-ends the active session — hard close.
 
-    Transitions the training child from ACTIVE (or already-
-    WINDING_DOWN) to WINDING_DOWN with an ends_at set to now — so
-    the standard 24h grace still applies (in-flight orders can
-    complete) and the hourly expiry sweep will hard-delete the
-    cascade after that. Returns the updated shape.
+    2026-07-25 — Switched from soft-close (WINDING_DOWN + 24h grace)
+    to hard-close per user's team feedback. Soft-close was creating
+    confusion because the `uq_one_active_training_per_parent` DB
+    index covers both ACTIVE and WINDING_DOWN rows, so a CA who
+    ended a session couldn't start a fresh one for ~25h until the
+    hourly sweep cascade-deleted the winding row. Hard-close runs
+    the same cascade helper synchronously so `POST /training/start`
+    is unblocked within seconds of tap.
+
+    In-flight orders / queries / subscriptions under the training
+    session vanish mid-transaction. That's the deliberate tradeoff
+    the team accepted — training data is throwaway, and the visual
+    friction of soft-close outweighed the value of the 24h grace.
+
+    The 12-day auto-expiry (`app/tasks/training_expiry.py`) still
+    routes ACTIVE → WINDING_DOWN → 24h grace → cascade. Only the
+    user-initiated end path is now synchronous; farmers + promoters
+    keep the grace window when the session times out naturally.
 
     404 if there's no active training session for this client.
     """
+    from app.tasks.training_expiry import _cascade_delete_training_child
+
     await _assert_ca(db, current_user, client_id)
     parent = await _load_parent_client(db, client_id)
     child = await _current_training_child(db, parent.id)
@@ -412,16 +427,17 @@ async def end_training_session(
                 "message": "No training session is currently active for this client.",
             },
         )
-    now = datetime.now(timezone.utc)
-    # Move ends_at to now — same 24h grace pattern applies from here.
-    # The expiry sweep (Commit F) reads ends_at + 24h to decide when
-    # to hard-delete; setting ends_at to now short-circuits the
-    # 12-day clock without special-casing the sweep.
-    child.training_status = "WINDING_DOWN"
-    child.training_ends_at = now
+    # Snapshot the id + label BEFORE cascade so we can return a
+    # meaningful confirmation payload after the row is gone.
+    ended_id = child.id
+    ended_label = child.display_name or child.full_name
+    await _cascade_delete_training_child(db, child)
     await db.commit()
-    await db.refresh(child)
-    return _serialise_training(child)
+    return {
+        "closed": True,
+        "id": ended_id,
+        "display_name": ended_label,
+    }
 
 
 # ── Promoter: list active training sessions the caller can join ──────────────
