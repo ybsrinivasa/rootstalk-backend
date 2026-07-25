@@ -4264,21 +4264,37 @@ async def my_subscriptions(
     # round-robin Primary) has nowhere to land and the query would
     # be orphaned. One batch query covers every client referenced
     # by the farmer's subscriptions.
+    #
+    # 2026-07-25 — Training-aware. Training children don't onboard
+    # their own pundits; they inherit the parent's roster (same
+    # "practise on real content" rationale as Commit C's Package
+    # inheritance). Resolve each sub's client_id to its authoring
+    # client (parent for training, self otherwise) before checking,
+    # then map the True back onto the original training id so the
+    # PWA gate reads correctly on the training crop dashboard.
     from app.modules.farmpundit.models import (
         ClientFarmPundit, PunditRole,
     )
-    client_ids_for_pundit_check = list({s.client_id for s in subs})
-    has_primary_by_client: dict[str, bool] = {cid: False for cid in client_ids_for_pundit_check}
-    if client_ids_for_pundit_check:
+    from app.services.training import resolve_package_client_id
+    sub_client_ids = list({s.client_id for s in subs})
+    # child id → authoring (parent for training) id
+    authoring_by_child: dict[str, str] = {}
+    for cid in sub_client_ids:
+        authoring_by_child[cid] = await resolve_package_client_id(db, cid)
+    authoring_ids = list(set(authoring_by_child.values()))
+    has_primary_by_client: dict[str, bool] = {cid: False for cid in sub_client_ids}
+    if authoring_ids:
         primary_rows = (await db.execute(
             select(ClientFarmPundit.client_id).where(
-                ClientFarmPundit.client_id.in_(client_ids_for_pundit_check),
+                ClientFarmPundit.client_id.in_(authoring_ids),
                 ClientFarmPundit.role == PunditRole.PRIMARY,
                 ClientFarmPundit.status == "ACTIVE",
             )
         )).scalars().all()
-        for cid in primary_rows:
-            has_primary_by_client[cid] = True
+        has_primary_authoring = set(primary_rows)
+        for child_id, auth_id in authoring_by_child.items():
+            if auth_id in has_primary_authoring:
+                has_primary_by_client[child_id] = True
 
     # 2026-05-31 — Promoter-assigned subs awaiting the farmer's
     # explicit approval are OMITTED from /farmer/my-subscriptions

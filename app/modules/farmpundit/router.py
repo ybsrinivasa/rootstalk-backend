@@ -847,9 +847,18 @@ async def submit_query(
     # this state (it reads `client_has_primary_expert` from
     # /my-subscriptions), but defence in depth — a tampered client or
     # a race against a deactivation must not orphan a query.
+    #
+    # 2026-07-25 — Training-aware. Training children inherit the
+    # parent's pundit roster (same rationale as Commit C's Package
+    # inheritance); resolve to the authoring client for the check
+    # and for the routing call below. Query.client_id itself stays
+    # as the training child so the Training pill catches the row
+    # and the cascade sweep picks it up.
+    from app.services.training import resolve_package_client_id
+    pundit_client_id = await resolve_package_client_id(db, request.client_id)
     has_primary = (await db.execute(
         select(ClientFarmPundit.id).where(
-            ClientFarmPundit.client_id == request.client_id,
+            ClientFarmPundit.client_id == pundit_client_id,
             ClientFarmPundit.role == PunditRole.PRIMARY,
             ClientFarmPundit.status == "ACTIVE",
         ).limit(1)
@@ -934,7 +943,11 @@ async def submit_query(
         db.add(QueryMedia(query_id=query.id, media_type=m.media_type, url=m.url))
 
     # BL-12a: Full priority routing (preference → Promoter-Pundit → round-robin)
-    next_pundit = await _get_next_pundit_for_query(db, request.client_id, request.subscription_id)
+    # 2026-07-25 — Use `pundit_client_id` (parent-resolved for training)
+    # so routing picks from the parent's Primary roster. The Query row
+    # itself keeps request.client_id (training child) so it stays on
+    # the Training pill + is cleaned up by the cascade sweep.
+    next_pundit = await _get_next_pundit_for_query(db, pundit_client_id, request.subscription_id)
     if next_pundit:
         query.current_holder_id = next_pundit.id
         db.add(QueryRemark(
