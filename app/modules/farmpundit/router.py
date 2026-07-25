@@ -65,9 +65,16 @@ async def _holder_role(
             status_code=403,
             detail="You are not the current holder of this query.",
         )
+    # 2026-07-25 — Training-aware. Training children don't onboard
+    # pundits; the pundit's binding lives on the parent (same rule as
+    # Commit C's Package inheritance). Resolve the query's client_id
+    # to its authoring client before checking the ClientFarmPundit
+    # row. Same helper the submit path uses.
+    from app.services.training import resolve_package_client_id
+    pundit_client_id = await resolve_package_client_id(db, query.client_id)
     holder_slot = (await db.execute(
         select(ClientFarmPundit).where(
-            ClientFarmPundit.client_id == query.client_id,
+            ClientFarmPundit.client_id == pundit_client_id,
             ClientFarmPundit.pundit_id == profile.id,
         )
     )).scalar_one_or_none()
@@ -384,6 +391,57 @@ async def get_pundit_profile_detail(
         select(ClientFarmPundit).where(ClientFarmPundit.pundit_id == profile.id, ClientFarmPundit.status == "ACTIVE")
     )).scalars().all()
 
+    # 2026-07-25 — Training Sandbox surfacing on the pundit dashboard.
+    # Training children don't have their own ClientFarmPundit rows
+    # (bindings live on the parent), so they'd never show as separate
+    # cards on the pundit home. But queries submitted from a training
+    # subscription carry the training child's client_id (Commit A /
+    # today's routing fix), so those queries have no card to bucket
+    # into and the pundit can't tap through to answer.
+    #
+    # Per user 2026-07-25: show a card for each training child of a
+    # parent the pundit is bound to, BUT ONLY if the pundit is
+    # currently holding at least one query on that training child in
+    # the same three status buckets the count pills read (NEW,
+    # FORWARDED, RETURNED). Zero-work training clients stay hidden
+    # so the dashboard doesn't get cluttered between real sessions.
+    training_company_entries: list[dict] = []
+    parent_ids = [c.client_id for c in companies]
+    if parent_ids:
+        from app.modules.clients.models import Client as _Client
+        kid_rows = (await db.execute(
+            select(_Client.id, _Client.parent_client_id).where(
+                _Client.is_training == True,  # noqa: E712
+                _Client.parent_client_id.in_(parent_ids),
+            )
+        )).all()
+        if kid_rows:
+            kid_ids = [k[0] for k in kid_rows]
+            active_kid_ids = set((await db.execute(
+                select(Query.client_id).where(
+                    Query.current_holder_id == profile.id,
+                    Query.client_id.in_(kid_ids),
+                    Query.status.in_([
+                        QueryStatus.NEW,
+                        QueryStatus.FORWARDED,
+                        QueryStatus.RETURNED,
+                    ]),
+                ).distinct()
+            )).scalars().all())
+            # Inherit role from the pundit's parent binding — a
+            # PRIMARY at the parent stays PRIMARY on training queries,
+            # same for PANEL / PROMOTER_PUNDIT.
+            role_by_parent = {c.client_id: c.role for c in companies}
+            for kid_id, parent_id in kid_rows:
+                if kid_id not in active_kid_ids:
+                    continue
+                training_company_entries.append({
+                    "client_id": kid_id,
+                    "role": role_by_parent[parent_id],
+                    "is_training": True,
+                    "parent_client_id": parent_id,
+                })
+
     # One batch lookup against cosh_core_items to resolve every cosh_id
     # (single-select picks + multi-select lists + state list) into an
     # English label. The Pundit's profile screen never sees UUIDs.
@@ -462,7 +520,10 @@ async def get_pundit_profile_detail(
             "district_cosh_id": a.district_cosh_id,
             "district_name": name_by_cosh_id.get(a.district_cosh_id) if a.district_cosh_id else None,
         } for a in areas],
-        "companies": [{"client_id": c.client_id, "role": c.role} for c in companies],
+        "companies": [
+            {"client_id": c.client_id, "role": c.role, "is_training": False}
+            for c in companies
+        ] + training_company_entries,
     }
 
 
