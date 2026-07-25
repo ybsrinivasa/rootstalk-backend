@@ -3185,6 +3185,18 @@ async def get_query_detail_pundit(
             },
         }
 
+    # 2026-07-25 — Training marker on the query detail. Cheap point
+    # read; drives the persistent Training banner on the pundit's
+    # query detail + response composer.
+    from app.modules.clients.models import Client as _ClientForTrain
+    client_is_training = bool(
+        (await db.execute(
+            select(_ClientForTrain.is_training).where(
+                _ClientForTrain.id == query.client_id
+            )
+        )).scalar_one_or_none()
+    )
+
     return {
         "id": query.id,
         "title": query.title,
@@ -3196,6 +3208,7 @@ async def get_query_detail_pundit(
         # the right company's standard library (the search endpoint
         # is client-scoped per spec §14.9).
         "client_id": query.client_id,
+        "client_is_training": client_is_training,
         "crop_cosh_id": query.crop_cosh_id,
         "crop_name": crop_name,
         "crop_measure": crop_measure,
