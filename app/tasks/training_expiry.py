@@ -358,6 +358,35 @@ async def _cascade_delete_training_child(
             )
         except ImportError:
             pass
+        # PracticeAcknowledgement (farmer's daily-practice ticks).
+        # Missing from Commit L cascade — caught 2026-07-25 when the
+        # first hard-close attempt hit a live YSR Testing session with
+        # acknowledged practices and blew up on FK violation.
+        try:
+            from app.modules.advisory.models import PracticeAcknowledgement
+            await db.execute(
+                delete(PracticeAcknowledgement).where(
+                    PracticeAcknowledgement.subscription_id.in_(sub_ids)
+                )
+            )
+        except ImportError:
+            pass
+        # LockedTimelineSnapshot (subscription-scoped despite living in
+        # the snapshot_models module — `subscription_id` FK is the one
+        # that blocks Subscription delete). Note: OrderItem also has a
+        # SET NULL FK pointing at this table, which is fine — those
+        # rows go via the order cascade above.
+        try:
+            from app.modules.subscriptions.snapshot_models import (
+                LockedTimelineSnapshot,
+            )
+            await db.execute(
+                delete(LockedTimelineSnapshot).where(
+                    LockedTimelineSnapshot.subscription_id.in_(sub_ids)
+                )
+            )
+        except ImportError:
+            pass
 
     # ── Layer 4: query itself ─────────────────────────────────────
     if query_ids:
