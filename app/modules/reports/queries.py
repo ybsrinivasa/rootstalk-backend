@@ -47,7 +47,9 @@ from typing import Any, Awaitable, Callable, Optional, TypeVar
 from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.advisory.models import Package
 from app.modules.clients.models import Client
+from app.modules.platform.models import User
 from app.modules.subscriptions.models import Subscription, SubscriptionStatus
 
 
@@ -119,6 +121,33 @@ def _subscription_scope(client_id: str) -> Select:
             Client.is_training.is_(False),
         )
     )
+
+
+def _apply_filters(stmt: Select, filters: "ReportFilters") -> Select:
+    """Apply the optional Report chip filters to a subscription-scoped stmt.
+
+    Joins Package / User only when a filter demands it — the ``subs_active``
+    "no chips selected" path stays a two-table query. Ordering matches the
+    frontend chip row: Crop · State · District · Package.
+
+    Time filters (``period_from`` / ``period_to``) are NOT applied here —
+    each metric applies them against its own date column (``subscription_date``
+    for subs_new, ``created_at`` for orders_count, etc.). Left to the
+    per-metric body to keep the semantics honest.
+    """
+    if filters.crop_cosh_id:
+        stmt = stmt.join(Package, Package.id == Subscription.package_id).where(
+            Package.crop_cosh_id == filters.crop_cosh_id,
+        )
+    if filters.state_cosh_id or filters.district_cosh_id:
+        stmt = stmt.join(User, User.id == Subscription.farmer_user_id)
+        if filters.state_cosh_id:
+            stmt = stmt.where(User.state_cosh_id == filters.state_cosh_id)
+        if filters.district_cosh_id:
+            stmt = stmt.where(User.district_cosh_id == filters.district_cosh_id)
+    if filters.package_id:
+        stmt = stmt.where(Subscription.package_id == filters.package_id)
+    return stmt
 
 
 # ── Common filter bundle ──────────────────────────────────────────────────────
@@ -199,13 +228,14 @@ async def subs_active(
     "active as of date X" needs a status audit trail and is deferred
     to Phase 2+.
     """
-    stmt = (
-        _subscription_scope(client_id)
-        .with_only_columns(
-            func.count(Subscription.id).label("subscriptions"),
-            func.count(func.distinct(Subscription.farmer_user_id)).label("farmers"),
-        )
-        .where(Subscription.status == SubscriptionStatus.ACTIVE)
+    stmt = _apply_filters(
+        _subscription_scope(client_id).where(
+            Subscription.status == SubscriptionStatus.ACTIVE,
+        ),
+        filters,
+    ).with_only_columns(
+        func.count(Subscription.id).label("subscriptions"),
+        func.count(func.distinct(Subscription.farmer_user_id)).label("farmers"),
     )
     row = (await db.execute(stmt)).one()
     return {"subscriptions": int(row.subscriptions), "farmers": int(row.farmers)}

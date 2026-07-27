@@ -111,3 +111,69 @@ async def test_subs_active_empty_client_returns_zero(db):
     result = await subs_active(db, client.id, ReportFilters())
 
     assert result == {"subscriptions": 0, "farmers": 0}
+
+
+async def test_subs_active_narrows_by_each_filter(db):
+    """Each of the four chip filters must scope the result independently.
+
+    The unfiltered baseline is 3 active subs across 2 farmers on 2
+    packages / 2 crops / 2 districts. Every filter should carve out
+    exactly the expected subset.
+    """
+    client = await make_client(db, full_name="Filter Test Client")
+
+    farmer_north = await make_user(db, name="Farmer North")
+    farmer_north.state_cosh_id = "state:north"
+    farmer_north.district_cosh_id = "district:north-a"
+
+    farmer_south = await make_user(db, name="Farmer South")
+    farmer_south.state_cosh_id = "state:south"
+    farmer_south.district_cosh_id = "district:south-b"
+
+    pkg_maize = await make_package(
+        db, client, name="Maize PoP", crop_cosh_id="crop:maize",
+    )
+    pkg_wheat = await make_package(
+        db, client, name="Wheat PoP", crop_cosh_id="crop:wheat",
+    )
+
+    # 3 active subs on 2 farmers:
+    #   north-a → Maize x1
+    #   north-a → Wheat x1     (same farmer, second crop)
+    #   south-b → Maize x1
+    await make_subscription(db, farmer=farmer_north, client=client, package=pkg_maize)
+    await make_subscription(db, farmer=farmer_north, client=client, package=pkg_wheat)
+    await make_subscription(db, farmer=farmer_south, client=client, package=pkg_maize)
+
+    await db.flush()
+
+    # Baseline.
+    assert await subs_active(db, client.id, ReportFilters()) == {
+        "subscriptions": 3, "farmers": 2,
+    }
+
+    # Crop chip.
+    assert await subs_active(
+        db, client.id, ReportFilters(crop_cosh_id="crop:maize"),
+    ) == {"subscriptions": 2, "farmers": 2}
+
+    # State chip.
+    assert await subs_active(
+        db, client.id, ReportFilters(state_cosh_id="state:north"),
+    ) == {"subscriptions": 2, "farmers": 1}
+
+    # District chip.
+    assert await subs_active(
+        db, client.id, ReportFilters(district_cosh_id="district:south-b"),
+    ) == {"subscriptions": 1, "farmers": 1}
+
+    # Package chip.
+    assert await subs_active(
+        db, client.id, ReportFilters(package_id=pkg_wheat.id),
+    ) == {"subscriptions": 1, "farmers": 1}
+
+    # Combination — Crop AND State (AND semantics; not OR).
+    assert await subs_active(
+        db, client.id,
+        ReportFilters(crop_cosh_id="crop:maize", state_cosh_id="state:north"),
+    ) == {"subscriptions": 1, "farmers": 1}
