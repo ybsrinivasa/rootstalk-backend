@@ -437,16 +437,56 @@ def _format_dt(dt) -> str:
 
 
 def _stream_csv(header: list[str], rows: list[list[str]]) -> StreamingResponse:
-    """Build a streaming CSV response. StringIO is fine for staging
-    volumes; if row counts grow past ~50k the generator can be
-    swapped for a per-row yield without touching call sites."""
+    """Build a streaming CSV response tuned for Excel compatibility.
+
+    Three defences against Excel's habit of "helpfully" mis-parsing
+    CSVs, all learned the hard way 2026-07-28:
+
+    1. ``sep=,`` as the first line — Excel-specific directive that
+       forces comma as the delimiter regardless of the user's locale
+       (some European Excel installs default to semicolon and would
+       otherwise auto-detect space as a sub-delimiter, blowing every
+       "Farmer Name" cell across two columns).
+
+    2. **UTF-8 BOM** at file start — signals UTF-8 to Excel so it
+       stops guessing and reads column boundaries reliably.
+
+    3. **``csv.QUOTE_ALL``** — every field is wrapped in double quotes.
+       Removes any ambiguity about where a cell ends. Cheap on wire
+       size, huge on parser sanity.
+
+    Phone numbers are separately wrapped as ``="+91…"`` at the call
+    site so Excel doesn't convert them to scientific notation; see
+    ``_excel_text``.
+
+    StringIO is fine for staging volumes; if row counts grow past
+    ~50k the generator can be swapped for a per-row yield without
+    touching call sites.
+    """
     buf = io.StringIO()
-    w = csv.writer(buf, quoting=csv.QUOTE_MINIMAL)
+    buf.write("sep=,\r\n")
+    w = csv.writer(buf, quoting=csv.QUOTE_ALL)
     w.writerow(header)
     for r in rows:
         w.writerow(r)
-    buf.seek(0)
-    return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv")
+    body = "﻿" + buf.getvalue()  # UTF-8 BOM prefix
+    return StreamingResponse(iter([body]), media_type="text/csv")
+
+
+def _excel_text(value: str) -> str:
+    """Force Excel to treat a numeric-looking string as text.
+
+    Excel converts anything starting with ``+``, ``-`` or all digits
+    into a number by default — long phone numbers like ``+919000889927``
+    become ``9.19001E+11``. Wrapping as ``="+919000889927"`` makes
+    Excel evaluate it as a formula returning the string, which
+    preserves the exact display. Other CSV consumers see the literal
+    ``="+919000889927"`` which is imperfect but readable; this is the
+    least-bad option for a CSV that has to be Excel-safe.
+    """
+    if not value:
+        return ""
+    return f'="{value}"'
 
 
 def _csv_filename(cid: str, subject: str) -> str:
@@ -496,7 +536,7 @@ async def subscriptions_csv(
         [
             r["subscription_ref"] or "",
             r["farmer_name"] or "",
-            r["farmer_phone"] or "",
+            _excel_text(r["farmer_phone"] or ""),
             r["package_name"] or "",
             cosh_names.get(r["crop_cosh_id"] or "", r["crop_cosh_id"] or ""),
             cosh_names.get(r["state_cosh_id"] or "", r["state_cosh_id"] or ""),
@@ -553,7 +593,7 @@ async def orders_csv(
             _format_dt(r["order_date"]),
             r["status"] or "",
             r["farmer_name"] or "",
-            r["farmer_phone"] or "",
+            _excel_text(r["farmer_phone"] or ""),
             r["dealer_name"] or "",
             r["facilitator_name"] or "",
             "Via Facilitator" if r["facilitator_user_id"] else "Direct",
