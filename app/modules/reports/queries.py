@@ -804,22 +804,38 @@ async def overview_bundle(
     db: AsyncSession,
     client_id: str,
     filters: ReportFilters,
-    prev_filters: ReportFilters,
 ) -> dict:
-    """Compose the Overview page payload in one round-trip to the router.
+    """Compose the Overview page payload in one HTTP round-trip.
 
-    Calls the underlying single-metric functions in sequence — six
-    Postgres round-trips today. Chosen deliberately over a single
-    hand-rolled SQL so each sub-query keeps its own P95 log line
-    (see feedback_reporting_architecture_escalation_ladder.md); if
-    Overview becomes slow, the logs tell us WHICH sub-query to
-    escalate first, not just "Overview is slow."
+    Calls four headline metrics sequentially with the same filter
+    set. Each metric keeps its own P95 log line via
+    ``@timed_query`` — when Overview becomes slow, the logs tell us
+    WHICH sub-query is heavy, not just "Overview is slow." See
+    ``feedback_reporting_architecture_escalation_ladder.md``.
 
-    ``prev_filters`` is the previous-period window (calendar-month
-    prior by default) so headline cards can render deltas without a
-    second round-trip.
+    Returns::
 
-    Returns a dict shaped for the ``/overview`` endpoint payload —
-    exact contract locked when the router lands.
+        {
+          "subs_new":          {"relationships": <int>, "farmers": <int>},
+          "subs_active":       {"subscriptions": <int>, "farmers": <int>},
+          "orders_count":      {"orders":        <int>, "farmers": <int>},
+          "orders_conversion": {"ordered":       <int>, "approved": <int>,
+                                "picked_up":     <int>},
+        }
+
+    Deferred to Phase 1 polish:
+    - Prev-period deltas (doubles the query count; add a second
+      ``prev_filters`` parameter and shape the response as
+      ``{current, prev, delta}`` per card).
+    - Hero chart series (needs the *_by_dimension queries to land).
     """
-    raise NotImplementedError
+    subs_new_res      = await subs_new(db, client_id, filters)
+    subs_active_res   = await subs_active(db, client_id, filters)
+    orders_count_res  = await orders_count(db, client_id, filters)
+    orders_conv_res   = await orders_conversion(db, client_id, filters)
+    return {
+        "subs_new":          subs_new_res,
+        "subs_active":       subs_active_res,
+        "orders_count":      orders_count_res,
+        "orders_conversion": orders_conv_res,
+    }

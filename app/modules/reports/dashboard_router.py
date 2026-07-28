@@ -185,6 +185,35 @@ async def filter_options(
     }
 
 
+# ── Overview (composed headlines) ─────────────────────────────────────────────
+
+@router.get("/client/{cid}/reports/overview")
+async def overview_report(
+    cid: str,
+    period_from: Optional[datetime] = None,
+    period_to: Optional[datetime] = None,
+    crop_cosh_id: Optional[str] = None,
+    state_cosh_id: Optional[str] = None,
+    district_cosh_id: Optional[str] = None,
+    package_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Reports landing payload — four headline metrics in one round-trip.
+
+    Combines subs_new + subs_active + orders_count + orders_conversion
+    under the same filter set. Same auth gate as the drill endpoints.
+    """
+    await _assert_client_report_reader(db, current_user, cid)
+    _assert_subject_enabled(cid, "overview")
+
+    filters = _build_filters(
+        period_from, period_to,
+        crop_cosh_id, state_cosh_id, district_cosh_id, package_id,
+    )
+    return await queries.overview_bundle(db, cid, filters)
+
+
 # ── Subscriptions subject area ────────────────────────────────────────────────
 
 @router.get("/client/{cid}/reports/subscriptions")
