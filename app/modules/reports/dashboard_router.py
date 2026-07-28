@@ -294,14 +294,7 @@ async def orders_report(
         if metric_up == "BRAND_MIX":
             return await queries.orders_brand_mix(db, cid, filters)
         if metric_up == "CONVERSION":
-            raise HTTPException(
-                status_code=501,
-                detail={
-                    "code": "metric_not_implemented",
-                    "message": "Orders 'CONVERSION' is on the "
-                               "Phase 1 punch list; not yet wired.",
-                },
-            )
+            return await queries.orders_conversion(db, cid, filters)
         raise HTTPException(
             status_code=422,
             detail={

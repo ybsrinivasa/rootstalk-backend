@@ -27,11 +27,11 @@ from tests.factories import (
 
 from app.modules.clients.models import Client
 from app.modules.reports.queries import (
-    ReportFilters, orders_brand_mix, orders_count, orders_items,
-    orders_routing, subs_active, subs_new, subs_total,
+    ReportFilters, orders_brand_mix, orders_conversion, orders_count,
+    orders_items, orders_routing, subs_active, subs_new, subs_total,
 )
 from app.modules.orders.models import (
-    Order, OrderItem, OrderItemStatus, OrderStatus,
+    Order, OrderItem, OrderItemStatus, OrderStatus, PackingList,
 )
 from app.modules.subscriptions.models import Subscription, SubscriptionStatus
 
@@ -504,6 +504,88 @@ async def test_orders_items_ignores_items_on_draft_orders(db):
     assert await orders_items(db, parent.id, ReportFilters()) == {
         "items_total": 0, "items_approved": 0, "items_rejected": 0,
     }
+
+
+async def test_orders_conversion_funnel(db):
+    """orders_conversion returns the three-part sale funnel:
+      ordered   = counted-status orders in period
+      approved  = has any APPROVED item
+      picked_up = has any PackingList row with farmer_received_at
+
+    Ordered ≥ Approved ≥ Picked_up (usually). Verify each step
+    counts distinct orders (multiple approved items or multiple
+    PackingList rows don't inflate).
+    """
+    from datetime import datetime, timedelta, timezone
+    from tests.factories import make_practice, make_timeline
+
+    parent = await make_client(db, full_name="Parent")
+    pkg = await make_package(db, parent, name="PoP")
+    tl = await make_timeline(db, pkg)
+    practice = await make_practice(db, tl)
+    farmer = await make_user(db, name="F")
+    dealer = await make_user(db, name="D")
+    sub = await make_subscription(db, farmer=farmer, client=parent, package=pkg)
+
+    period_from = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    period_to   = datetime(2026, 8, 1, tzinfo=timezone.utc)
+
+    def _order(status, created):
+        o = Order(
+            subscription_id=sub.id, farmer_user_id=farmer.id,
+            client_id=parent.id, dealer_user_id=dealer.id,
+            date_from=created, date_to=created + timedelta(days=14),
+            status=status,
+        )
+        o.created_at = created
+        db.add(o)
+        return o
+
+    def _item(order, status):
+        db.add(OrderItem(
+            order_id=order.id, practice_id=practice.id, timeline_id=tl.id,
+            status=status,
+        ))
+
+    def _packing(order, received=False):
+        pl = PackingList(order_id=order.id)
+        if received:
+            pl.farmer_received_at = datetime(2026, 7, 20, tzinfo=timezone.utc)
+        db.add(pl)
+
+    # Order 1 — approved AND picked up: full funnel.
+    o1 = _order(OrderStatus.SENT, datetime(2026, 7, 5, tzinfo=timezone.utc))
+    _item(o1, OrderItemStatus.APPROVED)
+    _item(o1, OrderItemStatus.APPROVED)  # 2nd APPROVED — must NOT inflate
+    _packing(o1, received=True)
+    _packing(o1, received=True)          # 2nd PackingList — must NOT inflate
+
+    # Order 2 — approved but NOT picked up (PackingList exists, no
+    # farmer_received_at yet — items handed to dealer only).
+    o2 = _order(OrderStatus.SENT, datetime(2026, 7, 10, tzinfo=timezone.utc))
+    _item(o2, OrderItemStatus.APPROVED)
+    _packing(o2, received=False)
+
+    # Order 3 — ordered but nothing approved, nothing picked up.
+    o3 = _order(OrderStatus.SENT, datetime(2026, 7, 15, tzinfo=timezone.utc))
+    _item(o3, OrderItemStatus.PENDING)
+
+    # Excluded — DRAFT status.
+    o_draft = _order(OrderStatus.DRAFT, datetime(2026, 7, 20, tzinfo=timezone.utc))
+    _item(o_draft, OrderItemStatus.APPROVED)
+    _packing(o_draft, received=True)
+
+    # Excluded — out of period.
+    o_june = _order(OrderStatus.SENT, datetime(2026, 6, 25, tzinfo=timezone.utc))
+    _item(o_june, OrderItemStatus.APPROVED)
+    _packing(o_june, received=True)
+
+    await db.flush()
+
+    assert await orders_conversion(
+        db, parent.id,
+        ReportFilters(period_from=period_from, period_to=period_to),
+    ) == {"ordered": 3, "approved": 2, "picked_up": 1}
 
 
 async def test_orders_brand_mix_via_snapshot_honors_2lock(db):

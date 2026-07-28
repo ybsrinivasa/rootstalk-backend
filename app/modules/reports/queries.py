@@ -50,7 +50,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.modules.advisory.models import Element, Package, Practice
 from app.modules.subscriptions.snapshot_models import LockedTimelineSnapshot
 from app.modules.clients.models import Client
-from app.modules.orders.models import Order, OrderItem, OrderItemStatus, OrderStatus
+from app.modules.orders.models import (
+    Order, OrderItem, OrderItemStatus, OrderStatus, PackingList,
+)
 from app.modules.platform.models import User
 from app.modules.subscriptions.models import Subscription, SubscriptionStatus
 
@@ -680,17 +682,70 @@ async def orders_conversion(
     Returns::
 
         {
-          "ordered": <int>,
-          "approved": <int>,       # order has any APPROVED item
-          "picked_up": <int>,      # PackingList.farmer_received_at NOT NULL
+          "ordered":   <int>,   # counted-status orders in period
+          "approved":  <int>,   # order has any APPROVED item
+          "picked_up": <int>,   # order has any PackingList row with
+                                # farmer_received_at NOT NULL
         }
 
     Frontend renders three ratios from these:
       - Sale conversion = picked_up / ordered  (headline)
       - Approval        = approved  / ordered  (secondary)
-      - Fulfilment      = picked_up / approved (diagnostic)
+      - Fulfilment      = picked_up / approved (diagnostic — how many
+                                                approvals actually
+                                                translated to pickup)
+
+    Semantics:
+    - **ordered** — same denominator as ``orders_count``. Every order
+      that reached the dealer (SENT and beyond) counts.
+    - **approved** — the order has AT LEAST ONE item in APPROVED
+      status. A partially-approved order still counts here.
+    - **picked_up** — the sale marker per the plan: at least one
+      PackingList row on the order has ``farmer_received_at`` set.
+      Farmer receipt is the moment the sale is genuinely closed.
+
+    All three counts in one round-trip via conditional COUNT FILTER
+    + correlated EXISTS.
     """
-    raise NotImplementedError
+    scope = _apply_filters(_subscription_scope(client_id), filters)
+
+    approved_exists = (
+        select(OrderItem.id).where(
+            OrderItem.order_id == Order.id,
+            OrderItem.status == OrderItemStatus.APPROVED,
+        ).exists()
+    )
+    picked_up_exists = (
+        select(PackingList.id).where(
+            PackingList.order_id == Order.id,
+            PackingList.farmer_received_at.is_not(None),
+        ).exists()
+    )
+
+    stmt = (
+        scope
+        .join(Order, Order.subscription_id == Subscription.id)
+        .with_only_columns(
+            func.count(func.distinct(Order.id)).label("ordered"),
+            func.count(func.distinct(Order.id))
+                .filter(approved_exists)
+                .label("approved"),
+            func.count(func.distinct(Order.id))
+                .filter(picked_up_exists)
+                .label("picked_up"),
+        )
+        .where(Order.status.in_(ORDER_COUNTED_STATUSES))
+    )
+    if filters.period_from is not None:
+        stmt = stmt.where(Order.created_at >= filters.period_from)
+    if filters.period_to is not None:
+        stmt = stmt.where(Order.created_at < filters.period_to)
+    row = (await db.execute(stmt)).one()
+    return {
+        "ordered":   int(row.ordered),
+        "approved":  int(row.approved),
+        "picked_up": int(row.picked_up),
+    }
 
 
 @timed_query("orders_count_by_dimension")
