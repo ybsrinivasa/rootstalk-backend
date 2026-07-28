@@ -748,12 +748,118 @@ async def orders_conversion(
     }
 
 
+def _pick_time_bucket(period_from, period_to) -> str:
+    """Auto-pick date_trunc bucket size based on the period window.
+
+    Rule confirmed with user on 2026-07-27:
+      ≤ 14 days  → daily
+      ≤ 120 days → weekly (Postgres week starts Monday)
+      else       → monthly
+
+    When no period bounds are given, default to monthly — a long
+    all-time trend is only readable as months.
+    """
+    if period_from is None or period_to is None:
+        return "month"
+    days = (period_to - period_from).days
+    if days <= 14:
+        return "day"
+    if days <= 120:
+        return "week"
+    return "month"
+
+
 @timed_query("orders_count_by_dimension")
 async def orders_count_by_dimension(
     db: AsyncSession, client_id: str, filters: ReportFilters, dimension: str,
 ) -> list[dict]:
-    """Group ``orders_count`` by dimension."""
-    raise NotImplementedError
+    """Group ``orders_count`` by CROP / SPACE / PACKAGE / TIME.
+
+    Returns a list of rows shaped for the frontend drill table::
+
+        [{"key": <id-or-iso-date>, "label_needs_lookup": <bool>,
+          "orders": <int>, "farmers": <int>, ...}, ...]
+
+    - **CROP**    — group by ``Package.crop_cosh_id``. Row ``key`` is
+      the cosh_id (resolved to English name by the router).
+    - **SPACE**   — group by farmer's ``User.state_cosh_id``. Same.
+      District drill deferred per plan (state-level is enough for v1).
+    - **PACKAGE** — group by ``Subscription.package_id``. Row ``key``
+      is the package_id; the label is ``Package.name`` (no cosh
+      lookup needed).
+    - **TIME**    — ``date_trunc(bucket, Order.created_at)`` with
+      auto bucket size from ``_pick_time_bucket``. Row ``key`` is
+      the bucket-start datetime (ISO). Ordered ascending.
+
+    Same status filter (ORDER_COUNTED_STATUSES) + period filter as
+    ``orders_count``. Dimension queries pre-join Package + User
+    directly instead of routing through ``_apply_filters`` because
+    the join needs to exist regardless of filter presence (else
+    grouping by an un-joined column blows up).
+    """
+    # Base scope: subscription + client + is_training + Order status filter.
+    # We do NOT call _apply_filters here — dimension queries need
+    # deterministic joins to Package + User whether or not those chip
+    # filters are set. Duplicating the six WHERE lines below is cheaper
+    # than reworking _apply_filters to be idempotent-with-aliases.
+    base = (
+        _subscription_scope(client_id)
+        .join(Order, Order.subscription_id == Subscription.id)
+        .join(Package, Package.id == Subscription.package_id)
+        .join(User, User.id == Subscription.farmer_user_id)
+        .where(Order.status.in_(ORDER_COUNTED_STATUSES))
+    )
+    if filters.crop_cosh_id:
+        base = base.where(Package.crop_cosh_id == filters.crop_cosh_id)
+    if filters.state_cosh_id:
+        base = base.where(User.state_cosh_id == filters.state_cosh_id)
+    if filters.district_cosh_id:
+        base = base.where(User.district_cosh_id == filters.district_cosh_id)
+    if filters.package_id:
+        base = base.where(Subscription.package_id == filters.package_id)
+    if filters.period_from is not None:
+        base = base.where(Order.created_at >= filters.period_from)
+    if filters.period_to is not None:
+        base = base.where(Order.created_at < filters.period_to)
+
+    orders_count_expr = func.count(func.distinct(Order.id))
+    farmers_count_expr = func.count(func.distinct(Order.farmer_user_id))
+
+    dim = dimension.upper()
+    if dim == "CROP":
+        stmt = base.with_only_columns(
+            Package.crop_cosh_id.label("key"),
+            orders_count_expr.label("orders"),
+            farmers_count_expr.label("farmers"),
+        ).group_by(Package.crop_cosh_id).order_by(orders_count_expr.desc())
+    elif dim == "SPACE":
+        stmt = base.with_only_columns(
+            User.state_cosh_id.label("key"),
+            orders_count_expr.label("orders"),
+            farmers_count_expr.label("farmers"),
+        ).group_by(User.state_cosh_id).order_by(orders_count_expr.desc())
+    elif dim == "PACKAGE":
+        stmt = base.with_only_columns(
+            Subscription.package_id.label("key"),
+            Package.name.label("package_name"),
+            orders_count_expr.label("orders"),
+            farmers_count_expr.label("farmers"),
+        ).group_by(Subscription.package_id, Package.name).order_by(
+            orders_count_expr.desc(),
+        )
+    elif dim == "TIME":
+        bucket = _pick_time_bucket(filters.period_from, filters.period_to)
+        bucket_col = func.date_trunc(bucket, Order.created_at).label("key")
+        stmt = base.with_only_columns(
+            bucket_col,
+            orders_count_expr.label("orders"),
+            farmers_count_expr.label("farmers"),
+        ).group_by(bucket_col).order_by(bucket_col.asc())
+    else:
+        raise ValueError(f"Unknown dimension: {dimension!r}")
+
+    rows = (await db.execute(stmt)).all()
+    return [dict(r._mapping) for r in rows]
 
 
 @timed_query("orders_items_by_dimension")

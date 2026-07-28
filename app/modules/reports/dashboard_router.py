@@ -336,14 +336,53 @@ async def orders_report(
             },
         )
 
+    dim_up = dimension.upper()
+    if dim_up not in {"CROP", "SPACE", "PACKAGE", "TIME"}:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "unknown_dimension",
+                "message": f"Unknown dimension '{dimension}'.",
+            },
+        )
+    if metric_up == "COUNT":
+        rows = await queries.orders_count_by_dimension(db, cid, filters, dim_up)
+        return await _hydrate_dimension_labels(db, rows, dim_up)
     raise HTTPException(
         status_code=501,
         detail={
-            "code": "dimension_not_implemented",
-            "message": "Dimension drills are on the Phase 1 punch list; "
-                       "not yet wired.",
+            "code": "dimension_metric_not_implemented",
+            "message": (
+                f"Dimension drill for orders metric '{metric_up}' is on "
+                "the Phase 1 punch list; not yet wired."
+            ),
         },
     )
+
+
+async def _hydrate_dimension_labels(
+    db: AsyncSession, rows: list[dict], dimension: str,
+) -> list[dict]:
+    """Resolve cosh_id keys to English labels for CROP / SPACE rows.
+    PACKAGE rows already carry ``package_name``; TIME rows carry
+    ISO datetimes that the frontend formats."""
+    if dimension in {"CROP", "SPACE"}:
+        keys = [r["key"] for r in rows if r.get("key")]
+        names = await _cosh_names(db, keys) if keys else {}
+        return [
+            {**r, "label": names.get(r.get("key") or "", r.get("key") or "—")}
+            for r in rows
+        ]
+    if dimension == "PACKAGE":
+        return [{**r, "label": r.get("package_name") or "—"} for r in rows]
+    if dimension == "TIME":
+        # Frontend formats the ISO string per bucket size — we just
+        # normalise to isoformat here so the wire shape is stable.
+        return [
+            {**r, "label": r["key"].isoformat() if r.get("key") else "—"}
+            for r in rows
+        ]
+    return rows
 
 
 # ── CSV export ────────────────────────────────────────────────────────────────

@@ -28,7 +28,8 @@ from tests.factories import (
 from app.modules.clients.models import Client
 from app.modules.reports.queries import (
     ReportFilters, orders_brand_mix, orders_conversion, orders_count,
-    orders_items, orders_routing, subs_active, subs_new, subs_total,
+    orders_count_by_dimension, orders_items, orders_routing,
+    subs_active, subs_new, subs_total,
 )
 from app.modules.orders.models import (
     Order, OrderItem, OrderItemStatus, OrderStatus, PackingList,
@@ -741,3 +742,82 @@ async def test_subs_new_no_period_returns_all_datable(db):
     assert await subs_new(db, parent.id, ReportFilters()) == {
         "relationships": 1, "farmers": 1,
     }
+
+
+async def test_orders_count_by_dimension_all_four_axes(db):
+    """orders_count_by_dimension groups by CROP / SPACE / PACKAGE /
+    TIME. Verify each axis returns the expected buckets with
+    correct per-bucket counts + farmer dedup.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    parent = await make_client(db, full_name="Parent")
+    pkg_maize = await make_package(db, parent, name="Maize PoP", crop_cosh_id="crop:maize")
+    pkg_wheat = await make_package(db, parent, name="Wheat PoP", crop_cosh_id="crop:wheat")
+
+    farmer_kar = await make_user(db, name="Farmer Kar")
+    farmer_kar.state_cosh_id = "state:karnataka"
+    farmer_tn = await make_user(db, name="Farmer TN")
+    farmer_tn.state_cosh_id = "state:tamil-nadu"
+
+    dealer = await make_user(db, name="D")
+
+    sub_kar_maize = await make_subscription(db, farmer=farmer_kar, client=parent, package=pkg_maize)
+    sub_kar_wheat = await make_subscription(db, farmer=farmer_kar, client=parent, package=pkg_wheat)
+    sub_tn_maize  = await make_subscription(db, farmer=farmer_tn,  client=parent, package=pkg_maize)
+
+    def _order(sub, farmer, created):
+        o = Order(
+            subscription_id=sub.id, farmer_user_id=farmer.id,
+            client_id=parent.id, dealer_user_id=dealer.id,
+            date_from=created, date_to=created + timedelta(days=14),
+            status=OrderStatus.SENT,
+        )
+        o.created_at = created
+        db.add(o)
+        return o
+
+    # Orders in July 2026 (period = this window).
+    _order(sub_kar_maize, farmer_kar, datetime(2026, 7, 3,  tzinfo=timezone.utc))
+    _order(sub_kar_maize, farmer_kar, datetime(2026, 7, 10, tzinfo=timezone.utc))
+    _order(sub_kar_wheat, farmer_kar, datetime(2026, 7, 5,  tzinfo=timezone.utc))
+    _order(sub_tn_maize,  farmer_tn,  datetime(2026, 7, 15, tzinfo=timezone.utc))
+    _order(sub_tn_maize,  farmer_tn,  datetime(2026, 7, 20, tzinfo=timezone.utc))
+    await db.flush()
+
+    f = ReportFilters(
+        period_from=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        period_to=datetime(2026, 8, 1, tzinfo=timezone.utc),
+    )
+
+    # CROP — Maize 4 (both farmers), Wheat 1 (kar only).
+    crop_rows = await orders_count_by_dimension(db, parent.id, f, "CROP")
+    crop_by_key = {r["key"]: r for r in crop_rows}
+    assert crop_by_key["crop:maize"]["orders"]  == 4
+    assert crop_by_key["crop:maize"]["farmers"] == 2
+    assert crop_by_key["crop:wheat"]["orders"]  == 1
+    assert crop_by_key["crop:wheat"]["farmers"] == 1
+
+    # SPACE — Karnataka 3, Tamil Nadu 2.
+    space_rows = await orders_count_by_dimension(db, parent.id, f, "SPACE")
+    space_by_key = {r["key"]: r for r in space_rows}
+    assert space_by_key["state:karnataka"]["orders"]  == 3
+    assert space_by_key["state:karnataka"]["farmers"] == 1
+    assert space_by_key["state:tamil-nadu"]["orders"] == 2
+    assert space_by_key["state:tamil-nadu"]["farmers"] == 1
+
+    # PACKAGE — Maize pkg 4, Wheat pkg 1. Row carries package_name.
+    pkg_rows = await orders_count_by_dimension(db, parent.id, f, "PACKAGE")
+    pkg_by_key = {r["key"]: r for r in pkg_rows}
+    assert pkg_by_key[pkg_maize.id]["orders"] == 4
+    assert pkg_by_key[pkg_wheat.id]["orders"] == 1
+    assert pkg_by_key[pkg_maize.id]["package_name"] == "Maize PoP"
+
+    # TIME — July is 31 days → weekly bucket per _pick_time_bucket.
+    # Orders on 3/5/10 land in week starting Jun 29; 15 in week Jul 13;
+    # 20 in week Jul 20. Postgres date_trunc('week') is Monday.
+    time_rows = await orders_count_by_dimension(db, parent.id, f, "TIME")
+    total = sum(r["orders"] for r in time_rows)
+    assert total == 5
+    # Time rows are ordered ascending.
+    assert time_rows == sorted(time_rows, key=lambda r: r["key"])
