@@ -287,7 +287,9 @@ async def orders_report(
     if dimension is None:
         if metric_up == "COUNT":
             return await queries.orders_count(db, cid, filters)
-        if metric_up in {"ITEMS", "BRAND_MIX", "ROUTING", "CONVERSION"}:
+        if metric_up == "ROUTING":
+            return await queries.orders_routing(db, cid, filters)
+        if metric_up in {"ITEMS", "BRAND_MIX", "CONVERSION"}:
             raise HTTPException(
                 status_code=501,
                 detail={

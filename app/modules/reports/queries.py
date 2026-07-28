@@ -457,10 +457,39 @@ async def orders_routing(
 
         {"direct": <int>, "via_facilitator": <int>}
 
-    Direct = ``facilitator_user_id IS NULL``. Via Facilitator = NOT NULL.
-    Labels are frontend-side; server returns keys.
+    Direct = ``facilitator_user_id IS NULL`` (farmer ordered directly
+    from a dealer). Via Facilitator = NOT NULL (facilitator forwarded
+    the order to a dealer).
+
+    One query, two conditional counts — cheaper than two separate
+    fetches for a metric that always renders both together.
+
+    Same status + period filters as ``orders_count``. Frontend-side
+    labels; server keys stay stable.
     """
-    raise NotImplementedError
+    scope = _apply_filters(_subscription_scope(client_id), filters)
+    stmt = (
+        scope
+        .join(Order, Order.subscription_id == Subscription.id)
+        .with_only_columns(
+            func.count(func.distinct(Order.id))
+                .filter(Order.facilitator_user_id.is_(None))
+                .label("direct"),
+            func.count(func.distinct(Order.id))
+                .filter(Order.facilitator_user_id.is_not(None))
+                .label("via_facilitator"),
+        )
+        .where(Order.status.in_(ORDER_COUNTED_STATUSES))
+    )
+    if filters.period_from is not None:
+        stmt = stmt.where(Order.created_at >= filters.period_from)
+    if filters.period_to is not None:
+        stmt = stmt.where(Order.created_at < filters.period_to)
+    row = (await db.execute(stmt)).one()
+    return {
+        "direct": int(row.direct),
+        "via_facilitator": int(row.via_facilitator),
+    }
 
 
 @timed_query("orders_conversion")

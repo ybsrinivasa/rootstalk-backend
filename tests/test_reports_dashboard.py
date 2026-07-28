@@ -27,7 +27,8 @@ from tests.factories import (
 
 from app.modules.clients.models import Client
 from app.modules.reports.queries import (
-    ReportFilters, orders_count, subs_active, subs_new, subs_total,
+    ReportFilters, orders_count, orders_routing,
+    subs_active, subs_new, subs_total,
 )
 from app.modules.orders.models import Order, OrderStatus
 from app.modules.subscriptions.models import Subscription, SubscriptionStatus
@@ -360,6 +361,56 @@ async def test_orders_count_status_period_and_scope(db):
     assert await orders_count(db, parent.id, ReportFilters()) == {
         "orders": 5, "farmers": 2,
     }
+
+
+async def test_orders_routing_direct_vs_via_facilitator(db):
+    """orders_routing splits counted-status orders by whether
+    Order.facilitator_user_id is NULL (Direct) or NOT NULL (Via
+    Facilitator). Status filter + period filter still apply.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    parent = await make_client(db, full_name="Parent")
+    pkg = await make_package(db, parent, name="PoP")
+    farmer = await make_user(db, name="F")
+    dealer = await make_user(db, name="D")
+    facilitator = await make_user(db, name="Fac")
+    sub = await make_subscription(db, farmer=farmer, client=parent, package=pkg)
+
+    period_from = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    period_to   = datetime(2026, 8, 1, tzinfo=timezone.utc)
+
+    def _order(status, created, via_fac):
+        return Order(
+            subscription_id=sub.id, farmer_user_id=farmer.id,
+            client_id=parent.id, dealer_user_id=dealer.id,
+            facilitator_user_id=(facilitator.id if via_fac else None),
+            date_from=created, date_to=created + timedelta(days=14),
+            status=status,
+        )
+
+    # 2 Direct (no facilitator), 3 Via Facilitator — all in period.
+    for i, via_fac in enumerate([False, False, True, True, True]):
+        o = _order(OrderStatus.SENT, datetime(2026, 7, 5 + i, tzinfo=timezone.utc), via_fac)
+        o.created_at = o.date_from
+        db.add(o)
+
+    # SHOULD NOT COUNT — DRAFT status.
+    o_draft = _order(OrderStatus.DRAFT, datetime(2026, 7, 20, tzinfo=timezone.utc), False)
+    o_draft.created_at = o_draft.date_from
+    db.add(o_draft)
+
+    # SHOULD NOT COUNT — out of period.
+    o_out = _order(OrderStatus.SENT, datetime(2026, 6, 20, tzinfo=timezone.utc), True)
+    o_out.created_at = o_out.date_from
+    db.add(o_out)
+
+    await db.flush()
+
+    assert await orders_routing(
+        db, parent.id,
+        ReportFilters(period_from=period_from, period_to=period_to),
+    ) == {"direct": 2, "via_facilitator": 3}
 
 
 async def test_subs_new_no_period_returns_all_datable(db):
