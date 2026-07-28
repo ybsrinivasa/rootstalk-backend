@@ -49,7 +49,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.advisory.models import Package
 from app.modules.clients.models import Client
-from app.modules.orders.models import Order, OrderStatus
+from app.modules.orders.models import Order, OrderItem, OrderItemStatus, OrderStatus
 from app.modules.platform.models import User
 from app.modules.subscriptions.models import Subscription, SubscriptionStatus
 
@@ -411,19 +411,58 @@ async def orders_count(
 async def orders_items(
     db: AsyncSession, client_id: str, filters: ReportFilters,
 ) -> dict:
-    """Item-level counts in period.
+    """Item-level counts on counted-status orders in period.
 
     Returns::
 
         {
-          "items_total": <int>,
+          "items_total":    <int>,   # every real item
           "items_approved": <int>,   # OrderItemStatus.APPROVED
           "items_rejected": <int>,   # OrderItemStatus.REJECTED
         }
 
-    REMOVED / REROUTED excluded — they're bookkeeping, not real items.
+    Real items exclude ``REMOVED`` (dropped from the order after it
+    was drafted) and ``REROUTED`` (bookkeeping husk after Orders V2
+    reroute — the actual item lives on a new order). Everything else
+    — PENDING, AVAILABLE, POSTPONED, NOT_AVAILABLE, SENT_FOR_APPROVAL,
+    APPROVED, REJECTED, NOT_NEEDED, SKIPPED — counts as a real item.
+
+    Parent Order must be counted-status + in period, same rules as
+    ``orders_count``. Period is on ``Order.created_at`` because
+    OrderItem has no separate created_at we can rely on.
+
+    All three counts in one round-trip via conditional COUNT FILTER.
     """
-    raise NotImplementedError
+    scope = _apply_filters(_subscription_scope(client_id), filters)
+    stmt = (
+        scope
+        .join(Order, Order.subscription_id == Subscription.id)
+        .join(OrderItem, OrderItem.order_id == Order.id)
+        .with_only_columns(
+            func.count(func.distinct(OrderItem.id))
+                .filter(OrderItem.status.notin_([
+                    OrderItemStatus.REMOVED, OrderItemStatus.REROUTED,
+                ]))
+                .label("items_total"),
+            func.count(func.distinct(OrderItem.id))
+                .filter(OrderItem.status == OrderItemStatus.APPROVED)
+                .label("items_approved"),
+            func.count(func.distinct(OrderItem.id))
+                .filter(OrderItem.status == OrderItemStatus.REJECTED)
+                .label("items_rejected"),
+        )
+        .where(Order.status.in_(ORDER_COUNTED_STATUSES))
+    )
+    if filters.period_from is not None:
+        stmt = stmt.where(Order.created_at >= filters.period_from)
+    if filters.period_to is not None:
+        stmt = stmt.where(Order.created_at < filters.period_to)
+    row = (await db.execute(stmt)).one()
+    return {
+        "items_total":    int(row.items_total),
+        "items_approved": int(row.items_approved),
+        "items_rejected": int(row.items_rejected),
+    }
 
 
 @timed_query("orders_brand_mix")

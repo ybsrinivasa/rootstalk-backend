@@ -27,10 +27,12 @@ from tests.factories import (
 
 from app.modules.clients.models import Client
 from app.modules.reports.queries import (
-    ReportFilters, orders_count, orders_routing,
+    ReportFilters, orders_count, orders_items, orders_routing,
     subs_active, subs_new, subs_total,
 )
-from app.modules.orders.models import Order, OrderStatus
+from app.modules.orders.models import (
+    Order, OrderItem, OrderItemStatus, OrderStatus,
+)
 from app.modules.subscriptions.models import Subscription, SubscriptionStatus
 
 
@@ -411,6 +413,97 @@ async def test_orders_routing_direct_vs_via_facilitator(db):
         db, parent.id,
         ReportFilters(period_from=period_from, period_to=period_to),
     ) == {"direct": 2, "via_facilitator": 3}
+
+
+async def test_orders_items_excludes_removed_rerouted_and_counts_approved_rejected(db):
+    """orders_items totals every OrderItem except REMOVED/REROUTED
+    on counted-status orders in period, and reports APPROVED /
+    REJECTED as separate counts.
+    """
+    from datetime import datetime, timedelta, timezone
+    from tests.factories import make_practice, make_timeline
+
+    parent = await make_client(db, full_name="Parent")
+    pkg = await make_package(db, parent, name="PoP")
+    tl = await make_timeline(db, pkg)
+    practice = await make_practice(db, tl)
+    farmer = await make_user(db, name="F")
+    dealer = await make_user(db, name="D")
+    sub = await make_subscription(db, farmer=farmer, client=parent, package=pkg)
+
+    order_created = datetime(2026, 7, 10, tzinfo=timezone.utc)
+    order = Order(
+        subscription_id=sub.id, farmer_user_id=farmer.id,
+        client_id=parent.id, dealer_user_id=dealer.id,
+        date_from=order_created, date_to=order_created + timedelta(days=14),
+        status=OrderStatus.SENT,
+    )
+    order.created_at = order_created
+    db.add(order)
+    await db.flush()
+
+    def _item(status):
+        db.add(OrderItem(
+            order_id=order.id, practice_id=practice.id, timeline_id=tl.id,
+            status=status,
+        ))
+
+    # Real items: 3 APPROVED, 2 REJECTED, 1 PENDING, 1 SKIPPED = 7 total.
+    for _ in range(3): _item(OrderItemStatus.APPROVED)
+    for _ in range(2): _item(OrderItemStatus.REJECTED)
+    _item(OrderItemStatus.PENDING)
+    _item(OrderItemStatus.SKIPPED)
+
+    # Bookkeeping — MUST NOT count in items_total.
+    _item(OrderItemStatus.REMOVED)
+    _item(OrderItemStatus.REROUTED)
+
+    await db.flush()
+
+    period_from = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    period_to   = datetime(2026, 8, 1, tzinfo=timezone.utc)
+
+    assert await orders_items(
+        db, parent.id,
+        ReportFilters(period_from=period_from, period_to=period_to),
+    ) == {"items_total": 7, "items_approved": 3, "items_rejected": 2}
+
+
+async def test_orders_items_ignores_items_on_draft_orders(db):
+    """Parent Order must pass the status filter (SENT and beyond).
+    Items on a DRAFT order don't count no matter their status."""
+    from datetime import datetime, timedelta, timezone
+    from tests.factories import make_practice, make_timeline
+
+    parent = await make_client(db, full_name="Parent")
+    pkg = await make_package(db, parent, name="PoP")
+    tl = await make_timeline(db, pkg)
+    practice = await make_practice(db, tl)
+    farmer = await make_user(db, name="F")
+    dealer = await make_user(db, name="D")
+    sub = await make_subscription(db, farmer=farmer, client=parent, package=pkg)
+
+    order_created = datetime(2026, 7, 10, tzinfo=timezone.utc)
+    draft = Order(
+        subscription_id=sub.id, farmer_user_id=farmer.id,
+        client_id=parent.id, dealer_user_id=dealer.id,
+        date_from=order_created, date_to=order_created + timedelta(days=14),
+        status=OrderStatus.DRAFT,
+    )
+    draft.created_at = order_created
+    db.add(draft)
+    await db.flush()
+
+    for _ in range(5):
+        db.add(OrderItem(
+            order_id=draft.id, practice_id=practice.id, timeline_id=tl.id,
+            status=OrderItemStatus.APPROVED,
+        ))
+    await db.flush()
+
+    assert await orders_items(db, parent.id, ReportFilters()) == {
+        "items_total": 0, "items_approved": 0, "items_rejected": 0,
+    }
 
 
 async def test_subs_new_no_period_returns_all_datable(db):
