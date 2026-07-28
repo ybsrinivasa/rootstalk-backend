@@ -37,6 +37,7 @@ class ProductQRCode(Base):
     expiry_date: Mapped[datetime] = mapped_column(Date, nullable=False)
     batch_lot_number: Mapped[str] = mapped_column(String(200), nullable=False)
     qr_payload: Mapped[str] = mapped_column(Text, nullable=True)
+    cultivation_practice: Mapped[str] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
     created_by: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

@@ -690,6 +690,7 @@ class QRCreate(BaseModel):
     manufacture_date: str
     expiry_date: str
     batch_lot_number: str
+    cultivation_practice: Optional[str] = None
 
 
 @router.post("/client/{client_id}/qr/codes", status_code=201)
@@ -753,6 +754,7 @@ async def create_qr_code(
         expiry_date=date.fromisoformat(request.expiry_date),
         batch_lot_number=request.batch_lot_number,
         qr_payload=f"{_public_base_url()}/verify/{qr_id}",
+        cultivation_practice=(request.cultivation_practice or None),
         created_by=current_user.id,
     )
     db.add(qr)
@@ -1457,6 +1459,8 @@ async def public_qr_verify(
         "description_points": seed_extras["description_points"],
         "photos": seed_extras["photos"],
         "dus_characters": seed_extras["dus_characters"],
+        # Per-QR free-text authored by the Client (any product type).
+        "cultivation_practice": qr.cultivation_practice,
     }
 
 
