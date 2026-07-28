@@ -26,7 +26,7 @@ from tests.factories import (
 )
 
 from app.modules.clients.models import Client
-from app.modules.reports.queries import ReportFilters, subs_active
+from app.modules.reports.queries import ReportFilters, subs_active, subs_total
 from app.modules.subscriptions.models import Subscription, SubscriptionStatus
 
 
@@ -177,3 +177,59 @@ async def test_subs_active_narrows_by_each_filter(db):
         db, client.id,
         ReportFilters(crop_cosh_id="crop:maize", state_cosh_id="state:north"),
     ) == {"subscriptions": 1, "farmers": 1}
+
+
+async def test_subs_total_counts_every_status_but_still_excludes_bad_scopes(db):
+    """subs_total = every subscription row on this client, any status.
+
+    Verifies two things at once:
+    - Status is NOT filtered (LAPSED / CANCELLED / SUSPENDED /
+      UNSUBSCRIBED all count).
+    - The base scope still applies: training, other-client, and
+      soft-deleted rows do NOT count.
+    """
+    parent = await make_client(db, full_name="Parent")
+    other = await make_client(db, full_name="Other")
+
+    training_child = Client(
+        full_name="Parent Training",
+        short_name="pt-" + parent.short_name[:8],
+        ca_name="T", ca_phone="+919", ca_email="tt@t.local",
+        payment_model=parent.payment_model,
+        is_training=True,
+        parent_client_id=parent.id,
+    )
+    db.add(training_child)
+    await db.flush()
+
+    farmer_a = await make_user(db, name="A")
+    farmer_b = await make_user(db, name="B")
+    farmer_c = await make_user(db, name="C")
+
+    pkg_parent = await make_package(db, parent, name="PoP Parent")
+    pkg_training = await make_package(db, training_child, name="PoP Training")
+    pkg_other = await make_package(db, other, name="PoP Other")
+
+    # SHOULD COUNT (any status on parent).
+    await make_subscription(db, farmer=farmer_a, client=parent, package=pkg_parent)  # ACTIVE
+    lapsed = await make_subscription(db, farmer=farmer_a, client=parent, package=pkg_parent)
+    lapsed.status = SubscriptionStatus.LAPSED
+    cancelled = await make_subscription(db, farmer=farmer_b, client=parent, package=pkg_parent)
+    cancelled.status = SubscriptionStatus.CANCELLED
+    unsubbed = await make_subscription(db, farmer=farmer_b, client=parent, package=pkg_parent)
+    unsubbed.status = SubscriptionStatus.UNSUBSCRIBED
+
+    # SHOULD NOT COUNT — soft-deleted.
+    soft = await make_subscription(db, farmer=farmer_a, client=parent, package=pkg_parent)
+    soft.deleted_at = datetime.now(timezone.utc)
+
+    # SHOULD NOT COUNT — training / other-client.
+    await make_subscription(db, farmer=farmer_c, client=training_child, package=pkg_training)
+    await make_subscription(db, farmer=farmer_c, client=other, package=pkg_other)
+
+    await db.flush()
+
+    # 4 counted (ACTIVE + LAPSED + CANCELLED + UNSUBSCRIBED); 2 distinct farmers.
+    assert await subs_total(db, parent.id, ReportFilters()) == {
+        "subscriptions": 4, "farmers": 2,
+    }

@@ -225,12 +225,14 @@ async def subscriptions_report(
     if dimension is None:
         if metric_up == "ACTIVE":
             return await queries.subs_active(db, cid, filters)
-        if metric_up in {"NEW", "TOTAL"}:
+        if metric_up == "TOTAL":
+            return await queries.subs_total(db, cid, filters)
+        if metric_up == "NEW":
             raise HTTPException(
                 status_code=501,
                 detail={
                     "code": "metric_not_implemented",
-                    "message": f"Subscriptions '{metric_up}' is on the "
+                    "message": "Subscriptions 'NEW' is on the "
                                "Phase 1 punch list; not yet wired.",
                 },
             )

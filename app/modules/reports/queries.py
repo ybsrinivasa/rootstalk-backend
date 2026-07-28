@@ -245,16 +245,31 @@ async def subs_active(
 async def subs_total(
     db: AsyncSession, client_id: str, filters: ReportFilters,
 ) -> dict:
-    """All subscriptions ever created (up to ``period_to``).
+    """All subscriptions ever created on this client.
 
     Returns::
 
         {
-          "subscriptions": <int>,
-          "farmers": <int>,
+          "subscriptions": <int>,   # every subscription row (any status)
+          "farmers": <int>,         # DISTINCT farmers who ever subscribed
         }
+
+    Same filter contract as ``subs_active`` minus the status carve-out
+    — includes LAPSED / CANCELLED / SUSPENDED / UNSUBSCRIBED. Training
+    and soft-deleted rows still don't count (auto via the base scope).
+
+    Period is not applied — "Total" is cumulative-to-now by design.
+    When we ship a Period-aware "Total as of date X", it becomes a
+    separate metric so the semantics stay obvious.
     """
-    raise NotImplementedError
+    stmt = _apply_filters(
+        _subscription_scope(client_id), filters,
+    ).with_only_columns(
+        func.count(Subscription.id).label("subscriptions"),
+        func.count(func.distinct(Subscription.farmer_user_id)).label("farmers"),
+    )
+    row = (await db.execute(stmt)).one()
+    return {"subscriptions": int(row.subscriptions), "farmers": int(row.farmers)}
 
 
 @timed_query("subs_new_by_dimension")
