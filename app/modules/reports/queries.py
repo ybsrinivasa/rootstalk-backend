@@ -1267,41 +1267,53 @@ async def overview_bundle(
     db: AsyncSession,
     client_id: str,
     filters: ReportFilters,
+    prev_filters: Optional[ReportFilters] = None,
 ) -> dict:
     """Compose the Overview page payload in one HTTP round-trip.
 
     Calls four headline metrics sequentially with the same filter
-    set. Each metric keeps its own P95 log line via
-    ``@timed_query`` — when Overview becomes slow, the logs tell us
-    WHICH sub-query is heavy, not just "Overview is slow." See
-    ``feedback_reporting_architecture_escalation_ladder.md``.
+    set. When ``prev_filters`` is supplied, ALSO runs the three
+    period-based metrics (subs_new, orders_count, orders_conversion)
+    against the prev window so the frontend can render deltas.
+    ``subs_active`` is point-in-time so has no prev counterpart.
+
+    Every underlying metric keeps its own P95 log line via
+    ``@timed_query`` — "Overview is slow" telemetry pinpoints the
+    heavy sub-query.
 
     Returns::
 
         {
-          "subs_new":          {"relationships": <int>, "farmers": <int>},
-          "subs_active":       {"subscriptions": <int>, "farmers": <int>},
-          "orders_count":      {"orders":        <int>, "farmers": <int>},
-          "orders_conversion": {"ordered":       <int>, "approved": <int>,
-                                "picked_up":     <int>},
+          "current": {
+            "subs_new":          {"relationships": ..., "farmers": ...},
+            "subs_active":       {"subscriptions": ..., "farmers": ...},
+            "orders_count":      {"orders": ..., "farmers": ...},
+            "orders_conversion": {"ordered": ..., "approved": ..., "picked_up": ...},
+          },
+          "prev": {   # null when prev_filters was not supplied
+            "subs_new":          {...},
+            "orders_count":      {...},
+            "orders_conversion": {...},
+          } | None,
         }
 
     Deferred to Phase 1 polish:
-    - Prev-period deltas (doubles the query count; add a second
-      ``prev_filters`` parameter and shape the response as
-      ``{current, prev, delta}`` per card).
-    - Hero chart series (needs the *_by_dimension queries to land).
+    - Hero chart series (needs *_by_dimension TIME data).
     """
-    subs_new_res      = await subs_new(db, client_id, filters)
-    subs_active_res   = await subs_active(db, client_id, filters)
-    orders_count_res  = await orders_count(db, client_id, filters)
-    orders_conv_res   = await orders_conversion(db, client_id, filters)
-    return {
-        "subs_new":          subs_new_res,
-        "subs_active":       subs_active_res,
-        "orders_count":      orders_count_res,
-        "orders_conversion": orders_conv_res,
+    current = {
+        "subs_new":          await subs_new(db, client_id, filters),
+        "subs_active":       await subs_active(db, client_id, filters),
+        "orders_count":      await orders_count(db, client_id, filters),
+        "orders_conversion": await orders_conversion(db, client_id, filters),
     }
+    prev: Optional[dict] = None
+    if prev_filters is not None:
+        prev = {
+            "subs_new":          await subs_new(db, client_id, prev_filters),
+            "orders_count":      await orders_count(db, client_id, prev_filters),
+            "orders_conversion": await orders_conversion(db, client_id, prev_filters),
+        }
+    return {"current": current, "prev": prev}
 
 
 # ── CSV row queries ───────────────────────────────────────────────────────────

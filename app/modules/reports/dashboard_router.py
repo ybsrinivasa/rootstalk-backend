@@ -196,6 +196,8 @@ async def overview_report(
     cid: str,
     period_from: Optional[datetime] = None,
     period_to: Optional[datetime] = None,
+    prev_period_from: Optional[datetime] = None,
+    prev_period_to: Optional[datetime] = None,
     crop_cosh_id: Optional[str] = None,
     state_cosh_id: Optional[str] = None,
     district_cosh_id: Optional[str] = None,
@@ -203,10 +205,15 @@ async def overview_report(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Reports landing payload — four headline metrics in one round-trip.
+    """Reports landing payload — headline metrics in one round-trip.
 
-    Combines subs_new + subs_active + orders_count + orders_conversion
-    under the same filter set. Same auth gate as the drill endpoints.
+    When ``prev_period_from`` + ``prev_period_to`` are supplied, the
+    three period-based metrics also run against the prev window and
+    the response carries a ``prev`` block for delta rendering. Chip
+    filters (crop / state / district / package) are shared across
+    both windows.
+
+    Same auth gate as the drill endpoints.
     """
     await _assert_client_report_reader(db, current_user, cid)
     _assert_subject_enabled(cid, "overview")
@@ -215,7 +222,13 @@ async def overview_report(
         period_from, period_to,
         crop_cosh_id, state_cosh_id, district_cosh_id, package_id,
     )
-    return await queries.overview_bundle(db, cid, filters)
+    prev_filters = None
+    if prev_period_from is not None and prev_period_to is not None:
+        prev_filters = _build_filters(
+            prev_period_from, prev_period_to,
+            crop_cosh_id, state_cosh_id, district_cosh_id, package_id,
+        )
+    return await queries.overview_bundle(db, cid, filters, prev_filters)
 
 
 # ── Subscriptions subject area ────────────────────────────────────────────────
