@@ -27,8 +27,9 @@ from tests.factories import (
 
 from app.modules.clients.models import Client
 from app.modules.reports.queries import (
-    ReportFilters, subs_active, subs_new, subs_total,
+    ReportFilters, orders_count, subs_active, subs_new, subs_total,
 )
+from app.modules.orders.models import Order, OrderStatus
 from app.modules.subscriptions.models import Subscription, SubscriptionStatus
 
 
@@ -293,6 +294,72 @@ async def test_subs_new_period_boundaries_and_first_ever_dedup(db):
         ReportFilters(period_from=period_from, period_to=period_to),
     )
     assert result == {"relationships": 2, "farmers": 1}
+
+
+async def test_orders_count_status_period_and_scope(db):
+    """orders_count must:
+    - Only count status in ORDER_COUNTED_STATUSES (SENT and beyond).
+      DRAFT / CANCELLED / EXPIRED excluded.
+    - Apply period filter on Order.created_at (not subscription_date).
+    - Inherit the base scope via the Subscription join — training,
+      soft-deleted subs, other-clients don't leak.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    parent = await make_client(db, full_name="Parent")
+    pkg = await make_package(db, parent, name="PoP")
+    farmer_a = await make_user(db, name="A")
+    farmer_b = await make_user(db, name="B")
+    dealer = await make_user(db, name="Dealer")
+
+    sub_a = await make_subscription(db, farmer=farmer_a, client=parent, package=pkg)
+    sub_b = await make_subscription(db, farmer=farmer_b, client=parent, package=pkg)
+
+    period_from = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    period_to   = datetime(2026, 8, 1, tzinfo=timezone.utc)
+
+    def _order(sub, farmer, status, created):
+        return Order(
+            subscription_id=sub.id, farmer_user_id=farmer.id,
+            client_id=parent.id, dealer_user_id=dealer.id,
+            date_from=created, date_to=created + timedelta(days=14),
+            status=status,
+        )
+
+    # SHOULD COUNT — 3 SENT-or-beyond orders in July on 2 distinct farmers.
+    o1 = _order(sub_a, farmer_a, OrderStatus.SENT,      datetime(2026, 7, 5,  tzinfo=timezone.utc))
+    o2 = _order(sub_a, farmer_a, OrderStatus.COMPLETED, datetime(2026, 7, 15, tzinfo=timezone.utc))
+    o3 = _order(sub_b, farmer_b, OrderStatus.ACCEPTED,  datetime(2026, 7, 20, tzinfo=timezone.utc))
+    for o in (o1, o2, o3):
+        o.created_at = o.date_from   # explicit — factory would default to utcnow()
+        db.add(o)
+
+    # SHOULD NOT COUNT — status excluded.
+    for status in (OrderStatus.DRAFT, OrderStatus.CANCELLED, OrderStatus.EXPIRED):
+        o = _order(sub_a, farmer_a, status, datetime(2026, 7, 10, tzinfo=timezone.utc))
+        o.created_at = o.date_from
+        db.add(o)
+
+    # SHOULD NOT COUNT — out of period.
+    o_june = _order(sub_a, farmer_a, OrderStatus.SENT, datetime(2026, 6, 25, tzinfo=timezone.utc))
+    o_june.created_at = o_june.date_from
+    db.add(o_june)
+    o_aug = _order(sub_a, farmer_a, OrderStatus.SENT, datetime(2026, 8, 5, tzinfo=timezone.utc))
+    o_aug.created_at = o_aug.date_from
+    db.add(o_aug)
+
+    await db.flush()
+
+    # 3 orders / 2 distinct farmers within the July window.
+    assert await orders_count(
+        db, parent.id,
+        ReportFilters(period_from=period_from, period_to=period_to),
+    ) == {"orders": 3, "farmers": 2}
+
+    # No period — everything counted-status is in scope: 5 (3 July + June + Aug).
+    assert await orders_count(db, parent.id, ReportFilters()) == {
+        "orders": 5, "farmers": 2,
+    }
 
 
 async def test_subs_new_no_period_returns_all_datable(db):

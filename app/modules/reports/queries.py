@@ -49,8 +49,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.advisory.models import Package
 from app.modules.clients.models import Client
+from app.modules.orders.models import Order, OrderStatus
 from app.modules.platform.models import User
 from app.modules.subscriptions.models import Subscription, SubscriptionStatus
+
+
+# Order statuses that count as a "real" order for headline metrics —
+# reached at least SENT. Excludes DRAFT (unshared with the dealer),
+# CANCELLED, and EXPIRED (aborted). Confirmed with the user 2026-07-27.
+ORDER_COUNTED_STATUSES = [
+    OrderStatus.SENT,
+    OrderStatus.ACCEPTED,
+    OrderStatus.PROCESSING,
+    OrderStatus.SENT_FOR_APPROVAL,
+    OrderStatus.PARTIALLY_APPROVED,
+    OrderStatus.COMPLETED,
+]
 
 
 logger = logging.getLogger(__name__)
@@ -360,15 +374,37 @@ async def orders_count(
 ) -> dict:
     """Order count in period.
 
-    Includes orders with status in {SENT, ACCEPTED, PROCESSING,
-    SENT_FOR_APPROVAL, PARTIALLY_APPROVED, COMPLETED}. Excludes DRAFT
-    (unshared) and CANCELLED / EXPIRED (aborted) per open decision.
-
     Returns::
 
         {"orders": <int>, "farmers": <int>}
+
+    ``orders`` counts orders with status in ``ORDER_COUNTED_STATUSES``
+    (see module top). DRAFT + CANCELLED + EXPIRED excluded.
+
+    Period filters on ``Order.created_at`` (not subscription_date —
+    they can be years apart on perennial subs). ``farmers`` = distinct
+    farmers who placed a counted order.
+
+    Every Order is reached via a JOIN through Subscription so the
+    filter contract cascades — no separate Order-side check for
+    training / soft-delete / client scoping.
     """
-    raise NotImplementedError
+    scope = _apply_filters(_subscription_scope(client_id), filters)
+    stmt = (
+        scope
+        .join(Order, Order.subscription_id == Subscription.id)
+        .with_only_columns(
+            func.count(func.distinct(Order.id)).label("orders"),
+            func.count(func.distinct(Order.farmer_user_id)).label("farmers"),
+        )
+        .where(Order.status.in_(ORDER_COUNTED_STATUSES))
+    )
+    if filters.period_from is not None:
+        stmt = stmt.where(Order.created_at >= filters.period_from)
+    if filters.period_to is not None:
+        stmt = stmt.where(Order.created_at < filters.period_to)
+    row = (await db.execute(stmt)).one()
+    return {"orders": int(row.orders), "farmers": int(row.farmers)}
 
 
 @timed_query("orders_items")

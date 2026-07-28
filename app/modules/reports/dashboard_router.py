@@ -245,3 +245,70 @@ async def subscriptions_report(
                        "not yet wired.",
         },
     )
+
+
+# ── Orders subject area ───────────────────────────────────────────────────────
+
+@router.get("/client/{cid}/reports/orders")
+async def orders_report(
+    cid: str,
+    metric: str = Query(
+        ..., description="COUNT | ITEMS | BRAND_MIX | ROUTING | CONVERSION",
+    ),
+    dimension: Optional[str] = Query(
+        None, description="TIME | SPACE | CROP | PACKAGE (drill only)",
+    ),
+    period_from: Optional[datetime] = None,
+    period_to: Optional[datetime] = None,
+    crop_cosh_id: Optional[str] = None,
+    state_cosh_id: Optional[str] = None,
+    district_cosh_id: Optional[str] = None,
+    package_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Orders subject area — headline metric OR dimension drill.
+
+    Same auth gate + filter shape as ``subscriptions_report``. Period
+    is meaningful for every Order metric (they're time-bounded event
+    counts, not point-in-time snapshots), so unlike Subscriptions,
+    Period always narrows the result.
+    """
+    await _assert_client_report_reader(db, current_user, cid)
+    _assert_subject_enabled(cid, "orders")
+
+    filters = _build_filters(
+        period_from, period_to,
+        crop_cosh_id, state_cosh_id, district_cosh_id, package_id,
+    )
+
+    metric_up = metric.upper()
+
+    if dimension is None:
+        if metric_up == "COUNT":
+            return await queries.orders_count(db, cid, filters)
+        if metric_up in {"ITEMS", "BRAND_MIX", "ROUTING", "CONVERSION"}:
+            raise HTTPException(
+                status_code=501,
+                detail={
+                    "code": "metric_not_implemented",
+                    "message": f"Orders '{metric_up}' is on the "
+                               "Phase 1 punch list; not yet wired.",
+                },
+            )
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "unknown_metric",
+                "message": f"Unknown orders metric '{metric}'.",
+            },
+        )
+
+    raise HTTPException(
+        status_code=501,
+        detail={
+            "code": "dimension_not_implemented",
+            "message": "Dimension drills are on the Phase 1 punch list; "
+                       "not yet wired.",
+        },
+    )
