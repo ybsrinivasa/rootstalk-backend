@@ -172,6 +172,13 @@ async def serialise_timeline(db: AsyncSession, timeline_id: str) -> dict:
                 "is_special_input": bool(p.is_special_input),
                 "common_name_cosh_id": p.common_name_cosh_id,
                 "frequency_days": _int_or_none(p.frequency_days),
+                # 2026-07-28 — capture brand-lock intent for
+                # historically-honest reporting. See
+                # reference_brand_authoring_states memory + the
+                # orders_brand_mix report. Snapshots written before
+                # this line are missing the field; the reader
+                # tolerates that (falls back to live Practice).
+                "is_brand_locked": bool(getattr(p, "is_brand_locked", False)),
                 "elements": [
                     {
                         "id": e.id,
@@ -324,6 +331,9 @@ async def serialise_cha_timeline(
                 "display_order": _int_or(p.display_order),
                 "is_special_input": bool(getattr(p, "is_special_input", False)),
                 "frequency_days": _int_or_none(getattr(p, "frequency_days", None)),
+                # 2026-07-28 — capture brand-lock intent (see the
+                # matching field in serialise_timeline above).
+                "is_brand_locked": bool(getattr(p, "is_brand_locked", False)),
                 # 2026-06-26 — relation membership preserved
                 "relation_id": p.relation_id,
                 "relation_role": p.relation_role,

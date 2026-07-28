@@ -48,6 +48,7 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.advisory.models import Element, Package, Practice
+from app.modules.subscriptions.snapshot_models import LockedTimelineSnapshot
 from app.modules.clients.models import Client
 from app.modules.orders.models import Order, OrderItem, OrderItemStatus, OrderStatus
 from app.modules.platform.models import User
@@ -465,77 +466,100 @@ async def orders_items(
     }
 
 
+def _classify_brand_from_snapshot(
+    snapshot_content: dict, practice_id: str,
+) -> str | None:
+    """Look up the practice inside a LockedTimelineSnapshot's JSONB
+    and classify its brand-lock intent. Returns 'LOCKED' /
+    'RECOMMENDED' / 'OPEN', or ``None`` if the practice isn't in the
+    snapshot (odd — shouldn't happen in practice, but bail rather
+    than misclassify).
+
+    Falls back on missing ``is_brand_locked`` (pre-2026-07-28
+    snapshots didn't capture the field) by returning None — caller
+    reads live Practice instead.
+    """
+    practices = snapshot_content.get("practices") or []
+    for p in practices:
+        if p.get("id") != practice_id:
+            continue
+        if "is_brand_locked" not in p:
+            return None
+        if p.get("is_brand_locked"):
+            return "LOCKED"
+        for e in p.get("elements") or []:
+            if e.get("element_type") != "BRAND_NAME":
+                continue
+            cosh_ref = (e.get("cosh_ref") or "").strip()
+            if cosh_ref:
+                return "RECOMMENDED"
+        return "OPEN"
+    return None
+
+
 @timed_query("orders_brand_mix")
 async def orders_brand_mix(
     db: AsyncSession, client_id: str, filters: ReportFilters,
 ) -> dict:
-    """Item-level brand mix — three-way split by SE AUTHORING intent.
+    """Item-level brand mix — three-way split by SE AUTHORING intent
+    at the moment the order landed with the dealer.
 
     Returns::
 
         {
-          "locked":      <int>,   # Practice.is_brand_locked = True
-          "recommended": <int>,   # not locked, but has a BRAND_NAME element
-          "open":        <int>,   # not locked, no BRAND_NAME element
+          "locked":      <int>,
+          "recommended": <int>,
+          "open":        <int>,
         }
 
-    Semantics (source of truth is the Practice, not OrderItem):
-    - **Locked**      — SE opted into ``Practice.is_brand_locked = True``.
-      A specific SKU is mandated; dealer MUST sell that brand.
-      This is direct business the client captured.
-    - **Recommended** — SE named a specific SKU as a BRAND_NAME
-      element but did NOT lock it. Dealer sees the recommendation
-      but can substitute.
-    - **Open**        — SE published only the common name (no
-      BRAND_NAME element with a non-empty cosh_ref). Dealer picks
-      any brand at fulfilment time.
+    Semantics (2-lock principle honoured):
+    - **Locked**      — Practice.is_brand_locked = True at the moment
+      the timeline was snapshotted. Dealer MUST sell the SE's SKU.
+      Direct business the client captured.
+    - **Recommended** — not locked, but Practice carries a BRAND_NAME
+      element with non-empty cosh_ref. Dealer sees the suggestion,
+      can substitute.
+    - **Open**        — no brand named. Dealer picks freely.
 
-    ``OrderItem.brand_cosh_id`` is what the dealer actually sold —
-    dealers CANNOT complete a sale without picking a specific SKU
-    from the Cosh brand picker. So brand_cosh_id doesn't distinguish
-    these three states; the SE's authoring intent lives on Practice.
+    Read path:
+    - If ``OrderItem.snapshot_id`` is set (the 2-lock frozen state),
+      read from ``LockedTimelineSnapshot.content`` JSONB. SE edits
+      to the live Practice after order-land do NOT reclassify.
+    - Fall back to live Practice + Element when snapshot_id is NULL
+      (legacy orders that pre-date the snapshot feature) OR the
+      snapshot was written before is_brand_locked was captured in
+      the serializer (pre-2026-07-28).
 
-    Item-level not order-level per the plan. REMOVED / REROUTED
-    excluded. Parent Order still gated by ``ORDER_COUNTED_STATUSES``
-    + period on ``Order.created_at``.
+    Python-side classification because the JSONB traversal makes for
+    unreadable SQL. Row volume per report call is bounded by
+    counted-status orders in the filter scope — modest even at 10x
+    current scale. If this becomes a P95 pain point (data will tell
+    us via the ``@timed_query`` log), extend the snapshot with a
+    denormalised ``brand_lock_state`` column and switch to SQL.
 
-    Historical accuracy caveat: this uses the CURRENT Practice state,
-    not a per-order snapshot. If a SE later flips is_brand_locked,
-    historical items reclassify. Snapshot-based accuracy is Phase 2
-    scope. All three counts in one round-trip via conditional
-    COUNT FILTER + a correlated EXISTS on the BRAND_NAME element.
+    Item-level not order-level. REMOVED / REROUTED excluded. Parent
+    Order gated by ORDER_COUNTED_STATUSES + period on
+    Order.created_at.
     """
     scope = _apply_filters(_subscription_scope(client_id), filters)
 
-    # EXISTS subquery — does this Practice carry a BRAND_NAME element
-    # with a non-empty cosh_ref? Mirrors the _validate_brand_lock
-    # check in advisory/router.py so the two definitions stay aligned.
-    has_brand_name = (
-        select(Element.id)
-        .where(
-            Element.practice_id == Practice.id,
-            Element.element_type == "BRAND_NAME",
-            Element.cosh_ref.is_not(None),
-            func.length(func.trim(Element.cosh_ref)) > 0,
-        )
-        .exists()
-    )
-
+    # Fetch every real item on counted-status orders in period,
+    # along with its Practice (fallback source) and the snapshot
+    # content (authoritative when present).
     stmt = (
         scope
         .join(Order, Order.subscription_id == Subscription.id)
         .join(OrderItem, OrderItem.order_id == Order.id)
         .join(Practice, Practice.id == OrderItem.practice_id)
+        .outerjoin(
+            LockedTimelineSnapshot,
+            LockedTimelineSnapshot.id == OrderItem.snapshot_id,
+        )
         .with_only_columns(
-            func.count(func.distinct(OrderItem.id))
-                .filter(Practice.is_brand_locked.is_(True))
-                .label("locked"),
-            func.count(func.distinct(OrderItem.id))
-                .filter(Practice.is_brand_locked.is_(False), has_brand_name)
-                .label("recommended"),
-            func.count(func.distinct(OrderItem.id))
-                .filter(Practice.is_brand_locked.is_(False), ~has_brand_name)
-                .label("open"),
+            OrderItem.id.label("item_id"),
+            OrderItem.practice_id.label("practice_id"),
+            Practice.is_brand_locked.label("live_locked"),
+            LockedTimelineSnapshot.content.label("snapshot_content"),
         )
         .where(
             Order.status.in_(ORDER_COUNTED_STATUSES),
@@ -543,16 +567,62 @@ async def orders_brand_mix(
                 OrderItemStatus.REMOVED, OrderItemStatus.REROUTED,
             ]),
         )
+        .distinct()
     )
     if filters.period_from is not None:
         stmt = stmt.where(Order.created_at >= filters.period_from)
     if filters.period_to is not None:
         stmt = stmt.where(Order.created_at < filters.period_to)
-    row = (await db.execute(stmt)).one()
+
+    rows = (await db.execute(stmt)).all()
+
+    # For the live-fallback path we need "does this practice have a
+    # BRAND_NAME element with non-empty cosh_ref?". Cache by
+    # practice_id since the same practice appears on many items.
+    fallback_pids: set[str] = set()
+    for r in rows:
+        if r.snapshot_content is None:
+            fallback_pids.add(r.practice_id)
+        else:
+            classified = _classify_brand_from_snapshot(
+                r.snapshot_content, r.practice_id,
+            )
+            if classified is None:
+                fallback_pids.add(r.practice_id)
+
+    has_brand_by_pid: dict[str, bool] = {}
+    if fallback_pids:
+        brand_rows = (await db.execute(
+            select(Element.practice_id).where(
+                Element.practice_id.in_(fallback_pids),
+                Element.element_type == "BRAND_NAME",
+                Element.cosh_ref.is_not(None),
+                func.length(func.trim(Element.cosh_ref)) > 0,
+            ).distinct()
+        )).all()
+        for (pid,) in brand_rows:
+            has_brand_by_pid[pid] = True
+
+    counts = {"LOCKED": 0, "RECOMMENDED": 0, "OPEN": 0}
+    for r in rows:
+        state: str | None = None
+        if r.snapshot_content is not None:
+            state = _classify_brand_from_snapshot(
+                r.snapshot_content, r.practice_id,
+            )
+        if state is None:
+            if r.live_locked:
+                state = "LOCKED"
+            elif has_brand_by_pid.get(r.practice_id):
+                state = "RECOMMENDED"
+            else:
+                state = "OPEN"
+        counts[state] += 1
+
     return {
-        "locked":      int(row.locked),
-        "recommended": int(row.recommended),
-        "open":        int(row.open),
+        "locked":      counts["LOCKED"],
+        "recommended": counts["RECOMMENDED"],
+        "open":        counts["OPEN"],
     }
 
 

@@ -506,28 +506,29 @@ async def test_orders_items_ignores_items_on_draft_orders(db):
     }
 
 
-async def test_orders_brand_mix_three_way_by_se_intent(db):
-    """orders_brand_mix classifies items by the SE's authoring intent
-    on the parent Practice (not by OrderItem.brand_cosh_id — dealers
-    always fill that at sale time regardless of authoring state):
+async def test_orders_brand_mix_via_snapshot_honors_2lock(db):
+    """orders_brand_mix classifies each item by the SE's authoring
+    intent AT THE MOMENT THE ORDER LANDED with the dealer — read
+    from LockedTimelineSnapshot.content when snapshot_id is set. SE
+    edits to the live Practice AFTER order-land must not
+    reclassify. That's the 2-lock guarantee.
 
-      locked      = Practice.is_brand_locked = True
-      recommended = not locked, but Practice has a BRAND_NAME element
-                    with non-empty cosh_ref
-      open        = not locked, no BRAND_NAME element
-
-    REMOVED / REROUTED items excluded. Parent Order status filter
-    still applies.
+    Also covers the fallback path: an item whose snapshot pre-dates
+    the is_brand_locked serializer addition (or has no snapshot at
+    all) falls back to live Practice.
     """
     from datetime import datetime, timedelta, timezone
     from tests.factories import make_practice, make_timeline
     from app.modules.advisory.models import Element
+    from app.modules.subscriptions.snapshot_models import (
+        LockedTimelineSnapshot,
+    )
 
     parent = await make_client(db, full_name="Parent")
     pkg = await make_package(db, parent, name="PoP")
     tl = await make_timeline(db, pkg)
 
-    # Three practices, one per authoring state.
+    # Practices to seed snapshots from.
     p_locked = await make_practice(db, tl)
     p_locked.is_brand_locked = True
     db.add(Element(
@@ -544,11 +545,35 @@ async def test_orders_brand_mix_three_way_by_se_intent(db):
 
     p_open = await make_practice(db, tl)
     p_open.is_brand_locked = False
-    # No BRAND_NAME element on p_open — dealer picks freely.
+
+    p_legacy = await make_practice(db, tl)
+    p_legacy.is_brand_locked = True  # live is locked; snapshot omits field
 
     farmer = await make_user(db, name="F")
     dealer = await make_user(db, name="D")
     sub = await make_subscription(db, farmer=farmer, client=parent, package=pkg)
+
+    # Snapshot with the CURRENT-day serializer (includes is_brand_locked).
+    snap_current = LockedTimelineSnapshot(
+        subscription_id=sub.id, timeline_id=tl.id, lineage_id=tl.id,
+        source="CCA", lock_trigger="PURCHASE_ORDER",
+        content={
+            "practices": [
+                {"id": p_locked.id, "is_brand_locked": True, "elements": [
+                    {"element_type": "BRAND_NAME", "cosh_ref": "cosh-brand-locked"},
+                ]},
+                {"id": p_reco.id, "is_brand_locked": False, "elements": [
+                    {"element_type": "BRAND_NAME", "cosh_ref": "cosh-brand-reco"},
+                ]},
+                {"id": p_open.id, "is_brand_locked": False, "elements": []},
+                # Legacy row inside a modern snapshot — no is_brand_locked
+                # key on this practice. Reader falls back to live Practice.
+                {"id": p_legacy.id, "elements": []},
+            ],
+        },
+    )
+    db.add(snap_current)
+    await db.flush()
 
     order_created = datetime(2026, 7, 10, tzinfo=timezone.utc)
     order = Order(
@@ -561,29 +586,56 @@ async def test_orders_brand_mix_three_way_by_se_intent(db):
     db.add(order)
     await db.flush()
 
-    def _item(practice, status=OrderItemStatus.PENDING):
-        # brand_cosh_id/brand_name populated to prove the classifier
-        # ignores them — SE-intent from Practice is what counts.
+    def _item(practice, snapshot_id, status=OrderItemStatus.PENDING):
         db.add(OrderItem(
             order_id=order.id, practice_id=practice.id, timeline_id=tl.id,
             brand_cosh_id="cosh-picked-by-dealer",
             brand_name="Whatever dealer picked",
+            snapshot_id=snapshot_id,
             status=status,
         ))
 
-    for _ in range(4): _item(p_locked)
-    for _ in range(2): _item(p_reco)
-    for _ in range(3): _item(p_open)
+    # 4 locked, 2 recommended, 3 open — all reading from snap_current.
+    for _ in range(4): _item(p_locked, snap_current.id)
+    for _ in range(2): _item(p_reco,   snap_current.id)
+    for _ in range(3): _item(p_open,   snap_current.id)
 
-    # REMOVED / REROUTED — MUST NOT count.
-    _item(p_locked, OrderItemStatus.REMOVED)
-    _item(p_open,   OrderItemStatus.REROUTED)
+    # 1 item on the legacy practice — snapshot lacks is_brand_locked
+    # so the reader falls back to live Practice (True → LOCKED).
+    _item(p_legacy, snap_current.id)
+
+    # 1 item with NO snapshot at all — pre-snapshot-feature orders.
+    # Falls back to live Practice (p_open, False, no BRAND_NAME) → OPEN.
+    _item(p_open, None)
+
+    # Excluded: REMOVED / REROUTED never counted.
+    _item(p_locked, snap_current.id, OrderItemStatus.REMOVED)
+    _item(p_open,   snap_current.id, OrderItemStatus.REROUTED)
 
     await db.flush()
 
-    assert await orders_brand_mix(db, parent.id, ReportFilters()) == {
-        "locked": 4, "recommended": 2, "open": 3,
-    }
+    # Baseline: 5 locked (4 snapshot + 1 legacy-fallback), 2 recommended,
+    # 4 open (3 snapshot + 1 no-snapshot-fallback).
+    baseline = await orders_brand_mix(db, parent.id, ReportFilters())
+    assert baseline == {"locked": 5, "recommended": 2, "open": 4}
+
+    # ── 2-LOCK INVARIANT ──
+    # SE flips every live Practice's is_brand_locked. The 4 items
+    # bound to snap_current's p_locked entry MUST still classify as
+    # LOCKED (their snapshot still says True). The 4 items bound to
+    # p_reco / p_open (in snapshot) stay recommended/open by their
+    # snapshot content, unaffected by the live edit.
+    #
+    # The 1 legacy-fallback item (p_legacy) flips from LOCKED to OPEN
+    # because it reads from live Practice — this is the honest cost
+    # of pre-2026-07-28 snapshots not carrying is_brand_locked.
+    # Same for the 1 no-snapshot item.
+    p_locked.is_brand_locked = False
+    p_legacy.is_brand_locked = False
+    await db.flush()
+
+    after_edit = await orders_brand_mix(db, parent.id, ReportFilters())
+    assert after_edit == {"locked": 4, "recommended": 2, "open": 5}
 
 
 async def test_subs_new_no_period_returns_all_datable(db):
