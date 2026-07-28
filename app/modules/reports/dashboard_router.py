@@ -291,12 +291,14 @@ async def orders_report(
             return await queries.orders_routing(db, cid, filters)
         if metric_up == "ITEMS":
             return await queries.orders_items(db, cid, filters)
-        if metric_up in {"BRAND_MIX", "CONVERSION"}:
+        if metric_up == "BRAND_MIX":
+            return await queries.orders_brand_mix(db, cid, filters)
+        if metric_up == "CONVERSION":
             raise HTTPException(
                 status_code=501,
                 detail={
                     "code": "metric_not_implemented",
-                    "message": f"Orders '{metric_up}' is on the "
+                    "message": "Orders 'CONVERSION' is on the "
                                "Phase 1 punch list; not yet wired.",
                 },
             )

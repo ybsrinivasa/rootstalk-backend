@@ -27,8 +27,8 @@ from tests.factories import (
 
 from app.modules.clients.models import Client
 from app.modules.reports.queries import (
-    ReportFilters, orders_count, orders_items, orders_routing,
-    subs_active, subs_new, subs_total,
+    ReportFilters, orders_brand_mix, orders_count, orders_items,
+    orders_routing, subs_active, subs_new, subs_total,
 )
 from app.modules.orders.models import (
     Order, OrderItem, OrderItemStatus, OrderStatus,
@@ -503,6 +503,59 @@ async def test_orders_items_ignores_items_on_draft_orders(db):
 
     assert await orders_items(db, parent.id, ReportFilters()) == {
         "items_total": 0, "items_approved": 0, "items_rejected": 0,
+    }
+
+
+async def test_orders_brand_mix_three_way_split(db):
+    """orders_brand_mix splits real items into three buckets:
+      locked   = brand_cosh_id NOT NULL
+      unlocked = brand_cosh_id NULL, brand_name NOT NULL
+      no_brand = both NULL
+    REMOVED / REROUTED items don't count in any bucket. Parent
+    Order status filter still applies.
+    """
+    from datetime import datetime, timedelta, timezone
+    from tests.factories import make_practice, make_timeline
+
+    parent = await make_client(db, full_name="Parent")
+    pkg = await make_package(db, parent, name="PoP")
+    tl = await make_timeline(db, pkg)
+    practice = await make_practice(db, tl)
+    farmer = await make_user(db, name="F")
+    dealer = await make_user(db, name="D")
+    sub = await make_subscription(db, farmer=farmer, client=parent, package=pkg)
+
+    order_created = datetime(2026, 7, 10, tzinfo=timezone.utc)
+    order = Order(
+        subscription_id=sub.id, farmer_user_id=farmer.id,
+        client_id=parent.id, dealer_user_id=dealer.id,
+        date_from=order_created, date_to=order_created + timedelta(days=14),
+        status=OrderStatus.SENT,
+    )
+    order.created_at = order_created
+    db.add(order)
+    await db.flush()
+
+    def _item(brand_cosh_id, brand_name, status=OrderItemStatus.PENDING):
+        db.add(OrderItem(
+            order_id=order.id, practice_id=practice.id, timeline_id=tl.id,
+            brand_cosh_id=brand_cosh_id, brand_name=brand_name,
+            status=status,
+        ))
+
+    # 4 locked, 2 unlocked, 3 no-brand.
+    for _ in range(4): _item("cosh-brand-1", "Locked Brand")
+    for _ in range(2): _item(None, "Free-text Brand")
+    for _ in range(3): _item(None, None)
+
+    # REMOVED / REROUTED with brand data — MUST NOT count anywhere.
+    _item("cosh-brand-1", "Locked Brand", OrderItemStatus.REMOVED)
+    _item(None, "Free-text", OrderItemStatus.REROUTED)
+
+    await db.flush()
+
+    assert await orders_brand_mix(db, parent.id, ReportFilters()) == {
+        "locked": 4, "unlocked": 2, "no_brand": 3,
     }
 
 

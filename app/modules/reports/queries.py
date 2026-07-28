@@ -469,21 +469,73 @@ async def orders_items(
 async def orders_brand_mix(
     db: AsyncSession, client_id: str, filters: ReportFilters,
 ) -> dict:
-    """Item-level brand mix — the three-way split.
+    """Item-level brand mix — three-way split.
 
     Returns::
 
         {
-          "locked": <int>,        # brand_cosh_id IS NOT NULL
-          "unlocked": <int>,      # brand_cosh_id NULL, brand_name NOT NULL
-          "no_brand": <int>,      # both NULL
+          "locked":   <int>,   # brand_cosh_id IS NOT NULL
+          "unlocked": <int>,   # brand_cosh_id NULL, brand_name NOT NULL
+          "no_brand": <int>,   # both NULL
         }
 
-    Item-level not order-level per design decision. no_brand kept as
-    a first-class bucket — silently dropping it would hide the "12% of
-    items have no brand" signal.
+    Semantics:
+    - **Locked**   — item is tied to a specific SKU (Cosh id).
+      Either the SE published the brand into advisory, or the dealer
+      chose a brand at fulfilment time. Either way, RootsTalk knows
+      exactly which product.
+    - **Unlocked** — dealer typed a free-text brand name that isn't
+      linked to a Cosh SKU (a Missing Brand Report candidate).
+    - **No-brand** — neither field is set. On many items this is the
+      pre-fulfilment state (dealer hasn't picked yet). Kept as a
+      first-class bucket per the plan — silently dropping it would
+      hide the "N% of items have no brand data" signal.
+
+    Item-level not order-level per the plan decision. REMOVED /
+    REROUTED excluded (bookkeeping). Parent Order still gated by
+    ``ORDER_COUNTED_STATUSES`` + period on ``Order.created_at``.
+
+    All three counts in one round-trip via conditional COUNT FILTER.
     """
-    raise NotImplementedError
+    scope = _apply_filters(_subscription_scope(client_id), filters)
+    stmt = (
+        scope
+        .join(Order, Order.subscription_id == Subscription.id)
+        .join(OrderItem, OrderItem.order_id == Order.id)
+        .with_only_columns(
+            func.count(func.distinct(OrderItem.id))
+                .filter(OrderItem.brand_cosh_id.is_not(None))
+                .label("locked"),
+            func.count(func.distinct(OrderItem.id))
+                .filter(
+                    OrderItem.brand_cosh_id.is_(None),
+                    OrderItem.brand_name.is_not(None),
+                )
+                .label("unlocked"),
+            func.count(func.distinct(OrderItem.id))
+                .filter(
+                    OrderItem.brand_cosh_id.is_(None),
+                    OrderItem.brand_name.is_(None),
+                )
+                .label("no_brand"),
+        )
+        .where(
+            Order.status.in_(ORDER_COUNTED_STATUSES),
+            OrderItem.status.notin_([
+                OrderItemStatus.REMOVED, OrderItemStatus.REROUTED,
+            ]),
+        )
+    )
+    if filters.period_from is not None:
+        stmt = stmt.where(Order.created_at >= filters.period_from)
+    if filters.period_to is not None:
+        stmt = stmt.where(Order.created_at < filters.period_to)
+    row = (await db.execute(stmt)).one()
+    return {
+        "locked":   int(row.locked),
+        "unlocked": int(row.unlocked),
+        "no_brand": int(row.no_brand),
+    }
 
 
 @timed_query("orders_routing")
