@@ -4706,9 +4706,18 @@ async def get_dashboard_attention(
     """
     from app.modules.advisory.models import Practice
     from app.modules.farmpundit.models import Query as PunditQuery, QueryStatus
-    from app.modules.orders.models import Order, OrderItem, OrderItemStatus, PackingList
+    from app.modules.orders.models import (
+        Order, OrderItem, OrderItemStatus, OrderStatus, PackingList,
+    )
     from app.modules.seed_mgmt.models import SeedOrderFull, SeedOrderStatus
     from app.modules.subscriptions.models import Subscription, SubscriptionStatus
+
+    # Items on terminal-status orders are un-actionable and would
+    # inflate the farmer's attention badge if counted.
+    _TERMINAL_ORDER_STATUSES = {
+        OrderStatus.CANCELLED,
+        OrderStatus.EXPIRED,
+    }
     from datetime import date as _date_cls
 
     subs = (await db.execute(
@@ -4842,11 +4851,11 @@ async def get_dashboard_attention(
             "urgency": urgency_by_sub.get(sub.id),
         }
 
-        # Regular orders' attention items.
         order_rows = (await db.execute(
             select(Order).where(
                 Order.subscription_id == sub.id,
                 Order.farmer_user_id == current_user.id,
+                Order.status.notin_(_TERMINAL_ORDER_STATUSES),
             )
         )).scalars().all()
         for o in order_rows:
