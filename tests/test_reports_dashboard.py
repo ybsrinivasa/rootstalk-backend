@@ -506,13 +506,14 @@ async def test_orders_items_ignores_items_on_draft_orders(db):
     }
 
 
-async def test_orders_brand_mix_three_way_split(db):
-    """orders_brand_mix splits real items into three buckets:
-      locked   = brand_cosh_id NOT NULL
-      unlocked = brand_cosh_id NULL, brand_name NOT NULL
-      no_brand = both NULL
-    REMOVED / REROUTED items don't count in any bucket. Parent
-    Order status filter still applies.
+async def test_orders_brand_mix_two_way_split(db):
+    """orders_brand_mix splits real items into two buckets:
+      locked   = brand_cosh_id NOT NULL   (specific Cosh SKU tied)
+      unlocked = brand_cosh_id IS NULL    (no SKU — open OR unfilled)
+
+    Dealers can't enter free-text brands, so brand_cosh_id alone is
+    the source of truth. REMOVED / REROUTED items don't count in
+    either bucket. Parent Order status filter still applies.
     """
     from datetime import datetime, timedelta, timezone
     from tests.factories import make_practice, make_timeline
@@ -543,19 +544,20 @@ async def test_orders_brand_mix_three_way_split(db):
             status=status,
         ))
 
-    # 4 locked, 2 unlocked, 3 no-brand.
-    for _ in range(4): _item("cosh-brand-1", "Locked Brand")
-    for _ in range(2): _item(None, "Free-text Brand")
+    # 4 locked (cosh_id set), 5 unlocked (cosh_id NULL — regardless
+    # of brand_name because the name follows the SKU).
+    for _ in range(4): _item("cosh-brand-1", "Some Brand")
     for _ in range(3): _item(None, None)
+    for _ in range(2): _item(None, "Legacy free-text noise")  # cosh_id NULL → unlocked
 
-    # REMOVED / REROUTED with brand data — MUST NOT count anywhere.
-    _item("cosh-brand-1", "Locked Brand", OrderItemStatus.REMOVED)
-    _item(None, "Free-text", OrderItemStatus.REROUTED)
+    # REMOVED / REROUTED — MUST NOT count in either bucket.
+    _item("cosh-brand-1", "Some Brand", OrderItemStatus.REMOVED)
+    _item(None, None, OrderItemStatus.REROUTED)
 
     await db.flush()
 
     assert await orders_brand_mix(db, parent.id, ReportFilters()) == {
-        "locked": 4, "unlocked": 2, "no_brand": 3,
+        "locked": 4, "unlocked": 5,
     }
 
 

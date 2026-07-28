@@ -469,33 +469,34 @@ async def orders_items(
 async def orders_brand_mix(
     db: AsyncSession, client_id: str, filters: ReportFilters,
 ) -> dict:
-    """Item-level brand mix — three-way split.
+    """Item-level brand mix — two-way split.
 
     Returns::
 
         {
           "locked":   <int>,   # brand_cosh_id IS NOT NULL
-          "unlocked": <int>,   # brand_cosh_id NULL, brand_name NOT NULL
-          "no_brand": <int>,   # both NULL
+          "unlocked": <int>,   # brand_cosh_id IS NULL
         }
 
     Semantics:
-    - **Locked**   — item is tied to a specific SKU (Cosh id).
-      Either the SE published the brand into advisory, or the dealer
-      chose a brand at fulfilment time. Either way, RootsTalk knows
-      exactly which product.
-    - **Unlocked** — dealer typed a free-text brand name that isn't
-      linked to a Cosh SKU (a Missing Brand Report candidate).
-    - **No-brand** — neither field is set. On many items this is the
-      pre-fulfilment state (dealer hasn't picked yet). Kept as a
-      first-class bucket per the plan — silently dropping it would
-      hide the "N% of items have no brand data" signal.
+    - **Locked** — item is tied to a specific Cosh SKU. Either the SE
+      published the brand into advisory, or the dealer chose one from
+      the Cosh brand picker at fulfilment time.
+    - **Unlocked** — no specific SKU is tied. Either advisory left
+      the brand open, or fulfilment hasn't happened yet.
 
-    Item-level not order-level per the plan decision. REMOVED /
-    REROUTED excluded (bookkeeping). Parent Order still gated by
-    ``ORDER_COUNTED_STATUSES`` + period on ``Order.created_at``.
+    Note: dealers CANNOT enter free-text brand names in RootsTalk —
+    every brand pick goes through Cosh. So ``brand_cosh_id`` alone is
+    the source of truth for this split; ``brand_name`` is a
+    denormalised display convenience that follows the cosh_id.
+    (Earlier three-way version incorrectly assumed a "free-text
+    brand" state existed; corrected 2026-07-28 per user.)
 
-    All three counts in one round-trip via conditional COUNT FILTER.
+    Item-level not order-level per the plan. REMOVED / REROUTED
+    excluded. Parent Order still gated by ``ORDER_COUNTED_STATUSES``
+    + period on ``Order.created_at``.
+
+    Both counts in one round-trip via conditional COUNT FILTER.
     """
     scope = _apply_filters(_subscription_scope(client_id), filters)
     stmt = (
@@ -507,17 +508,8 @@ async def orders_brand_mix(
                 .filter(OrderItem.brand_cosh_id.is_not(None))
                 .label("locked"),
             func.count(func.distinct(OrderItem.id))
-                .filter(
-                    OrderItem.brand_cosh_id.is_(None),
-                    OrderItem.brand_name.is_not(None),
-                )
+                .filter(OrderItem.brand_cosh_id.is_(None))
                 .label("unlocked"),
-            func.count(func.distinct(OrderItem.id))
-                .filter(
-                    OrderItem.brand_cosh_id.is_(None),
-                    OrderItem.brand_name.is_(None),
-                )
-                .label("no_brand"),
         )
         .where(
             Order.status.in_(ORDER_COUNTED_STATUSES),
@@ -534,7 +526,6 @@ async def orders_brand_mix(
     return {
         "locked":   int(row.locked),
         "unlocked": int(row.unlocked),
-        "no_brand": int(row.no_brand),
     }
 
 
