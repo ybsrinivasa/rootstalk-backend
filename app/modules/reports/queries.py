@@ -839,3 +839,145 @@ async def overview_bundle(
         "orders_count":      orders_count_res,
         "orders_conversion": orders_conv_res,
     }
+
+
+# ── CSV row queries ───────────────────────────────────────────────────────────
+#
+# Row-per-entity fetchers for the CSV export endpoints. Unlike the
+# headline metrics which aggregate, these return raw rows so a
+# manager can slice further in Excel. Same filter contract applies
+# (client scoping + is_training + soft-delete cascade) via
+# _subscription_scope + _apply_filters.
+
+@timed_query("subscriptions_rows")
+async def subscriptions_rows(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> list[dict]:
+    """Row-per-Subscription for CSV export.
+
+    Applies chip filters (crop/state/district/package). If
+    ``period_from`` / ``period_to`` are set, further narrows to
+    subscriptions whose ``subscription_date`` falls in the window
+    (matching ``subs_new`` semantics). Rows lacking
+    ``subscription_date`` are included only when Period is unset.
+
+    Cosh id fields (crop_cosh_id, state, district) are returned as
+    ids; the endpoint resolves them to English names in a single
+    batch lookup before writing the CSV.
+    """
+    stmt = (
+        _apply_filters(_subscription_scope(client_id), filters)
+        .join(Package, Package.id == Subscription.package_id)
+        .join(User, User.id == Subscription.farmer_user_id)
+        .with_only_columns(
+            Subscription.reference_number.label("subscription_ref"),
+            User.name.label("farmer_name"),
+            User.phone.label("farmer_phone"),
+            Package.name.label("package_name"),
+            Package.crop_cosh_id.label("crop_cosh_id"),
+            User.state_cosh_id.label("state_cosh_id"),
+            User.district_cosh_id.label("district_cosh_id"),
+            Subscription.subscription_date.label("subscription_date"),
+            Subscription.status.label("status"),
+            Subscription.subscription_type.label("subscription_type"),
+        )
+        .order_by(Subscription.subscription_date.desc().nulls_last())
+    )
+    if filters.period_from is not None:
+        stmt = stmt.where(Subscription.subscription_date >= filters.period_from)
+    if filters.period_to is not None:
+        stmt = stmt.where(Subscription.subscription_date < filters.period_to)
+    rows = (await db.execute(stmt)).all()
+    return [dict(r._mapping) for r in rows]
+
+
+@timed_query("orders_rows")
+async def orders_rows(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> list[dict]:
+    """Row-per-Order for CSV export.
+
+    Only counted-status orders (SENT and beyond) in period. Includes
+    aggregated item counts (total, approved, rejected) and pickup
+    timestamp (max farmer_received_at across the order's
+    PackingLists — an order can have multiple).
+
+    Facilitator / dealer names looked up via correlated subqueries
+    to keep this to one round-trip; if that becomes a P95 pain
+    point, replace with a bulk-hydrate pass in Python.
+    """
+    dealer_alias = User.__table__.alias("dealer_u")
+    facilitator_alias = User.__table__.alias("facilitator_u")
+    farmer_alias = User.__table__.alias("farmer_u")
+
+    approved_count = (
+        select(func.count(OrderItem.id))
+        .where(
+            OrderItem.order_id == Order.id,
+            OrderItem.status == OrderItemStatus.APPROVED,
+        )
+        .correlate(Order)
+        .scalar_subquery()
+    )
+    rejected_count = (
+        select(func.count(OrderItem.id))
+        .where(
+            OrderItem.order_id == Order.id,
+            OrderItem.status == OrderItemStatus.REJECTED,
+        )
+        .correlate(Order)
+        .scalar_subquery()
+    )
+    real_count = (
+        select(func.count(OrderItem.id))
+        .where(
+            OrderItem.order_id == Order.id,
+            OrderItem.status.notin_([
+                OrderItemStatus.REMOVED, OrderItemStatus.REROUTED,
+            ]),
+        )
+        .correlate(Order)
+        .scalar_subquery()
+    )
+    picked_up_at = (
+        select(func.max(PackingList.farmer_received_at))
+        .where(PackingList.order_id == Order.id)
+        .correlate(Order)
+        .scalar_subquery()
+    )
+
+    stmt = (
+        _apply_filters(_subscription_scope(client_id), filters)
+        .join(Order, Order.subscription_id == Subscription.id)
+        .join(Package, Package.id == Subscription.package_id)
+        .join(farmer_alias, farmer_alias.c.id == Order.farmer_user_id)
+        .outerjoin(dealer_alias, dealer_alias.c.id == Order.dealer_user_id)
+        .outerjoin(
+            facilitator_alias,
+            facilitator_alias.c.id == Order.facilitator_user_id,
+        )
+        .with_only_columns(
+            Order.reference_number.label("order_ref"),
+            Order.created_at.label("order_date"),
+            Order.status.label("status"),
+            farmer_alias.c.name.label("farmer_name"),
+            farmer_alias.c.phone.label("farmer_phone"),
+            dealer_alias.c.name.label("dealer_name"),
+            facilitator_alias.c.name.label("facilitator_name"),
+            Order.facilitator_user_id.label("facilitator_user_id"),
+            Package.name.label("package_name"),
+            Package.crop_cosh_id.label("crop_cosh_id"),
+            real_count.label("items_total"),
+            approved_count.label("items_approved"),
+            rejected_count.label("items_rejected"),
+            picked_up_at.label("picked_up_at"),
+        )
+        .where(Order.status.in_(ORDER_COUNTED_STATUSES))
+        .order_by(Order.created_at.desc())
+    )
+    if filters.period_from is not None:
+        stmt = stmt.where(Order.created_at >= filters.period_from)
+    if filters.period_to is not None:
+        stmt = stmt.where(Order.created_at < filters.period_to)
+    rows = (await db.execute(stmt)).all()
+    return [dict(r._mapping) for r in rows]

@@ -20,10 +20,13 @@ Vertical-slice status (2026-07-27): only ``subscriptions?metric=ACTIVE``
 is wired end-to-end. Every other metric returns 501 until its query
 body lands.
 """
+import csv
+import io
 from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -37,6 +40,7 @@ from app.modules.sync.models import CoshCoreItem
 
 from app.modules.reports import queries
 from app.modules.reports.access import (
+    _assert_ca_for_export,
     _assert_client_report_reader,
     client_can_access_reports,
 )
@@ -340,3 +344,147 @@ async def orders_report(
                        "not yet wired.",
         },
     )
+
+
+# ── CSV export ────────────────────────────────────────────────────────────────
+
+def _format_dt(dt) -> str:
+    """ISO-8601 formatter that survives None gracefully."""
+    return dt.isoformat() if dt is not None else ""
+
+
+def _stream_csv(header: list[str], rows: list[list[str]]) -> StreamingResponse:
+    """Build a streaming CSV response. StringIO is fine for staging
+    volumes; if row counts grow past ~50k the generator can be
+    swapped for a per-row yield without touching call sites."""
+    buf = io.StringIO()
+    w = csv.writer(buf, quoting=csv.QUOTE_MINIMAL)
+    w.writerow(header)
+    for r in rows:
+        w.writerow(r)
+    buf.seek(0)
+    return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv")
+
+
+def _csv_filename(cid: str, subject: str) -> str:
+    """`<cid>-<subject>-<YYYYMMDD>.csv` — server sends via
+    Content-Disposition; the frontend also builds a fallback if
+    the header is stripped by CORS."""
+    stamp = datetime.utcnow().strftime("%Y%m%d")
+    return f"{cid}-{subject}-{stamp}.csv"
+
+
+@router.get("/client/{cid}/reports/subscriptions/export.csv")
+async def subscriptions_csv(
+    cid: str,
+    period_from: Optional[datetime] = None,
+    period_to: Optional[datetime] = None,
+    crop_cosh_id: Optional[str] = None,
+    state_cosh_id: Optional[str] = None,
+    district_cosh_id: Optional[str] = None,
+    package_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Row-per-Subscription CSV. CA-only (Report User gets 403)."""
+    await _assert_ca_for_export(db, current_user, cid)
+    _assert_subject_enabled(cid, "subscriptions")
+
+    filters = _build_filters(
+        period_from, period_to,
+        crop_cosh_id, state_cosh_id, district_cosh_id, package_id,
+    )
+    rows = await queries.subscriptions_rows(db, cid, filters)
+
+    cosh_ids: list[str] = []
+    for r in rows:
+        for k in ("crop_cosh_id", "state_cosh_id", "district_cosh_id"):
+            v = r.get(k)
+            if v:
+                cosh_ids.append(v)
+    cosh_names = await _cosh_names(db, cosh_ids) if cosh_ids else {}
+
+    header = [
+        "Subscription Ref", "Farmer Name", "Farmer Phone",
+        "Package", "Crop", "State", "District",
+        "Subscription Date", "Status", "Type",
+    ]
+    body = [
+        [
+            r["subscription_ref"] or "",
+            r["farmer_name"] or "",
+            r["farmer_phone"] or "",
+            r["package_name"] or "",
+            cosh_names.get(r["crop_cosh_id"] or "", r["crop_cosh_id"] or ""),
+            cosh_names.get(r["state_cosh_id"] or "", r["state_cosh_id"] or ""),
+            cosh_names.get(r["district_cosh_id"] or "", r["district_cosh_id"] or ""),
+            _format_dt(r["subscription_date"]),
+            r["status"] or "",
+            r["subscription_type"] or "",
+        ]
+        for r in rows
+    ]
+    resp = _stream_csv(header, body)
+    resp.headers["Content-Disposition"] = (
+        f'attachment; filename="{_csv_filename(cid, "subscriptions")}"'
+    )
+    return resp
+
+
+@router.get("/client/{cid}/reports/orders/export.csv")
+async def orders_csv(
+    cid: str,
+    period_from: Optional[datetime] = None,
+    period_to: Optional[datetime] = None,
+    crop_cosh_id: Optional[str] = None,
+    state_cosh_id: Optional[str] = None,
+    district_cosh_id: Optional[str] = None,
+    package_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Row-per-Order CSV. CA-only."""
+    await _assert_ca_for_export(db, current_user, cid)
+    _assert_subject_enabled(cid, "orders")
+
+    filters = _build_filters(
+        period_from, period_to,
+        crop_cosh_id, state_cosh_id, district_cosh_id, package_id,
+    )
+    rows = await queries.orders_rows(db, cid, filters)
+
+    crop_ids = [r["crop_cosh_id"] for r in rows if r.get("crop_cosh_id")]
+    cosh_names = await _cosh_names(db, crop_ids) if crop_ids else {}
+
+    header = [
+        "Order Ref", "Order Date", "Status",
+        "Farmer Name", "Farmer Phone",
+        "Dealer", "Facilitator", "Routing",
+        "Package", "Crop",
+        "Items Total", "Items Approved", "Items Rejected",
+        "Picked Up At",
+    ]
+    body = [
+        [
+            r["order_ref"] or "",
+            _format_dt(r["order_date"]),
+            r["status"] or "",
+            r["farmer_name"] or "",
+            r["farmer_phone"] or "",
+            r["dealer_name"] or "",
+            r["facilitator_name"] or "",
+            "Via Facilitator" if r["facilitator_user_id"] else "Direct",
+            r["package_name"] or "",
+            cosh_names.get(r["crop_cosh_id"] or "", r["crop_cosh_id"] or ""),
+            str(r["items_total"] or 0),
+            str(r["items_approved"] or 0),
+            str(r["items_rejected"] or 0),
+            _format_dt(r["picked_up_at"]),
+        ]
+        for r in rows
+    ]
+    resp = _stream_csv(header, body)
+    resp.headers["Content-Disposition"] = (
+        f'attachment; filename="{_csv_filename(cid, "orders")}"'
+    )
+    return resp
