@@ -1702,17 +1702,138 @@ async def toggle_portal_user_status(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Deactivate / reactivate ALL of a user's ClientUser rows at
+    this client in one call. 2026-07-28 — updated to scalars().all()
+    so multi-role users (Batch K) flip cleanly; the earlier
+    scalar_one_or_none() raised MultipleResultsFound as soon as a
+    user held more than one role."""
     new_status = data.get("status")  # "ACTIVE" or "INACTIVE"
     if new_status not in ("ACTIVE", "INACTIVE"):
         raise HTTPException(status_code=422, detail="status must be ACTIVE or INACTIVE")
-    cu = (await db.execute(
-        select(ClientUser).where(ClientUser.client_id == client_id, ClientUser.user_id == user_id)
-    )).scalar_one_or_none()
-    if not cu:
+    rows = (await db.execute(
+        select(ClientUser).where(
+            ClientUser.client_id == client_id, ClientUser.user_id == user_id,
+        )
+    )).scalars().all()
+    if not rows:
         raise HTTPException(status_code=404, detail="User not found")
-    cu.status = StatusEnum.ACTIVE if new_status == "ACTIVE" else StatusEnum.INACTIVE
+    target = StatusEnum.ACTIVE if new_status == "ACTIVE" else StatusEnum.INACTIVE
+    for cu in rows:
+        cu.status = target
+        if target == StatusEnum.INACTIVE:
+            cu.deactivated_at = utcnow()
+        else:
+            cu.deactivated_at = None
     await db.commit()
     return {"detail": f"User status set to {new_status}"}
+
+
+@router.put("/client/{client_id}/users/{user_id}/roles")
+async def reconcile_portal_user_roles(
+    client_id: str, user_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Reconcile a user's ACTIVE ClientUser roles at this client to
+    exactly the given set. Adds missing, soft-deactivates extra.
+
+    Body: ``{"roles": ["SUBJECT_EXPERT", "REPORT_USER", ...]}``.
+
+    Rules:
+    - Target set must contain at least one role. Removing a user
+      entirely goes through the Deactivate button, not this endpoint.
+    - Target set MUST NOT contain CA. CA is exclusive and managed
+      by SA via the client-edit flow; refusing here keeps this
+      endpoint out of CA-assignment territory (409 ``ca_not_managed_here``).
+    - If the user is currently CA, refuse the reconcile entirely
+      (409 ``ca_role_exclusive``) — they can't hold non-CA roles.
+    - Roles already ACTIVE stay put; roles present but INACTIVE flip
+      back to ACTIVE (re-add). Roles absent from target flip to
+      INACTIVE with a fresh ``deactivated_at`` stamp.
+    """
+    from app.modules.clients.models import ClientUser, ClientUserRole
+    from app.modules.platform.models import StatusEnum
+
+    target_raw = data.get("roles")
+    if not isinstance(target_raw, list) or len(target_raw) == 0:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "roles_required",
+                "message": (
+                    "Pick at least one role. To remove the user "
+                    "entirely, use the Deactivate button."
+                ),
+            },
+        )
+    try:
+        target_set = {ClientUserRole(r) for r in target_raw}
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Unknown role in payload")
+
+    if ClientUserRole.CA in target_set:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ca_not_managed_here",
+                "message": (
+                    "CA is exclusive and assigned separately by SA. "
+                    "This endpoint reconciles non-CA roles only."
+                ),
+            },
+        )
+
+    existing_rows = (await db.execute(
+        select(ClientUser).where(
+            ClientUser.client_id == client_id, ClientUser.user_id == user_id,
+        )
+    )).scalars().all()
+    if not existing_rows:
+        raise HTTPException(status_code=404, detail="User not found at this client")
+
+    # If the user is currently CA, refuse the whole reconcile.
+    if any(r.role == ClientUserRole.CA and r.status == StatusEnum.ACTIVE
+           for r in existing_rows):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ca_role_exclusive",
+                "message": (
+                    "This user is the CA. CA is a single exclusive role — "
+                    "they cannot also hold other roles."
+                ),
+            },
+        )
+
+    existing_by_role = {r.role: r for r in existing_rows}
+    now = utcnow()
+
+    # Add or re-activate the roles in target.
+    for role in target_set:
+        if role in existing_by_role:
+            r = existing_by_role[role]
+            if r.status != StatusEnum.ACTIVE:
+                r.status = StatusEnum.ACTIVE
+                r.deactivated_at = None
+        else:
+            db.add(ClientUser(
+                client_id=client_id, user_id=user_id,
+                role=role, status=StatusEnum.ACTIVE,
+            ))
+
+    # Deactivate the roles that are ACTIVE-but-not-in-target.
+    for r in existing_rows:
+        if r.role in target_set:
+            continue
+        if r.role == ClientUserRole.CA:
+            continue  # already refused above; belt-and-braces
+        if r.status == StatusEnum.ACTIVE:
+            r.status = StatusEnum.INACTIVE
+            r.deactivated_at = now
+
+    await db.commit()
+    return {"detail": "roles reconciled", "roles": sorted(r.value for r in target_set)}
 
 
 # ── CA: Per-client single-holder privileges (Batch X, 2026-05-19) ───────────
