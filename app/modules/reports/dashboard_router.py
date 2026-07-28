@@ -270,14 +270,39 @@ async def subscriptions_report(
             },
         )
 
-    raise HTTPException(
-        status_code=501,
-        detail={
-            "code": "dimension_not_implemented",
-            "message": "Dimension drills are on the Phase 1 punch list; "
-                       "not yet wired.",
-        },
-    )
+    dim_up = dimension.upper()
+    if dim_up not in {"CROP", "SPACE", "PACKAGE", "TIME"}:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "unknown_dimension",
+                "message": f"Unknown dimension '{dimension}'.",
+            },
+        )
+    if metric_up == "ACTIVE":
+        if dim_up == "TIME":
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "dimension_not_applicable",
+                    "message": "Active subscriptions is a point-in-time "
+                               "snapshot — TIME dimension is meaningless.",
+                },
+            )
+        rows = await queries.subs_active_by_dimension(db, cid, filters, dim_up)
+    elif metric_up == "TOTAL":
+        rows = await queries.subs_total_by_dimension(db, cid, filters, dim_up)
+    elif metric_up == "NEW":
+        rows = await queries.subs_new_by_dimension(db, cid, filters, dim_up)
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "unknown_metric",
+                "message": f"Unknown subscriptions metric '{metric}'.",
+            },
+        )
+    return await _hydrate_dimension_labels(db, rows, dim_up)
 
 
 # ── Orders subject area ───────────────────────────────────────────────────────
@@ -347,17 +372,23 @@ async def orders_report(
         )
     if metric_up == "COUNT":
         rows = await queries.orders_count_by_dimension(db, cid, filters, dim_up)
-        return await _hydrate_dimension_labels(db, rows, dim_up)
-    raise HTTPException(
-        status_code=501,
-        detail={
-            "code": "dimension_metric_not_implemented",
-            "message": (
-                f"Dimension drill for orders metric '{metric_up}' is on "
-                "the Phase 1 punch list; not yet wired."
-            ),
-        },
-    )
+    elif metric_up == "ROUTING":
+        rows = await queries.orders_routing_by_dimension(db, cid, filters, dim_up)
+    elif metric_up == "ITEMS":
+        rows = await queries.orders_items_by_dimension(db, cid, filters, dim_up)
+    elif metric_up == "BRAND_MIX":
+        rows = await queries.orders_brand_mix_by_dimension(db, cid, filters, dim_up)
+    elif metric_up == "CONVERSION":
+        rows = await queries.orders_conversion_by_dimension(db, cid, filters, dim_up)
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "unknown_metric",
+                "message": f"Unknown orders metric '{metric}'.",
+            },
+        )
+    return await _hydrate_dimension_labels(db, rows, dim_up)
 
 
 async def _hydrate_dimension_labels(

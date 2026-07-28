@@ -340,33 +340,154 @@ async def subs_total(
     return {"subscriptions": int(row.subscriptions), "farmers": int(row.farmers)}
 
 
-@timed_query("subs_new_by_dimension")
-async def subs_new_by_dimension(
-    db: AsyncSession, client_id: str, filters: ReportFilters, dimension: str,
-) -> list[dict]:
-    """Group ``subs_new`` by dimension.
-
-    ``dimension`` one of TIME | SPACE | CROP | PACKAGE. Returns a list
-    of ``{label, subscriptions, farmers}`` rows ordered by count desc
-    (or by time bucket ascending when dimension=TIME).
-    """
-    raise NotImplementedError
-
-
 @timed_query("subs_active_by_dimension")
 async def subs_active_by_dimension(
     db: AsyncSession, client_id: str, filters: ReportFilters, dimension: str,
 ) -> list[dict]:
-    """Group ``subs_active`` by dimension."""
-    raise NotImplementedError
+    """Group ``subs_active`` by CROP / SPACE / PACKAGE.
+
+    TIME dimension is unsupported (subs_active is point-in-time —
+    there's nothing to bucket). Frontend hides the TIME tab for
+    metrics with ``supportsTime=false``; if it slips through, this
+    raises ValueError.
+    """
+    if dimension.upper() == "TIME":
+        raise ValueError("subs_active does not support TIME dimension")
+    base = _dimension_base(client_id, filters).where(
+        Subscription.status == SubscriptionStatus.ACTIVE,
+    )
+    subs_expr = func.count(Subscription.id)
+    farmers_expr = func.count(func.distinct(Subscription.farmer_user_id))
+    stmt = _group_by_dimension(
+        base, dimension, Subscription.subscription_date,
+        filters.period_from, filters.period_to,
+        extra_select=[
+            subs_expr.label("subscriptions"),
+            farmers_expr.label("farmers"),
+        ],
+        primary_order_expr=subs_expr,
+    )
+    rows = (await db.execute(stmt)).all()
+    return [dict(r._mapping) for r in rows]
 
 
 @timed_query("subs_total_by_dimension")
 async def subs_total_by_dimension(
     db: AsyncSession, client_id: str, filters: ReportFilters, dimension: str,
 ) -> list[dict]:
-    """Group ``subs_total`` by dimension."""
-    raise NotImplementedError
+    """Group ``subs_total`` by CROP / SPACE / PACKAGE / TIME.
+
+    TIME buckets by ``Subscription.subscription_date`` — subs with
+    NULL subscription_date drop out of the TIME bucket (nothing to
+    bucket into) but still count in the other dimensions.
+    """
+    base = _dimension_base(client_id, filters)
+    subs_expr = func.count(Subscription.id)
+    farmers_expr = func.count(func.distinct(Subscription.farmer_user_id))
+    stmt = _group_by_dimension(
+        base, dimension, Subscription.subscription_date,
+        filters.period_from, filters.period_to,
+        extra_select=[
+            subs_expr.label("subscriptions"),
+            farmers_expr.label("farmers"),
+        ],
+        primary_order_expr=subs_expr,
+    )
+    rows = (await db.execute(stmt)).all()
+    return [dict(r._mapping) for r in rows]
+
+
+@timed_query("subs_new_by_dimension")
+async def subs_new_by_dimension(
+    db: AsyncSession, client_id: str, filters: ReportFilters, dimension: str,
+) -> list[dict]:
+    """Group ``subs_new`` by CROP / SPACE / PACKAGE / TIME.
+
+    Returns ``{key, relationships, farmers, ...}`` per group.
+    - **relationships** — subs whose subscription_date is in period,
+      counted per group.
+    - **farmers**       — DISTINCT farmers whose MIN(subscription_date)
+      within (filtered scope × group) falls in period. "First-time in
+      the current chip scope AND in this group" — under a Crop filter
+      + CROP dimension, this is trivially "farmers whose first-ever
+      Tomato sub is this month" grouped by crop.
+
+    Two queries under the hood — one for relationships, one for
+    grouped-MIN farmers — merged Python-side by key. Same pattern as
+    the ``subs_new`` headline, extended to a GROUP BY.
+    """
+    base = _dimension_base(client_id, filters).where(
+        Subscription.subscription_date.is_not(None),
+    )
+
+    # Query 1: relationships per group (subs with subscription_date in period)
+    rel_base = base
+    if filters.period_from is not None:
+        rel_base = rel_base.where(Subscription.subscription_date >= filters.period_from)
+    if filters.period_to is not None:
+        rel_base = rel_base.where(Subscription.subscription_date < filters.period_to)
+    rel_expr = func.count(Subscription.id)
+    rel_stmt = _group_by_dimension(
+        rel_base, dimension, Subscription.subscription_date,
+        filters.period_from, filters.period_to,
+        extra_select=[rel_expr.label("relationships")],
+        primary_order_expr=rel_expr,
+    )
+    rel_rows = (await db.execute(rel_stmt)).all()
+
+    # Query 2: first-time farmers per group. Group by (dim_key, farmer),
+    # compute MIN(subscription_date), then HAVING min in period.
+    dim = dimension.upper()
+    min_date = func.min(Subscription.subscription_date).label("first_date")
+
+    if dim == "CROP":
+        grouped = base.with_only_columns(
+            Package.crop_cosh_id.label("k"),
+            Subscription.farmer_user_id.label("f"),
+            min_date,
+        ).group_by(Package.crop_cosh_id, Subscription.farmer_user_id)
+    elif dim == "SPACE":
+        grouped = base.with_only_columns(
+            User.state_cosh_id.label("k"),
+            Subscription.farmer_user_id.label("f"),
+            min_date,
+        ).group_by(User.state_cosh_id, Subscription.farmer_user_id)
+    elif dim == "PACKAGE":
+        grouped = base.with_only_columns(
+            Subscription.package_id.label("k"),
+            Subscription.farmer_user_id.label("f"),
+            min_date,
+        ).group_by(Subscription.package_id, Subscription.farmer_user_id)
+    elif dim == "TIME":
+        bucket = _pick_time_bucket(filters.period_from, filters.period_to)
+        bucket_col = func.date_trunc(bucket, Subscription.subscription_date)
+        grouped = base.with_only_columns(
+            bucket_col.label("k"),
+            Subscription.farmer_user_id.label("f"),
+            min_date,
+        ).group_by(bucket_col, Subscription.farmer_user_id)
+    else:
+        raise ValueError(f"Unknown dimension: {dimension!r}")
+
+    if filters.period_from is not None:
+        grouped = grouped.having(min_date >= filters.period_from)
+    if filters.period_to is not None:
+        grouped = grouped.having(min_date < filters.period_to)
+    subq = grouped.subquery()
+    farmers_by_group = (await db.execute(
+        select(subq.c.k, func.count()).group_by(subq.c.k)
+    )).all()
+    farmer_map = {k: n for k, n in farmers_by_group}
+
+    # Merge relationships + farmers by key. Include groups with 0
+    # first-time farmers but nonzero relationships (returning-only).
+    merged: list[dict] = []
+    for r in rel_rows:
+        row = dict(r._mapping)
+        key = row.get("key")
+        row["farmers"] = int(farmer_map.get(key, 0))
+        merged.append(row)
+    return merged
 
 
 # ── Orders subject area ───────────────────────────────────────────────────────
@@ -748,6 +869,102 @@ async def orders_conversion(
     }
 
 
+# ── Dimension-drill shared helpers ────────────────────────────────────────────
+#
+# All *_by_dimension functions share the same base-query shape:
+# subscription scope + Package + User pre-joined (so GROUP BY on
+# crop_cosh_id / state_cosh_id / package_id doesn't need conditional
+# joins). Filter WHERE clauses are inlined here rather than routing
+# through _apply_filters — the latter conditionally-joins based on
+# filter presence, which conflicts with the deterministic-join
+# requirement of dimension drills.
+
+def _dimension_base(client_id: str, filters: ReportFilters) -> Select:
+    """Subscription scope + Package + User joins + chip filter WHEREs.
+    Callers add the metric-specific joins (Order, OrderItem) and any
+    metric-specific period filter on top."""
+    base = (
+        _subscription_scope(client_id)
+        .join(Package, Package.id == Subscription.package_id)
+        .join(User, User.id == Subscription.farmer_user_id)
+    )
+    if filters.crop_cosh_id:
+        base = base.where(Package.crop_cosh_id == filters.crop_cosh_id)
+    if filters.state_cosh_id:
+        base = base.where(User.state_cosh_id == filters.state_cosh_id)
+    if filters.district_cosh_id:
+        base = base.where(User.district_cosh_id == filters.district_cosh_id)
+    if filters.package_id:
+        base = base.where(Subscription.package_id == filters.package_id)
+    return base
+
+
+def _orders_dimension_base(client_id: str, filters: ReportFilters) -> Select:
+    """Dimension base extended with Order join + status + period on
+    Order.created_at. Used by every orders_*_by_dimension query."""
+    base = _dimension_base(client_id, filters).join(
+        Order, Order.subscription_id == Subscription.id,
+    ).where(Order.status.in_(ORDER_COUNTED_STATUSES))
+    if filters.period_from is not None:
+        base = base.where(Order.created_at >= filters.period_from)
+    if filters.period_to is not None:
+        base = base.where(Order.created_at < filters.period_to)
+    return base
+
+
+def _group_by_dimension(
+    base: Select,
+    dimension: str,
+    date_col,
+    period_from,
+    period_to,
+    *,
+    extra_select: list,
+    primary_order_expr,
+) -> Select:
+    """Attach the dimension GROUP BY + ORDER BY.
+
+    ``date_col`` — the column used for TIME bucketing (e.g.
+    ``Order.created_at`` or ``Subscription.subscription_date``).
+    ``extra_select`` — metric-specific SELECT columns (COUNT FILTERs).
+    ``primary_order_expr`` — the expression used to order desc for
+    non-TIME dimensions (usually the primary count).
+
+    Returns a Select shaped like::
+
+        SELECT <dim_key>[, <dim_extras>], <metric_columns...>
+        FROM <base>
+        GROUP BY <dim_key>[, <dim_extras>]
+        ORDER BY <primary_order_expr DESC>   -- or bucket ASC for TIME
+    """
+    dim = dimension.upper()
+    if dim == "CROP":
+        stmt = base.with_only_columns(
+            Package.crop_cosh_id.label("key"), *extra_select,
+        ).group_by(Package.crop_cosh_id).order_by(primary_order_expr.desc())
+    elif dim == "SPACE":
+        stmt = base.with_only_columns(
+            User.state_cosh_id.label("key"), *extra_select,
+        ).group_by(User.state_cosh_id).order_by(primary_order_expr.desc())
+    elif dim == "PACKAGE":
+        stmt = base.with_only_columns(
+            Subscription.package_id.label("key"),
+            Package.name.label("package_name"),
+            *extra_select,
+        ).group_by(Subscription.package_id, Package.name).order_by(
+            primary_order_expr.desc(),
+        )
+    elif dim == "TIME":
+        bucket = _pick_time_bucket(period_from, period_to)
+        bucket_col = func.date_trunc(bucket, date_col).label("key")
+        stmt = base.with_only_columns(
+            bucket_col, *extra_select,
+        ).where(date_col.is_not(None)).group_by(bucket_col).order_by(bucket_col.asc())
+    else:
+        raise ValueError(f"Unknown dimension: {dimension!r}")
+    return stmt
+
+
 def _pick_time_bucket(period_from, period_to) -> str:
     """Auto-pick date_trunc bucket size based on the period window.
 
@@ -797,89 +1014,20 @@ async def orders_count_by_dimension(
     the join needs to exist regardless of filter presence (else
     grouping by an un-joined column blows up).
     """
-    # Base scope: subscription + client + is_training + Order status filter.
-    # We do NOT call _apply_filters here — dimension queries need
-    # deterministic joins to Package + User whether or not those chip
-    # filters are set. Duplicating the six WHERE lines below is cheaper
-    # than reworking _apply_filters to be idempotent-with-aliases.
-    base = (
-        _subscription_scope(client_id)
-        .join(Order, Order.subscription_id == Subscription.id)
-        .join(Package, Package.id == Subscription.package_id)
-        .join(User, User.id == Subscription.farmer_user_id)
-        .where(Order.status.in_(ORDER_COUNTED_STATUSES))
-    )
-    if filters.crop_cosh_id:
-        base = base.where(Package.crop_cosh_id == filters.crop_cosh_id)
-    if filters.state_cosh_id:
-        base = base.where(User.state_cosh_id == filters.state_cosh_id)
-    if filters.district_cosh_id:
-        base = base.where(User.district_cosh_id == filters.district_cosh_id)
-    if filters.package_id:
-        base = base.where(Subscription.package_id == filters.package_id)
-    if filters.period_from is not None:
-        base = base.where(Order.created_at >= filters.period_from)
-    if filters.period_to is not None:
-        base = base.where(Order.created_at < filters.period_to)
-
+    base = _orders_dimension_base(client_id, filters)
     orders_count_expr = func.count(func.distinct(Order.id))
     farmers_count_expr = func.count(func.distinct(Order.farmer_user_id))
-
-    dim = dimension.upper()
-    if dim == "CROP":
-        stmt = base.with_only_columns(
-            Package.crop_cosh_id.label("key"),
+    stmt = _group_by_dimension(
+        base, dimension, Order.created_at,
+        filters.period_from, filters.period_to,
+        extra_select=[
             orders_count_expr.label("orders"),
             farmers_count_expr.label("farmers"),
-        ).group_by(Package.crop_cosh_id).order_by(orders_count_expr.desc())
-    elif dim == "SPACE":
-        stmt = base.with_only_columns(
-            User.state_cosh_id.label("key"),
-            orders_count_expr.label("orders"),
-            farmers_count_expr.label("farmers"),
-        ).group_by(User.state_cosh_id).order_by(orders_count_expr.desc())
-    elif dim == "PACKAGE":
-        stmt = base.with_only_columns(
-            Subscription.package_id.label("key"),
-            Package.name.label("package_name"),
-            orders_count_expr.label("orders"),
-            farmers_count_expr.label("farmers"),
-        ).group_by(Subscription.package_id, Package.name).order_by(
-            orders_count_expr.desc(),
-        )
-    elif dim == "TIME":
-        bucket = _pick_time_bucket(filters.period_from, filters.period_to)
-        bucket_col = func.date_trunc(bucket, Order.created_at).label("key")
-        stmt = base.with_only_columns(
-            bucket_col,
-            orders_count_expr.label("orders"),
-            farmers_count_expr.label("farmers"),
-        ).group_by(bucket_col).order_by(bucket_col.asc())
-    else:
-        raise ValueError(f"Unknown dimension: {dimension!r}")
-
+        ],
+        primary_order_expr=orders_count_expr,
+    )
     rows = (await db.execute(stmt)).all()
     return [dict(r._mapping) for r in rows]
-
-
-@timed_query("orders_items_by_dimension")
-async def orders_items_by_dimension(
-    db: AsyncSession, client_id: str, filters: ReportFilters, dimension: str,
-) -> list[dict]:
-    """Group ``orders_items`` by dimension."""
-    raise NotImplementedError
-
-
-@timed_query("orders_brand_mix_by_dimension")
-async def orders_brand_mix_by_dimension(
-    db: AsyncSession, client_id: str, filters: ReportFilters, dimension: str,
-) -> list[dict]:
-    """Group ``orders_brand_mix`` by dimension.
-
-    Each row: ``{label, locked, unlocked, no_brand}``. Frontend renders
-    a stacked-bar chart from this shape.
-    """
-    raise NotImplementedError
 
 
 @timed_query("orders_routing_by_dimension")
@@ -888,9 +1036,66 @@ async def orders_routing_by_dimension(
 ) -> list[dict]:
     """Group ``orders_routing`` by dimension.
 
-    Each row: ``{label, direct, via_facilitator}``.
+    Row shape: ``{key, direct, via_facilitator, ...}`` per group.
+    Primary sort by (direct + via_facilitator) desc so the busiest
+    group leads.
     """
-    raise NotImplementedError
+    base = _orders_dimension_base(client_id, filters)
+    direct_expr = func.count(func.distinct(Order.id)).filter(
+        Order.facilitator_user_id.is_(None),
+    )
+    via_expr = func.count(func.distinct(Order.id)).filter(
+        Order.facilitator_user_id.is_not(None),
+    )
+    stmt = _group_by_dimension(
+        base, dimension, Order.created_at,
+        filters.period_from, filters.period_to,
+        extra_select=[
+            direct_expr.label("direct"),
+            via_expr.label("via_facilitator"),
+        ],
+        primary_order_expr=func.count(func.distinct(Order.id)),
+    )
+    rows = (await db.execute(stmt)).all()
+    return [dict(r._mapping) for r in rows]
+
+
+@timed_query("orders_items_by_dimension")
+async def orders_items_by_dimension(
+    db: AsyncSession, client_id: str, filters: ReportFilters, dimension: str,
+) -> list[dict]:
+    """Group ``orders_items`` by dimension.
+
+    Row shape: ``{key, items_total, items_approved, items_rejected,
+    ...}`` per group. Real items only (REMOVED / REROUTED excluded).
+    Primary sort by items_total desc.
+    """
+    base = _orders_dimension_base(client_id, filters).join(
+        OrderItem, OrderItem.order_id == Order.id,
+    )
+    total_expr = func.count(func.distinct(OrderItem.id)).filter(
+        OrderItem.status.notin_([
+            OrderItemStatus.REMOVED, OrderItemStatus.REROUTED,
+        ]),
+    )
+    approved_expr = func.count(func.distinct(OrderItem.id)).filter(
+        OrderItem.status == OrderItemStatus.APPROVED,
+    )
+    rejected_expr = func.count(func.distinct(OrderItem.id)).filter(
+        OrderItem.status == OrderItemStatus.REJECTED,
+    )
+    stmt = _group_by_dimension(
+        base, dimension, Order.created_at,
+        filters.period_from, filters.period_to,
+        extra_select=[
+            total_expr.label("items_total"),
+            approved_expr.label("items_approved"),
+            rejected_expr.label("items_rejected"),
+        ],
+        primary_order_expr=total_expr,
+    )
+    rows = (await db.execute(stmt)).all()
+    return [dict(r._mapping) for r in rows]
 
 
 @timed_query("orders_conversion_by_dimension")
@@ -899,9 +1104,161 @@ async def orders_conversion_by_dimension(
 ) -> list[dict]:
     """Group ``orders_conversion`` by dimension.
 
-    Each row: ``{label, ordered, approved, picked_up}``.
+    Row shape: ``{key, ordered, approved, picked_up, ...}`` per
+    group. Same EXISTS-based conditional counts as the headline.
+    Primary sort by ordered desc.
     """
-    raise NotImplementedError
+    base = _orders_dimension_base(client_id, filters)
+    approved_exists = (
+        select(OrderItem.id).where(
+            OrderItem.order_id == Order.id,
+            OrderItem.status == OrderItemStatus.APPROVED,
+        ).exists()
+    )
+    picked_up_exists = (
+        select(PackingList.id).where(
+            PackingList.order_id == Order.id,
+            PackingList.farmer_received_at.is_not(None),
+        ).exists()
+    )
+    ordered_expr  = func.count(func.distinct(Order.id))
+    approved_expr = func.count(func.distinct(Order.id)).filter(approved_exists)
+    picked_expr   = func.count(func.distinct(Order.id)).filter(picked_up_exists)
+    stmt = _group_by_dimension(
+        base, dimension, Order.created_at,
+        filters.period_from, filters.period_to,
+        extra_select=[
+            ordered_expr.label("ordered"),
+            approved_expr.label("approved"),
+            picked_expr.label("picked_up"),
+        ],
+        primary_order_expr=ordered_expr,
+    )
+    rows = (await db.execute(stmt)).all()
+    return [dict(r._mapping) for r in rows]
+
+
+@timed_query("orders_brand_mix_by_dimension")
+async def orders_brand_mix_by_dimension(
+    db: AsyncSession, client_id: str, filters: ReportFilters, dimension: str,
+) -> list[dict]:
+    """Group ``orders_brand_mix`` by dimension. Snapshot-aware.
+
+    Row shape: ``{key, locked, recommended, open, ...}`` per group.
+
+    Reads brand-lock intent from ``LockedTimelineSnapshot.content``
+    when ``OrderItem.snapshot_id`` is set (2-lock guarantee — see
+    ``reference_brand_authoring_states``). Falls back to live
+    Practice when the snapshot is absent or pre-dates the
+    is_brand_locked serializer addition.
+
+    Python-side classification because the JSONB traversal on top
+    of a GROUP BY makes for gnarly SQL. Row volume per report call
+    is bounded by items on counted-status orders in scope — modest
+    at current scale. If this hits a P95 pain point, denormalise
+    the brand_lock_state onto the OrderItem or an aux table.
+    """
+    dim = dimension.upper()
+    base = _orders_dimension_base(client_id, filters).join(
+        OrderItem, OrderItem.order_id == Order.id,
+    ).outerjoin(
+        LockedTimelineSnapshot,
+        LockedTimelineSnapshot.id == OrderItem.snapshot_id,
+    ).join(
+        Practice, Practice.id == OrderItem.practice_id,
+    ).where(
+        OrderItem.status.notin_([
+            OrderItemStatus.REMOVED, OrderItemStatus.REROUTED,
+        ]),
+    )
+
+    # Select dimension key + per-item classification inputs.
+    if dim == "CROP":
+        key_col = Package.crop_cosh_id.label("key")
+        extra_cols = [key_col]
+    elif dim == "SPACE":
+        key_col = User.state_cosh_id.label("key")
+        extra_cols = [key_col]
+    elif dim == "PACKAGE":
+        key_col = Subscription.package_id.label("key")
+        extra_cols = [key_col, Package.name.label("package_name")]
+    elif dim == "TIME":
+        bucket = _pick_time_bucket(filters.period_from, filters.period_to)
+        key_col = func.date_trunc(bucket, Order.created_at).label("key")
+        extra_cols = [key_col]
+    else:
+        raise ValueError(f"Unknown dimension: {dimension!r}")
+
+    stmt = base.with_only_columns(
+        *extra_cols,
+        OrderItem.id.label("item_id"),
+        OrderItem.practice_id.label("practice_id"),
+        Practice.is_brand_locked.label("live_locked"),
+        LockedTimelineSnapshot.content.label("snapshot_content"),
+    ).distinct()
+
+    rows = (await db.execute(stmt)).all()
+
+    # Fallback lookup: for practices whose snapshot doesn't carry
+    # is_brand_locked (or has no snapshot at all), read the BRAND_NAME
+    # element existence from the live Practice.
+    fallback_pids: set[str] = set()
+    for r in rows:
+        if r.snapshot_content is None:
+            fallback_pids.add(r.practice_id)
+        else:
+            if _classify_brand_from_snapshot(
+                r.snapshot_content, r.practice_id,
+            ) is None:
+                fallback_pids.add(r.practice_id)
+    has_brand_by_pid: dict[str, bool] = {}
+    if fallback_pids:
+        brand_rows = (await db.execute(
+            select(Element.practice_id).where(
+                Element.practice_id.in_(fallback_pids),
+                Element.element_type == "BRAND_NAME",
+                Element.cosh_ref.is_not(None),
+                func.length(func.trim(Element.cosh_ref)) > 0,
+            ).distinct()
+        )).all()
+        for (pid,) in brand_rows:
+            has_brand_by_pid[pid] = True
+
+    # Bucket per-item classification by dimension key.
+    buckets: dict[Any, dict] = {}
+    for r in rows:
+        state: Optional[str] = None
+        if r.snapshot_content is not None:
+            state = _classify_brand_from_snapshot(
+                r.snapshot_content, r.practice_id,
+            )
+        if state is None:
+            if r.live_locked:
+                state = "LOCKED"
+            elif has_brand_by_pid.get(r.practice_id):
+                state = "RECOMMENDED"
+            else:
+                state = "OPEN"
+
+        key = r.key
+        if key not in buckets:
+            bucket_entry: dict = {
+                "key": key, "locked": 0, "recommended": 0, "open": 0,
+            }
+            if dim == "PACKAGE":
+                bucket_entry["package_name"] = r.package_name
+            buckets[key] = bucket_entry
+        buckets[key][state.lower()] += 1
+
+    out = list(buckets.values())
+    if dim == "TIME":
+        out.sort(key=lambda x: x["key"] or datetime.min)
+    else:
+        out.sort(
+            key=lambda x: (x["locked"] + x["recommended"] + x["open"]),
+            reverse=True,
+        )
+    return out
 
 
 # ── Overview page composer ────────────────────────────────────────────────────
