@@ -506,22 +506,46 @@ async def test_orders_items_ignores_items_on_draft_orders(db):
     }
 
 
-async def test_orders_brand_mix_two_way_split(db):
-    """orders_brand_mix splits real items into two buckets:
-      locked   = brand_cosh_id NOT NULL   (specific Cosh SKU tied)
-      unlocked = brand_cosh_id IS NULL    (no SKU — open OR unfilled)
+async def test_orders_brand_mix_three_way_by_se_intent(db):
+    """orders_brand_mix classifies items by the SE's authoring intent
+    on the parent Practice (not by OrderItem.brand_cosh_id — dealers
+    always fill that at sale time regardless of authoring state):
 
-    Dealers can't enter free-text brands, so brand_cosh_id alone is
-    the source of truth. REMOVED / REROUTED items don't count in
-    either bucket. Parent Order status filter still applies.
+      locked      = Practice.is_brand_locked = True
+      recommended = not locked, but Practice has a BRAND_NAME element
+                    with non-empty cosh_ref
+      open        = not locked, no BRAND_NAME element
+
+    REMOVED / REROUTED items excluded. Parent Order status filter
+    still applies.
     """
     from datetime import datetime, timedelta, timezone
     from tests.factories import make_practice, make_timeline
+    from app.modules.advisory.models import Element
 
     parent = await make_client(db, full_name="Parent")
     pkg = await make_package(db, parent, name="PoP")
     tl = await make_timeline(db, pkg)
-    practice = await make_practice(db, tl)
+
+    # Three practices, one per authoring state.
+    p_locked = await make_practice(db, tl)
+    p_locked.is_brand_locked = True
+    db.add(Element(
+        practice_id=p_locked.id, element_type="BRAND_NAME",
+        cosh_ref="cosh-brand-locked",
+    ))
+
+    p_reco = await make_practice(db, tl)
+    p_reco.is_brand_locked = False
+    db.add(Element(
+        practice_id=p_reco.id, element_type="BRAND_NAME",
+        cosh_ref="cosh-brand-reco",
+    ))
+
+    p_open = await make_practice(db, tl)
+    p_open.is_brand_locked = False
+    # No BRAND_NAME element on p_open — dealer picks freely.
+
     farmer = await make_user(db, name="F")
     dealer = await make_user(db, name="D")
     sub = await make_subscription(db, farmer=farmer, client=parent, package=pkg)
@@ -537,27 +561,28 @@ async def test_orders_brand_mix_two_way_split(db):
     db.add(order)
     await db.flush()
 
-    def _item(brand_cosh_id, brand_name, status=OrderItemStatus.PENDING):
+    def _item(practice, status=OrderItemStatus.PENDING):
+        # brand_cosh_id/brand_name populated to prove the classifier
+        # ignores them — SE-intent from Practice is what counts.
         db.add(OrderItem(
             order_id=order.id, practice_id=practice.id, timeline_id=tl.id,
-            brand_cosh_id=brand_cosh_id, brand_name=brand_name,
+            brand_cosh_id="cosh-picked-by-dealer",
+            brand_name="Whatever dealer picked",
             status=status,
         ))
 
-    # 4 locked (cosh_id set), 5 unlocked (cosh_id NULL — regardless
-    # of brand_name because the name follows the SKU).
-    for _ in range(4): _item("cosh-brand-1", "Some Brand")
-    for _ in range(3): _item(None, None)
-    for _ in range(2): _item(None, "Legacy free-text noise")  # cosh_id NULL → unlocked
+    for _ in range(4): _item(p_locked)
+    for _ in range(2): _item(p_reco)
+    for _ in range(3): _item(p_open)
 
-    # REMOVED / REROUTED — MUST NOT count in either bucket.
-    _item("cosh-brand-1", "Some Brand", OrderItemStatus.REMOVED)
-    _item(None, None, OrderItemStatus.REROUTED)
+    # REMOVED / REROUTED — MUST NOT count.
+    _item(p_locked, OrderItemStatus.REMOVED)
+    _item(p_open,   OrderItemStatus.REROUTED)
 
     await db.flush()
 
     assert await orders_brand_mix(db, parent.id, ReportFilters()) == {
-        "locked": 4, "unlocked": 5,
+        "locked": 4, "recommended": 2, "open": 3,
     }
 
 

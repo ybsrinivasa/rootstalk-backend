@@ -47,7 +47,7 @@ from typing import Any, Awaitable, Callable, Optional, TypeVar
 from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.advisory.models import Package
+from app.modules.advisory.models import Element, Package, Practice
 from app.modules.clients.models import Client
 from app.modules.orders.models import Order, OrderItem, OrderItemStatus, OrderStatus
 from app.modules.platform.models import User
@@ -469,47 +469,73 @@ async def orders_items(
 async def orders_brand_mix(
     db: AsyncSession, client_id: str, filters: ReportFilters,
 ) -> dict:
-    """Item-level brand mix — two-way split.
+    """Item-level brand mix — three-way split by SE AUTHORING intent.
 
     Returns::
 
         {
-          "locked":   <int>,   # brand_cosh_id IS NOT NULL
-          "unlocked": <int>,   # brand_cosh_id IS NULL
+          "locked":      <int>,   # Practice.is_brand_locked = True
+          "recommended": <int>,   # not locked, but has a BRAND_NAME element
+          "open":        <int>,   # not locked, no BRAND_NAME element
         }
 
-    Semantics:
-    - **Locked** — item is tied to a specific Cosh SKU. Either the SE
-      published the brand into advisory, or the dealer chose one from
-      the Cosh brand picker at fulfilment time.
-    - **Unlocked** — no specific SKU is tied. Either advisory left
-      the brand open, or fulfilment hasn't happened yet.
+    Semantics (source of truth is the Practice, not OrderItem):
+    - **Locked**      — SE opted into ``Practice.is_brand_locked = True``.
+      A specific SKU is mandated; dealer MUST sell that brand.
+      This is direct business the client captured.
+    - **Recommended** — SE named a specific SKU as a BRAND_NAME
+      element but did NOT lock it. Dealer sees the recommendation
+      but can substitute.
+    - **Open**        — SE published only the common name (no
+      BRAND_NAME element with a non-empty cosh_ref). Dealer picks
+      any brand at fulfilment time.
 
-    Note: dealers CANNOT enter free-text brand names in RootsTalk —
-    every brand pick goes through Cosh. So ``brand_cosh_id`` alone is
-    the source of truth for this split; ``brand_name`` is a
-    denormalised display convenience that follows the cosh_id.
-    (Earlier three-way version incorrectly assumed a "free-text
-    brand" state existed; corrected 2026-07-28 per user.)
+    ``OrderItem.brand_cosh_id`` is what the dealer actually sold —
+    dealers CANNOT complete a sale without picking a specific SKU
+    from the Cosh brand picker. So brand_cosh_id doesn't distinguish
+    these three states; the SE's authoring intent lives on Practice.
 
     Item-level not order-level per the plan. REMOVED / REROUTED
     excluded. Parent Order still gated by ``ORDER_COUNTED_STATUSES``
     + period on ``Order.created_at``.
 
-    Both counts in one round-trip via conditional COUNT FILTER.
+    Historical accuracy caveat: this uses the CURRENT Practice state,
+    not a per-order snapshot. If a SE later flips is_brand_locked,
+    historical items reclassify. Snapshot-based accuracy is Phase 2
+    scope. All three counts in one round-trip via conditional
+    COUNT FILTER + a correlated EXISTS on the BRAND_NAME element.
     """
     scope = _apply_filters(_subscription_scope(client_id), filters)
+
+    # EXISTS subquery — does this Practice carry a BRAND_NAME element
+    # with a non-empty cosh_ref? Mirrors the _validate_brand_lock
+    # check in advisory/router.py so the two definitions stay aligned.
+    has_brand_name = (
+        select(Element.id)
+        .where(
+            Element.practice_id == Practice.id,
+            Element.element_type == "BRAND_NAME",
+            Element.cosh_ref.is_not(None),
+            func.length(func.trim(Element.cosh_ref)) > 0,
+        )
+        .exists()
+    )
+
     stmt = (
         scope
         .join(Order, Order.subscription_id == Subscription.id)
         .join(OrderItem, OrderItem.order_id == Order.id)
+        .join(Practice, Practice.id == OrderItem.practice_id)
         .with_only_columns(
             func.count(func.distinct(OrderItem.id))
-                .filter(OrderItem.brand_cosh_id.is_not(None))
+                .filter(Practice.is_brand_locked.is_(True))
                 .label("locked"),
             func.count(func.distinct(OrderItem.id))
-                .filter(OrderItem.brand_cosh_id.is_(None))
-                .label("unlocked"),
+                .filter(Practice.is_brand_locked.is_(False), has_brand_name)
+                .label("recommended"),
+            func.count(func.distinct(OrderItem.id))
+                .filter(Practice.is_brand_locked.is_(False), ~has_brand_name)
+                .label("open"),
         )
         .where(
             Order.status.in_(ORDER_COUNTED_STATUSES),
@@ -524,8 +550,9 @@ async def orders_brand_mix(
         stmt = stmt.where(Order.created_at < filters.period_to)
     row = (await db.execute(stmt)).one()
     return {
-        "locked":   int(row.locked),
-        "unlocked": int(row.unlocked),
+        "locked":      int(row.locked),
+        "recommended": int(row.recommended),
+        "open":        int(row.open),
     }
 
 
