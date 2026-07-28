@@ -228,14 +228,7 @@ async def subscriptions_report(
         if metric_up == "TOTAL":
             return await queries.subs_total(db, cid, filters)
         if metric_up == "NEW":
-            raise HTTPException(
-                status_code=501,
-                detail={
-                    "code": "metric_not_implemented",
-                    "message": "Subscriptions 'NEW' is on the "
-                               "Phase 1 punch list; not yet wired.",
-                },
-            )
+            return await queries.subs_new(db, cid, filters)
         raise HTTPException(
             status_code=422,
             detail={

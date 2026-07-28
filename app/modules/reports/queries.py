@@ -193,21 +193,72 @@ class ReportFilters:
 async def subs_new(
     db: AsyncSession, client_id: str, filters: ReportFilters,
 ) -> dict:
-    """New subscriptions in [period_from, period_to).
+    """New subscriptions in ``[period_from, period_to)``.
 
     Returns::
 
         {
-          "relationships": <int>,   # sub events in period
+          "relationships": <int>,   # subscription events in period
           "farmers": <int>,         # DISTINCT farmers whose FIRST-ever
-                                    # sub with this client fell in period
+                                    # sub within the filtered scope fell
+                                    # in period
         }
 
-    Both numbers on the same card per the design decision. ``farmers``
-    uses a correlated MIN(subscription_date) subquery scoped to this
-    client so a farmer's 2nd crop later doesn't count them again.
+    Both numbers on the same card per the design decision — "412 new
+    subscriptions · 247 first-time farmers" reads as one story.
+
+    Period semantics: subscription_date >= period_from AND < period_to.
+    NULL subscription_date rows are excluded from both counts (can't
+    date them; usually legacy pre-feature rows).
+
+    "First-ever" scope: the MIN(subscription_date) subquery runs
+    inside ``_apply_filters`` too — so under a Crop=Tomato filter,
+    a farmer's first-ever *Tomato* sub in July counts even if they
+    had Maize since 2020. That's the useful interpretation: "new is
+    relative to what you're looking at."
+
+    Two round-trips (one per aggregation) — cheap at Stage 1 scale
+    and each keeps its own P95 log line, which is exactly the data
+    we want if we ever escalate. Fold into a single SQL only when
+    subs_new specifically shows up as a Stage-2 candidate.
     """
-    raise NotImplementedError
+    scope = _apply_filters(_subscription_scope(client_id), filters)
+
+    period_from = filters.period_from
+    period_to = filters.period_to
+
+    # ── relationships: sub events in period ──────────────────────────
+    rel_stmt = scope.with_only_columns(
+        func.count(Subscription.id).label("n"),
+    ).where(Subscription.subscription_date.is_not(None))
+    if period_from is not None:
+        rel_stmt = rel_stmt.where(Subscription.subscription_date >= period_from)
+    if period_to is not None:
+        rel_stmt = rel_stmt.where(Subscription.subscription_date < period_to)
+    relationships = int((await db.execute(rel_stmt)).scalar_one())
+
+    # ── farmers: distinct first-time farmers whose MIN(sub_date) in period ──
+    # Grouped subquery over the SAME filtered scope, then filter by
+    # the MIN date. Postgres handles this well; the GROUP BY collapses
+    # to farmer_user_id and HAVING scopes the min-date to the window.
+    min_date_col = func.min(Subscription.subscription_date).label("first_date")
+    grouped_scope = (
+        scope.with_only_columns(
+            Subscription.farmer_user_id.label("farmer_user_id"),
+            min_date_col,
+        )
+        .where(Subscription.subscription_date.is_not(None))
+        .group_by(Subscription.farmer_user_id)
+    )
+    if period_from is not None:
+        grouped_scope = grouped_scope.having(min_date_col >= period_from)
+    if period_to is not None:
+        grouped_scope = grouped_scope.having(min_date_col < period_to)
+    farmers_subq = grouped_scope.subquery()
+    farmers_stmt = select(func.count()).select_from(farmers_subq)
+    farmers = int((await db.execute(farmers_stmt)).scalar_one())
+
+    return {"relationships": relationships, "farmers": farmers}
 
 
 @timed_query("subs_active")

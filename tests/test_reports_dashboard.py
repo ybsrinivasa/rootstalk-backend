@@ -26,7 +26,9 @@ from tests.factories import (
 )
 
 from app.modules.clients.models import Client
-from app.modules.reports.queries import ReportFilters, subs_active, subs_total
+from app.modules.reports.queries import (
+    ReportFilters, subs_active, subs_new, subs_total,
+)
 from app.modules.subscriptions.models import Subscription, SubscriptionStatus
 
 
@@ -232,4 +234,85 @@ async def test_subs_total_counts_every_status_but_still_excludes_bad_scopes(db):
     # 4 counted (ACTIVE + LAPSED + CANCELLED + UNSUBSCRIBED); 2 distinct farmers.
     assert await subs_total(db, parent.id, ReportFilters()) == {
         "subscriptions": 4, "farmers": 2,
+    }
+
+
+async def test_subs_new_period_boundaries_and_first_ever_dedup(db):
+    """subs_new must:
+    - Count subs with subscription_date in [period_from, period_to).
+    - NOT count NULL subscription_date rows (undatable).
+    - Report "farmers" as first-time-in-scope: a returning farmer whose
+      earlier sub predates the window does NOT count as a new farmer,
+      even though the in-window sub does count as a new relationship.
+    """
+    from datetime import datetime, timezone
+
+    parent = await make_client(db, full_name="Parent")
+    pkg = await make_package(db, parent, name="PoP")
+
+    # Three farmers.
+    farmer_new = await make_user(db, name="Truly New")
+    farmer_returning = await make_user(db, name="Returning")
+    farmer_pre = await make_user(db, name="Pre-window")
+
+    period_from = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    period_to   = datetime(2026, 8, 1, tzinfo=timezone.utc)
+
+    # farmer_new: FIRST-EVER sub is 15 Jul → counts as new relationship
+    # AND new farmer.
+    s_new = await make_subscription(db, farmer=farmer_new, client=parent, package=pkg)
+    s_new.subscription_date = datetime(2026, 7, 15, tzinfo=timezone.utc)
+
+    # farmer_returning: had a sub in May (pre-window), plus a NEW sub
+    # on 20 Jul (in window). July sub counts as a new relationship; the
+    # farmer does NOT count as a new farmer (May sub is earlier).
+    s_ret_may = await make_subscription(db, farmer=farmer_returning, client=parent, package=pkg)
+    s_ret_may.subscription_date = datetime(2026, 5, 10, tzinfo=timezone.utc)
+    s_ret_jul = await make_subscription(db, farmer=farmer_returning, client=parent, package=pkg)
+    s_ret_jul.subscription_date = datetime(2026, 7, 20, tzinfo=timezone.utc)
+
+    # farmer_pre: FIRST-EVER sub is 30 Jun — one day before window.
+    # NOT counted in relationships (out of window) nor farmers.
+    s_pre = await make_subscription(db, farmer=farmer_pre, client=parent, package=pkg)
+    s_pre.subscription_date = datetime(2026, 6, 30, tzinfo=timezone.utc)
+
+    # Legacy NULL subscription_date — never dated, always excluded.
+    s_null = await make_subscription(db, farmer=farmer_new, client=parent, package=pkg)
+    s_null.subscription_date = None
+
+    # Sub on the exclusive right boundary — 1 Aug 00:00 is OUTSIDE.
+    s_boundary_out = await make_subscription(db, farmer=farmer_new, client=parent, package=pkg)
+    s_boundary_out.subscription_date = datetime(2026, 8, 1, tzinfo=timezone.utc)
+
+    await db.flush()
+
+    # relationships = farmer_new (15 Jul) + farmer_returning (20 Jul) = 2
+    # farmers = farmer_new only (returning had May sub earlier) = 1
+    result = await subs_new(
+        db, parent.id,
+        ReportFilters(period_from=period_from, period_to=period_to),
+    )
+    assert result == {"relationships": 2, "farmers": 1}
+
+
+async def test_subs_new_no_period_returns_all_datable(db):
+    """When neither period_from nor period_to is set, every datable
+    sub counts as a relationship, and every farmer with >=1 datable
+    sub counts as a farmer (their first-ever is trivially in-window).
+    NULL subscription_date still excluded."""
+    from datetime import datetime, timezone
+
+    parent = await make_client(db, full_name="Parent")
+    pkg = await make_package(db, parent, name="PoP")
+    farmer = await make_user(db, name="F")
+
+    s_dated = await make_subscription(db, farmer=farmer, client=parent, package=pkg)
+    s_dated.subscription_date = datetime(2026, 3, 1, tzinfo=timezone.utc)
+    s_null = await make_subscription(db, farmer=farmer, client=parent, package=pkg)
+    s_null.subscription_date = None
+
+    await db.flush()
+
+    assert await subs_new(db, parent.id, ReportFilters()) == {
+        "relationships": 1, "farmers": 1,
     }
