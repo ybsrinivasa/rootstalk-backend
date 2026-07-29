@@ -1807,7 +1807,7 @@ async def reconcile_portal_user_roles(
         )
 
     existing_by_role = {r.role: r for r in existing_rows}
-    now = utcnow()
+    now = datetime.now(timezone.utc)
 
     # Add or re-activate the roles in target.
     for role in target_set:
