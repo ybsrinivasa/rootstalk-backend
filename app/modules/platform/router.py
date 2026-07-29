@@ -239,6 +239,76 @@ async def update_neytiri_user(
     return {"id": user.id, "name": user.name, "email": user.email}
 
 
+@router.put("/admin/users/{user_id}/roles")
+async def reconcile_neytiri_user_roles(
+    user_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SA: reconcile a Neytiri portal user's roles to exactly the
+    given set. Body ``{"roles": ["CONTENT_MANAGER", ...]}``.
+
+    - Target set must have at least one role, all in NEYTIRI_ROLES.
+    - Missing roles are added (status=ACTIVE).
+    - Roles present but INACTIVE and in target flip back to ACTIVE.
+    - Roles ACTIVE and NOT in target flip to INACTIVE.
+    - Deactivating the user entirely goes through /status, not here.
+    """
+    await _get_neytiri_user(db, user_id)
+
+    target_raw = data.get("roles")
+    if not isinstance(target_raw, list) or len(target_raw) == 0:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "roles_required",
+                "message": (
+                    "Pick at least one role. To remove the user "
+                    "entirely, use the Deactivate button."
+                ),
+            },
+        )
+    try:
+        target_set = {RoleType(r) for r in target_raw}
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Unknown role in payload")
+
+    if not target_set.issubset(NEYTIRI_ROLES):
+        raise HTTPException(
+            status_code=422,
+            detail="Only Neytiri roles (CM / RM / BM) can be assigned here",
+        )
+
+    existing_rows = (await db.execute(
+        select(UserRole).where(
+            UserRole.user_id == user_id,
+            UserRole.role_type.in_(list(NEYTIRI_ROLES)),
+        )
+    )).scalars().all()
+    existing_by_role = {r.role_type: r for r in existing_rows}
+
+    for role in target_set:
+        if role in existing_by_role:
+            r = existing_by_role[role]
+            if r.status != StatusEnum.ACTIVE:
+                r.status = StatusEnum.ACTIVE
+        else:
+            db.add(UserRole(
+                user_id=user_id, role_type=role, status=StatusEnum.ACTIVE,
+            ))
+
+    for r in existing_rows:
+        if r.role_type in target_set:
+            continue
+        if r.status == StatusEnum.ACTIVE:
+            r.status = StatusEnum.INACTIVE
+
+    await db.commit()
+    return {"detail": "roles reconciled",
+            "roles": sorted(r.value for r in target_set)}
+
+
 @router.put("/admin/users/{user_id}/status")
 async def toggle_neytiri_user_status(
     user_id: str,
