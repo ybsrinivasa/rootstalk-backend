@@ -462,12 +462,14 @@ async def override_user_password(
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 async def _get_neytiri_user(db: AsyncSession, user_id: str) -> User:
+    # Multi-role Neytiri users have >1 UserRole row — use .first() so
+    # the existence check doesn't 500 with MultipleResultsFound.
     role = (await db.execute(
         select(UserRole).where(
             UserRole.user_id == user_id,
             UserRole.role_type.in_(list(NEYTIRI_ROLES)),
         )
-    )).scalar_one_or_none()
+    )).scalars().first()
     if not role:
         raise HTTPException(status_code=404, detail="Neytiri portal user not found")
     user = (await db.execute(select(User).where(User.id == user_id))).scalar_one()
