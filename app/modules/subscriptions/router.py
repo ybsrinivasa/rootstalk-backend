@@ -6404,6 +6404,45 @@ async def get_pre_start_inputs(
     return out
 
 
+# ── Farmer: Package authors (Crop Dashboard attribution) ────────────────────
+
+@router.get("/farmer/subscriptions/{subscription_id}/authors")
+async def get_package_authors_for_farmer(
+    subscription_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Subject Experts credited on the farmer's package, in
+    `display_order`. Name + designation + professional_profile joined
+    from User (Batch D+E). Returns [] when the CA hasn't assigned any
+    authors — the PWA hides the accordion in that case."""
+    from app.modules.advisory.models import PackageAuthor
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    rows = (await db.execute(
+        select(PackageAuthor, User)
+        .join(User, User.id == PackageAuthor.user_id)
+        .where(PackageAuthor.package_id == sub.package_id)
+        .order_by(PackageAuthor.display_order, PackageAuthor.id)
+    )).all()
+    return [
+        {
+            "user_id": pa.user_id,
+            "name": u.name,
+            "designation": u.designation,
+            "professional_profile": u.professional_profile,
+            "display_order": pa.display_order,
+        }
+        for pa, u in rows
+    ]
+
+
 # ── Farmer: Missed items (expired practices) ──────────────────────────────────
 
 @router.get("/farmer/subscriptions/{subscription_id}/missed-items")
