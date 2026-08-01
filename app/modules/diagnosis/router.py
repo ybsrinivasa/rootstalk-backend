@@ -449,6 +449,7 @@ async def get_diagnosis_eligibility(
     from app.modules.clients.models import ClientCrop
     from app.modules.subscriptions.models import Subscription
     from app.modules.sync.models import CropHealthCrop
+    from app.services.training import resolve_package_client_id
 
     sub = (await db.execute(
         select(Subscription).where(
@@ -465,9 +466,13 @@ async def get_diagnosis_eligibility(
     if not package:
         raise HTTPException(status_code=404, detail="Subscription's package not found")
 
+    # ClientCrop lives on the real parent. Training children don't
+    # hold their own crop belt — resolve to parent so training subs
+    # inherit the parent's eligibility.
+    effective_client_id = await resolve_package_client_id(db, sub.client_id)
     on_belt = (await db.execute(
         select(ClientCrop).where(
-            ClientCrop.client_id == sub.client_id,
+            ClientCrop.client_id == effective_client_id,
             ClientCrop.crop_cosh_id == package.crop_cosh_id,
             ClientCrop.removed_at.is_(None),
         )
