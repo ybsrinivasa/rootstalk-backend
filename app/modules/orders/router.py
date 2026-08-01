@@ -1942,12 +1942,17 @@ async def list_eligible_recipients(
     `nearby-*` endpoints; this surface is about *eligibility*,
     not ranking.
     """
+    from app.services.training import resolve_package_client_id
     order = await _get_farmer_order(db, order_id, current_user.id)
     has_locked = await _order_has_locked_brand_items(db, order.id)
+    # Training subs' order.client_id is the training-child id, which
+    # holds no ClientPromoter rows — resolve to parent so the picker
+    # surfaces the parent's onboarded promoters.
+    effective_client_id = await resolve_package_client_id(db, order.client_id)
     return await _build_eligible_recipients_payload(
         db,
         current_user=current_user,
-        client_id=order.client_id,
+        client_id=effective_client_id,
         category=order.category,
         has_locked=has_locked,
     )
@@ -1978,12 +1983,14 @@ async def list_eligible_recipients_for_new_order(
     if not sub:
         raise HTTPException(status_code=404, detail="Subscription not found")
 
+    from app.services.training import resolve_package_client_id
     pids = [p for p in (practice_ids or "").split(",") if p]
     has_locked = await _practice_ids_have_locked_brand(db, pids)
+    effective_client_id = await resolve_package_client_id(db, sub.client_id)
     return await _build_eligible_recipients_payload(
         db,
         current_user=current_user,
-        client_id=sub.client_id,
+        client_id=effective_client_id,
         category=category,
         has_locked=has_locked,
     )

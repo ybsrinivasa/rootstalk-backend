@@ -6235,12 +6235,16 @@ async def nearby_dealers_for_farmer(
     brand_lock_client_id: Optional[str] = None
     if variety_id:
         from app.modules.seed_mgmt.models import SeedVariety as _Var
+        from app.services.training import resolve_package_client_id
         var_row = (await db.execute(
             select(_Var.client_id).where(_Var.id == variety_id)
         )).scalar_one_or_none()
         if var_row is None:
             raise HTTPException(status_code=404, detail="Variety not found")
-        brand_lock_client_id = var_row
+        # Defensive: varieties are typically parent-owned so this is
+        # already the parent, but resolve so any training-child-owned
+        # variety still surfaces the parent's onboarded dealers.
+        brand_lock_client_id = await resolve_package_client_id(db, var_row)
 
     farmer_lat = lat or (float(current_user.gps_lat) if current_user.gps_lat else 0.0)
     farmer_lng = lng or (float(current_user.gps_lng) if current_user.gps_lng else 0.0)
@@ -6314,6 +6318,7 @@ async def nearby_facilitators_for_farmer(
     are excluded — the picker is a reference list of vetted recipients
     for the order's client."""
     from app.modules.clients.models import ClientPromoter
+    from app.services.training import resolve_package_client_id
     sub = (await db.execute(
         select(Subscription).where(
             Subscription.id == subscription_id,
@@ -6328,9 +6333,11 @@ async def nearby_facilitators_for_farmer(
 
     promoter_user_id = await _get_promoter(db, subscription_id, PromoterType.FACILITATOR)
 
+    # Training subs inherit the parent's onboarded facilitators.
+    effective_client_id = await resolve_package_client_id(db, sub.client_id)
     onboarded_ids = set((await db.execute(
         select(ClientPromoter.user_id).where(
-            ClientPromoter.client_id == sub.client_id,
+            ClientPromoter.client_id == effective_client_id,
             ClientPromoter.promoter_type == "FACILITATOR",
             ClientPromoter.status == "ACTIVE",
         )
