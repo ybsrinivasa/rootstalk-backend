@@ -6309,7 +6309,11 @@ async def nearby_facilitators_for_farmer(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Returns up to 5 nearest facilitators + Promoter pinned first."""
+    """Returns up to 5 nearest ONBOARDED facilitators for the sub's
+    client, with the pinned Promoter first. Non-onboarded facilitators
+    are excluded — the picker is a reference list of vetted recipients
+    for the order's client."""
+    from app.modules.clients.models import ClientPromoter
     sub = (await db.execute(
         select(Subscription).where(
             Subscription.id == subscription_id,
@@ -6324,15 +6328,22 @@ async def nearby_facilitators_for_farmer(
 
     promoter_user_id = await _get_promoter(db, subscription_id, PromoterType.FACILITATOR)
 
-    facilitator_role_rows = (await db.execute(
-        select(UserRole).where(UserRole.role_type == RoleType.FACILITATOR)
-    )).scalars().all()
-    facilitator_ids = {r.user_id for r in facilitator_role_rows}
+    onboarded_ids = set((await db.execute(
+        select(ClientPromoter.user_id).where(
+            ClientPromoter.client_id == sub.client_id,
+            ClientPromoter.promoter_type == "FACILITATOR",
+            ClientPromoter.status == "ACTIVE",
+        )
+    )).scalars().all())
+    if not onboarded_ids:
+        return []
 
+    facilitators = (await db.execute(
+        select(User).where(User.id.in_(onboarded_ids))
+    )).scalars().all()
     results = []
-    for uid in facilitator_ids:
-        fac = (await db.execute(select(User).where(User.id == uid))).scalar_one_or_none()
-        if not fac or not fac.gps_lat or not fac.gps_lng:
+    for fac in facilitators:
+        if not fac.gps_lat or not fac.gps_lng:
             continue
         dist = _haversine_sub(farmer_lat, farmer_lng,
                               float(fac.gps_lat), float(fac.gps_lng))

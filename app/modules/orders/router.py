@@ -9801,68 +9801,82 @@ async def _build_eligible_recipients_payload(
     has_locked: bool,
 ) -> dict:
     """Shared core for both the order-based and new-order
-    eligible-recipients endpoints. Filters dealers by licence-
-    category match + (if locked) client onboarding; filters
-    facilitators to active-only, empty when locked-brand."""
+    eligible-recipients endpoints. Returns the 5 nearest onboarded
+    dealers (licence-matched) and the 5 nearest onboarded facilitators
+    for the order's client, regardless of brand-lock. The picker is
+    always a reference list of vetted recipients; the phone-entry
+    escape hatch (unlocked orders → any RootsTalk-registered dealer)
+    remains at the send-action layer.
+
+    `has_locked_brand` is still returned — the frontend uses it to
+    decide whether the phone-entry escape hatch is offered.
+    """
+    from math import radians, sin, cos, asin, sqrt
+    from app.modules.clients.models import ClientPromoter
+
     cat_to_plural = {"PESTICIDE": "PESTICIDES", "FERTILIZER": "FERTILISERS"}
     required_plural = cat_to_plural.get((category or "").upper())
-
-    onboarded_dealer_ids: set[str] = set()
-    if has_locked:
-        from app.modules.clients.models import ClientPromoter
-        rows = (await db.execute(
-            select(ClientPromoter.user_id).where(
-                ClientPromoter.client_id == client_id,
-                ClientPromoter.promoter_type == "DEALER",
-                ClientPromoter.status == "ACTIVE",
-            )
-        )).all()
-        onboarded_dealer_ids = {r[0] for r in rows}
 
     farmer_lat = float(current_user.gps_lat) if current_user.gps_lat else 0.0
     farmer_lng = float(current_user.gps_lng) if current_user.gps_lng else 0.0
 
-    profiles = (await db.execute(select(DealerProfile))).scalars().all()
+    def _dist_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        rlat1, rlon1, rlat2, rlon2 = map(radians, [lat1, lon1, lat2, lon2])
+        a = sin((rlat2 - rlat1) / 2) ** 2 + cos(rlat1) * cos(rlat2) * sin((rlon2 - rlon1) / 2) ** 2
+        return 2 * 6371 * asin(sqrt(a))
+
+    promoter_rows = (await db.execute(
+        select(ClientPromoter).where(
+            ClientPromoter.client_id == client_id,
+            ClientPromoter.status == "ACTIVE",
+        )
+    )).scalars().all()
+    onboarded_dealer_ids = {cp.user_id for cp in promoter_rows if cp.promoter_type == "DEALER"}
+    onboarded_facilitator_ids = {cp.user_id for cp in promoter_rows if cp.promoter_type == "FACILITATOR"}
+
     dealers: list[dict] = []
-    for profile in profiles:
-        if required_plural and required_plural not in (profile.sell_categories or []):
-            continue
-        if has_locked and profile.user_id not in onboarded_dealer_ids:
-            continue
-        if not profile.shop_gps_lat or not profile.shop_gps_lng:
-            continue
-        dealer = (await db.execute(select(User).where(User.id == profile.user_id))).scalar_one_or_none()
-        if not dealer:
-            continue
-        from math import radians, sin, cos, asin, sqrt
-        lat1, lon1, lat2, lon2 = map(radians, [
-            farmer_lat, farmer_lng,
-            float(profile.shop_gps_lat), float(profile.shop_gps_lng),
-        ])
-        a = sin((lat2 - lat1) / 2) ** 2 + cos(lat1) * cos(lat2) * sin((lon2 - lon1) / 2) ** 2
-        dist = 2 * 6371 * asin(sqrt(a))
-        dealers.append({
-            "user_id": dealer.id,
-            "name": dealer.name,
-            "phone": dealer.phone,
-            "shop_name": profile.shop_name,
-            "shop_address": profile.shop_address,
-            "sell_categories": profile.sell_categories or [],
-            "distance_km": round(dist, 1),
-        })
+    if onboarded_dealer_ids:
+        profiles = (await db.execute(
+            select(DealerProfile).where(DealerProfile.user_id.in_(onboarded_dealer_ids))
+        )).scalars().all()
+        for profile in profiles:
+            if required_plural and required_plural not in (profile.sell_categories or []):
+                continue
+            if not profile.shop_gps_lat or not profile.shop_gps_lng:
+                continue
+            dealer = (await db.execute(select(User).where(User.id == profile.user_id))).scalar_one_or_none()
+            if not dealer:
+                continue
+            dist = _dist_km(farmer_lat, farmer_lng,
+                            float(profile.shop_gps_lat), float(profile.shop_gps_lng))
+            dealers.append({
+                "user_id": dealer.id,
+                "name": dealer.name,
+                "phone": dealer.phone,
+                "shop_name": profile.shop_name,
+                "shop_address": profile.shop_address,
+                "sell_categories": profile.sell_categories or [],
+                "distance_km": round(dist, 1),
+            })
     dealers.sort(key=lambda x: x["distance_km"])
 
     facilitators: list[dict] = []
-    if not has_locked:
-        from app.modules.platform.models import RoleType, UserRole
+    if onboarded_facilitator_ids:
         fac_users = (await db.execute(
-            select(User).join(UserRole, UserRole.user_id == User.id)
-            .where(UserRole.role_type == RoleType.FACILITATOR)
+            select(User).where(User.id.in_(onboarded_facilitator_ids))
         )).scalars().all()
         for fac in fac_users:
+            if not fac.gps_lat or not fac.gps_lng:
+                continue
+            dist = _dist_km(farmer_lat, farmer_lng,
+                            float(fac.gps_lat), float(fac.gps_lng))
             facilitators.append({
-                "user_id": fac.id, "name": fac.name, "phone": fac.phone,
+                "user_id": fac.id,
+                "name": fac.name,
+                "phone": fac.phone,
+                "distance_km": round(dist, 1),
             })
+    facilitators.sort(key=lambda x: x["distance_km"])
 
     return {
         "category": (category or "").upper() or None,
@@ -9871,8 +9885,8 @@ async def _build_eligible_recipients_payload(
             "This order has a brand-locked item — only the company's "
             "onboarded dealers can fulfil it."
         ) if has_locked else None,
-        "dealers": dealers[:10],
-        "facilitators": facilitators[:10],
+        "dealers": dealers[:5],
+        "facilitators": facilitators[:5],
     }
 
 
