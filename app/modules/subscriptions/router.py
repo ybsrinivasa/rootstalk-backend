@@ -6299,6 +6299,8 @@ async def nearby_dealers_for_farmer(
                 "sell_categories": profile.sell_categories or [],
                 "distance_km": round(dist, 1),
                 "is_promoter": dealer.id == promoter_user_id,
+                "shop_gps_lat": float(profile.shop_gps_lat),
+                "shop_gps_lng": float(profile.shop_gps_lng),
             })
 
     results.sort(key=lambda x: (0 if x["is_promoter"] else 1, x["distance_km"]))
@@ -6360,6 +6362,8 @@ async def nearby_facilitators_for_farmer(
             "phone": fac.phone,
             "distance_km": round(dist, 1),
             "is_promoter": fac.id == promoter_user_id,
+            "gps_lat": float(fac.gps_lat),
+            "gps_lng": float(fac.gps_lng),
         })
 
     results.sort(key=lambda x: (0 if x["is_promoter"] else 1, x["distance_km"]))

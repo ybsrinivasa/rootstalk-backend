@@ -1924,6 +1924,8 @@ async def send_draft_order(
 @router.get("/farmer/orders/{order_id}/eligible-recipients")
 async def list_eligible_recipients(
     order_id: str,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1955,6 +1957,8 @@ async def list_eligible_recipients(
         client_id=effective_client_id,
         category=order.category,
         has_locked=has_locked,
+        origin_lat=lat,
+        origin_lng=lng,
     )
 
 
@@ -1963,6 +1967,8 @@ async def list_eligible_recipients_for_new_order(
     subscription_id: str,
     category: str,
     practice_ids: str = "",
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1993,6 +1999,8 @@ async def list_eligible_recipients_for_new_order(
         client_id=effective_client_id,
         category=category,
         has_locked=has_locked,
+        origin_lat=lat,
+        origin_lng=lng,
     )
 
 
@@ -9806,6 +9814,8 @@ async def _build_eligible_recipients_payload(
     client_id: str,
     category: str | None,
     has_locked: bool,
+    origin_lat: float | None = None,
+    origin_lng: float | None = None,
 ) -> dict:
     """Shared core for both the order-based and new-order
     eligible-recipients endpoints. Returns the 5 nearest onboarded
@@ -9824,8 +9834,14 @@ async def _build_eligible_recipients_payload(
     cat_to_plural = {"PESTICIDE": "PESTICIDES", "FERTILIZER": "FERTILISERS"}
     required_plural = cat_to_plural.get((category or "").upper())
 
-    farmer_lat = float(current_user.gps_lat) if current_user.gps_lat else 0.0
-    farmer_lng = float(current_user.gps_lng) if current_user.gps_lng else 0.0
+    # Origin for haversine — caller may override (Current Location
+    # toggle in the PWA) else fall back to the farmer's saved
+    # profile coords.
+    if origin_lat is not None and origin_lng is not None:
+        farmer_lat, farmer_lng = float(origin_lat), float(origin_lng)
+    else:
+        farmer_lat = float(current_user.gps_lat) if current_user.gps_lat else 0.0
+        farmer_lng = float(current_user.gps_lng) if current_user.gps_lng else 0.0
 
     def _dist_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         rlat1, rlon1, rlat2, rlon2 = map(radians, [lat1, lon1, lat2, lon2])
@@ -9864,6 +9880,8 @@ async def _build_eligible_recipients_payload(
                 "shop_address": profile.shop_address,
                 "sell_categories": profile.sell_categories or [],
                 "distance_km": round(dist, 1),
+                "shop_gps_lat": float(profile.shop_gps_lat),
+                "shop_gps_lng": float(profile.shop_gps_lng),
             })
     dealers.sort(key=lambda x: x["distance_km"])
 
@@ -9882,6 +9900,8 @@ async def _build_eligible_recipients_payload(
                 "name": fac.name,
                 "phone": fac.phone,
                 "distance_km": round(dist, 1),
+                "gps_lat": float(fac.gps_lat),
+                "gps_lng": float(fac.gps_lng),
             })
     facilitators.sort(key=lambda x: x["distance_km"])
 
