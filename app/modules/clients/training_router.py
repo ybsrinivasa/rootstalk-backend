@@ -194,7 +194,11 @@ def _training_child_short_name() -> str:
 
 
 def _serialise_training(child: Client) -> dict:
-    """Response shape shared across start / current."""
+    """Response shape shared across start / current. Session-role
+    slots (`training_expert_user_id`, `training_dealer_user_id`) are
+    returned as ids only here; the CA-portal panel resolves names in
+    a separate fetch to keep this helper cheap + free of the User
+    join."""
     return {
         "id": child.id,
         "parent_client_id": child.parent_client_id,
@@ -204,6 +208,8 @@ def _serialise_training(child: Client) -> dict:
         "training_started_at": child.training_started_at,
         "training_ends_at": child.training_ends_at,
         "training_status": child.training_status,
+        "training_expert_user_id": child.training_expert_user_id,
+        "training_dealer_user_id": child.training_dealer_user_id,
     }
 
 
@@ -778,3 +784,287 @@ async def invite_farmer_to_training(
         "assignment_id": assignment.id,
         "status": "Awaiting farmer approval",
     }
+
+
+# ── Session Roles — Training Expert + Training Dealer ──────────────────────
+#
+# Both are per-session assignment slots on the training-child row. Set +
+# cleared by the CA from the /training panel. Cleared implicitly on
+# session end via the existing hard-close cascade — no separate teardown.
+
+
+class _SessionRoleUserBody(BaseModel):
+    user_id: str
+
+
+class _SessionRolePhoneBody(BaseModel):
+    phone: str
+
+
+async def _load_active_training_child(
+    db: AsyncSession, parent_client_id: str,
+) -> Client:
+    """Fetch the parent's active training child or 404."""
+    await _load_parent_client(db, parent_client_id)
+    child = await _current_training_child(db, parent_client_id)
+    if child is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "no_active_training_session",
+                "message": "No training session is currently active for this client.",
+            },
+        )
+    return child
+
+
+def _normalise_phone(phone: str) -> str:
+    """Match the app's phone-key convention: +91 + last 10 digits."""
+    digits = "".join(c for c in (phone or "") if c.isdigit())
+    if len(digits) < 10:
+        return ""
+    return "+91" + digits[-10:]
+
+
+# ── Training Expert ─────────────────────────────────────────────────────
+
+@router.post("/client/{client_id}/training/expert")
+async def set_training_expert(
+    client_id: str,
+    body: _SessionRoleUserBody,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Mark one ACTIVE onboarded Primary Expert (Pundit) of the parent
+    as the go-to expert for this training session. All training-farmer
+    queries route directly to their device instead of the round-robin
+    queue while this is set.
+
+    Validation:
+      - Parent has an active training child (else 404 no_active_training_session).
+      - Target user is an ACTIVE onboarded PE of the parent (via
+        ClientPromoter with promoter_type='FARM_PUNDIT' and status='ACTIVE').
+
+    409 `not_active_primary_expert` if the target isn't currently active on
+    the parent's onboarded PE list.
+    """
+    await _assert_ca(db, current_user, client_id)
+    child = await _load_active_training_child(db, client_id)
+
+    pe_row = (await db.execute(
+        select(ClientPromoter).where(
+            ClientPromoter.client_id == child.parent_client_id,
+            ClientPromoter.user_id == body.user_id,
+            ClientPromoter.promoter_type == "FARM_PUNDIT",
+            ClientPromoter.status == "ACTIVE",
+        )
+    )).scalar_one_or_none()
+    if pe_row is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "not_active_primary_expert",
+                "message": (
+                    "This user is not an active Primary Expert onboarded by "
+                    "the parent client. Only currently-active PEs can be "
+                    "marked as the Training Expert."
+                ),
+            },
+        )
+
+    child.training_expert_user_id = body.user_id
+    await db.commit()
+    await db.refresh(child)
+    return _serialise_training(child)
+
+
+@router.delete("/client/{client_id}/training/expert")
+async def clear_training_expert(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Clear the Training Expert assignment; queries revert to today's
+    round-robin behaviour immediately."""
+    await _assert_ca(db, current_user, client_id)
+    child = await _load_active_training_child(db, client_id)
+    child.training_expert_user_id = None
+    await db.commit()
+    await db.refresh(child)
+    return _serialise_training(child)
+
+
+# ── Training Dealer ─────────────────────────────────────────────────────
+
+async def _validate_training_dealer_candidate(
+    db: AsyncSession, phone: str,
+) -> tuple[User, dict]:
+    """Look up a phone and validate it can be the Training Dealer.
+
+    Returns (user, info-dict). Info-dict carries the shape needed by
+    both the preflight /lookup-dealer endpoint and the POST — one
+    query path, two callers.
+
+    Raises HTTPException with a specific code on failure:
+      - `phone_not_registered` — no User for this phone.
+      - `dealer_profile_missing` — user hasn't set up their shop.
+      - `user_inactive` — user's DEALER role isn't ACTIVE.
+      - `already_onboarded` — user is in some ClientPromoter as DEALER.
+    """
+    from app.modules.orders.models import DealerProfile
+    from app.modules.platform.models import RoleType, UserRole
+
+    normalised = _normalise_phone(phone)
+    if not normalised:
+        raise HTTPException(status_code=422, detail="Enter a 10-digit phone number.")
+
+    user = (await db.execute(
+        select(User).where(User.phone == normalised)
+    )).scalar_one_or_none()
+    if user is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "phone_not_registered",
+                "message": "No RootsTalk account found for this phone.",
+            },
+        )
+
+    dealer_role = (await db.execute(
+        select(UserRole).where(
+            UserRole.user_id == user.id,
+            UserRole.role_type == RoleType.DEALER,
+        )
+    )).scalar_one_or_none()
+    if dealer_role is None or dealer_role.status != StatusEnum.ACTIVE:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "user_inactive",
+                "message": "This user isn't an active Dealer on RootsTalk.",
+            },
+        )
+
+    profile = (await db.execute(
+        select(DealerProfile).where(DealerProfile.user_id == user.id)
+    )).scalar_one_or_none()
+    if profile is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "dealer_profile_missing",
+                "message": (
+                    "This dealer hasn't set up their shop yet. Ask them to "
+                    "complete the shop profile in the PWA first."
+                ),
+            },
+        )
+
+    already = (await db.execute(
+        select(ClientPromoter).where(
+            ClientPromoter.user_id == user.id,
+            ClientPromoter.promoter_type == "DEALER",
+            ClientPromoter.status == "ACTIVE",
+        )
+    )).scalars().first()
+    if already is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "already_onboarded",
+                "message": (
+                    "This dealer is already onboarded by another client and "
+                    "can't be used as a Training Dealer. Pick a phone number "
+                    "that isn't onboarded anywhere on RootsTalk."
+                ),
+            },
+        )
+
+    return user, {
+        "user_id": user.id,
+        "name": user.name,
+        "phone": user.phone,
+        "shop_name": profile.shop_name,
+        "shop_address": profile.shop_address,
+    }
+
+
+@router.get("/client/{client_id}/training/lookup-dealer")
+async def lookup_training_dealer(
+    client_id: str,
+    phone: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CA preflight — validate a phone before committing it as the
+    Training Dealer. Returns the resolved user + shop metadata when
+    eligible; raises with a specific code otherwise so the CA sees
+    exactly why a candidate was rejected."""
+    await _assert_ca(db, current_user, client_id)
+    await _load_active_training_child(db, client_id)
+    _, info = await _validate_training_dealer_candidate(db, phone)
+    return info
+
+
+@router.post("/client/{client_id}/training/dealer")
+async def set_training_dealer(
+    client_id: str,
+    body: _SessionRolePhoneBody,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Mark one phone number as the Training Dealer for this session.
+    The user must satisfy every check in _validate_training_dealer_candidate."""
+    await _assert_ca(db, current_user, client_id)
+    child = await _load_active_training_child(db, client_id)
+    user, _ = await _validate_training_dealer_candidate(db, body.phone)
+    child.training_dealer_user_id = user.id
+    await db.commit()
+    await db.refresh(child)
+    return _serialise_training(child)
+
+
+@router.delete("/client/{client_id}/training/dealer")
+async def clear_training_dealer(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Clear the Training Dealer slot. Recipient picker reverts to
+    just the parent's onboarded dealers immediately."""
+    await _assert_ca(db, current_user, client_id)
+    child = await _load_active_training_child(db, client_id)
+    child.training_dealer_user_id = None
+    await db.commit()
+    await db.refresh(child)
+    return _serialise_training(child)
+
+
+# ── Onboarded PE lookup for the Training Expert dropdown ───────────────
+
+@router.get("/client/{client_id}/training/onboarded-experts")
+async def list_onboarded_primary_experts(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List the parent's currently-ACTIVE Primary Experts so the CA
+    can pick one for the Training Expert dropdown. Fed by the same
+    ClientPromoter table used by real query routing."""
+    await _assert_ca(db, current_user, client_id)
+    child = await _load_active_training_child(db, client_id)
+
+    rows = (await db.execute(
+        select(ClientPromoter, User)
+        .join(User, User.id == ClientPromoter.user_id)
+        .where(
+            ClientPromoter.client_id == child.parent_client_id,
+            ClientPromoter.promoter_type == "FARM_PUNDIT",
+            ClientPromoter.status == "ACTIVE",
+        )
+        .order_by(User.name)
+    )).all()
+    return [
+        {"user_id": u.id, "name": u.name, "phone": u.phone}
+        for _cp, u in rows
+    ]

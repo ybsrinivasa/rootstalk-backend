@@ -147,6 +147,17 @@ class Client(Base):
     training_status: Mapped[str] = mapped_column(
         String(20), nullable=True,
     )
+    # Optional session-scoped role assignments — only meaningful when
+    # is_training=True. Cleared implicitly when the training-child row
+    # is cascade-deleted on session end.
+    training_expert_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    training_dealer_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     # 2026-07-05 — QR Product Authentication: the Cosh
     # `input_manufacturers` cosh_id this client corresponds to. Set
     # by the SA at approval or via the edit modal — deterministic

@@ -1008,7 +1008,29 @@ async def submit_query(
     # so routing picks from the parent's Primary roster. The Query row
     # itself keeps request.client_id (training child) so it stays on
     # the Training pill + is cleaned up by the cascade sweep.
-    next_pundit = await _get_next_pundit_for_query(db, pundit_client_id, request.subscription_id)
+    #
+    # 2026-08-03 — Training Expert short-circuit. If the request comes
+    # from a training-child client AND the CA has designated a
+    # Training Expert for the session, the query lands directly on
+    # that PE's device — bypassing preference / Promoter-Pundit /
+    # round-robin. Only when unset does routing fall through to the
+    # usual queue behaviour. `_get_next_pundit_for_query` already
+    # returns a User, so we mirror that shape by fetching the target
+    # here.
+    from app.modules.clients.models import Client as _TrainingClient
+    next_pundit = None
+    training_child = (await db.execute(
+        select(_TrainingClient).where(
+            _TrainingClient.id == request.client_id,
+            _TrainingClient.is_training == True,  # noqa: E712
+        )
+    )).scalar_one_or_none()
+    if training_child is not None and training_child.training_expert_user_id:
+        next_pundit = (await db.execute(
+            select(User).where(User.id == training_child.training_expert_user_id)
+        )).scalar_one_or_none()
+    if next_pundit is None:
+        next_pundit = await _get_next_pundit_for_query(db, pundit_client_id, request.subscription_id)
     if next_pundit:
         query.current_holder_id = next_pundit.id
         db.add(QueryRemark(

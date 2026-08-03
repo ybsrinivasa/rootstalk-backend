@@ -6277,6 +6277,19 @@ async def nearby_dealers_for_farmer(
         )).scalars().all()
         onboarded_dealer_ids = set(onboarded_rows)
 
+    # Training Dealer widens the allow-list by one when the sub is on
+    # a training-child client. Pinned first in the sort below so the
+    # CA's demo target always surfaces regardless of distance.
+    training_dealer_user_id: Optional[str] = None
+    if sub.client_id != brand_lock_client_id and sub.client_id:
+        from app.modules.clients.models import Client as _Client
+        training_dealer_user_id = (await db.execute(
+            select(_Client.training_dealer_user_id)
+            .where(_Client.id == sub.client_id, _Client.is_training == True)  # noqa: E712
+        )).scalar_one_or_none()
+    if training_dealer_user_id and onboarded_dealer_ids is not None:
+        onboarded_dealer_ids = onboarded_dealer_ids | {training_dealer_user_id}
+
     profiles = (await db.execute(select(DealerProfile))).scalars().all()
     results = []
     for profile in profiles:
@@ -6299,11 +6312,19 @@ async def nearby_dealers_for_farmer(
                 "sell_categories": profile.sell_categories or [],
                 "distance_km": round(dist, 1),
                 "is_promoter": dealer.id == promoter_user_id,
+                "is_training_dealer": dealer.id == training_dealer_user_id,
                 "shop_gps_lat": float(profile.shop_gps_lat),
                 "shop_gps_lng": float(profile.shop_gps_lng),
             })
 
-    results.sort(key=lambda x: (0 if x["is_promoter"] else 1, x["distance_km"]))
+    # Training Dealer > Promoter > distance. Guarantees the CA's
+    # demo target and the sub's Promoter both surface even when
+    # further away than five other candidates.
+    results.sort(key=lambda x: (
+        0 if x.get("is_training_dealer") else 1,
+        0 if x["is_promoter"] else 1,
+        x["distance_km"],
+    ))
     return results[:5]
 
 

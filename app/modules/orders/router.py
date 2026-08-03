@@ -1945,12 +1945,20 @@ async def list_eligible_recipients(
     not ranking.
     """
     from app.services.training import resolve_package_client_id
+    from app.modules.clients.models import Client
     order = await _get_farmer_order(db, order_id, current_user.id)
     has_locked = await _order_has_locked_brand_items(db, order.id)
     # Training subs' order.client_id is the training-child id, which
     # holds no ClientPromoter rows — resolve to parent so the picker
     # surfaces the parent's onboarded promoters.
     effective_client_id = await resolve_package_client_id(db, order.client_id)
+    # Training Dealer (if any) lives on the training-child row.
+    training_dealer_user_id: str | None = None
+    if effective_client_id != order.client_id:
+        child = (await db.execute(
+            select(Client.training_dealer_user_id).where(Client.id == order.client_id)
+        )).scalar_one_or_none()
+        training_dealer_user_id = child
     return await _build_eligible_recipients_payload(
         db,
         current_user=current_user,
@@ -1959,6 +1967,7 @@ async def list_eligible_recipients(
         has_locked=has_locked,
         origin_lat=lat,
         origin_lng=lng,
+        training_dealer_user_id=training_dealer_user_id,
     )
 
 
@@ -1990,9 +1999,15 @@ async def list_eligible_recipients_for_new_order(
         raise HTTPException(status_code=404, detail="Subscription not found")
 
     from app.services.training import resolve_package_client_id
+    from app.modules.clients.models import Client
     pids = [p for p in (practice_ids or "").split(",") if p]
     has_locked = await _practice_ids_have_locked_brand(db, pids)
     effective_client_id = await resolve_package_client_id(db, sub.client_id)
+    training_dealer_user_id: str | None = None
+    if effective_client_id != sub.client_id:
+        training_dealer_user_id = (await db.execute(
+            select(Client.training_dealer_user_id).where(Client.id == sub.client_id)
+        )).scalar_one_or_none()
     return await _build_eligible_recipients_payload(
         db,
         current_user=current_user,
@@ -2001,6 +2016,7 @@ async def list_eligible_recipients_for_new_order(
         has_locked=has_locked,
         origin_lat=lat,
         origin_lng=lng,
+        training_dealer_user_id=training_dealer_user_id,
     )
 
 
@@ -9816,6 +9832,7 @@ async def _build_eligible_recipients_payload(
     has_locked: bool,
     origin_lat: float | None = None,
     origin_lng: float | None = None,
+    training_dealer_user_id: str | None = None,
 ) -> dict:
     """Shared core for both the order-based and new-order
     eligible-recipients endpoints. Returns the 5 nearest onboarded
@@ -9857,10 +9874,18 @@ async def _build_eligible_recipients_payload(
     onboarded_dealer_ids = {cp.user_id for cp in promoter_rows if cp.promoter_type == "DEALER"}
     onboarded_facilitator_ids = {cp.user_id for cp in promoter_rows if cp.promoter_type == "FACILITATOR"}
 
+    # Training Dealer folds into the same dealer id-set as the
+    # onboarded ones for the fetch below; the is_training_dealer flag
+    # is stamped when materialising each row so the PWA can render a
+    # "Training" chip. Licence-category check still applies.
+    dealer_ids_to_fetch = set(onboarded_dealer_ids)
+    if training_dealer_user_id:
+        dealer_ids_to_fetch.add(training_dealer_user_id)
+
     dealers: list[dict] = []
-    if onboarded_dealer_ids:
+    if dealer_ids_to_fetch:
         profiles = (await db.execute(
-            select(DealerProfile).where(DealerProfile.user_id.in_(onboarded_dealer_ids))
+            select(DealerProfile).where(DealerProfile.user_id.in_(dealer_ids_to_fetch))
         )).scalars().all()
         for profile in profiles:
             if required_plural and required_plural not in (profile.sell_categories or []):
@@ -9877,13 +9902,18 @@ async def _build_eligible_recipients_payload(
                 "name": dealer.name,
                 "phone": dealer.phone,
                 "shop_name": profile.shop_name,
+                "is_training_dealer": dealer.id == training_dealer_user_id,
                 "shop_address": profile.shop_address,
                 "sell_categories": profile.sell_categories or [],
                 "distance_km": round(dist, 1),
                 "shop_gps_lat": float(profile.shop_gps_lat),
                 "shop_gps_lng": float(profile.shop_gps_lng),
             })
-    dealers.sort(key=lambda x: x["distance_km"])
+    # Training Dealer pinned first so the CA's chosen demo target
+    # always shows regardless of its haversine distance (otherwise
+    # a distant demo-purpose dealer could get sliced off by the
+    # cap-5 tail).
+    dealers.sort(key=lambda x: (0 if x.get("is_training_dealer") else 1, x["distance_km"]))
 
     facilitators: list[dict] = []
     if onboarded_facilitator_ids:
