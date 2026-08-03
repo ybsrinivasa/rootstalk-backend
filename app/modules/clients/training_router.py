@@ -851,12 +851,20 @@ async def set_training_expert(
     await _assert_ca(db, current_user, client_id)
     child = await _load_active_training_child(db, client_id)
 
+    # Primary Experts live in ClientFarmPundit joined through
+    # FarmPunditProfile — NOT in ClientPromoter (which is
+    # DEALER/FACILITATOR only).
+    from app.modules.farmpundit.models import (
+        ClientFarmPundit, FarmPunditProfile, PunditRole,
+    )
     pe_row = (await db.execute(
-        select(ClientPromoter).where(
-            ClientPromoter.client_id == child.parent_client_id,
-            ClientPromoter.user_id == body.user_id,
-            ClientPromoter.promoter_type == "FARM_PUNDIT",
-            ClientPromoter.status == "ACTIVE",
+        select(ClientFarmPundit)
+        .join(FarmPunditProfile, FarmPunditProfile.id == ClientFarmPundit.pundit_id)
+        .where(
+            ClientFarmPundit.client_id == child.parent_client_id,
+            FarmPunditProfile.user_id == body.user_id,
+            ClientFarmPundit.role == PunditRole.PRIMARY,
+            ClientFarmPundit.status == "ACTIVE",
         )
     )).scalar_one_or_none()
     if pe_row is None:
@@ -1049,22 +1057,28 @@ async def list_onboarded_primary_experts(
     current_user: User = Depends(get_current_user),
 ):
     """List the parent's currently-ACTIVE Primary Experts so the CA
-    can pick one for the Training Expert dropdown. Fed by the same
-    ClientPromoter table used by real query routing."""
+    can pick one for the Training Expert dropdown. Same table that
+    real query routing reads from (ClientFarmPundit joined via
+    FarmPunditProfile) so the dropdown never surfaces someone who
+    couldn't have received a live query."""
+    from app.modules.farmpundit.models import (
+        ClientFarmPundit, FarmPunditProfile, PunditRole,
+    )
     await _assert_ca(db, current_user, client_id)
     child = await _load_active_training_child(db, client_id)
 
     rows = (await db.execute(
-        select(ClientPromoter, User)
-        .join(User, User.id == ClientPromoter.user_id)
+        select(User)
+        .join(FarmPunditProfile, FarmPunditProfile.user_id == User.id)
+        .join(ClientFarmPundit, ClientFarmPundit.pundit_id == FarmPunditProfile.id)
         .where(
-            ClientPromoter.client_id == child.parent_client_id,
-            ClientPromoter.promoter_type == "FARM_PUNDIT",
-            ClientPromoter.status == "ACTIVE",
+            ClientFarmPundit.client_id == child.parent_client_id,
+            ClientFarmPundit.role == PunditRole.PRIMARY,
+            ClientFarmPundit.status == "ACTIVE",
         )
         .order_by(User.name)
-    )).all()
+    )).scalars().all()
     return [
         {"user_id": u.id, "name": u.name, "phone": u.phone}
-        for _cp, u in rows
+        for u in rows
     ]
