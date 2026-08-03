@@ -1717,8 +1717,26 @@ async def toggle_portal_user_status(
     )).scalars().all()
     if not rows:
         raise HTTPException(status_code=404, detail="User not found")
+    # CA-exclusivity — CA rows are SA-managed only (rotation via
+    # client-edit / Manage CAs). Skip them here so a CA-portal toggle
+    # can never (a) accidentally re-activate a historical CA row and
+    # produce a dual-role state, or (b) deactivate the active CA from
+    # under SA's feet.
+    non_ca_rows = [cu for cu in rows if cu.role != ClientUserRole.CA]
+    if not non_ca_rows:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ca_role_status_sa_only",
+                "message": (
+                    "This user only holds the Company Admin role. CA "
+                    "activation / deactivation is managed by the Super "
+                    "Admin through the client-edit or Manage CAs flow."
+                ),
+            },
+        )
     target = StatusEnum.ACTIVE if new_status == "ACTIVE" else StatusEnum.INACTIVE
-    for cu in rows:
+    for cu in non_ca_rows:
         cu.status = target
         if target == StatusEnum.INACTIVE:
             cu.deactivated_at = utcnow()

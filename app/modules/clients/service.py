@@ -276,6 +276,47 @@ async def create_ca_user(db: AsyncSession, client: Client) -> tuple[User, str]:
     return user, plain_password
 
 
+async def _assert_ca_target_has_no_other_active_roles(
+    db: AsyncSession, client_id: str, target_user_id: str,
+) -> None:
+    """CA is exclusive per (client, user). Before activating a user as
+    CA — via SA rotation (email change) or SA reactivation of a past
+    CA row — refuse if they already hold any ACTIVE non-CA role at
+    this client. The user must first be deactivated from the other
+    role(s) via the CA portal (or a different user must be picked).
+
+    Raises HTTPException(409, ca_target_has_other_active_roles).
+
+    Mirror of the same guard baked into `add_portal_user`
+    (CA-portal invite flow) — this helper closes the SA-side gap.
+    """
+    from fastapi import HTTPException
+    other = (await db.execute(
+        select(ClientUser).where(
+            ClientUser.client_id == client_id,
+            ClientUser.user_id == target_user_id,
+            ClientUser.role != ClientUserRole.CA,
+            ClientUser.status == StatusEnum.ACTIVE,
+        )
+    )).scalars().all()
+    if not other:
+        return
+    role_names = sorted({r.role.value for r in other})
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": "ca_target_has_other_active_roles",
+            "message": (
+                "This user is currently active at this company as "
+                f"{', '.join(role_names)}. Company Admin is an exclusive "
+                "role — deactivate the other role(s) first (from the "
+                "Users page in the client portal), then rotate CA."
+            ),
+            "roles": role_names,
+        },
+    )
+
+
 async def rotate_ca_admin(
     db: AsyncSession, client: Client,
 ) -> tuple[bool, str | None, str | None]:
@@ -327,6 +368,9 @@ async def rotate_ca_admin(
     )).scalar_one_or_none()
 
     if existing_user is not None:
+        await _assert_ca_target_has_no_other_active_roles(
+            db, client.id, existing_user.id,
+        )
         # 2026-07-07 — Reactivation path. When the SA rotates back to
         # a previously-CA user (User1 → User2 → User1 again), the
         # (client_id, user_id, role=CA) triple already exists on the
@@ -408,6 +452,10 @@ async def activate_ca_by_client_user_id(
 
     if target.status == StatusEnum.ACTIVE:
         return target_user, target_user
+
+    await _assert_ca_target_has_no_other_active_roles(
+        db, client.id, target_user.id,
+    )
 
     current_ca = (await db.execute(
         select(ClientUser).where(
