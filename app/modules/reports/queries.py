@@ -1993,9 +1993,9 @@ async def sales_open_volume_by_dimension(
 ) -> list[dict]:
     """Open-Category volume grouped by dimension. Same NOT-EXISTS
     filter as the headline metric — Practices in this client's
-    Packages with is_brand_locked=False AND no BRAND_NAME element."""
-    from app.modules.advisory.models import Timeline
-
+    Packages with is_brand_locked=False AND no BRAND_NAME element.
+    Package is already joined via _dimension_base; do NOT re-join it
+    or Postgres 500s with DuplicateAliasError."""
     onboarded = await _onboarded_dealer_ids_for(db, client_id)
     if not onboarded:
         return []
@@ -2011,15 +2011,7 @@ async def sales_open_volume_by_dimension(
     )
     base = _sales_dimension_base(client_id, filters).join(
         Practice, Practice.id == OrderItem.practice_id,
-    ).join(
-        Timeline, Timeline.id == Practice.timeline_id,
-        # Package already joined via _dimension_base, but with the
-        # farmer's subscription-package linkage. For Open scope we
-        # need Practice's authoring Package, which is the same one
-        # (Practice.timeline → Timeline.package_id ↔ Subscription.package_id
-        # via join in _dimension_base). Postgres will fold the joins.
     ).where(
-        Package.client_id == client_id,
         Practice.is_brand_locked.is_(False),
         ~has_brand_name,
         Order.dealer_user_id.in_(onboarded),
@@ -2091,15 +2083,16 @@ async def sales_open_volume(
 
         {"litres": <float>, "kilograms": <float>, "numbers": <float>}
     """
-    from sqlalchemy import exists
-    from app.modules.advisory.models import Timeline
-
     onboarded = await _onboarded_dealer_ids_for(db, client_id)
     if not onboarded:
         return _empty_unit_buckets()
 
     # `has_brand_name` = correlated EXISTS on Element(BRAND_NAME) with
-    # a non-empty cosh_ref. NOT-EXISTS filters to Open practices.
+    # a non-empty cosh_ref. NOT-EXISTS filters to Open practices. No
+    # Timeline / Package re-join needed — the OrderItem's Practice is
+    # bound to the Subscription's Package (which is this client's
+    # Package by scope), so "in THIS client's Package" is naturally
+    # satisfied via _sales_scope + subscription-scoping.
     has_brand_name = (
         select(Element.id)
         .where(
@@ -2114,10 +2107,7 @@ async def sales_open_volume(
     stmt = (
         _sales_scope(client_id)
         .join(Practice, Practice.id == OrderItem.practice_id)
-        .join(Timeline, Timeline.id == Practice.timeline_id)
-        .join(Package, Package.id == Timeline.package_id)
         .where(
-            Package.client_id == client_id,
             Practice.is_brand_locked.is_(False),
             ~has_brand_name,
             Order.dealer_user_id.in_(onboarded),
