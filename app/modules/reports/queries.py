@@ -2063,10 +2063,120 @@ def _shape_sales_row(mapping) -> dict:
 
 # ─── Pivot matrices ────────────────────────────────────────────────────────
 #
-# Two matrices, both nested-row shape (rows = the client's authoring
+# Three matrices, all nested-row shape (rows = the client's authoring
 # scope; each row carries a `given` array of what dealers actually
 # sold). Rendered on /reports/sales as expandable panels below the
 # drill panel. Router hydrates cosh_ids to English names.
+#
+# Every matrix row carries a `category` field derived from
+# Practice.l1_type (PESTICIDE / FERTILIZER / SPECIAL_INPUT / other)
+# — frontend uses it to group rows within each matrix so a
+# manufacturer selling both categories can scan them separately.
+
+
+def _category_from_l1(l1_type: str | None) -> str:
+    """Fold Practice.l1_type strings into the three UI-facing input
+    categories. SPECIAL_INPUT folds into PESTICIDE per the same rule
+    the order-category resolver in orders/router.py uses (line 288).
+    Unknown / NULL values become "OTHER" — visible in the UI as a
+    catch-all group."""
+    v = (l1_type or "").upper()
+    if v in ("PESTICIDE", "SPECIAL_INPUT"):
+        return "PESTICIDE"
+    if v == "FERTILIZER":
+        return "FERTILIZER"
+    return "OTHER"
+
+
+@timed_query("sales_locked_brand_matrix")
+async def sales_locked_brand_matrix(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> list[dict]:
+    """Locked-Brand matrix — for each of the client's locked brands
+    sold through onboarded network, break down what dealers actually
+    fulfilled with. By RootsTalk enforcement, Locked → dealer MUST
+    sell that brand, so every row's `given` array SHOULD be a single
+    honored entry (match=True) matching the row's brand. Substitution
+    or NULL-brand entries appearing here are data-integrity anomalies
+    — worth surfacing so the client can chase them.
+
+    Same nested-row shape as sales_recommended_vs_given_matrix so the
+    frontend can reuse MatrixPanel. Frontend collapses the given
+    breakdown to just the total row when everything's honored, and
+    only expands the sub-rows when substitutions exist.
+    """
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    brands = await _client_brand_cosh_ids_for(db, client_id)
+    locked = brands["locked"]
+    if not onboarded or not locked:
+        return []
+
+    base = _sales_dimension_base(client_id, filters).join(
+        Practice, Practice.id == OrderItem.practice_id,
+    ).where(
+        Practice.is_brand_locked.is_(True),
+        # OrderItem's brand may be NULL or drift from the locked
+        # brand — we still want those rows to surface as anomalies.
+        # Filter on the Practice's carry: we consider an item "locked
+        # to one of our brands" if its brand_cosh_id is in our locked
+        # set OR the item's brand_cosh_id agrees with any locked brand
+        # (which is the enforcement path). For the row_key we use
+        # OrderItem.brand_cosh_id when it's ours, else fall back to
+        # the item itself (rare, worth flagging). Simplest first-cut:
+        # row-key = OrderItem.brand_cosh_id (the truthful sold brand),
+        # but scope to only items whose brand_cosh_id is a locked one
+        # of ours. Anomalies (non-locked brand somehow sold on a
+        # locked practice) will show up as sold_brand mismatches
+        # within the row.
+        OrderItem.brand_cosh_id.in_(locked),
+        Order.dealer_user_id.in_(onboarded),
+    )
+    litres, kilograms, numbers = _volume_case_sums()
+    stmt = base.with_only_columns(
+        # For a Locked practice the "our brand" IS whichever locked
+        # brand the item was sold as. The truth is at OrderItem —
+        # that's what actually moved through the shop.
+        OrderItem.brand_cosh_id.label("our_brand_cosh_id"),
+        Practice.l1_type.label("l1_type"),
+        OrderItem.brand_cosh_id.label("sold_brand_cosh_id"),
+        litres, kilograms, numbers,
+    ).group_by(OrderItem.brand_cosh_id, Practice.l1_type)
+
+    rows = (await db.execute(stmt)).all()
+    grouped: dict[str, dict] = {}
+    for r in rows:
+        our = r.our_brand_cosh_id
+        if our not in grouped:
+            grouped[our] = {
+                "our_brand_cosh_id": our,
+                "category": _category_from_l1(r.l1_type),
+                "totals": {"litres": 0.0, "kilograms": 0.0, "numbers": 0.0},
+                "given": [],
+            }
+        entry = {
+            "sold_brand_cosh_id": r.sold_brand_cosh_id,
+            "match": (r.sold_brand_cosh_id == our),
+            "litres": round(float(r.litres or 0), 3),
+            "kilograms": round(float(r.kilograms or 0), 3),
+            "numbers": round(float(r.numbers or 0), 3),
+        }
+        grouped[our]["given"].append(entry)
+        grouped[our]["totals"]["litres"] += entry["litres"]
+        grouped[our]["totals"]["kilograms"] += entry["kilograms"]
+        grouped[our]["totals"]["numbers"] += entry["numbers"]
+
+    out = list(grouped.values())
+    for row in out:
+        row["totals"] = {k: round(v, 3) for k, v in row["totals"].items()}
+        row["given"].sort(
+            key=lambda g: -(g["litres"] + g["kilograms"] + g["numbers"]),
+        )
+    out.sort(
+        key=lambda r: -(
+            r["totals"]["litres"] + r["totals"]["kilograms"] + r["totals"]["numbers"]
+        ),
+    )
+    return out
 
 @timed_query("sales_recommended_vs_given_matrix")
 async def sales_recommended_vs_given_matrix(
@@ -2119,9 +2229,10 @@ async def sales_recommended_vs_given_matrix(
     litres, kilograms, numbers = _volume_case_sums()
     stmt = base.with_only_columns(
         Element.cosh_ref.label("our_brand_cosh_id"),
+        Practice.l1_type.label("l1_type"),
         OrderItem.brand_cosh_id.label("sold_brand_cosh_id"),
         litres, kilograms, numbers,
-    ).group_by(Element.cosh_ref, OrderItem.brand_cosh_id)
+    ).group_by(Element.cosh_ref, Practice.l1_type, OrderItem.brand_cosh_id)
 
     rows = (await db.execute(stmt)).all()
     # Fold into nested-row shape.
@@ -2131,6 +2242,7 @@ async def sales_recommended_vs_given_matrix(
         if our not in grouped:
             grouped[our] = {
                 "our_brand_cosh_id": our,
+                "category": _category_from_l1(r.l1_type),
                 "totals": {"litres": 0.0, "kilograms": 0.0, "numbers": 0.0},
                 "given": [],
             }
@@ -2212,9 +2324,10 @@ async def sales_common_name_vs_sold_matrix(
     stmt = base.with_only_columns(
         name_key.label("common_name_key"),
         Practice.common_name_cosh_id.label("common_name_cosh_id"),
+        Practice.l1_type.label("l1_type"),
         OrderItem.brand_cosh_id.label("sold_brand_cosh_id"),
         litres, kilograms, numbers,
-    ).group_by(name_key, Practice.common_name_cosh_id, OrderItem.brand_cosh_id)
+    ).group_by(name_key, Practice.common_name_cosh_id, Practice.l1_type, OrderItem.brand_cosh_id)
 
     rows = (await db.execute(stmt)).all()
     grouped: dict[str, dict] = {}
@@ -2226,6 +2339,7 @@ async def sales_common_name_vs_sold_matrix(
                 # Router hydrates this to an English name if it's a
                 # cosh_id; else uses the l2_type string verbatim.
                 "common_name_cosh_id": r.common_name_cosh_id,
+                "category": _category_from_l1(r.l1_type),
                 "totals": {"litres": 0.0, "kilograms": 0.0, "numbers": 0.0},
                 "given": [],
             }

@@ -582,6 +582,52 @@ async def _brand_names_for(db: AsyncSession, cosh_ids: list[str]) -> dict[str, s
     return await _cosh_names(db, cosh_ids)
 
 
+@router.get("/client/{cid}/reports/sales/locked-matrix")
+async def sales_locked_matrix(
+    cid: str,
+    period_from: Optional[datetime] = None,
+    period_to: Optional[datetime] = None,
+    crop_cosh_id: Optional[str] = None,
+    state_cosh_id: Optional[str] = None,
+    district_cosh_id: Optional[str] = None,
+    package_id: Optional[str] = None,
+    dealer_user_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Locked-Brand matrix — per-brand sales through our onboarded
+    network. By enforcement, every row's `given` should be a single
+    honored entry; substitutions or NULL brands surfacing here are
+    data-integrity anomalies. Same nested-row + brand-name hydration
+    treatment as the recommended matrix."""
+    await _assert_client_report_reader(db, current_user, cid)
+    _assert_subject_enabled(cid, "sales")
+    filters = _build_filters(
+        period_from, period_to,
+        crop_cosh_id, state_cosh_id, district_cosh_id, package_id,
+        dealer_user_id=dealer_user_id,
+    )
+    rows = await queries.sales_locked_brand_matrix(db, cid, filters)
+
+    all_brand_ids: set[str] = set()
+    for r in rows:
+        if r["our_brand_cosh_id"]:
+            all_brand_ids.add(r["our_brand_cosh_id"])
+        for g in r["given"]:
+            if g.get("sold_brand_cosh_id"):
+                all_brand_ids.add(g["sold_brand_cosh_id"])
+    names = await _brand_names_for(db, list(all_brand_ids))
+
+    for r in rows:
+        r["our_brand_name"] = names.get(r["our_brand_cosh_id"]) or r["our_brand_cosh_id"] or "—"
+        for g in r["given"]:
+            if g.get("sold_brand_cosh_id"):
+                g["sold_brand_name"] = names.get(g["sold_brand_cosh_id"]) or g["sold_brand_cosh_id"]
+            else:
+                g["sold_brand_name"] = None
+    return {"rows": rows}
+
+
 @router.get("/client/{cid}/reports/sales/recommended-matrix")
 async def sales_recommended_matrix(
     cid: str,
