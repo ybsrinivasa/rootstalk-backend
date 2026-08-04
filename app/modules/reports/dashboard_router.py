@@ -121,86 +121,122 @@ async def _cosh_names(
 @router.get("/client/{cid}/reports/filter-options")
 async def filter_options(
     cid: str,
+    crop_cosh_id: Optional[str] = None,
+    state_cosh_id: Optional[str] = None,
+    district_cosh_id: Optional[str] = None,
+    package_id: Optional[str] = None,
+    dealer_user_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Options for the four filter chips on the Reports pages.
+    """Options for the five filter chips (Crop / State / District /
+    Package / Dealer) on the Reports pages.
 
-    One round-trip so the frontend can render every chip on first
-    paint. Values are:
+    **Cascading behaviour (added 2026-08-04).** When any chip filter is
+    passed as a query param, every OTHER chip's options are narrowed
+    to only values that are intersectable with the current selection.
+    E.g., ``crop_cosh_id=<tomato>`` → the states / districts / packages
+    / dealers lists shrink to only those with at least one row in the
+    intersection.
 
-    - ``crops``    — distinct Package.crop_cosh_id on this client's
-                     subscriptions, with English names.
-    - ``states``   — distinct farmer states seen on this client's
-                     subscriptions, with English names.
-    - ``districts``— same shape as states, at district resolution.
-    - ``packages`` — this client's ACTIVE + INACTIVE packages
-                     (DRAFT excluded — nothing subscribes to it).
+    A chip never narrows itself (else you couldn't unset an active
+    filter). The frontend refetches on every chip change and reconciles
+    any now-invalid selection with a "cleared — no data" toast.
 
-    All four queries reuse ``_subscription_scope(cid)`` so the pickers
-    inherit the filter contract (client scoping + training exclusion
-    + soft-delete cascade) automatically. That means the pickers can
-    never surface a value that has no matching data — a state that
-    only appears on training subs won't be pickable.
+    All queries build on ``_subscription_scope(cid)`` so the filter
+    contract (client scoping + training exclusion + soft-delete
+    cascade) is enforced at a single place.
     """
     await _assert_client_report_reader(db, current_user, cid)
 
-    scope = queries._subscription_scope(cid)
+    from app.modules.clients.models import ClientPromoter
+    from app.modules.orders.models import DealerProfile, Order
+
+    def scoped(exclude: str):
+        """Subscription-scoped base with Package + User pre-joined; adds
+        Order only when Dealer is either filtered or being computed. Then
+        applies every chip value EXCEPT the one named ``exclude``.
+
+        Every option-query starts from this so each chip's list is the
+        exact intersection of the OTHER chips."""
+        stmt = queries._subscription_scope(cid)
+        stmt = stmt.join(Package, Package.id == Subscription.package_id)
+        stmt = stmt.join(User, User.id == Subscription.farmer_user_id)
+        needs_order = (exclude != 'dealer' and dealer_user_id) or exclude == 'dealer'
+        if needs_order:
+            stmt = stmt.join(Order, Order.subscription_id == Subscription.id)
+        if exclude != 'crop' and crop_cosh_id:
+            stmt = stmt.where(Package.crop_cosh_id == crop_cosh_id)
+        if exclude != 'state' and state_cosh_id:
+            stmt = stmt.where(User.state_cosh_id == state_cosh_id)
+        if exclude != 'district' and district_cosh_id:
+            stmt = stmt.where(User.district_cosh_id == district_cosh_id)
+        if exclude != 'package' and package_id:
+            stmt = stmt.where(Subscription.package_id == package_id)
+        if exclude != 'dealer' and dealer_user_id:
+            stmt = stmt.where(Order.dealer_user_id == dealer_user_id)
+        return stmt
 
     crop_ids = [
         r[0] for r in (await db.execute(
-            scope.join(Package, Package.id == Subscription.package_id)
-                 .with_only_columns(Package.crop_cosh_id)
-                 .distinct()
+            scoped('crop').with_only_columns(Package.crop_cosh_id).distinct()
         )).all() if r[0]
     ]
     state_ids = [
         r[0] for r in (await db.execute(
-            scope.join(User, User.id == Subscription.farmer_user_id)
-                 .with_only_columns(User.state_cosh_id)
-                 .distinct()
+            scoped('state').with_only_columns(User.state_cosh_id).distinct()
         )).all() if r[0]
     ]
     district_ids = [
         r[0] for r in (await db.execute(
-            scope.join(User, User.id == Subscription.farmer_user_id)
-                 .with_only_columns(User.district_cosh_id)
-                 .distinct()
+            scoped('district').with_only_columns(User.district_cosh_id).distinct()
+        )).all() if r[0]
+    ]
+
+    # Packages — sub-scoped (only packages that have at least one sub
+    # under the current OTHER-chip filters). Pre-cascade this was a
+    # client-wide list including unsubscribed drafts.
+    package_ids = [
+        r[0] for r in (await db.execute(
+            scoped('package').with_only_columns(Subscription.package_id).distinct()
         )).all() if r[0]
     ]
     package_rows = (await db.execute(
         select(Package.id, Package.name).where(
-            Package.client_id == cid,
+            Package.id.in_(package_ids),
             Package.status != PackageStatus.DRAFT,
         ).order_by(Package.name)
-    )).all()
+    )).all() if package_ids else []
 
-    # Dealer chip (Phase 2 — Sales). Onboarded dealers only — the same
-    # set every Sales metric filters against. `shop_name || name` so a
-    # dealer without a shop-profile row still surfaces something
-    # sensible in the dropdown.
-    from app.modules.clients.models import ClientPromoter
-    from app.modules.orders.models import DealerProfile
+    # Dealers — the client's onboarded dealers, further narrowed to
+    # those who have received at least one order intersectable with
+    # the OTHER chips. Zero-order onboarded dealers drop from the list
+    # under any active filter (the pure-cascade behaviour). With no
+    # other chips set, still requires at least one order — the "onboarded
+    # but never used" case is not exposed as a chip option.
+    dealer_ids_with_orders = [
+        r[0] for r in (await db.execute(
+            scoped('dealer').with_only_columns(Order.dealer_user_id).distinct()
+        )).all() if r[0]
+    ]
+    onboarded_dealer_ids = {
+        r[0] for r in (await db.execute(
+            select(ClientPromoter.user_id).where(
+                ClientPromoter.client_id == cid,
+                ClientPromoter.promoter_type == "DEALER",
+                ClientPromoter.status == "ACTIVE",
+            )
+        )).all()
+    }
+    dealer_ids = [d for d in dealer_ids_with_orders if d in onboarded_dealer_ids]
     dealer_rows = (await db.execute(
-        select(
-            User.id,
-            User.name,
-            DealerProfile.shop_name,
-        )
-        .join(ClientPromoter, ClientPromoter.user_id == User.id)
+        select(User.id, User.name, DealerProfile.shop_name)
         .outerjoin(DealerProfile, DealerProfile.user_id == User.id)
-        .where(
-            ClientPromoter.client_id == cid,
-            ClientPromoter.promoter_type == "DEALER",
-            ClientPromoter.status == "ACTIVE",
-        )
-    )).all()
+        .where(User.id.in_(dealer_ids))
+    )).all() if dealer_ids else []
     dealers = sorted(
         [
-            {
-                "id": r.id,
-                "name": r.shop_name or r.name or "(unnamed)",
-            }
+            {"id": r.id, "name": r.shop_name or r.name or "(unnamed)"}
             for r in dealer_rows
         ],
         key=lambda o: o["name"].lower(),
