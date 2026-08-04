@@ -446,7 +446,7 @@ async def sales_report(
     metric: str = Query(
         ...,
         description=(
-            "LOCKED | RECOMMENDED_HONORED | RECOMMENDED_SUBSTITUTED | NETWORK_TOTAL"
+            "LOCKED | RECOMMENDED_HONORED | RECOMMENDED_SUBSTITUTED | OPEN | NETWORK_TOTAL"
         ),
     ),
     dimension: Optional[str] = Query(
@@ -491,6 +491,8 @@ async def sales_report(
             return await queries.sales_recommended_honored_volume(db, cid, filters)
         if metric_up == "RECOMMENDED_SUBSTITUTED":
             return await queries.sales_recommended_substituted_volume(db, cid, filters)
+        if metric_up == "OPEN":
+            return await queries.sales_open_volume(db, cid, filters)
         if metric_up == "NETWORK_TOTAL":
             return await queries.sales_network_total_volume(db, cid, filters)
         raise HTTPException(

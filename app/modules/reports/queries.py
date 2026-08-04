@@ -1814,3 +1814,63 @@ async def sales_network_total_volume(
     stmt = _apply_sales_filters(stmt, filters)
     rows = (await db.execute(stmt)).all()
     return _sum_into_buckets([(r[0], r[1]) for r in rows])
+
+
+@timed_query("sales_open_volume")
+async def sales_open_volume(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> dict:
+    """Volume of Open-Category items sold through our network.
+
+    Open = Practice.is_brand_locked = False AND no BRAND_NAME element
+    with a non-empty cosh_ref (dealer's free brand pick). Scope is
+    THIS client's Packages — Open items in OTHER clients' Packages
+    don't count as our sales even if they happen to flow through our
+    onboarded dealer.
+
+    Restricted to onboarded-dealer orders (network scope) — the "how
+    much of my Package's dealer-free-choice volume actually landed
+    through my shops" number. The full "which brands did dealers pick"
+    breakdown lives on the Common Name → Brand Sold pivot matrix
+    (drill-only, separate iteration).
+
+    Returns::
+
+        {"litres": <float>, "kilograms": <float>, "numbers": <float>}
+    """
+    from sqlalchemy import exists
+    from app.modules.advisory.models import Timeline
+
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    if not onboarded:
+        return _empty_unit_buckets()
+
+    # `has_brand_name` = correlated EXISTS on Element(BRAND_NAME) with
+    # a non-empty cosh_ref. NOT-EXISTS filters to Open practices.
+    has_brand_name = (
+        select(Element.id)
+        .where(
+            Element.practice_id == Practice.id,
+            Element.element_type == "BRAND_NAME",
+            Element.cosh_ref.isnot(None),
+            Element.cosh_ref != "",
+        )
+        .exists()
+    )
+
+    stmt = (
+        _sales_scope(client_id)
+        .join(Practice, Practice.id == OrderItem.practice_id)
+        .join(Timeline, Timeline.id == Practice.timeline_id)
+        .join(Package, Package.id == Timeline.package_id)
+        .where(
+            Package.client_id == client_id,
+            Practice.is_brand_locked.is_(False),
+            ~has_brand_name,
+            Order.dealer_user_id.in_(onboarded),
+        )
+        .with_only_columns(OrderItem.given_volume, OrderItem.volume_unit)
+    )
+    stmt = _apply_sales_filters(stmt, filters)
+    rows = (await db.execute(stmt)).all()
+    return _sum_into_buckets([(r[0], r[1]) for r in rows])
