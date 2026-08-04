@@ -503,17 +503,34 @@ async def sales_report(
             },
         )
 
-    # Dimension drills — all deferred until the by_dimension queries land.
-    raise HTTPException(
-        status_code=501,
-        detail={
-            "code": "dimension_not_implemented",
-            "message": (
-                f"Sales dimension drills are scheduled but not yet wired "
-                f"(metric={metric}, dimension={dimension})."
-            ),
-        },
-    )
+    dim_up = dimension.upper()
+    if dim_up not in {"CROP", "SPACE", "PACKAGE", "TIME", "DEALER"}:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "unknown_dimension",
+                "message": f"Unknown dimension '{dimension}'.",
+            },
+        )
+    if metric_up == "LOCKED":
+        rows = await queries.sales_locked_volume_by_dimension(db, cid, filters, dim_up)
+    elif metric_up == "RECOMMENDED_HONORED":
+        rows = await queries.sales_recommended_honored_volume_by_dimension(db, cid, filters, dim_up)
+    elif metric_up == "RECOMMENDED_SUBSTITUTED":
+        rows = await queries.sales_recommended_substituted_volume_by_dimension(db, cid, filters, dim_up)
+    elif metric_up == "OPEN":
+        rows = await queries.sales_open_volume_by_dimension(db, cid, filters, dim_up)
+    elif metric_up == "NETWORK_TOTAL":
+        rows = await queries.sales_network_total_volume_by_dimension(db, cid, filters, dim_up)
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "unknown_metric",
+                "message": f"Unknown sales metric '{metric}'.",
+            },
+        )
+    return await _hydrate_dimension_labels(db, rows, dim_up)
 
 
 async def _hydrate_dimension_labels(
@@ -521,7 +538,8 @@ async def _hydrate_dimension_labels(
 ) -> list[dict]:
     """Resolve cosh_id keys to English labels for CROP / SPACE rows.
     PACKAGE rows already carry ``package_name``; TIME rows carry
-    ISO datetimes that the frontend formats."""
+    ISO datetimes that the frontend formats. DEALER rows resolve the
+    user_id → shop_name (fallback to user.name) in one batch."""
     if dimension in {"CROP", "SPACE"}:
         keys = [r["key"] for r in rows if r.get("key")]
         names = await _cosh_names(db, keys) if keys else {}
@@ -536,6 +554,27 @@ async def _hydrate_dimension_labels(
         # normalise to isoformat here so the wire shape is stable.
         return [
             {**r, "label": r["key"].isoformat() if r.get("key") else "—"}
+            for r in rows
+        ]
+    if dimension == "DEALER":
+        from app.modules.orders.models import DealerProfile
+        dealer_ids = [r["key"] for r in rows if r.get("key")]
+        if not dealer_ids:
+            return [{**r, "label": r.get("key") or "—"} for r in rows]
+        dealer_rows = (await db.execute(
+            select(
+                User.id,
+                User.name,
+                DealerProfile.shop_name,
+            )
+            .outerjoin(DealerProfile, DealerProfile.user_id == User.id)
+            .where(User.id.in_(dealer_ids))
+        )).all()
+        names: dict[str, str] = {}
+        for r in dealer_rows:
+            names[r.id] = r.shop_name or r.name or r.id
+        return [
+            {**r, "label": names.get(r.get("key") or "", r.get("key") or "—")}
             for r in rows
         ]
     return rows

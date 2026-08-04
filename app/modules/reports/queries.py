@@ -966,6 +966,15 @@ def _group_by_dimension(
         stmt = base.with_only_columns(
             bucket_col, *extra_select,
         ).where(date_col.is_not(None)).group_by(bucket_col).order_by(bucket_col.asc())
+    elif dim == "DEALER":
+        # Phase 2 addition. Router hydrates the dealer_user_id → dealer
+        # display label (shop_name || user.name) so the response
+        # matches CROP/SPACE label shape.
+        stmt = base.with_only_columns(
+            Order.dealer_user_id.label("key"), *extra_select,
+        ).where(Order.dealer_user_id.is_not(None)).group_by(
+            Order.dealer_user_id,
+        ).order_by(primary_order_expr.desc())
     else:
         raise ValueError(f"Unknown dimension: {dimension!r}")
     return stmt
@@ -1814,6 +1823,250 @@ async def sales_network_total_volume(
     stmt = _apply_sales_filters(stmt, filters)
     rows = (await db.execute(stmt)).all()
     return _sum_into_buckets([(r[0], r[1]) for r in rows])
+
+
+def _volume_case_sums():
+    """Three CASE-based SUMs that split OrderItem.given_volume into
+    Litres / Kilograms / Numbers buckets, mirroring _normalize_volume's
+    fold rules. Used by dimension drills so aggregation happens SQL-side.
+
+    Kept in sync with _normalize_volume — update both when a new unit
+    string turns up in production data.
+    """
+    from sqlalchemy import case, cast, Numeric
+
+    u = func.upper(OrderItem.volume_unit)
+    zero = cast(0, Numeric)
+    litres_expr = case(
+        (u.in_(_LITRES_UNITS), OrderItem.given_volume),
+        (u.in_(_MILLILITRES_UNITS), OrderItem.given_volume / cast(1000, Numeric)),
+        else_=zero,
+    )
+    kg_expr = case(
+        (u.in_(_KILOGRAMS_UNITS), OrderItem.given_volume),
+        (u.in_(_GRAMS_UNITS), OrderItem.given_volume / cast(1000, Numeric)),
+        else_=zero,
+    )
+    numbers_expr = case(
+        (u.in_(_NUMBERS_UNITS), OrderItem.given_volume),
+        else_=zero,
+    )
+    return (
+        func.coalesce(func.sum(litres_expr), 0).label("litres"),
+        func.coalesce(func.sum(kg_expr), 0).label("kilograms"),
+        func.coalesce(func.sum(numbers_expr), 0).label("numbers"),
+    )
+
+
+def _sales_dimension_base(client_id: str, filters: ReportFilters) -> Select:
+    """Sales-specific dimension base. Extends _dimension_base with the
+    Order + OrderItem + PackingList joins, sale-marker filter, plus
+    the Dealer chip filter and the Sales-specific Period filter
+    (on PackingList.farmer_received_at, NOT Order.created_at)."""
+    base = _dimension_base(client_id, filters).join(
+        Order, Order.subscription_id == Subscription.id,
+    ).join(
+        OrderItem, OrderItem.order_id == Order.id,
+    ).join(
+        PackingList, PackingList.order_id == Order.id,
+    ).where(
+        Order.status.in_(ORDER_COUNTED_STATUSES),
+        OrderItem.status.notin_([OrderItemStatus.REMOVED, OrderItemStatus.REROUTED]),
+        PackingList.farmer_received_at.isnot(None),
+    )
+    if filters.dealer_user_id:
+        base = base.where(Order.dealer_user_id == filters.dealer_user_id)
+    if filters.period_from is not None:
+        base = base.where(PackingList.farmer_received_at >= filters.period_from)
+    if filters.period_to is not None:
+        base = base.where(PackingList.farmer_received_at < filters.period_to)
+    return base
+
+
+def _sales_primary_order_expr():
+    """Combined ordering hint for Sales dimensions. Ranks by the sum of
+    all three unit buckets — bit of an apples-to-oranges tally, but for
+    ordering-only purposes this puts the busiest dimension keys first
+    without needing per-unit tabs."""
+    from sqlalchemy import case, cast, Numeric
+    u = func.upper(OrderItem.volume_unit)
+    zero = cast(0, Numeric)
+    all_units = _LITRES_UNITS | _MILLILITRES_UNITS | _KILOGRAMS_UNITS | _GRAMS_UNITS | _NUMBERS_UNITS
+    return func.coalesce(
+        func.sum(case((u.in_(all_units), OrderItem.given_volume), else_=zero)),
+        0,
+    )
+
+
+@timed_query("sales_locked_volume_by_dimension")
+async def sales_locked_volume_by_dimension(
+    db: AsyncSession, client_id: str, filters: ReportFilters, dimension: str,
+) -> list[dict]:
+    """Group sales_locked_volume by CROP / SPACE / PACKAGE / TIME / DEALER."""
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    brands = await _client_brand_cosh_ids_for(db, client_id)
+    locked_brands = brands["locked"]
+    if not onboarded or not locked_brands:
+        return []
+    base = _sales_dimension_base(client_id, filters).join(
+        Practice, Practice.id == OrderItem.practice_id,
+    ).where(
+        Practice.is_brand_locked.is_(True),
+        OrderItem.brand_cosh_id.in_(locked_brands),
+        Order.dealer_user_id.in_(onboarded),
+    )
+    litres, kilograms, numbers = _volume_case_sums()
+    stmt = _group_by_dimension(
+        base, dimension, PackingList.farmer_received_at,
+        filters.period_from, filters.period_to,
+        extra_select=[litres, kilograms, numbers],
+        primary_order_expr=_sales_primary_order_expr(),
+    )
+    rows = (await db.execute(stmt)).all()
+    return [_shape_sales_row(r._mapping) for r in rows]
+
+
+@timed_query("sales_recommended_honored_volume_by_dimension")
+async def sales_recommended_honored_volume_by_dimension(
+    db: AsyncSession, client_id: str, filters: ReportFilters, dimension: str,
+) -> list[dict]:
+    """Recommended-Honored volume grouped by dimension. Same shape as
+    the headline metric but returns per-dimension rows. Restricted to
+    onboarded dealers (network scope) — outside-network volumes are
+    excluded here (the headline card carries them as a caption)."""
+    return await _sales_recommended_by_dimension(
+        db, client_id, filters, dimension, honored=True,
+    )
+
+
+@timed_query("sales_recommended_substituted_volume_by_dimension")
+async def sales_recommended_substituted_volume_by_dimension(
+    db: AsyncSession, client_id: str, filters: ReportFilters, dimension: str,
+) -> list[dict]:
+    """Recommended-Substituted volume grouped by dimension. Restricted
+    to onboarded dealers."""
+    return await _sales_recommended_by_dimension(
+        db, client_id, filters, dimension, honored=False,
+    )
+
+
+async def _sales_recommended_by_dimension(
+    db: AsyncSession, client_id: str, filters: ReportFilters, dimension: str,
+    *, honored: bool,
+) -> list[dict]:
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    brands = await _client_brand_cosh_ids_for(db, client_id)
+    recommended = brands["recommended"]
+    if not onboarded or not recommended:
+        return []
+    base = _sales_dimension_base(client_id, filters).join(
+        Practice, Practice.id == OrderItem.practice_id,
+    ).join(
+        Element, Element.practice_id == Practice.id,
+    ).where(
+        Practice.is_brand_locked.is_(False),
+        Element.element_type == "BRAND_NAME",
+        Element.cosh_ref.in_(recommended),
+        Order.dealer_user_id.in_(onboarded),
+    )
+    if honored:
+        base = base.where(OrderItem.brand_cosh_id == Element.cosh_ref)
+    else:
+        base = base.where(
+            OrderItem.brand_cosh_id.isnot(None),
+            OrderItem.brand_cosh_id != Element.cosh_ref,
+        )
+    litres, kilograms, numbers = _volume_case_sums()
+    stmt = _group_by_dimension(
+        base, dimension, PackingList.farmer_received_at,
+        filters.period_from, filters.period_to,
+        extra_select=[litres, kilograms, numbers],
+        primary_order_expr=_sales_primary_order_expr(),
+    )
+    rows = (await db.execute(stmt)).all()
+    return [_shape_sales_row(r._mapping) for r in rows]
+
+
+@timed_query("sales_open_volume_by_dimension")
+async def sales_open_volume_by_dimension(
+    db: AsyncSession, client_id: str, filters: ReportFilters, dimension: str,
+) -> list[dict]:
+    """Open-Category volume grouped by dimension. Same NOT-EXISTS
+    filter as the headline metric — Practices in this client's
+    Packages with is_brand_locked=False AND no BRAND_NAME element."""
+    from app.modules.advisory.models import Timeline
+
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    if not onboarded:
+        return []
+    has_brand_name = (
+        select(Element.id)
+        .where(
+            Element.practice_id == Practice.id,
+            Element.element_type == "BRAND_NAME",
+            Element.cosh_ref.isnot(None),
+            Element.cosh_ref != "",
+        )
+        .exists()
+    )
+    base = _sales_dimension_base(client_id, filters).join(
+        Practice, Practice.id == OrderItem.practice_id,
+    ).join(
+        Timeline, Timeline.id == Practice.timeline_id,
+        # Package already joined via _dimension_base, but with the
+        # farmer's subscription-package linkage. For Open scope we
+        # need Practice's authoring Package, which is the same one
+        # (Practice.timeline → Timeline.package_id ↔ Subscription.package_id
+        # via join in _dimension_base). Postgres will fold the joins.
+    ).where(
+        Package.client_id == client_id,
+        Practice.is_brand_locked.is_(False),
+        ~has_brand_name,
+        Order.dealer_user_id.in_(onboarded),
+    )
+    litres, kilograms, numbers = _volume_case_sums()
+    stmt = _group_by_dimension(
+        base, dimension, PackingList.farmer_received_at,
+        filters.period_from, filters.period_to,
+        extra_select=[litres, kilograms, numbers],
+        primary_order_expr=_sales_primary_order_expr(),
+    )
+    rows = (await db.execute(stmt)).all()
+    return [_shape_sales_row(r._mapping) for r in rows]
+
+
+@timed_query("sales_network_total_volume_by_dimension")
+async def sales_network_total_volume_by_dimension(
+    db: AsyncSession, client_id: str, filters: ReportFilters, dimension: str,
+) -> list[dict]:
+    """Network-Total volume grouped by dimension. Everything sold by
+    onboarded dealers, regardless of brand or authoring intent."""
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    if not onboarded:
+        return []
+    base = _sales_dimension_base(client_id, filters).where(
+        Order.dealer_user_id.in_(onboarded),
+    )
+    litres, kilograms, numbers = _volume_case_sums()
+    stmt = _group_by_dimension(
+        base, dimension, PackingList.farmer_received_at,
+        filters.period_from, filters.period_to,
+        extra_select=[litres, kilograms, numbers],
+        primary_order_expr=_sales_primary_order_expr(),
+    )
+    rows = (await db.execute(stmt)).all()
+    return [_shape_sales_row(r._mapping) for r in rows]
+
+
+def _shape_sales_row(mapping) -> dict:
+    """Round volume buckets to 3 decimals (mirrors _sum_into_buckets)
+    and cast anything the driver returns as Decimal → float so JSON
+    serialisation stays clean."""
+    out = dict(mapping)
+    for k in ("litres", "kilograms", "numbers"):
+        if k in out and out[k] is not None:
+            out[k] = round(float(out[k]), 3)
+    return out
 
 
 @timed_query("sales_open_volume")
