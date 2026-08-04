@@ -175,6 +175,37 @@ async def filter_options(
         ).order_by(Package.name)
     )).all()
 
+    # Dealer chip (Phase 2 — Sales). Onboarded dealers only — the same
+    # set every Sales metric filters against. `shop_name || name` so a
+    # dealer without a shop-profile row still surfaces something
+    # sensible in the dropdown.
+    from app.modules.clients.models import ClientPromoter
+    from app.modules.orders.models import DealerProfile
+    dealer_rows = (await db.execute(
+        select(
+            User.id,
+            User.name,
+            DealerProfile.shop_name,
+        )
+        .join(ClientPromoter, ClientPromoter.user_id == User.id)
+        .outerjoin(DealerProfile, DealerProfile.user_id == User.id)
+        .where(
+            ClientPromoter.client_id == cid,
+            ClientPromoter.promoter_type == "DEALER",
+            ClientPromoter.status == "ACTIVE",
+        )
+    )).all()
+    dealers = sorted(
+        [
+            {
+                "id": r.id,
+                "name": r.shop_name or r.name or "(unnamed)",
+            }
+            for r in dealer_rows
+        ],
+        key=lambda o: o["name"].lower(),
+    )
+
     cosh_names = await _cosh_names(db, crop_ids + state_ids + district_ids)
 
     def _pack(ids: list[str]) -> list[dict]:
@@ -188,6 +219,7 @@ async def filter_options(
         "states":    _pack(state_ids),
         "districts": _pack(district_ids),
         "packages":  [{"id": p.id, "name": p.name} for p in package_rows],
+        "dealers":   dealers,
     }
 
 
