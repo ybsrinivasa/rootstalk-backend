@@ -2088,6 +2088,319 @@ def _category_from_l1(l1_type: str | None) -> str:
     return "OTHER"
 
 
+# ─── Seeds sales path ─────────────────────────────────────────────────────
+#
+# Seeds live in `seed_orders_full`, NOT `order_items`, so every sales
+# query needs a parallel branch here. Sale marker: SeedOrderStatus.PURCHASED
+# (the dealer's /handover flip is terminal); "when" is
+# SeedOrderFull.updated_at since there's no dedicated purchased_at
+# column. The three-way brand-authoring model (Locked / Recommended /
+# Open) doesn't apply — a seed order names a specific variety and
+# there's no dealer substitution mechanism. So seeds contribute to:
+#   - LOCKED headline + Locked matrix (rows tagged category=SEED)
+#   - NETWORK_TOTAL headline
+#   - The three dimension drills for both metrics
+# Seeds skip the Recommended / Open metrics + matrices entirely.
+#
+# "Our variety" for a client = SeedVariety.client_id == cid (varieties
+# are directly client-owned; no Cosh/Portfolio detour).
+
+
+def _seed_sales_base(client_id: str, filters: ReportFilters) -> Select:
+    """Base select for seeds: purchased seed orders on this client's
+    subs, sold through onboarded dealers. Same subscription-scoping
+    contract as _sales_scope (client + is_training + soft-delete
+    cascade via SQLAlchemy listener); adds seed-specific joins."""
+    from app.modules.seed_mgmt.models import SeedOrderFull, SeedVariety
+    base = (
+        _subscription_scope(client_id)
+        .join(SeedOrderFull, SeedOrderFull.subscription_id == Subscription.id)
+        .join(SeedVariety, SeedVariety.id == SeedOrderFull.variety_id)
+        .where(SeedOrderFull.status == "PURCHASED")
+    )
+    if filters.dealer_user_id:
+        base = base.where(SeedOrderFull.dealer_user_id == filters.dealer_user_id)
+    if filters.period_from is not None:
+        base = base.where(SeedOrderFull.updated_at >= filters.period_from)
+    if filters.period_to is not None:
+        base = base.where(SeedOrderFull.updated_at < filters.period_to)
+    return base
+
+
+def _apply_seed_chip_filters(stmt: Select, filters: ReportFilters) -> Select:
+    """Chip filters for seed sales — Crop/State/District/Package
+    (Dealer + Period baked into _seed_sales_base). Needs the same
+    Package / User conditional joins as _apply_filters, but on the
+    seed side."""
+    if filters.crop_cosh_id:
+        stmt = stmt.join(Package, Package.id == Subscription.package_id).where(
+            Package.crop_cosh_id == filters.crop_cosh_id,
+        )
+    if filters.state_cosh_id or filters.district_cosh_id:
+        stmt = stmt.join(User, User.id == Subscription.farmer_user_id)
+        if filters.state_cosh_id:
+            stmt = stmt.where(User.state_cosh_id == filters.state_cosh_id)
+        if filters.district_cosh_id:
+            stmt = stmt.where(User.district_cosh_id == filters.district_cosh_id)
+    if filters.package_id:
+        stmt = stmt.where(Subscription.package_id == filters.package_id)
+    return stmt
+
+
+def _seed_dimension_base(client_id: str, filters: ReportFilters) -> Select:
+    """Deterministic-joins variant of _seed_sales_base — Package + User
+    always joined so dimension GROUP BYs can reference their columns.
+    Mirrors _sales_dimension_base for the seed path."""
+    from app.modules.seed_mgmt.models import SeedOrderFull, SeedVariety
+    base = (
+        _subscription_scope(client_id)
+        .join(Package, Package.id == Subscription.package_id)
+        .join(User, User.id == Subscription.farmer_user_id)
+        .join(SeedOrderFull, SeedOrderFull.subscription_id == Subscription.id)
+        .join(SeedVariety, SeedVariety.id == SeedOrderFull.variety_id)
+        .where(SeedOrderFull.status == "PURCHASED")
+    )
+    if filters.crop_cosh_id:
+        base = base.where(Package.crop_cosh_id == filters.crop_cosh_id)
+    if filters.state_cosh_id:
+        base = base.where(User.state_cosh_id == filters.state_cosh_id)
+    if filters.district_cosh_id:
+        base = base.where(User.district_cosh_id == filters.district_cosh_id)
+    if filters.package_id:
+        base = base.where(Subscription.package_id == filters.package_id)
+    if filters.dealer_user_id:
+        base = base.where(SeedOrderFull.dealer_user_id == filters.dealer_user_id)
+    if filters.period_from is not None:
+        base = base.where(SeedOrderFull.updated_at >= filters.period_from)
+    if filters.period_to is not None:
+        base = base.where(SeedOrderFull.updated_at < filters.period_to)
+    return base
+
+
+def _seed_volume_case_sums():
+    """Three CASE-based SUMs for seed volumes. Uses SeedOrderFull.unit
+    (KG / GM / PACKETS / NOS / …) which folds through the same three
+    unit buckets as OrderItem.volume_unit — same _LITRES_UNITS etc.
+    sets, same rules."""
+    from sqlalchemy import case, cast, Numeric
+    from app.modules.seed_mgmt.models import SeedOrderFull
+    u = func.upper(SeedOrderFull.unit)
+    zero = cast(0, Numeric)
+    litres_expr = case(
+        (u.in_(_LITRES_UNITS), SeedOrderFull.quantity),
+        (u.in_(_MILLILITRES_UNITS), SeedOrderFull.quantity / cast(1000, Numeric)),
+        else_=zero,
+    )
+    kg_expr = case(
+        (u.in_(_KILOGRAMS_UNITS), SeedOrderFull.quantity),
+        (u.in_(_GRAMS_UNITS), SeedOrderFull.quantity / cast(1000, Numeric)),
+        else_=zero,
+    )
+    numbers_expr = case(
+        (u.in_(_NUMBERS_UNITS), SeedOrderFull.quantity),
+        else_=zero,
+    )
+    return (
+        func.coalesce(func.sum(litres_expr), 0).label("litres"),
+        func.coalesce(func.sum(kg_expr), 0).label("kilograms"),
+        func.coalesce(func.sum(numbers_expr), 0).label("numbers"),
+    )
+
+
+async def sales_seed_locked_volume(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> dict:
+    """Seed sales where the variety is owned by this client
+    (variety.client_id == cid), sold through onboarded dealers.
+    Volume in three unit buckets."""
+    from app.modules.seed_mgmt.models import SeedOrderFull, SeedVariety
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    if not onboarded:
+        return _empty_unit_buckets()
+    stmt = (
+        _seed_sales_base(client_id, filters)
+        .where(
+            SeedVariety.client_id == client_id,
+            SeedOrderFull.dealer_user_id.in_(onboarded),
+        )
+        .with_only_columns(SeedOrderFull.quantity, SeedOrderFull.unit)
+    )
+    stmt = _apply_seed_chip_filters(stmt, filters)
+    rows = (await db.execute(stmt)).all()
+    return _sum_into_buckets([(r[0], r[1]) for r in rows])
+
+
+async def sales_seed_network_total_volume(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> dict:
+    """All seed sales through this client's onboarded dealers,
+    regardless of variety ownership. Complements the pesticide/
+    fertilizer NETWORK_TOTAL so the headline sums honestly."""
+    from app.modules.seed_mgmt.models import SeedOrderFull
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    if not onboarded:
+        return _empty_unit_buckets()
+    stmt = (
+        _seed_sales_base(client_id, filters)
+        .where(SeedOrderFull.dealer_user_id.in_(onboarded))
+        .with_only_columns(SeedOrderFull.quantity, SeedOrderFull.unit)
+    )
+    stmt = _apply_seed_chip_filters(stmt, filters)
+    rows = (await db.execute(stmt)).all()
+    return _sum_into_buckets([(r[0], r[1]) for r in rows])
+
+
+async def sales_seed_locked_matrix(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> list[dict]:
+    """Per-variety Locked matrix rows for seeds. category=SEED. Since
+    seed variety orders don't have brand substitution, each row's
+    `given` array is a single self-match entry (variety = variety).
+    Frontend's collapseWhenAllHonored skips the sub-row breakdown and
+    shows just the per-variety total. Row shape matches the pesticide
+    Locked matrix so the frontend consumes both identically."""
+    from app.modules.seed_mgmt.models import SeedOrderFull, SeedVariety
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    if not onboarded:
+        return []
+    base = (
+        _seed_dimension_base(client_id, filters)
+        .where(
+            SeedVariety.client_id == client_id,
+            SeedOrderFull.dealer_user_id.in_(onboarded),
+        )
+    )
+    litres, kilograms, numbers = _seed_volume_case_sums()
+    stmt = base.with_only_columns(
+        SeedVariety.id.label("variety_id"),
+        SeedVariety.name.label("variety_name"),
+        litres, kilograms, numbers,
+    ).group_by(SeedVariety.id, SeedVariety.name)
+
+    rows = (await db.execute(stmt)).all()
+    out = []
+    for r in rows:
+        totals = {
+            "litres": round(float(r.litres or 0), 3),
+            "kilograms": round(float(r.kilograms or 0), 3),
+            "numbers": round(float(r.numbers or 0), 3),
+        }
+        out.append({
+            # Reuse the matrix schema: variety_id ↔ our_brand_cosh_id
+            # slot, variety_name ↔ our_brand_name so the router doesn't
+            # need a seed-specific hydration path.
+            "our_brand_cosh_id": r.variety_id,
+            "our_brand_name": r.variety_name,
+            "category": "SEED",
+            "totals": totals,
+            "given": [{
+                "sold_brand_cosh_id": r.variety_id,
+                "sold_brand_name": r.variety_name,
+                "match": True,
+                **totals,
+            }],
+        })
+    out.sort(
+        key=lambda r: -(
+            r["totals"]["litres"] + r["totals"]["kilograms"] + r["totals"]["numbers"]
+        ),
+    )
+    return out
+
+
+async def sales_seed_by_dimension(
+    db: AsyncSession, client_id: str, filters: ReportFilters, dimension: str,
+    *, locked_only: bool,
+) -> list[dict]:
+    """Seed contribution to Locked or Network-Total by-dimension
+    drills. locked_only=True filters to variety.client_id == cid;
+    False includes every purchased seed order through our onboarded
+    dealers regardless of variety ownership.
+
+    Row shape matches the pesticide/fertilizer variants: {key,
+    litres, kilograms, numbers} plus dimension-specific extras that
+    the router hydrates."""
+    from app.modules.seed_mgmt.models import SeedOrderFull, SeedVariety
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    if not onboarded:
+        return []
+    base = _seed_dimension_base(client_id, filters).where(
+        SeedOrderFull.dealer_user_id.in_(onboarded),
+    )
+    if locked_only:
+        base = base.where(SeedVariety.client_id == client_id)
+    litres, kilograms, numbers = _seed_volume_case_sums()
+
+    dim = dimension.upper()
+    if dim == "CROP":
+        stmt = base.with_only_columns(
+            Package.crop_cosh_id.label("key"), litres, kilograms, numbers,
+        ).group_by(Package.crop_cosh_id)
+    elif dim == "SPACE":
+        stmt = base.with_only_columns(
+            User.state_cosh_id.label("key"), litres, kilograms, numbers,
+        ).group_by(User.state_cosh_id)
+    elif dim == "PACKAGE":
+        stmt = base.with_only_columns(
+            Subscription.package_id.label("key"),
+            Package.name.label("package_name"),
+            litres, kilograms, numbers,
+        ).group_by(Subscription.package_id, Package.name)
+    elif dim == "DEALER":
+        stmt = base.with_only_columns(
+            SeedOrderFull.dealer_user_id.label("key"), litres, kilograms, numbers,
+        ).where(SeedOrderFull.dealer_user_id.is_not(None)).group_by(
+            SeedOrderFull.dealer_user_id,
+        )
+    elif dim == "TIME":
+        bucket = _pick_time_bucket(filters.period_from, filters.period_to)
+        bucket_col = func.date_trunc(bucket, SeedOrderFull.updated_at).label("key")
+        stmt = base.with_only_columns(
+            bucket_col, litres, kilograms, numbers,
+        ).group_by(bucket_col)
+    else:
+        return []
+    rows = (await db.execute(stmt)).all()
+    return [_shape_sales_row(r._mapping) for r in rows]
+
+
+def _merge_volume_buckets(a: dict, b: dict) -> dict:
+    """Sum two three-unit dicts. Used at endpoint layer to combine
+    pesticide/fertilizer + seed volumes into a single headline number."""
+    return {
+        "litres": round(a.get("litres", 0) + b.get("litres", 0), 3),
+        "kilograms": round(a.get("kilograms", 0) + b.get("kilograms", 0), 3),
+        "numbers": round(a.get("numbers", 0) + b.get("numbers", 0), 3),
+    }
+
+
+def _merge_dimension_rows(a: list[dict], b: list[dict]) -> list[dict]:
+    """Union two by-dimension row lists on the `key` field, summing
+    the three unit buckets. Non-volume fields (package_name, etc.)
+    preserved from whichever side had them first."""
+    merged: dict = {}
+    for src in (a, b):
+        for r in src:
+            key = r.get("key")
+            if key not in merged:
+                merged[key] = {**r}
+                for k in ("litres", "kilograms", "numbers"):
+                    merged[key][k] = float(r.get(k, 0) or 0)
+            else:
+                for k in ("litres", "kilograms", "numbers"):
+                    merged[key][k] += float(r.get(k, 0) or 0)
+                for extra in ("package_name",):
+                    if extra in r and extra not in merged[key]:
+                        merged[key][extra] = r[extra]
+    for r in merged.values():
+        for k in ("litres", "kilograms", "numbers"):
+            r[k] = round(r[k], 3)
+    return sorted(
+        merged.values(),
+        key=lambda r: -(r.get("litres", 0) + r.get("kilograms", 0) + r.get("numbers", 0)),
+    )
+
+
 @timed_query("sales_locked_brand_matrix")
 async def sales_locked_brand_matrix(
     db: AsyncSession, client_id: str, filters: ReportFilters,

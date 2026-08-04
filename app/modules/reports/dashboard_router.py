@@ -214,11 +214,37 @@ async def filter_options(
     # under any active filter (the pure-cascade behaviour). With no
     # other chips set, still requires at least one order — the "onboarded
     # but never used" case is not exposed as a chip option.
-    dealer_ids_with_orders = [
+    #
+    # Seeds path — seed orders live in seed_orders_full, not orders.
+    # Union both so a client whose network only handles seeds still
+    # sees dealer options.
+    from app.modules.seed_mgmt.models import SeedOrderFull as _SOF
+    dealer_ids_with_pf_orders = {
         r[0] for r in (await db.execute(
             scoped('dealer').with_only_columns(Order.dealer_user_id).distinct()
         )).all() if r[0]
-    ]
+    }
+    # Rebuild a seed-scoped query similar shape to scoped('dealer'),
+    # applying the same OTHER-chip filters.
+    seed_scope = queries._subscription_scope(cid)
+    seed_scope = seed_scope.join(_SOF, _SOF.subscription_id == Subscription.id)
+    seed_scope = seed_scope.join(Package, Package.id == Subscription.package_id)
+    seed_scope = seed_scope.join(User, User.id == Subscription.farmer_user_id)
+    seed_scope = seed_scope.where(_SOF.status == "PURCHASED")
+    if crop_cosh_id:
+        seed_scope = seed_scope.where(Package.crop_cosh_id == crop_cosh_id)
+    if state_cosh_id:
+        seed_scope = seed_scope.where(User.state_cosh_id == state_cosh_id)
+    if district_cosh_id:
+        seed_scope = seed_scope.where(User.district_cosh_id == district_cosh_id)
+    if package_id:
+        seed_scope = seed_scope.where(Subscription.package_id == package_id)
+    dealer_ids_with_seed_orders = {
+        r[0] for r in (await db.execute(
+            seed_scope.with_only_columns(_SOF.dealer_user_id).distinct()
+        )).all() if r[0]
+    }
+    dealer_ids_with_orders = list(dealer_ids_with_pf_orders | dealer_ids_with_seed_orders)
     onboarded_dealer_ids = {
         r[0] for r in (await db.execute(
             select(ClientPromoter.user_id).where(
@@ -522,7 +548,12 @@ async def sales_report(
 
     if dimension is None:
         if metric_up == "LOCKED":
-            return await queries.sales_locked_volume(db, cid, filters)
+            # Combined = pesticide/fertilizer locked + seed locked.
+            # Seeds path adds seed variety volumes onto the same three
+            # unit buckets.
+            pf = await queries.sales_locked_volume(db, cid, filters)
+            seed = await queries.sales_seed_locked_volume(db, cid, filters)
+            return queries._merge_volume_buckets(pf, seed)
         if metric_up == "RECOMMENDED_HONORED":
             return await queries.sales_recommended_honored_volume(db, cid, filters)
         if metric_up == "RECOMMENDED_SUBSTITUTED":
@@ -530,7 +561,9 @@ async def sales_report(
         if metric_up == "OPEN":
             return await queries.sales_open_volume(db, cid, filters)
         if metric_up == "NETWORK_TOTAL":
-            return await queries.sales_network_total_volume(db, cid, filters)
+            pf = await queries.sales_network_total_volume(db, cid, filters)
+            seed = await queries.sales_seed_network_total_volume(db, cid, filters)
+            return queries._merge_volume_buckets(pf, seed)
         raise HTTPException(
             status_code=422,
             detail={
@@ -549,7 +582,11 @@ async def sales_report(
             },
         )
     if metric_up == "LOCKED":
-        rows = await queries.sales_locked_volume_by_dimension(db, cid, filters, dim_up)
+        pf = await queries.sales_locked_volume_by_dimension(db, cid, filters, dim_up)
+        seed = await queries.sales_seed_by_dimension(
+            db, cid, filters, dim_up, locked_only=True,
+        )
+        rows = queries._merge_dimension_rows(pf, seed)
     elif metric_up == "RECOMMENDED_HONORED":
         rows = await queries.sales_recommended_honored_volume_by_dimension(db, cid, filters, dim_up)
     elif metric_up == "RECOMMENDED_SUBSTITUTED":
@@ -557,7 +594,11 @@ async def sales_report(
     elif metric_up == "OPEN":
         rows = await queries.sales_open_volume_by_dimension(db, cid, filters, dim_up)
     elif metric_up == "NETWORK_TOTAL":
-        rows = await queries.sales_network_total_volume_by_dimension(db, cid, filters, dim_up)
+        pf = await queries.sales_network_total_volume_by_dimension(db, cid, filters, dim_up)
+        seed = await queries.sales_seed_by_dimension(
+            db, cid, filters, dim_up, locked_only=False,
+        )
+        rows = queries._merge_dimension_rows(pf, seed)
     else:
         raise HTTPException(
             status_code=422,
@@ -607,10 +648,15 @@ async def sales_locked_matrix(
         crop_cosh_id, state_cosh_id, district_cosh_id, package_id,
         dealer_user_id=dealer_user_id,
     )
-    rows = await queries.sales_locked_brand_matrix(db, cid, filters)
+    # Pesticide/fertilizer path — brand cosh_ids need Cosh tradename
+    # hydration. Seed path — variety rows already carry their own
+    # names (SeedVariety.name), no hydration needed. We concat, then
+    # hydrate only the cosh_id-bearing rows.
+    pf_rows = await queries.sales_locked_brand_matrix(db, cid, filters)
+    seed_rows = await queries.sales_seed_locked_matrix(db, cid, filters)
 
     all_brand_ids: set[str] = set()
-    for r in rows:
+    for r in pf_rows:
         if r["our_brand_cosh_id"]:
             all_brand_ids.add(r["our_brand_cosh_id"])
         for g in r["given"]:
@@ -618,14 +664,23 @@ async def sales_locked_matrix(
                 all_brand_ids.add(g["sold_brand_cosh_id"])
     names = await _brand_names_for(db, list(all_brand_ids))
 
-    for r in rows:
+    for r in pf_rows:
         r["our_brand_name"] = names.get(r["our_brand_cosh_id"]) or r["our_brand_cosh_id"] or "—"
         for g in r["given"]:
             if g.get("sold_brand_cosh_id"):
                 g["sold_brand_name"] = names.get(g["sold_brand_cosh_id"]) or g["sold_brand_cosh_id"]
             else:
                 g["sold_brand_name"] = None
-    return {"rows": rows}
+    # Seed rows already carry variety names. Frontend groups by
+    # row.category so PESTICIDE / FERTILIZER / SEED render as separate
+    # sub-sections; row order within a category is by total desc.
+    combined = pf_rows + seed_rows
+    combined.sort(
+        key=lambda r: -(
+            r["totals"]["litres"] + r["totals"]["kilograms"] + r["totals"]["numbers"]
+        ),
+    )
+    return {"rows": combined}
 
 
 @router.get("/client/{cid}/reports/sales/recommended-matrix")
