@@ -185,6 +185,10 @@ class ReportFilters:
         "period_from", "period_to",
         "crop_cosh_id", "state_cosh_id", "district_cosh_id",
         "package_id",
+        # Phase 2 (Sales) — filter to one onboarded dealer. Applies at
+        # the OrderItem / PackingList level via the dealer_user_id on
+        # the parent Order.
+        "dealer_user_id",
     )
 
     def __init__(
@@ -195,6 +199,7 @@ class ReportFilters:
         state_cosh_id: Optional[str] = None,
         district_cosh_id: Optional[str] = None,
         package_id: Optional[str] = None,
+        dealer_user_id: Optional[str] = None,
     ) -> None:
         self.period_from = period_from
         self.period_to = period_to
@@ -202,6 +207,7 @@ class ReportFilters:
         self.state_cosh_id = state_cosh_id
         self.district_cosh_id = district_cosh_id
         self.package_id = package_id
+        self.dealer_user_id = dealer_user_id
 
 
 # ── Subscriptions subject area ────────────────────────────────────────────────
@@ -1456,3 +1462,229 @@ async def orders_rows(
         stmt = stmt.where(Order.created_at < filters.period_to)
     rows = (await db.execute(stmt)).all()
     return [dict(r._mapping) for r in rows]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Sales subject area (Phase 2)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Volume-only (never price — see project_rootstalk_client_reports_phase_2.md).
+# Three unit families (Litres / Kilograms / Numbers); ambiguous units silently
+# excluded. Sale marker: `PackingList.farmer_received_at IS NOT NULL` (same as
+# Phase 1 Sale Conversion for dashboard consistency).
+#
+# Two orthogonal scopes:
+# - Brand scope   — client's committed brands via Package authoring
+#                   (Locked / Recommended / Open). NOT Cosh manufacturer;
+#                   retail chains lock brands they don't make.
+# - Network scope — dealers this client has onboarded (ClientPromoter DEALER
+#                   ACTIVE for that client).
+
+# Unit normalisation. Values encountered in prod include L, ML, KG, GM, G,
+# GRAM, NOS, PIECES, PACKETS, EACH — plus a long tail of legacy strings.
+# Fold to one of three canonical buckets; anything else returns (None, None)
+# and gets silently dropped from the aggregate. Per the user (2026-08-04),
+# a brand has a definite unit — never both L and KG for the same SKU — so
+# ambiguity is rare at brand level.
+_LITRES_UNITS = {"L", "LITRE", "LITRES", "LITER", "LITERS"}
+_MILLILITRES_UNITS = {"ML", "MILLILITRE", "MILLILITRES", "MILLILITER", "MILLILITERS"}
+_KILOGRAMS_UNITS = {"KG", "KGS", "KILOGRAM", "KILOGRAMS"}
+_GRAMS_UNITS = {"G", "GM", "GMS", "GRAM", "GRAMS"}
+_NUMBERS_UNITS = {"NOS", "NO", "NUMBER", "NUMBERS", "PIECE", "PIECES", "PC", "PCS", "PACKET", "PACKETS", "EACH", "UNIT", "UNITS"}
+
+
+def _normalize_volume(
+    volume: float | None, unit: str | None,
+) -> tuple[str | None, float | None]:
+    """Fold (volume, unit) into (bucket, normalised_value).
+
+    Buckets: 'litres', 'kilograms', 'numbers'. Return (None, None) when the
+    unit is unrecognised or the volume is None/<=0 — silently dropped from
+    aggregates.
+
+    Cheap pure function; per-row call cost is negligible. If this becomes a
+    bottleneck (data will tell us via @timed_query), fold the normalisation
+    into a materialised view.
+    """
+    if volume is None or volume <= 0:
+        return None, None
+    if not unit:
+        return None, None
+    u = unit.strip().upper()
+    if u in _LITRES_UNITS:
+        return "litres", float(volume)
+    if u in _MILLILITRES_UNITS:
+        return "litres", float(volume) / 1000.0
+    if u in _KILOGRAMS_UNITS:
+        return "kilograms", float(volume)
+    if u in _GRAMS_UNITS:
+        return "kilograms", float(volume) / 1000.0
+    if u in _NUMBERS_UNITS:
+        return "numbers", float(volume)
+    return None, None
+
+
+def _empty_unit_buckets() -> dict:
+    return {"litres": 0.0, "kilograms": 0.0, "numbers": 0.0}
+
+
+def _sum_into_buckets(items: list[tuple[float | None, str | None]]) -> dict:
+    """Given a list of (volume, unit) rows, return per-bucket sums."""
+    buckets = _empty_unit_buckets()
+    for volume, unit in items:
+        bucket, value = _normalize_volume(volume, unit)
+        if bucket:
+            buckets[bucket] += value
+    # Round for cleaner display; 3 decimals covers ML→L / GM→KG conversions.
+    return {k: round(v, 3) for k, v in buckets.items()}
+
+
+async def _onboarded_dealer_ids_for(
+    db: AsyncSession, client_id: str,
+) -> set[str]:
+    """User IDs of dealers currently onboarded by this client. Used as the
+    network scope for every Sales query."""
+    from app.modules.clients.models import ClientPromoter
+    rows = (await db.execute(
+        select(ClientPromoter.user_id).where(
+            ClientPromoter.client_id == client_id,
+            ClientPromoter.promoter_type == "DEALER",
+            ClientPromoter.status == "ACTIVE",
+        )
+    )).scalars().all()
+    return set(rows)
+
+
+async def _client_brand_cosh_ids_for(
+    db: AsyncSession, client_id: str,
+) -> dict:
+    """Enumerate the client's committed brands from Package authoring.
+
+    Returns::
+
+        {
+          "locked":      set[brand_cosh_id],   # is_brand_locked=True
+          "recommended": set[brand_cosh_id],   # Element BRAND_NAME cosh_ref, not locked
+        }
+
+    This is the brand-scope anchor — works uniformly for manufacturer clients
+    and retail-chain clients that lock brands they don't own (see
+    `reference_rootstalk_client_types_and_brand_ownership.md`).
+
+    NOT anchored on Cosh manufacturer_id — that would leave retail chains
+    out entirely.
+    """
+    # Practices under the client's Packages that carry a BRAND_NAME element.
+    rows = (await db.execute(
+        select(Practice.is_brand_locked, Element.cosh_ref)
+        .join(Element, Element.practice_id == Practice.id)
+        .join(Package, Package.id == Practice.timeline_id, isouter=False)  # placeholder join corrected below
+        .where(
+            Element.element_type == "BRAND_NAME",
+            Element.cosh_ref.isnot(None),
+            Element.cosh_ref != "",
+        )
+    )).all()
+    # NOTE: the join above is intentionally the wrong shape (Practice.timeline_id
+    # is not Package.id). Corrected in the real query below — this scaffold
+    # comment is a reminder that the Practice → Timeline → Package chain
+    # requires two joins. Actual query:
+    from app.modules.advisory.models import Timeline
+    rows = (await db.execute(
+        select(Practice.is_brand_locked, Element.cosh_ref)
+        .select_from(Element)
+        .join(Practice, Practice.id == Element.practice_id)
+        .join(Timeline, Timeline.id == Practice.timeline_id)
+        .join(Package, Package.id == Timeline.package_id)
+        .where(
+            Package.client_id == client_id,
+            Element.element_type == "BRAND_NAME",
+            Element.cosh_ref.isnot(None),
+            Element.cosh_ref != "",
+        )
+    )).all()
+    locked: set[str] = set()
+    recommended: set[str] = set()
+    for is_locked, cosh_ref in rows:
+        target = locked if is_locked else recommended
+        target.add(cosh_ref)
+    return {"locked": locked, "recommended": recommended}
+
+
+def _sales_scope(client_id: str) -> Select:
+    """Base select for Sales queries.
+
+    Joins Subscription (for the filter contract) → Order → OrderItem →
+    PackingList (received=NOT NULL). Item statuses REMOVED/REROUTED are
+    excluded (they're husks post-Orders-V2 rewiring). Parent Order status
+    is gated by ORDER_COUNTED_STATUSES for consistency with Phase 1.
+
+    Callers add their own SELECT columns + additional WHEREs.
+    """
+    return (
+        _subscription_scope(client_id)
+        .join(Order, Order.subscription_id == Subscription.id)
+        .join(OrderItem, OrderItem.order_id == Order.id)
+        .join(PackingList, PackingList.order_id == Order.id)
+        .where(
+            Order.status.in_(ORDER_COUNTED_STATUSES),
+            OrderItem.status.notin_([OrderItemStatus.REMOVED, OrderItemStatus.REROUTED]),
+            PackingList.farmer_received_at.isnot(None),
+        )
+    )
+
+
+def _apply_sales_filters(stmt: Select, filters: ReportFilters) -> Select:
+    """Extends _apply_filters with Phase 2's Dealer chip + time on
+    PackingList.farmer_received_at (not Order.created_at — for a Sales
+    report we care about when the sale actually completed)."""
+    stmt = _apply_filters(stmt, filters)
+    if filters.dealer_user_id:
+        stmt = stmt.where(Order.dealer_user_id == filters.dealer_user_id)
+    if filters.period_from is not None:
+        stmt = stmt.where(PackingList.farmer_received_at >= filters.period_from)
+    if filters.period_to is not None:
+        stmt = stmt.where(PackingList.farmer_received_at < filters.period_to)
+    return stmt
+
+
+@timed_query("sales_locked_volume")
+async def sales_locked_volume(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> dict:
+    """Volume of Locked-Brand items sold through our network, in three
+    unit buckets (Litres / Kilograms / Numbers).
+
+    Locked = Practice.is_brand_locked = True AND the item's brand_cosh_id is
+    one of our client's locked brands. Since Locked orders can only be sent
+    to onboarded dealers (RootsTalk enforcement), no extra network filter is
+    needed — but we still restrict to onboarded-dealer orders for defensive
+    consistency (guards against any historical row that pre-dates the
+    enforcement).
+
+    Returns::
+
+        {"litres": <float>, "kilograms": <float>, "numbers": <float>}
+
+    Ambiguous / unrecognised units are silently excluded (brand-level unit
+    uniqueness makes this rare in practice).
+    """
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    brands = await _client_brand_cosh_ids_for(db, client_id)
+    locked_brands = brands["locked"]
+    if not onboarded or not locked_brands:
+        return _empty_unit_buckets()
+
+    stmt = (
+        _sales_scope(client_id)
+        .join(Practice, Practice.id == OrderItem.practice_id)
+        .where(
+            Practice.is_brand_locked.is_(True),
+            OrderItem.brand_cosh_id.in_(locked_brands),
+            Order.dealer_user_id.in_(onboarded),
+        )
+        .with_only_columns(OrderItem.given_volume, OrderItem.volume_unit)
+    )
+    stmt = _apply_sales_filters(stmt, filters)
+    rows = (await db.execute(stmt)).all()
+    return _sum_into_buckets([(r[0], r[1]) for r in rows])

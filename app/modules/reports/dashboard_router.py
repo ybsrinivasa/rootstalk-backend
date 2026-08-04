@@ -75,6 +75,7 @@ def _build_filters(
     state_cosh_id: Optional[str],
     district_cosh_id: Optional[str],
     package_id: Optional[str],
+    dealer_user_id: Optional[str] = None,
 ) -> queries.ReportFilters:
     return queries.ReportFilters(
         period_from=period_from,
@@ -83,6 +84,7 @@ def _build_filters(
         state_cosh_id=state_cosh_id,
         district_cosh_id=district_cosh_id,
         package_id=package_id,
+        dealer_user_id=dealer_user_id,
     )
 
 
@@ -402,6 +404,85 @@ async def orders_report(
             },
         )
     return await _hydrate_dimension_labels(db, rows, dim_up)
+
+
+# ── Sales subject area (Phase 2) ─────────────────────────────────────────────
+
+@router.get("/client/{cid}/reports/sales")
+async def sales_report(
+    cid: str,
+    metric: str = Query(
+        ...,
+        description=(
+            "LOCKED | RECOMMENDED_HONORED | RECOMMENDED_SUBSTITUTED | NETWORK_TOTAL"
+        ),
+    ),
+    dimension: Optional[str] = Query(
+        None, description="TIME | SPACE | CROP | PACKAGE | DEALER (drill only)",
+    ),
+    period_from: Optional[datetime] = None,
+    period_to: Optional[datetime] = None,
+    crop_cosh_id: Optional[str] = None,
+    state_cosh_id: Optional[str] = None,
+    district_cosh_id: Optional[str] = None,
+    package_id: Optional[str] = None,
+    dealer_user_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Sales subject area — headline metric OR dimension drill.
+
+    Volume-only (never price), three unit buckets (Litres / Kilograms /
+    Numbers). See ``project_rootstalk_client_reports_phase_2.md`` for the
+    full metric definitions. Sale marker inherited from Phase 1
+    (``PackingList.farmer_received_at IS NOT NULL``).
+
+    First vertical slice ships ``LOCKED`` end-to-end. The other three
+    headline metrics + dimension drills + the two pivot matrices fill in
+    metric-by-metric per the punch list.
+    """
+    await _assert_client_report_reader(db, current_user, cid)
+    _assert_subject_enabled(cid, "sales")
+
+    filters = _build_filters(
+        period_from, period_to,
+        crop_cosh_id, state_cosh_id, district_cosh_id, package_id,
+        dealer_user_id=dealer_user_id,
+    )
+
+    metric_up = metric.upper()
+
+    if dimension is None:
+        if metric_up == "LOCKED":
+            return await queries.sales_locked_volume(db, cid, filters)
+        # Other three headline metrics land in follow-up commits.
+        if metric_up in {"RECOMMENDED_HONORED", "RECOMMENDED_SUBSTITUTED", "NETWORK_TOTAL"}:
+            raise HTTPException(
+                status_code=501,
+                detail={
+                    "code": "metric_not_implemented",
+                    "message": f"Sales metric '{metric}' is scheduled but not yet wired.",
+                },
+            )
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "unknown_metric",
+                "message": f"Unknown sales metric '{metric}'.",
+            },
+        )
+
+    # Dimension drills — all deferred until the by_dimension queries land.
+    raise HTTPException(
+        status_code=501,
+        detail={
+            "code": "dimension_not_implemented",
+            "message": (
+                f"Sales dimension drills are scheduled but not yet wired "
+                f"(metric={metric}, dimension={dimension})."
+            ),
+        },
+    )
 
 
 async def _hydrate_dimension_labels(
