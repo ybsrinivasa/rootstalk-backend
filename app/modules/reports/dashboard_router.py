@@ -569,6 +569,118 @@ async def sales_report(
     return await _hydrate_dimension_labels(db, rows, dim_up)
 
 
+# ─── Sales pivot matrices ─────────────────────────────────────────────────
+
+async def _brand_names_for(db: AsyncSession, cosh_ids: list[str]) -> dict[str, str]:
+    """Bulk-lookup Cosh tradename → English display name. Falls back
+    to raw cosh_id when a row is missing so a rare mismatch still
+    renders something. Same treatment as _cosh_names but semantically
+    scoped to brand tradenames (they live in the same table today —
+    kept as a separate helper in case the schema splits later)."""
+    if not cosh_ids:
+        return {}
+    return await _cosh_names(db, cosh_ids)
+
+
+@router.get("/client/{cid}/reports/sales/recommended-matrix")
+async def sales_recommended_matrix(
+    cid: str,
+    period_from: Optional[datetime] = None,
+    period_to: Optional[datetime] = None,
+    crop_cosh_id: Optional[str] = None,
+    state_cosh_id: Optional[str] = None,
+    district_cosh_id: Optional[str] = None,
+    package_id: Optional[str] = None,
+    dealer_user_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Recommended vs Given pivot — one row per recommended brand,
+    each row's `given` array shows what dealers actually sold. Same
+    filter chip set as the headline cards."""
+    await _assert_client_report_reader(db, current_user, cid)
+    _assert_subject_enabled(cid, "sales")
+    filters = _build_filters(
+        period_from, period_to,
+        crop_cosh_id, state_cosh_id, district_cosh_id, package_id,
+        dealer_user_id=dealer_user_id,
+    )
+    rows = await queries.sales_recommended_vs_given_matrix(db, cid, filters)
+
+    # Hydrate brand names — one bulk lookup covering all cosh_ids
+    # that appear on either side of the matrix.
+    all_brand_ids: set[str] = set()
+    for r in rows:
+        if r["our_brand_cosh_id"]:
+            all_brand_ids.add(r["our_brand_cosh_id"])
+        for g in r["given"]:
+            if g.get("sold_brand_cosh_id"):
+                all_brand_ids.add(g["sold_brand_cosh_id"])
+    names = await _brand_names_for(db, list(all_brand_ids))
+
+    for r in rows:
+        r["our_brand_name"] = names.get(r["our_brand_cosh_id"]) or r["our_brand_cosh_id"] or "—"
+        for g in r["given"]:
+            if g.get("sold_brand_cosh_id"):
+                g["sold_brand_name"] = names.get(g["sold_brand_cosh_id"]) or g["sold_brand_cosh_id"]
+            else:
+                g["sold_brand_name"] = None    # frontend renders "(no brand recorded)"
+    return {"rows": rows}
+
+
+@router.get("/client/{cid}/reports/sales/open-matrix")
+async def sales_open_matrix(
+    cid: str,
+    period_from: Optional[datetime] = None,
+    period_to: Optional[datetime] = None,
+    crop_cosh_id: Optional[str] = None,
+    state_cosh_id: Optional[str] = None,
+    district_cosh_id: Optional[str] = None,
+    package_id: Optional[str] = None,
+    dealer_user_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Common Name → Brand Sold pivot — one row per common name (or
+    l2_type fallback), each row's `given` array shows which brands
+    dealers picked. Same filter chip set as the headline cards."""
+    await _assert_client_report_reader(db, current_user, cid)
+    _assert_subject_enabled(cid, "sales")
+    filters = _build_filters(
+        period_from, period_to,
+        crop_cosh_id, state_cosh_id, district_cosh_id, package_id,
+        dealer_user_id=dealer_user_id,
+    )
+    rows = await queries.sales_common_name_vs_sold_matrix(db, cid, filters)
+
+    # Bulk hydrate — common_name cosh_ids and sold_brand cosh_ids
+    # both live in the CoshCoreItem catalog.
+    cosh_ids: set[str] = set()
+    for r in rows:
+        if r.get("common_name_cosh_id"):
+            cosh_ids.add(r["common_name_cosh_id"])
+        for g in r["given"]:
+            if g.get("sold_brand_cosh_id"):
+                cosh_ids.add(g["sold_brand_cosh_id"])
+    names = await _cosh_names(db, list(cosh_ids))
+
+    for r in rows:
+        # common_name_key is either a cosh_id or a raw l2_type
+        # string; if the key is a cosh_id we hydrate, else the
+        # verbatim l2_type IS the display label.
+        cid_key = r.get("common_name_cosh_id")
+        if cid_key:
+            r["common_name_label"] = names.get(cid_key) or cid_key
+        else:
+            r["common_name_label"] = r["common_name_key"] or "(unspecified)"
+        for g in r["given"]:
+            if g.get("sold_brand_cosh_id"):
+                g["sold_brand_name"] = names.get(g["sold_brand_cosh_id"]) or g["sold_brand_cosh_id"]
+            else:
+                g["sold_brand_name"] = None
+    return {"rows": rows}
+
+
 async def _hydrate_dimension_labels(
     db: AsyncSession, rows: list[dict], dimension: str,
 ) -> list[dict]:

@@ -2061,6 +2061,199 @@ def _shape_sales_row(mapping) -> dict:
     return out
 
 
+# ─── Pivot matrices ────────────────────────────────────────────────────────
+#
+# Two matrices, both nested-row shape (rows = the client's authoring
+# scope; each row carries a `given` array of what dealers actually
+# sold). Rendered on /reports/sales as expandable panels below the
+# drill panel. Router hydrates cosh_ids to English names.
+
+@timed_query("sales_recommended_vs_given_matrix")
+async def sales_recommended_vs_given_matrix(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> list[dict]:
+    """Recommended vs Given — for each of our recommended brands sold
+    through our onboarded network, break down what dealers actually
+    fulfilled with. Rows = our recommended brand_cosh_ids; each row's
+    `given` array holds one entry per distinct sold brand_cosh_id
+    (or None for items where brand wasn't recorded).
+
+    Returns::
+
+        [
+          {
+            "our_brand_cosh_id":   "<cosh_id>",
+            "totals": {"litres": …, "kilograms": …, "numbers": …},
+            "given": [
+              {
+                "sold_brand_cosh_id": "<cosh_id or None>",
+                "match": True/False,   # dealer sold what SE recommended
+                "litres": …, "kilograms": …, "numbers": …,
+              },
+              ...
+            ],
+          },
+          ...
+        ]
+
+    Router adds `our_brand_name` + `sold_brand_name` from Cosh
+    tradenames. Sort order: our-brand rows by total-volume desc; each
+    `given` array by volume desc.
+    """
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    brands = await _client_brand_cosh_ids_for(db, client_id)
+    recommended = brands["recommended"]
+    if not onboarded or not recommended:
+        return []
+
+    base = _sales_dimension_base(client_id, filters).join(
+        Practice, Practice.id == OrderItem.practice_id,
+    ).join(
+        Element, Element.practice_id == Practice.id,
+    ).where(
+        Practice.is_brand_locked.is_(False),
+        Element.element_type == "BRAND_NAME",
+        Element.cosh_ref.in_(recommended),
+        Order.dealer_user_id.in_(onboarded),
+    )
+    litres, kilograms, numbers = _volume_case_sums()
+    stmt = base.with_only_columns(
+        Element.cosh_ref.label("our_brand_cosh_id"),
+        OrderItem.brand_cosh_id.label("sold_brand_cosh_id"),
+        litres, kilograms, numbers,
+    ).group_by(Element.cosh_ref, OrderItem.brand_cosh_id)
+
+    rows = (await db.execute(stmt)).all()
+    # Fold into nested-row shape.
+    grouped: dict[str, dict] = {}
+    for r in rows:
+        our = r.our_brand_cosh_id
+        if our not in grouped:
+            grouped[our] = {
+                "our_brand_cosh_id": our,
+                "totals": {"litres": 0.0, "kilograms": 0.0, "numbers": 0.0},
+                "given": [],
+            }
+        entry = {
+            "sold_brand_cosh_id": r.sold_brand_cosh_id,
+            "match": (r.sold_brand_cosh_id == our),
+            "litres": round(float(r.litres or 0), 3),
+            "kilograms": round(float(r.kilograms or 0), 3),
+            "numbers": round(float(r.numbers or 0), 3),
+        }
+        grouped[our]["given"].append(entry)
+        grouped[our]["totals"]["litres"] += entry["litres"]
+        grouped[our]["totals"]["kilograms"] += entry["kilograms"]
+        grouped[our]["totals"]["numbers"] += entry["numbers"]
+
+    # Round totals + sort. Rows by total volume desc; `given` by
+    # its own volume desc within each row.
+    out = list(grouped.values())
+    for row in out:
+        row["totals"] = {k: round(v, 3) for k, v in row["totals"].items()}
+        row["given"].sort(
+            key=lambda g: -(g["litres"] + g["kilograms"] + g["numbers"]),
+        )
+    out.sort(
+        key=lambda r: -(
+            r["totals"]["litres"] + r["totals"]["kilograms"] + r["totals"]["numbers"]
+        ),
+    )
+    return out
+
+
+@timed_query("sales_common_name_vs_sold_matrix")
+async def sales_common_name_vs_sold_matrix(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> list[dict]:
+    """Common Name → Brand Sold — for Open items authored in this
+    client's Packages and sold through onboarded network, break down
+    which brands dealers organically picked. Rows = common name
+    (Practice.common_name_cosh_id when set, else the l2_type string
+    verbatim so nothing gets lost); each row's `given` array holds
+    one entry per distinct sold brand_cosh_id.
+
+    Returns the same nested-row shape as
+    ``sales_recommended_vs_given_matrix`` but with ``common_name_key``
+    (mixed cosh_id or l2_type) instead of ``our_brand_cosh_id`` and
+    no ``match`` field on the given entries (Open items don't have a
+    "recommended" to match against).
+    """
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    if not onboarded:
+        return []
+
+    has_brand_name = (
+        select(Element.id)
+        .where(
+            Element.practice_id == Practice.id,
+            Element.element_type == "BRAND_NAME",
+            Element.cosh_ref.isnot(None),
+            Element.cosh_ref != "",
+        )
+        .exists()
+    )
+
+    # Prefer common_name_cosh_id when populated (Cosh-anchored, will
+    # hydrate to English name); fall back to l2_type string when NULL
+    # so older Practices still surface. `coalesce` guarantees a group
+    # key for every row.
+    from sqlalchemy import func as _func
+    name_key = _func.coalesce(Practice.common_name_cosh_id, Practice.l2_type)
+
+    base = _sales_dimension_base(client_id, filters).join(
+        Practice, Practice.id == OrderItem.practice_id,
+    ).where(
+        Practice.is_brand_locked.is_(False),
+        ~has_brand_name,
+        Order.dealer_user_id.in_(onboarded),
+    )
+    litres, kilograms, numbers = _volume_case_sums()
+    stmt = base.with_only_columns(
+        name_key.label("common_name_key"),
+        Practice.common_name_cosh_id.label("common_name_cosh_id"),
+        OrderItem.brand_cosh_id.label("sold_brand_cosh_id"),
+        litres, kilograms, numbers,
+    ).group_by(name_key, Practice.common_name_cosh_id, OrderItem.brand_cosh_id)
+
+    rows = (await db.execute(stmt)).all()
+    grouped: dict[str, dict] = {}
+    for r in rows:
+        key = r.common_name_key or "(unspecified)"
+        if key not in grouped:
+            grouped[key] = {
+                "common_name_key": key,
+                # Router hydrates this to an English name if it's a
+                # cosh_id; else uses the l2_type string verbatim.
+                "common_name_cosh_id": r.common_name_cosh_id,
+                "totals": {"litres": 0.0, "kilograms": 0.0, "numbers": 0.0},
+                "given": [],
+            }
+        entry = {
+            "sold_brand_cosh_id": r.sold_brand_cosh_id,
+            "litres": round(float(r.litres or 0), 3),
+            "kilograms": round(float(r.kilograms or 0), 3),
+            "numbers": round(float(r.numbers or 0), 3),
+        }
+        grouped[key]["given"].append(entry)
+        grouped[key]["totals"]["litres"] += entry["litres"]
+        grouped[key]["totals"]["kilograms"] += entry["kilograms"]
+        grouped[key]["totals"]["numbers"] += entry["numbers"]
+
+    out = list(grouped.values())
+    for row in out:
+        row["totals"] = {k: round(v, 3) for k, v in row["totals"].items()}
+        row["given"].sort(
+            key=lambda g: -(g["litres"] + g["kilograms"] + g["numbers"]),
+        )
+    out.sort(
+        key=lambda r: -(
+            r["totals"]["litres"] + r["totals"]["kilograms"] + r["totals"]["numbers"]
+        ),
+    )
+    return out
+
+
 @timed_query("sales_open_volume")
 async def sales_open_volume(
     db: AsyncSession, client_id: str, filters: ReportFilters,
