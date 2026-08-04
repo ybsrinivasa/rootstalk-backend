@@ -69,6 +69,16 @@ ORDER_COUNTED_STATUSES = [
     OrderStatus.COMPLETED,
 ]
 
+# ── Leads/Conversion framing (Phase 2, 2026-08-04) ───────────────────────
+# A "lead" = an OrderItem that reached a dealer (order left DRAFT).
+# EXPIRED is included as a lead-that-failed-to-convert (dealer had it,
+# didn't act in time). CANCELLED is farmer-side abort → not a lead.
+ORDER_LEAD_STATUSES = ORDER_COUNTED_STATUSES + [OrderStatus.EXPIRED]
+
+# Item statuses excluded from every count (husk rows after Orders V2
+# re-routing) — the item's real successor lives on a new order.
+ITEM_EXCLUDED_STATUSES = [OrderItemStatus.REMOVED, OrderItemStatus.REROUTED]
+
 
 logger = logging.getLogger(__name__)
 
@@ -2737,3 +2747,712 @@ async def sales_open_volume(
     stmt = _apply_sales_filters(stmt, filters)
     rows = (await db.execute(stmt)).all()
     return _sum_into_buckets([(r[0], r[1]) for r in rows])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Leads / Conversion (2026-08-04)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Reframes the Sales report around a manufacturer's core question:
+# "how many leads did my SE's authoring generate, and how many landed?"
+#
+# Lead = OrderItem where parent Order.status ∈ ORDER_LEAD_STATUSES
+# (includes EXPIRED — an expired order is a real lead that timed out).
+# Excludes item-level husk statuses (REMOVED / REROUTED). For seeds,
+# Lead = SeedOrderFull row not in DRAFT/CANCELLED/REROUTED.
+#
+# Converted = same lead + PackingList.farmer_received_at IS NOT NULL
+# (pesticide/fert) or SeedOrderFull.status = PURCHASED (seeds).
+#
+# Recommended has an additional split: honored (dealer sold OUR
+# brand) vs substituted (dealer sold different brand). Both are
+# converted; the manufacturer cares about honor rate.
+#
+# Volumes stay in the matrices; leads/conversion drives headlines +
+# drill panel + dealer scorecard.
+
+
+def _leads_scope(client_id: str) -> Select:
+    """Base for leads queries: subscription → order → order_item →
+    LEFT JOIN packing_list. Same client + training + soft-delete
+    contract as _sales_scope; drops the sale-marker WHERE so leads
+    that DIDN'T convert are still counted."""
+    return (
+        _subscription_scope(client_id)
+        .join(Order, Order.subscription_id == Subscription.id)
+        .join(OrderItem, OrderItem.order_id == Order.id)
+        .outerjoin(PackingList, PackingList.order_id == Order.id)
+        .where(
+            Order.status.in_(ORDER_LEAD_STATUSES),
+            OrderItem.status.notin_(ITEM_EXCLUDED_STATUSES),
+        )
+    )
+
+
+def _apply_leads_filters(stmt: Select, filters: ReportFilters) -> Select:
+    """Chip + period filters for leads. Period on Order.created_at
+    (when the lead was received)."""
+    stmt = _apply_filters(stmt, filters)
+    if filters.dealer_user_id:
+        stmt = stmt.where(Order.dealer_user_id == filters.dealer_user_id)
+    if filters.period_from is not None:
+        stmt = stmt.where(Order.created_at >= filters.period_from)
+    if filters.period_to is not None:
+        stmt = stmt.where(Order.created_at < filters.period_to)
+    return stmt
+
+
+def _leads_and_converted_columns():
+    leads = func.count(func.distinct(OrderItem.id)).label("leads")
+    converted = func.count(func.distinct(OrderItem.id)).filter(
+        PackingList.farmer_received_at.isnot(None),
+    ).label("converted")
+    return leads, converted
+
+
+@timed_query("sales_locked_leads")
+async def sales_locked_leads(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> dict:
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    brands = await _client_brand_cosh_ids_for(db, client_id)
+    locked = brands["locked"]
+    if not onboarded or not locked:
+        return {"leads": 0, "converted": 0}
+    leads_col, converted_col = _leads_and_converted_columns()
+    stmt = (
+        _leads_scope(client_id)
+        .join(Practice, Practice.id == OrderItem.practice_id)
+        .where(
+            Practice.is_brand_locked.is_(True),
+            OrderItem.brand_cosh_id.in_(locked),
+            Order.dealer_user_id.in_(onboarded),
+        )
+        .with_only_columns(leads_col, converted_col)
+    )
+    stmt = _apply_leads_filters(stmt, filters)
+    row = (await db.execute(stmt)).one()
+    return {"leads": int(row.leads or 0), "converted": int(row.converted or 0)}
+
+
+@timed_query("sales_recommended_leads")
+async def sales_recommended_leads(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> dict:
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    brands = await _client_brand_cosh_ids_for(db, client_id)
+    recommended = brands["recommended"]
+    if not onboarded or not recommended:
+        return {"leads": 0, "honored": 0, "substituted": 0, "pending": 0}
+    leads = func.count(func.distinct(OrderItem.id)).label("leads")
+    honored = func.count(func.distinct(OrderItem.id)).filter(
+        PackingList.farmer_received_at.isnot(None),
+        OrderItem.brand_cosh_id == Element.cosh_ref,
+    ).label("honored")
+    substituted = func.count(func.distinct(OrderItem.id)).filter(
+        PackingList.farmer_received_at.isnot(None),
+        OrderItem.brand_cosh_id != Element.cosh_ref,
+    ).label("substituted")
+    stmt = (
+        _leads_scope(client_id)
+        .join(Practice, Practice.id == OrderItem.practice_id)
+        .join(Element, Element.practice_id == Practice.id)
+        .where(
+            Practice.is_brand_locked.is_(False),
+            Element.element_type == "BRAND_NAME",
+            Element.cosh_ref.in_(recommended),
+            Order.dealer_user_id.in_(onboarded),
+        )
+        .with_only_columns(leads, honored, substituted)
+    )
+    stmt = _apply_leads_filters(stmt, filters)
+    row = (await db.execute(stmt)).one()
+    n_leads = int(row.leads or 0)
+    n_hon = int(row.honored or 0)
+    n_sub = int(row.substituted or 0)
+    return {
+        "leads": n_leads,
+        "honored": n_hon,
+        "substituted": n_sub,
+        "pending": max(0, n_leads - n_hon - n_sub),
+    }
+
+
+@timed_query("sales_open_leads")
+async def sales_open_leads(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> dict:
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    if not onboarded:
+        return {"leads": 0, "converted": 0}
+    has_brand_name = (
+        select(Element.id)
+        .where(
+            Element.practice_id == Practice.id,
+            Element.element_type == "BRAND_NAME",
+            Element.cosh_ref.isnot(None),
+            Element.cosh_ref != "",
+        )
+        .exists()
+    )
+    leads_col, converted_col = _leads_and_converted_columns()
+    stmt = (
+        _leads_scope(client_id)
+        .join(Practice, Practice.id == OrderItem.practice_id)
+        .where(
+            Practice.is_brand_locked.is_(False),
+            ~has_brand_name,
+            Order.dealer_user_id.in_(onboarded),
+        )
+        .with_only_columns(leads_col, converted_col)
+    )
+    stmt = _apply_leads_filters(stmt, filters)
+    row = (await db.execute(stmt)).one()
+    return {"leads": int(row.leads or 0), "converted": int(row.converted or 0)}
+
+
+@timed_query("sales_network_total_leads")
+async def sales_network_total_leads(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> dict:
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    if not onboarded:
+        return {"leads": 0, "converted": 0}
+    leads_col, converted_col = _leads_and_converted_columns()
+    stmt = (
+        _leads_scope(client_id)
+        .where(Order.dealer_user_id.in_(onboarded))
+        .with_only_columns(leads_col, converted_col)
+    )
+    stmt = _apply_leads_filters(stmt, filters)
+    row = (await db.execute(stmt)).one()
+    return {"leads": int(row.leads or 0), "converted": int(row.converted or 0)}
+
+
+# ─── Seed leads ─────────────────────────────────────────────
+_SEED_LEAD_EXCLUDED = {"DRAFT", "CANCELLED", "REROUTED"}
+
+
+def _seed_leads_scope(client_id: str, filters: ReportFilters) -> Select:
+    from app.modules.seed_mgmt.models import SeedOrderFull, SeedVariety
+    base = (
+        _subscription_scope(client_id)
+        .join(SeedOrderFull, SeedOrderFull.subscription_id == Subscription.id)
+        .join(SeedVariety, SeedVariety.id == SeedOrderFull.variety_id)
+        .where(SeedOrderFull.status.notin_(_SEED_LEAD_EXCLUDED))
+    )
+    if filters.dealer_user_id:
+        base = base.where(SeedOrderFull.dealer_user_id == filters.dealer_user_id)
+    if filters.period_from is not None:
+        base = base.where(SeedOrderFull.created_at >= filters.period_from)
+    if filters.period_to is not None:
+        base = base.where(SeedOrderFull.created_at < filters.period_to)
+    return base
+
+
+def _seed_leads_columns():
+    from app.modules.seed_mgmt.models import SeedOrderFull
+    leads = func.count(func.distinct(SeedOrderFull.id)).label("leads")
+    converted = func.count(func.distinct(SeedOrderFull.id)).filter(
+        SeedOrderFull.status == "PURCHASED",
+    ).label("converted")
+    return leads, converted
+
+
+async def sales_seed_locked_leads(
+    db, client_id, filters,
+) -> dict:
+    from app.modules.seed_mgmt.models import SeedOrderFull, SeedVariety
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    if not onboarded:
+        return {"leads": 0, "converted": 0}
+    leads, converted = _seed_leads_columns()
+    stmt = (
+        _seed_leads_scope(client_id, filters)
+        .where(
+            SeedVariety.client_id == client_id,
+            SeedOrderFull.dealer_user_id.in_(onboarded),
+        )
+        .with_only_columns(leads, converted)
+    )
+    stmt = _apply_seed_chip_filters(stmt, filters)
+    row = (await db.execute(stmt)).one()
+    return {"leads": int(row.leads or 0), "converted": int(row.converted or 0)}
+
+
+async def sales_seed_network_total_leads(
+    db, client_id, filters,
+) -> dict:
+    from app.modules.seed_mgmt.models import SeedOrderFull
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    if not onboarded:
+        return {"leads": 0, "converted": 0}
+    leads, converted = _seed_leads_columns()
+    stmt = (
+        _seed_leads_scope(client_id, filters)
+        .where(SeedOrderFull.dealer_user_id.in_(onboarded))
+        .with_only_columns(leads, converted)
+    )
+    stmt = _apply_seed_chip_filters(stmt, filters)
+    row = (await db.execute(stmt)).one()
+    return {"leads": int(row.leads or 0), "converted": int(row.converted or 0)}
+
+
+def _merge_leads_totals(a: dict, b: dict) -> dict:
+    return {
+        "leads": int(a.get("leads", 0)) + int(b.get("leads", 0)),
+        "converted": int(a.get("converted", 0)) + int(b.get("converted", 0)),
+    }
+
+
+# ─── Leads dimension drills ─────────────────────────────────────
+
+def _leads_dimension_base(client_id: str, filters: ReportFilters) -> Select:
+    base = _dimension_base(client_id, filters).join(
+        Order, Order.subscription_id == Subscription.id,
+    ).join(
+        OrderItem, OrderItem.order_id == Order.id,
+    ).outerjoin(
+        PackingList, PackingList.order_id == Order.id,
+    ).where(
+        Order.status.in_(ORDER_LEAD_STATUSES),
+        OrderItem.status.notin_(ITEM_EXCLUDED_STATUSES),
+    )
+    if filters.dealer_user_id:
+        base = base.where(Order.dealer_user_id == filters.dealer_user_id)
+    if filters.period_from is not None:
+        base = base.where(Order.created_at >= filters.period_from)
+    if filters.period_to is not None:
+        base = base.where(Order.created_at < filters.period_to)
+    return base
+
+
+def _group_leads_dim(base, dimension: str, filters: ReportFilters,
+                    extra_cols: list | None = None) -> Select:
+    leads_col, converted_col = _leads_and_converted_columns()
+    cols = [leads_col, converted_col]
+    if extra_cols:
+        cols = extra_cols + cols
+    dim = dimension.upper()
+    if dim == "CROP":
+        stmt = base.with_only_columns(Package.crop_cosh_id.label("key"), *cols
+        ).group_by(Package.crop_cosh_id).order_by(leads_col.desc())
+    elif dim == "SPACE":
+        stmt = base.with_only_columns(User.state_cosh_id.label("key"), *cols
+        ).group_by(User.state_cosh_id).order_by(leads_col.desc())
+    elif dim == "PACKAGE":
+        stmt = base.with_only_columns(
+            Subscription.package_id.label("key"),
+            Package.name.label("package_name"),
+            *cols,
+        ).group_by(Subscription.package_id, Package.name).order_by(leads_col.desc())
+    elif dim == "DEALER":
+        stmt = base.with_only_columns(Order.dealer_user_id.label("key"), *cols
+        ).where(Order.dealer_user_id.is_not(None)).group_by(
+            Order.dealer_user_id,
+        ).order_by(leads_col.desc())
+    elif dim == "TIME":
+        bucket = _pick_time_bucket(filters.period_from, filters.period_to)
+        bucket_col = func.date_trunc(bucket, Order.created_at).label("key")
+        stmt = base.with_only_columns(bucket_col, *cols
+        ).where(Order.created_at.isnot(None)).group_by(bucket_col).order_by(bucket_col.asc())
+    else:
+        raise ValueError(f"Unknown dimension: {dimension!r}")
+    return stmt
+
+
+def _shape_leads_row(mapping) -> dict:
+    out = dict(mapping)
+    for k in ("leads", "converted", "honored", "substituted"):
+        if k in out:
+            out[k] = int(out[k] or 0)
+    return out
+
+
+@timed_query("sales_locked_leads_by_dimension")
+async def sales_locked_leads_by_dimension(db, client_id, filters, dimension):
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    brands = await _client_brand_cosh_ids_for(db, client_id)
+    locked = brands["locked"]
+    if not onboarded or not locked:
+        return []
+    base = _leads_dimension_base(client_id, filters).join(
+        Practice, Practice.id == OrderItem.practice_id,
+    ).where(
+        Practice.is_brand_locked.is_(True),
+        OrderItem.brand_cosh_id.in_(locked),
+        Order.dealer_user_id.in_(onboarded),
+    )
+    stmt = _group_leads_dim(base, dimension, filters)
+    rows = (await db.execute(stmt)).all()
+    return [_shape_leads_row(r._mapping) for r in rows]
+
+
+@timed_query("sales_recommended_leads_by_dimension")
+async def sales_recommended_leads_by_dimension(db, client_id, filters, dimension):
+    """For Recommended dimension rows: {leads, honored, substituted,
+    converted, pending}. Frontend renders honor rate."""
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    brands = await _client_brand_cosh_ids_for(db, client_id)
+    recommended = brands["recommended"]
+    if not onboarded or not recommended:
+        return []
+    base = _leads_dimension_base(client_id, filters).join(
+        Practice, Practice.id == OrderItem.practice_id,
+    ).join(
+        Element, Element.practice_id == Practice.id,
+    ).where(
+        Practice.is_brand_locked.is_(False),
+        Element.element_type == "BRAND_NAME",
+        Element.cosh_ref.in_(recommended),
+        Order.dealer_user_id.in_(onboarded),
+    )
+    leads = func.count(func.distinct(OrderItem.id)).label("leads")
+    honored = func.count(func.distinct(OrderItem.id)).filter(
+        PackingList.farmer_received_at.isnot(None),
+        OrderItem.brand_cosh_id == Element.cosh_ref,
+    ).label("honored")
+    substituted = func.count(func.distinct(OrderItem.id)).filter(
+        PackingList.farmer_received_at.isnot(None),
+        OrderItem.brand_cosh_id != Element.cosh_ref,
+    ).label("substituted")
+    dim = dimension.upper()
+    if dim == "CROP":
+        stmt = base.with_only_columns(
+            Package.crop_cosh_id.label("key"), leads, honored, substituted,
+        ).group_by(Package.crop_cosh_id).order_by(leads.desc())
+    elif dim == "SPACE":
+        stmt = base.with_only_columns(
+            User.state_cosh_id.label("key"), leads, honored, substituted,
+        ).group_by(User.state_cosh_id).order_by(leads.desc())
+    elif dim == "PACKAGE":
+        stmt = base.with_only_columns(
+            Subscription.package_id.label("key"),
+            Package.name.label("package_name"),
+            leads, honored, substituted,
+        ).group_by(Subscription.package_id, Package.name).order_by(leads.desc())
+    elif dim == "DEALER":
+        stmt = base.with_only_columns(
+            Order.dealer_user_id.label("key"), leads, honored, substituted,
+        ).where(Order.dealer_user_id.is_not(None)).group_by(
+            Order.dealer_user_id,
+        ).order_by(leads.desc())
+    elif dim == "TIME":
+        bucket = _pick_time_bucket(filters.period_from, filters.period_to)
+        bucket_col = func.date_trunc(bucket, Order.created_at).label("key")
+        stmt = base.with_only_columns(
+            bucket_col, leads, honored, substituted,
+        ).where(Order.created_at.isnot(None)).group_by(bucket_col).order_by(bucket_col.asc())
+    else:
+        return []
+    rows = (await db.execute(stmt)).all()
+    out = []
+    for r in rows:
+        m = dict(r._mapping)
+        m["leads"] = int(m.get("leads") or 0)
+        m["honored"] = int(m.get("honored") or 0)
+        m["substituted"] = int(m.get("substituted") or 0)
+        m["pending"] = max(0, m["leads"] - m["honored"] - m["substituted"])
+        m["converted"] = m["honored"] + m["substituted"]
+        out.append(m)
+    return out
+
+
+@timed_query("sales_open_leads_by_dimension")
+async def sales_open_leads_by_dimension(db, client_id, filters, dimension):
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    if not onboarded:
+        return []
+    has_brand_name = (
+        select(Element.id)
+        .where(
+            Element.practice_id == Practice.id,
+            Element.element_type == "BRAND_NAME",
+            Element.cosh_ref.isnot(None),
+            Element.cosh_ref != "",
+        )
+        .exists()
+    )
+    base = _leads_dimension_base(client_id, filters).join(
+        Practice, Practice.id == OrderItem.practice_id,
+    ).where(
+        Practice.is_brand_locked.is_(False),
+        ~has_brand_name,
+        Order.dealer_user_id.in_(onboarded),
+    )
+    stmt = _group_leads_dim(base, dimension, filters)
+    rows = (await db.execute(stmt)).all()
+    return [_shape_leads_row(r._mapping) for r in rows]
+
+
+@timed_query("sales_network_total_leads_by_dimension")
+async def sales_network_total_leads_by_dimension(db, client_id, filters, dimension):
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    if not onboarded:
+        return []
+    base = _leads_dimension_base(client_id, filters).where(
+        Order.dealer_user_id.in_(onboarded),
+    )
+    stmt = _group_leads_dim(base, dimension, filters)
+    rows = (await db.execute(stmt)).all()
+    return [_shape_leads_row(r._mapping) for r in rows]
+
+
+async def sales_seed_leads_by_dimension(
+    db, client_id, filters, dimension, *, locked_only: bool,
+):
+    from app.modules.seed_mgmt.models import SeedOrderFull, SeedVariety
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    if not onboarded:
+        return []
+    base = (
+        _subscription_scope(client_id)
+        .join(Package, Package.id == Subscription.package_id)
+        .join(User, User.id == Subscription.farmer_user_id)
+        .join(SeedOrderFull, SeedOrderFull.subscription_id == Subscription.id)
+        .join(SeedVariety, SeedVariety.id == SeedOrderFull.variety_id)
+        .where(
+            SeedOrderFull.status.notin_(_SEED_LEAD_EXCLUDED),
+            SeedOrderFull.dealer_user_id.in_(onboarded),
+        )
+    )
+    if locked_only:
+        base = base.where(SeedVariety.client_id == client_id)
+    if filters.crop_cosh_id:
+        base = base.where(Package.crop_cosh_id == filters.crop_cosh_id)
+    if filters.state_cosh_id:
+        base = base.where(User.state_cosh_id == filters.state_cosh_id)
+    if filters.district_cosh_id:
+        base = base.where(User.district_cosh_id == filters.district_cosh_id)
+    if filters.package_id:
+        base = base.where(Subscription.package_id == filters.package_id)
+    if filters.dealer_user_id:
+        base = base.where(SeedOrderFull.dealer_user_id == filters.dealer_user_id)
+    if filters.period_from is not None:
+        base = base.where(SeedOrderFull.created_at >= filters.period_from)
+    if filters.period_to is not None:
+        base = base.where(SeedOrderFull.created_at < filters.period_to)
+
+    leads, converted = _seed_leads_columns()
+    dim = dimension.upper()
+    if dim == "CROP":
+        stmt = base.with_only_columns(
+            Package.crop_cosh_id.label("key"), leads, converted,
+        ).group_by(Package.crop_cosh_id)
+    elif dim == "SPACE":
+        stmt = base.with_only_columns(
+            User.state_cosh_id.label("key"), leads, converted,
+        ).group_by(User.state_cosh_id)
+    elif dim == "PACKAGE":
+        stmt = base.with_only_columns(
+            Subscription.package_id.label("key"),
+            Package.name.label("package_name"),
+            leads, converted,
+        ).group_by(Subscription.package_id, Package.name)
+    elif dim == "DEALER":
+        stmt = base.with_only_columns(
+            SeedOrderFull.dealer_user_id.label("key"), leads, converted,
+        ).where(SeedOrderFull.dealer_user_id.is_not(None)).group_by(
+            SeedOrderFull.dealer_user_id,
+        )
+    elif dim == "TIME":
+        bucket = _pick_time_bucket(filters.period_from, filters.period_to)
+        bucket_col = func.date_trunc(bucket, SeedOrderFull.created_at).label("key")
+        stmt = base.with_only_columns(
+            bucket_col, leads, converted,
+        ).group_by(bucket_col)
+    else:
+        return []
+    rows = (await db.execute(stmt)).all()
+    return [_shape_leads_row(r._mapping) for r in rows]
+
+
+def _merge_leads_dim_rows(a: list[dict], b: list[dict]) -> list[dict]:
+    merged: dict = {}
+    for src in (a, b):
+        for r in src:
+            key = r.get("key")
+            if key not in merged:
+                merged[key] = {**r}
+                merged[key]["leads"] = int(r.get("leads", 0) or 0)
+                merged[key]["converted"] = int(r.get("converted", 0) or 0)
+            else:
+                merged[key]["leads"] += int(r.get("leads", 0) or 0)
+                merged[key]["converted"] += int(r.get("converted", 0) or 0)
+                for extra in ("package_name",):
+                    if extra in r and extra not in merged[key]:
+                        merged[key][extra] = r[extra]
+    return sorted(merged.values(), key=lambda r: -r["leads"])
+
+
+# ─── Dealer scorecard ────────────────────────────────────────────
+
+@timed_query("sales_dealer_scorecard")
+async def sales_dealer_scorecard(db, client_id, filters):
+    """Per-dealer leads/converted summary combining pesticide/fert +
+    seed leads. Rows sorted by leads desc; endpoint appends a pooled
+    totals row + hydrates dealer names."""
+    from app.modules.seed_mgmt.models import SeedOrderFull
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    if not onboarded:
+        return []
+
+    pf_leads, pf_converted = _leads_and_converted_columns()
+    pf_stmt = (
+        _leads_scope(client_id)
+        .where(Order.dealer_user_id.in_(onboarded))
+        .with_only_columns(
+            Order.dealer_user_id.label("dealer_user_id"),
+            pf_leads, pf_converted,
+        )
+        .group_by(Order.dealer_user_id)
+    )
+    pf_stmt = _apply_leads_filters(pf_stmt, filters)
+    pf_rows = (await db.execute(pf_stmt)).all()
+
+    sd_leads, sd_converted = _seed_leads_columns()
+    seed_base = _seed_leads_scope(client_id, filters).where(
+        SeedOrderFull.dealer_user_id.in_(onboarded),
+    )
+    seed_stmt = seed_base.with_only_columns(
+        SeedOrderFull.dealer_user_id.label("dealer_user_id"),
+        sd_leads, sd_converted,
+    ).group_by(SeedOrderFull.dealer_user_id)
+    seed_stmt = _apply_seed_chip_filters(seed_stmt, filters)
+    seed_rows = (await db.execute(seed_stmt)).all()
+
+    merged: dict = {}
+    for r in pf_rows:
+        did = r.dealer_user_id
+        merged[did] = {
+            "dealer_user_id": did,
+            "leads": int(r.leads or 0),
+            "converted": int(r.converted or 0),
+        }
+    for r in seed_rows:
+        did = r.dealer_user_id
+        if did in merged:
+            merged[did]["leads"] += int(r.leads or 0)
+            merged[did]["converted"] += int(r.converted or 0)
+        else:
+            merged[did] = {
+                "dealer_user_id": did,
+                "leads": int(r.leads or 0),
+                "converted": int(r.converted or 0),
+            }
+    return sorted(merged.values(), key=lambda r: -r["leads"])
+
+
+# ─── Matrix row-level leads lookup ────────────────────────────────
+
+async def _matrix_locked_row_leads(
+    db, client_id, filters,
+) -> dict:
+    """Row-key → (leads, converted) for the Locked matrix. Row key is
+    OrderItem.brand_cosh_id (matches the matrix row key)."""
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    brands = await _client_brand_cosh_ids_for(db, client_id)
+    if not onboarded or not brands["locked"]:
+        return {}
+    leads_col, converted_col = _leads_and_converted_columns()
+    base = _leads_dimension_base(client_id, filters).join(
+        Practice, Practice.id == OrderItem.practice_id,
+    ).where(
+        Practice.is_brand_locked.is_(True),
+        OrderItem.brand_cosh_id.in_(brands["locked"]),
+        Order.dealer_user_id.in_(onboarded),
+    )
+    stmt = base.with_only_columns(
+        OrderItem.brand_cosh_id.label("key"), leads_col, converted_col,
+    ).group_by(OrderItem.brand_cosh_id)
+    rows = (await db.execute(stmt)).all()
+    return {r.key: {"leads": int(r.leads or 0), "converted": int(r.converted or 0)} for r in rows}
+
+
+async def _matrix_recommended_row_leads(
+    db, client_id, filters,
+) -> dict:
+    """Row-key → (leads, converted) for Recommended matrix. Row key is
+    Element.cosh_ref (our recommended brand)."""
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    brands = await _client_brand_cosh_ids_for(db, client_id)
+    if not onboarded or not brands["recommended"]:
+        return {}
+    leads_col, converted_col = _leads_and_converted_columns()
+    base = _leads_dimension_base(client_id, filters).join(
+        Practice, Practice.id == OrderItem.practice_id,
+    ).join(
+        Element, Element.practice_id == Practice.id,
+    ).where(
+        Practice.is_brand_locked.is_(False),
+        Element.element_type == "BRAND_NAME",
+        Element.cosh_ref.in_(brands["recommended"]),
+        Order.dealer_user_id.in_(onboarded),
+    )
+    stmt = base.with_only_columns(
+        Element.cosh_ref.label("key"), leads_col, converted_col,
+    ).group_by(Element.cosh_ref)
+    rows = (await db.execute(stmt)).all()
+    return {r.key: {"leads": int(r.leads or 0), "converted": int(r.converted or 0)} for r in rows}
+
+
+async def _matrix_open_row_leads(
+    db, client_id, filters,
+) -> dict:
+    """Row-key → (leads, converted) for Open matrix. Row key is
+    common_name_cosh_id when set, else l2_type verbatim (matching the
+    matrix query's coalesce)."""
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    if not onboarded:
+        return {}
+    has_brand_name = (
+        select(Element.id)
+        .where(
+            Element.practice_id == Practice.id,
+            Element.element_type == "BRAND_NAME",
+            Element.cosh_ref.isnot(None),
+            Element.cosh_ref != "",
+        )
+        .exists()
+    )
+    from sqlalchemy import func as _func
+    name_key = _func.coalesce(Practice.common_name_cosh_id, Practice.l2_type)
+    leads_col, converted_col = _leads_and_converted_columns()
+    base = _leads_dimension_base(client_id, filters).join(
+        Practice, Practice.id == OrderItem.practice_id,
+    ).where(
+        Practice.is_brand_locked.is_(False),
+        ~has_brand_name,
+        Order.dealer_user_id.in_(onboarded),
+    )
+    stmt = base.with_only_columns(
+        name_key.label("key"), leads_col, converted_col,
+    ).group_by(name_key)
+    rows = (await db.execute(stmt)).all()
+    return {r.key: {"leads": int(r.leads or 0), "converted": int(r.converted or 0)} for r in rows}
+
+
+async def _matrix_seed_row_leads(
+    db, client_id, filters,
+) -> dict:
+    """Row-key → (leads, converted) for seed variety rows in Locked
+    matrix. Row key is SeedVariety.id (matches the seed matrix row's
+    our_brand_cosh_id slot)."""
+    from app.modules.seed_mgmt.models import SeedOrderFull, SeedVariety
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    if not onboarded:
+        return {}
+    leads, converted = _seed_leads_columns()
+    base = (
+        _seed_leads_scope(client_id, filters)
+        .where(
+            SeedVariety.client_id == client_id,
+            SeedOrderFull.dealer_user_id.in_(onboarded),
+        )
+    )
+    stmt = base.with_only_columns(
+        SeedVariety.id.label("key"), leads, converted,
+    ).group_by(SeedVariety.id)
+    stmt = _apply_seed_chip_filters(stmt, filters)
+    rows = (await db.execute(stmt)).all()
+    return {r.key: {"leads": int(r.leads or 0), "converted": int(r.converted or 0)} for r in rows}

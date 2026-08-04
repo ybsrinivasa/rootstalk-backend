@@ -508,7 +508,7 @@ async def sales_report(
     metric: str = Query(
         ...,
         description=(
-            "LOCKED | RECOMMENDED_HONORED | RECOMMENDED_SUBSTITUTED | OPEN | NETWORK_TOTAL"
+            "LOCKED | RECOMMENDED | OPEN | NETWORK_TOTAL — leads/conversion shape"
         ),
     ),
     dimension: Optional[str] = Query(
@@ -526,14 +526,19 @@ async def sales_report(
 ):
     """Sales subject area — headline metric OR dimension drill.
 
-    Volume-only (never price), three unit buckets (Litres / Kilograms /
-    Numbers). See ``project_rootstalk_client_reports_phase_2.md`` for the
-    full metric definitions. Sale marker inherited from Phase 1
-    (``PackingList.farmer_received_at IS NOT NULL``).
+    2026-08-04 reframing: report speaks in leads/conversion terms
+    (matches how a manufacturer's leadership scans the story). Volumes
+    still live in the matrices — see /sales/*-matrix endpoints.
 
-    First vertical slice ships ``LOCKED`` end-to-end. The other three
-    headline metrics + dimension drills + the two pivot matrices fill in
-    metric-by-metric per the punch list.
+    Metric shapes:
+      LOCKED / OPEN / NETWORK_TOTAL   → {leads, converted}
+      RECOMMENDED (formerly _HONORED + _SUBSTITUTED) → {leads, honored,
+        substituted, pending}  (converted = honored + substituted;
+        headline % = honored / leads)
+
+    LOCKED + NETWORK_TOTAL combine pesticide/fertilizer + seed leads
+    via `_merge_leads_totals`. RECOMMENDED + OPEN are pesticide/fert
+    only (seeds have no brand-authoring flow).
     """
     await _assert_client_report_reader(db, current_user, cid)
     _assert_subject_enabled(cid, "sales")
@@ -548,22 +553,17 @@ async def sales_report(
 
     if dimension is None:
         if metric_up == "LOCKED":
-            # Combined = pesticide/fertilizer locked + seed locked.
-            # Seeds path adds seed variety volumes onto the same three
-            # unit buckets.
-            pf = await queries.sales_locked_volume(db, cid, filters)
-            seed = await queries.sales_seed_locked_volume(db, cid, filters)
-            return queries._merge_volume_buckets(pf, seed)
-        if metric_up == "RECOMMENDED_HONORED":
-            return await queries.sales_recommended_honored_volume(db, cid, filters)
-        if metric_up == "RECOMMENDED_SUBSTITUTED":
-            return await queries.sales_recommended_substituted_volume(db, cid, filters)
+            pf = await queries.sales_locked_leads(db, cid, filters)
+            seed = await queries.sales_seed_locked_leads(db, cid, filters)
+            return queries._merge_leads_totals(pf, seed)
+        if metric_up == "RECOMMENDED":
+            return await queries.sales_recommended_leads(db, cid, filters)
         if metric_up == "OPEN":
-            return await queries.sales_open_volume(db, cid, filters)
+            return await queries.sales_open_leads(db, cid, filters)
         if metric_up == "NETWORK_TOTAL":
-            pf = await queries.sales_network_total_volume(db, cid, filters)
-            seed = await queries.sales_seed_network_total_volume(db, cid, filters)
-            return queries._merge_volume_buckets(pf, seed)
+            pf = await queries.sales_network_total_leads(db, cid, filters)
+            seed = await queries.sales_seed_network_total_leads(db, cid, filters)
+            return queries._merge_leads_totals(pf, seed)
         raise HTTPException(
             status_code=422,
             detail={
@@ -582,23 +582,21 @@ async def sales_report(
             },
         )
     if metric_up == "LOCKED":
-        pf = await queries.sales_locked_volume_by_dimension(db, cid, filters, dim_up)
-        seed = await queries.sales_seed_by_dimension(
+        pf = await queries.sales_locked_leads_by_dimension(db, cid, filters, dim_up)
+        seed = await queries.sales_seed_leads_by_dimension(
             db, cid, filters, dim_up, locked_only=True,
         )
-        rows = queries._merge_dimension_rows(pf, seed)
-    elif metric_up == "RECOMMENDED_HONORED":
-        rows = await queries.sales_recommended_honored_volume_by_dimension(db, cid, filters, dim_up)
-    elif metric_up == "RECOMMENDED_SUBSTITUTED":
-        rows = await queries.sales_recommended_substituted_volume_by_dimension(db, cid, filters, dim_up)
+        rows = queries._merge_leads_dim_rows(pf, seed)
+    elif metric_up == "RECOMMENDED":
+        rows = await queries.sales_recommended_leads_by_dimension(db, cid, filters, dim_up)
     elif metric_up == "OPEN":
-        rows = await queries.sales_open_volume_by_dimension(db, cid, filters, dim_up)
+        rows = await queries.sales_open_leads_by_dimension(db, cid, filters, dim_up)
     elif metric_up == "NETWORK_TOTAL":
-        pf = await queries.sales_network_total_volume_by_dimension(db, cid, filters, dim_up)
-        seed = await queries.sales_seed_by_dimension(
+        pf = await queries.sales_network_total_leads_by_dimension(db, cid, filters, dim_up)
+        seed = await queries.sales_seed_leads_by_dimension(
             db, cid, filters, dim_up, locked_only=False,
         )
-        rows = queries._merge_dimension_rows(pf, seed)
+        rows = queries._merge_leads_dim_rows(pf, seed)
     else:
         raise HTTPException(
             status_code=422,
@@ -671,15 +669,26 @@ async def sales_locked_matrix(
                 g["sold_brand_name"] = names.get(g["sold_brand_cosh_id"]) or g["sold_brand_cosh_id"]
             else:
                 g["sold_brand_name"] = None
-    # Seed rows already carry variety names. Frontend groups by
-    # row.category so PESTICIDE / FERTILIZER / SEED render as separate
-    # sub-sections; row order within a category is by total desc.
+    # Seed rows already carry variety names.
     combined = pf_rows + seed_rows
-    combined.sort(
-        key=lambda r: -(
-            r["totals"]["litres"] + r["totals"]["kilograms"] + r["totals"]["numbers"]
-        ),
-    )
+
+    # Attach leads/converted per row via two lookups. Row key is
+    # OrderItem.brand_cosh_id for pesticide/fert rows and
+    # SeedVariety.id for seed rows — both stored under
+    # `our_brand_cosh_id` on the row dict.
+    pf_row_leads = await queries._matrix_locked_row_leads(db, cid, filters)
+    seed_row_leads = await queries._matrix_seed_row_leads(db, cid, filters)
+    for r in combined:
+        key = r.get("our_brand_cosh_id")
+        entry = pf_row_leads.get(key) or seed_row_leads.get(key)
+        if entry:
+            r["leads"] = entry["leads"]
+            r["converted"] = entry["converted"]
+        else:
+            r["leads"] = 0
+            r["converted"] = 0
+
+    combined.sort(key=lambda r: -r["leads"])
     return {"rows": combined}
 
 
@@ -726,6 +735,12 @@ async def sales_recommended_matrix(
                 g["sold_brand_name"] = names.get(g["sold_brand_cosh_id"]) or g["sold_brand_cosh_id"]
             else:
                 g["sold_brand_name"] = None    # frontend renders "(no brand recorded)"
+
+    row_leads = await queries._matrix_recommended_row_leads(db, cid, filters)
+    for r in rows:
+        entry = row_leads.get(r.get("our_brand_cosh_id"))
+        r["leads"] = entry["leads"] if entry else 0
+        r["converted"] = entry["converted"] if entry else 0
     return {"rows": rows}
 
 
@@ -779,7 +794,63 @@ async def sales_open_matrix(
                 g["sold_brand_name"] = names.get(g["sold_brand_cosh_id"]) or g["sold_brand_cosh_id"]
             else:
                 g["sold_brand_name"] = None
+
+    row_leads = await queries._matrix_open_row_leads(db, cid, filters)
+    for r in rows:
+        entry = row_leads.get(r.get("common_name_key"))
+        r["leads"] = entry["leads"] if entry else 0
+        r["converted"] = entry["converted"] if entry else 0
     return {"rows": rows}
+
+
+@router.get("/client/{cid}/reports/sales/dealer-scorecard")
+async def sales_dealer_scorecard(
+    cid: str,
+    period_from: Optional[datetime] = None,
+    period_to: Optional[datetime] = None,
+    crop_cosh_id: Optional[str] = None,
+    state_cosh_id: Optional[str] = None,
+    district_cosh_id: Optional[str] = None,
+    package_id: Optional[str] = None,
+    dealer_user_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Per-dealer leads/conversion summary + pooled totals row. Rows
+    hydrated with shop_name (falls back to user.name)."""
+    from app.modules.orders.models import DealerProfile
+    await _assert_client_report_reader(db, current_user, cid)
+    _assert_subject_enabled(cid, "sales")
+    filters = _build_filters(
+        period_from, period_to,
+        crop_cosh_id, state_cosh_id, district_cosh_id, package_id,
+        dealer_user_id=dealer_user_id,
+    )
+    rows = await queries.sales_dealer_scorecard(db, cid, filters)
+
+    dealer_ids = [r["dealer_user_id"] for r in rows]
+    if dealer_ids:
+        dealer_rows = (await db.execute(
+            select(User.id, User.name, DealerProfile.shop_name)
+            .outerjoin(DealerProfile, DealerProfile.user_id == User.id)
+            .where(User.id.in_(dealer_ids))
+        )).all()
+        names = {r.id: (r.shop_name or r.name or r.id) for r in dealer_rows}
+    else:
+        names = {}
+    for r in rows:
+        r["dealer_name"] = names.get(r["dealer_user_id"], r["dealer_user_id"])
+
+    # Synthetic pooled row appended so the frontend can render a
+    # totals footer without re-summing client-side.
+    pooled = {
+        "dealer_user_id": None,
+        "dealer_name": f"Pooled ({len(rows)} dealer{'s' if len(rows) != 1 else ''})",
+        "leads": sum(r["leads"] for r in rows),
+        "converted": sum(r["converted"] for r in rows),
+        "pooled": True,
+    }
+    return {"rows": rows, "pooled": pooled}
 
 
 async def _hydrate_dimension_labels(
