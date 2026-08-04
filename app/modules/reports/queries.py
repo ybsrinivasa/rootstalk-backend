@@ -1688,3 +1688,129 @@ async def sales_locked_volume(
     stmt = _apply_sales_filters(stmt, filters)
     rows = (await db.execute(stmt)).all()
     return _sum_into_buckets([(r[0], r[1]) for r in rows])
+
+
+async def _sales_recommended_volume(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+    *, honored: bool,
+) -> dict:
+    """Shared body for the honored / substituted Recommended metrics.
+
+    ``honored=True`` → dealer sold the exact brand the SE recommended
+    (OrderItem.brand_cosh_id == Element.cosh_ref).
+    ``honored=False`` → dealer sold a DIFFERENT brand (or NULL). Includes
+    substitutions with the client's other brands — the strict "did the
+    specific recommendation convert?" reading. The full breakdown (which
+    substitute brands, in what proportion) lives on the Recommended vs
+    Given pivot report, not here.
+
+    Both variants also compute an ``outside_network`` block: the same
+    metric but on orders fulfilled by dealers NOT in our onboarded set.
+    Surfaces demand our network isn't capturing (honored variant) or
+    substitutions happening beyond our network (substituted variant).
+
+    Returns::
+
+        {
+          "litres":    <float>, "kilograms": <float>, "numbers": <float>,
+          "outside_network": {
+            "litres":  <float>, "kilograms": <float>, "numbers": <float>,
+          }
+        }
+    """
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    brands = await _client_brand_cosh_ids_for(db, client_id)
+    recommended_brands = brands["recommended"]
+    empty = {**_empty_unit_buckets(), "outside_network": _empty_unit_buckets()}
+    if not recommended_brands:
+        return empty
+
+    # Pull rows once with dealer_user_id tagged so we can split network vs
+    # outside-network in Python. Cheaper than two round-trips + keeps the
+    # scope filters in one place.
+    stmt = (
+        _sales_scope(client_id)
+        .join(Practice, Practice.id == OrderItem.practice_id)
+        .join(Element, Element.practice_id == Practice.id)
+        .where(
+            Practice.is_brand_locked.is_(False),
+            Element.element_type == "BRAND_NAME",
+            Element.cosh_ref.in_(recommended_brands),
+        )
+        .with_only_columns(
+            OrderItem.given_volume,
+            OrderItem.volume_unit,
+            OrderItem.brand_cosh_id,
+            Element.cosh_ref,
+            Order.dealer_user_id,
+        )
+    )
+    if honored:
+        stmt = stmt.where(OrderItem.brand_cosh_id == Element.cosh_ref)
+    else:
+        stmt = stmt.where(
+            OrderItem.brand_cosh_id.isnot(None),
+            OrderItem.brand_cosh_id != Element.cosh_ref,
+        )
+    stmt = _apply_sales_filters(stmt, filters)
+    rows = (await db.execute(stmt)).all()
+
+    in_network: list[tuple[float | None, str | None]] = []
+    outside: list[tuple[float | None, str | None]] = []
+    for volume, unit, _sold_brand, _rec_brand, dealer_user_id in rows:
+        if dealer_user_id and dealer_user_id in onboarded:
+            in_network.append((volume, unit))
+        else:
+            outside.append((volume, unit))
+    return {
+        **_sum_into_buckets(in_network),
+        "outside_network": _sum_into_buckets(outside),
+    }
+
+
+@timed_query("sales_recommended_honored_volume")
+async def sales_recommended_honored_volume(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> dict:
+    """Volume where SE recommended our brand AND dealer sold that
+    exact brand. The conversion win — SE authoring converted into a
+    matching sale.
+    """
+    return await _sales_recommended_volume(db, client_id, filters, honored=True)
+
+
+@timed_query("sales_recommended_substituted_volume")
+async def sales_recommended_substituted_volume(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> dict:
+    """Volume where SE recommended our brand AND dealer sold a
+    DIFFERENT brand. The leakage signal — how much of our SE's
+    recommendation isn't landing.
+    """
+    return await _sales_recommended_volume(db, client_id, filters, honored=False)
+
+
+@timed_query("sales_network_total_volume")
+async def sales_network_total_volume(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> dict:
+    """Total volume sold by dealers this client has onboarded — any
+    brand, any authoring intent (locked / recommended / open / no
+    matching practice at all). This is the retail-chain's primary
+    number; hybrid manufacturers with own retail arm also care.
+
+    Does NOT carry an outside_network block by definition — the whole
+    metric IS the network scope.
+    """
+    onboarded = await _onboarded_dealer_ids_for(db, client_id)
+    if not onboarded:
+        return _empty_unit_buckets()
+
+    stmt = (
+        _sales_scope(client_id)
+        .where(Order.dealer_user_id.in_(onboarded))
+        .with_only_columns(OrderItem.given_volume, OrderItem.volume_unit)
+    )
+    stmt = _apply_sales_filters(stmt, filters)
+    rows = (await db.execute(stmt)).all()
+    return _sum_into_buckets([(r[0], r[1]) for r in rows])

@@ -455,15 +455,12 @@ async def sales_report(
     if dimension is None:
         if metric_up == "LOCKED":
             return await queries.sales_locked_volume(db, cid, filters)
-        # Other three headline metrics land in follow-up commits.
-        if metric_up in {"RECOMMENDED_HONORED", "RECOMMENDED_SUBSTITUTED", "NETWORK_TOTAL"}:
-            raise HTTPException(
-                status_code=501,
-                detail={
-                    "code": "metric_not_implemented",
-                    "message": f"Sales metric '{metric}' is scheduled but not yet wired.",
-                },
-            )
+        if metric_up == "RECOMMENDED_HONORED":
+            return await queries.sales_recommended_honored_volume(db, cid, filters)
+        if metric_up == "RECOMMENDED_SUBSTITUTED":
+            return await queries.sales_recommended_substituted_volume(db, cid, filters)
+        if metric_up == "NETWORK_TOTAL":
+            return await queries.sales_network_total_volume(db, cid, filters)
         raise HTTPException(
             status_code=422,
             detail={
