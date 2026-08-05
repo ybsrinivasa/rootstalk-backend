@@ -205,6 +205,12 @@ class ReportFilters:
         # Subscription.promoter_user_id, so it works on any query
         # that already runs through _apply_filters.
         "promoter_user_id",
+        # Phase 4 (Queries) — severity (SEVERE / MODERATE / LOW) and
+        # pundit_id (FarmPunditProfile.id — "queries this pundit ever
+        # touched"). Only the Queries area's _apply_query_filters
+        # consumes these; other subject areas ignore them.
+        "severity",
+        "pundit_id",
     )
 
     def __init__(
@@ -217,6 +223,8 @@ class ReportFilters:
         package_id: Optional[str] = None,
         dealer_user_id: Optional[str] = None,
         promoter_user_id: Optional[str] = None,
+        severity: Optional[str] = None,
+        pundit_id: Optional[str] = None,
     ) -> None:
         self.period_from = period_from
         self.period_to = period_to
@@ -226,6 +234,8 @@ class ReportFilters:
         self.package_id = package_id
         self.dealer_user_id = dealer_user_id
         self.promoter_user_id = promoter_user_id
+        self.severity = severity
+        self.pundit_id = pundit_id
 
 
 # ── Subscriptions subject area ────────────────────────────────────────────────
@@ -3719,3 +3729,438 @@ async def promoter_scorecard(
         else:
             merged[pid]["leads"] = int(r.leads or 0)
     return sorted(merged.values(), key=lambda r: -r["subscriptions"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Queries subject area (Phase 4, 2026-08-05)
+# ═══════════════════════════════════════════════════════════════════════════
+# Two views on the same underlying data:
+#
+#   Queries area  — counts / rates about queries themselves. Every count
+#                   here is DISTINCT queries; sums reconcile with the
+#                   total-queries card. This is the source of truth.
+#
+#   Pundit view   — event counts about the pundits handling queries.
+#                   "Receptions" = direct + forwarded landings; a query
+#                   forwarded shows on BOTH pundits' rows. Sums here do
+#                   NOT equal total queries by design.
+#
+# Uses the query lifecycle from farmpundit.models:
+#   Query.status ∈ {NEW, FORWARDED, RETURNED, RESPONDED, REJECTED, EXPIRED}
+#   QueryRemark.action ∈ {RECEIVED, FORWARDED, RETURNED, RESPONDED, REJECTED}
+#   QueryResponse — one row per responded query (unique on query_id)
+#   ClientFarmPundit.role ∈ {PRIMARY, PANEL, PROMOTER_PUNDIT}
+
+from app.modules.farmpundit.models import (
+    Query,
+    QueryRemark,
+    QueryRemarkAction,
+    QueryResponse,
+    QueryStatus,
+    FarmPunditProfile,
+    ClientFarmPundit,
+    PunditRole,
+)
+
+
+QUERY_SEVERITIES = ["SEVERE", "MODERATE", "LOW"]
+_SLA_HOURS = 24
+
+
+def _query_scope(client_id: str) -> Select:
+    """Query base scope — client-scoped, training-excluded.
+    Every Queries-area query builds on this."""
+    return (
+        select(Query)
+        .join(Client, Client.id == Query.client_id)
+        .where(
+            Query.client_id == client_id,
+            Client.is_training.is_(False),
+        )
+    )
+
+
+def _apply_query_filters(stmt: Select, filters: ReportFilters) -> Select:
+    """Chip + period filters for Queries-area statements.
+
+    Query has its own `crop_cosh_id` (not via Package), so the crop
+    filter joins nothing extra. Severity is a Queries-only chip.
+    Pundit chip filters to queries the given pundit ever touched
+    (EXISTS on QueryRemark) — matches the "queries handled by
+    Pundit X" mental model."""
+    if filters.crop_cosh_id:
+        stmt = stmt.where(Query.crop_cosh_id == filters.crop_cosh_id)
+    if filters.state_cosh_id or filters.district_cosh_id:
+        stmt = stmt.join(User, User.id == Query.farmer_user_id)
+        if filters.state_cosh_id:
+            stmt = stmt.where(User.state_cosh_id == filters.state_cosh_id)
+        if filters.district_cosh_id:
+            stmt = stmt.where(User.district_cosh_id == filters.district_cosh_id)
+    if filters.severity:
+        stmt = stmt.where(Query.severity == filters.severity)
+    if filters.pundit_id:
+        stmt = stmt.where(
+            select(QueryRemark.id).where(
+                QueryRemark.query_id == Query.id,
+                QueryRemark.pundit_id == filters.pundit_id,
+            ).exists()
+        )
+    if filters.period_from is not None:
+        stmt = stmt.where(Query.created_at >= filters.period_from)
+    if filters.period_to is not None:
+        stmt = stmt.where(Query.created_at < filters.period_to)
+    return stmt
+
+
+# ── Headline metrics ─────────────────────────────────────────────────
+
+@timed_query("queries_count")
+async def queries_count(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> dict:
+    """Total queries created in the period, matching the chip filters."""
+    stmt = _apply_query_filters(_query_scope(client_id), filters).with_only_columns(
+        func.count(Query.id).label("count"),
+    )
+    n = (await db.execute(stmt)).scalar_one_or_none() or 0
+    return {"count": int(n)}
+
+
+@timed_query("queries_responded")
+async def queries_responded(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> dict:
+    """Queries in scope that have a response (QueryResponse row exists)."""
+    stmt = _apply_query_filters(_query_scope(client_id), filters).join(
+        QueryResponse, QueryResponse.query_id == Query.id,
+    ).with_only_columns(
+        func.count(Query.id).label("count"),
+    )
+    n = (await db.execute(stmt)).scalar_one_or_none() or 0
+    return {"count": int(n)}
+
+
+@timed_query("queries_expired")
+async def queries_expired(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> dict:
+    """Queries that expired without a response (status == EXPIRED)."""
+    stmt = _apply_query_filters(_query_scope(client_id), filters).where(
+        Query.status == QueryStatus.EXPIRED,
+    ).with_only_columns(
+        func.count(Query.id).label("count"),
+    )
+    n = (await db.execute(stmt)).scalar_one_or_none() or 0
+    return {"count": int(n)}
+
+
+@timed_query("queries_avg_response_seconds")
+async def queries_avg_response_seconds(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> dict:
+    """Average time from Query.created_at to QueryResponse.created_at,
+    in seconds, across responded queries in scope."""
+    stmt = _apply_query_filters(_query_scope(client_id), filters).join(
+        QueryResponse, QueryResponse.query_id == Query.id,
+    ).with_only_columns(
+        func.avg(
+            func.extract("epoch", QueryResponse.created_at - Query.created_at),
+        ).label("avg_seconds"),
+        func.count(Query.id).label("responded"),
+    )
+    row = (await db.execute(stmt)).first()
+    avg_seconds = float(row.avg_seconds) if row and row.avg_seconds is not None else 0.0
+    responded = int(row.responded) if row and row.responded else 0
+    return {"avg_seconds": avg_seconds, "responded": responded}
+
+
+@timed_query("queries_sla_24h")
+async def queries_sla_24h(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> dict:
+    """Share of queries responded within 24 hours of creation.
+
+    Returns ``{within: N, total: M}`` — frontend renders `within/total`
+    as a % (colour-coded like the Sales conversion cards). Denominator
+    is total queries in scope (including unresponded/expired) so the
+    metric answers "how likely is a new query to get a fast response",
+    not "of the ones we responded to, how fast were we"."""
+    total_stmt = _apply_query_filters(_query_scope(client_id), filters).with_only_columns(
+        func.count(Query.id).label("total"),
+    )
+    within_stmt = _apply_query_filters(_query_scope(client_id), filters).join(
+        QueryResponse, QueryResponse.query_id == Query.id,
+    ).where(
+        func.extract("epoch", QueryResponse.created_at - Query.created_at)
+        <= _SLA_HOURS * 3600,
+    ).with_only_columns(
+        func.count(Query.id).label("within"),
+    )
+    total = (await db.execute(total_stmt)).scalar_one_or_none() or 0
+    within = (await db.execute(within_stmt)).scalar_one_or_none() or 0
+    return {"within": int(within), "total": int(total), "sla_hours": _SLA_HOURS}
+
+
+@timed_query("queries_severity_split")
+async def queries_severity_split(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> dict:
+    """Count of queries per severity in scope.
+
+    Returns ``{severe: N, moderate: N, low: N, total: N}``. Any severity
+    values outside the standard three roll into ``total`` but not into
+    the named buckets — legacy rows without a set severity thus don't
+    poison the primary split display."""
+    stmt = _apply_query_filters(_query_scope(client_id), filters).with_only_columns(
+        Query.severity.label("severity"),
+        func.count(Query.id).label("count"),
+    ).group_by(Query.severity)
+    rows = (await db.execute(stmt)).all()
+    out = {"severe": 0, "moderate": 0, "low": 0, "total": 0}
+    for r in rows:
+        sev = (r.severity or "").upper()
+        c = int(r.count or 0)
+        out["total"] += c
+        if sev == "SEVERE":
+            out["severe"] = c
+        elif sev == "MODERATE":
+            out["moderate"] = c
+        elif sev == "LOW":
+            out["low"] = c
+    return out
+
+
+# ── Dimension drills (COUNT / RESPONDED / EXPIRED / AVG_RESPONSE) ────
+
+def _query_time_bucket_col(filters: ReportFilters):
+    bucket = _pick_time_bucket(filters.period_from, filters.period_to)
+    return func.date_trunc(bucket, Query.created_at).label("key")
+
+
+async def _queries_count_dim(
+    db: AsyncSession, client_id: str, filters: ReportFilters, dimension: str,
+    *, joined: Select | None = None,
+    value_col=None,
+) -> list[dict]:
+    """Shared dim runner for the four Queries-area countable metrics.
+
+    ``joined`` is an already-filtered stmt (possibly with extra joins
+    like QueryResponse). ``value_col`` is the aggregate column expression
+    labelled 'v'; caller picks it (count / avg / etc.)."""
+    stmt = joined if joined is not None else _apply_query_filters(
+        _query_scope(client_id), filters,
+    )
+    if value_col is None:
+        value_col = func.count(Query.id).label("v")
+    dim = dimension.upper()
+    if dim == "TIME":
+        bucket_col = _query_time_bucket_col(filters)
+        stmt = stmt.with_only_columns(bucket_col, value_col).where(
+            Query.created_at.isnot(None),
+        ).group_by(bucket_col).order_by(bucket_col.asc())
+    elif dim == "SPACE":
+        # If state/district filter didn't force the User join, add it now.
+        if not filters.state_cosh_id and not filters.district_cosh_id:
+            stmt = stmt.join(User, User.id == Query.farmer_user_id)
+        stmt = stmt.with_only_columns(
+            User.state_cosh_id.label("key"), value_col,
+        ).group_by(User.state_cosh_id).order_by(value_col.desc())
+    elif dim == "CROP":
+        stmt = stmt.with_only_columns(
+            Query.crop_cosh_id.label("key"), value_col,
+        ).where(Query.crop_cosh_id.isnot(None)).group_by(
+            Query.crop_cosh_id,
+        ).order_by(value_col.desc())
+    else:
+        raise ValueError(f"Unknown dimension: {dimension!r}")
+    rows = (await db.execute(stmt)).all()
+    return [{"key": r.key, "value": (float(r.v or 0) if not isinstance(r.v, int) else int(r.v or 0))} for r in rows]
+
+
+@timed_query("queries_count_by_dimension")
+async def queries_count_by_dimension(
+    db: AsyncSession, client_id: str, filters: ReportFilters, dimension: str,
+) -> list[dict]:
+    return await _queries_count_dim(db, client_id, filters, dimension)
+
+
+@timed_query("queries_responded_by_dimension")
+async def queries_responded_by_dimension(
+    db: AsyncSession, client_id: str, filters: ReportFilters, dimension: str,
+) -> list[dict]:
+    base = _apply_query_filters(_query_scope(client_id), filters).join(
+        QueryResponse, QueryResponse.query_id == Query.id,
+    )
+    return await _queries_count_dim(
+        db, client_id, filters, dimension, joined=base,
+    )
+
+
+@timed_query("queries_expired_by_dimension")
+async def queries_expired_by_dimension(
+    db: AsyncSession, client_id: str, filters: ReportFilters, dimension: str,
+) -> list[dict]:
+    base = _apply_query_filters(_query_scope(client_id), filters).where(
+        Query.status == QueryStatus.EXPIRED,
+    )
+    return await _queries_count_dim(
+        db, client_id, filters, dimension, joined=base,
+    )
+
+
+@timed_query("queries_avg_response_by_dimension")
+async def queries_avg_response_by_dimension(
+    db: AsyncSession, client_id: str, filters: ReportFilters, dimension: str,
+) -> list[dict]:
+    """Average response time (in seconds) per dimension bucket.
+    Only over responded queries — bucket keys with zero responded
+    queries simply drop out."""
+    base = _apply_query_filters(_query_scope(client_id), filters).join(
+        QueryResponse, QueryResponse.query_id == Query.id,
+    )
+    value_col = func.avg(
+        func.extract("epoch", QueryResponse.created_at - Query.created_at),
+    ).label("v")
+    return await _queries_count_dim(
+        db, client_id, filters, dimension, joined=base, value_col=value_col,
+    )
+
+
+# ── Pundit Scorecard ─────────────────────────────────────────────────
+
+@timed_query("pundit_scorecard")
+async def pundit_scorecard(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> list[dict]:
+    """Per-pundit event counts for the given filter scope.
+
+    Columns per pundit:
+      direct       — receptions where this pundit was FIRST holder
+      forwarded_in — receptions after another pundit forwarded to them
+      responded    — count of QueryResponses authored by this pundit
+      forwarded_out — this pundit forwarded a query away (Primary)
+      returned     — this pundit returned a query (Panel-only lifecycle)
+      expired      — was current holder when the query hit EXPIRED
+      avg_response_seconds — mean response time for their responses
+
+    Each column is scoped to queries matching the same filter chips
+    used by the Queries area (crop / space / severity / pundit /
+    period on Query.created_at). Reception sums ≠ total queries by
+    design — a forwarded query is counted for each pundit.
+
+    Rows are returned sorted by (direct + forwarded_in) DESC. Names +
+    roles are hydrated at the router layer.
+    """
+    # Build the filtered set of query IDs once. All per-pundit event
+    # counts then filter their JOIN to this set — ensures every column
+    # is talking about the SAME queries.
+    scope = _apply_query_filters(_query_scope(client_id), filters).with_only_columns(
+        Query.id.label("qid"),
+    ).subquery()
+
+    # Direct + forwarded_in — decide from QueryRemark row order.
+    # Direct = the RECEIVED remark that has the earliest created_at for
+    # its query. Forwarded_in = all subsequent RECEIVED remarks.
+    rn = func.row_number().over(
+        partition_by=QueryRemark.query_id,
+        order_by=QueryRemark.created_at.asc(),
+    ).label("rn")
+    ranked_received = (
+        select(
+            QueryRemark.pundit_id.label("pundit_id"),
+            rn,
+        )
+        .join(scope, scope.c.qid == QueryRemark.query_id)
+        .where(
+            QueryRemark.action == QueryRemarkAction.RECEIVED,
+            QueryRemark.pundit_id.isnot(None),
+        )
+    ).subquery()
+    receipts_stmt = select(
+        ranked_received.c.pundit_id.label("pundit_id"),
+        func.count().filter(ranked_received.c.rn == 1).label("direct"),
+        func.count().filter(ranked_received.c.rn > 1).label("forwarded_in"),
+    ).group_by(ranked_received.c.pundit_id)
+    receipts_rows = (await db.execute(receipts_stmt)).all()
+
+    # Responded — QueryResponse authored by each pundit + avg time.
+    resp_stmt = (
+        select(
+            QueryResponse.pundit_id.label("pundit_id"),
+            func.count().label("responded"),
+            func.avg(
+                func.extract("epoch", QueryResponse.created_at - Query.created_at),
+            ).label("avg_seconds"),
+        )
+        .select_from(QueryResponse)
+        .join(Query, Query.id == QueryResponse.query_id)
+        .join(scope, scope.c.qid == QueryResponse.query_id)
+        .group_by(QueryResponse.pundit_id)
+    )
+    resp_rows = (await db.execute(resp_stmt)).all()
+
+    # Forwarded out (Primary) and Returned (Panel) — QueryRemark actions.
+    action_stmt = (
+        select(
+            QueryRemark.pundit_id.label("pundit_id"),
+            func.count().filter(
+                QueryRemark.action == QueryRemarkAction.FORWARDED,
+            ).label("forwarded_out"),
+            func.count().filter(
+                QueryRemark.action == QueryRemarkAction.RETURNED,
+            ).label("returned"),
+        )
+        .join(scope, scope.c.qid == QueryRemark.query_id)
+        .where(QueryRemark.pundit_id.isnot(None))
+        .group_by(QueryRemark.pundit_id)
+    )
+    action_rows = (await db.execute(action_stmt)).all()
+
+    # Expired — attribute to whoever was current holder at expiry.
+    expired_stmt = (
+        select(
+            Query.current_holder_id.label("pundit_id"),
+            func.count().label("expired"),
+        )
+        .join(scope, scope.c.qid == Query.id)
+        .where(
+            Query.status == QueryStatus.EXPIRED,
+            Query.current_holder_id.isnot(None),
+        )
+        .group_by(Query.current_holder_id)
+    )
+    expired_rows = (await db.execute(expired_stmt)).all()
+
+    # Merge — union of all pundit_ids seen across the four passes.
+    merged: dict[str, dict] = {}
+    def _row(pid: str) -> dict:
+        if pid not in merged:
+            merged[pid] = {
+                "pundit_id": pid,
+                "direct": 0, "forwarded_in": 0,
+                "responded": 0, "forwarded_out": 0, "returned": 0,
+                "expired": 0,
+                "avg_response_seconds": 0.0,
+            }
+        return merged[pid]
+
+    for r in receipts_rows:
+        row = _row(r.pundit_id)
+        row["direct"] = int(r.direct or 0)
+        row["forwarded_in"] = int(r.forwarded_in or 0)
+    for r in resp_rows:
+        row = _row(r.pundit_id)
+        row["responded"] = int(r.responded or 0)
+        row["avg_response_seconds"] = float(r.avg_seconds or 0)
+    for r in action_rows:
+        row = _row(r.pundit_id)
+        row["forwarded_out"] = int(r.forwarded_out or 0)
+        row["returned"] = int(r.returned or 0)
+    for r in expired_rows:
+        row = _row(r.pundit_id)
+        row["expired"] = int(r.expired or 0)
+
+    return sorted(
+        merged.values(),
+        key=lambda r: -(r["direct"] + r["forwarded_in"]),
+    )

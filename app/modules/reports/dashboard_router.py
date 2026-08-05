@@ -77,6 +77,8 @@ def _build_filters(
     package_id: Optional[str],
     dealer_user_id: Optional[str] = None,
     promoter_user_id: Optional[str] = None,
+    severity: Optional[str] = None,
+    pundit_id: Optional[str] = None,
 ) -> queries.ReportFilters:
     return queries.ReportFilters(
         period_from=period_from,
@@ -87,6 +89,8 @@ def _build_filters(
         package_id=package_id,
         dealer_user_id=dealer_user_id,
         promoter_user_id=promoter_user_id,
+        severity=severity,
+        pundit_id=pundit_id,
     )
 
 
@@ -1245,3 +1249,310 @@ async def promoters_scorecard(
         "leads":            sum(r["leads"] for r in hydrated),
     }
     return {"rows": hydrated, "pooled": pooled}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Queries subject area (Phase 4, 2026-08-05)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_QUERY_METRICS = {"COUNT", "RESPONDED", "AVG_RESPONSE", "SLA_24H", "EXPIRED", "SEVERITY"}
+_QUERY_DIMENSIONS = {"TIME", "SPACE", "CROP"}
+_QUERY_DRILL_METRICS = {"COUNT", "RESPONDED", "EXPIRED", "AVG_RESPONSE"}
+
+
+@router.get("/client/{cid}/reports/queries")
+async def queries_report(
+    cid: str,
+    metric: str = Query(
+        ...,
+        description="COUNT | RESPONDED | AVG_RESPONSE | SLA_24H | EXPIRED | SEVERITY",
+    ),
+    dimension: Optional[str] = Query(
+        None, description="TIME | SPACE | CROP (drill only, for the four countable metrics)",
+    ),
+    period_from: Optional[datetime] = None,
+    period_to: Optional[datetime] = None,
+    crop_cosh_id: Optional[str] = None,
+    state_cosh_id: Optional[str] = None,
+    district_cosh_id: Optional[str] = None,
+    severity: Optional[str] = None,
+    pundit_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Queries subject area — headline metric OR dimension drill.
+
+    Metric shapes (headline, no dimension):
+      COUNT / RESPONDED / EXPIRED   → {"count": int}
+      AVG_RESPONSE                  → {"avg_seconds": float, "responded": int}
+      SLA_24H                       → {"within": int, "total": int, "sla_hours": 24}
+      SEVERITY                      → {"severe": N, "moderate": N, "low": N, "total": N}
+
+    With ``dimension`` set (TIME | SPACE | CROP), only the four countable
+    metrics are valid: COUNT, RESPONDED, EXPIRED, AVG_RESPONSE. Each
+    returns ``[{key, value, label}, ...]``. SLA_24H and SEVERITY are
+    headline-only.
+    """
+    await _assert_client_report_reader(db, current_user, cid)
+    _assert_subject_enabled(cid, "queries")
+
+    filters = _build_filters(
+        period_from, period_to,
+        crop_cosh_id, state_cosh_id, district_cosh_id,
+        None,  # package_id — not used in queries area
+        severity=severity, pundit_id=pundit_id,
+    )
+
+    metric_up = metric.upper()
+    if metric_up not in _QUERY_METRICS:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "unknown_metric", "message": f"Unknown queries metric '{metric}'."},
+        )
+
+    if dimension is None:
+        if metric_up == "COUNT":
+            return await queries.queries_count(db, cid, filters)
+        if metric_up == "RESPONDED":
+            return await queries.queries_responded(db, cid, filters)
+        if metric_up == "AVG_RESPONSE":
+            return await queries.queries_avg_response_seconds(db, cid, filters)
+        if metric_up == "SLA_24H":
+            return await queries.queries_sla_24h(db, cid, filters)
+        if metric_up == "EXPIRED":
+            return await queries.queries_expired(db, cid, filters)
+        return await queries.queries_severity_split(db, cid, filters)
+
+    dim_up = dimension.upper()
+    if dim_up not in _QUERY_DIMENSIONS:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "unknown_dimension", "message": f"Unknown dimension '{dimension}'."},
+        )
+    if metric_up not in _QUERY_DRILL_METRICS:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "metric_no_dimension",
+                "message": f"Metric '{metric}' does not support dimension drill.",
+            },
+        )
+    if metric_up == "COUNT":
+        rows = await queries.queries_count_by_dimension(db, cid, filters, dim_up)
+    elif metric_up == "RESPONDED":
+        rows = await queries.queries_responded_by_dimension(db, cid, filters, dim_up)
+    elif metric_up == "EXPIRED":
+        rows = await queries.queries_expired_by_dimension(db, cid, filters, dim_up)
+    else:
+        rows = await queries.queries_avg_response_by_dimension(db, cid, filters, dim_up)
+    return await _hydrate_dimension_labels(db, rows, dim_up)
+
+
+@router.get("/client/{cid}/reports/queries/pundit-scorecard")
+async def queries_pundit_scorecard(
+    cid: str,
+    period_from: Optional[datetime] = None,
+    period_to: Optional[datetime] = None,
+    crop_cosh_id: Optional[str] = None,
+    state_cosh_id: Optional[str] = None,
+    district_cosh_id: Optional[str] = None,
+    severity: Optional[str] = None,
+    pundit_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Per-pundit row + pooled totals footer.
+
+    Row shape: ``{pundit_id, name, role, direct, forwarded_in,
+    responded, forwarded_out, returned, expired, avg_response_seconds}``.
+    ``role`` is the client-scoped role from ClientFarmPundit — one of
+    PRIMARY / PANEL / PROMOTER_PUNDIT.
+
+    Reception sums (direct + forwarded_in) across rows will NOT equal
+    the total-queries card in the Queries area — a query forwarded is
+    counted on both pundits. Caption on the client caveats this.
+    """
+    await _assert_client_report_reader(db, current_user, cid)
+    _assert_subject_enabled(cid, "queries")
+
+    from app.modules.farmpundit.models import FarmPunditProfile, ClientFarmPundit
+
+    filters = _build_filters(
+        period_from, period_to,
+        crop_cosh_id, state_cosh_id, district_cosh_id,
+        None,
+        severity=severity, pundit_id=pundit_id,
+    )
+    rows = await queries.pundit_scorecard(db, cid, filters)
+    if not rows:
+        return {"rows": [], "pooled": None}
+
+    # Hydrate pundit_id → (user_id, name, role) in one batch.
+    pundit_ids = [r["pundit_id"] for r in rows if r.get("pundit_id")]
+    hydrated: list[dict] = []
+    if pundit_ids:
+        info_rows = (await db.execute(
+            select(
+                FarmPunditProfile.id.label("profile_id"),
+                User.name.label("name"),
+                ClientFarmPundit.role.label("role"),
+            )
+            .join(User, User.id == FarmPunditProfile.user_id)
+            .outerjoin(
+                ClientFarmPundit,
+                (ClientFarmPundit.pundit_id == FarmPunditProfile.id)
+                & (ClientFarmPundit.client_id == cid),
+            )
+            .where(FarmPunditProfile.id.in_(pundit_ids))
+        )).all()
+        info = {
+            i.profile_id: {"name": i.name or "(unnamed)", "role": i.role or None}
+            for i in info_rows
+        }
+        for r in rows:
+            meta = info.get(r["pundit_id"], {"name": "(unknown)", "role": None})
+            hydrated.append({
+                **r,
+                "name": meta["name"],
+                "role": meta["role"],
+                "avg_response_seconds": round(r["avg_response_seconds"], 1),
+            })
+
+    # Pooled row — reception sums honestly may exceed distinct-queries
+    # totals (that's the whole point of the caption on the frontend).
+    pooled = {
+        "pundit_id": None,
+        "name":              "All pundits",
+        "role":              None,
+        "direct":            sum(r["direct"] for r in hydrated),
+        "forwarded_in":      sum(r["forwarded_in"] for r in hydrated),
+        "responded":         sum(r["responded"] for r in hydrated),
+        "forwarded_out":     sum(r["forwarded_out"] for r in hydrated),
+        "returned":          sum(r["returned"] for r in hydrated),
+        "expired":           sum(r["expired"] for r in hydrated),
+        # Pooled avg response — mean of per-pundit means weighted by
+        # responded count. Falls back to 0 when no responses.
+        "avg_response_seconds": round(
+            (sum(r["avg_response_seconds"] * r["responded"] for r in hydrated)
+             / max(1, sum(r["responded"] for r in hydrated))),
+            1,
+        ),
+    }
+    return {"rows": hydrated, "pooled": pooled}
+
+
+@router.get("/client/{cid}/reports/queries/filter-options")
+async def queries_filter_options(
+    cid: str,
+    crop_cosh_id: Optional[str] = None,
+    state_cosh_id: Optional[str] = None,
+    district_cosh_id: Optional[str] = None,
+    severity: Optional[str] = None,
+    pundit_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cascading chip options for the Queries page.
+
+    Same cascade behaviour as the shared /filter-options: every chip's
+    list is the intersection of the OTHER chips' current values. A chip
+    never narrows itself.
+
+    Scoped to Query rows (not Subscription rows) — so ``crops`` here
+    means "crops that have at least one query in this client", which
+    won't match the shared endpoint's Subscription-based crops list.
+    """
+    await _assert_client_report_reader(db, current_user, cid)
+
+    from app.modules.farmpundit.models import (
+        Query as QueryModel, QueryRemark, FarmPunditProfile,
+    )
+
+    def scoped(exclude: str):
+        stmt = queries._query_scope(cid)
+        stmt = stmt.join(User, User.id == QueryModel.farmer_user_id, isouter=False)
+        if exclude != 'crop' and crop_cosh_id:
+            stmt = stmt.where(QueryModel.crop_cosh_id == crop_cosh_id)
+        if exclude != 'state' and state_cosh_id:
+            stmt = stmt.where(User.state_cosh_id == state_cosh_id)
+        if exclude != 'district' and district_cosh_id:
+            stmt = stmt.where(User.district_cosh_id == district_cosh_id)
+        if exclude != 'severity' and severity:
+            stmt = stmt.where(QueryModel.severity == severity)
+        if exclude != 'pundit' and pundit_id:
+            stmt = stmt.where(
+                select(QueryRemark.id).where(
+                    QueryRemark.query_id == QueryModel.id,
+                    QueryRemark.pundit_id == pundit_id,
+                ).exists()
+            )
+        return stmt
+
+    crop_ids = [
+        r[0] for r in (await db.execute(
+            scoped('crop').with_only_columns(QueryModel.crop_cosh_id).distinct()
+        )).all() if r[0]
+    ]
+    state_ids = [
+        r[0] for r in (await db.execute(
+            scoped('state').with_only_columns(User.state_cosh_id).distinct()
+        )).all() if r[0]
+    ]
+    district_ids = [
+        r[0] for r in (await db.execute(
+            scoped('district').with_only_columns(User.district_cosh_id).distinct()
+        )).all() if r[0]
+    ]
+
+    # Pundits — distinct pundits who ever touched a query in the
+    # intersection of the OTHER chips. Cascades naturally.
+    scoped_pundit = scoped('pundit').join(
+        QueryRemark, QueryRemark.query_id == QueryModel.id,
+    )
+    pundit_profile_ids = [
+        r[0] for r in (await db.execute(
+            scoped_pundit.with_only_columns(QueryRemark.pundit_id).distinct()
+        )).all() if r[0]
+    ]
+    pundit_rows = (await db.execute(
+        select(FarmPunditProfile.id, User.name)
+        .join(User, User.id == FarmPunditProfile.user_id)
+        .where(FarmPunditProfile.id.in_(pundit_profile_ids))
+    )).all() if pundit_profile_ids else []
+    pundits = sorted(
+        [{"id": r.id, "name": r.name or "(unnamed)"} for r in pundit_rows],
+        key=lambda o: o["name"].lower(),
+    )
+
+    # Severity — static three (only the standard values are exposed as
+    # chip options; legacy rows with other values just don't get a chip
+    # bucket). No cascade needed for the values themselves; we still
+    # optionally intersect to "severities that have at least one row"
+    # so an empty-scope client doesn't see all three when only some
+    # are used.
+    scoped_sev = scoped('severity').with_only_columns(QueryModel.severity).distinct()
+    present = {r[0] for r in (await db.execute(scoped_sev)).all() if r[0]}
+    severities = [
+        {"id": s, "name": s.title()}
+        for s in QUERY_SEVERITIES_ORDERED
+        if s in present or not present   # empty scope → show all three
+    ]
+
+    cosh_names = await _cosh_names(db, crop_ids + state_ids + district_ids)
+
+    def _pack(ids: list[str]) -> list[dict]:
+        return sorted(
+            [{"id": i, "name": cosh_names.get(i, i)} for i in ids],
+            key=lambda o: o["name"].lower(),
+        )
+
+    return {
+        "crops":      _pack(crop_ids),
+        "states":     _pack(state_ids),
+        "districts":  _pack(district_ids),
+        "severities": severities,
+        "pundits":    pundits,
+    }
+
+
+QUERY_SEVERITIES_ORDERED = ["SEVERE", "MODERATE", "LOW"]
