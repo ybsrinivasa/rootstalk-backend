@@ -3763,7 +3763,7 @@ from app.modules.farmpundit.models import (
 )
 
 
-QUERY_SEVERITIES = ["SEVERE", "MODERATE", "LOW"]
+QUERY_SEVERITIES = ["CRITICAL", "HIGH", "MODERATE", "LOW"]
 _SLA_HOURS = 24
 
 
@@ -3907,26 +3907,31 @@ async def queries_severity_split(
 ) -> dict:
     """Count of queries per severity in scope.
 
-    Returns ``{severe: N, moderate: N, low: N, total: N}``. Any severity
-    values outside the standard three roll into ``total`` but not into
-    the named buckets — legacy rows without a set severity thus don't
-    poison the primary split display."""
+    Returns ``{critical, high, moderate, low, other, total}``.
+    Farmer-facing UI has four severity buttons — CRITICAL / HIGH /
+    MODERATE / LOW — reflected here 1:1 so the split reconciles with
+    Total Queries. Any legacy value outside these four rolls into
+    ``other`` so the reader can see the miss."""
     stmt = _apply_query_filters(_query_scope(client_id), filters).with_only_columns(
         Query.severity.label("severity"),
         func.count(Query.id).label("count"),
     ).group_by(Query.severity)
     rows = (await db.execute(stmt)).all()
-    out = {"severe": 0, "moderate": 0, "low": 0, "total": 0}
+    out = {"critical": 0, "high": 0, "moderate": 0, "low": 0, "other": 0, "total": 0}
     for r in rows:
         sev = (r.severity or "").upper()
         c = int(r.count or 0)
         out["total"] += c
-        if sev == "SEVERE":
-            out["severe"] = c
+        if sev == "CRITICAL":
+            out["critical"] = c
+        elif sev == "HIGH":
+            out["high"] = c
         elif sev == "MODERATE":
             out["moderate"] = c
         elif sev == "LOW":
             out["low"] = c
+        else:
+            out["other"] += c
     return out
 
 

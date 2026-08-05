@@ -1555,4 +1555,4 @@ async def queries_filter_options(
     }
 
 
-QUERY_SEVERITIES_ORDERED = ["SEVERE", "MODERATE", "LOW"]
+QUERY_SEVERITIES_ORDERED = ["CRITICAL", "HIGH", "MODERATE", "LOW"]
