@@ -76,6 +76,7 @@ def _build_filters(
     district_cosh_id: Optional[str],
     package_id: Optional[str],
     dealer_user_id: Optional[str] = None,
+    promoter_user_id: Optional[str] = None,
 ) -> queries.ReportFilters:
     return queries.ReportFilters(
         period_from=period_from,
@@ -85,6 +86,7 @@ def _build_filters(
         district_cosh_id=district_cosh_id,
         package_id=package_id,
         dealer_user_id=dealer_user_id,
+        promoter_user_id=promoter_user_id,
     )
 
 
@@ -126,6 +128,7 @@ async def filter_options(
     district_cosh_id: Optional[str] = None,
     package_id: Optional[str] = None,
     dealer_user_id: Optional[str] = None,
+    promoter_user_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -175,6 +178,8 @@ async def filter_options(
             stmt = stmt.where(Subscription.package_id == package_id)
         if exclude != 'dealer' and dealer_user_id:
             stmt = stmt.where(Order.dealer_user_id == dealer_user_id)
+        if exclude != 'promoter' and promoter_user_id:
+            stmt = stmt.where(Subscription.promoter_user_id == promoter_user_id)
         return stmt
 
     crop_ids = [
@@ -268,6 +273,22 @@ async def filter_options(
         key=lambda o: o["name"].lower(),
     )
 
+    # Promoters — every distinct promoter_user_id on a subscription in
+    # the intersection of the OTHER chips. NULL (no promoter) drops out.
+    # Names come from users.name; the CA UI shows the plain name.
+    promoter_ids = [
+        r[0] for r in (await db.execute(
+            scoped('promoter').with_only_columns(Subscription.promoter_user_id).distinct()
+        )).all() if r[0]
+    ]
+    promoter_rows = (await db.execute(
+        select(User.id, User.name).where(User.id.in_(promoter_ids))
+    )).all() if promoter_ids else []
+    promoters = sorted(
+        [{"id": r.id, "name": r.name or "(unnamed)"} for r in promoter_rows],
+        key=lambda o: o["name"].lower(),
+    )
+
     cosh_names = await _cosh_names(db, crop_ids + state_ids + district_ids)
 
     def _pack(ids: list[str]) -> list[dict]:
@@ -282,6 +303,7 @@ async def filter_options(
         "districts": _pack(district_ids),
         "packages":  [{"id": p.id, "name": p.name} for p in package_rows],
         "dealers":   dealers,
+        "promoters": promoters,
     }
 
 
@@ -1082,3 +1104,144 @@ async def orders_csv(
         f'attachment; filename="{_csv_filename(cid, "orders")}"'
     )
     return resp
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Promoters subject area (Phase 3, 2026-08-05)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_PROMOTER_METRICS = {"ACTIVE", "SUBSCRIPTIONS", "ACRES", "LEADS"}
+_PROMOTER_DIMENSIONS = {"TIME", "SPACE", "CROP"}
+
+
+@router.get("/client/{cid}/reports/promoters")
+async def promoters_report(
+    cid: str,
+    metric: str = Query(
+        ...,
+        description=(
+            "ACTIVE | SUBSCRIPTIONS | ACRES | LEADS — headline OR dimension drill"
+        ),
+    ),
+    dimension: Optional[str] = Query(
+        None, description="TIME | SPACE | CROP (drill only)",
+    ),
+    period_from: Optional[datetime] = None,
+    period_to: Optional[datetime] = None,
+    crop_cosh_id: Optional[str] = None,
+    state_cosh_id: Optional[str] = None,
+    district_cosh_id: Optional[str] = None,
+    package_id: Optional[str] = None,
+    promoter_user_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Promoters subject area — headline metric OR TIME/SPACE/CROP drill.
+
+    Metric shapes:
+      ACTIVE / SUBSCRIPTIONS / LEADS  → {"count"|"leads": <int>}
+      ACRES                           → {"acres": <float>}
+
+    Attribution: Subscription.promoter_user_id (nullable) — subs with
+    NULL promoter drop out of every promoter metric. Leads follow the
+    Sales lead definition (ORDER_LEAD_STATUSES + ITEM_EXCLUDED_STATUSES)
+    so cross-report comparisons stay honest.
+    """
+    await _assert_client_report_reader(db, current_user, cid)
+    _assert_subject_enabled(cid, "promoters")
+
+    filters = _build_filters(
+        period_from, period_to,
+        crop_cosh_id, state_cosh_id, district_cosh_id, package_id,
+        promoter_user_id=promoter_user_id,
+    )
+
+    metric_up = metric.upper()
+    if metric_up not in _PROMOTER_METRICS:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "unknown_metric",
+                "message": f"Unknown promoters metric '{metric}'.",
+            },
+        )
+
+    if dimension is None:
+        if metric_up == "ACTIVE":
+            return await queries.promoters_active(db, cid, filters)
+        if metric_up == "SUBSCRIPTIONS":
+            return await queries.subscriptions_promoted(db, cid, filters)
+        if metric_up == "ACRES":
+            return await queries.acres_promoted(db, cid, filters)
+        return await queries.promoters_leads(db, cid, filters)
+
+    dim_up = dimension.upper()
+    if dim_up not in _PROMOTER_DIMENSIONS:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "unknown_dimension",
+                "message": f"Unknown dimension '{dimension}'.",
+            },
+        )
+    if metric_up == "ACTIVE":
+        rows = await queries.promoters_active_by_dimension(db, cid, filters, dim_up)
+    elif metric_up == "SUBSCRIPTIONS":
+        rows = await queries.subscriptions_promoted_by_dimension(db, cid, filters, dim_up)
+    elif metric_up == "ACRES":
+        rows = await queries.acres_promoted_by_dimension(db, cid, filters, dim_up)
+    else:
+        rows = await queries.promoters_leads_by_dimension(db, cid, filters, dim_up)
+    return await _hydrate_dimension_labels(db, rows, dim_up)
+
+
+@router.get("/client/{cid}/reports/promoters/scorecard")
+async def promoters_scorecard(
+    cid: str,
+    period_from: Optional[datetime] = None,
+    period_to: Optional[datetime] = None,
+    crop_cosh_id: Optional[str] = None,
+    state_cosh_id: Optional[str] = None,
+    district_cosh_id: Optional[str] = None,
+    package_id: Optional[str] = None,
+    promoter_user_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Per-promoter scorecard rows + pooled totals footer.
+
+    Row shape: {promoter_user_id, name, subscriptions, acres, leads}.
+    Pooled row uses promoter_user_id = None and name = "All promoters"
+    so the frontend can render it separately without a special flag.
+    """
+    await _assert_client_report_reader(db, current_user, cid)
+    _assert_subject_enabled(cid, "promoters")
+
+    filters = _build_filters(
+        period_from, period_to,
+        crop_cosh_id, state_cosh_id, district_cosh_id, package_id,
+        promoter_user_id=promoter_user_id,
+    )
+    rows = await queries.promoter_scorecard(db, cid, filters)
+    if not rows:
+        return {"rows": [], "pooled": None}
+
+    # Hydrate names in one batch.
+    ids = [r["promoter_user_id"] for r in rows if r.get("promoter_user_id")]
+    name_rows = (await db.execute(
+        select(User.id, User.name).where(User.id.in_(ids))
+    )).all() if ids else []
+    names = {r.id: (r.name or "(unnamed)") for r in name_rows}
+    hydrated = [
+        {**r, "name": names.get(r["promoter_user_id"], "(unnamed)")}
+        for r in rows
+    ]
+
+    pooled = {
+        "promoter_user_id": None,
+        "name":             "All promoters",
+        "subscriptions":    sum(r["subscriptions"] for r in hydrated),
+        "acres":            round(sum(r["acres"] for r in hydrated), 2),
+        "leads":            sum(r["leads"] for r in hydrated),
+    }
+    return {"rows": hydrated, "pooled": pooled}

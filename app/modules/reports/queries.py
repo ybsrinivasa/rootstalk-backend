@@ -174,6 +174,8 @@ def _apply_filters(stmt: Select, filters: "ReportFilters") -> Select:
             stmt = stmt.where(User.district_cosh_id == filters.district_cosh_id)
     if filters.package_id:
         stmt = stmt.where(Subscription.package_id == filters.package_id)
+    if filters.promoter_user_id:
+        stmt = stmt.where(Subscription.promoter_user_id == filters.promoter_user_id)
     return stmt
 
 
@@ -199,6 +201,10 @@ class ReportFilters:
         # the OrderItem / PackingList level via the dealer_user_id on
         # the parent Order.
         "dealer_user_id",
+        # Phase 3 (Promoters) — filter to one promoter. Applies on
+        # Subscription.promoter_user_id, so it works on any query
+        # that already runs through _apply_filters.
+        "promoter_user_id",
     )
 
     def __init__(
@@ -210,6 +216,7 @@ class ReportFilters:
         district_cosh_id: Optional[str] = None,
         package_id: Optional[str] = None,
         dealer_user_id: Optional[str] = None,
+        promoter_user_id: Optional[str] = None,
     ) -> None:
         self.period_from = period_from
         self.period_to = period_to
@@ -218,6 +225,7 @@ class ReportFilters:
         self.district_cosh_id = district_cosh_id
         self.package_id = package_id
         self.dealer_user_id = dealer_user_id
+        self.promoter_user_id = promoter_user_id
 
 
 # ── Subscriptions subject area ────────────────────────────────────────────────
@@ -3461,3 +3469,253 @@ async def _matrix_seed_row_leads(
     stmt = _apply_seed_chip_filters(stmt, filters)
     rows = (await db.execute(stmt)).all()
     return {r.key: {"leads": int(r.leads or 0), "converted": int(r.converted or 0)} for r in rows}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Promoters subject area (Phase 3, 2026-08-05)
+# ═══════════════════════════════════════════════════════════════════════════
+# Attribution: Subscription.promoter_user_id (nullable). Every promoter
+# metric filters `promoter_user_id IS NOT NULL` at the scope layer.
+# Period is applied on Subscription.subscription_date for the three
+# subscription-shape metrics; the Leads metric applies period on
+# Order.created_at (matches Sales lead semantics).
+#
+# A promoter can be enrolled with multiple clients — every scope stays
+# client-scoped so the count reflects THIS client's activity only.
+
+def _promoter_scope(client_id: str) -> Select:
+    """Subscription scope narrowed to subs that HAVE a promoter."""
+    return _subscription_scope(client_id).where(
+        Subscription.promoter_user_id.isnot(None),
+    )
+
+
+def _apply_promoter_period(stmt: Select, filters: ReportFilters) -> Select:
+    """Period filter on Subscription.subscription_date for the three
+    subscription-shape metrics (active / count / acres)."""
+    if filters.period_from is not None:
+        stmt = stmt.where(Subscription.subscription_date >= filters.period_from)
+    if filters.period_to is not None:
+        stmt = stmt.where(Subscription.subscription_date < filters.period_to)
+    return stmt
+
+
+@timed_query("promoters_active")
+async def promoters_active(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> dict:
+    """Distinct promoters with at least one subscription in the period."""
+    stmt = _apply_promoter_period(
+        _apply_filters(_promoter_scope(client_id), filters), filters,
+    ).with_only_columns(
+        func.count(func.distinct(Subscription.promoter_user_id)).label("count"),
+    )
+    n = (await db.execute(stmt)).scalar_one_or_none() or 0
+    return {"count": int(n)}
+
+
+@timed_query("subscriptions_promoted")
+async def subscriptions_promoted(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> dict:
+    """Count of subscriptions with a promoter attributed in the period."""
+    stmt = _apply_promoter_period(
+        _apply_filters(_promoter_scope(client_id), filters), filters,
+    ).with_only_columns(
+        func.count(Subscription.id).label("count"),
+    )
+    n = (await db.execute(stmt)).scalar_one_or_none() or 0
+    return {"count": int(n)}
+
+
+@timed_query("acres_promoted")
+async def acres_promoted(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> dict:
+    """Sum of Subscription.farm_area_acres for promoter-attributed subs.
+    NULLs (plant-wise crops or unset area) contribute 0."""
+    stmt = _apply_promoter_period(
+        _apply_filters(_promoter_scope(client_id), filters), filters,
+    ).with_only_columns(
+        func.coalesce(func.sum(Subscription.farm_area_acres), 0).label("acres"),
+    )
+    v = (await db.execute(stmt)).scalar_one_or_none() or 0
+    return {"acres": float(v)}
+
+
+@timed_query("promoters_leads")
+async def promoters_leads(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> dict:
+    """Order-item leads generated on subscriptions attributed to a
+    promoter. Same lead definition as Sales (ORDER_LEAD_STATUSES,
+    ITEM_EXCLUDED_STATUSES) so the two numbers are directly
+    comparable."""
+    base = _leads_scope(client_id).where(
+        Subscription.promoter_user_id.isnot(None),
+    )
+    stmt = _apply_leads_filters(base, filters).with_only_columns(
+        func.count(func.distinct(OrderItem.id)).label("leads"),
+    )
+    n = (await db.execute(stmt)).scalar_one_or_none() or 0
+    return {"leads": int(n)}
+
+
+# ── Dimension drills ────────────────────────────────────────────────────
+
+def _group_promoter_sub_dim(
+    stmt: Select, dimension: str, filters: ReportFilters, value_col,
+) -> Select:
+    """Shared dim-grouping for the subscription-shape metrics.
+    `value_col` is the aggregate column (COUNT, SUM, COUNT DISTINCT)
+    labelled 'v'; caller picks the aggregation."""
+    dim = dimension.upper()
+    if dim == "TIME":
+        bucket = _pick_time_bucket(filters.period_from, filters.period_to)
+        bucket_col = func.date_trunc(bucket, Subscription.subscription_date).label("key")
+        return stmt.with_only_columns(bucket_col, value_col).where(
+            Subscription.subscription_date.is_not(None),
+        ).group_by(bucket_col).order_by(bucket_col.asc())
+    if dim == "SPACE":
+        stmt = stmt.join(User, User.id == Subscription.farmer_user_id, isouter=False)
+        return stmt.with_only_columns(
+            User.state_cosh_id.label("key"), value_col,
+        ).group_by(User.state_cosh_id).order_by(value_col.desc())
+    if dim == "CROP":
+        stmt = stmt.join(Package, Package.id == Subscription.package_id, isouter=False)
+        return stmt.with_only_columns(
+            Package.crop_cosh_id.label("key"), value_col,
+        ).group_by(Package.crop_cosh_id).order_by(value_col.desc())
+    raise ValueError(f"Unknown dimension: {dimension!r}")
+
+
+@timed_query("promoters_active_by_dimension")
+async def promoters_active_by_dimension(
+    db: AsyncSession, client_id: str, filters: ReportFilters, dimension: str,
+) -> list[dict]:
+    base = _apply_promoter_period(
+        _apply_filters(_promoter_scope(client_id), filters), filters,
+    )
+    value_col = func.count(func.distinct(Subscription.promoter_user_id)).label("v")
+    stmt = _group_promoter_sub_dim(base, dimension, filters, value_col)
+    rows = (await db.execute(stmt)).all()
+    return [{"key": r.key, "value": int(r.v or 0)} for r in rows]
+
+
+@timed_query("subscriptions_promoted_by_dimension")
+async def subscriptions_promoted_by_dimension(
+    db: AsyncSession, client_id: str, filters: ReportFilters, dimension: str,
+) -> list[dict]:
+    base = _apply_promoter_period(
+        _apply_filters(_promoter_scope(client_id), filters), filters,
+    )
+    value_col = func.count(Subscription.id).label("v")
+    stmt = _group_promoter_sub_dim(base, dimension, filters, value_col)
+    rows = (await db.execute(stmt)).all()
+    return [{"key": r.key, "value": int(r.v or 0)} for r in rows]
+
+
+@timed_query("acres_promoted_by_dimension")
+async def acres_promoted_by_dimension(
+    db: AsyncSession, client_id: str, filters: ReportFilters, dimension: str,
+) -> list[dict]:
+    base = _apply_promoter_period(
+        _apply_filters(_promoter_scope(client_id), filters), filters,
+    )
+    value_col = func.coalesce(func.sum(Subscription.farm_area_acres), 0).label("v")
+    stmt = _group_promoter_sub_dim(base, dimension, filters, value_col)
+    rows = (await db.execute(stmt)).all()
+    return [{"key": r.key, "value": float(r.v or 0)} for r in rows]
+
+
+@timed_query("promoters_leads_by_dimension")
+async def promoters_leads_by_dimension(
+    db: AsyncSession, client_id: str, filters: ReportFilters, dimension: str,
+) -> list[dict]:
+    """Leads dimension for the Promoters area. Groups on Order.created_at
+    for TIME (matches _apply_leads_filters period column) so the trend
+    lines up with when leads arrived, not when subs were started."""
+    base = _leads_scope(client_id).where(
+        Subscription.promoter_user_id.isnot(None),
+    )
+    base = _apply_leads_filters(base, filters)
+    value_col = func.count(func.distinct(OrderItem.id)).label("v")
+    dim = dimension.upper()
+    if dim == "TIME":
+        bucket = _pick_time_bucket(filters.period_from, filters.period_to)
+        bucket_col = func.date_trunc(bucket, Order.created_at).label("key")
+        stmt = base.with_only_columns(bucket_col, value_col).where(
+            Order.created_at.isnot(None),
+        ).group_by(bucket_col).order_by(bucket_col.asc())
+    elif dim == "SPACE":
+        # User is already joined by _apply_leads_filters when state/district
+        # filter is set — otherwise we need to join it here for the SPACE
+        # grouping. Idempotent join via existence check would be cleaner;
+        # for now a plain join is fine because base doesn't touch User.
+        if not filters.state_cosh_id and not filters.district_cosh_id:
+            base = base.join(User, User.id == Subscription.farmer_user_id)
+        stmt = base.with_only_columns(
+            User.state_cosh_id.label("key"), value_col,
+        ).group_by(User.state_cosh_id).order_by(value_col.desc())
+    elif dim == "CROP":
+        if not filters.crop_cosh_id:
+            base = base.join(Package, Package.id == Subscription.package_id)
+        stmt = base.with_only_columns(
+            Package.crop_cosh_id.label("key"), value_col,
+        ).group_by(Package.crop_cosh_id).order_by(value_col.desc())
+    else:
+        raise ValueError(f"Unknown dimension: {dimension!r}")
+    rows = (await db.execute(stmt)).all()
+    return [{"key": r.key, "value": int(r.v or 0)} for r in rows]
+
+
+# ── Promoter Scorecard ──────────────────────────────────────────────────
+
+@timed_query("promoter_scorecard")
+async def promoter_scorecard(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+) -> list[dict]:
+    """Per-promoter table: {promoter_user_id, subscriptions, acres, leads}.
+    Leads are computed in a separate query and merged in Python because
+    they use a different period column (Order.created_at) than the
+    subscription-shape metrics (Subscription.subscription_date). Pooling
+    is done at the endpoint layer along with name hydration."""
+    sub_stmt = _apply_promoter_period(
+        _apply_filters(_promoter_scope(client_id), filters), filters,
+    ).with_only_columns(
+        Subscription.promoter_user_id.label("promoter_user_id"),
+        func.count(Subscription.id).label("subscriptions"),
+        func.coalesce(func.sum(Subscription.farm_area_acres), 0).label("acres"),
+    ).group_by(Subscription.promoter_user_id)
+    sub_rows = (await db.execute(sub_stmt)).all()
+
+    leads_base = _leads_scope(client_id).where(
+        Subscription.promoter_user_id.isnot(None),
+    )
+    leads_base = _apply_leads_filters(leads_base, filters)
+    leads_stmt = leads_base.with_only_columns(
+        Subscription.promoter_user_id.label("promoter_user_id"),
+        func.count(func.distinct(OrderItem.id)).label("leads"),
+    ).group_by(Subscription.promoter_user_id)
+    leads_rows = (await db.execute(leads_stmt)).all()
+
+    merged: dict[str, dict] = {}
+    for r in sub_rows:
+        merged[r.promoter_user_id] = {
+            "promoter_user_id": r.promoter_user_id,
+            "subscriptions":   int(r.subscriptions or 0),
+            "acres":           float(r.acres or 0),
+            "leads":           0,
+        }
+    for r in leads_rows:
+        pid = r.promoter_user_id
+        if pid not in merged:
+            merged[pid] = {
+                "promoter_user_id": pid,
+                "subscriptions":   0,
+                "acres":           0.0,
+                "leads":           int(r.leads or 0),
+            }
+        else:
+            merged[pid]["leads"] = int(r.leads or 0)
+    return sorted(merged.values(), key=lambda r: -r["subscriptions"])
