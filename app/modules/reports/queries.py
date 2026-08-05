@@ -3267,7 +3267,7 @@ async def sales_seed_leads_by_dimension(
     return [_shape_leads_row(r._mapping) for r in rows]
 
 
-def _merge_leads_dim_rows(a: list[dict], b: list[dict]) -> list[dict]:
+def _merge_leads_dim_rows(a: list[dict], b: list[dict], dimension: str = "") -> list[dict]:
     merged: dict = {}
     for src in (a, b):
         for r in src:
@@ -3282,6 +3282,11 @@ def _merge_leads_dim_rows(a: list[dict], b: list[dict]) -> list[dict]:
                 for extra in ("package_name",):
                     if extra in r and extra not in merged[key]:
                         merged[key][extra] = r[extra]
+    # TIME must stay chronological — sorting by leads DESC destroys the
+    # trend chart's x-axis order. Everything else stays leads-DESC so
+    # the drill panel keeps its "biggest first" reading.
+    if dimension.upper() == "TIME":
+        return sorted(merged.values(), key=lambda r: r["key"] or 0)
     return sorted(merged.values(), key=lambda r: -r["leads"])
 
 

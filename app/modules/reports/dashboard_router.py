@@ -586,7 +586,7 @@ async def sales_report(
         seed = await queries.sales_seed_leads_by_dimension(
             db, cid, filters, dim_up, locked_only=True,
         )
-        rows = queries._merge_leads_dim_rows(pf, seed)
+        rows = queries._merge_leads_dim_rows(pf, seed, dim_up)
     elif metric_up == "RECOMMENDED":
         rows = await queries.sales_recommended_leads_by_dimension(db, cid, filters, dim_up)
     elif metric_up == "OPEN":
@@ -596,7 +596,7 @@ async def sales_report(
         seed = await queries.sales_seed_leads_by_dimension(
             db, cid, filters, dim_up, locked_only=False,
         )
-        rows = queries._merge_leads_dim_rows(pf, seed)
+        rows = queries._merge_leads_dim_rows(pf, seed, dim_up)
     else:
         raise HTTPException(
             status_code=422,
