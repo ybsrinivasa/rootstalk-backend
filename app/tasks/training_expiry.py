@@ -472,6 +472,20 @@ async def _cascade_delete_training_child(
     await db.execute(
         delete(ClientUser).where(ClientUser.client_id == cid)
     )
+    # CMClientAssignment — a SA-portal CM-assignment can point at any
+    # ACTIVE client, including a training child (the picker doesn't
+    # filter training out today, 2026-08-09). Without this delete the
+    # Client row delete hits a FK violation from
+    # `cm_client_assignments_client_id_fkey`. Caught 2026-08-09 when
+    # the CA hit "End Session Now" on a Kalyan RamaRajya training child
+    # that had a stray CM assignment.
+    try:
+        from app.modules.clients.models import CMClientAssignment
+        await db.execute(
+            delete(CMClientAssignment).where(CMClientAssignment.client_id == cid)
+        )
+    except ImportError:
+        pass
 
     # ── Layer 9: ClientPromoter + ClientLocation + ClientCrop ─────
     await db.execute(

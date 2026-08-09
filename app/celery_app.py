@@ -42,6 +42,7 @@ celery_app = Celery(
         "app.tasks.postpone_expiry",
         "app.tasks.timeline_archive",
         "app.tasks.translate_content",
+        "app.tasks.training_expiry",
     ],
 )
 
