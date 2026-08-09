@@ -6277,9 +6277,14 @@ async def nearby_dealers_for_farmer(
         )).scalars().all()
         onboarded_dealer_ids = set(onboarded_rows)
 
-    # Training Dealer widens the allow-list by one when the sub is on
-    # a training-child client. Pinned first in the sort below so the
-    # CA's demo target always surfaces regardless of distance.
+    # Training Dealer EXCLUSIVITY (2026-08-09): when the sub is on a
+    # training-child client and the CA has designated a Training Dealer,
+    # the picker returns ONLY that dealer — the whole point of the slot
+    # is to isolate training orders from the client's real dealers. If
+    # no Training Dealer is designated, we fall through to the normal
+    # picker (onboarded real dealers) and training orders route through
+    # them like today — the "Training" pill in the dealer PWA already
+    # marks them as training.
     training_dealer_user_id: Optional[str] = None
     if sub.client_id != brand_lock_client_id and sub.client_id:
         from app.modules.clients.models import Client as _Client
@@ -6287,8 +6292,36 @@ async def nearby_dealers_for_farmer(
             select(_Client.training_dealer_user_id)
             .where(_Client.id == sub.client_id, _Client.is_training == True)  # noqa: E712
         )).scalar_one_or_none()
-    if training_dealer_user_id and onboarded_dealer_ids is not None:
-        onboarded_dealer_ids = onboarded_dealer_ids | {training_dealer_user_id}
+
+    if training_dealer_user_id:
+        td_profile = (await db.execute(
+            select(DealerProfile).where(DealerProfile.user_id == training_dealer_user_id)
+        )).scalar_one_or_none()
+        if td_profile and td_profile.shop_gps_lat and td_profile.shop_gps_lng:
+            td_user = (await db.execute(
+                select(User).where(User.id == training_dealer_user_id)
+            )).scalar_one_or_none()
+            if td_user:
+                dist = _haversine_sub(
+                    farmer_lat, farmer_lng,
+                    float(td_profile.shop_gps_lat), float(td_profile.shop_gps_lng),
+                )
+                return [{
+                    "user_id": td_user.id,
+                    "name": td_user.name,
+                    "phone": td_user.phone,
+                    "shop_name": td_profile.shop_name,
+                    "shop_address": td_profile.shop_address,
+                    "sell_categories": td_profile.sell_categories or [],
+                    "distance_km": round(dist, 1),
+                    "is_promoter": td_user.id == promoter_user_id,
+                    "is_training_dealer": True,
+                    "shop_gps_lat": float(td_profile.shop_gps_lat),
+                    "shop_gps_lng": float(td_profile.shop_gps_lng),
+                }]
+        # Rare: Training Dealer id set but their profile is gone or
+        # missing GPS — fall through to the normal picker so the farmer
+        # isn't stuck with an empty list.
 
     profiles = (await db.execute(select(DealerProfile))).scalars().all()
     results = []
@@ -6312,16 +6345,14 @@ async def nearby_dealers_for_farmer(
                 "sell_categories": profile.sell_categories or [],
                 "distance_km": round(dist, 1),
                 "is_promoter": dealer.id == promoter_user_id,
-                "is_training_dealer": dealer.id == training_dealer_user_id,
+                "is_training_dealer": False,
                 "shop_gps_lat": float(profile.shop_gps_lat),
                 "shop_gps_lng": float(profile.shop_gps_lng),
             })
 
-    # Training Dealer > Promoter > distance. Guarantees the CA's
-    # demo target and the sub's Promoter both surface even when
-    # further away than five other candidates.
+    # Promoter > distance. (Training Dealer exclusivity is handled
+    # by the early return above, so this sort never mixes the two.)
     results.sort(key=lambda x: (
-        0 if x.get("is_training_dealer") else 1,
         0 if x["is_promoter"] else 1,
         x["distance_km"],
     ))

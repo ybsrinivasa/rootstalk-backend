@@ -9874,46 +9874,73 @@ async def _build_eligible_recipients_payload(
     onboarded_dealer_ids = {cp.user_id for cp in promoter_rows if cp.promoter_type == "DEALER"}
     onboarded_facilitator_ids = {cp.user_id for cp in promoter_rows if cp.promoter_type == "FACILITATOR"}
 
-    # Training Dealer folds into the same dealer id-set as the
-    # onboarded ones for the fetch below; the is_training_dealer flag
-    # is stamped when materialising each row so the PWA can render a
-    # "Training" chip. Licence-category check still applies.
-    dealer_ids_to_fetch = set(onboarded_dealer_ids)
-    if training_dealer_user_id:
-        dealer_ids_to_fetch.add(training_dealer_user_id)
-
+    # Training Dealer EXCLUSIVITY (2026-08-09): when a Training Dealer
+    # is designated on a training-child client, the dealer list returns
+    # ONLY that dealer — the slot exists so training orders don't leak
+    # to the client's real dealers. If no Training Dealer is set, the
+    # dealer list falls through to real onboarded dealers (they still
+    # get training orders under the "Training" pill in their PWA).
+    # Licence-category check still applies.
     dealers: list[dict] = []
-    if dealer_ids_to_fetch:
-        profiles = (await db.execute(
-            select(DealerProfile).where(DealerProfile.user_id.in_(dealer_ids_to_fetch))
-        )).scalars().all()
-        for profile in profiles:
-            if required_plural and required_plural not in (profile.sell_categories or []):
-                continue
-            if not profile.shop_gps_lat or not profile.shop_gps_lng:
-                continue
-            dealer = (await db.execute(select(User).where(User.id == profile.user_id))).scalar_one_or_none()
-            if not dealer:
-                continue
-            dist = _dist_km(farmer_lat, farmer_lng,
-                            float(profile.shop_gps_lat), float(profile.shop_gps_lng))
-            dealers.append({
-                "user_id": dealer.id,
-                "name": dealer.name,
-                "phone": dealer.phone,
-                "shop_name": profile.shop_name,
-                "is_training_dealer": dealer.id == training_dealer_user_id,
-                "shop_address": profile.shop_address,
-                "sell_categories": profile.sell_categories or [],
-                "distance_km": round(dist, 1),
-                "shop_gps_lat": float(profile.shop_gps_lat),
-                "shop_gps_lng": float(profile.shop_gps_lng),
-            })
-    # Training Dealer pinned first so the CA's chosen demo target
-    # always shows regardless of its haversine distance (otherwise
-    # a distant demo-purpose dealer could get sliced off by the
-    # cap-5 tail).
-    dealers.sort(key=lambda x: (0 if x.get("is_training_dealer") else 1, x["distance_km"]))
+    if training_dealer_user_id:
+        td_profile = (await db.execute(
+            select(DealerProfile).where(DealerProfile.user_id == training_dealer_user_id)
+        )).scalar_one_or_none()
+        if td_profile and (not required_plural or required_plural in (td_profile.sell_categories or [])) \
+                and td_profile.shop_gps_lat and td_profile.shop_gps_lng:
+            td_user = (await db.execute(
+                select(User).where(User.id == training_dealer_user_id)
+            )).scalar_one_or_none()
+            if td_user:
+                dist = _dist_km(
+                    farmer_lat, farmer_lng,
+                    float(td_profile.shop_gps_lat), float(td_profile.shop_gps_lng),
+                )
+                dealers.append({
+                    "user_id": td_user.id,
+                    "name": td_user.name,
+                    "phone": td_user.phone,
+                    "shop_name": td_profile.shop_name,
+                    "is_training_dealer": True,
+                    "shop_address": td_profile.shop_address,
+                    "sell_categories": td_profile.sell_categories or [],
+                    "distance_km": round(dist, 1),
+                    "shop_gps_lat": float(td_profile.shop_gps_lat),
+                    "shop_gps_lng": float(td_profile.shop_gps_lng),
+                })
+        # (No fallback if the Training Dealer profile is unusable — an
+        # explicitly-designated dealer that can't be materialised should
+        # surface as an empty list rather than silently reverting to
+        # real dealers; the CA sees "no dealer available" and can fix
+        # the Training Dealer picker in the CA portal.)
+    else:
+        if onboarded_dealer_ids:
+            profiles = (await db.execute(
+                select(DealerProfile).where(DealerProfile.user_id.in_(onboarded_dealer_ids))
+            )).scalars().all()
+            for profile in profiles:
+                if required_plural and required_plural not in (profile.sell_categories or []):
+                    continue
+                if not profile.shop_gps_lat or not profile.shop_gps_lng:
+                    continue
+                dealer = (await db.execute(select(User).where(User.id == profile.user_id))).scalar_one_or_none()
+                if not dealer:
+                    continue
+                dist = _dist_km(farmer_lat, farmer_lng,
+                                float(profile.shop_gps_lat), float(profile.shop_gps_lng))
+                dealers.append({
+                    "user_id": dealer.id,
+                    "name": dealer.name,
+                    "phone": dealer.phone,
+                    "shop_name": profile.shop_name,
+                    "is_training_dealer": False,
+                    "shop_address": profile.shop_address,
+                    "sell_categories": profile.sell_categories or [],
+                    "distance_km": round(dist, 1),
+                    "shop_gps_lat": float(profile.shop_gps_lat),
+                    "shop_gps_lng": float(profile.shop_gps_lng),
+                })
+        dealers.sort(key=lambda x: x["distance_km"])
 
     facilitators: list[dict] = []
     if onboarded_facilitator_ids:

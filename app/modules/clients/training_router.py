@@ -905,7 +905,7 @@ async def clear_training_expert(
 # ── Training Dealer ─────────────────────────────────────────────────────
 
 async def _validate_training_dealer_candidate(
-    db: AsyncSession, phone: str,
+    db: AsyncSession, phone: str, client_id: str,
 ) -> tuple[User, dict]:
     """Look up a phone and validate it can be the Training Dealer.
 
@@ -917,7 +917,11 @@ async def _validate_training_dealer_candidate(
       - `phone_not_registered` — no User for this phone.
       - `dealer_profile_missing` — user hasn't set up their shop.
       - `user_inactive` — user's DEALER role isn't ACTIVE.
-      - `already_onboarded` — user is in some ClientPromoter as DEALER.
+      - `already_onboarded_here` — user is onboarded to THIS client
+        as an active DEALER promoter. Scoped to this client only
+        (2026-08-09) — a dealer onboarded to some OTHER client can
+        still be a Training Dealer here because they won't appear
+        in this client's real-orders dealer picker.
     """
     from app.modules.orders.models import DealerProfile
     from app.modules.platform.models import RoleType, UserRole
@@ -968,9 +972,16 @@ async def _validate_training_dealer_candidate(
             },
         )
 
+    # Scoped to THIS client — a dealer onboarded to a different
+    # client is fine to serve as Training Dealer here. Preventing
+    # that would kill a legitimate design: the CA wants an
+    # "exclusive dummy" for training that doesn't overlap with THIS
+    # client's real dealers; some other company's real dealer is
+    # invisible to THIS client's real-orders picker so no bleed.
     already = (await db.execute(
         select(ClientPromoter).where(
             ClientPromoter.user_id == user.id,
+            ClientPromoter.client_id == client_id,
             ClientPromoter.promoter_type == "DEALER",
             ClientPromoter.status == "ACTIVE",
         )
@@ -979,11 +990,11 @@ async def _validate_training_dealer_candidate(
         raise HTTPException(
             status_code=409,
             detail={
-                "code": "already_onboarded",
+                "code": "already_onboarded_here",
                 "message": (
-                    "This dealer is already onboarded by another client and "
-                    "can't be used as a Training Dealer. Pick a phone number "
-                    "that isn't onboarded anywhere on RootsTalk."
+                    "This dealer is already onboarded to your company as a "
+                    "real dealer. Pick a phone number that isn't one of your "
+                    "onboarded dealers so training stays isolated from real orders."
                 ),
             },
         )
@@ -1010,7 +1021,7 @@ async def lookup_training_dealer(
     exactly why a candidate was rejected."""
     await _assert_ca(db, current_user, client_id)
     await _load_active_training_child(db, client_id)
-    _, info = await _validate_training_dealer_candidate(db, phone)
+    _, info = await _validate_training_dealer_candidate(db, phone, client_id)
     return info
 
 
@@ -1025,7 +1036,7 @@ async def set_training_dealer(
     The user must satisfy every check in _validate_training_dealer_candidate."""
     await _assert_ca(db, current_user, client_id)
     child = await _load_active_training_child(db, client_id)
-    user, _ = await _validate_training_dealer_candidate(db, body.phone)
+    user, _ = await _validate_training_dealer_candidate(db, body.phone, client_id)
     child.training_dealer_user_id = user.id
     await db.commit()
     await db.refresh(child)
