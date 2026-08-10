@@ -1026,8 +1026,18 @@ async def submit_query(
         )
     )).scalar_one_or_none()
     if training_child is not None and training_child.training_expert_user_id:
+        # `training_expert_user_id` stores a User.id, but current_holder_id
+        # and QueryRemark.pundit_id FK-reference farm_pundit_profiles.id.
+        # Fetch the FarmPunditProfile by user_id so the shape matches the
+        # other branch's return (also a FarmPunditProfile). Bug caught
+        # 2026-08-10 — training query submissions were 500-ing with
+        # `queries_current_holder_id_fkey` FK violation because the
+        # earlier code fetched a User and stored its id in a pundit-id
+        # column.
         next_pundit = (await db.execute(
-            select(User).where(User.id == training_child.training_expert_user_id)
+            select(FarmPunditProfile).where(
+                FarmPunditProfile.user_id == training_child.training_expert_user_id
+            )
         )).scalar_one_or_none()
     if next_pundit is None:
         next_pundit = await _get_next_pundit_for_query(db, pundit_client_id, request.subscription_id)
