@@ -752,6 +752,91 @@ async def answer_question(
     }
 
 
+@router.post("/diagnosis/{session_id}/rewind")
+async def rewind_diagnosis(
+    session_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Rewind the session by N answered questions and return the resulting
+    diagnosis step.
+
+    Powers the PWA back-navigation in Diagnosis (2026-08-11): back from
+    Problem → last symptom = rewind(1); back from any symptom node →
+    first symptom = rewind(all-but-zero). Also resets a terminal session
+    (DIAGNOSED / OUTSIDE_LIST) back to ACTIVE so the farmer can re-answer
+    without needing a brand-new session id.
+
+    Body: ``{"steps": int}`` — the number of answers to pop off the
+    session's `answers` array. If steps <= 0 or steps >= len(answers),
+    the session is fully reset to zero answers (equivalent to restarting
+    at the initial plant_part). Returns the same shape as /answer /
+    /start so the frontend can render the resulting question / diagnosis.
+    """
+    session = (await db.execute(
+        select(DiagnosisSession).where(
+            DiagnosisSession.id == session_id,
+            DiagnosisSession.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    steps = int(data.get("steps") or 0)
+    current_answers = list(session.answers or [])
+    if steps <= 0:
+        target_len = len(current_answers)
+    elif steps >= len(current_answers):
+        target_len = 0
+    else:
+        target_len = len(current_answers) - steps
+
+    truncated = current_answers[:target_len]
+    replay_answers = [DiagnosisAnswer(**a) for a in truncated]
+
+    rows = await _load_problem_symptom_rows(
+        db, session.crop_cosh_id, session.crop_stage_cosh_id,
+    )
+    step = run_diagnosis_step(
+        rows, session.initial_plant_part_cosh_id, replay_answers,
+    )
+
+    # Reset terminal-state fields on the way back to ACTIVE so a
+    # re-answer from the returned question flows through /answer cleanly.
+    session.answers = truncated
+    session.remaining_problem_ids = step.remaining_problem_ids
+    session.has_yes_answer = step.has_yes_answer
+    session.status = "ACTIVE"
+    session.diagnosed_problem_cosh_id = None
+    await db.commit()
+
+    problem_info = None
+    if step.status == "CONFIRMATION" and step.diagnosed_problem_cosh_id:
+        problem_info = await _get_problem_info(
+            db, step.diagnosed_problem_cosh_id, current_user.language_code or "en",
+        )
+        crop_name = await resolve_name_for_cosh_id(
+            db, session.crop_cosh_id, current_user.language_code or "en",
+        ) or session.crop_cosh_id
+        problem_info = await enrich_problem_with_description(
+            problem_info, crop_name, language_code=current_user.language_code or "en",
+        )
+
+    return {
+        "session_id": session_id,
+        "status": step.status,
+        "remaining_count": step.remaining_count,
+        "question": await _format_question(
+            step.question, db, current_user.language_code or "en",
+        ),
+        "diagnosed_problem_cosh_id": step.diagnosed_problem_cosh_id,
+        "problem_info": problem_info,
+        "committed_to_advisory": session.committed_at is not None,
+        "answers_remaining": target_len,
+    }
+
+
 @router.post("/diagnosis/{session_id}/abort")
 async def abort_diagnosis(
     session_id: str,
