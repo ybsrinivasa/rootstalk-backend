@@ -10038,8 +10038,18 @@ async def _assert_active_dealer(db: AsyncSession, user_id: str) -> None:
 
     NOT scoped to a specific client — the user can act on orders
     from any company once any one company has onboarded them.
+
+    **Training Dealer exception (2026-08-10)**: a user designated as
+    `Client.training_dealer_user_id` on any ACTIVE training-child also
+    passes this gate. The Training Dealer is by design a "dummy" — the
+    CA picks a phone number that ISN'T onboarded so training orders
+    are isolated from real dealers (see `_validate_training_dealer_candidate`).
+    Requiring onboarding here would contradict the whole point of the
+    slot: the CA can designate them, the farmer's picker will show
+    them, they'll receive the order — and then this gate would 403
+    them out of every dealer action. Empty case handled.
     """
-    from app.modules.clients.models import ClientPromoter
+    from app.modules.clients.models import ClientPromoter, Client
 
     onboarded = (await db.execute(
         select(ClientPromoter).where(
@@ -10048,18 +10058,30 @@ async def _assert_active_dealer(db: AsyncSession, user_id: str) -> None:
             ClientPromoter.status == "ACTIVE",
         ).limit(1)
     )).scalar_one_or_none()
-    if onboarded is None:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "not_an_active_dealer",
-                "message": (
-                    "You aren't currently onboarded as a Dealer at any "
-                    "RootsTalk company. Ask a Field Manager to onboard "
-                    "you first."
-                ),
-            },
-        )
+    if onboarded is not None:
+        return
+
+    training_slot = (await db.execute(
+        select(Client.id).where(
+            Client.training_dealer_user_id == user_id,
+            Client.is_training == True,  # noqa: E712
+            Client.training_status == "ACTIVE",
+        ).limit(1)
+    )).scalar_one_or_none()
+    if training_slot is not None:
+        return
+
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "code": "not_an_active_dealer",
+            "message": (
+                "You aren't currently onboarded as a Dealer at any "
+                "RootsTalk company. Ask a Field Manager to onboard "
+                "you first."
+            ),
+        },
+    )
 
 
 async def _assert_active_facilitator(db: AsyncSession, user_id: str) -> None:
