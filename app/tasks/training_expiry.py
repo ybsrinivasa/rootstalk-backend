@@ -487,6 +487,49 @@ async def _cascade_delete_training_child(
     except ImportError:
         pass
 
+    # Every other NO-ACTION FK to clients.id — defensive raw SQL deletes
+    # so the cascade tolerates a stray row without needing a model
+    # import per table. Full list generated 2026-08-10 by querying
+    # information_schema for `constraint_type='FOREIGN KEY' AND
+    # ccu.table_name='clients' AND rc.delete_rule='NO ACTION'`.
+    # Tables already handled above (subscriptions, orders, queries,
+    # seed_orders_full, standard_responses, client_farm_pundits,
+    # pundit_invitations, subscription_pools, client_users,
+    # cm_client_assignments, client_promoters, client_locations,
+    # client_crops) are excluded here.
+    #
+    # Anchor: 2026-08-10 — a training child had rows in
+    # `client_organisation_types` (from an SA client-edit), blocking
+    # END. The SA-edit surface doesn't filter training children today,
+    # so ANY of these could accumulate rows on any given training child.
+    # Keep this list in sync with the FK audit whenever a new client-
+    # scoped table is added — see feedback memory on training cascade.
+    from sqlalchemy import text
+    for table in (
+        "client_organisation_types",
+        "client_user_privileges",
+        "crop_expert_assignments",
+        "manufacturer_brand_portfolios",
+        "packages",
+        "parameters",
+        "pg_recommendations",
+        "product_qr_codes",
+        "rm_cases",
+        "seed_varieties",
+        "sp_recommendations",
+        "triggered_cha_entries",
+        "variables",
+    ):
+        await db.execute(
+            text(f"DELETE FROM {table} WHERE client_id = :cid"), {"cid": cid},
+        )
+    # dealer_relationships uses `manufacturer_client_id` — separate
+    # column name so it needs its own delete.
+    await db.execute(
+        text("DELETE FROM dealer_relationships WHERE manufacturer_client_id = :cid"),
+        {"cid": cid},
+    )
+
     # ── Layer 9: ClientPromoter + ClientLocation + ClientCrop ─────
     await db.execute(
         delete(ClientPromoter).where(ClientPromoter.client_id == cid)
