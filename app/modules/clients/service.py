@@ -183,10 +183,8 @@ async def send_promoter_stepdown_request_email(
     promoter_type: str,          # DEALER | FACILITATOR
     client_display_name: str,
     login_url: str,
-    open_orders: int = 0,
-    pending_payments: int = 0,
-    pending_payments_amount: float | None = None,
     unassigned_units: int = 0,
+    pending_assignments: int = 0,
 ):
     """Notify the CA + every Field Manager when a Promoter (Facilitator
     or Dealer) requests to step down from the Promoter sub-role.
@@ -194,23 +192,32 @@ async def send_promoter_stepdown_request_email(
     The stepdown is NOT self-completing (as of 2026-08-10): the CA or
     a Field Manager must approve via the CA-side revoke endpoint for
     the role to actually be removed. This email is the notification
-    trigger. Any recipient can act. Lines with zero counts are hidden
-    so the email doesn't read like a template.
+    trigger. Any recipient can act.
+
+    Counts (only Promoter-scoped — Facilitator-side work continues
+    regardless of stepdown outcome and is deliberately NOT counted):
+      unassigned_units     — reclaimed at approve
+      pending_assignments  — PromoterAssignment rows sent by this
+                             promoter that are still awaiting the
+                             farmer's response
+
+    Zero-count lines are hidden so the email doesn't read like a
+    template. Empty case renders "safe to approve" copy.
     """
     role_label = "Dealer-Promoter" if promoter_type == "DEALER" else "Facilitator-Promoter"
     subject = f"{promoter_name} has requested to step down as {role_label} — {client_display_name}"
 
     lines: list[tuple[str, str]] = []
-    if open_orders > 0:
-        lines.append(("Open orders being facilitated", f"{open_orders}"))
-    if pending_payments > 0:
-        amt = (
-            f" (₹{pending_payments_amount:,.0f})"
-            if pending_payments_amount is not None else ""
-        )
-        lines.append(("Pending payments", f"{pending_payments}{amt}"))
     if unassigned_units > 0:
-        lines.append(("Unassigned allocation units", f"{unassigned_units}"))
+        lines.append((
+            "Unassigned allocation units (reclaimed on approve)",
+            f"{unassigned_units}",
+        ))
+    if pending_assignments > 0:
+        lines.append((
+            "Farmer assignments awaiting response",
+            f"{pending_assignments}",
+        ))
 
     plain_lines = "\n".join(f"  {label}: {value}" for label, value in lines)
     plain_lines_block = f"\n\nPending items:\n{plain_lines}\n" if lines else "\n"

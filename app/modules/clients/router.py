@@ -2906,6 +2906,10 @@ async def revoke_promoter(
             units=int(alloc.units_balance),
         )
 
+    # 2026-08-10 — snapshot for the FCM push below (whether this
+    # revoke is the approval-completion of a stepdown request).
+    was_stepdown_request = cp.promoter_request_status == "STEPDOWN_REQUESTED"
+
     cp.is_promoter = False
     # 2026-07-14: PP requires being an active Promoter, so cascade the
     # flag off here too. Otherwise the CA Promoters list keeps showing
@@ -2916,6 +2920,44 @@ async def revoke_promoter(
     cp.promoter_request_responded_at = datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(cp)
+
+    # 2026-08-10 — Push the promoter an FCM so they know the CA has
+    # acted. Post-commit + wrapped so a delivery failure doesn't
+    # roll back the revoke. The copy differs based on whether this
+    # was the promoter's own stepdown being approved vs a
+    # company-initiated revoke — the wording matters for trust.
+    try:
+        from app.services.fcm_service import send_fcm
+        from app.modules.platform.models import User as _User
+        promoter_user = (await db.execute(
+            select(_User).where(_User.id == cp.user_id)
+        )).scalar_one_or_none()
+        client_row = (await db.execute(
+            select(Client).where(Client.id == client_id)
+        )).scalar_one_or_none()
+        if promoter_user and promoter_user.fcm_token:
+            company_name = (
+                (client_row.display_name or client_row.full_name)
+                if client_row else "the company"
+            )
+            if was_stepdown_request:
+                title = "Your stepdown has been approved"
+                body = f"You've been cleared from the Promoter role at {company_name}. Thank you for your service."
+            else:
+                title = "Promoter role ended"
+                body = f"Your Promoter role at {company_name} has been ended by the company."
+            await send_fcm(
+                token=promoter_user.fcm_token,
+                title=title,
+                body=body,
+                data={"type": "PROMOTER_ROLE_ENDED", "client_id": client_id},
+            )
+    except Exception as exc:   # noqa: BLE001
+        import logging
+        logging.getLogger(__name__).warning(
+            f"revoke_promoter FCM push failed for cp={cp.id}: {exc}"
+        )
+
     return {
         "id": cp.id,
         "promoter_type": cp.promoter_type,

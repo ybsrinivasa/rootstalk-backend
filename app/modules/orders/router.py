@@ -8490,50 +8490,33 @@ async def facilitator_decline_promoter_invitation(
 async def _pending_stepdown_counts(
     db: AsyncSession, promoter_user_id: str, client_id: str,
 ) -> dict:
-    """Snapshot of what this promoter is still holding at this client
-    when they request stepdown. Powers both the email body and the
-    per-row badge on the CA Promoters list.
+    """Snapshot of what's actually PROMOTER-scoped for this user at
+    this client when they request stepdown. Powers the email body and
+    the per-row badge on the CA Promoters list.
 
-    Fields returned (all counts; monetary amount included when available):
-      open_orders             — orders where this user is the facilitator
-                                and status is not terminal (CANCELLED /
-                                EXPIRED / RECEIVED)
-      pending_payments        — PENDING SubscriptionPaymentRequest rows
-                                where this user is the designated payer
-      pending_payments_amount — sum of `amount` for the above
-      unassigned_units        — PromoterAllocation.units_balance held by
-                                this user at this client (reclaimed at
-                                CA-side revoke)
+    Deliberately narrow (2026-08-10 correction): only items tied to
+    the Promoter sub-role. Orders being facilitated and pending
+    SubscriptionPaymentRequests are Facilitator-side work and continue
+    regardless of stepdown outcome — counting them here would scare
+    the CA into thinking there's handoff to arrange when there isn't.
+
+    Fields:
+      unassigned_units        — PromoterAllocation.units_balance held
+                                by this promoter at this client
+                                (reclaimed at CA-side approve)
+      pending_assignments     — PromoterAssignment rows this promoter
+                                sent that are still awaiting the
+                                farmer's response (PENDING_FARMER_APPROVAL).
+                                They become moot on stepdown — farmers
+                                who haven't responded won't get this
+                                promoter's onboarding if reassigned.
     """
-    from app.modules.orders.models import Order, OrderStatus
     from app.modules.subscriptions.models import (
-        SubscriptionPaymentRequest, Subscription,
+        PromoterAssignment, AssignmentStatus, Subscription,
     )
     from app.modules.subscriptions.promoter_allocation_models import (
         PromoterAllocation,
     )
-
-    open_orders = (await db.execute(
-        select(func.count(Order.id)).where(
-            Order.facilitator_user_id == promoter_user_id,
-            Order.client_id == client_id,
-            Order.status.notin_([
-                OrderStatus.CANCELLED, OrderStatus.EXPIRED, OrderStatus.RECEIVED,
-            ]),
-        )
-    )).scalar_one() or 0
-
-    payment_rows = (await db.execute(
-        select(SubscriptionPaymentRequest.amount)
-        .join(Subscription, Subscription.id == SubscriptionPaymentRequest.subscription_id)
-        .where(
-            SubscriptionPaymentRequest.requested_from_user_id == promoter_user_id,
-            SubscriptionPaymentRequest.status == "PENDING",
-            Subscription.client_id == client_id,
-        )
-    )).scalars().all()
-    pending_payments = len(payment_rows)
-    pending_payments_amount = float(sum(payment_rows)) if payment_rows else 0.0
 
     alloc = (await db.execute(
         select(PromoterAllocation.units_balance).where(
@@ -8543,11 +8526,19 @@ async def _pending_stepdown_counts(
     )).scalar_one_or_none()
     unassigned_units = int(alloc or 0)
 
+    pending_assignments = (await db.execute(
+        select(func.count(PromoterAssignment.id))
+        .join(Subscription, Subscription.id == PromoterAssignment.subscription_id)
+        .where(
+            PromoterAssignment.promoter_user_id == promoter_user_id,
+            PromoterAssignment.status == AssignmentStatus.PENDING_FARMER_APPROVAL,
+            Subscription.client_id == client_id,
+        )
+    )).scalar_one() or 0
+
     return {
-        "open_orders":              int(open_orders),
-        "pending_payments":         pending_payments,
-        "pending_payments_amount":  pending_payments_amount,
-        "unassigned_units":         unassigned_units,
+        "unassigned_units":     unassigned_units,
+        "pending_assignments":  int(pending_assignments),
     }
 
 
@@ -8600,12 +8591,8 @@ async def _notify_ca_and_fms_of_stepdown_request(
         promoter_type=cp.promoter_type,
         client_display_name=(client.display_name or client.full_name),
         login_url=login_url,
-        open_orders=counts["open_orders"],
-        pending_payments=counts["pending_payments"],
-        pending_payments_amount=(
-            counts["pending_payments_amount"] if counts["pending_payments"] > 0 else None
-        ),
         unassigned_units=counts["unassigned_units"],
+        pending_assignments=counts["pending_assignments"],
     )
 
 
@@ -8751,6 +8738,7 @@ async def dealer_onboarding_clients(
             "logo_url": c.logo_url,
             "primary_colour": c.primary_colour,
             "is_promoter": cp.is_promoter,
+            "promoter_request_status": cp.promoter_request_status,
             "website": c.website,
             "phone": c.support_phone or c.office_phone,
             "onboarded_at": cp.registered_at,
@@ -8949,6 +8937,7 @@ async def facilitator_onboarding_clients(
             "logo_url": c.logo_url,
             "primary_colour": c.primary_colour,
             "is_promoter": cp.is_promoter,
+            "promoter_request_status": cp.promoter_request_status,
             # 2026-06-23 — PP designation lives on the ClientPromoter
             # row (FM-side flag). True means the Facilitator is acting
             # as Promoter-Pundit at this client.
