@@ -2053,6 +2053,30 @@ async def initiate_assignment(
             })
         effective_client_id = request.client_id
 
+    # 2026-08-10 — stepdown-request block. Once a promoter requests to
+    # step down, they can't take on NEW farmers even before the CA
+    # approves — the whole point of the request is "I'm winding down."
+    # In-flight work (order routing, existing farmer relationships)
+    # is unaffected; only new assignments are refused here.
+    from app.modules.clients.models import ClientPromoter
+    cp_check = (await db.execute(
+        select(ClientPromoter).where(
+            ClientPromoter.user_id == current_user.id,
+            ClientPromoter.client_id == effective_client_id,
+            ClientPromoter.promoter_type == request.promoter_type,
+            ClientPromoter.status == "ACTIVE",
+        )
+    )).scalar_one_or_none()
+    if cp_check is not None and cp_check.promoter_request_status == "STEPDOWN_REQUESTED":
+        raise HTTPException(status_code=409, detail={
+            "code": "stepdown_requested",
+            "message": (
+                "You've requested to step down from the Promoter role at this "
+                "company — no new farmer assignments can be initiated until "
+                "the company reviews your request."
+            ),
+        })
+
     # ── Validate optional measure inputs. ─────────────────────────
     # User direction 2026-05-30: the Promoter no longer enters the
     # farmer's farm area / plant count at assign time. Both are the

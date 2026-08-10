@@ -43,6 +43,7 @@ celery_app = Celery(
         "app.tasks.timeline_archive",
         "app.tasks.translate_content",
         "app.tasks.training_expiry",
+        "app.tasks.promoter_stepdown_expiry",
     ],
 )
 
@@ -136,6 +137,14 @@ celery_app.conf.beat_schedule = {
     "training-expiry-check": {
         "task": "app.tasks.training_expiry.sweep_training_expiry",
         "schedule": crontab(minute=55),
+    },
+    # Promoter stepdown auto-revoke (2026-08-10): stepdown requests
+    # sitting >7d without CA action get finalised so a promoter who's
+    # checked out doesn't linger indefinitely. Hourly at :40 to keep
+    # off the training / share-link / assignment collision zones.
+    "promoter-stepdown-expiry-check": {
+        "task": "app.tasks.promoter_stepdown_expiry.sweep_stepdown_requests",
+        "schedule": crontab(minute=40),
     },
 }
 

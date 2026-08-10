@@ -8487,25 +8487,151 @@ async def facilitator_decline_promoter_invitation(
     }
 
 
-@router.put("/facilitator/promoter-status/{client_promoter_id}/step-down")
-async def facilitator_step_down_promoter(
-    client_promoter_id: str,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """R10 (2026-05-29) Facilitator side: step down from an accepted
-    Promoter role. Transitions ACCEPTED → NONE, clears `is_promoter`.
+async def _pending_stepdown_counts(
+    db: AsyncSession, promoter_user_id: str, client_id: str,
+) -> dict:
+    """Snapshot of what this promoter is still holding at this client
+    when they request stepdown. Powers both the email body and the
+    per-row badge on the CA Promoters list.
 
-    Symmetric to the Client-side `revoke-promoter` — either side can
-    end the Promoter relationship. The Facilitator-onboarding row
-    itself is untouched (still ACTIVE for normal Facilitator work)."""
+    Fields returned (all counts; monetary amount included when available):
+      open_orders             — orders where this user is the facilitator
+                                and status is not terminal (CANCELLED /
+                                EXPIRED / RECEIVED)
+      pending_payments        — PENDING SubscriptionPaymentRequest rows
+                                where this user is the designated payer
+      pending_payments_amount — sum of `amount` for the above
+      unassigned_units        — PromoterAllocation.units_balance held by
+                                this user at this client (reclaimed at
+                                CA-side revoke)
+    """
+    from app.modules.orders.models import Order, OrderStatus
+    from app.modules.subscriptions.models import (
+        SubscriptionPaymentRequest, Subscription,
+    )
+    from app.modules.subscriptions.promoter_allocation_models import (
+        PromoterAllocation,
+    )
+
+    open_orders = (await db.execute(
+        select(func.count(Order.id)).where(
+            Order.facilitator_user_id == promoter_user_id,
+            Order.client_id == client_id,
+            Order.status.notin_([
+                OrderStatus.CANCELLED, OrderStatus.EXPIRED, OrderStatus.RECEIVED,
+            ]),
+        )
+    )).scalar_one() or 0
+
+    payment_rows = (await db.execute(
+        select(SubscriptionPaymentRequest.amount)
+        .join(Subscription, Subscription.id == SubscriptionPaymentRequest.subscription_id)
+        .where(
+            SubscriptionPaymentRequest.requested_from_user_id == promoter_user_id,
+            SubscriptionPaymentRequest.status == "PENDING",
+            Subscription.client_id == client_id,
+        )
+    )).scalars().all()
+    pending_payments = len(payment_rows)
+    pending_payments_amount = float(sum(payment_rows)) if payment_rows else 0.0
+
+    alloc = (await db.execute(
+        select(PromoterAllocation.units_balance).where(
+            PromoterAllocation.client_id == client_id,
+            PromoterAllocation.promoter_user_id == promoter_user_id,
+        )
+    )).scalar_one_or_none()
+    unassigned_units = int(alloc or 0)
+
+    return {
+        "open_orders":              int(open_orders),
+        "pending_payments":         pending_payments,
+        "pending_payments_amount":  pending_payments_amount,
+        "unassigned_units":         unassigned_units,
+    }
+
+
+async def _notify_ca_and_fms_of_stepdown_request(
+    db: AsyncSession, cp, promoter_user, counts: dict,
+) -> None:
+    """Send the stepdown-request email to CA + every active Field
+    Manager for the client. Called by both the F-P and Dealer
+    stepdown endpoints. Non-fatal on delivery failure — the request
+    itself is committed even if email delivery hiccups; the CA still
+    sees the badge on their Promoters page.
+    """
+    from app.modules.clients.models import Client, ClientUser, ClientUserRole
+    from app.modules.platform.models import StatusEnum
+    from app.modules.clients.service import send_promoter_stepdown_request_email
+    from app.config import settings as _settings
+
+    client = (await db.execute(
+        select(Client).where(Client.id == cp.client_id)
+    )).scalar_one_or_none()
+    if client is None:
+        return
+
+    fm_emails: set[str] = set()
+    fm_rows = (await db.execute(
+        select(User.email).select_from(ClientUser).join(
+            User, User.id == ClientUser.user_id,
+        ).where(
+            ClientUser.client_id == cp.client_id,
+            ClientUser.role == ClientUserRole.FIELD_MANAGER,
+            ClientUser.status == StatusEnum.ACTIVE,
+        )
+    )).scalars().all()
+    for email in fm_rows:
+        if email:
+            fm_emails.add(email)
+
+    recipients = list(fm_emails)
+    if client.ca_email and client.ca_email not in fm_emails:
+        recipients.insert(0, client.ca_email)
+
+    if not recipients:
+        return
+
+    login_url = f"{(_settings.frontend_base_url or '').rstrip('/')}/promoters"
+
+    await send_promoter_stepdown_request_email(
+        recipients=recipients,
+        promoter_name=(promoter_user.name or promoter_user.phone or "A promoter"),
+        promoter_type=cp.promoter_type,
+        client_display_name=(client.display_name or client.full_name),
+        login_url=login_url,
+        open_orders=counts["open_orders"],
+        pending_payments=counts["pending_payments"],
+        pending_payments_amount=(
+            counts["pending_payments_amount"] if counts["pending_payments"] > 0 else None
+        ),
+        unassigned_units=counts["unassigned_units"],
+    )
+
+
+async def _step_down_promoter_common(
+    db: AsyncSession,
+    current_user: User,
+    client_promoter_id: str,
+    promoter_type: str,   # DEALER | FACILITATOR
+) -> dict:
+    """Shared body for F-P + Dealer stepdown.
+
+    Stepdown is a REQUEST, not a self-completion (2026-08-10). We
+    flip `promoter_request_status='STEPDOWN_REQUESTED'` and stamp the
+    timestamp; `is_promoter` STAYS True until the CA/FM approves via
+    the CA-side revoke endpoint (which flips it False + reclaims
+    allocation units). This preserves in-flight work while blocking
+    new promoter-side actions (see per-endpoint guards) and gives
+    the company control over the exit.
+    """
     from app.modules.clients.models import ClientPromoter
 
     cp = (await db.execute(
         select(ClientPromoter).where(
             ClientPromoter.id == client_promoter_id,
             ClientPromoter.user_id == current_user.id,
-            ClientPromoter.promoter_type == "FACILITATOR",
+            ClientPromoter.promoter_type == promoter_type,
             ClientPromoter.status == "ACTIVE",
         )
     )).scalar_one_or_none()
@@ -8522,22 +8648,55 @@ async def facilitator_step_down_promoter(
                 ),
             },
         )
+    if cp.promoter_request_status == "STEPDOWN_REQUESTED":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "stepdown_already_requested",
+                "message": (
+                    "You have already requested to step down. The company is "
+                    "reviewing your request."
+                ),
+            },
+        )
 
     from datetime import datetime, timezone
-    cp.is_promoter = False
-    # 2026-07-14: PP requires being an active Promoter — cascade off.
-    # See the CA-side revoke_promoter for the full rationale.
-    cp.is_promoter_pundit = False
-    cp.promoter_request_status = "NONE"
+    cp.promoter_request_status = "STEPDOWN_REQUESTED"
     cp.promoter_request_responded_at = datetime.now(timezone.utc)
+    # `is_promoter` intentionally stays True — the CA/FM revoke is
+    # what flips it to False + reclaims allocation units.
     await db.commit()
     await db.refresh(cp)
+
+    # Fire notification AFTER the commit so the request is persisted
+    # even if email delivery is flaky. Wrapped in try to keep the
+    # response 200 on transient SMTP issues — the CA sees the badge
+    # in the portal regardless.
+    try:
+        counts = await _pending_stepdown_counts(db, cp.user_id, cp.client_id)
+        await _notify_ca_and_fms_of_stepdown_request(db, cp, current_user, counts)
+    except Exception as exc:   # noqa: BLE001
+        _orders_logger.warning(f"stepdown-request email failed for cp={cp.id}: {exc}")
+
     return {
         "id": cp.id,
         "is_promoter": cp.is_promoter,
         "promoter_request_status": cp.promoter_request_status,
         "promoter_request_responded_at": cp.promoter_request_responded_at,
     }
+
+
+@router.put("/facilitator/promoter-status/{client_promoter_id}/step-down")
+async def facilitator_step_down_promoter(
+    client_promoter_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Facilitator-side stepdown request. See `_step_down_promoter_common`
+    for the shared semantics (stepdown-as-request pattern, 2026-08-10)."""
+    return await _step_down_promoter_common(
+        db, current_user, client_promoter_id, "FACILITATOR",
+    )
 
 
 @router.put("/dealer/promoter-status/{client_promoter_id}/step-down")
@@ -8546,54 +8705,13 @@ async def dealer_step_down_promoter(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Dealer side: step down from an accepted Promoter role at one
-    company. Transitions ACCEPTED → NONE, clears `is_promoter` on this
-    row.
-
-    Dealers are multi-company per §11.2 — stepping down from one
-    company doesn't touch any other Promoter row the dealer holds.
-    Symmetric to the Client-side `revoke-promoter`. The Dealer-
-    onboarding row itself (the ClientPromoter row's existence and
-    its `status='ACTIVE'`) is untouched."""
-    from app.modules.clients.models import ClientPromoter
-
-    cp = (await db.execute(
-        select(ClientPromoter).where(
-            ClientPromoter.id == client_promoter_id,
-            ClientPromoter.user_id == current_user.id,
-            ClientPromoter.promoter_type == "DEALER",
-            ClientPromoter.status == "ACTIVE",
-        )
-    )).scalar_one_or_none()
-    if not cp:
-        raise HTTPException(status_code=404, detail="Promoter row not found")
-    if not cp.is_promoter:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "not_currently_promoter",
-                "message": (
-                    "You are not currently a Promoter at this company. "
-                    "Nothing to step down from."
-                ),
-            },
-        )
-
-    from datetime import datetime, timezone
-    cp.is_promoter = False
-    # 2026-07-14: PP requires being an active Promoter — cascade off.
-    # See the CA-side revoke_promoter for the full rationale.
-    cp.is_promoter_pundit = False
-    cp.promoter_request_status = "NONE"
-    cp.promoter_request_responded_at = datetime.now(timezone.utc)
-    await db.commit()
-    await db.refresh(cp)
-    return {
-        "id": cp.id,
-        "is_promoter": cp.is_promoter,
-        "promoter_request_status": cp.promoter_request_status,
-        "promoter_request_responded_at": cp.promoter_request_responded_at,
-    }
+    """Dealer-side stepdown request. See `_step_down_promoter_common`
+    for the shared semantics. Dealers are multi-company per §11.2 —
+    stepping down from one company doesn't touch any other Promoter
+    row the dealer holds."""
+    return await _step_down_promoter_common(
+        db, current_user, client_promoter_id, "DEALER",
+    )
 
 
 @router.get("/dealer/onboarding-clients")

@@ -177,6 +177,86 @@ RootsTalk — Neytiri Eywafarm Agritech"""
     _send_email(ca_email, subject, html, plain)
 
 
+async def send_promoter_stepdown_request_email(
+    recipients: list[str],
+    promoter_name: str,
+    promoter_type: str,          # DEALER | FACILITATOR
+    client_display_name: str,
+    login_url: str,
+    open_orders: int = 0,
+    pending_payments: int = 0,
+    pending_payments_amount: float | None = None,
+    unassigned_units: int = 0,
+):
+    """Notify the CA + every Field Manager when a Promoter (Facilitator
+    or Dealer) requests to step down from the Promoter sub-role.
+
+    The stepdown is NOT self-completing (as of 2026-08-10): the CA or
+    a Field Manager must approve via the CA-side revoke endpoint for
+    the role to actually be removed. This email is the notification
+    trigger. Any recipient can act. Lines with zero counts are hidden
+    so the email doesn't read like a template.
+    """
+    role_label = "Dealer-Promoter" if promoter_type == "DEALER" else "Facilitator-Promoter"
+    subject = f"{promoter_name} has requested to step down as {role_label} — {client_display_name}"
+
+    lines: list[tuple[str, str]] = []
+    if open_orders > 0:
+        lines.append(("Open orders being facilitated", f"{open_orders}"))
+    if pending_payments > 0:
+        amt = (
+            f" (₹{pending_payments_amount:,.0f})"
+            if pending_payments_amount is not None else ""
+        )
+        lines.append(("Pending payments", f"{pending_payments}{amt}"))
+    if unassigned_units > 0:
+        lines.append(("Unassigned allocation units", f"{unassigned_units}"))
+
+    plain_lines = "\n".join(f"  {label}: {value}" for label, value in lines)
+    plain_lines_block = f"\n\nPending items:\n{plain_lines}\n" if lines else "\n"
+
+    html_lines = "".join(
+        f'<tr><td style="padding:4px 12px;color:#555">{label}</td>'
+        f'<td style="padding:4px 12px;font-weight:600">{value}</td></tr>'
+        for label, value in lines
+    )
+    html_lines_block = (
+        f'<table style="background:#fef3c7;border-radius:8px;padding:12px;margin:16px 0">'
+        f'<tr><td colspan="2" style="padding:0 12px 6px;font-weight:600;color:#92400e">'
+        f'Pending items</td></tr>{html_lines}</table>'
+        if html_lines else ""
+    )
+
+    plain = f"""{promoter_name} has requested to step down as {role_label} at {client_display_name} on RootsTalk.
+{plain_lines_block}
+The stepdown is not complete until you (or another Field Manager) approve it in the CA portal.
+
+Open the Promoters page: {login_url}
+
+RootsTalk — Neytiri Eywafarm Agritech"""
+
+    html = f"""
+<body style="font-family:sans-serif;padding:32px;color:#111">
+  <h2>Stepdown request from {promoter_name}</h2>
+  <p><strong>{promoter_name}</strong> has requested to step down as
+     <strong>{role_label}</strong> at <strong>{client_display_name}</strong>.</p>
+  {html_lines_block}
+  <p>The stepdown is not complete until you (or another Field Manager) approve
+     it in the CA portal.</p>
+  <p><a href="{login_url}"
+        style="background:#1A5C2A;color:#fff;padding:12px 24px;border-radius:8px;
+               text-decoration:none;display:inline-block">
+     Open the Promoters page</a></p>
+  <p style="color:#666;font-size:12px;margin-top:24px">
+     Sent to the CA and Field Managers of {client_display_name}. Any one of
+     you can approve.</p>
+</body>"""
+
+    for email in recipients:
+        if email:
+            _send_email(email, subject, html, plain)
+
+
 async def send_ca_reassignment_email(
     ca_email: str, ca_name: str, client_display_name: str, login_url: str,
     ca_phone: str | None = None,

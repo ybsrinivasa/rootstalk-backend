@@ -2198,6 +2198,17 @@ async def list_promoters(
             row["sell_categories"] = dp.sell_categories or []
             row["shop_photo_url"] = dp.shop_photo_url
             row["shop_registration_url"] = dp.shop_registration_url
+        # 2026-08-10 — enrich stepdown-requested rows with the pending
+        # counts so the FM sees "who's still holding what" at a glance
+        # (same three numbers the notification email carries). Only
+        # computed for the requested rows so non-request rows stay
+        # cheap.
+        row["pending_stepdown"] = None
+        if cp.promoter_request_status == "STEPDOWN_REQUESTED":
+            from app.modules.orders.router import _pending_stepdown_counts
+            row["pending_stepdown"] = await _pending_stepdown_counts(
+                db, user.id, client_id,
+            )
         out.append(row)
     return out
 
