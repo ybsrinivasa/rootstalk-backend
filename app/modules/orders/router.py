@@ -8583,7 +8583,12 @@ async def _notify_ca_and_fms_of_stepdown_request(
     if not recipients:
         return
 
-    login_url = f"{(_settings.frontend_base_url or '').rstrip('/')}/promoters"
+    # 2026-08-10 — Deep-link to /promoters 404s for the recipient
+    # because the CA portal requires an authenticated session at the
+    # right client's short-name path. Send them to the branded login
+    # instead; they navigate to Promoters after signing in.
+    base = (_settings.frontend_base_url or '').rstrip('/')
+    login_url = f"{base}/login/{client.short_name}" if client.short_name else base
 
     await send_promoter_stepdown_request_email(
         recipients=recipients,

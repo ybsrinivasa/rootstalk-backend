@@ -236,9 +236,9 @@ async def send_promoter_stepdown_request_email(
 
     plain = f"""{promoter_name} has requested to step down as {role_label} at {client_display_name} on RootsTalk.
 {plain_lines_block}
-The stepdown is not complete until you (or another Field Manager) approve it in the CA portal.
+The stepdown is not complete until you (or another Field Manager) approve it in the CA portal. Sign in and open the Field Manager → Promoters section to review.
 
-Open the Promoters page: {login_url}
+Sign in: {login_url}
 
 RootsTalk — Neytiri Eywafarm Agritech"""
 
@@ -249,11 +249,12 @@ RootsTalk — Neytiri Eywafarm Agritech"""
      <strong>{role_label}</strong> at <strong>{client_display_name}</strong>.</p>
   {html_lines_block}
   <p>The stepdown is not complete until you (or another Field Manager) approve
-     it in the CA portal.</p>
+     it. Sign in to the CA portal and open the Field Manager → Promoters
+     section to review.</p>
   <p><a href="{login_url}"
         style="background:#1A5C2A;color:#fff;padding:12px 24px;border-radius:8px;
                text-decoration:none;display:inline-block">
-     Open the Promoters page</a></p>
+     Sign in to the CA portal</a></p>
   <p style="color:#666;font-size:12px;margin-top:24px">
      Sent to the CA and Field Managers of {client_display_name}. Any one of
      you can approve.</p>
