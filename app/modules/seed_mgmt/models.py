@@ -112,5 +112,12 @@ class SeedOrderFull(Base):
     scan_verified: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=sa_false(),
     )
+    # 2026-08-11 — Presence lease mirror of orders.dealer_viewing_until.
+    # PUT'd forward by the dealer PWA heartbeat while a dealer-side seed
+    # order detail screen is active (no such screen exists today; column
+    # is future-ready). Farmer cancel refuses when this is in the future.
+    dealer_viewing_until: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

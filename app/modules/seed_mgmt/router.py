@@ -1097,6 +1097,21 @@ async def cancel_seed_order(
             status_code=400,
             detail=f"Order is already {order.status}; nothing to cancel.",
         )
+    # 2026-08-11 — Presence gate mirror of the pest/fert cancel.
+    # `dealer_viewing_until` is heartbeated forward by the dealer PWA
+    # while a dealer-side seed-order detail screen is active. No such
+    # screen exists today, so this always no-ops; wired in advance so
+    # farmer cancel is automatically gated when that screen lands.
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    if order.dealer_viewing_until and order.dealer_viewing_until > now:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "dealer_currently_viewing",
+                "message": "The dealer has opened your order for processing, please wait.",
+            },
+        )
 
     prev_status = order.status
 
@@ -1513,6 +1528,38 @@ async def abort_seed_order(
     order.total_price = None
     await db.commit()
     return {"id": order_id, "status": order.status}
+
+
+# ── Dealer: presence heartbeat (2026-08-11, seed parity) ──────────────────────
+#
+# Mirror of `/dealer/orders/{oid}/heartbeat` (Orders V2 Batch 2) on the
+# seed side. Ping every ~20 s while the dealer's seed-order detail
+# screen is mounted; each call extends `dealer_viewing_until` by ~30 s.
+# The farmer's cancel refuses while the lease is in the future. No
+# dealer seed-order detail screen exists in the PWA today — this
+# endpoint is provisioned so the future screen just wires the mount
+# effect and the gate goes live automatically.
+
+_DEALER_SEED_VIEWING_LEASE_SECONDS = 30
+
+@router.put("/dealer/seed-orders/{order_id}/heartbeat")
+async def dealer_seed_heartbeat(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from datetime import datetime, timedelta, timezone
+    from app.modules.orders.router import _assert_active_dealer
+    await _assert_active_dealer(db, current_user.id)
+    order = await _get_seed_order(db, order_id, current_user.id, farmer=False)
+    order.dealer_viewing_until = (
+        datetime.now(timezone.utc) + timedelta(seconds=_DEALER_SEED_VIEWING_LEASE_SECONDS)
+    )
+    await db.commit()
+    return {
+        "viewing_until": order.dealer_viewing_until.isoformat(),
+        "lease_seconds": _DEALER_SEED_VIEWING_LEASE_SECONDS,
+    }
 
 
 # ── Facilitator: variety-blind passthrough surface ────────────────────────────

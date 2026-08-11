@@ -1210,7 +1210,33 @@ async def cancel_order(
             status_code=409,
             detail={
                 "code": "dealer_currently_viewing",
-                "message": "The dealer is reviewing this order right now. Try again in a minute.",
+                "message": "The dealer has opened your order for processing, please wait.",
+            },
+        )
+
+    # 2026-08-11 — Second soft gate: refuse cancel while there are
+    # items the farmer still needs to approve/reject. Cancelling in
+    # that window leaves the pending items in an ambiguous state
+    # (did the farmer approve or reject them by walking away?). The
+    # farmer is asked to act on the pending items first; the cancel
+    # then works on the remaining postponed items as before.
+    pending_approval_count = (await db.execute(
+        select(func.count(OrderItem.id)).where(
+            OrderItem.order_id == order.id,
+            OrderItem.status == OrderItemStatus.SENT_FOR_APPROVAL,
+            OrderItem.archived_at.is_(None),
+        )
+    )).scalar_one() or 0
+    if pending_approval_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "items_pending_your_approval",
+                "message": (
+                    "You have items awaiting your approval on this order. "
+                    "Please approve or reject them first, then you can cancel "
+                    "the remaining items."
+                ),
             },
         )
 
