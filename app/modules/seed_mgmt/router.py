@@ -1076,7 +1076,7 @@ async def _check_seed_cancel_eligibility(order, db: AsyncSession) -> tuple[bool,
     now = datetime.now(timezone.utc)
     if order.dealer_viewing_until and order.dealer_viewing_until > now:
         return False, "dealer_currently_viewing", (
-            "The dealer has opened your order for processing, please wait."
+            "Your dealer is looking at this order right now. Please try again in a minute."
         )
     return True, None, None
 
@@ -1140,7 +1140,7 @@ async def cancel_seed_order(
             status_code=409,
             detail={
                 "code": "dealer_currently_viewing",
-                "message": "The dealer has opened your order for processing, please wait.",
+                "message": "Your dealer is looking at this order right now. Please try again in a minute.",
             },
         )
 

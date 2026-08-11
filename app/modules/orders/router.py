@@ -1245,7 +1245,7 @@ async def _check_cancel_eligibility(order, db: AsyncSession) -> tuple[bool, str 
     now = datetime.now(timezone.utc)
     if order.dealer_viewing_until and order.dealer_viewing_until > now:
         return False, "dealer_currently_viewing", (
-            "The dealer has opened your order for processing, please wait."
+            "Your dealer is looking at this order right now. Please try again in a minute."
         )
     pending = (await db.execute(
         select(func.count(OrderItem.id)).where(
@@ -1345,7 +1345,7 @@ async def cancel_order(
             status_code=409,
             detail={
                 "code": "dealer_currently_viewing",
-                "message": "The dealer has opened your order for processing, please wait.",
+                "message": "Your dealer is looking at this order right now. Please try again in a minute.",
             },
         )
 
