@@ -4738,9 +4738,17 @@ async def get_dashboard_attention(
 
     # Items on terminal-status orders are un-actionable and would
     # inflate the farmer's attention badge if counted.
+    # 2026-08-11 — COMPLETED / REJECTED / REROUTED added: a
+    # completed order's NOT_AVAILABLE items were still being counted
+    # under orders_returned on the Crop Dashboard tile (badge=2)
+    # even though the order was already history. History treats
+    # COMPLETED as a positive terminal — attention counts must agree.
     _TERMINAL_ORDER_STATUSES = {
         OrderStatus.CANCELLED,
         OrderStatus.EXPIRED,
+        OrderStatus.COMPLETED,
+        OrderStatus.REJECTED,
+        OrderStatus.REROUTED,
     }
     from datetime import date as _date_cls
 
