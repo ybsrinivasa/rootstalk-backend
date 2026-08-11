@@ -1225,6 +1225,71 @@ async def get_farmer_order_detail(
     }
 
 
+async def _check_cancel_eligibility(order, db: AsyncSession) -> tuple[bool, str | None, str | None]:
+    """Shared gate for the cancel flow. Returns (can_cancel, code, message).
+
+    Used by GET /cancel-eligibility (called by the farmer PWA on tap
+    of the Cancel button so we can decide confirm-vs-alert BEFORE the
+    farmer sees any confirmation dialog) AND by PUT /cancel itself as
+    the authoritative check (handles the tiny race between the
+    eligibility read and the mutation write).
+    """
+    from datetime import datetime, timezone
+    from app.modules.orders.models import (
+        OrderStatus, OrderItem, OrderItemStatus,
+    )
+    terminal = {OrderStatus.COMPLETED, OrderStatus.CANCELLED, OrderStatus.EXPIRED}
+    if order.status in terminal:
+        s = order.status.value if hasattr(order.status, "value") else order.status
+        return False, "already_terminal", f"Order is already {s}; nothing to cancel."
+    now = datetime.now(timezone.utc)
+    if order.dealer_viewing_until and order.dealer_viewing_until > now:
+        return False, "dealer_currently_viewing", (
+            "The dealer has opened your order for processing, please wait."
+        )
+    pending = (await db.execute(
+        select(func.count(OrderItem.id)).where(
+            OrderItem.order_id == order.id,
+            OrderItem.status == OrderItemStatus.SENT_FOR_APPROVAL,
+            OrderItem.archived_at.is_(None),
+        )
+    )).scalar_one() or 0
+    if pending > 0:
+        return False, "items_pending_your_approval", (
+            "You have items awaiting your approval on this order. Please "
+            "approve or reject them first, then you can cancel the "
+            "remaining items."
+        )
+    return True, None, None
+
+
+@router.get("/farmer/orders/{order_id}/cancel-eligibility")
+async def cancel_eligibility(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Tap-time eligibility check for the farmer's Cancel button.
+
+    The farmer PWA fires this BEFORE showing the "Cancel this order?"
+    confirm dialog. If can_cancel is false, the PWA shows the message
+    directly (e.g. "The dealer has opened your order for processing,
+    please wait.") — no confirmation prompt, no failed cancel attempt.
+
+    This matters because dealer_viewing_until is a 30s heartbeat lease
+    that can be freshly stamped between the PWA's last list fetch and
+    the farmer's cancel tap. Cached data on the client is stale by
+    definition; only a server call at tap-time is authoritative.
+
+    The result is authoritative at the moment of the query — the tiny
+    race window between this GET and the follow-up PUT is handled by
+    the PUT calling the same helper and 409'ing if the state changed.
+    """
+    order = await _get_farmer_order(db, order_id, current_user.id)
+    can_cancel, code, message = await _check_cancel_eligibility(order, db)
+    return {"can_cancel": can_cancel, "code": code, "message": message}
+
+
 @router.put("/farmer/orders/{order_id}/cancel")
 async def cancel_order(
     order_id: str,

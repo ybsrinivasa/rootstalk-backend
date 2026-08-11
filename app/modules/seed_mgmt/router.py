@@ -1064,6 +1064,36 @@ realistic restock window. (2026-05-31 narrative, Batch 12 carve-out.)
 """
 
 
+async def _check_seed_cancel_eligibility(order, db: AsyncSession) -> tuple[bool, str | None, str | None]:
+    """Seed parity of _check_cancel_eligibility in orders/router.py."""
+    from datetime import datetime, timezone
+    terminal = {
+        SeedOrderStatus.CANCELLED, SeedOrderStatus.PURCHASED,
+        SeedOrderStatus.REROUTED, SeedOrderStatus.READY_FOR_PICKUP,
+    }
+    if order.status in terminal:
+        return False, "already_terminal", f"Order is already {order.status}; nothing to cancel."
+    now = datetime.now(timezone.utc)
+    if order.dealer_viewing_until and order.dealer_viewing_until > now:
+        return False, "dealer_currently_viewing", (
+            "The dealer has opened your order for processing, please wait."
+        )
+    return True, None, None
+
+
+@router.get("/farmer/seed-orders/{order_id}/cancel-eligibility")
+async def cancel_seed_eligibility(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Tap-time eligibility check for the farmer's Cancel button on
+    seed orders. See regular-order counterpart for the full rationale."""
+    order = await _get_seed_order(db, order_id, current_user.id, farmer=True)
+    can_cancel, code, message = await _check_seed_cancel_eligibility(order, db)
+    return {"can_cancel": can_cancel, "code": code, "message": message}
+
+
 @router.put("/farmer/seed-orders/{order_id}/cancel")
 async def cancel_seed_order(
     order_id: str,
