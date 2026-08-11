@@ -965,6 +965,8 @@ async def get_farmer_seed_order(
         "scan_verified": order.scan_verified,
         "qr_available": qr_available,
         "created_at": order.created_at,
+        # 2026-08-11 — Cancel-migrate marker (see orders/router.py).
+        "is_returned_to_farmer": bool(getattr(order, "is_returned_to_farmer", False)),
     }
 
 
@@ -1070,15 +1072,14 @@ async def cancel_seed_order(
 ):
     """Farmer cancels a seed order.
 
-    2026-06-21 — Release-not-migrate parity with the regular-order
-    cancel path. Cancel is a clean terminal action; status → CANCELLED
-    and that's it. No DRAFT continuation: if the farmer wants to re-
-    order the same variety they go through the seed-advisory pull in
-    their preferred window, the same way they'd raise a fresh
-    pesticide / fertilizer order.
-
-    A seed order is single-variety, so there's no per-item release
-    step to do — the order itself going CANCELLED is the release.
+    2026-08-11 — Cancel-migrate (Model B reinstated, superseding the
+    2026-06-21 release-not-migrate flow). Farmer intent is "leave this
+    dealer," not "abandon the variety." Since a seed order is single-
+    variety, there's no item release + copy step: we flip the row to
+    DRAFT in place, clear dealer/facilitator, and mark
+    is_returned_to_farmer=True. The Returned pill picks it up and the
+    farmer can either PUT /send it to another dealer or PUT /discard
+    it to CANCELLED.
     """
     from app.services.order_events import record_event as _record_event
 
@@ -1114,23 +1115,81 @@ async def cancel_seed_order(
         )
 
     prev_status = order.status
+    prev_dealer = order.dealer_user_id
+    prev_facilitator = order.facilitator_user_id
+
+    order.status = SeedOrderStatus.DRAFT
+    order.dealer_user_id = None
+    order.facilitator_user_id = None
+    order.is_returned_to_farmer = True
+    # 2026-08-11 — Preserve outgoing-recipient context for the
+    # Returned pill's "Cancelled by you · from X" hint.
+    order.released_dealer_user_id = prev_dealer
+    order.released_facilitator_user_id = prev_facilitator
 
     await _record_event(
-        db, lineage_id=order.id,
+        db, lineage_id=order.lineage_id,
         event_type="CANCELLED_BY_FARMER",
         actor_user_id=current_user.id, actor_role="FARMER",
         seed_order_id=order.id,
         prev_status=prev_status,
-        new_status=SeedOrderStatus.CANCELLED.value,
-        metadata={},
+        new_status=SeedOrderStatus.DRAFT.value,
+        metadata={
+            "released_dealer_user_id": prev_dealer,
+            "released_facilitator_user_id": prev_facilitator,
+            "returned_to_farmer": True,
+        },
     )
 
-    order.status = SeedOrderStatus.CANCELLED
     await db.commit()
     return {
         "id": order_id,
         "status": order.status,
+        "is_returned_to_farmer": True,
     }
+
+
+@router.put("/farmer/seed-orders/{order_id}/discard")
+async def discard_returned_seed_draft(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Farmer discards a returned seed DRAFT ("Don't need these now").
+
+    Seed cancel-migrate leaves the seed order in DRAFT with
+    is_returned_to_farmer=True. Two exits: PUT /send to another dealer,
+    or PUT /discard here. Discard flips status → CANCELLED. Since seed
+    is single-variety with no OrderItem rows, there's no per-item
+    REROUTED step — the seed-advisory pull for this variety will re-
+    offer it naturally once the row is out of DRAFT.
+    """
+    from app.services.order_events import record_event as _record_event
+
+    order = await _get_seed_order(db, order_id, current_user.id, farmer=True)
+    if order.status != SeedOrderStatus.DRAFT or not order.is_returned_to_farmer:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "not_a_returned_draft",
+                "message": "This action only applies to items returned to you after a cancel.",
+            },
+        )
+
+    prev_status = order.status
+    order.status = SeedOrderStatus.CANCELLED
+    order.is_returned_to_farmer = False
+    await _record_event(
+        db, lineage_id=order.lineage_id,
+        event_type="DISCARDED_BY_FARMER",
+        actor_user_id=current_user.id, actor_role="FARMER",
+        seed_order_id=order.id,
+        prev_status=prev_status,
+        new_status=SeedOrderStatus.CANCELLED.value,
+        metadata={"reason": "returned_seed_draft_discard"},
+    )
+    await db.commit()
+    return {"id": order.id, "status": order.status}
 
 
 @router.delete("/farmer/seed-orders/{order_id}")
@@ -1198,6 +1257,13 @@ async def send_draft_seed_order(
         order.dealer_user_id = None
 
     order.status = SeedOrderStatus.SENT
+    # 2026-08-11 — Clear the cancel-migrate marker once the DRAFT is
+    # sent so it no longer surfaces on the Returned pill. Only
+    # meaningful while the farmer is deciding forward-or-discard.
+    # Drop the released-from hint too — new recipient overrides.
+    order.is_returned_to_farmer = False
+    order.released_dealer_user_id = None
+    order.released_facilitator_user_id = None
     await _record_event(
         db, lineage_id=order.lineage_id,
         event_type="SENT",

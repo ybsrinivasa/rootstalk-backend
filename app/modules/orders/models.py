@@ -1,7 +1,7 @@
 import uuid
 import enum
 from datetime import datetime, timezone
-from sqlalchemy import String, Text, Boolean, Integer, DateTime, ForeignKey, DECIMAL, JSON, Index
+from sqlalchemy import String, Text, Boolean, Integer, DateTime, ForeignKey, DECIMAL, JSON, Index, false as sa_false
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database import Base
 
@@ -103,6 +103,27 @@ class Order(Base):
     # everywhere. See feedback / order_integrity memory entries.
     reference_number: Mapped[str] = mapped_column(
         String(15), nullable=True, index=True,
+    )
+    # 2026-08-11 — Cancel-migrate marker (Model B reinstated). TRUE on
+    # DRAFT rows created by farmer Cancel Order to carry the source
+    # order's in-flight items. Feeds the "Returned" pill in place of
+    # the initial-composer / bulk / reroute-returned DRAFTs, and gates
+    # the /discard endpoint so it can't kill a DRAFT that was never a
+    # cancel result. FALSE on every other DRAFT and on all non-DRAFT
+    # rows. Flag is cleared once the DRAFT flips to SENT (dealer picked).
+    is_returned_to_farmer: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_false(),
+    )
+    # 2026-08-11 — "Cancelled by you · Previously with X" hint on the
+    # returned-DRAFT card. Populated at cancel with the outgoing
+    # recipient (from the source order for pest/fert; from the row
+    # itself before the in-place flip for seed). Cleared when the
+    # DRAFT flips to SENT. Purely informational — no downstream logic.
+    released_dealer_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=True,
+    )
+    released_facilitator_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

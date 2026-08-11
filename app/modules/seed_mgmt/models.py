@@ -119,5 +119,23 @@ class SeedOrderFull(Base):
     dealer_viewing_until: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )
+    # 2026-08-11 — Cancel-migrate marker (Model B reinstated). TRUE when
+    # the farmer taps Cancel — the row flips to DRAFT + clears dealer/
+    # facilitator and this flag turns on so the Returned pill picks it
+    # up and the /discard endpoint accepts it. Flag clears once the
+    # DRAFT is forwarded (flips to SENT).
+    is_returned_to_farmer: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_false(),
+    )
+    # 2026-08-11 — "Cancelled by you · Previously with X" hint. Copied
+    # from dealer_user_id / facilitator_user_id at cancel-time (right
+    # before those are cleared for the in-place DRAFT flip). Cleared
+    # again when /send picks a new recipient. Informational only.
+    released_dealer_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=True,
+    )
+    released_facilitator_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

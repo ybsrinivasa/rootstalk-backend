@@ -4738,17 +4738,16 @@ async def get_dashboard_attention(
 
     # Items on terminal-status orders are un-actionable and would
     # inflate the farmer's attention badge if counted.
-    # 2026-08-11 — COMPLETED / REJECTED / REROUTED added: a
-    # completed order's NOT_AVAILABLE items were still being counted
-    # under orders_returned on the Crop Dashboard tile (badge=2)
-    # even though the order was already history. History treats
-    # COMPLETED as a positive terminal — attention counts must agree.
+    # 2026-08-11 — COMPLETED added: a completed order's NOT_AVAILABLE
+    # items were still being counted under orders_returned on the Crop
+    # Dashboard tile (badge=2) even though the order was already history.
+    # REJECTED/REROUTED live on OrderItemStatus, not OrderStatus, so
+    # they don't belong here (referencing them AttributeError'd the
+    # whole /farmer/dashboard/attention endpoint into a 500).
     _TERMINAL_ORDER_STATUSES = {
         OrderStatus.CANCELLED,
         OrderStatus.EXPIRED,
         OrderStatus.COMPLETED,
-        OrderStatus.REJECTED,
-        OrderStatus.REROUTED,
     }
     from datetime import date as _date_cls
 
@@ -4891,6 +4890,16 @@ async def get_dashboard_attention(
             )
         )).scalars().all()
         for o in order_rows:
+            # 2026-08-11 — Cancel-migrate DRAFT (Model B). The DRAFT
+            # itself is the returned batch — count it as one attention
+            # item regardless of how many child OrderItems it holds
+            # (whole-batch action: forward or discard).
+            if (
+                o.status == OrderStatus.DRAFT
+                and getattr(o, "is_returned_to_farmer", False)
+            ):
+                bucket["orders_returned"] += 1
+                continue
             items = (await db.execute(
                 select(OrderItem).where(
                     OrderItem.order_id == o.id,
@@ -4936,6 +4945,12 @@ async def get_dashboard_attention(
                 bucket["seeds_returned"] += 1
             elif so.status == SeedOrderStatus.READY_FOR_PICKUP.value:
                 bucket["seeds_pickup_ready"] += 1
+            elif (
+                so.status == SeedOrderStatus.DRAFT.value
+                and getattr(so, "is_returned_to_farmer", False)
+            ):
+                # 2026-08-11 — Cancel-migrate seed DRAFT (Model B).
+                bucket["seeds_returned"] += 1
 
         bucket["total"] = (
             bucket["advisory_unmarked"]
