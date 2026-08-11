@@ -4738,16 +4738,21 @@ async def get_dashboard_attention(
 
     # Items on terminal-status orders are un-actionable and would
     # inflate the farmer's attention badge if counted.
-    # 2026-08-11 — COMPLETED added: a completed order's NOT_AVAILABLE
-    # items were still being counted under orders_returned on the Crop
-    # Dashboard tile (badge=2) even though the order was already history.
+    # 2026-08-11 (v1): added COMPLETED here to stop a completed order's
+    # NOT_AVAILABLE items from inflating orders_returned. But COMPLETED
+    # only means "approval work done" — the farmer may still need to
+    # pick items up. Excluding COMPLETED entirely also drops legitimate
+    # orders_pickup_ready counts, and the Manage-tab Pickup pill (which
+    # shares this filter shape) started to miss pickup-pending items.
+    # (v2): keep only truly-dead statuses here; per-count gates below
+    # skip the returned/awaiting counters for COMPLETED so its NA items
+    # don't leak into the badge, while pickup_ready still counts.
     # REJECTED/REROUTED live on OrderItemStatus, not OrderStatus, so
     # they don't belong here (referencing them AttributeError'd the
     # whole /farmer/dashboard/attention endpoint into a 500).
     _TERMINAL_ORDER_STATUSES = {
         OrderStatus.CANCELLED,
         OrderStatus.EXPIRED,
-        OrderStatus.COMPLETED,
     }
     from datetime import date as _date_cls
 
@@ -4906,16 +4911,22 @@ async def get_dashboard_attention(
                     OrderItem.archived_at.is_(None),
                 )
             )).scalars().all()
-            bucket["orders_awaiting_approval"] += sum(
-                1 for i in items if i.status == OrderItemStatus.SENT_FOR_APPROVAL
-            )
-            # Returned items only belong to the farmer when the order
-            # is direct-to-dealer; facilitator-held NOT_AVAILABLE is
-            # the facilitator's queue.
-            if not o.facilitator_user_id:
-                bucket["orders_returned"] += sum(
-                    1 for i in items if i.status == OrderItemStatus.NOT_AVAILABLE
+            # 2026-08-11 — Approval + returned counters skip COMPLETED
+            # orders: approval work is done and any leftover NA items
+            # are historical (frontend Returned pill also excludes
+            # COMPLETED). Pickup counter below still runs — a completed
+            # order can still be pickup-pending until packing_received.
+            if o.status != OrderStatus.COMPLETED:
+                bucket["orders_awaiting_approval"] += sum(
+                    1 for i in items if i.status == OrderItemStatus.SENT_FOR_APPROVAL
                 )
+                # Returned items only belong to the farmer when the order
+                # is direct-to-dealer; facilitator-held NOT_AVAILABLE is
+                # the facilitator's queue.
+                if not o.facilitator_user_id:
+                    bucket["orders_returned"] += sum(
+                        1 for i in items if i.status == OrderItemStatus.NOT_AVAILABLE
+                    )
             # Pickup ready = packing list shared with the farmer +
             # nothing received yet + at least one APPROVED item present
             # + dealer hasn't voluntarily removed it from the pill.
