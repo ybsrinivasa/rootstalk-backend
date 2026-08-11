@@ -896,6 +896,13 @@ async def list_subscription_orders(
             "date_to": o.date_to,
             "dealer_user_id": o.dealer_user_id,
             "facilitator_user_id": o.facilitator_user_id,
+            # 2026-08-11 — 30s heartbeat lease from the dealer PWA.
+            # Farmer's Cancel button uses this to short-circuit the
+            # confirm dialog when the dealer is actively viewing the
+            # order — showing the "please wait" message directly
+            # instead of asking the farmer to confirm a cancel that
+            # the server would immediately refuse with 409.
+            "dealer_viewing_until": o.dealer_viewing_until,
             "created_at": o.created_at,
             "item_count": cd.count,
             "is_max_count": cd.is_max,
@@ -987,6 +994,10 @@ async def list_subscription_orders(
             "dealer_user_id": so.dealer_user_id,
             "facilitator_user_id": so.facilitator_user_id,
             "subscription_id": so.subscription_id,
+            # 2026-08-11 — Seed parity for dealer-presence gate
+            # (no dealer-side seed-detail screen today so this stays
+            # NULL, but wired in advance).
+            "dealer_viewing_until": getattr(so, "dealer_viewing_until", None),
             # SEED has no item-level table; expose a 1/0 awaiting flag
             # so the Manage tab can render the same Approve-all action
             # using the order-level PUT /farmer/seed-orders/{id}/approve.
