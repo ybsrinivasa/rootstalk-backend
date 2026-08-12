@@ -131,6 +131,14 @@ class Order(Base):
     # card. NULL on non-returned rows; cleared when the DRAFT flips
     # to SENT.
     return_reason: Mapped[str] = mapped_column(String(30), nullable=True)
+    # 2026-08-12 — Facilitator-side parallel: dealer declined a
+    # facilitator-forwarded order. Farmer chip stays "Routed"
+    # (facilitator still owns it); facilitator's Returned pill picks
+    # it up instead of the ambiguous Pending pill. Cleared to FALSE
+    # when the facilitator forwards to a new dealer.
+    is_returned_to_facilitator: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_false(),
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 

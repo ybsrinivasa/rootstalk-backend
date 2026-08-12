@@ -140,5 +140,9 @@ class SeedOrderFull(Base):
     # 2026-08-12 — See orders.models.Order.return_reason. Values:
     # farmer_cancel | dealer_declined | facilitator_declined.
     return_reason: Mapped[str] = mapped_column(String(30), nullable=True)
+    # 2026-08-12 — Facilitator-side parallel (see Order for full note).
+    is_returned_to_facilitator: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_false(),
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

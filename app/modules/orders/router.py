@@ -4978,6 +4978,12 @@ async def list_facilitator_orders(
                 pl.farmer_received_at.isoformat() if pl and pl.farmer_received_at else None
             ),
             "packing_items": packing_items,
+            # 2026-08-12 — Facilitator-side returned marker so subBelongsTo
+            # can route dealer-declined orders to Returned pill (not
+            # lumped with fresh "needs accept" on Pending). Cleared on
+            # /route-to-dealer send.
+            "is_returned_to_facilitator": bool(getattr(o, "is_returned_to_facilitator", False)),
+            "released_dealer_user_id": getattr(o, "released_dealer_user_id", None),
         })
     return out
 
@@ -5035,6 +5041,10 @@ async def route_order_to_dealer(
     # facilitator handed off the routing decision; the dealer still
     # owns the commit-to-process decision.
     order.status = OrderStatus.SENT
+    # 2026-08-12 — Clear the returned-to-facilitator marker on forward:
+    # the previous dealer's decline is history, this is a fresh routing.
+    order.is_returned_to_facilitator = False
+    order.released_dealer_user_id = None
     await _record_event(
         db, lineage_id=order.id,
         event_type="ROUTED_TO_DEALER",
@@ -7171,10 +7181,12 @@ async def dealer_decline_order(
         reference_number=order.reference_number,
         # 2026-08-12 — Direct-dealer branch: route through the same
         # returned-to-farmer plumbing as farmer cancel. Facilitator
-        # branch stays in the facilitator's queue — not returned to
-        # farmer, no released_* / return_reason needed there.
+        # branch: routed back to facilitator's Returned pill via
+        # is_returned_to_facilitator so it doesn't lump with fresh
+        # "needs accept" orders on the Pending pill.
         is_returned_to_farmer=not facilitator_owns,
-        released_dealer_user_id=None if facilitator_owns else order.dealer_user_id,
+        is_returned_to_facilitator=facilitator_owns,
+        released_dealer_user_id=order.dealer_user_id,
         return_reason=None if facilitator_owns else 'dealer_declined',
     )
     db.add(new_draft)

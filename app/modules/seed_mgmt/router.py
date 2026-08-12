@@ -1624,28 +1624,51 @@ async def mark_seed_order_not_available(
     prev_status = order.status
     prev_dealer = order.dealer_user_id
     prev_facilitator = order.facilitator_user_id
-    order.status = SeedOrderStatus.DRAFT
-    order.dealer_user_id = None
-    order.facilitator_user_id = None
-    order.is_returned_to_farmer = True
-    order.released_dealer_user_id = prev_dealer
-    order.released_facilitator_user_id = prev_facilitator
-    order.return_reason = 'dealer_declined'
+    facilitator_owns = prev_facilitator is not None
+    # 2026-08-12 — Branch on facilitator ownership. Facilitator-forwarded
+    # seed → return to FACILITATOR (parity with pest/fert dealer_decline_
+    # order's facilitator branch). Direct-to-dealer seed → return to
+    # farmer as before. Bug found by audit: earlier this endpoint
+    # unconditionally cleared BOTH dealer + facilitator, bouncing
+    # facilitator-forwarded seed orders past the facilitator straight
+    # to the farmer.
+    if facilitator_owns:
+        # Return to facilitator: order stays ACCEPTED, dealer cleared,
+        # facilitator preserved, is_returned_to_facilitator marker set.
+        order.status = SeedOrderStatus.ACCEPTED
+        order.dealer_user_id = None
+        order.is_returned_to_facilitator = True
+        order.released_dealer_user_id = prev_dealer
+    else:
+        # Direct-to-dealer decline: return to farmer via cancel-migrate
+        # plumbing (matches farmer-cancel shape).
+        order.status = SeedOrderStatus.DRAFT
+        order.dealer_user_id = None
+        order.facilitator_user_id = None
+        order.is_returned_to_farmer = True
+        order.released_dealer_user_id = prev_dealer
+        order.released_facilitator_user_id = prev_facilitator
+        order.return_reason = 'dealer_declined'
     await _record_event(
         db, lineage_id=order.lineage_id,
         event_type="DECLINED_BY_DEALER",
         actor_user_id=current_user.id, actor_role="DEALER",
         seed_order_id=order.id,
         prev_status=prev_status,
-        new_status=SeedOrderStatus.DRAFT.value,
+        new_status=order.status.value if hasattr(order.status, 'value') else order.status,
         metadata={
             "released_dealer_user_id": prev_dealer,
             "released_facilitator_user_id": prev_facilitator,
-            "returned_to_farmer": True,
+            "returned_to_farmer": not facilitator_owns,
+            "returned_to_facilitator": facilitator_owns,
         },
     )
     await db.commit()
-    return {"id": order_id, "status": order.status, "is_returned_to_farmer": True}
+    return {
+        "id": order_id, "status": order.status,
+        "is_returned_to_farmer": not facilitator_owns,
+        "is_returned_to_facilitator": facilitator_owns,
+    }
 
 
 @router.put("/dealer/seed-orders/{order_id}/accept")
@@ -1789,6 +1812,9 @@ def _seed_for_facilitator_payload(
         "dealer_user_id": o.dealer_user_id,
         "dealer_name": dealer.name if dealer else None,
         "created_at": o.created_at,
+        # 2026-08-12 — Facilitator-side returned marker (see Order model).
+        "is_returned_to_facilitator": bool(getattr(o, "is_returned_to_facilitator", False)),
+        "released_dealer_user_id": getattr(o, "released_dealer_user_id", None),
     }
 
 
@@ -2080,6 +2106,10 @@ async def facilitator_route_seed_to_dealer(
         )
     order.dealer_user_id = dealer_user_id
     order.status = SeedOrderStatus.SENT
+    # 2026-08-12 — Clear the returned-to-facilitator marker on forward
+    # (parity with pest/fert route_order_to_dealer).
+    order.is_returned_to_facilitator = False
+    order.released_dealer_user_id = None
     await db.commit()
     return {
         "id": order_id,
