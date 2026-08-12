@@ -121,11 +121,16 @@ _ITEM_TRANSITIONS: dict[tuple[str, str], frozenset[str]] = {
 
     # Edit / change-decision self-edges. Allow the dealer to re-save
     # the same item (Edit details) or flip a NOT_AVAILABLE back to
-    # AVAILABLE ("actually I do have it now") before submission. The
-    # router gates these on order.status == PROCESSING so they can't
-    # be used after the farmer has the order.
+    # AVAILABLE / POSTPONED before submission. The router gates these
+    # on order.status == PROCESSING so they can't be used after the
+    # farmer has the order.
     ("AVAILABLE", "AVAILABLE"):              frozenset({DEALER}),
     ("NOT_AVAILABLE", "AVAILABLE"):          frozenset({DEALER}),
+    # 2026-08-12 — NA → POSTPONED added: dealer marks NA, then
+    # realises "actually I can get this in a couple of days." Change
+    # Decision on the NA card now offers Later alongside Available +
+    # Not Available (matches the PENDING card's three-way choice).
+    ("NOT_AVAILABLE", "POSTPONED"):          frozenset({DEALER}),
 
     # Submit-for-approval batch.
     ("AVAILABLE", "SENT_FOR_APPROVAL"):      frozenset({DEALER}),
