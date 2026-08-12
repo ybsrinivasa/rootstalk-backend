@@ -125,6 +125,12 @@ class Order(Base):
     released_facilitator_user_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("users.id"), nullable=True,
     )
+    # 2026-08-12 — Distinguishes returned-to-farmer DRAFTs by who
+    # caused the return: farmer_cancel | dealer_declined |
+    # facilitator_declined. Drives the chip text on the Returned pill
+    # card. NULL on non-returned rows; cleared when the DRAFT flips
+    # to SENT.
+    return_reason: Mapped[str] = mapped_column(String(30), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 

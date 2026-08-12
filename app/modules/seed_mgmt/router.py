@@ -967,6 +967,8 @@ async def get_farmer_seed_order(
         "created_at": order.created_at,
         # 2026-08-11 — Cancel-migrate marker (see orders/router.py).
         "is_returned_to_farmer": bool(getattr(order, "is_returned_to_farmer", False)),
+        # 2026-08-12 — Chip text differentiator surfaced on /forward.
+        "return_reason": getattr(order, "return_reason", None),
     }
 
 
@@ -1081,6 +1083,53 @@ async def _check_seed_cancel_eligibility(order, db: AsyncSession) -> tuple[bool,
     return True, None, None
 
 
+@router.get("/farmer/seed-orders/{order_id}/eligible-recipients")
+async def list_seed_eligible_recipients(
+    order_id: str,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Seed parity of pest/fert /farmer/orders/{id}/eligible-recipients.
+
+    Returns dealers + facilitators eligible to receive this seed order,
+    ranked by distance. Seeds are always brand-locked to the variety's
+    owning client, so dealers must be onboarded by that client;
+    facilitators are always allowed (brand-lock kicks in on their
+    onward route-to-dealer step). Powers the /seed-orders/[id]/forward
+    picker page.
+    """
+    from app.modules.subscriptions.router import (
+        nearby_dealers_for_farmer, nearby_facilitators_for_farmer,
+    )
+    order = await _get_seed_order(db, order_id, current_user.id, farmer=True)
+    # Both nearby_* helpers return a plain list (per subscriptions/
+    # router.py:6417 for dealers, mirrored on facilitators). Wrap
+    # into the {dealers, facilitators} shape that the pest/fert
+    # /eligible-recipients uses so the frontend can share code.
+    dealers = await nearby_dealers_for_farmer(
+        subscription_id=order.subscription_id,
+        order_type="SEED",
+        variety_id=order.variety_id,
+        lat=lat, lng=lng,
+        db=db, current_user=current_user,
+    )
+    facilitators = await nearby_facilitators_for_farmer(
+        subscription_id=order.subscription_id,
+        variety_id=order.variety_id,
+        lat=lat, lng=lng,
+        db=db, current_user=current_user,
+    )
+    return {
+        "category": "SEED",
+        "has_locked_brand": True,
+        "locked_brand_explainer": None,
+        "dealers": dealers if isinstance(dealers, list) else [],
+        "facilitators": facilitators if isinstance(facilitators, list) else [],
+    }
+
+
 @router.get("/farmer/seed-orders/{order_id}/cancel-eligibility")
 async def cancel_seed_eligibility(
     order_id: str,
@@ -1156,6 +1205,7 @@ async def cancel_seed_order(
     # Returned pill's "Cancelled by you · from X" hint.
     order.released_dealer_user_id = prev_dealer
     order.released_facilitator_user_id = prev_facilitator
+    order.return_reason = 'farmer_cancel'
 
     await _record_event(
         db, lineage_id=order.lineage_id,
@@ -1290,10 +1340,12 @@ async def send_draft_seed_order(
     # 2026-08-11 — Clear the cancel-migrate marker once the DRAFT is
     # sent so it no longer surfaces on the Returned pill. Only
     # meaningful while the farmer is deciding forward-or-discard.
-    # Drop the released-from hint too — new recipient overrides.
+    # Drop the released-from hint + return-reason too — informational
+    # only, and the new recipient replaces the "with X" context.
     order.is_returned_to_farmer = False
     order.released_dealer_user_id = None
     order.released_facilitator_user_id = None
+    order.return_reason = None
     await _record_event(
         db, lineage_id=order.lineage_id,
         event_type="SENT",
@@ -1542,8 +1594,21 @@ async def mark_seed_order_not_available(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Dealer marks a seed order as NOT_AVAILABLE — bounces to the
-    farmer for a re-route (cancel → new DRAFT → pick someone else)."""
+    """Dealer declines a seed order.
+
+    2026-08-12 — Routes through the same returned-to-farmer plumbing
+    that cancel-migrate uses (DRAFT + is_returned_to_farmer=True +
+    released_dealer_user_id + return_reason='dealer_declined'). Effect
+    is that the farmer's Manage tab picks it up on the Returned pill
+    with the standard two-button UI (Send to another dealer /
+    Don't need these now), same as for a farmer-cancelled seed. Chip
+    reads "DECLINED BY DEALER · from [Dealer]" via return_reason.
+
+    Old behaviour just flipped status → NOT_AVAILABLE and left the
+    dealer on the row; the farmer's Send-to-another-dealer tap 404'd
+    (routed to the pest/fert /forward URL which doesn't understand
+    seed IDs).
+    """
     from app.modules.orders.router import _assert_active_dealer
     from app.services.order_events import record_event as _record_event
 
@@ -1557,17 +1622,30 @@ async def mark_seed_order_not_available(
             detail="Order cannot be marked Not Available in current status",
         )
     prev_status = order.status
-    order.status = SeedOrderStatus.NOT_AVAILABLE
+    prev_dealer = order.dealer_user_id
+    prev_facilitator = order.facilitator_user_id
+    order.status = SeedOrderStatus.DRAFT
+    order.dealer_user_id = None
+    order.facilitator_user_id = None
+    order.is_returned_to_farmer = True
+    order.released_dealer_user_id = prev_dealer
+    order.released_facilitator_user_id = prev_facilitator
+    order.return_reason = 'dealer_declined'
     await _record_event(
         db, lineage_id=order.lineage_id,
-        event_type="MARKED_NOT_AVAILABLE",
+        event_type="DECLINED_BY_DEALER",
         actor_user_id=current_user.id, actor_role="DEALER",
         seed_order_id=order.id,
         prev_status=prev_status,
-        new_status=SeedOrderStatus.NOT_AVAILABLE.value,
+        new_status=SeedOrderStatus.DRAFT.value,
+        metadata={
+            "released_dealer_user_id": prev_dealer,
+            "released_facilitator_user_id": prev_facilitator,
+            "returned_to_farmer": True,
+        },
     )
     await db.commit()
-    return {"id": order_id, "status": order.status}
+    return {"id": order_id, "status": order.status, "is_returned_to_farmer": True}
 
 
 @router.put("/dealer/seed-orders/{order_id}/accept")
@@ -1840,13 +1918,22 @@ async def facilitator_reject_seed_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Facilitator declines a seed order. Status → REJECTED. The
-    farmer's existing cancel-and-migrate machinery
-    (`/farmer/seed-orders/{id}/cancel`) then lets them route the
-    intent elsewhere; mirroring the regular-order
-    facilitator-reject auto-migration is deferred until users ask
-    for it on the seed side."""
+    """Facilitator declines a seed order.
+
+    2026-08-12 — Routes through the same returned-to-farmer plumbing
+    as farmer cancel + dealer decline: DRAFT + is_returned_to_farmer=
+    True + released_facilitator_user_id + return_reason=
+    'facilitator_declined'. Farmer's Manage tab picks it up on the
+    Returned pill with the standard two-button UI. Chip reads
+    "DECLINED BY FACILITATOR · from [Facilitator]".
+
+    Old behaviour just flipped status → REJECTED (terminal). Farmer
+    then had to manually cancel to migrate the intent, which was
+    friction; now the migrate happens at reject-time.
+    """
     from app.modules.orders.router import _assert_active_facilitator
+    from app.services.order_events import record_event as _record_event
+
     await _assert_active_facilitator(db, current_user.id)
     order = await _get_facilitator_seed_order(db, order_id, current_user.id)
     if order.status not in (SeedOrderStatus.SENT, SeedOrderStatus.ACCEPTED):
@@ -1854,9 +1941,29 @@ async def facilitator_reject_seed_order(
             status_code=400,
             detail="Seed order can only be rejected from SENT or ACCEPTED",
         )
-    order.status = SeedOrderStatus.REJECTED
+    prev_status = order.status
+    prev_facilitator = order.facilitator_user_id
+    order.status = SeedOrderStatus.DRAFT
+    order.dealer_user_id = None
+    order.facilitator_user_id = None
+    order.is_returned_to_farmer = True
+    order.released_dealer_user_id = None
+    order.released_facilitator_user_id = prev_facilitator
+    order.return_reason = 'facilitator_declined'
+    await _record_event(
+        db, lineage_id=order.lineage_id,
+        event_type="DECLINED_BY_FACILITATOR",
+        actor_user_id=current_user.id, actor_role="FACILITATOR",
+        seed_order_id=order.id,
+        prev_status=prev_status,
+        new_status=SeedOrderStatus.DRAFT.value,
+        metadata={
+            "released_facilitator_user_id": prev_facilitator,
+            "returned_to_farmer": True,
+        },
+    )
     await db.commit()
-    return {"id": order_id, "status": order.status}
+    return {"id": order_id, "status": order.status, "is_returned_to_farmer": True}
 
 
 @router.get("/facilitator/seed-orders/{order_id}/nearby-dealers")

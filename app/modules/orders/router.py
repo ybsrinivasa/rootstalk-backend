@@ -943,8 +943,11 @@ async def list_subscription_orders(
             # farmer cancel (whole-batch forward-or-discard flow).
             "is_returned_to_farmer": bool(o.is_returned_to_farmer),
             # "Cancelled by you · Previously with X" hint. Only set
-            # on cancel-migrate DRAFTs; NULL on every other order.
+            # on returned-to-farmer DRAFTs; NULL on every other order.
             **_released_from_fields(o, recipients),
+            # 2026-08-12 — Chip text differentiator for the Returned
+            # pill card: farmer_cancel / dealer_declined / facilitator_declined.
+            "return_reason": getattr(o, "return_reason", None),
             **meta_dict,
             **(rcp.to_dict() if rcp else {}),
         })
@@ -1005,6 +1008,7 @@ async def list_subscription_orders(
             # 2026-08-11 — Cancel-migrate marker (parity with regular).
             "is_returned_to_farmer": bool(getattr(so, "is_returned_to_farmer", False)),
             **_released_from_fields(so, seed_recipients),
+            "return_reason": getattr(so, "return_reason", None),
             **meta_dict,
             **(rcp.to_dict() if rcp else {}),
         })
@@ -1467,6 +1471,8 @@ async def cancel_order(
             # Returned pill card can show "Cancelled by you · from X".
             released_dealer_user_id=order.dealer_user_id,
             released_facilitator_user_id=order.facilitator_user_id,
+            # 2026-08-12 — Chip text differentiator across return causes.
+            return_reason='farmer_cancel',
         )
         db.add(draft)
         await db.flush()
@@ -2322,12 +2328,13 @@ async def send_draft_order(
     # 2026-08-11 — Clear the cancel-migrate marker once the DRAFT is
     # sent so it no longer surfaces on the Returned pill. The flag is
     # only meaningful while the DRAFT is waiting on the farmer's
-    # forward-or-discard decision. Also drop the released-from hint —
-    # informational only, and the new recipient replaces the "with X"
-    # context anyway.
+    # forward-or-discard decision. Also drop the released-from hint
+    # and the return-reason — informational only, and the new
+    # recipient replaces the "with X" context anyway.
     order.is_returned_to_farmer = False
     order.released_dealer_user_id = None
     order.released_facilitator_user_id = None
+    order.return_reason = None
     # Refresh the 14-day expiry from the moment of send — the
     # original draft's clock isn't fair to a recipient who only
     # just got the order.
@@ -7162,6 +7169,13 @@ async def dealer_decline_order(
         lineage_root_id=new_lineage_root,
         # Dealer decline-migrate inherits the Order ID.
         reference_number=order.reference_number,
+        # 2026-08-12 — Direct-dealer branch: route through the same
+        # returned-to-farmer plumbing as farmer cancel. Facilitator
+        # branch stays in the facilitator's queue — not returned to
+        # farmer, no released_* / return_reason needed there.
+        is_returned_to_farmer=not facilitator_owns,
+        released_dealer_user_id=None if facilitator_owns else order.dealer_user_id,
+        return_reason=None if facilitator_owns else 'dealer_declined',
     )
     db.add(new_draft)
     await db.flush()
@@ -9602,6 +9616,13 @@ async def facilitator_reject_order(
         lineage_root_id=new_lineage_root,
         # Facilitator reject-migrate inherits the Order ID.
         reference_number=order.reference_number,
+        # 2026-08-12 — Route through returned-to-farmer plumbing so the
+        # farmer's Returned pill picks it up with the standard two-
+        # button UI. released_facilitator_user_id preserves the
+        # "declined by X" context for the chip.
+        is_returned_to_farmer=True,
+        released_facilitator_user_id=order.facilitator_user_id,
+        return_reason='facilitator_declined',
     )
     db.add(new_draft)
     await db.flush()

@@ -137,5 +137,8 @@ class SeedOrderFull(Base):
     released_facilitator_user_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("users.id"), nullable=True,
     )
+    # 2026-08-12 — See orders.models.Order.return_reason. Values:
+    # farmer_cancel | dealer_declined | facilitator_declined.
+    return_reason: Mapped[str] = mapped_column(String(30), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
