@@ -10775,9 +10775,12 @@ async def _update_order_status(db: AsyncSession, order_id: str):
         order.status = OrderStatus.COMPLETED
     elif len(approved) > 0:
         order.status = OrderStatus.PARTIALLY_APPROVED
-    elif items and not active:
-        # Every item is in a terminal-non-approved state (NOT_AVAILABLE,
-        # REROUTED, REMOVED, REJECTED, NOT_NEEDED, SKIPPED). Nothing for
-        # the farmer to approve, nothing to pack. Move the order off the
-        # Pending feed silently.
-        order.status = OrderStatus.COMPLETED
+    # 2026-08-12 — Removed the "all-items-terminal-non-approved →
+    # COMPLETED" branch. It hid the abandoned order from every surface
+    # (farmer's Returned pill, facilitator's, dealer's own queue).
+    # Correct behaviour: leave the order in its previous non-terminal
+    # status so the returned_count > 0 gate on the Returned pill fires,
+    # AND the dealer's Abort remains legal (Abort refuses on COMPLETED).
+    # Dealer's explicit "Decline order" (now allowed from PROCESSING
+    # too) provides the finalisation path when they know they have
+    # nothing available.

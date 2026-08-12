@@ -59,7 +59,12 @@ _ORDER_TRANSITIONS: dict[tuple[str, str], frozenset[str]] = {
     # Dealer abort: reset to SENT so a different dealer can pick it up.
     ("PROCESSING", "SENT"):               frozenset({DEALER, FACILITATOR}),
     ("PROCESSING", "SENT_FOR_APPROVAL"):  frozenset({DEALER}),
-    ("PROCESSING", "CANCELLED"):          frozenset({FARMER}),
+    # 2026-08-12 — DEALER added on PROCESSING → CANCELLED. Enables the
+    # dealer's "Decline order" affordance after they've accepted +
+    # marked items (typically all NA). Existing dealer_decline_order
+    # endpoint migrates items to a returned-to-farmer / returned-to-
+    # facilitator DRAFT via the same plumbing farmer-cancel uses.
+    ("PROCESSING", "CANCELLED"):          frozenset({FARMER, DEALER}),
     ("PROCESSING", "EXPIRED"):            frozenset({SYSTEM}),
 
     # After farmer-side approvals; live router writes both edges from
