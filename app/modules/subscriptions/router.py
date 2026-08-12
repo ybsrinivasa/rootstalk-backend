@@ -5614,6 +5614,12 @@ async def _today_advisory_for_user(
                 "order_status": ord_row.status.value if hasattr(ord_row.status, "value") else ord_row.status,
                 "dealer_user_id": ord_row.dealer_user_id,
                 "facilitator_user_id": ord_row.facilitator_user_id,
+                # 2026-08-12 — Returned-to-farmer marker: when the item's
+                # parent Order is a returned-to-farmer DRAFT (farmer
+                # cancel or dealer/facilitator decline), the advisory
+                # chip should read "Returned" — not "Routed" (which
+                # implies a dealer is actively working on it).
+                "is_returned_to_farmer": bool(getattr(ord_row, "is_returned_to_farmer", False)),
                 "brand_name": (
                     brand_loc.get(it.brand_cosh_id) or it.brand_name
                     if show_money else None
