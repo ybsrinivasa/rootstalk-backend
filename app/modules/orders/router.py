@@ -1402,16 +1402,17 @@ async def cancel_order(
     if order.lineage_root_id is None:
         order.lineage_root_id = order.id
 
-    # Items that the farmer has already committed to (APPROVED) or that
-    # are already at a per-item terminal stay on the source — the
-    # cancelled order must still tell the truth about what the farmer
-    # approved and what the dealer settled. Only still-in-flight items
-    # (PENDING / AVAILABLE / POSTPONED / NOT_AVAILABLE / SENT_FOR_APPROVAL)
-    # get released. Released items flip to REROUTED on the source AND
+    # Items that the farmer has already committed to (APPROVED) stay
+    # on the source — the cancelled order must still tell the truth
+    # about what the farmer accepted from the dealer. Still-in-flight
+    # items (PENDING / AVAILABLE / POSTPONED / NOT_AVAILABLE /
+    # SENT_FOR_APPROVAL) plus REJECTED (farmer's per-item "no" to
+    # THIS dealer's brand — user direction 2026-08-12: rejected =
+    # cancelled-for-this-dealer, joins the returned batch) get
+    # released. Released items flip to REROUTED on the source AND
     # get copied onto the returned-to-farmer DRAFT (see below).
     skip_statuses = {
         OrderItemStatus.APPROVED,
-        OrderItemStatus.REJECTED,
         OrderItemStatus.NOT_NEEDED,
         OrderItemStatus.SKIPPED,
         OrderItemStatus.REMOVED,
