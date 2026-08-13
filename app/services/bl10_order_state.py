@@ -115,6 +115,11 @@ _ITEM_TRANSITIONS: dict[tuple[str, str], frozenset[str]] = {
     # AVAILABLE one to NOT_NEEDED).
     ("PENDING", "NOT_NEEDED"):               frozenset({DEALER}),
     ("AVAILABLE", "NOT_NEEDED"):             frozenset({DEALER}),
+    # 2026-08-13 — U-turn: when dealer picks a leg on an OR, POSTPONED
+    # siblings on the other Option collapse to NOT_NEEDED (mirrors
+    # PENDING sibling collapse). No point holding a postpone slot on
+    # an item that's no longer needed.
+    ("POSTPONED", "NOT_NEEDED"):             frozenset({DEALER}),
     # And the dealer's Change-selection reset flips NOT_NEEDED back to
     # PENDING so the OR group reopens for a fresh pick.
     ("NOT_NEEDED", "PENDING"):               frozenset({DEALER}),

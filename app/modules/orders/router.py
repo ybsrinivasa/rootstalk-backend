@@ -3560,12 +3560,21 @@ async def mark_item_available(
                 # bucket + reroute prompts. The dealer-side render
                 # already treats both as "locked" (dimmed, read-only)
                 # so the UX there is unchanged.
+                # 2026-08-13 — U-turn: also collapse POSTPONED
+                # siblings. Once the OR resolves to a chosen leg, a
+                # sibling postpone on the other leg is meaningless
+                # (nobody needs it now). Clear postponed_until too
+                # so the auto-expiry sweep doesn't chase it.
                 if (
                     s_coords.part == my_coords.part
                     and s_coords.option != my_coords.option
-                    and sibling.status == OrderItemStatus.PENDING
+                    and sibling.status in (
+                        OrderItemStatus.PENDING,
+                        OrderItemStatus.POSTPONED,
+                    )
                 ):
                     sibling.status = OrderItemStatus.NOT_NEEDED
+                    sibling.postponed_until = None
                 # Same Part, same Option (compound AND) -> leave alone, dealer fills these
                 # Different Part -> leave alone, dealer processes that Part separately
         except ValueError:
@@ -3576,11 +3585,15 @@ async def mark_item_available(
                         OrderItem.order_id == order_id,
                         OrderItem.relation_id == item.relation_id,
                         OrderItem.id != item.id,
-                        OrderItem.status == OrderItemStatus.PENDING,
+                        OrderItem.status.in_((
+                            OrderItemStatus.PENDING,
+                            OrderItemStatus.POSTPONED,
+                        )),
                     )
                 )
                 for sibling in fb_result.scalars().all():
                     sibling.status = OrderItemStatus.NOT_NEEDED
+                    sibling.postponed_until = None
     elif item.relation_id and item.relation_type == "OR":
         # No relation_role at all (legacy data) — preserve original flat OR closure
         fb_result = await db.execute(
@@ -3588,11 +3601,15 @@ async def mark_item_available(
                 OrderItem.order_id == order_id,
                 OrderItem.relation_id == item.relation_id,
                 OrderItem.id != item.id,
-                OrderItem.status == OrderItemStatus.PENDING,
+                OrderItem.status.in_((
+                    OrderItemStatus.PENDING,
+                    OrderItemStatus.POSTPONED,
+                )),
             )
         )
         for sibling in fb_result.scalars().all():
             sibling.status = OrderItemStatus.NOT_NEEDED
+            sibling.postponed_until = None
 
     # Batch 28 — drop the draft entry now that the item is committed.
     # Whole-dict reassignment so SQLAlchemy detects the JSON change.
