@@ -7350,12 +7350,15 @@ async def _fertigation_multiplier_from_practice(
     """Compute the total number of applications across a Fertigation
     NPK practice's timeline given its `FERTIGATION_INTERVAL` element.
 
-    Spec §5.2: "Total purchase quantity = dosage per application ×
-    number of remaining applications from order date to timeline end."
-    MVP uses TOTAL applications across the timeline (from timeline
-    start, not from order date) — simpler and only over-purchases when
-    the farmer orders mid-timeline. "From order date" is a follow-up
-    refinement.
+    Invariant (universal RootsTalk rule): a PO is a procurement event
+    for the WHOLE timeline protocol, not a per-day-window purchase. So
+    the multiplier counts total applications across the full timeline
+    (from timeline start to timeline end), independent of the PO's own
+    date_from / date_to. A farmer ordering mid-timeline still receives
+    the full timeline's requirement. Do NOT "optimise" this by narrowing
+    to remaining-applications-from-order-date; that would fragment
+    fertigation protocols across multiple POs and break the invariant
+    shared with bl06_volume_calc.py.
 
     Returns 1 (no multiplier) when:
     - Interval element is missing / blank / unparseable (SE meant a
