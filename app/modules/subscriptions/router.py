@@ -4920,13 +4920,30 @@ async def get_dashboard_attention(
                 bucket["orders_awaiting_approval"] += sum(
                     1 for i in items if i.status == OrderItemStatus.SENT_FOR_APPROVAL
                 )
-                # Returned items only belong to the farmer when the order
-                # is direct-to-dealer; facilitator-held NOT_AVAILABLE is
-                # the facilitator's queue.
-                if not o.facilitator_user_id:
-                    bucket["orders_returned"] += sum(
-                        1 for i in items if i.status == OrderItemStatus.NOT_AVAILABLE
+            # 2026-08-13 — U-turn: orders_returned counts only when the
+            # order is quiescent (no PENDING / AVAILABLE / POSTPONED /
+            # SFA items still open with the dealer). Otherwise the N/A
+            # items are held in the wrapper and shouldn't show as
+            # attention for the farmer. Mirrors the Returned-pill gate
+            # on the frontend.
+            active_with_dealer = sum(
+                1 for i in items if i.status in (
+                    OrderItemStatus.PENDING,
+                    OrderItemStatus.AVAILABLE,
+                    OrderItemStatus.POSTPONED,
+                    OrderItemStatus.SENT_FOR_APPROVAL,
+                )
+            )
+            # Returned items only belong to the farmer when the order
+            # is direct-to-dealer; facilitator-held NOT_AVAILABLE is
+            # the facilitator's queue.
+            if not o.facilitator_user_id and active_with_dealer == 0:
+                bucket["orders_returned"] += sum(
+                    1 for i in items if i.status in (
+                        OrderItemStatus.NOT_AVAILABLE,
+                        OrderItemStatus.REJECTED,
                     )
+                )
             # Pickup ready = packing list shared with the farmer +
             # nothing received yet + at least one APPROVED item present
             # + dealer hasn't voluntarily removed it from the pill.

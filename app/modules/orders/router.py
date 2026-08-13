@@ -844,6 +844,19 @@ async def list_subscription_orders(
         returned_count = sum(1 for i in items if i.status in RETURNED)
         postponed_count = sum(1 for i in items if i.status in POSTPONED)
         approved_count = sum(1 for i in items if i.status == OrderItemStatus.APPROVED)
+        # 2026-08-13 — U-turn model: order stays with the dealer as one
+        # unit until fully settled. Returned pill on the farmer + faci-
+        # litator PWAs gates on active_item_count == 0 (no more in-flight
+        # dealer work of any kind) so N/A items don't leak to the farmer
+        # while a POSTPONE or unsubmitted PENDING/AVAILABLE is still open.
+        active_item_count = sum(
+            1 for i in items if i.status in (
+                OrderItemStatus.PENDING,
+                OrderItemStatus.AVAILABLE,
+                OrderItemStatus.POSTPONED,
+                OrderItemStatus.SENT_FOR_APPROVAL,
+            )
+        )
         # 2026-06-09 — REROUTED items live on a husk after a reroute /
         # cancel-migrate. Count separately so the PWA's History page
         # can show "lineage husk" rows under Cancelled.
@@ -912,6 +925,7 @@ async def list_subscription_orders(
             "approval_rounds_pending": len(queued_rounds_for_o),
             "returned_count": returned_count,
             "postponed_count": postponed_count,
+            "active_item_count": active_item_count,
             # 2026-06-09 — Lineage husk indicator. PWA History page
             # uses this to surface a "lineage husk" row under
             # Cancelled even when order.status is still PROCESSING.

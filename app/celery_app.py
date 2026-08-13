@@ -121,6 +121,16 @@ celery_app.conf.beat_schedule = {
         "task": "app.tasks.postpone_expiry.sweep_expired_postpones",
         "schedule": crontab(minute=45),
     },
+    # 2026-08-13 — U-turn: H-24 dealer heads-up for postpones about
+    # to auto-flip. Runs hourly at :35 (a few minutes ahead of the
+    # expiry sweep at :45 so the warning window and expiry window
+    # never contend on the same run). Each postpone hits exactly one
+    # warning-sweep window (23h30min – 24h30min from now) → exactly
+    # one FCM per postpone.
+    "postpone-warning-check": {
+        "task": "app.tasks.postpone_expiry.sweep_postpone_warnings",
+        "schedule": crontab(minute=35),
+    },
     # Orders V2 Batch 8: hourly tandem-archive of OrderItems whose
     # timeline window has closed. Mirrors the advisory's hidden-past
     # behaviour on the order side. :50 keeps it adjacent to the
