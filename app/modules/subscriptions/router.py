@@ -5494,6 +5494,47 @@ async def _today_advisory_for_user(
             if (it.status.value if hasattr(it.status, "value") else it.status) == "APPROVED"
         }
 
+        # 2026-08-14 — OR-branch collapse for the advisory. When a
+        # dealer picks a leg of an OR-relation, the sibling Options
+        # on the same Part get NOT_NEEDED at the OrderItem level
+        # (see mark_item_available's OR-cascade), but the advisory
+        # endpoint had no signal to filter the losing Options' PRACTICES
+        # out of the response. Farmer's advisory kept showing the
+        # unpicked branch with an "Order both together" CTA — a
+        # phantom that misleads the farmer into thinking they can
+        # still procure it.
+        # Fix: build a set of (relation_id, part) tuples where SOME
+        # option has been chosen (any in-flight OrderItem). For each
+        # practice we're about to include, if its (relation_id, part)
+        # has a chosen sibling in a DIFFERENT Option, drop it — the
+        # OR resolved elsewhere.
+        from app.services.relations import decode_role as _decode_role_adv
+        chosen_option_by_relation_part: dict[tuple[str, int], int] = {}
+        for it in committed_items:
+            if not (it.relation_id and it.relation_role):
+                continue
+            try:
+                coords = _decode_role_adv(it.relation_role)
+            except ValueError:
+                continue
+            key = (it.relation_id, coords.part)
+            # If multiple options end up committed on the same Part
+            # (should only happen mid-transition), the first-committed
+            # wins for the filter; the second would collapse naturally.
+            if key not in chosen_option_by_relation_part:
+                chosen_option_by_relation_part[key] = coords.option
+
+        def _is_or_loser(p) -> bool:
+            """True if practice p is in the LOSING Option of a resolved OR."""
+            if not (p.relation_id and p.relation_role):
+                return False
+            try:
+                coords = _decode_role_adv(p.relation_role)
+            except ValueError:
+                return False
+            chosen = chosen_option_by_relation_part.get((p.relation_id, coords.part))
+            return chosen is not None and chosen != coords.option
+
         # ── Orders V2 Batch 11: tappable per-practice fulfilment ──
         # For each practice the farmer sees on the advisory, surface
         # the latest live OrderItem status so the card can render a
@@ -6053,6 +6094,9 @@ async def _today_advisory_for_user(
             freq_filtered_practices = [
                 p for p in dedup_tl.visible_practices
                 if _is_frequency_due_today(p.frequency_days, from_d, today)
+                # 2026-08-14 — Drop practices whose OR-Option lost.
+                # See _is_or_loser + chosen_option_by_relation_part above.
+                and not _is_or_loser(p)
             ]
             # 2026-06-19 — Per-practice ack lookup. occurrence_date is
             # the timeline's from_d for non-frequency (sticky across the

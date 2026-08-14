@@ -5700,6 +5700,14 @@ async def get_dealer_order(
             # "Please check with the farmer" alongside an empty volume
             # input; the dealer enters volume manually.
             "affected_plants_count": affected_count_by_item.get(i.id),
+            # 2026-08-14 (Phase 2 rework): dealer's Final Confirmation
+            # timestamp. Null when APPROVED and dealer hasn't tapped
+            # Final Confirmation yet — the dealer PWA shows the button
+            # on these items. Non-null when the dealer has committed
+            # to hand-off → item flows to farmer's Pickup pill.
+            "final_confirmed_at": (
+                i.final_confirmed_at.isoformat() if i.final_confirmed_at else None
+            ),
         }
 
     # Group items by relation
