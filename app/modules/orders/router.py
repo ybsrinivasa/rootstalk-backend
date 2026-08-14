@@ -3242,6 +3242,13 @@ async def list_dealer_orders(
                     "given_volume": float(i.given_volume) if i.given_volume else None,
                     "volume_unit": i.volume_unit,
                     "price": float(i.price) if i.price else None,
+                    # 2026-08-14 (Phase 2 rework): per-item Final
+                    # Confirmation timestamp so the dealer PWA can
+                    # render per-item Confirm / Cancel buttons on the
+                    # Packing card without a per-row detail fetch.
+                    "final_confirmed_at": (
+                        i.final_confirmed_at.isoformat() if i.final_confirmed_at else None
+                    ),
                 })
         facilitator = (
             facilitator_by_id.get(o.facilitator_user_id)
