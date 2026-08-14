@@ -844,18 +844,36 @@ async def list_subscription_orders(
         returned_count = sum(1 for i in items if i.status in RETURNED)
         postponed_count = sum(1 for i in items if i.status in POSTPONED)
         approved_count = sum(1 for i in items if i.status == OrderItemStatus.APPROVED)
+        # 2026-08-14 (Phase 2 rework): Final Confirmation splits APPROVED
+        # into two sub-states. `awaiting_final_confirmation` = dealer
+        # has yet to commit; `pickup_ready` = dealer has stamped
+        # final_confirmed_at and the item is ready for hand-off.
+        awaiting_final_confirmation_count = sum(
+            1 for i in items
+            if i.status == OrderItemStatus.APPROVED and i.final_confirmed_at is None
+        )
+        final_confirmed_count = sum(
+            1 for i in items
+            if i.status == OrderItemStatus.APPROVED and i.final_confirmed_at is not None
+        )
         # 2026-08-13 — U-turn model: order stays with the dealer as one
         # unit until fully settled. Returned pill on the farmer + faci-
         # litator PWAs gates on active_item_count == 0 (no more in-flight
         # dealer work of any kind) so N/A items don't leak to the farmer
         # while a POSTPONE or unsubmitted PENDING/AVAILABLE is still open.
-        active_item_count = sum(
-            1 for i in items if i.status in (
-                OrderItemStatus.PENDING,
-                OrderItemStatus.AVAILABLE,
-                OrderItemStatus.POSTPONED,
-                OrderItemStatus.SENT_FOR_APPROVAL,
+        # 2026-08-14 — Phase 2: APPROVED-awaiting-Final-Confirm also
+        # counts as active (dealer's Final Confirmation is the remaining
+        # in-flight work; farmer's Cancel should still release it).
+        active_item_count = (
+            sum(
+                1 for i in items if i.status in (
+                    OrderItemStatus.PENDING,
+                    OrderItemStatus.AVAILABLE,
+                    OrderItemStatus.POSTPONED,
+                    OrderItemStatus.SENT_FOR_APPROVAL,
+                )
             )
+            + awaiting_final_confirmation_count
         )
         # 2026-06-09 — REROUTED items live on a husk after a reroute /
         # cancel-migrate. Count separately so the PWA's History page
@@ -926,6 +944,12 @@ async def list_subscription_orders(
             "returned_count": returned_count,
             "postponed_count": postponed_count,
             "active_item_count": active_item_count,
+            # 2026-08-14 (Phase 2): awaiting_final_confirmation_count
+            # is APPROVED items with final_confirmed_at IS NULL. The
+            # farmer's Routed card uses this to render the "dealer's
+            # Final Confirmation pending" state; the Pickup pill gates
+            # on final_confirmed_count instead.
+            "awaiting_final_confirmation_count": awaiting_final_confirmation_count,
             # 2026-06-09 — Lineage husk indicator. PWA History page
             # uses this to surface a "lineage husk" row under
             # Cancelled even when order.status is still PROCESSING.
@@ -933,8 +957,11 @@ async def list_subscription_orders(
             # 2026-06-06 — Drives the emerald "Pick up N items from X"
             # banner on the Manage card. Counts approved items only
             # when the farmer hasn't yet confirmed receipt.
+            # 2026-08-14 (Phase 2): gate on final_confirmed_at — a
+            # farmer-approved-but-dealer-not-yet-Final-Confirmed item
+            # is NOT ready for pickup yet.
             "pickup_ready_count": (
-                approved_count if not pl_received_by_order.get(o.id, False) else 0
+                final_confirmed_count if not pl_received_by_order.get(o.id, False) else 0
             ),
             # 2026-06-08 — When 'FACILITATOR', the farmer's banner +
             # confirmation page switch wording from "Pick up" →
@@ -1314,39 +1341,28 @@ async def cancel_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Farmer cancels an order.
+    """Farmer's Cancel — releases in-flight items and marks the source
+    as returned-to-farmer (Phase 2 rework, 2026-08-14). Supersedes the
+    2026-08-11 Model B DRAFT flow.
 
-    Allowed at any non-terminal status (DRAFT, SENT, ACCEPTED,
-    PROCESSING, SENT_FOR_APPROVAL, PARTIALLY_APPROVED). The narrative
-    is explicit (2026-05-31): "It can be cancelled even if the dealer
-    has accepted it. The farmer cannot be left at the dealer's mercy."
+    Cancel is a RELEASE step, not a fate decision:
+      - In-flight items (PENDING / AVAILABLE / POSTPONED + APPROVED-
+        with-final_confirmed_at-null i.e. dealer hasn't Final Confirmed
+        yet) flip to NOT_AVAILABLE. They stay on the source order as
+        unsold items awaiting the farmer's Send-or-Discard decision.
+      - APPROVED-Final-Confirmed items stay untouched — they are the
+        dealer's physical commitment and continue their Pickup lifecycle.
+      - Source order does NOT transition to CANCELLED (that's what
+        /discard does). It gets `is_returned_to_farmer=true` +
+        `return_reason='farmer_cancel'` + released_dealer_user_id /
+        released_facilitator_user_id preserved for the chip context.
+      - No DRAFT row is created (Model B fully unwound).
 
-    The only block is a *live* presence lease: if the dealer's app is
-    heartbeating against this order right now (dealer_viewing_until in
-    the future), we 409. The dealer's lease extends ~30 s past their
-    last heartbeat, so a closed screen frees the lock quickly.
+    Blocks: (a) dealer's live heartbeat lease; (b) SFA items awaiting
+    farmer's approval — the farmer clears those first via approve/
+    reject, then Cancel becomes valid.
 
-    Cancel-migrate semantics (2026-08-11 — Model B reinstated,
-    superseding the 2026-06-20 release-not-migrate flow):
-    Cancel is farmer intent to leave THIS dealer, not to abandon the
-    items. Every still-in-flight OrderItem on the source (and cascaded
-    siblings) is flipped to REROUTED on the source for history hygiene
-    AND copied as a fresh PENDING OrderItem onto a NEW DRAFT order
-    marked `is_returned_to_farmer=True`. That DRAFT surfaces on the
-    farmer's Returned pill with two actions: "Send to another dealer"
-    (PUT /send → dealer picker, existing endpoint) or "Don't need these
-    now" (PUT /discard → DRAFT → CANCELLED + items → REROUTED so
-    advisory re-offers the practice with an Order CTA).
-
-    APPROVED items — which the farmer has committed to and the dealer
-    is fulfilling — stay untouched on the source, as do already-
-    terminal per-item statuses (REJECTED, NOT_NEEDED, SKIPPED, REMOVED,
-    REROUTED). The cancelled source keeps its history of what the
-    farmer actually kept.
-
-    A single DRAFT gathers items from source + all cascaded siblings.
-    If nothing was in-flight (all items were already terminal), no
-    DRAFT is created and the source simply flips to CANCELLED.
+    Cascade: all lineage siblings receive the same release + flag flip.
     """
     order = await _get_farmer_order(db, order_id, current_user.id)
 
@@ -1367,12 +1383,6 @@ async def cancel_order(
             },
         )
 
-    # 2026-08-11 — Second soft gate: refuse cancel while there are
-    # items the farmer still needs to approve/reject. Cancelling in
-    # that window leaves the pending items in an ambiguous state
-    # (did the farmer approve or reject them by walking away?). The
-    # farmer is asked to act on the pending items first; the cancel
-    # then works on the remaining postponed items as before.
     pending_approval_count = (await db.execute(
         select(func.count(OrderItem.id)).where(
             OrderItem.order_id == order.id,
@@ -1395,12 +1405,8 @@ async def cancel_order(
 
     prev_order_status = order.status.value if hasattr(order.status, "value") else order.status
 
-    # 2026-06-07 — Cascade cancel across the whole lineage.
-    # User direction: "If a farmer cancels the Order, then it remains
-    # cancelled for both facilitator and the dealer." The Order ID
-    # groups all sub-orders sharing one reference_number /
-    # lineage_root_id; cancelling the source cascades CANCELLED
-    # silently to every non-terminal sibling.
+    # Cascade across the lineage — every non-terminal sibling gets the
+    # same release + flag flip. Reference_number groups the family.
     root_id = order.lineage_root_id or order.id
     sibling_rows = (await db.execute(
         select(Order).where(
@@ -1408,280 +1414,216 @@ async def cancel_order(
             & (Order.id != order.id)
         )
     )).scalars().all()
-    siblings_to_cancel = [
+    siblings_to_release = [
         s for s in sibling_rows if s.status not in terminal
     ]
-
-    # Backfill lineage_root_id on the source if it's still null.
     if order.lineage_root_id is None:
         order.lineage_root_id = order.id
 
-    # Items that the farmer has already committed to (APPROVED) stay
-    # on the source — the cancelled order must still tell the truth
-    # about what the farmer accepted from the dealer. Still-in-flight
-    # items (PENDING / AVAILABLE / POSTPONED / NOT_AVAILABLE /
-    # SENT_FOR_APPROVAL) plus REJECTED (farmer's per-item "no" to
-    # THIS dealer's brand — user direction 2026-08-12: rejected =
-    # cancelled-for-this-dealer, joins the returned batch) get
-    # released. Released items flip to REROUTED on the source AND
-    # get copied onto the returned-to-farmer DRAFT (see below).
-    skip_statuses = {
-        OrderItemStatus.APPROVED,
-        OrderItemStatus.NOT_NEEDED,
-        OrderItemStatus.SKIPPED,
-        OrderItemStatus.REMOVED,
-        OrderItemStatus.REROUTED,
-    }
+    def _is_in_flight(it: OrderItem) -> bool:
+        # In-flight = still expected from the dealer. Includes APPROVED
+        # items the dealer hasn't Final Confirmed yet (they're a farmer-
+        # side commitment but not a dealer-side physical commitment).
+        if it.status in (
+            OrderItemStatus.PENDING,
+            OrderItemStatus.AVAILABLE,
+            OrderItemStatus.POSTPONED,
+        ):
+            return True
+        if it.status == OrderItemStatus.APPROVED and it.final_confirmed_at is None:
+            return True
+        return False
 
-    async def _collect_in_flight_items(target: Order) -> list[OrderItem]:
+    async def _collect_in_flight(target: Order) -> list[OrderItem]:
         items_q = await db.execute(
             select(OrderItem).where(
                 OrderItem.order_id == target.id,
                 OrderItem.archived_at.is_(None),
             )
         )
-        return [
-            it for it in items_q.scalars().all()
-            if it.status not in skip_statuses
-        ]
+        return [it for it in items_q.scalars().all() if _is_in_flight(it)]
 
-    async def _cancel_source(target: Order) -> None:
-        if target.lineage_root_id is None:
-            target.lineage_root_id = root_id
-        target.status = OrderStatus.CANCELLED
-
-    released_from_source = await _collect_in_flight_items(order)
-    released_from_siblings: list[tuple[Order, list[OrderItem]]] = []
-    for sibling in siblings_to_cancel:
-        released_from_siblings.append(
-            (sibling, await _collect_in_flight_items(sibling))
-        )
-
-    total_released = (
-        len(released_from_source)
-        + sum(len(items) for _, items in released_from_siblings)
-    )
-
-    # Create ONE DRAFT that gathers every released item across
-    # source + cascaded siblings. The farmer sees one returned batch
-    # (per user direction: whole-batch, not per-item).
-    draft: Order | None = None
-    if total_released > 0:
-        draft = Order(
-            subscription_id=order.subscription_id,
-            farmer_user_id=order.farmer_user_id,
-            client_id=order.client_id,
-            category=order.category,
-            date_from=order.date_from,
-            date_to=order.date_to,
-            status=OrderStatus.DRAFT,
-            dealer_user_id=None,
-            facilitator_user_id=None,
-            locked_timelines=order.locked_timelines,
-            expires_at=order.expires_at,
-            lineage_root_id=root_id,
-            reference_number=order.reference_number,
-            is_returned_to_farmer=True,
-            # 2026-08-11 — Preserve outgoing-recipient context so the
-            # Returned pill card can show "Cancelled by you · from X".
-            released_dealer_user_id=order.dealer_user_id,
-            released_facilitator_user_id=order.facilitator_user_id,
-            # 2026-08-12 — Chip text differentiator across return causes.
-            return_reason='farmer_cancel',
-        )
-        db.add(draft)
-        await db.flush()
-
-    async def _release_and_copy(
-        target: Order, items: list[OrderItem], *, is_source: bool,
-    ) -> None:
+    async def _release(target: Order, items: list[OrderItem]) -> None:
         for it in items:
-            prev_item_status = (
-                it.status.value if hasattr(it.status, "value") else it.status
-            )
-            new_item = OrderItem(
-                order_id=draft.id,
-                practice_id=it.practice_id,
-                timeline_id=it.timeline_id,
-                brand_cosh_id=None,
-                brand_name=None,
-                given_volume=None,
-                volume_unit=it.volume_unit,
-                price=None,
-                estimated_volume=it.estimated_volume,
-                relation_id=it.relation_id,
-                relation_type=it.relation_type,
-                relation_role=it.relation_role,
-                scan_verified=False,
-                status=OrderItemStatus.PENDING,
-                snapshot_id=it.snapshot_id,
-                lineage_id=it.lineage_id,
-            )
-            db.add(new_item)
-            await db.flush()
+            prev = it.status.value if hasattr(it.status, "value") else it.status
+            it.status = OrderItemStatus.NOT_AVAILABLE
+            it.postponed_until = None
             await _record_event(
                 db, lineage_id=it.lineage_id,
-                event_type="REROUTED_FROM",
+                event_type="RELEASED_BY_FARMER_CANCEL",
                 actor_user_id=current_user.id, actor_role="FARMER",
                 order_id=target.id, order_item_id=it.id,
-                prev_status=prev_item_status,
-                new_status=OrderItemStatus.REROUTED.value,
-                metadata={
-                    "to_order_id": draft.id,
-                    "to_order_item_id": new_item.id,
-                    "reason": (
-                        "farmer_cancel_cascade" if not is_source
-                        else "farmer_cancel"
-                    ),
-                },
+                prev_status=prev,
+                new_status=OrderItemStatus.NOT_AVAILABLE.value,
             )
-            await _record_event(
-                db, lineage_id=it.lineage_id,
-                event_type="REROUTED_TO",
-                actor_user_id=current_user.id, actor_role="FARMER",
-                order_id=draft.id, order_item_id=new_item.id,
-                prev_status=OrderItemStatus.REROUTED.value,
-                new_status=OrderItemStatus.PENDING.value,
-                metadata={
-                    "from_order_id": target.id,
-                    "from_order_item_id": it.id,
-                    "reason": (
-                        "farmer_cancel_cascade" if not is_source
-                        else "farmer_cancel"
-                    ),
-                },
-            )
-            it.status = OrderItemStatus.REROUTED
 
-    if draft is not None:
-        await _release_and_copy(order, released_from_source, is_source=True)
-        for sibling, items in released_from_siblings:
-            await _release_and_copy(sibling, items, is_source=False)
+    def _flip_return_flag(target: Order) -> None:
+        if target.lineage_root_id is None:
+            target.lineage_root_id = root_id
+        target.is_returned_to_farmer = True
+        target.return_reason = 'farmer_cancel'
+        if target.dealer_user_id and not target.released_dealer_user_id:
+            target.released_dealer_user_id = target.dealer_user_id
+        if target.facilitator_user_id and not target.released_facilitator_user_id:
+            target.released_facilitator_user_id = target.facilitator_user_id
 
-    await _cancel_source(order)
-    cascaded_counts = []
-    for sibling, items in released_from_siblings:
-        await _cancel_source(sibling)
-        cascaded_counts.append((sibling.id, len(items)))
+    released_from_source = await _collect_in_flight(order)
+    await _release(order, released_from_source)
+    _flip_return_flag(order)
+
+    cascaded_counts: list[tuple[str, int]] = []
+    for sibling in siblings_to_release:
+        released = await _collect_in_flight(sibling)
+        await _release(sibling, released)
+        _flip_return_flag(sibling)
+        cascaded_counts.append((sibling.id, len(released)))
         await _record_event(
             db, lineage_id=sibling.id,
-            event_type="CANCELLED_BY_FARMER",
+            event_type="RETURNED_TO_FARMER_BY_CANCEL",
             actor_user_id=current_user.id, actor_role="FARMER",
             order_id=sibling.id,
             prev_status=(
                 sibling.status.value if hasattr(sibling.status, "value")
                 else sibling.status
             ),
-            new_status=OrderStatus.CANCELLED.value,
+            new_status=(
+                sibling.status.value if hasattr(sibling.status, "value")
+                else sibling.status
+            ),
             metadata={
                 "trigger": "lineage_cascade",
                 "source_order_id": order.id,
-                "released_item_count": len(items),
-                "returned_draft_id": draft.id if draft else None,
+                "released_item_count": len(released),
             },
         )
 
+    total_released = (
+        len(released_from_source)
+        + sum(count for _, count in cascaded_counts)
+    )
     await _record_event(
-        db,
-        lineage_id=order.id,
-        event_type="CANCELLED_BY_FARMER",
-        actor_user_id=current_user.id,
-        actor_role="FARMER",
+        db, lineage_id=order.id,
+        event_type="RETURNED_TO_FARMER_BY_CANCEL",
+        actor_user_id=current_user.id, actor_role="FARMER",
         order_id=order.id,
         prev_status=prev_order_status,
-        new_status=OrderStatus.CANCELLED.value,
+        new_status=prev_order_status,
         metadata={
             "released_item_count": len(released_from_source),
             "cascaded_sibling_count": len(cascaded_counts),
             "cascaded_sibling_ids": [sid for sid, _ in cascaded_counts],
             "total_released_item_count": total_released,
-            "returned_draft_id": draft.id if draft else None,
         },
     )
 
     await db.commit()
     return {
         "status": order.status,
+        "is_returned_to_farmer": True,
         "released_item_count": len(released_from_source),
         "cascaded_sibling_count": len(cascaded_counts),
         "total_released_item_count": total_released,
-        "returned_draft_id": draft.id if draft else None,
     }
 
 
 @router.put("/farmer/orders/{order_id}/discard")
-async def discard_returned_draft(
+async def discard_order(
     order_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Farmer discards a returned DRAFT ("Don't need these now").
+    """Farmer's Discard — the fate decision that finalises a returned-
+    to-farmer order (Phase 2 rework, 2026-08-14). Reached from the
+    Routed card's Discard button, either directly (at natural quiescence
+    with unsold items) or after Cancel (which set is_returned_to_farmer).
 
-    Cancel-migrate (Model B) leaves the farmer holding a DRAFT of the
-    items released from a cancelled dealer engagement. Two exits:
-      - Forward to a different dealer via PUT /farmer/orders/{id}/send
-      - Discard here — DRAFT → CANCELLED, items → REROUTED. REROUTED
-        items are excluded from advisory dedup, so the source practice
-        reappears in the next advisory pull with an "Order" CTA. That
-        matches the farmer's spec: "the status in his advisory against
-        those very items should show 'Order'".
+    Semantics:
+      - Requires is_returned_to_farmer=true on the source (the order
+        must be back with the farmer for a fate decision).
+      - Unsold items (NOT_AVAILABLE / REJECTED) stay in place; the
+        Discard doesn't need to re-flip them — they're already terminal
+        per-item. The event log stamps the farmer's intent.
+      - is_returned_to_farmer is cleared (the fate is now decided).
+      - If NO APPROVED items exist on the source (nothing pending in
+        Pickup lifecycle), the source order transitions to CANCELLED
+        so the Routed card auto-removes cleanly.
+      - If APPROVED items exist (physical hand-off in motion via
+        Pickup pill), the source stays live — the Routed card renders
+        in "Delivering" state with no buttons, Pickup card continues
+        independently. Farmer's Discard has closed the reroute/discard
+        question; the pickup lifecycle proceeds on its own clock.
 
-    Gated on is_returned_to_farmer=True so we can't accidentally kill
-    a DRAFT that came from the initial composer / bulk-order / reroute
-    paths — those have their own DELETE surface.
+    Rerouted items on other lineage siblings are not touched here —
+    each sibling with is_returned_to_farmer=true gets its own Discard
+    action from its own Routed card if needed.
     """
     order = await _get_farmer_order(db, order_id, current_user.id)
-    if order.status != OrderStatus.DRAFT or not order.is_returned_to_farmer:
+    if not order.is_returned_to_farmer:
         raise HTTPException(
             status_code=400,
             detail={
-                "code": "not_a_returned_draft",
-                "message": "This action only applies to items returned to you after a cancel.",
+                "code": "not_returned_to_farmer",
+                "message": "This order is not currently back with you for a fate decision.",
+            },
+        )
+    if order.status == OrderStatus.CANCELLED:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "already_cancelled",
+                "message": "Order is already cancelled.",
             },
         )
 
-    items = (await db.execute(
+    unsold_items = (await db.execute(
         select(OrderItem).where(
             OrderItem.order_id == order.id,
             OrderItem.archived_at.is_(None),
+            OrderItem.status.in_((
+                OrderItemStatus.NOT_AVAILABLE,
+                OrderItemStatus.REJECTED,
+            )),
         )
     )).scalars().all()
 
-    for it in items:
-        prev_item_status = (
-            it.status.value if hasattr(it.status, "value") else it.status
+    has_approved = (await db.execute(
+        select(func.count(OrderItem.id)).where(
+            OrderItem.order_id == order.id,
+            OrderItem.status == OrderItemStatus.APPROVED,
+            OrderItem.archived_at.is_(None),
         )
-        await _record_event(
-            db, lineage_id=it.lineage_id,
-            event_type="DISCARDED_BY_FARMER",
-            actor_user_id=current_user.id, actor_role="FARMER",
-            order_id=order.id, order_item_id=it.id,
-            prev_status=prev_item_status,
-            new_status=OrderItemStatus.REROUTED.value,
-            metadata={"reason": "returned_draft_discard"},
-        )
-        it.status = OrderItemStatus.REROUTED
+    )).scalar_one() or 0
 
     prev_order_status = (
         order.status.value if hasattr(order.status, "value") else order.status
     )
-    order.status = OrderStatus.CANCELLED
     order.is_returned_to_farmer = False
+    if not has_approved:
+        order.status = OrderStatus.CANCELLED
+
     await _record_event(
         db, lineage_id=order.id,
         event_type="DISCARDED_BY_FARMER",
         actor_user_id=current_user.id, actor_role="FARMER",
         order_id=order.id,
         prev_status=prev_order_status,
-        new_status=OrderStatus.CANCELLED.value,
-        metadata={"item_count": len(items)},
+        new_status=(
+            order.status.value if hasattr(order.status, "value")
+            else order.status
+        ),
+        metadata={
+            "unsold_item_count": len(unsold_items),
+            "approved_items_pending_pickup": has_approved,
+            "source_cancelled": not has_approved,
+        },
     )
 
     await db.commit()
     return {
         "id": order.id,
         "status": order.status,
-        "discarded_item_count": len(items),
+        "unsold_item_count": len(unsold_items),
+        "approved_items_pending_pickup": has_approved,
     }
 
 
@@ -3233,6 +3175,18 @@ async def list_dealer_orders(
             "sent_for_approval": sum(1 for i in live_items if i.status == OrderItemStatus.SENT_FOR_APPROVAL),
             "approved": sum(1 for i in live_items if i.status == OrderItemStatus.APPROVED),
             "rejected": sum(1 for i in live_items if i.status == OrderItemStatus.REJECTED),
+            # 2026-08-14 (Phase 2): APPROVED items split by dealer's
+            # Final Confirmation. Facilitator + dealer PWAs read these
+            # to distinguish "awaiting your Final Confirmation" vs
+            # "ready for pickup".
+            "awaiting_final_confirmation": sum(
+                1 for i in live_items
+                if i.status == OrderItemStatus.APPROVED and i.final_confirmed_at is None
+            ),
+            "final_confirmed": sum(
+                1 for i in live_items
+                if i.status == OrderItemStatus.APPROVED and i.final_confirmed_at is not None
+            ),
         }
         pl = pl_by_order.get(o.id)
         # Packing items — only when there are APPROVED items AND the
@@ -4136,6 +4090,127 @@ async def mark_item_unavailable(
     return {"item_id": item_id, "status": item.status}
 
 
+# 2026-08-14 — Final Confirmation endpoints (Phase 2 rework). The
+# dealer's explicit commitment step between farmer's APPROVED
+# decision and the item reaching the Pickup pill. Represents the
+# moment payment / credit terms are settled and the dealer is
+# ready to pack. See project_rootstalk_order_lifecycle_rework
+# _2026_08_13.md for full context.
+@router.put("/dealer/orders/{order_id}/items/{item_id}/final-confirm")
+async def final_confirm_item(
+    order_id: str, item_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await _assert_active_dealer(db, current_user.id)
+    await _get_dealer_order(db, order_id, current_user.id)
+    item = await _get_order_item(db, item_id, order_id)
+    if item.status != OrderItemStatus.APPROVED:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "not_approved",
+                "message": "Only farmer-approved items can be Final Confirmed.",
+            },
+        )
+    if item.final_confirmed_at is not None:
+        return {"item_id": item_id, "final_confirmed_at": item.final_confirmed_at}
+    item.final_confirmed_at = datetime.now(timezone.utc)
+    await _record_event(
+        db, lineage_id=item.lineage_id,
+        event_type="FINAL_CONFIRMED",
+        actor_user_id=current_user.id, actor_role="DEALER",
+        order_id=order_id, order_item_id=item.id,
+        prev_status=OrderItemStatus.APPROVED.value,
+        new_status=OrderItemStatus.APPROVED.value,
+        metadata={"final_confirmed_at": item.final_confirmed_at.isoformat()},
+    )
+    await db.commit()
+    return {"item_id": item_id, "final_confirmed_at": item.final_confirmed_at}
+
+
+@router.put("/dealer/orders/{order_id}/final-confirm-all")
+async def final_confirm_all(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Batch stamp final_confirmed_at on every APPROVED item that's
+    still awaiting Final Confirmation. Dealer's one-tap "confirm all"
+    action from the order-detail footer."""
+    await _assert_active_dealer(db, current_user.id)
+    await _get_dealer_order(db, order_id, current_user.id)
+    items = (await db.execute(
+        select(OrderItem).where(
+            OrderItem.order_id == order_id,
+            OrderItem.status == OrderItemStatus.APPROVED,
+            OrderItem.final_confirmed_at.is_(None),
+            OrderItem.archived_at.is_(None),
+        )
+    )).scalars().all()
+    now = datetime.now(timezone.utc)
+    for item in items:
+        item.final_confirmed_at = now
+        await _record_event(
+            db, lineage_id=item.lineage_id,
+            event_type="FINAL_CONFIRMED",
+            actor_user_id=current_user.id, actor_role="DEALER",
+            order_id=order_id, order_item_id=item.id,
+            prev_status=OrderItemStatus.APPROVED.value,
+            new_status=OrderItemStatus.APPROVED.value,
+            metadata={"final_confirmed_at": now.isoformat(), "batch": True},
+        )
+    await db.commit()
+    return {"count": len(items), "final_confirmed_at": now}
+
+
+@router.put("/dealer/orders/{order_id}/items/{item_id}/cancel-final-confirm")
+async def cancel_final_confirm_item(
+    order_id: str, item_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Dealer's back-out on an APPROVED-but-not-yet-Final-Confirmed
+    item. Common reason: farmer's payment / credit didn't materialise
+    after all. Item goes to NOT_AVAILABLE and joins the wrapper —
+    surfaces on the farmer's unsold-items batch when the order goes
+    quiescent."""
+    await _assert_active_dealer(db, current_user.id)
+    await _get_dealer_order(db, order_id, current_user.id)
+    item = await _get_order_item(db, item_id, order_id)
+    if item.status != OrderItemStatus.APPROVED:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "not_approved",
+                "message": "Cancel-final-confirm is only available on APPROVED items.",
+            },
+        )
+    if item.final_confirmed_at is not None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "already_final_confirmed",
+                "message": "This item is already Final Confirmed and can no longer be cancelled by you — it is with the farmer for pickup.",
+            },
+        )
+    res = validate_item_transition(item.status, OrderItemStatus.NOT_AVAILABLE.value, DEALER)
+    if not res.allowed:
+        _raise_transition(res)
+    prev = item.status.value if hasattr(item.status, "value") else item.status
+    item.status = OrderItemStatus.NOT_AVAILABLE
+    await _record_event(
+        db, lineage_id=item.lineage_id,
+        event_type="CANCEL_FINAL_CONFIRM",
+        actor_user_id=current_user.id, actor_role="DEALER",
+        order_id=order_id, order_item_id=item.id,
+        prev_status=prev, new_status=OrderItemStatus.NOT_AVAILABLE.value,
+    )
+    await _update_order_status(db, order_id)
+    await db.commit()
+    return {"item_id": item_id, "status": item.status}
+
+
 @router.put("/dealer/orders/{order_id}/items/{item_id}/reset")
 async def reset_item(
     order_id: str, item_id: str,
@@ -4936,6 +5011,18 @@ async def list_facilitator_orders(
             "sent_for_approval": sum(1 for i in live_items if i.status == OrderItemStatus.SENT_FOR_APPROVAL),
             "approved": sum(1 for i in live_items if i.status == OrderItemStatus.APPROVED),
             "rejected": sum(1 for i in live_items if i.status == OrderItemStatus.REJECTED),
+            # 2026-08-14 (Phase 2): APPROVED items split by dealer's
+            # Final Confirmation. Facilitator + dealer PWAs read these
+            # to distinguish "awaiting your Final Confirmation" vs
+            # "ready for pickup".
+            "awaiting_final_confirmation": sum(
+                1 for i in live_items
+                if i.status == OrderItemStatus.APPROVED and i.final_confirmed_at is None
+            ),
+            "final_confirmed": sum(
+                1 for i in live_items
+                if i.status == OrderItemStatus.APPROVED and i.final_confirmed_at is not None
+            ),
         }
         pl = pl_by_order.get(o.id)
         # 2026-06-22 — Inline list of items the facilitator picks up
@@ -7148,29 +7235,23 @@ async def dealer_decline_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Dealer rejects a fresh SENT order without ever processing it.
+    """Dealer declines an order (Phase 2 rework, 2026-08-14). Model B
+    DRAFT flow unwound — source order gets flagged returned-to-farmer
+    (or returned-to-facilitator, if facilitator-owned), items released
+    in place. No new order row created.
 
-    Mirrors the farmer-side cancel-with-migrate flow: the husk goes
-    CANCELLED with a DECLINED_BY_DEALER event; items duplicate into a
-    new order carrying the source's lineage_root_id so the
-    procurement intent stays grouped.
-
-    Branch on `source.facilitator_user_id`:
-    - **No facilitator** (direct farmer → dealer): new order in
-      DRAFT, both recipient fields cleared. The farmer's Manage tab
-      Routed pill picks it up and they pick a new recipient.
-    - **Facilitator owns** (farmer → facilitator → dealer):
-      returned-items-stay-with-facilitator rule applies at the
-      order level too. New order in ACCEPTED status,
-      facilitator_user_id preserved, dealer_user_id cleared. The
-      facilitator's Pending pill (expanded to include
-      `ACCEPTED && !dealer_user_id`) picks it up and the chunk
-      offers Forward-to-another-dealer.
-
-    2026-06-09 — Earlier code unconditionally nulled
-    facilitator_user_id, dropping the order back on the farmer
-    even when a facilitator was actively handling it. Same bug
-    class as the 2026-06-08 farmer-reroute fix.
+    Semantics:
+      - All non-terminal items on the source flip to NOT_AVAILABLE
+        (dealer said no to every item).
+      - Facilitator-owned source: is_returned_to_facilitator=true so
+        the facilitator's Routed card picks it up in "Returned" state.
+      - Direct farmer-dealer source: is_returned_to_farmer=true +
+        return_reason='dealer_declined', released_dealer_user_id
+        preserved for the chip context. Farmer's Routed card picks it
+        up in "Returned" state with Send / Discard buttons.
+      - Source order stays live (status not changed to CANCELLED).
+        Dealer's queue drops the order via the is_returned_to_farmer /
+        is_returned_to_facilitator filter.
     """
     await _assert_active_dealer(db, current_user.id)
     order = (await db.execute(
@@ -7179,9 +7260,8 @@ async def dealer_decline_order(
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    res = validate_order_transition(order.status, OrderStatus.CANCELLED.value, DEALER)
-    if not res.allowed:
-        _raise_transition(res)
+    prev_order_status = order.status.value if hasattr(order.status, "value") else order.status
+    facilitator_owns = order.facilitator_user_id is not None
 
     items = (await db.execute(
         select(OrderItem).where(
@@ -7190,112 +7270,55 @@ async def dealer_decline_order(
         )
     )).scalars().all()
 
-    new_lineage_root = order.lineage_root_id or order.id
-    facilitator_owns = order.facilitator_user_id is not None
-    new_draft = Order(
-        subscription_id=order.subscription_id,
-        farmer_user_id=order.farmer_user_id,
-        client_id=order.client_id,
-        category=order.category,
-        date_from=order.date_from,
-        date_to=order.date_to,
-        # Facilitator-routed → new order lands in ACCEPTED (the
-        # facilitator already committed by forwarding; no need to
-        # re-Accept). Direct-dealer → DRAFT so the farmer can
-        # pick a new recipient.
-        status=OrderStatus.ACCEPTED if facilitator_owns else OrderStatus.DRAFT,
-        dealer_user_id=None,
-        facilitator_user_id=order.facilitator_user_id if facilitator_owns else None,
-        locked_timelines=order.locked_timelines,
-        expires_at=order.expires_at,
-        lineage_root_id=new_lineage_root,
-        # Dealer decline-migrate inherits the Order ID.
-        reference_number=order.reference_number,
-        # 2026-08-12 — Direct-dealer branch: route through the same
-        # returned-to-farmer plumbing as farmer cancel. Facilitator
-        # branch: routed back to facilitator's Returned pill via
-        # is_returned_to_facilitator so it doesn't lump with fresh
-        # "needs accept" orders on the Pending pill.
-        is_returned_to_farmer=not facilitator_owns,
-        is_returned_to_facilitator=facilitator_owns,
-        released_dealer_user_id=order.dealer_user_id,
-        return_reason=None if facilitator_owns else 'dealer_declined',
-    )
-    db.add(new_draft)
-    await db.flush()
-    if order.lineage_root_id is None:
-        order.lineage_root_id = order.id
-
-    migrated = 0
+    released = 0
     for it in items:
         if it.status in {
             OrderItemStatus.APPROVED, OrderItemStatus.REJECTED,
             OrderItemStatus.REROUTED, OrderItemStatus.SKIPPED,
             OrderItemStatus.REMOVED, OrderItemStatus.NOT_NEEDED,
+            OrderItemStatus.NOT_AVAILABLE,
         }:
             continue
-        prev_item_status = it.status.value if hasattr(it.status, "value") else it.status
-        new_item = OrderItem(
-            order_id=new_draft.id,
-            practice_id=it.practice_id,
-            timeline_id=it.timeline_id,
-            brand_cosh_id=None, brand_name=None,
-            given_volume=None, volume_unit=it.volume_unit, price=None,
-            estimated_volume=it.estimated_volume,
-            relation_id=it.relation_id, relation_type=it.relation_type,
-            relation_role=it.relation_role,
-            scan_verified=False,
-            status=OrderItemStatus.PENDING,
-            snapshot_id=it.snapshot_id,
-            lineage_id=it.lineage_id,
-        )
-        db.add(new_item)
-        await db.flush()
+        prev_item = it.status.value if hasattr(it.status, "value") else it.status
+        it.status = OrderItemStatus.NOT_AVAILABLE
+        it.postponed_until = None
         await _record_event(
             db, lineage_id=it.lineage_id,
-            event_type="REROUTED_FROM",
+            event_type="RELEASED_BY_DEALER_DECLINE",
             actor_user_id=current_user.id, actor_role="DEALER",
             order_id=order.id, order_item_id=it.id,
-            prev_status=prev_item_status,
-            new_status=OrderItemStatus.REROUTED.value,
-            metadata={"to_order_id": new_draft.id, "to_order_item_id": new_item.id,
-                      "reason": "dealer_declined"},
+            prev_status=prev_item,
+            new_status=OrderItemStatus.NOT_AVAILABLE.value,
         )
-        await _record_event(
-            db, lineage_id=it.lineage_id,
-            event_type="REROUTED_TO",
-            actor_user_id=current_user.id, actor_role="DEALER",
-            order_id=new_draft.id, order_item_id=new_item.id,
-            prev_status=OrderItemStatus.REROUTED.value,
-            new_status=OrderItemStatus.PENDING.value,
-            metadata={"from_order_id": order.id, "from_order_item_id": it.id,
-                      "reason": "dealer_declined"},
-        )
-        it.status = OrderItemStatus.REROUTED
-        migrated += 1
+        released += 1
 
-    order.status = OrderStatus.CANCELLED
+    if order.lineage_root_id is None:
+        order.lineage_root_id = order.id
+
+    if facilitator_owns:
+        order.is_returned_to_facilitator = True
+    else:
+        order.is_returned_to_farmer = True
+        order.return_reason = 'dealer_declined'
+        if order.dealer_user_id and not order.released_dealer_user_id:
+            order.released_dealer_user_id = order.dealer_user_id
+
     await _record_event(
         db, lineage_id=order.id,
         event_type="DECLINED_BY_DEALER",
         actor_user_id=current_user.id, actor_role="DEALER",
         order_id=order.id,
-        prev_status=OrderStatus.SENT.value,
-        new_status=OrderStatus.CANCELLED.value,
+        prev_status=prev_order_status,
+        new_status=prev_order_status,
         metadata={
-            "new_draft_order_id": new_draft.id,
-            "migrated_item_count": migrated,
-            # 2026-06-09 — Routing target lets the UI / reports
-            # know whether the items went to the facilitator's
-            # queue or the farmer's queue.
+            "released_item_count": released,
             "routed_back_to": "FACILITATOR" if facilitator_owns else "FARMER",
         },
     )
     await db.commit()
     return {
         "status": order.status,
-        "new_draft_order_id": new_draft.id,
-        "migrated_item_count": migrated,
+        "released_item_count": released,
         "routed_back_to": "FACILITATOR" if facilitator_owns else "FARMER",
     }
 
@@ -9611,18 +9634,14 @@ async def facilitator_reject_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Facilitator declines a fresh order.
+    """Facilitator declines a fresh order (Phase 2 rework, 2026-08-14).
+    Model B DRAFT flow unwound — source flagged returned-to-farmer,
+    items released in place, no new order created.
 
-    2026-06-06 — Was a soft "set CANCELLED + null facilitator" that
-    left the farmer's order silently dead. Now mirrors the farmer's
-    /farmer/orders/{id}/cancel cancel-and-migrate: husk → CANCELLED;
-    every active item migrates onto a fresh DRAFT (dealer +
-    facilitator both cleared) so the farmer's Manage tab picks up a
-    new DRAFT card and can re-route to someone else without
-    re-keying the items.
-
-    Lineage preserved via lineage_root_id so the farmer's Manage tab
-    groups the husk + new DRAFT under one chain.
+    Facilitator loses visibility (their Routed / Pending pill filters
+    on `!is_returned_to_farmer && facilitator_user_id == me`; flag
+    flip drops the card from their queue). Farmer's Routed card picks
+    up in "Returned" state with Send / Discard buttons.
     """
     await _assert_active_facilitator(db, current_user.id)
     order = (await db.execute(
@@ -9635,117 +9654,60 @@ async def facilitator_reject_order(
 
     prev_status = order.status.value if hasattr(order.status, "value") else order.status
 
-    items_q = await db.execute(
+    items = (await db.execute(
         select(OrderItem).where(
             OrderItem.order_id == order.id,
             OrderItem.archived_at.is_(None),
         )
-    )
-    skip_statuses = {OrderItemStatus.REROUTED, OrderItemStatus.REMOVED}
-    items_to_migrate = [
-        it for it in items_q.scalars().all() if it.status not in skip_statuses
-    ]
+    )).scalars().all()
 
-    new_lineage_root = order.lineage_root_id or order.id
-
-    new_draft = Order(
-        subscription_id=order.subscription_id,
-        farmer_user_id=order.farmer_user_id,
-        client_id=order.client_id,
-        category=order.category,
-        date_from=order.date_from,
-        date_to=order.date_to,
-        status=OrderStatus.DRAFT,
-        dealer_user_id=None,
-        facilitator_user_id=None,
-        locked_timelines=order.locked_timelines,
-        expires_at=order.expires_at,
-        lineage_root_id=new_lineage_root,
-        # Facilitator reject-migrate inherits the Order ID.
-        reference_number=order.reference_number,
-        # 2026-08-12 — Route through returned-to-farmer plumbing so the
-        # farmer's Returned pill picks it up with the standard two-
-        # button UI. released_facilitator_user_id preserves the
-        # "declined by X" context for the chip.
-        is_returned_to_farmer=True,
-        released_facilitator_user_id=order.facilitator_user_id,
-        return_reason='facilitator_declined',
-    )
-    db.add(new_draft)
-    await db.flush()
+    released = 0
+    for it in items:
+        if it.status in {
+            OrderItemStatus.APPROVED, OrderItemStatus.REJECTED,
+            OrderItemStatus.REROUTED, OrderItemStatus.SKIPPED,
+            OrderItemStatus.REMOVED, OrderItemStatus.NOT_NEEDED,
+            OrderItemStatus.NOT_AVAILABLE,
+        }:
+            continue
+        prev_item = it.status.value if hasattr(it.status, "value") else it.status
+        it.status = OrderItemStatus.NOT_AVAILABLE
+        it.postponed_until = None
+        await _record_event(
+            db, lineage_id=it.lineage_id,
+            event_type="RELEASED_BY_FACILITATOR_REJECT",
+            actor_user_id=current_user.id, actor_role="FACILITATOR",
+            order_id=order.id, order_item_id=it.id,
+            prev_status=prev_item,
+            new_status=OrderItemStatus.NOT_AVAILABLE.value,
+        )
+        released += 1
 
     if order.lineage_root_id is None:
         order.lineage_root_id = order.id
 
-    for it in items_to_migrate:
-        prev_item_status = it.status.value if hasattr(it.status, "value") else it.status
-        new_item = OrderItem(
-            order_id=new_draft.id,
-            practice_id=it.practice_id,
-            timeline_id=it.timeline_id,
-            brand_cosh_id=None,
-            brand_name=None,
-            given_volume=None,
-            volume_unit=it.volume_unit,
-            price=None,
-            estimated_volume=it.estimated_volume,
-            relation_id=it.relation_id,
-            relation_type=it.relation_type,
-            relation_role=it.relation_role,
-            scan_verified=False,
-            status=OrderItemStatus.PENDING,
-            snapshot_id=it.snapshot_id,
-            lineage_id=it.lineage_id,
-        )
-        db.add(new_item)
-        await db.flush()
-        await _record_event(
-            db, lineage_id=it.lineage_id,
-            event_type="REROUTED_FROM",
-            actor_user_id=current_user.id, actor_role="FACILITATOR",
-            order_id=order.id, order_item_id=it.id,
-            prev_status=prev_item_status,
-            new_status=OrderItemStatus.REROUTED.value,
-            metadata={
-                "to_order_id": new_draft.id,
-                "to_order_item_id": new_item.id,
-                "reason": "facilitator_reject_migrate",
-            },
-        )
-        await _record_event(
-            db, lineage_id=it.lineage_id,
-            event_type="REROUTED_TO",
-            actor_user_id=current_user.id, actor_role="FACILITATOR",
-            order_id=new_draft.id, order_item_id=new_item.id,
-            prev_status=OrderItemStatus.REROUTED.value,
-            new_status=OrderItemStatus.PENDING.value,
-            metadata={
-                "from_order_id": order.id,
-                "from_order_item_id": it.id,
-                "reason": "facilitator_reject_migrate",
-            },
-        )
-        it.status = OrderItemStatus.REROUTED
+    order.is_returned_to_farmer = True
+    order.return_reason = 'facilitator_declined'
+    if order.facilitator_user_id and not order.released_facilitator_user_id:
+        order.released_facilitator_user_id = order.facilitator_user_id
 
     await _record_event(
         db, lineage_id=order.id,
         event_type="REJECTED_BY_FACILITATOR",
         actor_user_id=current_user.id, actor_role="FACILITATOR",
         order_id=order.id,
-        prev_status=prev_status, new_status=OrderStatus.CANCELLED.value,
+        prev_status=prev_status,
+        new_status=prev_status,
         metadata={
-            "new_draft_order_id": new_draft.id,
+            "released_item_count": released,
             "reason": data.get("reason") if data else None,
         },
     )
-
-    order.status = OrderStatus.CANCELLED
-    order.facilitator_user_id = None
     await db.commit()
     return {
         "order_id": order_id,
         "status": order.status,
-        "new_draft_order_id": new_draft.id,
+        "released_item_count": released,
         "reason": (data or {}).get("reason"),
     }
 

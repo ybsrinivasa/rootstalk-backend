@@ -144,5 +144,11 @@ class SeedOrderFull(Base):
     is_returned_to_facilitator: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=sa_false(),
     )
+    # 2026-08-14 — Dealer's Final Confirmation timestamp (Phase 2 of the
+    # order-lifecycle rework). See order_items.final_confirmed_at for
+    # the semantics; same rule applies to the single-item seed order.
+    final_confirmed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

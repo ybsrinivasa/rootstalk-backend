@@ -120,6 +120,13 @@ _ITEM_TRANSITIONS: dict[tuple[str, str], frozenset[str]] = {
     # PENDING sibling collapse). No point holding a postpone slot on
     # an item that's no longer needed.
     ("POSTPONED", "NOT_NEEDED"):             frozenset({DEALER}),
+    # 2026-08-14 — Phase 2 rework: dealer's Cancel-final-confirm on
+    # an APPROVED-but-not-yet-Final-Confirmed item releases it to
+    # NOT_AVAILABLE (item joins the wrapper, surfaces on farmer's
+    # unsold-items batch when the order goes quiescent). Farmer's
+    # Cancel also uses this edge to release APPROVED-awaiting-Final-
+    # Confirm items when reclaiming an order from the dealer.
+    ("APPROVED", "NOT_AVAILABLE"):           frozenset({DEALER, FARMER}),
     # And the dealer's Change-selection reset flips NOT_NEEDED back to
     # PENDING so the OR group reopens for a fresh pick.
     ("NOT_NEEDED", "PENDING"):               frozenset({DEALER}),

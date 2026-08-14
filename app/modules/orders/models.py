@@ -192,6 +192,13 @@ class OrderItem(Base):
     archived_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )
+    # 2026-08-14 — Dealer's Final Confirmation timestamp. Stamped when
+    # the dealer commits to physically hand the item over (usually
+    # after payment or credit terms are settled). NULL = still awaiting
+    # Final Confirmation; farmer's Pickup pill gates on non-NULL.
+    final_confirmed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 

@@ -1149,39 +1149,41 @@ async def cancel_seed_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Farmer cancels a seed order.
+    """Farmer cancels a seed order (Phase 2 rework, 2026-08-14). Model
+    B DRAFT flow unwound — source flagged returned-to-farmer, status
+    → NOT_AVAILABLE. No DRAFT row created (there was never one for
+    seed since seed is single-item, but the cancel-and-flip-to-DRAFT
+    dance is gone).
 
-    2026-08-11 — Cancel-migrate (Model B reinstated, superseding the
-    2026-06-21 release-not-migrate flow). Farmer intent is "leave this
-    dealer," not "abandon the variety." Since a seed order is single-
-    variety, there's no item release + copy step: we flip the row to
-    DRAFT in place, clear dealer/facilitator, and mark
-    is_returned_to_farmer=True. The Returned pill picks it up and the
-    farmer can either PUT /send it to another dealer or PUT /discard
-    it to CANCELLED.
+    Cancel is BLOCKED when:
+      - Order is already terminal (CANCELLED / PURCHASED / REROUTED)
+      - Order is READY_FOR_PICKUP AND final_confirmed_at IS NOT NULL
+        (dealer has committed physically; cancel would void a real
+        transaction — admin intervention needed for edge cases)
     """
     from app.services.order_events import record_event as _record_event
 
     order = await _get_seed_order(db, order_id, current_user.id, farmer=True)
-    # 2026-06-19 — READY_FOR_PICKUP joins the terminal-for-cancel
-    # set. Once the farmer has approved the purchase, the seed packet
-    # is committed; cancelling here would void the commercial
-    # transaction. Edge-cases where the dealer can't deliver should
-    # be handled outside the cancel path (admin intervention).
     terminal = {
         SeedOrderStatus.CANCELLED, SeedOrderStatus.PURCHASED,
-        SeedOrderStatus.REROUTED, SeedOrderStatus.READY_FOR_PICKUP,
+        SeedOrderStatus.REROUTED,
     }
     if order.status in terminal:
         raise HTTPException(
             status_code=400,
             detail=f"Order is already {order.status}; nothing to cancel.",
         )
-    # 2026-08-11 — Presence gate mirror of the pest/fert cancel.
-    # `dealer_viewing_until` is heartbeated forward by the dealer PWA
-    # while a dealer-side seed-order detail screen is active. No such
-    # screen exists today, so this always no-ops; wired in advance so
-    # farmer cancel is automatically gated when that screen lands.
+    if (
+        order.status == SeedOrderStatus.READY_FOR_PICKUP
+        and order.final_confirmed_at is not None
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "final_confirmed_cannot_cancel",
+                "message": "This order has been Final Confirmed by the dealer for pickup. Contact the dealer to resolve.",
+            },
+        )
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
     if order.dealer_viewing_until and order.dealer_viewing_until > now:
@@ -1197,27 +1199,25 @@ async def cancel_seed_order(
     prev_dealer = order.dealer_user_id
     prev_facilitator = order.facilitator_user_id
 
-    order.status = SeedOrderStatus.DRAFT
-    order.dealer_user_id = None
-    order.facilitator_user_id = None
+    order.status = SeedOrderStatus.NOT_AVAILABLE
+    order.postponed_until = None
     order.is_returned_to_farmer = True
-    # 2026-08-11 — Preserve outgoing-recipient context for the
-    # Returned pill's "Cancelled by you · from X" hint.
-    order.released_dealer_user_id = prev_dealer
-    order.released_facilitator_user_id = prev_facilitator
+    if prev_dealer and not order.released_dealer_user_id:
+        order.released_dealer_user_id = prev_dealer
+    if prev_facilitator and not order.released_facilitator_user_id:
+        order.released_facilitator_user_id = prev_facilitator
     order.return_reason = 'farmer_cancel'
 
     await _record_event(
         db, lineage_id=order.lineage_id,
-        event_type="CANCELLED_BY_FARMER",
+        event_type="RETURNED_TO_FARMER_BY_CANCEL",
         actor_user_id=current_user.id, actor_role="FARMER",
         seed_order_id=order.id,
         prev_status=prev_status,
-        new_status=SeedOrderStatus.DRAFT.value,
+        new_status=SeedOrderStatus.NOT_AVAILABLE.value,
         metadata={
             "released_dealer_user_id": prev_dealer,
             "released_facilitator_user_id": prev_facilitator,
-            "returned_to_farmer": True,
         },
     )
 
@@ -1230,29 +1230,31 @@ async def cancel_seed_order(
 
 
 @router.put("/farmer/seed-orders/{order_id}/discard")
-async def discard_returned_seed_draft(
+async def discard_seed_order(
     order_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Farmer discards a returned seed DRAFT ("Don't need these now").
-
-    Seed cancel-migrate leaves the seed order in DRAFT with
-    is_returned_to_farmer=True. Two exits: PUT /send to another dealer,
-    or PUT /discard here. Discard flips status → CANCELLED. Since seed
-    is single-variety with no OrderItem rows, there's no per-item
-    REROUTED step — the seed-advisory pull for this variety will re-
-    offer it naturally once the row is out of DRAFT.
-    """
+    """Farmer's Discard on a returned-to-farmer seed order (Phase 2
+    rework, 2026-08-14). Fate decision — flips status to CANCELLED
+    and clears is_returned_to_farmer."""
     from app.services.order_events import record_event as _record_event
 
     order = await _get_seed_order(db, order_id, current_user.id, farmer=True)
-    if order.status != SeedOrderStatus.DRAFT or not order.is_returned_to_farmer:
+    if not order.is_returned_to_farmer:
         raise HTTPException(
             status_code=400,
             detail={
-                "code": "not_a_returned_draft",
-                "message": "This action only applies to items returned to you after a cancel.",
+                "code": "not_returned_to_farmer",
+                "message": "This seed order is not currently back with you for a fate decision.",
+            },
+        )
+    if order.status == SeedOrderStatus.CANCELLED:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "already_cancelled",
+                "message": "Seed order is already cancelled.",
             },
         )
 
@@ -1266,7 +1268,7 @@ async def discard_returned_seed_draft(
         seed_order_id=order.id,
         prev_status=prev_status,
         new_status=SeedOrderStatus.CANCELLED.value,
-        metadata={"reason": "returned_seed_draft_discard"},
+        metadata={"phase2": True},
     )
     await db.commit()
     return {"id": order.id, "status": order.status}
@@ -1625,30 +1627,23 @@ async def mark_seed_order_not_available(
     prev_dealer = order.dealer_user_id
     prev_facilitator = order.facilitator_user_id
     facilitator_owns = prev_facilitator is not None
-    # 2026-08-12 — Branch on facilitator ownership. Facilitator-forwarded
-    # seed → return to FACILITATOR (parity with pest/fert dealer_decline_
-    # order's facilitator branch). Direct-to-dealer seed → return to
-    # farmer as before. Bug found by audit: earlier this endpoint
-    # unconditionally cleared BOTH dealer + facilitator, bouncing
-    # facilitator-forwarded seed orders past the facilitator straight
-    # to the farmer.
+    # 2026-08-14 (Phase 2 rework): flag-flip only, no DRAFT reset. Both
+    # branches keep dealer_user_id / facilitator_user_id intact (queue
+    # filters on the flags, not on the FK nullability). Order status
+    # goes to NOT_AVAILABLE (unified unsold-state for seed).
+    order.status = SeedOrderStatus.NOT_AVAILABLE
+    order.postponed_until = None
     if facilitator_owns:
-        # Return to facilitator: order stays ACCEPTED, dealer cleared,
-        # facilitator preserved, is_returned_to_facilitator marker set.
-        order.status = SeedOrderStatus.ACCEPTED
-        order.dealer_user_id = None
         order.is_returned_to_facilitator = True
-        order.released_dealer_user_id = prev_dealer
+        if prev_dealer and not order.released_dealer_user_id:
+            order.released_dealer_user_id = prev_dealer
     else:
-        # Direct-to-dealer decline: return to farmer via cancel-migrate
-        # plumbing (matches farmer-cancel shape).
-        order.status = SeedOrderStatus.DRAFT
-        order.dealer_user_id = None
-        order.facilitator_user_id = None
         order.is_returned_to_farmer = True
-        order.released_dealer_user_id = prev_dealer
-        order.released_facilitator_user_id = prev_facilitator
         order.return_reason = 'dealer_declined'
+        if prev_dealer and not order.released_dealer_user_id:
+            order.released_dealer_user_id = prev_dealer
+        if prev_facilitator and not order.released_facilitator_user_id:
+            order.released_facilitator_user_id = prev_facilitator
     await _record_event(
         db, lineage_id=order.lineage_id,
         event_type="DECLINED_BY_DEALER",
@@ -1683,6 +1678,69 @@ async def accept_seed_order(
     if order.status != SeedOrderStatus.SENT:
         raise HTTPException(status_code=400, detail="Order can only be accepted from SENT status")
     order.status = SeedOrderStatus.ACCEPTED
+    await db.commit()
+    return {"id": order_id, "status": order.status}
+
+
+# 2026-08-14 — Final Confirmation for seed orders (Phase 2 rework).
+# Farmer's approval takes the order to READY_FOR_PICKUP with a null
+# final_confirmed_at. Dealer stamps final_confirmed_at when payment /
+# credit is settled → farmer's Pickup pill fires. See the equivalent
+# `final_confirm_item` in orders/router.py for the pest/fert path.
+@router.put("/dealer/seed-orders/{order_id}/final-confirm")
+async def seed_final_confirm(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from datetime import datetime, timezone
+    from app.modules.orders.router import _assert_active_dealer
+    await _assert_active_dealer(db, current_user.id)
+    order = await _get_seed_order(db, order_id, current_user.id, farmer=False)
+    if order.status != SeedOrderStatus.READY_FOR_PICKUP:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "not_approved",
+                "message": "Only farmer-approved seed orders can be Final Confirmed.",
+            },
+        )
+    if order.final_confirmed_at is not None:
+        return {"id": order_id, "final_confirmed_at": order.final_confirmed_at}
+    order.final_confirmed_at = datetime.now(timezone.utc)
+    await db.commit()
+    return {"id": order_id, "final_confirmed_at": order.final_confirmed_at}
+
+
+@router.put("/dealer/seed-orders/{order_id}/cancel-final-confirm")
+async def seed_cancel_final_confirm(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Dealer's back-out on a farmer-approved seed order (before Final
+    Confirmation). Status → NOT_AVAILABLE, joins the wrapper. Common
+    reason: payment / credit didn't come through."""
+    from app.modules.orders.router import _assert_active_dealer
+    await _assert_active_dealer(db, current_user.id)
+    order = await _get_seed_order(db, order_id, current_user.id, farmer=False)
+    if order.status != SeedOrderStatus.READY_FOR_PICKUP:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "not_approved",
+                "message": "Cancel-final-confirm only applies to farmer-approved seed orders.",
+            },
+        )
+    if order.final_confirmed_at is not None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "already_final_confirmed",
+                "message": "This order is already Final Confirmed and can no longer be cancelled — the farmer is expecting pickup.",
+            },
+        )
+    order.status = SeedOrderStatus.NOT_AVAILABLE
     await db.commit()
     return {"id": order_id, "status": order.status}
 
@@ -1969,12 +2027,12 @@ async def facilitator_reject_seed_order(
         )
     prev_status = order.status
     prev_facilitator = order.facilitator_user_id
-    order.status = SeedOrderStatus.DRAFT
-    order.dealer_user_id = None
-    order.facilitator_user_id = None
+    # 2026-08-14 (Phase 2 rework): flag-flip only, no DRAFT reset.
+    order.status = SeedOrderStatus.NOT_AVAILABLE
+    order.postponed_until = None
     order.is_returned_to_farmer = True
-    order.released_dealer_user_id = None
-    order.released_facilitator_user_id = prev_facilitator
+    if prev_facilitator and not order.released_facilitator_user_id:
+        order.released_facilitator_user_id = prev_facilitator
     order.return_reason = 'facilitator_declined'
     await _record_event(
         db, lineage_id=order.lineage_id,
@@ -1982,10 +2040,9 @@ async def facilitator_reject_seed_order(
         actor_user_id=current_user.id, actor_role="FACILITATOR",
         seed_order_id=order.id,
         prev_status=prev_status,
-        new_status=SeedOrderStatus.DRAFT.value,
+        new_status=SeedOrderStatus.NOT_AVAILABLE.value,
         metadata={
             "released_facilitator_user_id": prev_facilitator,
-            "returned_to_farmer": True,
         },
     )
     await db.commit()

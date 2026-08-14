@@ -4950,12 +4950,21 @@ async def get_dashboard_attention(
             pl = (await db.execute(
                 select(PackingList).where(PackingList.order_id == o.id)
             )).scalar_one_or_none()
+            # 2026-08-14 (Phase 2 rework): pickup-ready requires the
+            # dealer's Final Confirmation (final_confirmed_at set) on
+            # at least one APPROVED item. Before Final Confirmation,
+            # the item is committed by the farmer but not yet by the
+            # dealer — not ready for hand-off.
             if (
                 pl is not None
                 and pl.first_shared_at is not None
                 and pl.farmer_received_at is None
                 and pl.dealer_removed_at is None
-                and any(i.status == OrderItemStatus.APPROVED for i in items)
+                and any(
+                    i.status == OrderItemStatus.APPROVED
+                    and i.final_confirmed_at is not None
+                    for i in items
+                )
             ):
                 bucket["orders_pickup_ready"] += 1
 
