@@ -1505,6 +1505,12 @@ async def list_dealer_seed_orders(
             "quantity": float(o.quantity) if o.quantity else None,
             "total_price": float(o.total_price) if o.total_price else None,
             "created_at": o.created_at,
+            # 2026-08-14 (Phase 2 rework): Final Confirmation timestamp
+            # on seed. Dealer's PWA renders "Final Confirmation" vs
+            # "Handover" based on whether this is null.
+            "final_confirmed_at": (
+                o.final_confirmed_at.isoformat() if o.final_confirmed_at else None
+            ),
         })
     return out
 
