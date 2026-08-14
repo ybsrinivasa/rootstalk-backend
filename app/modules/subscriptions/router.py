@@ -5646,6 +5646,13 @@ async def _today_advisory_for_user(
                 # chip should read "Returned" — not "Routed" (which
                 # implies a dealer is actively working on it).
                 "is_returned_to_farmer": bool(getattr(ord_row, "is_returned_to_farmer", False)),
+                # 2026-08-14 (Phase 2 rework): Final Confirmation
+                # timestamp so the advisory chip can distinguish
+                # APPROVED-awaiting-Final-Confirm (chips Routed) from
+                # APPROVED-and-Final-Confirmed (chips Pickup).
+                "final_confirmed_at": (
+                    it.final_confirmed_at.isoformat() if it.final_confirmed_at else None
+                ),
                 "brand_name": (
                     brand_loc.get(it.brand_cosh_id) or it.brand_name
                     if show_money else None
