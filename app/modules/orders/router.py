@@ -1048,6 +1048,41 @@ async def list_subscription_orders(
             "awaiting_approval_count": 1 if so.status == SeedOrderStatus.SENT_FOR_APPROVAL.value else 0,
             # 2026-08-11 — Cancel-migrate marker (parity with regular).
             "is_returned_to_farmer": bool(getattr(so, "is_returned_to_farmer", False)),
+            # 2026-08-14 (Phase 2): Final Confirmation timestamp on seed.
+            # Farmer PWA's Pickup pill gates on this. ISO string or null.
+            "final_confirmed_at": (
+                so.final_confirmed_at.isoformat() if so.final_confirmed_at else None
+            ),
+            # 2026-08-14 (Phase 2): active_item_count for the U-turn
+            # visibility gate. Seed has no per-item table, so 1 = seed
+            # is in flight with the dealer (SENT/ACCEPTED/AVAILABLE/
+            # POSTPONED/SFA/READY_FOR_PICKUP-not-yet-final-confirmed),
+            # 0 = quiescent (NOT_AVAILABLE / READY_FOR_PICKUP-Final-
+            # Confirmed / terminal).
+            "active_item_count": (
+                1 if so.status in {
+                    SeedOrderStatus.SENT.value, SeedOrderStatus.ACCEPTED.value,
+                    SeedOrderStatus.AVAILABLE.value, SeedOrderStatus.POSTPONED.value,
+                    SeedOrderStatus.SENT_FOR_APPROVAL.value,
+                } or (
+                    so.status == SeedOrderStatus.READY_FOR_PICKUP.value
+                    and so.final_confirmed_at is None
+                ) else 0
+            ),
+            # 2026-08-14 (Phase 2): matches regular's awaiting_final_
+            # confirmation_count. Seeds get 1 when READY_FOR_PICKUP and
+            # final_confirmed_at IS NULL; else 0.
+            "awaiting_final_confirmation_count": (
+                1 if so.status == SeedOrderStatus.READY_FOR_PICKUP.value
+                and so.final_confirmed_at is None else 0
+            ),
+            # 2026-08-14 (Phase 2): pickup_ready_count for seed — 1
+            # when Final Confirmed by dealer and farmer hasn't picked up
+            # yet, else 0.
+            "pickup_ready_count": (
+                1 if so.status == SeedOrderStatus.READY_FOR_PICKUP.value
+                and so.final_confirmed_at is not None else 0
+            ),
             **_released_from_fields(so, seed_recipients),
             "return_reason": getattr(so, "return_reason", None),
             **meta_dict,
