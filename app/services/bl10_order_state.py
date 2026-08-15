@@ -198,18 +198,27 @@ _ITEM_TRANSITIONS: dict[tuple[str, str], frozenset[str]] = {
 # ── Abort policy ──────────────────────────────────────────────────────────────
 
 # The order-level abort flips items in these statuses back to PENDING.
-# Items in any other status (APPROVED, REJECTED, REMOVED, SKIPPED,
-# NOT_NEEDED) are LEFT ALONE — those carry meaningful farmer or
-# system decisions that an abort must not erase.
+# Items in any other status (APPROVED, REJECTED, REMOVED, SKIPPED) are
+# LEFT ALONE — those carry farmer decisions that an abort must not
+# erase.
+# 2026-08-15 — NOT_NEEDED added: the only way an item becomes
+# NOT_NEEDED today is via the OR-collapse cascade in
+# mark_item_available (dealer marks A=AVAILABLE, sibling B on a
+# different Option auto-flips NOT_NEEDED). Reset expects to undo
+# every dealer decision, and the OR pick IS a dealer decision, so
+# NOT_NEEDED must reset back to PENDING too — otherwise the OR
+# stays "resolved to A" even after Reset. Confirmed no other code
+# path sets NOT_NEEDED (see grep on the constant).
 _ABORTABLE_ITEM_STATUSES: frozenset[str] = frozenset({
-    "PENDING", "AVAILABLE", "POSTPONED", "NOT_AVAILABLE", "SENT_FOR_APPROVAL",
+    "PENDING", "AVAILABLE", "POSTPONED", "NOT_AVAILABLE",
+    "SENT_FOR_APPROVAL", "NOT_NEEDED",
 })
 
 
 def is_item_abortable(current_item_status: str) -> bool:
     """True iff the item should be reset to PENDING during an order abort.
-    APPROVED / REJECTED / REMOVED / SKIPPED / NOT_NEEDED items are
-    preserved across an abort (they carry farmer or system decisions).
+    APPROVED / REJECTED / REMOVED / SKIPPED items are preserved across
+    an abort (they carry farmer decisions).
     """
     return current_item_status in _ABORTABLE_ITEM_STATUSES
 
