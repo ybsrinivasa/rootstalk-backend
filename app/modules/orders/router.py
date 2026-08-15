@@ -1501,6 +1501,15 @@ async def cancel_order(
             target.released_dealer_user_id = target.dealer_user_id
         if target.facilitator_user_id and not target.released_facilitator_user_id:
             target.released_facilitator_user_id = target.facilitator_user_id
+        # 2026-08-15 (Phase 2 facilitator-flow fix F4): farmer's Cancel
+        # pulls the order back from whoever's holding it. Clear FK
+        # pointers so facilitator's + dealer's queue filters drop the
+        # order; released_* fields preserved for chip context. Also
+        # clear is_returned_to_facilitator (that flag is now moot —
+        # is_returned_to_farmer supersedes it).
+        target.dealer_user_id = None
+        target.facilitator_user_id = None
+        target.is_returned_to_facilitator = False
 
     released_from_source = await _collect_in_flight(order)
     await _release(order, released_from_source)
@@ -3087,6 +3096,13 @@ async def list_dealer_orders(
         base_where.append(Order.status.notin_([
             OrderStatus.CANCELLED, OrderStatus.EXPIRED,
         ]))
+        # 2026-08-15 (Phase 2 facilitator-flow F9): drop orders that
+        # have been reclaimed by farmer or facilitator. Dealer_user_id
+        # may still be set on the row (for released_dealer_user_id
+        # chip context on the farmer/facilitator side) but the dealer
+        # has been dropped from active responsibility.
+        base_where.append(Order.is_returned_to_farmer.is_(False))
+        base_where.append(Order.is_returned_to_facilitator.is_(False))
     # 2026-06-28 — Soft-delete defense: join through Subscription so
     # the auto-listener filters orders on soft-deleted subscriptions
     # out of the dealer's feed.
@@ -4921,6 +4937,13 @@ async def list_facilitator_orders(
         select(Order)
         .join(Subscription, Subscription.id == Order.subscription_id)
         .where(Order.facilitator_user_id == current_user.id)
+        # 2026-08-15 (Phase 2 facilitator-flow F7): drop orders that
+        # have been reclaimed by the farmer (farmer Cancel or
+        # facilitator's own Return-to-farmer). facilitator_user_id
+        # stays NULL on those anyway after F1/F3 clear it — but the
+        # explicit is_returned_to_farmer check is defence-in-depth
+        # for any code path that flips the flag without clearing FKs.
+        .where(Order.is_returned_to_farmer.is_(False))
         .order_by(Order.created_at.desc())
     )
     if status_filter:
@@ -7347,11 +7370,19 @@ async def dealer_decline_order(
 
     if facilitator_owns:
         order.is_returned_to_facilitator = True
+        # 2026-08-15 (Phase 2 facilitator-flow fix F2): preserve the
+        # dealer chip context, then drop dealer_user_id. Dealer is out;
+        # the order is now the facilitator's problem (Send / Return to
+        # farmer). Symmetric with F1 on facilitator_reject_order.
+        if order.dealer_user_id and not order.released_dealer_user_id:
+            order.released_dealer_user_id = order.dealer_user_id
+        order.dealer_user_id = None
     else:
         order.is_returned_to_farmer = True
         order.return_reason = 'dealer_declined'
         if order.dealer_user_id and not order.released_dealer_user_id:
             order.released_dealer_user_id = order.dealer_user_id
+        order.dealer_user_id = None
 
     await _record_event(
         db, lineage_id=order.id,
@@ -9740,6 +9771,11 @@ async def facilitator_reject_order(
     order.return_reason = 'facilitator_declined'
     if order.facilitator_user_id and not order.released_facilitator_user_id:
         order.released_facilitator_user_id = order.facilitator_user_id
+    # 2026-08-15 (Phase 2 facilitator-flow fix F1): clear
+    # facilitator_user_id so the farmer's Send action (reroute-returned
+    # items) doesn't 403 on the "facilitator owns this" defence. The
+    # released_facilitator_user_id above preserves the chip context.
+    order.facilitator_user_id = None
 
     await _record_event(
         db, lineage_id=order.id,
@@ -9768,20 +9804,21 @@ async def return_to_farmer(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Facilitator gives up on the returned items and hands them back
-    to the farmer.
+    """Facilitator hands the returned items back to the farmer (Phase 2
+    rework, 2026-08-15). Model B DRAFT unwound — flip flags on source
+    instead of creating a new order.
 
-    2026-06-06 — Was a soft "flip NOT_AVAILABLE → PENDING + clear
-    dealer + keep facilitator" that left the farmer with no clear
-    "action needed" surface. Now mirrors cancel-and-migrate: the
-    returned items migrate to a fresh DRAFT (dealer + facilitator
-    both cleared) and the farmer's Manage tab gets a new DRAFT card.
-    From there the farmer picks a new recipient — dealer OR
-    facilitator — per spec.
+    Gate (per user spec): refuse if the order has any in-flight work —
+    postponed items, items pending farmer's approval, or items awaiting
+    the dealer's Final Confirmation. Return-to-farmer is only valid
+    when the dealer side is quiescent and unsold items exist.
 
-    Source items become REROUTED so the audit trail tells the full
-    story. lineage_root_id preserved so the farmer's Manage tab
-    groups the chain under one card.
+    Effect on source order:
+      - is_returned_to_farmer = true
+      - is_returned_to_facilitator = false
+      - released_facilitator_user_id preserved (chip context)
+      - facilitator_user_id cleared (facilitator hands off)
+      - return_reason = 'facilitator_returned'
     """
     await _assert_active_facilitator(db, current_user.id)
     order = (await db.execute(
@@ -9790,103 +9827,74 @@ async def return_to_farmer(
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    returned_set = {OrderItemStatus.NOT_AVAILABLE, OrderItemStatus.REJECTED}
-    items_to_migrate = (await db.execute(
+    items = (await db.execute(
         select(OrderItem).where(
             OrderItem.order_id == order_id,
             OrderItem.archived_at.is_(None),
-            OrderItem.status.in_(returned_set),
         )
     )).scalars().all()
-    if not items_to_migrate:
+
+    postponed = sum(1 for i in items if i.status == OrderItemStatus.POSTPONED)
+    sfa = sum(1 for i in items if i.status == OrderItemStatus.SENT_FOR_APPROVAL)
+    awaiting_final_confirm = sum(
+        1 for i in items
+        if i.status == OrderItemStatus.APPROVED and i.final_confirmed_at is None
+    )
+    if postponed > 0 or sfa > 0 or awaiting_final_confirm > 0:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "order_not_quiescent",
+                "message": (
+                    "Return to farmer is only available once the dealer has "
+                    "settled every item — no postponed items, no items with "
+                    "the farmer for approval, and no items awaiting your "
+                    "Final Confirmation."
+                ),
+                "postponed": postponed,
+                "sent_for_approval": sfa,
+                "awaiting_final_confirmation": awaiting_final_confirm,
+            },
+        )
+
+    returned_set = {OrderItemStatus.NOT_AVAILABLE, OrderItemStatus.REJECTED}
+    returned_count = sum(1 for i in items if i.status in returned_set)
+    if returned_count == 0:
         raise HTTPException(
             status_code=400,
             detail={
                 "code": "nothing_to_return",
-                "message": "No returned items on this order.",
+                "message": "No unsold items to return to the farmer.",
             },
         )
 
-    new_lineage_root = order.lineage_root_id or order.id
-
-    new_draft = Order(
-        subscription_id=order.subscription_id,
-        farmer_user_id=order.farmer_user_id,
-        client_id=order.client_id,
-        category=order.category,
-        date_from=order.date_from,
-        date_to=order.date_to,
-        status=OrderStatus.DRAFT,
-        dealer_user_id=None,
-        facilitator_user_id=None,
-        locked_timelines=order.locked_timelines,
-        expires_at=order.expires_at,
-        lineage_root_id=new_lineage_root,
-        # Facilitator return-to-farmer inherits the Order ID.
-        reference_number=order.reference_number,
-    )
-    db.add(new_draft)
-    await db.flush()
-
+    prev_status = order.status.value if hasattr(order.status, "value") else order.status
     if order.lineage_root_id is None:
         order.lineage_root_id = order.id
+    order.is_returned_to_farmer = True
+    order.is_returned_to_facilitator = False
+    order.return_reason = 'facilitator_returned'
+    if order.facilitator_user_id and not order.released_facilitator_user_id:
+        order.released_facilitator_user_id = order.facilitator_user_id
+    order.facilitator_user_id = None
 
-    for it in items_to_migrate:
-        prev = it.status.value if hasattr(it.status, "value") else it.status
-        new_item = OrderItem(
-            order_id=new_draft.id,
-            practice_id=it.practice_id,
-            timeline_id=it.timeline_id,
-            brand_cosh_id=None,
-            brand_name=None,
-            given_volume=None,
-            volume_unit=it.volume_unit,
-            price=None,
-            estimated_volume=it.estimated_volume,
-            relation_id=it.relation_id,
-            relation_type=it.relation_type,
-            relation_role=it.relation_role,
-            scan_verified=False,
-            status=OrderItemStatus.PENDING,
-            snapshot_id=it.snapshot_id,
-            lineage_id=it.lineage_id,
-        )
-        db.add(new_item)
-        await db.flush()
-        await _record_event(
-            db, lineage_id=it.lineage_id,
-            event_type="REROUTED_FROM",
-            actor_user_id=current_user.id, actor_role="FACILITATOR",
-            order_id=order.id, order_item_id=it.id,
-            prev_status=prev,
-            new_status=OrderItemStatus.REROUTED.value,
-            metadata={
-                "to_order_id": new_draft.id,
-                "to_order_item_id": new_item.id,
-                "reason": "facilitator_return_to_farmer",
-            },
-        )
-        await _record_event(
-            db, lineage_id=it.lineage_id,
-            event_type="REROUTED_TO",
-            actor_user_id=current_user.id, actor_role="FACILITATOR",
-            order_id=new_draft.id, order_item_id=new_item.id,
-            prev_status=OrderItemStatus.REROUTED.value,
-            new_status=OrderItemStatus.PENDING.value,
-            metadata={
-                "from_order_id": order.id,
-                "from_order_item_id": it.id,
-                "reason": "facilitator_return_to_farmer",
-            },
-        )
-        it.status = OrderItemStatus.REROUTED
-
-    await _update_order_status(db, order.id)
+    await _record_event(
+        db, lineage_id=order.id,
+        event_type="RETURNED_TO_FARMER_BY_FACILITATOR",
+        actor_user_id=current_user.id, actor_role="FACILITATOR",
+        order_id=order.id,
+        prev_status=prev_status,
+        new_status=prev_status,
+        metadata={
+            "returned_item_count": returned_count,
+        },
+    )
     await db.commit()
     return {
         "order_id": order_id,
-        "returned_items": len(items_to_migrate),
-        "new_draft_order_id": new_draft.id,
+        "status": order.status,
+        "returned_item_count": returned_count,
+        "is_returned_to_farmer": True,
     }
 
 

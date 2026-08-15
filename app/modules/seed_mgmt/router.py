@@ -1383,6 +1383,11 @@ async def list_dealer_seed_orders(
         select(SeedOrderFull).where(
             SeedOrderFull.dealer_user_id == current_user.id,
             SeedOrderFull.status.notin_([SeedOrderStatus.CANCELLED]),
+            # 2026-08-15 (Phase 2 facilitator-flow F9): drop seed
+            # orders reclaimed by farmer or facilitator (dealer_user_id
+            # may still be set for released_dealer_user_id chip context).
+            SeedOrderFull.is_returned_to_farmer.is_(False),
+            SeedOrderFull.is_returned_to_facilitator.is_(False),
         ).order_by(SeedOrderFull.created_at.desc())
     )
     orders = result.scalars().all()
@@ -1896,6 +1901,9 @@ async def list_facilitator_seed_orders(
         select(SeedOrderFull).where(
             SeedOrderFull.facilitator_user_id == current_user.id,
             SeedOrderFull.status.notin_([SeedOrderStatus.CANCELLED]),
+            # 2026-08-15 (Phase 2 facilitator-flow F7): drop seed
+            # orders reclaimed by the farmer.
+            SeedOrderFull.is_returned_to_farmer.is_(False),
         ).order_by(SeedOrderFull.created_at.desc())
     )
     orders = result.scalars().all()
