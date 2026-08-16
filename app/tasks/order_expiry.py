@@ -60,9 +60,14 @@ async def _run():
         #    See _has_pickup_in_grace().
         result = await db.execute(
             select(Order).where(
+                # OrderStatus terminals are only CANCELLED + EXPIRED.
+                # PURCHASED + REROUTED are OrderItemStatus / SeedOrder
+                # Status values, not Order status — putting them here
+                # AttributeErrors at first call. Anchor 2026-08-16 (and
+                # the pre-existing reference_rootstalk_order_vs_
+                # orderitem_status.md memory).
                 Order.status.notin_([
                     OrderStatus.CANCELLED, OrderStatus.EXPIRED,
-                    OrderStatus.PURCHASED, OrderStatus.REROUTED,
                 ]),
                 or_(
                     and_(
