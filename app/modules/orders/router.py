@@ -5382,6 +5382,59 @@ async def list_facilitator_orders(
                     "volume_unit": i.volume_unit,
                     "price": float(i.price) if i.price else None,
                 })
+        # 2026-08-17 (per-batch rework) — assemble packing_batches
+        # analogous to the dealer + farmer serializers. Facilitator
+        # PWA iterates these to render one Pickup card per batch (own
+        # packing code, own pick-up state, own hand-off progress).
+        order_pls_fac = pls_by_order.get(o.id, [])
+        pls_by_round_fac = {(pl_.approval_round or 1): pl_ for pl_ in order_pls_fac}
+        approved_by_round_fac: dict[int, list[OrderItem]] = {}
+        for i in live_items:
+            if i.status == OrderItemStatus.APPROVED:
+                approved_by_round_fac.setdefault(i.approval_round or 1, []).append(i)
+        packing_batches: list[dict] = []
+        for round_n in sorted(approved_by_round_fac.keys()):
+            batch_items = approved_by_round_fac[round_n]
+            pl_row = pls_by_round_fac.get(round_n)
+            awaiting_fc = sum(1 for i in batch_items if i.final_confirmed_at is None)
+            final_confirmed = sum(1 for i in batch_items if i.final_confirmed_at is not None)
+            batch_pickup_role = None
+            if pl_row and pl_row.picked_up_by_user_id and pl_row.picked_up_at:
+                if pl_row.picked_up_by_user_id == o.facilitator_user_id:
+                    batch_pickup_role = "FACILITATOR"
+                elif pl_row.picked_up_by_user_id == o.farmer_user_id:
+                    batch_pickup_role = "FARMER"
+            packing_batches.append({
+                "approval_round": round_n,
+                "packing_list_id": pl_row.id if pl_row else None,
+                "packing_code": pl_row.packing_code if pl_row else None,
+                "shared_at": (
+                    pl_row.first_shared_at.isoformat()
+                    if pl_row and pl_row.first_shared_at else None
+                ),
+                "picked_up_at": (
+                    pl_row.picked_up_at.isoformat()
+                    if pl_row and pl_row.picked_up_at else None
+                ),
+                "picked_up_by_role": batch_pickup_role,
+                "farmer_received_at": (
+                    pl_row.farmer_received_at.isoformat()
+                    if pl_row and pl_row.farmer_received_at else None
+                ),
+                "awaiting_final_confirmation": awaiting_fc,
+                "final_confirmed": final_confirmed,
+                "all_final_confirmed": awaiting_fc == 0 and final_confirmed > 0,
+                "items": [
+                    {
+                        "id": i.id,
+                        "brand_name": i.brand_name,
+                        "given_volume": float(i.given_volume) if i.given_volume else None,
+                        "volume_unit": i.volume_unit,
+                        "price": float(i.price) if i.price else None,
+                    }
+                    for i in batch_items
+                ],
+            })
         out.append({
             "id": o.id, "status": o.status,
             # 2026-06-07 — Order ID.
@@ -5435,6 +5488,10 @@ async def list_facilitator_orders(
                 pl.farmer_received_at.isoformat() if pl and pl.farmer_received_at else None
             ),
             "packing_items": packing_items,
+            # 2026-08-17 — Per-batch pickup lifecycle. Facilitator PWA
+            # iterates this to render one Pickup card per batch (each
+            # with its own code + pick-up state).
+            "packing_batches": packing_batches,
             # 2026-08-12 — Facilitator-side returned marker so subBelongsTo
             # can route dealer-declined orders to Returned pill (not
             # lumped with fresh "needs accept" on Pending). Cleared on
@@ -5535,15 +5592,68 @@ async def get_facilitator_order(
     items = items_result.scalars().all()
     # 2026-06-06 — Packing fields for the facilitator's pickup tap.
     approved_count = sum(1 for i in items if i.status == OrderItemStatus.APPROVED)
-    # 2026-08-17 — Per-batch rework: earliest unresolved round is the
-    # canonical PL for this facilitator card slot.
-    pl = (await db.execute(
-        select(PackingList)
-        .where(PackingList.order_id == order.id)
-        .order_by(PackingList.approval_round.asc().nulls_first())
-        .limit(1)
-    )).scalar_one_or_none()
+    # 2026-08-17 — Per-batch rework: load ALL PL rows so we can emit
+    # packing_batches[] alongside the legacy single-slot packing_*
+    # (canonical = earliest round, kept for pages that haven't yet
+    # migrated).
+    all_pls = (await db.execute(
+        select(PackingList).where(PackingList.order_id == order.id)
+    )).scalars().all()
+    pls_by_round_detail = {(pl_.approval_round or 1): pl_ for pl_ in all_pls}
+    pl = (
+        sorted(all_pls, key=lambda p: (p.approval_round or 1))[0]
+        if all_pls else None
+    )
     packing_fields = await _farmer_packing_fields(db, order, pl, approved_count)
+
+    # Per-batch payload matching the /facilitator/orders list shape.
+    approved_by_round_det: dict[int, list[OrderItem]] = {}
+    for i in items:
+        if i.status == OrderItemStatus.APPROVED:
+            approved_by_round_det.setdefault(i.approval_round or 1, []).append(i)
+    packing_batches_detail: list[dict] = []
+    for round_n in sorted(approved_by_round_det.keys()):
+        batch_items = approved_by_round_det[round_n]
+        pl_row = pls_by_round_detail.get(round_n)
+        awaiting_fc = sum(1 for i in batch_items if i.final_confirmed_at is None)
+        final_confirmed = sum(1 for i in batch_items if i.final_confirmed_at is not None)
+        batch_pickup_role = None
+        if pl_row and pl_row.picked_up_by_user_id and pl_row.picked_up_at:
+            if pl_row.picked_up_by_user_id == order.facilitator_user_id:
+                batch_pickup_role = "FACILITATOR"
+            elif pl_row.picked_up_by_user_id == order.farmer_user_id:
+                batch_pickup_role = "FARMER"
+        packing_batches_detail.append({
+            "approval_round": round_n,
+            "packing_list_id": pl_row.id if pl_row else None,
+            "packing_code": pl_row.packing_code if pl_row else None,
+            "shared_at": (
+                pl_row.first_shared_at.isoformat()
+                if pl_row and pl_row.first_shared_at else None
+            ),
+            "picked_up_at": (
+                pl_row.picked_up_at.isoformat()
+                if pl_row and pl_row.picked_up_at else None
+            ),
+            "picked_up_by_role": batch_pickup_role,
+            "farmer_received_at": (
+                pl_row.farmer_received_at.isoformat()
+                if pl_row and pl_row.farmer_received_at else None
+            ),
+            "awaiting_final_confirmation": awaiting_fc,
+            "final_confirmed": final_confirmed,
+            "all_final_confirmed": awaiting_fc == 0 and final_confirmed > 0,
+            "items": [
+                {
+                    "id": i.id,
+                    "brand_name": i.brand_name,
+                    "given_volume": float(i.given_volume) if i.given_volume else None,
+                    "volume_unit": i.volume_unit,
+                    "price": float(i.price) if i.price else None,
+                }
+                for i in batch_items
+            ],
+        })
 
     # 2026-06-30 — Affected-plants count per approved item. Mirrors the
     # dealer endpoint's resolution so the facilitator sees the same
@@ -5654,6 +5764,9 @@ async def get_facilitator_order(
             for i in items
         ],
         **packing_fields,
+        # 2026-08-17 — Per-batch pickup lifecycle for the facilitator's
+        # order-detail page. Iterate to render one pickup card per batch.
+        "packing_batches": packing_batches_detail,
     }
 
 
@@ -5698,40 +5811,48 @@ async def list_facilitator_pickup(
         )
     )).all()
 
-    # Group items by order_id.
-    items_by_order: dict[str, list[OrderItem]] = {}
+    # 2026-08-17 (per-batch pickup rework) — one entry per (order,
+    # approval_round) instead of per order. Facilitator's pickup basket
+    # now surfaces each dealer submission round separately: batch 1 can
+    # be picked up + received, batch 2 stays independently visible for
+    # its own pickup. Emitted rows carry approval_round so the PWA can
+    # scope `mark-picked-up?approval_round=N` calls.
+    items_by_order_round: dict[tuple[str, int], list[OrderItem]] = {}
     order_by_id: dict[str, Order] = {}
     for item, order in rows:
-        items_by_order.setdefault(order.id, []).append(item)
+        key = (order.id, item.approval_round or 1)
+        items_by_order_round.setdefault(key, []).append(item)
         order_by_id[order.id] = order
 
-    if not items_by_order:
+    if not items_by_order_round:
         return []
 
-    order_ids = list(items_by_order.keys())
+    order_ids = list(order_by_id.keys())
     pls = (await db.execute(
         select(PackingList).where(PackingList.order_id.in_(order_ids))
     )).scalars().all()
-    # 2026-08-17 (per-batch rework): PackingList is 1:N with Order.
-    # Group by order; the facilitator card picks the earliest unresolved
-    # (not-yet-received) batch as the canonical pickup target. If EVERY
-    # batch is received, drop the order (done).
-    pls_by_order_fac: dict[str, list[PackingList]] = {}
-    for pl in pls:
-        pls_by_order_fac.setdefault(pl.order_id, []).append(pl)
-    pl_by_order: dict[str, PackingList] = {}
-    for oid, rows in pls_by_order_fac.items():
-        pending = [pl for pl in rows if pl.farmer_received_at is None]
-        if pending:
-            pl_by_order[oid] = sorted(
-                pending, key=lambda p: (p.approval_round or 1)
-            )[0]
-    live_order_ids = [
-        oid for oid in order_ids
-        if oid in pl_by_order
-    ]
-    if not live_order_ids:
+    pl_by_key: dict[tuple[str, int], PackingList] = {
+        (pl.order_id, pl.approval_round or 1): pl for pl in pls
+    }
+
+    # A batch qualifies as a pickup candidate when:
+    #   - every item in the batch is Final Confirmed (dealer committed)
+    #   - PL row exists AND farmer_received_at is null (not delivered)
+    # PL rows without a matching batch (edge case: legacy null-round)
+    # get skipped — the /facilitator/orders GET is what lazy-creates
+    # them on the dealer/farmer flow; the pickup endpoint is a
+    # consumer only.
+    live_keys: list[tuple[str, int]] = []
+    for key, items in items_by_order_round.items():
+        pl = pl_by_key.get(key)
+        if pl is None or pl.farmer_received_at is not None:
+            continue
+        if any(i.final_confirmed_at is None for i in items):
+            continue
+        live_keys.append(key)
+    if not live_keys:
         return []
+    live_order_ids = list({k[0] for k in live_keys})
 
     # Resolve farmer / dealer / dealer profile / crop name. Batched.
     orders = [order_by_id[oid] for oid in live_order_ids]
@@ -5789,10 +5910,10 @@ async def list_facilitator_pickup(
                     crop_name_by_cosh_id[cid] = name
 
     out = []
-    for oid in live_order_ids:
+    for oid, round_n in sorted(live_keys, key=lambda k: (k[0], k[1])):
         o = order_by_id[oid]
-        items = items_by_order[oid]
-        pl = pl_by_order.get(oid)
+        items = items_by_order_round[(oid, round_n)]
+        pl = pl_by_key.get((oid, round_n))
         farmer = user_by_id.get(o.farmer_user_id)
         dealer = user_by_id.get(o.dealer_user_id) if o.dealer_user_id else None
         dprof = dealer_profile_by_id.get(o.dealer_user_id) if o.dealer_user_id else None
@@ -5806,6 +5927,9 @@ async def list_facilitator_pickup(
         out.append({
             "order_id": o.id,
             "reference_number": o.reference_number,
+            # 2026-08-17 (per-batch rework): each entry is one batch of
+            # this order. approval_round scopes the mark-picked-up PUT.
+            "approval_round": round_n,
             "packing_code": pl.packing_code if pl else None,
             "packing_shared_at": pl.first_shared_at.isoformat() if pl and pl.first_shared_at else None,
             "picked_up_at": pl.picked_up_at.isoformat() if pl and pl.picked_up_at else None,
@@ -5834,8 +5958,8 @@ async def list_facilitator_pickup(
             ],
             "total_amount": total,
         })
-    # Sort newest first.
-    out.sort(key=lambda d: d["created_at"], reverse=True)
+    # Sort newest first (by order created_at, then by batch round).
+    out.sort(key=lambda d: (d["created_at"], -d["approval_round"]), reverse=True)
     return out
 
 
