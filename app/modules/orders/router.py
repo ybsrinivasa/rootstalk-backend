@@ -2383,12 +2383,18 @@ async def send_draft_order(
     reports can date the leg without joining item events.
     """
     order = await _get_farmer_order(db, order_id, current_user.id)
-    if order.status != OrderStatus.DRAFT:
+    # 2026-08-17 — Phase 2 unwind: returned-to-farmer orders reuse the
+    # same Order row (no more Model B DRAFT); they can be non-DRAFT
+    # (COMPLETED / PROCESSING / SENT_FOR_APPROVAL) with is_returned_to_
+    # farmer set. Accept those too. Anchor: user hit "Only DRAFT orders
+    # can be sent" trying to Send-to-another-dealer on a returned order.
+    is_returned = bool(getattr(order, "is_returned_to_farmer", False))
+    if order.status != OrderStatus.DRAFT and not is_returned:
         raise HTTPException(
             status_code=400,
             detail={
-                "code": "not_a_draft",
-                "message": "Only DRAFT orders can be sent. Cancel the order first if you want to re-route it.",
+                "code": "not_sendable",
+                "message": "This order isn't currently available for re-routing. Cancel it first to reclaim the items.",
             },
         )
 
@@ -2464,6 +2470,49 @@ async def send_draft_order(
     # original draft's clock isn't fair to a recipient who only
     # just got the order.
     order.expires_at = datetime.now(timezone.utc) + timedelta(days=14)
+
+    # 2026-08-17 — Phase 2 unwind (returned-to-farmer path): on the
+    # DRAFT flow the migrated items were already PENDING on the fresh
+    # DRAFT row. On the reused-order flow the items are still NA /
+    # REJECTED / SKIPPED (or POSTPONED) from whichever action landed
+    # them back with the farmer. Flip everything not-in-flight back to
+    # PENDING and clear the dealer-side fields so the new recipient
+    # sees a fresh order. APPROVED-with-Final-Confirmed items are left
+    # untouched — those keep their pickup lifecycle independent of the
+    # re-route.
+    if is_returned:
+        resettable_statuses = {
+            OrderItemStatus.NOT_AVAILABLE, OrderItemStatus.REJECTED,
+            OrderItemStatus.SKIPPED, OrderItemStatus.POSTPONED,
+            OrderItemStatus.NOT_NEEDED,
+        }
+        reset_rows = (await db.execute(
+            select(OrderItem).where(
+                OrderItem.order_id == order.id,
+                OrderItem.archived_at.is_(None),
+                OrderItem.status.in_(resettable_statuses),
+            )
+        )).scalars().all()
+        for it in reset_rows:
+            prev = it.status.value if hasattr(it.status, "value") else it.status
+            it.status = OrderItemStatus.PENDING
+            it.brand_cosh_id = None
+            it.brand_name = None
+            it.given_volume = None
+            it.volume_unit = None
+            it.price = None
+            it.postponed_until = None
+            it.scan_verified = False
+            it.approval_round = None
+            it.final_confirmed_at = None
+            await _record_event(
+                db, lineage_id=it.lineage_id,
+                event_type="REROUTED_ON_SEND",
+                actor_user_id=current_user.id, actor_role="FARMER",
+                order_id=order.id, order_item_id=it.id,
+                prev_status=prev,
+                new_status=OrderItemStatus.PENDING.value,
+            )
 
     items_q = await db.execute(
         select(OrderItem).where(
