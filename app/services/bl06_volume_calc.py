@@ -148,6 +148,17 @@ def calculate_volume(
     }
     try:
         volume = evaluate_formula(formula, variables)
-        return round(volume, 3), brand_unit
     except ValueError:
         return None
+    # 2026-08-17 — Seeded VolumeFormula rows compute per-application
+    # volume (`Dosage × Total_area`) and never reference the
+    # `Applications` variable, even for frequency-based practices where
+    # the invariant is `per-app × N applications × area`. Post-multiply
+    # here so the estimate the dealer sees matches the full-timeline
+    # quantity that will actually be ordered. Skip when the formula
+    # already references Applications (future-proof: honours a formula
+    # that does its own multiplication) or when there's only one
+    # application (multiplier is a no-op).
+    if resolved_applications > 1 and "Applications" not in (formula or ""):
+        volume = volume * resolved_applications
+    return round(volume, 3), brand_unit
