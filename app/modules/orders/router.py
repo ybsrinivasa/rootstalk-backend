@@ -2769,6 +2769,7 @@ async def reject_order_item(
         order_id=order_id, order_item_id=item.id,
         prev_status=prev, new_status=OrderItemStatus.REJECTED.value,
     )
+    await _update_order_status(db, order_id)
     await db.commit()
     return {"item_id": item_id, "status": item.status}
 
@@ -2797,6 +2798,7 @@ async def cancel_postponed_item(
         order_id=order_id, order_item_id=item.id,
         prev_status=prev, new_status=OrderItemStatus.NOT_AVAILABLE.value,
     )
+    await _update_order_status(db, order_id)
     await db.commit()
     return {"item_id": item_id, "status": item.status}
 
@@ -4183,6 +4185,7 @@ async def final_confirm_item(
         new_status=OrderItemStatus.APPROVED.value,
         metadata={"final_confirmed_at": item.final_confirmed_at.isoformat()},
     )
+    await _update_order_status(db, order_id)
     await db.commit()
     return {"item_id": item_id, "final_confirmed_at": item.final_confirmed_at}
 
@@ -4218,6 +4221,7 @@ async def final_confirm_all(
             new_status=OrderItemStatus.APPROVED.value,
             metadata={"final_confirmed_at": now.isoformat(), "batch": True},
         )
+    await _update_order_status(db, order_id)
     await db.commit()
     return {"count": len(items), "final_confirmed_at": now}
 
@@ -10839,3 +10843,80 @@ async def _update_order_status(db: AsyncSession, order_id: str):
     # Dealer's explicit "Decline order" (now allowed from PROCESSING
     # too) provides the finalisation path when they know they have
     # nothing available.
+    await _maybe_flip_returned_state(db, order, items)
+
+
+# 2026-08-17 — Auto-flip is_returned_to_farmer (or _to_facilitator) when
+# the order goes quiescent with unsold items still present. Without this,
+# the farmer's Routed-card Send / Discard buttons render (frontend infers
+# from active===0 && returned>0 counts) but /discard 400s because the DB
+# flag was never set. Only Cancel + dealer whole-order decline used to
+# set the flag; the natural dealer-marks-some-NA + farmer-approves-rest
+# quiescence path was invisible to the flag. Follows the "invariant at
+# every write path" rule: this is the extracted shared helper — every
+# item-status mutation runs through _update_order_status (which calls
+# here), and the four endpoints that skip _update_order_status
+# (reject_order_item, cancel_postponed_item, final_confirm_item,
+# final_confirm_all) call this helper directly.
+async def _maybe_flip_returned_state(
+    db: AsyncSession,
+    order: Order,
+    items: list[OrderItem] | None = None,
+) -> None:
+    if order.is_returned_to_farmer or order.is_returned_to_facilitator:
+        return
+    if order.status in (OrderStatus.CANCELLED, OrderStatus.EXPIRED):
+        return
+    if items is None:
+        items = (await db.execute(
+            select(OrderItem).where(
+                OrderItem.order_id == order.id,
+                OrderItem.archived_at.is_(None),
+            )
+        )).scalars().all()
+    else:
+        items = [i for i in items if i.archived_at is None]
+    # Mirror the /farmer/subscriptions/{id}/orders serializer's
+    # active_item_count + returned_count computation exactly — that's
+    # what the PWA reads to decide send-discard vs cancel modes.
+    active = sum(
+        1 for i in items if i.status in (
+            OrderItemStatus.PENDING,
+            OrderItemStatus.AVAILABLE,
+            OrderItemStatus.POSTPONED,
+            OrderItemStatus.SENT_FOR_APPROVAL,
+        )
+    ) + sum(
+        1 for i in items
+        if i.status == OrderItemStatus.APPROVED and i.final_confirmed_at is None
+    )
+    returned = sum(
+        1 for i in items
+        if i.status in (OrderItemStatus.NOT_AVAILABLE, OrderItemStatus.REJECTED)
+    )
+    if active > 0 or returned == 0:
+        return
+    # Route the flag to whoever's holding the order. Symmetric with the
+    # facilitator_owns branching in dealer_decline_order.
+    if order.facilitator_user_id:
+        order.is_returned_to_facilitator = True
+        routed_back_to = "FACILITATOR"
+    else:
+        order.is_returned_to_farmer = True
+        routed_back_to = "FARMER"
+    order.return_reason = 'dealer_declined'
+    if order.dealer_user_id and not order.released_dealer_user_id:
+        order.released_dealer_user_id = order.dealer_user_id
+    prev_status = order.status.value if hasattr(order.status, "value") else order.status
+    await _record_event(
+        db, lineage_id=order.id,
+        event_type="RETURNED_ON_QUIESCENCE",
+        actor_user_id=None, actor_role="SYSTEM",
+        order_id=order.id,
+        prev_status=prev_status,
+        new_status=prev_status,
+        metadata={
+            "routed_back_to": routed_back_to,
+            "returned_item_count": returned,
+        },
+    )
