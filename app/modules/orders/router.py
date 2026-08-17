@@ -846,11 +846,27 @@ async def list_subscription_orders(
         # 2026-06-03 — POSTPONED is no longer counted under "returned".
         # Surfaced separately so the nudge modal can ask "you also have
         # N postponed items with this dealer — cancel them and bundle?"
+        # 2026-08-17 — User principle: "The final decision of the dealer
+        # is only when he Send for Approval. Before that it is just
+        # tentative." AVAILABLE items are dealer-side tentative (they've
+        # picked but not committed). From farmer's POV, an AVAILABLE
+        # item is indistinguishable from a POSTPONED one — dealer's
+        # still working. Fold AVAILABLE into postponed_count WHEN the
+        # order has any POSTPONED item (so the count stays stable
+        # through a postpone-resolve until dealer submits). Fresh-order
+        # AVAILABLE items (no POSTPONED) don't trigger the strip — the
+        # existing "N items · Dealer is processing" chunk already
+        # communicates that state via item_count. RT-26-000467 anchor.
         POSTPONED = {OrderItemStatus.POSTPONED}
+        AVAILABLE = {OrderItemStatus.AVAILABLE}
         sfa_items_for_o = [i for i in items if i.status in AWAITING]
         awaiting_count = len(sfa_items_for_o)
         returned_count = sum(1 for i in items if i.status in RETURNED)
-        postponed_count = sum(1 for i in items if i.status in POSTPONED)
+        has_postponed_now = any(i.status in POSTPONED for i in items)
+        postponed_count = (
+            sum(1 for i in items if i.status in POSTPONED)
+            + (sum(1 for i in items if i.status in AVAILABLE) if has_postponed_now else 0)
+        )
         approved_count = sum(1 for i in items if i.status == OrderItemStatus.APPROVED)
         # 2026-08-14 (Phase 2 rework): Final Confirmation splits APPROVED
         # into two sub-states. `awaiting_final_confirmation` = dealer
