@@ -4944,28 +4944,25 @@ async def get_dashboard_attention(
                         OrderItemStatus.REJECTED,
                     )
                 )
-            # Pickup ready = packing list shared with the farmer +
-            # nothing received yet + at least one APPROVED item present
-            # + dealer hasn't voluntarily removed it from the pill.
-            pl = (await db.execute(
+            # 2026-08-17 (per-batch rework): multiple PL rows per order.
+            # Pickup ready = ANY batch has a shared PL that isn't
+            # received yet AND that batch has APPROVED + Final Confirmed
+            # items. Count of one per order (existence check, not sum).
+            pl_rows = (await db.execute(
                 select(PackingList).where(PackingList.order_id == o.id)
-            )).scalar_one_or_none()
-            # 2026-08-14 (Phase 2 rework): pickup-ready requires the
-            # dealer's Final Confirmation (final_confirmed_at set) on
-            # at least one APPROVED item. Before Final Confirmation,
-            # the item is committed by the farmer but not yet by the
-            # dealer — not ready for hand-off.
-            if (
-                pl is not None
-                and pl.first_shared_at is not None
+            )).scalars().all()
+            approved_final_rounds = {
+                (i.approval_round or 1) for i in items
+                if i.status == OrderItemStatus.APPROVED and i.final_confirmed_at is not None
+            }
+            any_batch_ready = any(
+                pl.first_shared_at is not None
                 and pl.farmer_received_at is None
                 and pl.dealer_removed_at is None
-                and any(
-                    i.status == OrderItemStatus.APPROVED
-                    and i.final_confirmed_at is not None
-                    for i in items
-                )
-            ):
+                and (pl.approval_round or 1) in approved_final_rounds
+                for pl in pl_rows
+            )
+            if any_batch_ready:
                 bucket["orders_pickup_ready"] += 1
 
         # Seed orders' attention items.
@@ -5549,10 +5546,23 @@ async def _today_advisory_for_user(
         # exact moment they're reading dosage instructions for that
         # item (highest-intent moment for confirmation).
         from app.modules.orders.models import PackingList, BrandLookupCache
+        from sqlalchemy import and_ as sa_and, func as sa_func
+        # 2026-08-17 (per-batch rework): PackingList is 1:N with Order,
+        # keyed on approval_round. Join on the item's own round so each
+        # OrderItem gets its OWN batch's PL row (not the arbitrary first
+        # one). COALESCE handles legacy items with NULL approval_round —
+        # those map to round 1 per the backfill migration.
         active_items_q = await db.execute(
             select(OrderItem, Order, PackingList)
             .join(Order, Order.id == OrderItem.order_id)
-            .outerjoin(PackingList, PackingList.order_id == Order.id)
+            .outerjoin(
+                PackingList,
+                sa_and(
+                    PackingList.order_id == Order.id,
+                    sa_func.coalesce(PackingList.approval_round, 1)
+                        == sa_func.coalesce(OrderItem.approval_round, 1),
+                ),
+            )
             .where(
                 Order.subscription_id == sub.id,
                 Order.status.notin_(["CANCELLED", "EXPIRED"]),

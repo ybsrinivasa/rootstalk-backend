@@ -312,6 +312,12 @@ class PackingList(Base):
     farmer_received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )
+    # 2026-08-17 — Per-batch Final Confirmation + Pickup. One PackingList
+    # row per (order_id, approval_round). Seed orders leave this NULL
+    # (single-item, no round concept). See
+    # project_rootstalk_order_lifecycle_rework_2026_08_13.md for the
+    # per-batch pill design.
+    approval_round: Mapped[int] = mapped_column(Integer, nullable=True)
 
 
 class DealerProfile(Base):

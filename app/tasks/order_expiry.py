@@ -154,21 +154,28 @@ async def _has_pickup_in_grace(db, order: Order, today) -> bool:
     grace_cutoff = order.date_to.date() + timedelta(days=PICKUP_GRACE_DAYS)
     if today > grace_cutoff:
         return False
-    row = (await db.execute(
-        select(OrderItem, PackingList)
-        .outerjoin(PackingList, PackingList.order_id == OrderItem.order_id)
-        .where(
+    # 2026-08-17 — Per-batch packing rework: multiple PL rows per order,
+    # one per approval_round. Grace applies if ANY batch has an APPROVED
+    # + Final Confirmed item that isn't received yet on that batch's PL.
+    items = (await db.execute(
+        select(OrderItem).where(
             OrderItem.order_id == order.id,
             OrderItem.status == OrderItemStatus.APPROVED,
             OrderItem.final_confirmed_at.isnot(None),
             OrderItem.archived_at.is_(None),
         )
-        .limit(1)
-    )).first()
-    if not row:
+    )).scalars().all()
+    if not items:
         return False
-    _item, pl = row
-    # Received already? No grace needed for this order's Pickup path.
-    if pl is not None and pl.farmer_received_at is not None:
-        return False
-    return True
+    pl_rows = (await db.execute(
+        select(PackingList).where(PackingList.order_id == order.id)
+    )).scalars().all()
+    received_rounds = {
+        (pl.approval_round or 1) for pl in pl_rows
+        if pl.farmer_received_at is not None
+    }
+    for it in items:
+        round_n = it.approval_round or 1
+        if round_n not in received_rounds:
+            return True
+    return False
