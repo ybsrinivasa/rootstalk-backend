@@ -861,7 +861,17 @@ async def list_subscription_orders(
         AVAILABLE = {OrderItemStatus.AVAILABLE}
         sfa_items_for_o = [i for i in items if i.status in AWAITING]
         awaiting_count = len(sfa_items_for_o)
-        returned_count = sum(1 for i in items if i.status in RETURNED)
+        # 2026-08-17 — Same tentative-until-submit gate as postponed_count.
+        # NA / REJECTED items count as "returned" to the farmer only if
+        # approval_round is set (i.e., they've been through a dealer
+        # submit — either the NA was communicated in a submit batch, or
+        # the REJECTED went through SFA and back). Pre-submit tentative
+        # NA items — dealer marked NA and hasn't submitted — stay
+        # invisible to the farmer. User principle 2026-08-17.
+        returned_count = sum(
+            1 for i in items
+            if i.status in RETURNED and i.approval_round is not None
+        )
         has_postponed_now = any(i.status in POSTPONED for i in items)
         postponed_count = (
             sum(1 for i in items if i.status in POSTPONED)
@@ -1366,9 +1376,13 @@ async def get_farmer_order_detail(
     else:
         approved_raw = [base_row(i) for i in items if i.status == OrderItemStatus.APPROVED]
     postponed_raw = [base_row(i) for i in items if i.status == OrderItemStatus.POSTPONED]
+    # 2026-08-17 — Same tentative-until-submit gate as returned_count.
+    # Pre-submit NA items don't surface in the Returned section on the
+    # farmer's review page.
     returned_raw = [
         base_row(i) for i in items
         if i.status in (OrderItemStatus.NOT_AVAILABLE, OrderItemStatus.REJECTED)
+        and i.approval_round is not None
     ]
     # Distinct queued rounds (those with at least one SFA item).
     queued_rounds = sorted({i.approval_round for i in sfa_items if i.approval_round is not None})
@@ -4764,6 +4778,15 @@ async def submit_for_approval(
             raise HTTPException(status_code=422, detail=f"given_volume missing for item {item.id}")
         item.status = OrderItemStatus.SENT_FOR_APPROVAL
         item.approval_round = next_round
+    # 2026-08-17 — Stamp approval_round on NOT_AVAILABLE items in this
+    # batch too. Under user's tentative-until-submit principle, a NA
+    # item shouldn't count as "returned" on the farmer's view until the
+    # dealer explicitly submits. Stamping approval_round is the
+    # commit marker the farmer's returned_count filter uses to know
+    # a NA item has crossed from "tentative NA" to "communicated NA".
+    for item in not_available_items:
+        if item.approval_round is None:
+            item.approval_round = next_round
 
     order.status = OrderStatus.SENT_FOR_APPROVAL
     await db.commit()
@@ -11462,9 +11485,14 @@ async def _maybe_flip_returned_state(
         1 for i in items
         if i.status == OrderItemStatus.APPROVED and i.final_confirmed_at is None
     )
+    # 2026-08-17 — Same tentative-until-submit gate: only count NA /
+    # REJECTED items with approval_round set. A dealer marking NA on a
+    # fresh order without submitting shouldn't trigger the auto-flip
+    # to is_returned_to_farmer.
     returned = sum(
         1 for i in items
         if i.status in (OrderItemStatus.NOT_AVAILABLE, OrderItemStatus.REJECTED)
+        and i.approval_round is not None
     )
     if active > 0 or returned == 0:
         return
