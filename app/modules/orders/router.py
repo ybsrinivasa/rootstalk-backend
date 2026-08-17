@@ -1222,16 +1222,25 @@ async def get_farmer_order_detail(
     # 2026-06-06 — Lazy-create a PackingList row + code once items
     # have been approved so the farmer sees the Packing ID alongside
     # the approve action.
-    # 2026-08-17 — Per-batch rework: pick the earliest round's PL row
-    # as the single-slot representative (used for legacy fields on the
-    # farmer's review payload). packing_batches on the list endpoint
-    # exposes all rounds independently.
-    packing_list = (await db.execute(
-        select(PackingList)
-        .where(PackingList.order_id == order.id)
-        .order_by(PackingList.approval_round.asc().nulls_first())
-        .limit(1)
-    )).scalar_one_or_none()
+    # 2026-08-17 — Per-batch rework: when the caller passes
+    # ?approval_round=N (Pickup detail page), scope the packing_list to
+    # that specific batch. Otherwise fall back to earliest-round as the
+    # single-slot representative used for the review page's legacy
+    # packing_* fields.
+    if approval_round is not None:
+        packing_list = (await db.execute(
+            select(PackingList).where(
+                PackingList.order_id == order.id,
+                PackingList.approval_round == approval_round,
+            )
+        )).scalar_one_or_none()
+    else:
+        packing_list = (await db.execute(
+            select(PackingList)
+            .where(PackingList.order_id == order.id)
+            .order_by(PackingList.approval_round.asc().nulls_first())
+            .limit(1)
+        )).scalar_one_or_none()
     items_result = await db.execute(
         select(OrderItem).where(
             OrderItem.order_id == order.id,
@@ -1325,7 +1334,21 @@ async def get_farmer_order_detail(
         base_row(i) for i in sfa_items
         if current_round is None or i.approval_round == current_round or i.approval_round is None
     ]
-    approved_raw = [base_row(i) for i in items if i.status == OrderItemStatus.APPROVED]
+    # 2026-08-17 — Per-batch Pickup: when approval_round is passed, scope
+    # approved_items to that specific batch so the /orders/{id}/pickup
+    # page's item list matches the batch the farmer tapped. Without this
+    # the page merged round 1 items (already picked up) with round 2
+    # items via consolidate_purchased_items, and the batch-2 rows either
+    # disappeared into a merged same-brand row or looked like already-
+    # received items on the Received banner.
+    if approval_round is not None:
+        approved_raw = [
+            base_row(i) for i in items
+            if i.status == OrderItemStatus.APPROVED
+            and (i.approval_round or 1) == approval_round
+        ]
+    else:
+        approved_raw = [base_row(i) for i in items if i.status == OrderItemStatus.APPROVED]
     postponed_raw = [base_row(i) for i in items if i.status == OrderItemStatus.POSTPONED]
     returned_raw = [
         base_row(i) for i in items
@@ -1369,7 +1392,9 @@ async def get_farmer_order_detail(
         # Lazy-create the row when there's at least one approved item
         # so the Packing ID is visible from the moment the farmer
         # could possibly want to confirm receipt.
-        **(await _farmer_packing_fields(db, order, packing_list, len(approved_raw))),
+        # 2026-08-17 — When the caller passes approval_round (Pickup
+        # detail page), the packing_* fields are scoped to that batch.
+        **(await _farmer_packing_fields(db, order, packing_list, len(approved_raw), approval_round)),
         # Legacy flat list kept for any pre-2026-06-03 caller.
         "items": [
             {
@@ -4798,13 +4823,19 @@ async def _farmer_packing_fields(
     order: Order,
     pl: PackingList | None,
     approved_count: int,
+    approval_round: int | None = None,
 ) -> dict:
     """Packing-surface fields for the farmer's review payload.
     Lazy-creates the row + code when approved_count > 0 so the
     farmer sees the Packing ID alongside the receipt-confirmation
-    action. Mirrors the dealer-side pattern."""
+    action. Mirrors the dealer-side pattern.
+
+    2026-08-17 — approval_round scopes the lazy-create to a specific
+    batch so the Pickup detail page (which fetches with the round
+    param) gets that batch's PL row created if it doesn't yet exist.
+    """
     if pl is None and approved_count > 0:
-        pl = await _ensure_packing_list(db, order.id)
+        pl = await _ensure_packing_list(db, order.id, approval_round)
         await db.commit()
     if pl is None:
         return {
