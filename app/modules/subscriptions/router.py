@@ -5566,7 +5566,20 @@ async def _today_advisory_for_user(
             .where(
                 Order.subscription_id == sub.id,
                 Order.status.notin_(["CANCELLED", "EXPIRED"]),
-                OrderItem.status.notin_(["REROUTED", "REMOVED"]),
+                # 2026-08-17 — Exclude every "farmer isn't going to
+                # receive this via this order" status from fulfilment
+                # attach. Same set as IN_FLIGHT_ITEM_STATUSES's inverse
+                # (NOT_AVAILABLE / REJECTED / NOT_NEEDED / SKIPPED /
+                # REMOVED / REROUTED) — these items shouldn't gate the
+                # advisory card's Order button (`!fulf && !is_purchased`
+                # on the PWA). SKIPPED anchor 2026-08-17: after the
+                # /discard NA→SKIPPED flip, a SKIPPED item was still
+                # being attached as fulfilment, suppressing the Order
+                # button on practices the farmer had just discarded.
+                OrderItem.status.notin_([
+                    "REROUTED", "REMOVED",
+                    "NOT_AVAILABLE", "REJECTED", "NOT_NEEDED", "SKIPPED",
+                ]),
                 OrderItem.archived_at.is_(None),
             )
             .order_by(OrderItem.updated_at.desc())
