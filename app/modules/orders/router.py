@@ -10844,6 +10844,58 @@ async def _update_order_status(db: AsyncSession, order_id: str):
     # too) provides the finalisation path when they know they have
     # nothing available.
     await _maybe_flip_returned_state(db, order, items)
+    await _maybe_reopen_packing_cycle(db, order_id, items)
+
+
+# 2026-08-17 — When new APPROVED items land on an order whose PackingList
+# has already been marked farmer-received (prior batch), reopen the cycle:
+# reset farmer_received_at + picked_up_at + picked_up_by_user_id to NULL
+# so the dealer's Packing pill + farmer's Pickup pill surface the order
+# again for the new-cycle items. Anchor 2026-08-17: RT-26-000445 shape
+# (item 1 approved + Final Confirmed + farmer received; postpone-resolved
+# item 2 later approved). Without this reset, the dealer's `!o.packing_
+# farmer_received_at` gate hides the whole order and there's no way to
+# Final Confirm the new item. Audit trail lives in order_item_events
+# (RECEIVED / FINAL_CONFIRMED events remain).
+async def _maybe_reopen_packing_cycle(
+    db: AsyncSession,
+    order_id: str,
+    items: list[OrderItem] | None = None,
+) -> None:
+    pl = (await db.execute(
+        select(PackingList).where(PackingList.order_id == order_id)
+    )).scalar_one_or_none()
+    if not pl or pl.farmer_received_at is None:
+        return
+    if items is None:
+        items = (await db.execute(
+            select(OrderItem).where(
+                OrderItem.order_id == order_id,
+                OrderItem.archived_at.is_(None),
+            )
+        )).scalars().all()
+    else:
+        items = [i for i in items if i.archived_at is None]
+    received_at = pl.farmer_received_at
+    has_new_cycle_item = any(
+        i.status == OrderItemStatus.APPROVED and (
+            i.final_confirmed_at is None
+            or i.final_confirmed_at > received_at
+        )
+        for i in items
+    )
+    if not has_new_cycle_item:
+        return
+    pl.farmer_received_at = None
+    pl.picked_up_at = None
+    pl.picked_up_by_user_id = None
+    await _record_event(
+        db, lineage_id=order_id,
+        event_type="PACKING_CYCLE_REOPENED",
+        actor_user_id=None, actor_role="SYSTEM",
+        order_id=order_id,
+        metadata={"reason": "new_approved_item_after_receipt"},
+    )
 
 
 # 2026-08-17 — Auto-flip is_returned_to_farmer (or _to_facilitator) when
