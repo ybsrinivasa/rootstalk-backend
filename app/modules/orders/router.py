@@ -6129,6 +6129,30 @@ async def get_dealer_order(
     )
     items = items_result.scalars().all()
 
+    # 2026-08-17 — Hide items past the dealer's decision phase. APPROVED
+    # items that were Final Confirmed (by any prior dealer, or by this
+    # dealer earlier) are in the pickup lifecycle now — farmer's turn.
+    # Showing them here confuses a re-routed dealer who inherited an
+    # order after a previous dealer already delivered some items
+    # (user anchor 2026-08-17). Original dealer still sees them on the
+    # Packing pill card; this filter narrows the DETAIL page to items
+    # the dealer can still act on. Also strip terminal-non-approved
+    # residues (SKIPPED / NA / REJECTED / NOT_NEEDED / REROUTED /
+    # REMOVED) — the re-route path resets them but a defensive filter
+    # avoids showing them if a race left one behind.
+    items = [
+        i for i in items
+        if not (
+            i.status == OrderItemStatus.APPROVED
+            and i.final_confirmed_at is not None
+        )
+        and i.status not in (
+            OrderItemStatus.SKIPPED, OrderItemStatus.NOT_AVAILABLE,
+            OrderItemStatus.REJECTED, OrderItemStatus.NOT_NEEDED,
+            OrderItemStatus.REROUTED, OrderItemStatus.REMOVED,
+        )
+    ]
+
     # Helper for the flat item shape. NOTE: relies on
     # `element_block_for_item` being defined further down — items
     # are iterated only after the element batch-resolution pass.
