@@ -1641,6 +1641,24 @@ async def discard_order(
     prev_order_status = (
         order.status.value if hasattr(order.status, "value") else order.status
     )
+    # 2026-08-17 — Flip unsold items to SKIPPED so `returned_count`
+    # (which counts NA + REJECTED) drops to 0. Without this, the farmer's
+    # Routed card kept rendering Send/Discard on the next refresh — the
+    # frontend's send-discard mode inference from active===0 && returned>0
+    # doesn't see is_returned_to_farmer, and clicking Discard again 400s
+    # because we just cleared the flag. SKIPPED = "farmer opted out";
+    # per-item event log preserves the transition.
+    for it in unsold_items:
+        prev_item = it.status.value if hasattr(it.status, "value") else it.status
+        it.status = OrderItemStatus.SKIPPED
+        await _record_event(
+            db, lineage_id=it.lineage_id,
+            event_type="DISCARDED_BY_FARMER",
+            actor_user_id=current_user.id, actor_role="FARMER",
+            order_id=order.id, order_item_id=it.id,
+            prev_status=prev_item,
+            new_status=OrderItemStatus.SKIPPED.value,
+        )
     order.is_returned_to_farmer = False
     if not has_approved:
         order.status = OrderStatus.CANCELLED
