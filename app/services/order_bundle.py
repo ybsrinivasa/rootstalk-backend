@@ -726,6 +726,16 @@ async def already_ordered_practice_ids(
     correctly dropped them and was re-surfacing the "Order" button.
     Farmer ended up in a dead-end: tap Order → "Nothing recommended
     in this window."
+
+    Fix 2026-08-17: extend the OrderItem.status exclusion to the full
+    "farmer did not receive this via this order" set (inverse of
+    IN_FLIGHT_ITEM_STATUSES). Same shape as the fix applied on the
+    advisory fulfilment attach — the two surfaces must agree on which
+    statuses release the practice for re-order. Anchor: /discard flipped
+    NA items to SKIPPED, but SKIPPED still counted as "already ordered"
+    here → farmer's Order tab said "Nothing recommended in this window"
+    even though the advisory correctly surfaced the practice's Order
+    button.
     """
     from app.modules.orders.models import OrderItemStatus
     rows = (await db.execute(
@@ -735,7 +745,11 @@ async def already_ordered_practice_ids(
             Order.subscription_id == subscription_id,
             Order.status.notin_([OrderStatus.CANCELLED, OrderStatus.EXPIRED]),
             OrderItem.archived_at.is_(None),
-            OrderItem.status.notin_([OrderItemStatus.REROUTED, OrderItemStatus.REMOVED]),
+            OrderItem.status.notin_([
+                OrderItemStatus.REROUTED, OrderItemStatus.REMOVED,
+                OrderItemStatus.NOT_AVAILABLE, OrderItemStatus.REJECTED,
+                OrderItemStatus.NOT_NEEDED, OrderItemStatus.SKIPPED,
+            ]),
         )
     )).all()
     return {r[0] for r in rows if r[0]}
