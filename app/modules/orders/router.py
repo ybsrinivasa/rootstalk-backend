@@ -6246,8 +6246,31 @@ async def get_dealer_order(
     def _resolve_name(ref):
         return cosh_name_by_id.get(ref) if ref else None
 
+    # 2026-08-17 — Item lookup for the element block so we can read
+    # Practice.frequency_days + resolve the item's timeline dates
+    # (needed to compute applications_count for frequency-based practices
+    # like Fertigation NPK Dosages / Fertigation Products).
+    items_by_id: dict[str, OrderItem] = {i.id: i for i in items}
+
     def element_block_for_item(item_id: str) -> dict:
         s = item_element_specs.get(item_id, {})
+        it = items_by_id.get(item_id)
+        practice = practice_map.get(it.practice_id) if it and it.practice_id else None
+        freq_days = (
+            int(practice.frequency_days)
+            if practice and practice.frequency_days else None
+        )
+        applications_count: int | None = None
+        if freq_days and freq_days >= 1 and it:
+            df_iso, dt_iso = _per_item_dates(it)
+            if df_iso and dt_iso:
+                from datetime import date as _d
+                df = _d.fromisoformat(df_iso)
+                dt = _d.fromisoformat(dt_iso)
+                timeline_days = (dt - df).days + 1
+                if timeline_days >= 1:
+                    from math import ceil as _ceil
+                    applications_count = _ceil(timeline_days / freq_days)
         return {
             "dosage_value": s.get("dosage_value"),
             "dosage_unit_cosh_id": s.get("dosage_unit_ref"),
@@ -6257,6 +6280,13 @@ async def get_dealer_order(
             "vol_per_plant_value": s.get("vol_per_plant_value"),
             "vol_per_plant_unit_cosh_id": s.get("vol_per_plant_unit_ref"),
             "vol_per_plant_unit_name": _resolve_name(s.get("vol_per_plant_unit_ref")),
+            # 2026-08-17 — Frequency-based practice metadata for the
+            # dealer's element-guidance card. Dealer sees "per
+            # application" on the dosage line + an "Applications" row
+            # so the total volume request makes sense (per-app dose ×
+            # applications × area).
+            "frequency_days": freq_days,
+            "applications_count": applications_count,
         }
 
     def has_locked_brand_item(it: OrderItem) -> bool:
