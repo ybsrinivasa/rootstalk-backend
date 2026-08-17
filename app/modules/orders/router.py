@@ -3635,21 +3635,47 @@ async def list_dealer_postponed_items(
 
     await _assert_active_dealer(db, current_user.id)
 
-    rows = (await db.execute(
-        select(OrderItem, Order, AdvPractice, User, Subscription, Client)
-        .join(Order, Order.id == OrderItem.order_id)
-        .join(AdvPractice, AdvPractice.id == OrderItem.practice_id, isouter=True)
-        .join(User, User.id == Order.farmer_user_id)
-        .join(Subscription, Subscription.id == Order.subscription_id)
-        .join(Client, Client.id == Order.client_id)
-        .where(
-            Order.dealer_user_id == current_user.id,
+    # 2026-08-17 — Two-stage query so an order surfaces on the
+    # Postponed page as long as ANY item on it is either POSTPONED or
+    # AVAILABLE (post-resolve, awaiting Submit). Rationale: dealer
+    # resolves a postpone → item flips to AVAILABLE. If dealer taps
+    # PWA back without submitting, the resolved AVAILABLE item was
+    # silently lost from the Postponed page (only POSTPONED items came
+    # back). Now the card sticks around, showing both remaining
+    # postpones AND the resolved items so the dealer can complete the
+    # journey (Submit) from here.
+    # Step 1: find order ids with at least one POSTPONED item.
+    postponed_order_ids = (await db.execute(
+        select(OrderItem.order_id).where(
+            Order.id == OrderItem.order_id,
             OrderItem.status == OrderItemStatus.POSTPONED,
             OrderItem.archived_at.is_(None),
+        ).join(Order, Order.id == OrderItem.order_id).where(
+            Order.dealer_user_id == current_user.id,
             Order.status.notin_([OrderStatus.CANCELLED, OrderStatus.EXPIRED]),
         )
-        .order_by(Order.created_at.asc(), OrderItem.postponed_until.asc().nullslast())
-    )).all()
+    )).scalars().all()
+    postponed_order_ids = list({oid for oid in postponed_order_ids if oid})
+
+    rows = []
+    if postponed_order_ids:
+        rows = (await db.execute(
+            select(OrderItem, Order, AdvPractice, User, Subscription, Client)
+            .join(Order, Order.id == OrderItem.order_id)
+            .join(AdvPractice, AdvPractice.id == OrderItem.practice_id, isouter=True)
+            .join(User, User.id == Order.farmer_user_id)
+            .join(Subscription, Subscription.id == Order.subscription_id)
+            .join(Client, Client.id == Order.client_id)
+            .where(
+                Order.id.in_(postponed_order_ids),
+                OrderItem.status.in_((
+                    OrderItemStatus.POSTPONED,
+                    OrderItemStatus.AVAILABLE,
+                )),
+                OrderItem.archived_at.is_(None),
+            )
+            .order_by(Order.created_at.asc(), OrderItem.postponed_until.asc().nullslast())
+        )).all()
 
     now_utc = datetime.now(timezone.utc)
     out = []
@@ -3688,6 +3714,10 @@ async def list_dealer_postponed_items(
             "postponed_until": item.postponed_until.isoformat() if item.postponed_until else None,
             "days_remaining": days_remaining,
             "order_status": order.status.value if hasattr(order.status, "value") else order.status,
+            # 2026-08-17 — Item's current status so the PWA can render
+            # resolved (AVAILABLE) items with a "ready to submit" chip
+            # alongside the still-POSTPONED ones.
+            "item_status": item.status.value if hasattr(item.status, "value") else item.status,
         })
     return out
 
