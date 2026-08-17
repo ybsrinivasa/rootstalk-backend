@@ -72,6 +72,14 @@ _ORDER_TRANSITIONS: dict[tuple[str, str], frozenset[str]] = {
     ("SENT_FOR_APPROVAL", "COMPLETED"):           frozenset({SYSTEM, FARMER}),
     ("SENT_FOR_APPROVAL", "PARTIALLY_APPROVED"):  frozenset({SYSTEM, FARMER}),
     ("SENT_FOR_APPROVAL", "CANCELLED"):           frozenset({FARMER}),
+    # 2026-08-17 — Dealer can re-submit a fresh batch (postpone-resolved
+    # items marked AVAILABLE + tapped Submit) even after the order has
+    # already been through a round (status COMPLETED / PARTIALLY_APPROVED
+    # / SFA). Replaces the auto-submit path that used to hijack the flow
+    # in mark_item_available — see issue anchor 2026-08-17 pm.
+    ("COMPLETED", "SENT_FOR_APPROVAL"):           frozenset({DEALER}),
+    ("PARTIALLY_APPROVED", "SENT_FOR_APPROVAL"):  frozenset({DEALER}),
+    ("SENT_FOR_APPROVAL", "SENT_FOR_APPROVAL"):   frozenset({DEALER}),
 
     # Orders V2 (2026-05-31): farmer keeps cancel rights through any
     # non-terminal status. The live-presence lease on the Order row

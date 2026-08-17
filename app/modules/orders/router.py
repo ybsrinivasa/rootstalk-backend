@@ -3793,39 +3793,16 @@ async def mark_item_available(
         new_draft.pop(item_id, None)
         order_row.dealer_draft = new_draft
 
-    # 2026-06-03 — Postponed-resolve auto-submit. When the dealer
-    # marks a previously POSTPONED item available AFTER the order
-    # has been submitted (status past PROCESSING), there's no
-    # separate "Submit for approval" batch coming — the dealer's
-    # intent is to commit AND send it to the farmer. So we flip the
-    # item directly to SENT_FOR_APPROVAL and recompute order status
-    # (typically COMPLETED → PARTIALLY_APPROVED). Order-level state
-    # is updated via _update_order_status which bypasses the
-    # transition table — that's by design for derived-status
-    # re-computation.
-    if prev_status == "POSTPONED" and order_row.status != OrderStatus.PROCESSING:
-        # 2026-06-05 — Stamp this resolution with the next approval
-        # round. The farmer's review filters to MIN(approval_round)
-        # among SENT_FOR_APPROVAL items so each batch queues cleanly.
-        existing_rounds = (await db.execute(
-            select(OrderItem.approval_round).where(
-                OrderItem.order_id == order_id,
-                OrderItem.approval_round.isnot(None),
-            )
-        )).scalars().all()
-        next_round = (max(existing_rounds) if existing_rounds else 0) + 1
-        item.approval_round = next_round
-        item.status = OrderItemStatus.SENT_FOR_APPROVAL
-        await _record_event(
-            db, lineage_id=item.lineage_id,
-            event_type="POSTPONED_RESOLVED_TO_APPROVAL",
-            actor_user_id=current_user.id, actor_role="DEALER",
-            order_id=order_id, order_item_id=item.id,
-            prev_status=OrderItemStatus.AVAILABLE.value,
-            new_status=OrderItemStatus.SENT_FOR_APPROVAL.value,
-            metadata={"approval_round": next_round},
-        )
-        await _update_order_status(db, order_id)
+    # 2026-08-17 — Removed the postpone-resolve auto-submit path. Under
+    # the previous behaviour each postpone-resolve auto-flipped to
+    # SENT_FOR_APPROVAL with a fresh approval_round, so a dealer resolving
+    # two postponed items in a row generated two separate approval rounds
+    # for the farmer — cluttering the approval feed and preventing the
+    # dealer from reviewing before sending. Now the item stays AVAILABLE
+    # after Save; the dealer taps Submit for approval when ready, and
+    # the standard batch path (submit_for_approval) stamps ONE
+    # approval_round covering every AVAILABLE item on the order. The
+    # Pending pill catches the order via the AVAILABLE > 0 predicate.
 
     await db.commit()
     return {"item_id": item_id, "status": item.status}
