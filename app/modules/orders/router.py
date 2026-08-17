@@ -910,6 +910,21 @@ async def list_subscription_orders(
             1 for i in sfa_items_for_o
             if current_round_for_o is None or i.approval_round == current_round_for_o
         )
+        # 2026-08-17 (per-batch approvals) — expose approval_batches so
+        # the farmer's For Approval pill can render one card per batch
+        # (dealer submission round), not one per order. Each batch
+        # carries item_count so the pill card leads with "N items to
+        # approve" + the batch tag when there's more than one round.
+        approval_by_round: dict[int, int] = {}
+        for it in items:
+            if it.status == OrderItemStatus.SENT_FOR_APPROVAL:
+                approval_by_round[it.approval_round or 1] = (
+                    approval_by_round.get(it.approval_round or 1, 0) + 1
+                )
+        approval_batches: list[dict] = [
+            {"approval_round": r, "item_count": approval_by_round[r]}
+            for r in sorted(approval_by_round.keys())
+        ]
         # 2026-08-17 (per-batch rework) — assemble packing_batches from
         # APPROVED items grouped by approval_round. Each batch tracks
         # its own Final Confirmation + Pickup state so the farmer's
@@ -1017,6 +1032,10 @@ async def list_subscription_orders(
             # batches only. Batch-level details live in packing_batches.
             "pickup_ready_count": pickup_ready_item_count,
             "packing_batches": packing_batches,
+            # 2026-08-17 — Per-batch approvals. One entry per SFA round
+            # so the farmer's For Approval pill can render one card per
+            # dealer submission (not one card per order).
+            "approval_batches": approval_batches,
             # Legacy top-level fields (canonical = earliest unresolved
             # batch). Slated for removal once the farmer PWA fully
             # switches to packing_batches.
@@ -1147,6 +1166,7 @@ async def list_subscription_orders(
 @router.get("/farmer/orders/{order_id}")
 async def get_farmer_order_detail(
     order_id: str,
+    approval_round: int | None = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1285,17 +1305,22 @@ async def get_farmer_order_detail(
             "postponed_until": i.postponed_until.isoformat() if i.postponed_until else None,
         }
 
-    # 2026-06-05 — Round-based queueing within a single order. The
-    # dealer's bulk submit stamps approval_round=N on every item;
-    # later postpone-resolve auto-submits each get round N+1. The
-    # farmer's review shows only the EARLIEST-still-pending round —
-    # so a second batch (resolved postpone) doesn't appear mixed
-    # into the first batch's review screen.
+    # 2026-06-05 — Round-based queueing within a single order. Dealer's
+    # bulk submit stamps approval_round=N on every AVAILABLE item; each
+    # submit gets its own round (postpone-resolve rounds are +1 on the
+    # previous max).
+    # 2026-08-17 — Explicit approval_round param: farmer's For Approval
+    # pill lists per-batch cards; tapping a batch's card navigates here
+    # with ?approval_round=N. If absent (legacy call), fall back to the
+    # earliest still-pending round.
     sfa_items = [i for i in items if i.status == OrderItemStatus.SENT_FOR_APPROVAL]
-    current_round = (
-        min((i.approval_round for i in sfa_items if i.approval_round is not None), default=None)
-        if sfa_items else None
-    )
+    if approval_round is not None:
+        current_round = approval_round
+    else:
+        current_round = (
+            min((i.approval_round for i in sfa_items if i.approval_round is not None), default=None)
+            if sfa_items else None
+        )
     approval_raw = [
         base_row(i) for i in sfa_items
         if current_round is None or i.approval_round == current_round or i.approval_round is None
