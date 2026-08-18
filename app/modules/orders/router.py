@@ -3742,14 +3742,18 @@ async def list_dealer_postponed_items(
 
     await _assert_active_dealer(db, current_user.id)
 
-    # 2026-08-18 — Under the tentative-until-submit model, POSTPONED is
-    # the only committed decision that lands on the Postponed page.
-    # A dealer resolving a postpone → dealer_pending_status=AVAILABLE
-    # (live still POSTPONED). Filter includes those too (effective
-    # status = POSTPONED or AVAILABLE) so a resolved item stays on
-    # the Postponed page as a "ready to submit" card until dealer
-    # taps Submit. Change Selection clears pending → dealer_pending
-    # NULL, live POSTPONED — still shows.
+    # 2026-08-18 — Postponed page under the tentative-until-submit
+    # model: an item lands here if the dealer's EFFECTIVE decision is
+    # POSTPONED. That covers three cases:
+    #   1. Fresh order, dealer tentatively marked postponed
+    #      → live=PENDING, dealer_pending=POSTPONED
+    #   2. Submitted round, item still awaiting dealer resolution
+    #      → live=POSTPONED, dealer_pending=NULL
+    #   3. Submitted round, dealer tentatively resolving now
+    #      → live=POSTPONED, dealer_pending IN (AVAILABLE, NOT_AVAILABLE)
+    # Item drops off once resolved on a fresh order (dealer moves on
+    # via the main order view).
+    from sqlalchemy import or_ as _or, and_ as _and
     rows = (await db.execute(
         select(OrderItem, Order, AdvPractice, User, Subscription, Client)
         .join(Order, Order.id == OrderItem.order_id)
@@ -3760,7 +3764,10 @@ async def list_dealer_postponed_items(
         .where(
             Order.dealer_user_id == current_user.id,
             Order.status.notin_([OrderStatus.CANCELLED, OrderStatus.EXPIRED]),
-            OrderItem.status == OrderItemStatus.POSTPONED,
+            _or(
+                OrderItem.status == OrderItemStatus.POSTPONED,
+                OrderItem.dealer_pending_status == OrderItemStatus.POSTPONED.value,
+            ),
             OrderItem.archived_at.is_(None),
         )
         .order_by(Order.created_at.asc(), OrderItem.postponed_until.asc().nullslast())
@@ -3962,7 +3969,6 @@ async def mark_item_available(
                 ):
                     # Tentative cascade: sibling gets pending NOT_NEEDED.
                     # Reset on the anchor will clear it.
-                    sibling.dealer_pending_status = OrderItemStatus.NOT_NEEDED.value
                     _set_dealer_pending(sibling, OrderItemStatus.NOT_NEEDED.value, clear_brand_details=True)
                 # Same Part, same Option (compound AND) -> leave alone, dealer fills these
                 # Different Part -> leave alone, dealer processes that Part separately
