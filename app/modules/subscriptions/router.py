@@ -5684,6 +5684,25 @@ async def _today_advisory_for_user(
                 "volume_unit": it_s.volume_unit,
             })
 
+        # 2026-08-18 — Per-batch Final-Confirmation rollup so the
+        # advisory chip can gate "Ready for pickup" on the WHOLE batch
+        # being FC'd, not just the individual item. Matches the
+        # Manage → Ready-for-pickup pill contract: pickup is per-
+        # batch (one packing list, one trip) so a batch with 1 FC'd
+        # + 3 awaiting-FC should NOT show any item as pickup-ready.
+        # Keyed on (order_id, approval_round). True iff every APPROVED
+        # item in that batch has final_confirmed_at set.
+        _batch_fc_map: dict[tuple[str, int], list[bool]] = {}
+        for it_b, ord_b, _pl_b in active_items_rows:
+            st_b = it_b.status.value if hasattr(it_b.status, "value") else it_b.status
+            if st_b != "APPROVED":
+                continue
+            _key_b = (ord_b.id, it_b.approval_round or 1)
+            _batch_fc_map.setdefault(_key_b, []).append(it_b.final_confirmed_at is not None)
+        batch_all_fc: dict[tuple[str, int], bool] = {
+            k: all(v) and len(v) > 0 for k, v in _batch_fc_map.items()
+        }
+
         # Take the first (most recent) row per practice_id.
         fulfilment_by_practice: dict[str, dict] = {}
         for it, ord_row, pl in active_items_rows:
@@ -5718,6 +5737,14 @@ async def _today_advisory_for_user(
                 # APPROVED-and-Final-Confirmed (chips Pickup).
                 "final_confirmed_at": (
                     it.final_confirmed_at.isoformat() if it.final_confirmed_at else None
+                ),
+                # 2026-08-18 — Per-batch Final-Confirmation rollup so
+                # the advisory chip can gate on the WHOLE batch being
+                # FC'd (matches the Manage Pickup-pill contract:
+                # per-batch, one packing list, one farmer trip). Frontend
+                # fulfilmentToPill returns 'pickup' iff this is true.
+                "batch_all_final_confirmed": batch_all_fc.get(
+                    (ord_row.id, it.approval_round or 1), False,
                 ),
                 "brand_name": (
                     brand_loc.get(it.brand_cosh_id) or it.brand_name
