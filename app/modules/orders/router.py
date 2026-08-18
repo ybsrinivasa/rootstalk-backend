@@ -3388,15 +3388,14 @@ async def list_dealer_orders(
     if created_any:
         await db.commit()
 
-    # 2026-08-18 — Common-name lookup for POSTPONED items so the
+    # 2026-08-18 — Common-name lookup for LIVE POSTPONED items so the
     # Postponed pill card can list "Acetamiprid · Kanemite …" right
-    # on the card. Common name lives on Element rows.
-    # Filter on effective status (live is POSTPONED and no tentative
-    # override that has since flipped the item to AVAILABLE/NA).
+    # on the card. Live-only (not effective) — tentative postpones
+    # don't reach the Postponed pill anyway.
     postponed_practice_ids: set[str] = set()
     for items in items_by_order.values():
         for i in items:
-            if _dealer_effective_status(i) == OrderItemStatus.POSTPONED and i.practice_id:
+            if i.status == OrderItemStatus.POSTPONED and i.practice_id:
                 postponed_practice_ids.add(i.practice_id)
     postponed_common_name_by_practice: dict[str, str | None] = {}
     if postponed_practice_ids:
@@ -3465,19 +3464,17 @@ async def list_dealer_orders(
         live_items = [i for i in items if i.status != OrderItemStatus.REROUTED]
         if items and not live_items and not include_husks:
             continue
-        # 2026-08-18 — Dealer-facing counts use EFFECTIVE status so
-        # tentative decisions land on the right pill (POSTPONED /
-        # AVAILABLE / NA) as soon as the dealer taps, but never
-        # reach the farmer's view until submit. Live-status counts
-        # (SFA / APPROVED / REJECTED / final_confirmed) are unchanged
-        # since those states only exist post-submit.
-        def _eff(i):
-            return _dealer_effective_status(i)
+        # 2026-08-18 — Item counts use LIVE status (not effective) so
+        # the dealer's own tentative-in-flight decisions don't move the
+        # order between pills. Tentative decisions are internal to the
+        # dealer's per-order detail view; the list-view classification
+        # only reacts to committed (post-submit) state. Fresh order
+        # with 4 tentative postpones stays on Pending until submit.
         counts = {
-            "pending": sum(1 for i in live_items if _eff(i) == OrderItemStatus.PENDING),
-            "available": sum(1 for i in live_items if _eff(i) == OrderItemStatus.AVAILABLE),
-            "postponed": sum(1 for i in live_items if _eff(i) == OrderItemStatus.POSTPONED),
-            "not_available": sum(1 for i in live_items if _eff(i) == OrderItemStatus.NOT_AVAILABLE),
+            "pending": sum(1 for i in live_items if i.status == OrderItemStatus.PENDING),
+            "available": sum(1 for i in live_items if i.status == OrderItemStatus.AVAILABLE),
+            "postponed": sum(1 for i in live_items if i.status == OrderItemStatus.POSTPONED),
+            "not_available": sum(1 for i in live_items if i.status == OrderItemStatus.NOT_AVAILABLE),
             "sent_for_approval": sum(1 for i in live_items if i.status == OrderItemStatus.SENT_FOR_APPROVAL),
             "approved": sum(1 for i in live_items if i.status == OrderItemStatus.APPROVED),
             "rejected": sum(1 for i in live_items if i.status == OrderItemStatus.REJECTED),
@@ -3619,7 +3616,7 @@ async def list_dealer_orders(
             "postponed_item_names": [
                 postponed_common_name_by_practice.get(i.practice_id) or ""
                 for i in sorted(
-                    (it for it in items if _dealer_effective_status(it) == OrderItemStatus.POSTPONED and it.practice_id),
+                    (it for it in items if it.status == OrderItemStatus.POSTPONED and it.practice_id),
                     key=lambda it: it.created_at,
                 )
                 if postponed_common_name_by_practice.get(i.practice_id)
@@ -3742,18 +3739,10 @@ async def list_dealer_postponed_items(
 
     await _assert_active_dealer(db, current_user.id)
 
-    # 2026-08-18 — Postponed page under the tentative-until-submit
-    # model: an item lands here if the dealer's EFFECTIVE decision is
-    # POSTPONED. That covers three cases:
-    #   1. Fresh order, dealer tentatively marked postponed
-    #      → live=PENDING, dealer_pending=POSTPONED
-    #   2. Submitted round, item still awaiting dealer resolution
-    #      → live=POSTPONED, dealer_pending=NULL
-    #   3. Submitted round, dealer tentatively resolving now
-    #      → live=POSTPONED, dealer_pending IN (AVAILABLE, NOT_AVAILABLE)
-    # Item drops off once resolved on a fresh order (dealer moves on
-    # via the main order view).
-    from sqlalchemy import or_ as _or, and_ as _and
+    # 2026-08-18 — Postponed page shows only COMMITTED (live) POSTPONED
+    # items — the ones that already went through a submit round and are
+    # waiting for the dealer's resolve. Tentative postpones on fresh
+    # orders live on the Pending pill until the dealer taps Submit.
     rows = (await db.execute(
         select(OrderItem, Order, AdvPractice, User, Subscription, Client)
         .join(Order, Order.id == OrderItem.order_id)
@@ -3764,10 +3753,7 @@ async def list_dealer_postponed_items(
         .where(
             Order.dealer_user_id == current_user.id,
             Order.status.notin_([OrderStatus.CANCELLED, OrderStatus.EXPIRED]),
-            _or(
-                OrderItem.status == OrderItemStatus.POSTPONED,
-                OrderItem.dealer_pending_status == OrderItemStatus.POSTPONED.value,
-            ),
+            OrderItem.status == OrderItemStatus.POSTPONED,
             OrderItem.archived_at.is_(None),
         )
         .order_by(Order.created_at.asc(), OrderItem.postponed_until.asc().nullslast())
