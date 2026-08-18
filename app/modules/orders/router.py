@@ -3388,6 +3388,37 @@ async def list_dealer_orders(
     if created_any:
         await db.commit()
 
+    # 2026-08-18 — Common-name lookup for POSTPONED items so the
+    # Postponed pill card can list "Acetamiprid, Kanemite …" right
+    # on the card. User anchor: dealer with many postponed orders
+    # doesn't want to open each order to see which items are waiting;
+    # supply from a manufacturer might resolve several across orders.
+    postponed_practice_ids: set[str] = set()
+    for items in items_by_order.values():
+        for i in items:
+            if i.status == OrderItemStatus.POSTPONED and i.practice_id:
+                postponed_practice_ids.add(i.practice_id)
+    postponed_common_name_by_practice: dict[str, str | None] = {}
+    if postponed_practice_ids:
+        from app.modules.advisory.models import Practice as _PostponedPractice
+        prow = (await db.execute(
+            select(_PostponedPractice.id, _PostponedPractice.common_name_cosh_id)
+            .where(_PostponedPractice.id.in_(postponed_practice_ids))
+        )).all()
+        needed_cosh = {cn for _pid, cn in prow if cn}
+        cosh_name: dict[str, str] = {}
+        if needed_cosh:
+            from app.modules.sync.models import CoshCoreItem as _PostponedCosh
+            crows = (await db.execute(
+                select(_PostponedCosh.cosh_id, _PostponedCosh.translations)
+                .where(_PostponedCosh.cosh_id.in_(needed_cosh))
+            )).all()
+            lang_pp = current_user.language_code or "en"
+            for cid, tr in crows:
+                cosh_name[cid] = pick_translation(tr or {}, lang_pp, cid)
+        for pid, cn in prow:
+            postponed_common_name_by_practice[pid] = cosh_name.get(cn) if cn else None
+
     # Manufacturer lookup for all approved brand_cosh_ids.
     approved_brand_ids = {
         i.brand_cosh_id
@@ -3547,6 +3578,18 @@ async def list_dealer_orders(
             # 2026-08-17 — Per-batch Pickup lifecycle. Primary source
             # for the new Final Confirmation + Packing + Pickup pills.
             "packing_batches": packing_batches,
+            # 2026-08-18 — Common-input names for POSTPONED items on
+            # this order, ordered by item creation. Dealer scans across
+            # cards to spot supply-match candidates without opening each
+            # order.
+            "postponed_item_names": [
+                postponed_common_name_by_practice.get(i.practice_id) or ""
+                for i in sorted(
+                    (it for it in items if it.status == OrderItemStatus.POSTPONED and it.practice_id),
+                    key=lambda it: it.created_at,
+                )
+                if postponed_common_name_by_practice.get(i.practice_id)
+            ],
             # Legacy top-level fields (kept for pages that haven't yet
             # migrated to packing_batches) — populated from the earliest
             # unresolved batch, or nulls if none. Home tile / history /
