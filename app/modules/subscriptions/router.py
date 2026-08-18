@@ -5566,19 +5566,21 @@ async def _today_advisory_for_user(
             .where(
                 Order.subscription_id == sub.id,
                 Order.status.notin_(["CANCELLED", "EXPIRED"]),
-                # 2026-08-17 — Exclude every "farmer isn't going to
-                # receive this via this order" status from fulfilment
-                # attach. Same set as IN_FLIGHT_ITEM_STATUSES's inverse
-                # (NOT_AVAILABLE / REJECTED / NOT_NEEDED / SKIPPED /
-                # REMOVED / REROUTED) — these items shouldn't gate the
-                # advisory card's Order button (`!fulf && !is_purchased`
-                # on the PWA). SKIPPED anchor 2026-08-17: after the
-                # /discard NA→SKIPPED flip, a SKIPPED item was still
-                # being attached as fulfilment, suppressing the Order
-                # button on practices the farmer had just discarded.
+                # 2026-08-18 — Exclude only items the farmer is truly
+                # done with on this order: REROUTED (cloned to a new
+                # order), REMOVED (farmer removed pre-approval),
+                # NOT_NEEDED (OR-alternative not chosen), SKIPPED
+                # (farmer discarded via /discard).
+                #
+                # NOT_AVAILABLE and REJECTED are KEPT — those items are
+                # sitting with the farmer awaiting Send-to-Another-Dealer
+                # or Discard. Their fulfilment attach lets the advisory
+                # chip render "Returned" (via fulfilmentToPill on PWA)
+                # instead of falling through to the green "Order" button.
+                # Once the farmer acts (Send → REROUTED, Discard →
+                # SKIPPED), the item drops out of this query naturally.
                 OrderItem.status.notin_([
-                    "REROUTED", "REMOVED",
-                    "NOT_AVAILABLE", "REJECTED", "NOT_NEEDED", "SKIPPED",
+                    "REROUTED", "REMOVED", "NOT_NEEDED", "SKIPPED",
                 ]),
                 OrderItem.archived_at.is_(None),
             )
