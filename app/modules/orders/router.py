@@ -3389,10 +3389,13 @@ async def list_dealer_orders(
         await db.commit()
 
     # 2026-08-18 — Common-name lookup for POSTPONED items so the
-    # Postponed pill card can list "Acetamiprid, Kanemite …" right
+    # Postponed pill card can list "Acetamiprid · Kanemite …" right
     # on the card. User anchor: dealer with many postponed orders
     # doesn't want to open each order to see which items are waiting;
     # supply from a manufacturer might resolve several across orders.
+    # Common name lives on Element rows (element_type='COMMON_NAME',
+    # cosh_ref → CoshCoreItem.translations) — not on the direct
+    # Practice.common_name_cosh_id field (that's used elsewhere).
     postponed_practice_ids: set[str] = set()
     for items in items_by_order.values():
         for i in items:
@@ -3400,12 +3403,16 @@ async def list_dealer_orders(
                 postponed_practice_ids.add(i.practice_id)
     postponed_common_name_by_practice: dict[str, str | None] = {}
     if postponed_practice_ids:
-        from app.modules.advisory.models import Practice as _PostponedPractice
-        prow = (await db.execute(
-            select(_PostponedPractice.id, _PostponedPractice.common_name_cosh_id)
-            .where(_PostponedPractice.id.in_(postponed_practice_ids))
+        from app.modules.advisory.models import Element as _PostponedEl
+        el_rows = (await db.execute(
+            select(_PostponedEl.practice_id, _PostponedEl.cosh_ref)
+            .where(
+                _PostponedEl.practice_id.in_(postponed_practice_ids),
+                _PostponedEl.element_type == "COMMON_NAME",
+            )
         )).all()
-        needed_cosh = {cn for _pid, cn in prow if cn}
+        cosh_by_practice = {pid: cref for pid, cref in el_rows if cref}
+        needed_cosh = set(cosh_by_practice.values())
         cosh_name: dict[str, str] = {}
         if needed_cosh:
             from app.modules.sync.models import CoshCoreItem as _PostponedCosh
@@ -3416,8 +3423,11 @@ async def list_dealer_orders(
             lang_pp = current_user.language_code or "en"
             for cid, tr in crows:
                 cosh_name[cid] = pick_translation(tr or {}, lang_pp, cid)
-        for pid, cn in prow:
-            postponed_common_name_by_practice[pid] = cosh_name.get(cn) if cn else None
+        for pid in postponed_practice_ids:
+            cref = cosh_by_practice.get(pid)
+            postponed_common_name_by_practice[pid] = (
+                cosh_name.get(cref) if cref else None
+            )
 
     # Manufacturer lookup for all approved brand_cosh_ids.
     approved_brand_ids = {
