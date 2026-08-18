@@ -4614,6 +4614,74 @@ async def cancel_final_confirm_item(
     return {"item_id": item_id, "status": item.status}
 
 
+@router.put("/dealer/orders/{order_id}/items/{item_id}/undo-final-confirm")
+async def undo_final_confirm_item(
+    order_id: str, item_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Dealer's undo on an already-Final-Confirmed item.
+
+    Same tentative-until-submit principle as the earlier dealer-tap
+    rework: a Final Confirmation is a commitment, but a fresh
+    commitment should be reversible until the physical hand-off
+    starts. Retracts the final_confirmed_at stamp; item stays
+    APPROVED. Batch's all_final_confirmed rolls back to False → farmer
+    Pickup pill loses this batch until dealer re-FCs.
+
+    Blocked once the batch's packing list has been picked up
+    (picked_up_at set on the PackingList row for this item's
+    approval_round) — physical hand-off in flight.
+    """
+    from app.modules.orders.models import PackingList
+    await _assert_active_dealer(db, current_user.id)
+    await _get_dealer_order(db, order_id, current_user.id)
+    item = await _get_order_item(db, item_id, order_id)
+    if item.status != OrderItemStatus.APPROVED:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "not_approved",
+                "message": "Undo Final Confirmation is only available on APPROVED items.",
+            },
+        )
+    if item.final_confirmed_at is None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "not_final_confirmed",
+                "message": "This item has not been Final Confirmed yet — nothing to undo.",
+            },
+        )
+    round_n = item.approval_round or 1
+    pl = (await db.execute(
+        select(PackingList).where(
+            PackingList.order_id == order_id,
+            PackingList.approval_round == round_n,
+        )
+    )).scalar_one_or_none()
+    if pl and pl.picked_up_at is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "packing_picked_up",
+                "message": "The packing list for this batch has already been picked up — Final Confirmation can no longer be undone.",
+            },
+        )
+    item.final_confirmed_at = None
+    await _record_event(
+        db, lineage_id=item.lineage_id,
+        event_type="UNDO_FINAL_CONFIRM",
+        actor_user_id=current_user.id, actor_role="DEALER",
+        order_id=order_id, order_item_id=item.id,
+        prev_status=item.status.value if hasattr(item.status, "value") else item.status,
+        new_status=item.status.value if hasattr(item.status, "value") else item.status,
+    )
+    await _update_order_status(db, order_id)
+    await db.commit()
+    return {"item_id": item_id, "status": item.status, "final_confirmed_at": None}
+
+
 @router.put("/dealer/orders/{order_id}/items/{item_id}/reset")
 async def reset_item(
     order_id: str, item_id: str,
