@@ -18,12 +18,17 @@ taps Submit — at that point submit_for_approval promotes pending → live
 and stamps `approval_round`. Farmer-facing surfaces read live status
 and see nothing new until the submit.
 
-Backfill: any pre-migration item with `approval_round IS NULL` and
-`status IN ('POSTPONED', 'NOT_AVAILABLE', 'AVAILABLE')` is by definition
-a tentative dealer decision under the new model. Move its status +
-brand/vol/price into the pending columns and reset the live columns to
-PENDING / NULL. Items with `approval_round IS NOT NULL` are already
-committed — leave alone. PENDING items with no tentative are untouched.
+Backfill: ONLY live AVAILABLE items move to the pending columns.
+Under the old model, live AVAILABLE was always pre-submit (submit
+promoted it to SENT_FOR_APPROVAL), so it maps cleanly to the new
+model's "tentative AVAILABLE." Live POSTPONED and NOT_AVAILABLE
+items are LEFT ALONE — under the old model those were committed
+decisions the farmer already sees, and there's no way to distinguish
+committed vs tentative in historical rows (POSTPONED never got
+approval_round; NA didn't until 2026-08-17). Moving those to
+pending would silently un-commit committed decisions, which is
+what happened on staging 2026-08-18 (five orders vanished from
+the Postponed pill after backfill ran).
 """
 from typing import Sequence, Union
 
@@ -47,7 +52,7 @@ def upgrade() -> None:
 
     op.execute("""
         UPDATE order_items SET
-            dealer_pending_status = status,
+            dealer_pending_status = 'AVAILABLE',
             dealer_pending_brand_cosh_id = brand_cosh_id,
             dealer_pending_brand_name = brand_name,
             dealer_pending_given_volume = given_volume,
@@ -60,7 +65,7 @@ def upgrade() -> None:
             volume_unit = NULL,
             price = NULL
         WHERE approval_round IS NULL
-          AND status IN ('POSTPONED', 'NOT_AVAILABLE', 'AVAILABLE')
+          AND status = 'AVAILABLE'
           AND archived_at IS NULL
     """)
 
