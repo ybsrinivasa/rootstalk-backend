@@ -3751,9 +3751,16 @@ async def list_dealer_postponed_items(
             .join(Client, Client.id == Order.client_id)
             .where(
                 Order.id.in_(postponed_order_ids),
+                # 2026-08-18 — Include PENDING too. If dealer resolves a
+                # postpone (POSTPONED → AVAILABLE) then uses Change
+                # Selection (AVAILABLE → PENDING), the item drops back
+                # into "dealer's turn again." Excluding PENDING here
+                # made the item vanish from the Postponed page on
+                # refresh — dealer lost the trail. RT-26-000446 anchor.
                 OrderItem.status.in_((
                     OrderItemStatus.POSTPONED,
                     OrderItemStatus.AVAILABLE,
+                    OrderItemStatus.PENDING,
                 )),
                 OrderItem.archived_at.is_(None),
             )
