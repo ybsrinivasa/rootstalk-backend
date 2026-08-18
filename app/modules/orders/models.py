@@ -173,6 +173,20 @@ class OrderItem(Base):
     # queue cleanly within the same order card: the original batch
     # gets decided first, then the resolved postpone, etc.
     approval_round: Mapped[int] = mapped_column(Integer, nullable=True)
+    # 2026-08-18 — Tentative-until-submit layer. Every dealer action
+    # (Postpone / Mark NA / Set Available with brand+vol+price /
+    # Change Selection) writes ONLY to these pending mirror columns.
+    # Live status/brand/vol/price are untouched until the dealer taps
+    # Submit; submit_for_approval promotes pending → live and stamps
+    # approval_round. Farmer-facing surfaces read live status → they
+    # see nothing until submit. Dealer-facing surfaces prefer pending
+    # over live so the dealer sees their own tentative state.
+    dealer_pending_status: Mapped[str] = mapped_column(String(30), nullable=True)
+    dealer_pending_brand_cosh_id: Mapped[str] = mapped_column(String(200), nullable=True)
+    dealer_pending_brand_name: Mapped[str] = mapped_column(String(500), nullable=True)
+    dealer_pending_given_volume: Mapped[float] = mapped_column(DECIMAL(10, 4), nullable=True)
+    dealer_pending_volume_unit: Mapped[str] = mapped_column(String(50), nullable=True)
+    dealer_pending_price: Mapped[float] = mapped_column(DECIMAL(10, 2), nullable=True)
     # Per-subscription versioning Phase 3.2: pointer to the locked snapshot in
     # force at order-create time. Nullable for backwards compatibility — orders
     # placed before Phase 3.2 have NULL and fall back to master at read time.

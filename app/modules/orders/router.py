@@ -3390,16 +3390,13 @@ async def list_dealer_orders(
 
     # 2026-08-18 — Common-name lookup for POSTPONED items so the
     # Postponed pill card can list "Acetamiprid · Kanemite …" right
-    # on the card. User anchor: dealer with many postponed orders
-    # doesn't want to open each order to see which items are waiting;
-    # supply from a manufacturer might resolve several across orders.
-    # Common name lives on Element rows (element_type='COMMON_NAME',
-    # cosh_ref → CoshCoreItem.translations) — not on the direct
-    # Practice.common_name_cosh_id field (that's used elsewhere).
+    # on the card. Common name lives on Element rows.
+    # Filter on effective status (live is POSTPONED and no tentative
+    # override that has since flipped the item to AVAILABLE/NA).
     postponed_practice_ids: set[str] = set()
     for items in items_by_order.values():
         for i in items:
-            if i.status == OrderItemStatus.POSTPONED and i.practice_id:
+            if _dealer_effective_status(i) == OrderItemStatus.POSTPONED and i.practice_id:
                 postponed_practice_ids.add(i.practice_id)
     postponed_common_name_by_practice: dict[str, str | None] = {}
     if postponed_practice_ids:
@@ -3468,18 +3465,22 @@ async def list_dealer_orders(
         live_items = [i for i in items if i.status != OrderItemStatus.REROUTED]
         if items and not live_items and not include_husks:
             continue
+        # 2026-08-18 — Dealer-facing counts use EFFECTIVE status so
+        # tentative decisions land on the right pill (POSTPONED /
+        # AVAILABLE / NA) as soon as the dealer taps, but never
+        # reach the farmer's view until submit. Live-status counts
+        # (SFA / APPROVED / REJECTED / final_confirmed) are unchanged
+        # since those states only exist post-submit.
+        def _eff(i):
+            return _dealer_effective_status(i)
         counts = {
-            "pending": sum(1 for i in live_items if i.status == OrderItemStatus.PENDING),
-            "available": sum(1 for i in live_items if i.status == OrderItemStatus.AVAILABLE),
-            "postponed": sum(1 for i in live_items if i.status == OrderItemStatus.POSTPONED),
-            "not_available": sum(1 for i in live_items if i.status == OrderItemStatus.NOT_AVAILABLE),
+            "pending": sum(1 for i in live_items if _eff(i) == OrderItemStatus.PENDING),
+            "available": sum(1 for i in live_items if _eff(i) == OrderItemStatus.AVAILABLE),
+            "postponed": sum(1 for i in live_items if _eff(i) == OrderItemStatus.POSTPONED),
+            "not_available": sum(1 for i in live_items if _eff(i) == OrderItemStatus.NOT_AVAILABLE),
             "sent_for_approval": sum(1 for i in live_items if i.status == OrderItemStatus.SENT_FOR_APPROVAL),
             "approved": sum(1 for i in live_items if i.status == OrderItemStatus.APPROVED),
             "rejected": sum(1 for i in live_items if i.status == OrderItemStatus.REJECTED),
-            # 2026-08-14 (Phase 2): APPROVED items split by dealer's
-            # Final Confirmation. Facilitator + dealer PWAs read these
-            # to distinguish "awaiting your Final Confirmation" vs
-            # "ready for pickup".
             "awaiting_final_confirmation": sum(
                 1 for i in live_items
                 if i.status == OrderItemStatus.APPROVED and i.final_confirmed_at is None
@@ -3489,6 +3490,28 @@ async def list_dealer_orders(
                 if i.status == OrderItemStatus.APPROVED and i.final_confirmed_at is not None
             ),
         }
+        # 2026-08-18 — submit_action_type drives the dealer PWA's
+        # bottom action bar. Only considers items in the dealer's
+        # decision phase (live PENDING or POSTPONED). One of:
+        #   SEND_TO_FARMER — ≥1 pending-AVAILABLE + no undecided items
+        #   SUBMIT_RESPONSE — only pending POSTPONED / NA + no undecided
+        #   null — nothing to submit (undecided items OR no tentative)
+        dealer_scope_items = [
+            i for i in live_items
+            if i.status in _DEALER_TENTATIVE_ELIGIBLE_LIVE_STATUSES
+        ]
+        undecided_scope = [
+            i for i in dealer_scope_items
+            if i.status == OrderItemStatus.PENDING and not i.dealer_pending_status
+        ]
+        has_pending_avail = any(
+            i.dealer_pending_status == OrderItemStatus.AVAILABLE.value
+            for i in dealer_scope_items
+        )
+        has_pending_any = any(i.dealer_pending_status for i in dealer_scope_items)
+        submit_action_type: str | None = None
+        if not undecided_scope and has_pending_any:
+            submit_action_type = "SEND_TO_FARMER" if has_pending_avail else "SUBMIT_RESPONSE"
         # 2026-08-17 (per-batch rework) — build one entry per
         # (order, approval_round) with APPROVED items. Each entry
         # carries its own Final-Confirmation state + Pickup state so
@@ -3585,17 +3608,18 @@ async def list_dealer_orders(
             "date_from": o.date_from, "date_to": o.date_to,
             "created_at": o.created_at,
             "item_status_counts": counts,
+            "submit_action_type": submit_action_type,
             # 2026-08-17 — Per-batch Pickup lifecycle. Primary source
             # for the new Final Confirmation + Packing + Pickup pills.
             "packing_batches": packing_batches,
             # 2026-08-18 — Common-input names for POSTPONED items on
-            # this order, ordered by item creation. Dealer scans across
-            # cards to spot supply-match candidates without opening each
-            # order.
+            # this order, ordered by item creation. Filter on EFFECTIVE
+            # status so items the dealer has tentatively resolved
+            # (AVAILABLE / NA) drop off the postponed name list.
             "postponed_item_names": [
                 postponed_common_name_by_practice.get(i.practice_id) or ""
                 for i in sorted(
-                    (it for it in items if it.status == OrderItemStatus.POSTPONED and it.practice_id),
+                    (it for it in items if _dealer_effective_status(it) == OrderItemStatus.POSTPONED and it.practice_id),
                     key=lambda it: it.created_at,
                 )
                 if postponed_common_name_by_practice.get(i.practice_id)
@@ -3718,54 +3742,29 @@ async def list_dealer_postponed_items(
 
     await _assert_active_dealer(db, current_user.id)
 
-    # 2026-08-17 — Two-stage query so an order surfaces on the
-    # Postponed page as long as ANY item on it is either POSTPONED or
-    # AVAILABLE (post-resolve, awaiting Submit). Rationale: dealer
-    # resolves a postpone → item flips to AVAILABLE. If dealer taps
-    # PWA back without submitting, the resolved AVAILABLE item was
-    # silently lost from the Postponed page (only POSTPONED items came
-    # back). Now the card sticks around, showing both remaining
-    # postpones AND the resolved items so the dealer can complete the
-    # journey (Submit) from here.
-    # Step 1: find order ids with at least one POSTPONED item.
-    postponed_order_ids = (await db.execute(
-        select(OrderItem.order_id).where(
-            Order.id == OrderItem.order_id,
-            OrderItem.status == OrderItemStatus.POSTPONED,
-            OrderItem.archived_at.is_(None),
-        ).join(Order, Order.id == OrderItem.order_id).where(
+    # 2026-08-18 — Under the tentative-until-submit model, POSTPONED is
+    # the only committed decision that lands on the Postponed page.
+    # A dealer resolving a postpone → dealer_pending_status=AVAILABLE
+    # (live still POSTPONED). Filter includes those too (effective
+    # status = POSTPONED or AVAILABLE) so a resolved item stays on
+    # the Postponed page as a "ready to submit" card until dealer
+    # taps Submit. Change Selection clears pending → dealer_pending
+    # NULL, live POSTPONED — still shows.
+    rows = (await db.execute(
+        select(OrderItem, Order, AdvPractice, User, Subscription, Client)
+        .join(Order, Order.id == OrderItem.order_id)
+        .join(AdvPractice, AdvPractice.id == OrderItem.practice_id, isouter=True)
+        .join(User, User.id == Order.farmer_user_id)
+        .join(Subscription, Subscription.id == Order.subscription_id)
+        .join(Client, Client.id == Order.client_id)
+        .where(
             Order.dealer_user_id == current_user.id,
             Order.status.notin_([OrderStatus.CANCELLED, OrderStatus.EXPIRED]),
+            OrderItem.status == OrderItemStatus.POSTPONED,
+            OrderItem.archived_at.is_(None),
         )
-    )).scalars().all()
-    postponed_order_ids = list({oid for oid in postponed_order_ids if oid})
-
-    rows = []
-    if postponed_order_ids:
-        rows = (await db.execute(
-            select(OrderItem, Order, AdvPractice, User, Subscription, Client)
-            .join(Order, Order.id == OrderItem.order_id)
-            .join(AdvPractice, AdvPractice.id == OrderItem.practice_id, isouter=True)
-            .join(User, User.id == Order.farmer_user_id)
-            .join(Subscription, Subscription.id == Order.subscription_id)
-            .join(Client, Client.id == Order.client_id)
-            .where(
-                Order.id.in_(postponed_order_ids),
-                # 2026-08-18 — Include PENDING too. If dealer resolves a
-                # postpone (POSTPONED → AVAILABLE) then uses Change
-                # Selection (AVAILABLE → PENDING), the item drops back
-                # into "dealer's turn again." Excluding PENDING here
-                # made the item vanish from the Postponed page on
-                # refresh — dealer lost the trail. RT-26-000446 anchor.
-                OrderItem.status.in_((
-                    OrderItemStatus.POSTPONED,
-                    OrderItemStatus.AVAILABLE,
-                    OrderItemStatus.PENDING,
-                )),
-                OrderItem.archived_at.is_(None),
-            )
-            .order_by(Order.created_at.asc(), OrderItem.postponed_until.asc().nullslast())
-        )).all()
+        .order_by(Order.created_at.asc(), OrderItem.postponed_until.asc().nullslast())
+    )).all()
 
     now_utc = datetime.now(timezone.utc)
     out = []
@@ -3804,10 +3803,12 @@ async def list_dealer_postponed_items(
             "postponed_until": item.postponed_until.isoformat() if item.postponed_until else None,
             "days_remaining": days_remaining,
             "order_status": order.status.value if hasattr(order.status, "value") else order.status,
-            # 2026-08-17 — Item's current status so the PWA can render
-            # resolved (AVAILABLE) items with a "ready to submit" chip
-            # alongside the still-POSTPONED ones.
-            "item_status": item.status.value if hasattr(item.status, "value") else item.status,
+            # 2026-08-18 — Effective status = dealer_pending || live.
+            # Postponed pill lists items whose live is POSTPONED; if
+            # dealer has tentatively resolved to AVAILABLE (or NA)
+            # the effective flips accordingly so the PWA renders a
+            # "ready to submit" chip instead of the postponed one.
+            "item_status": _dealer_effective_status_value(item),
         })
     return out
 
@@ -3852,9 +3853,7 @@ async def mark_item_available(
     await _assert_active_dealer(db, current_user.id)
     await _get_dealer_order(db, order_id, current_user.id)
     item = await _get_order_item(db, item_id, order_id)
-    res = validate_item_transition(item.status, OrderItemStatus.AVAILABLE.value, DEALER)
-    if not res.allowed:
-        _raise_transition(res)
+    _assert_dealer_may_write_tentative(item)
 
     # ── BL-07 strict brand validation ─────────────────────────────────────
     brand_cosh_id = (data.get("brand_cosh_id") or "").strip()
@@ -3895,32 +3894,32 @@ async def mark_item_available(
     # spellings are 100% consistent across the system.
     canonical_name = (brand_row.translations or {}).get("en") or brand_cosh_id
 
-    item.brand_cosh_id = brand_cosh_id
-    item.brand_name = canonical_name
+    # 2026-08-18 — Tentative write. Every dealer decision on brand /
+    # vol / price / status lives in dealer_pending_* until submit.
+    item.dealer_pending_brand_cosh_id = brand_cosh_id
+    item.dealer_pending_brand_name = canonical_name
     if data.get("given_volume") is not None:
-        item.given_volume = data["given_volume"]
-        item.volume_unit = data.get("volume_unit", "")
-    # 2026-06-03 — Distinguish "key absent" from "key present with null":
-    #   - "price" not in payload → leave item.price untouched.
-    #   - "price" present as null → clear item.price (dealer removed a
-    #     previously-entered price; this used to silently no-op).
-    #   - "price" present as a number → overwrite.
+        item.dealer_pending_given_volume = data["given_volume"]
+        item.dealer_pending_volume_unit = data.get("volume_unit", "")
+    # 2026-06-03 semantics preserved: "price" key absent → leave;
+    # key present with null → clear; present number → overwrite.
     if "price" in data:
-        item.price = data["price"]
-    prev_status = item.status.value if hasattr(item.status, "value") else item.status
-    item.status = OrderItemStatus.AVAILABLE
+        item.dealer_pending_price = data["price"]
+    prev_effective = _dealer_effective_status_value(item)
+    item.dealer_pending_status = OrderItemStatus.AVAILABLE.value
     await _record_event(
         db, lineage_id=item.lineage_id,
-        event_type="MARKED_AVAILABLE",
+        event_type="MARKED_AVAILABLE_TENTATIVE",
         actor_user_id=current_user.id, actor_role="DEALER",
         order_id=order_id, order_item_id=item.id,
-        prev_status=prev_status, new_status=OrderItemStatus.AVAILABLE.value,
+        prev_status=prev_effective, new_status=OrderItemStatus.AVAILABLE.value,
         metadata={
             "brand_cosh_id": brand_cosh_id,
             "brand_name": canonical_name,
-            "given_volume": float(item.given_volume) if item.given_volume else None,
-            "volume_unit": item.volume_unit,
-            "price": float(item.price) if item.price else None,
+            "given_volume": float(item.dealer_pending_given_volume) if item.dealer_pending_given_volume else None,
+            "volume_unit": item.dealer_pending_volume_unit,
+            "price": float(item.dealer_pending_price) if item.dealer_pending_price else None,
+            "tentative": True,
         },
     )
 
@@ -3959,13 +3958,12 @@ async def mark_item_available(
                 if (
                     s_coords.part == my_coords.part
                     and s_coords.option != my_coords.option
-                    and sibling.status in (
-                        OrderItemStatus.PENDING,
-                        OrderItemStatus.POSTPONED,
-                    )
+                    and sibling.status in _DEALER_TENTATIVE_ELIGIBLE_LIVE_STATUSES
                 ):
-                    sibling.status = OrderItemStatus.NOT_NEEDED
-                    sibling.postponed_until = None
+                    # Tentative cascade: sibling gets pending NOT_NEEDED.
+                    # Reset on the anchor will clear it.
+                    sibling.dealer_pending_status = OrderItemStatus.NOT_NEEDED.value
+                    _set_dealer_pending(sibling, OrderItemStatus.NOT_NEEDED.value, clear_brand_details=True)
                 # Same Part, same Option (compound AND) -> leave alone, dealer fills these
                 # Different Part -> leave alone, dealer processes that Part separately
         except ValueError:
@@ -3976,15 +3974,11 @@ async def mark_item_available(
                         OrderItem.order_id == order_id,
                         OrderItem.relation_id == item.relation_id,
                         OrderItem.id != item.id,
-                        OrderItem.status.in_((
-                            OrderItemStatus.PENDING,
-                            OrderItemStatus.POSTPONED,
-                        )),
+                        OrderItem.status.in_(list(_DEALER_TENTATIVE_ELIGIBLE_LIVE_STATUSES)),
                     )
                 )
                 for sibling in fb_result.scalars().all():
-                    sibling.status = OrderItemStatus.NOT_NEEDED
-                    sibling.postponed_until = None
+                    _set_dealer_pending(sibling, OrderItemStatus.NOT_NEEDED.value, clear_brand_details=True)
     elif item.relation_id and item.relation_type == "OR":
         # No relation_role at all (legacy data) — preserve original flat OR closure
         fb_result = await db.execute(
@@ -3992,15 +3986,11 @@ async def mark_item_available(
                 OrderItem.order_id == order_id,
                 OrderItem.relation_id == item.relation_id,
                 OrderItem.id != item.id,
-                OrderItem.status.in_((
-                    OrderItemStatus.PENDING,
-                    OrderItemStatus.POSTPONED,
-                )),
+                OrderItem.status.in_(list(_DEALER_TENTATIVE_ELIGIBLE_LIVE_STATUSES)),
             )
         )
         for sibling in fb_result.scalars().all():
-            sibling.status = OrderItemStatus.NOT_NEEDED
-            sibling.postponed_until = None
+            _set_dealer_pending(sibling, OrderItemStatus.NOT_NEEDED.value, clear_brand_details=True)
 
     # Batch 28 — drop the draft entry now that the item is committed.
     # Whole-dict reassignment so SQLAlchemy detects the JSON change.
@@ -4024,7 +4014,7 @@ async def mark_item_available(
     # Pending pill catches the order via the AVAILABLE > 0 predicate.
 
     await db.commit()
-    return {"item_id": item_id, "status": item.status}
+    return {"item_id": item_id, "status": _dealer_effective_status(item)}
 
 
 @router.post("/dealer/orders/{order_id}/relations/{relation_id}/parts/{part_index}/select-option")
@@ -4072,16 +4062,19 @@ async def select_option(
             continue
         if coords.part != part_index:
             continue
+        if item.status not in _DEALER_TENTATIVE_ELIGIBLE_LIVE_STATUSES:
+            continue
+        # Tentative writes only — dealer_pending_status carries the
+        # per-option pick until submit.
         if coords.option == option_index:
-            item.status = OrderItemStatus.AVAILABLE
+            _set_dealer_pending(item, OrderItemStatus.AVAILABLE.value)
             affected["available"] += 1
         else:
-            item.status = OrderItemStatus.NOT_AVAILABLE
+            _set_dealer_pending(item, OrderItemStatus.NOT_AVAILABLE.value, clear_brand_details=True)
             affected["not_available"] += 1
 
     # TODO(FCM): when all options in a Part end up NOT_AVAILABLE, push notification
     # to farmer that this Part of the relation could not be fulfilled.
-    await _update_order_status(db, order_id)
     await db.commit()
     return {"part_index": part_index, "selected_option": option_index, **affected}
 
@@ -4229,33 +4222,26 @@ async def reset_relation_part(
             continue
         if coords.part != part_index:
             continue
-        prev_status = item.status.value if hasattr(item.status, "value") else item.status
-        # 2026-06-29 — Also reset NOT_NEEDED siblings so the OR-Part
-        # change-selection flow unwinds the cascade-set NOT_NEEDED
-        # rows back to PENDING.
-        if prev_status not in ("AVAILABLE", "POSTPONED", "NOT_AVAILABLE", "NOT_NEEDED"):
+        # Tentative model: only items where dealer's live is still
+        # PENDING/POSTPONED can be reset. Their tentative cascade
+        # (AVAILABLE / NOT_AVAILABLE / NOT_NEEDED) lives in
+        # dealer_pending_status — clearing that pending is the reset.
+        if item.status not in _DEALER_TENTATIVE_ELIGIBLE_LIVE_STATUSES:
             continue
-        res = validate_item_transition(item.status, OrderItemStatus.PENDING.value, DEALER)
-        if not res.allowed:
+        prev_effective = _dealer_effective_status_value(item)
+        if not item.dealer_pending_status:
             continue
-        if prev_status == "AVAILABLE":
-            item.brand_cosh_id = None
-            item.brand_name = None
-            item.given_volume = None
-            item.volume_unit = None
-            item.price = None
-        item.status = OrderItemStatus.PENDING
+        _clear_dealer_pending(item)
         await _record_event(
             db, lineage_id=item.lineage_id,
-            event_type="RESET_TO_PENDING",
+            event_type="RESET_TO_PENDING_TENTATIVE",
             actor_user_id=current_user.id, actor_role="DEALER",
             order_id=order_id, order_item_id=item.id,
-            prev_status=prev_status, new_status=OrderItemStatus.PENDING.value,
-            metadata={"relation_id": relation_id, "part_index": part_index},
+            prev_status=prev_effective, new_status=OrderItemStatus.PENDING.value,
+            metadata={"relation_id": relation_id, "part_index": part_index, "tentative": True},
         )
         reset_count += 1
 
-    await _update_order_status(db, order_id)
     await db.commit()
     return {"relation_id": relation_id, "part_index": part_index, "reset": reset_count}
 
@@ -4303,12 +4289,13 @@ async def mark_option_not_available(
         except ValueError:
             continue
         if coords.part == part_index and coords.option == option_index:
-            item.status = OrderItemStatus.NOT_AVAILABLE
+            if item.status not in _DEALER_TENTATIVE_ELIGIBLE_LIVE_STATUSES:
+                continue
+            _set_dealer_pending(item, OrderItemStatus.NOT_AVAILABLE.value, clear_brand_details=True)
             affected += 1
 
     # TODO(FCM): if this closes the last open Option in the Part, push notification
     # to farmer that this Part of the relation could not be fulfilled.
-    await _update_order_status(db, order_id)
     await db.commit()
     return {"part_index": part_index, "option_index": option_index, "not_available": affected}
 
@@ -4429,10 +4416,8 @@ async def postpone_item(
     await _assert_active_dealer(db, current_user.id)
     order = await _get_dealer_order(db, order_id, current_user.id)
     item = await _get_order_item(db, item_id, order_id)
-    res = validate_item_transition(item.status, OrderItemStatus.POSTPONED.value, DEALER)
-    if not res.allowed:
-        _raise_transition(res)
-    prev = item.status.value if hasattr(item.status, "value") else item.status
+    _assert_dealer_may_write_tentative(item)
+    prev_effective = _dealer_effective_status_value(item)
 
     days = data.get("days")
     if days is not None:
@@ -4454,7 +4439,8 @@ async def postpone_item(
         # IST today + days, expressed at IST midnight in UTC.
         ist_today = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).date()
         target = ist_today + _timedelta(days=days)
-        # Convert IST midnight → UTC = target 00:00 IST = target -5h30m UTC
+        # postponed_until is a timestamp not a decision — safe to write
+        # live even in the tentative phase. Submit doesn't touch it.
         item.postponed_until = datetime(
             target.year, target.month, target.day, 0, 0,
             tzinfo=timezone.utc,
@@ -4462,20 +4448,21 @@ async def postpone_item(
     else:
         item.postponed_until = data.get("postponed_until")
 
-    item.status = OrderItemStatus.POSTPONED
+    _set_dealer_pending(item, OrderItemStatus.POSTPONED.value, clear_brand_details=True)
     await _record_event(
         db, lineage_id=item.lineage_id,
-        event_type="MARKED_POSTPONED",
+        event_type="MARKED_POSTPONED_TENTATIVE",
         actor_user_id=current_user.id, actor_role="DEALER",
         order_id=order_id, order_item_id=item.id,
-        prev_status=prev, new_status=OrderItemStatus.POSTPONED.value,
+        prev_status=prev_effective, new_status=OrderItemStatus.POSTPONED.value,
         metadata={
             "postponed_until": item.postponed_until.isoformat() if item.postponed_until else None,
             "days": days,
+            "tentative": True,
         },
     )
     await db.commit()
-    return {"item_id": item_id, "status": item.status, "postponed_until": item.postponed_until}
+    return {"item_id": item_id, "status": _dealer_effective_status(item), "postponed_until": item.postponed_until}
 
 
 @router.put("/dealer/orders/{order_id}/items/{item_id}/not-available")
@@ -4487,21 +4474,19 @@ async def mark_item_unavailable(
     await _assert_active_dealer(db, current_user.id)
     await _get_dealer_order(db, order_id, current_user.id)
     item = await _get_order_item(db, item_id, order_id)
-    res = validate_item_transition(item.status, OrderItemStatus.NOT_AVAILABLE.value, DEALER)
-    if not res.allowed:
-        _raise_transition(res)
-    prev = item.status.value if hasattr(item.status, "value") else item.status
-    item.status = OrderItemStatus.NOT_AVAILABLE
+    _assert_dealer_may_write_tentative(item)
+    prev_effective = _dealer_effective_status_value(item)
+    _set_dealer_pending(item, OrderItemStatus.NOT_AVAILABLE.value, clear_brand_details=True)
     await _record_event(
         db, lineage_id=item.lineage_id,
-        event_type="MARKED_NOT_AVAILABLE",
+        event_type="MARKED_NOT_AVAILABLE_TENTATIVE",
         actor_user_id=current_user.id, actor_role="DEALER",
         order_id=order_id, order_item_id=item.id,
-        prev_status=prev, new_status=OrderItemStatus.NOT_AVAILABLE.value,
+        prev_status=prev_effective, new_status=OrderItemStatus.NOT_AVAILABLE.value,
+        metadata={"tentative": True},
     )
-    await _update_order_status(db, order_id)
     await db.commit()
-    return {"item_id": item_id, "status": item.status}
+    return {"item_id": item_id, "status": _dealer_effective_status(item)}
 
 
 # 2026-08-14 — Final Confirmation endpoints (Phase 2 rework). The
@@ -4675,8 +4660,11 @@ async def reset_item(
             },
         )
     item = await _get_order_item(db, item_id, order_id)
-    prev_status = item.status.value if hasattr(item.status, "value") else item.status
-    if prev_status != "AVAILABLE":
+    _assert_dealer_may_write_tentative(item)
+    prev_effective = _dealer_effective_status_value(item)
+    # Change Selection only makes sense on items the dealer has tentatively
+    # marked AVAILABLE. Fresh PENDING has nothing to reset.
+    if prev_effective != OrderItemStatus.AVAILABLE.value:
         raise HTTPException(
             status_code=409,
             detail={
@@ -4686,9 +4674,6 @@ async def reset_item(
                 ),
             },
         )
-    res = validate_item_transition(item.status, OrderItemStatus.PENDING.value, DEALER)
-    if not res.allowed:
-        _raise_transition(res)
 
     # 2026-07-13 — NPK AND-sibling detection. When the dealer picked an
     # NPK Mixed + Straight combo via /npk-select, the resulting
@@ -4720,18 +4705,20 @@ async def reset_item(
 
     from datetime import datetime as _dt_reset, timezone as _tz_reset
     now_utc = _dt_reset.now(_tz_reset.utc)
+    # NPK siblings are physical rows created by /npk-select; archive
+    # them live (matches current behavior). They're tentative
+    # (dealer_pending_status=AVAILABLE, live status=PENDING) so this
+    # doesn't affect farmer's view.
     for sib in npk_siblings:
         sib.archived_at = now_utc
+        _clear_dealer_pending(sib)
 
-    item.brand_cosh_id = None
-    item.brand_name = None
-    item.given_volume = None
-    item.volume_unit = None
-    item.price = None
-    item.status = OrderItemStatus.PENDING
+    _clear_dealer_pending(item)
     # When this was an NPK anchor, drop the AND stamp so the item
     # reads as a fresh standalone PENDING and the dealer's next tap
-    # opens the NPK form clean.
+    # opens the NPK form clean. relation_* live edits are safe under
+    # tentative — farmer never sees an item until submit stamps
+    # approval_round anyway.
     if npk_siblings:
         item.relation_id = None
         item.relation_type = None
@@ -4739,19 +4726,19 @@ async def reset_item(
 
     await _record_event(
         db, lineage_id=item.lineage_id,
-        event_type="RESET_TO_PENDING",
+        event_type="RESET_TO_PENDING_TENTATIVE",
         actor_user_id=current_user.id, actor_role="DEALER",
         order_id=order_id, order_item_id=item.id,
-        prev_status=prev_status, new_status=OrderItemStatus.PENDING.value,
+        prev_status=prev_effective, new_status=OrderItemStatus.PENDING.value,
         metadata={
             "npk_siblings_archived": [s.id for s in npk_siblings],
-        } if npk_siblings else None,
+            "tentative": True,
+        } if npk_siblings else {"tentative": True},
     )
-    await _update_order_status(db, order_id)
     await db.commit()
     return {
         "item_id": item_id,
-        "status": item.status,
+        "status": _dealer_effective_status(item),
         "npk_siblings_archived": [s.id for s in npk_siblings],
     }
 
@@ -4763,57 +4750,98 @@ async def submit_for_approval(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """BL-14: Sends all AVAILABLE items to farmer for approval."""
+    """BL-14: Commits the dealer's tentative decisions.
+
+    Two-path dispatch on the dealer's effective decisions:
+      • SEND_TO_FARMER: at least one item is effective AVAILABLE.
+        Promotes AVAILABLE → SENT_FOR_APPROVAL, stamps approval_round,
+        transitions order to SENT_FOR_APPROVAL, pushes FCM to farmer.
+      • SUBMIT_RESPONSE: no AVAILABLE items; POSTPONED and/or NA only.
+        Promotes decisions to live, stamps approval_round on NA items,
+        keeps order in PROCESSING. No FCM (nothing to approve).
+
+    Both paths refuse if any active item has no effective decision
+    (live PENDING + no dealer_pending_status). Both promote every
+    dealer_pending_* → live and clear the pending mirror.
+    """
     await _assert_active_dealer(db, current_user.id)
     order = await _get_dealer_order(db, order_id, current_user.id)
-    res = validate_order_transition(order.status, OrderStatus.SENT_FOR_APPROVAL.value, DEALER)
-    if not res.allowed:
-        _raise_transition(res)
-    # 2026-06-03 — Every active item must have a decision before the
-    # dealer can submit. Any PENDING item blocks the submit (the
-    # dealer hasn't decided yet). The submit succeeds if at least one
-    # item is AVAILABLE OR NOT_AVAILABLE — both are signals to the
-    # farmer (available = approve flow, not_available = returned).
-    # All-POSTPONED means nothing for the farmer to act on; the
-    # dealer just stays in PROCESSING.
     all_active = (await db.execute(
         select(OrderItem).where(
             OrderItem.order_id == order_id,
             OrderItem.archived_at.is_(None),
-            OrderItem.status.in_([
-                OrderItemStatus.PENDING,
-                OrderItemStatus.AVAILABLE,
-                OrderItemStatus.POSTPONED,
-                OrderItemStatus.NOT_AVAILABLE,
-            ]),
         )
     )).scalars().all()
-    pending_items = [i for i in all_active if i.status == OrderItemStatus.PENDING]
-    if pending_items:
+    # Consider only items that can still receive a dealer decision — everything
+    # already past the dealer's phase (SFA, APPROVED, NA already submitted,
+    # REJECTED etc.) is out of scope for this submit call.
+    dealer_scope = [
+        i for i in all_active
+        if i.status in _DEALER_TENTATIVE_ELIGIBLE_LIVE_STATUSES
+    ]
+    # An item without a decision = live PENDING AND no dealer_pending_status.
+    # (Live POSTPONED with no dealer_pending is a decision the dealer already
+    # submitted in a prior round; leaving it untouched is a valid stance.)
+    undecided = [
+        i for i in dealer_scope
+        if i.status == OrderItemStatus.PENDING and not i.dealer_pending_status
+    ]
+    if undecided:
         raise HTTPException(
             status_code=400,
             detail={
                 "error_code": "UNDECIDED_ITEMS",
                 "message": (
-                    f"{len(pending_items)} item(s) still need a decision "
+                    f"{len(undecided)} item(s) still need a decision "
                     "(Available / Later / Not available)."
                 ),
-                "pending_count": len(pending_items),
+                "pending_count": len(undecided),
             },
         )
-    available_items = [i for i in all_active if i.status == OrderItemStatus.AVAILABLE]
-    not_available_items = [i for i in all_active if i.status == OrderItemStatus.NOT_AVAILABLE]
-    if not available_items and not not_available_items:
+
+    pending_available = [
+        i for i in dealer_scope
+        if i.dealer_pending_status == OrderItemStatus.AVAILABLE.value
+    ]
+    pending_na = [
+        i for i in dealer_scope
+        if i.dealer_pending_status == OrderItemStatus.NOT_AVAILABLE.value
+    ]
+    pending_postponed = [
+        i for i in dealer_scope
+        if i.dealer_pending_status == OrderItemStatus.POSTPONED.value
+    ]
+    # Nothing tentative to promote? Reject — there's no work to submit.
+    if not (pending_available or pending_na or pending_postponed):
         raise HTTPException(
             status_code=400,
             detail={
-                "error_code": "NOTHING_TO_NOTIFY",
+                "error_code": "NOTHING_TO_SUBMIT",
                 "message": (
-                    "All items are postponed — nothing to send to the farmer yet. "
-                    "Wait for the postponed items, or change some decisions."
+                    "No new decisions to submit. Make a decision on the pending items first."
                 ),
             },
         )
+
+    # Optional last-mile brand/vol/price overrides from the submit
+    # payload — write them into dealer_pending before promotion.
+    volumes = data.get("items", {})
+    for item in pending_available:
+        item_data = volumes.get(item.id, {})
+        if item_data.get("given_volume"):
+            item.dealer_pending_given_volume = item_data["given_volume"]
+            item.dealer_pending_volume_unit = item_data.get("volume_unit", "")
+        if item_data.get("price") is not None:
+            item.dealer_pending_price = item_data["price"]
+        if not item.dealer_pending_given_volume:
+            raise HTTPException(status_code=422, detail=f"given_volume missing for item {item.id}")
+
+    action_type = "SEND_TO_FARMER" if pending_available else "SUBMIT_RESPONSE"
+
+    if action_type == "SEND_TO_FARMER":
+        res = validate_order_transition(order.status, OrderStatus.SENT_FOR_APPROVAL.value, DEALER)
+        if not res.allowed:
+            _raise_transition(res)
 
     # 2026-06-05 — Round number for the queue. First bulk submit on
     # an order gets round 1; subsequent postpone-resolves increment
@@ -4826,81 +4854,85 @@ async def submit_for_approval(
     )).scalars().all()
     next_round = (max(existing_rounds) if existing_rounds else 0) + 1
 
-    volumes = data.get("items", {})
-    for item in available_items:
-        item_data = volumes.get(item.id, {})
-        if item_data.get("given_volume"):
-            item.given_volume = item_data["given_volume"]
-            item.volume_unit = item_data.get("volume_unit", "")
-        if item_data.get("price") is not None:
-            item.price = item_data["price"]
-        if not item.given_volume:
-            raise HTTPException(status_code=422, detail=f"given_volume missing for item {item.id}")
+    # Promote all tentative decisions to live in one pass.
+    for item in pending_available:
+        _promote_dealer_pending_to_live(item)
+        # AVAILABLE items enter the farmer's approval queue as SFA.
         item.status = OrderItemStatus.SENT_FOR_APPROVAL
         item.approval_round = next_round
-    # 2026-08-17 — Stamp approval_round on NOT_AVAILABLE items in this
-    # batch too. Under user's tentative-until-submit principle, a NA
-    # item shouldn't count as "returned" on the farmer's view until the
-    # dealer explicitly submits. Stamping approval_round is the
-    # commit marker the farmer's returned_count filter uses to know
-    # a NA item has crossed from "tentative NA" to "communicated NA".
-    for item in not_available_items:
+    for item in pending_na:
+        _promote_dealer_pending_to_live(item)
+        # NA items get approval_round so the farmer's returned_count
+        # (which gates on approval_round IS NOT NULL) sees them.
         if item.approval_round is None:
             item.approval_round = next_round
+    for item in pending_postponed:
+        _promote_dealer_pending_to_live(item)
+        # POSTPONED items historically do NOT get approval_round — the
+        # dealer hasn't yet given the farmer anything to act on. Kept
+        # for backward compat with farmer's postponed_count read.
 
-    order.status = OrderStatus.SENT_FOR_APPROVAL
+    if action_type == "SEND_TO_FARMER":
+        order.status = OrderStatus.SENT_FOR_APPROVAL
     await db.commit()
 
-    # BL-14: push the farmer first — they're the actor whose
-    # approval is required. If a facilitator is assigned, push them
-    # too as a courtesy nudge. Both branches are skipped silently
-    # if the target hasn't registered an fcm_token yet. 2026-07-16:
-    # farmer branch added; previously only the facilitator was
-    # notified, which meant direct dealer↔farmer orders (no
-    # facilitator on the order) sent no push at all and the farmer
-    # never knew there was something to approve.
-    farmer = (await db.execute(
-        select(User).where(User.id == order.farmer_user_id)
-    )).scalar_one_or_none()
-    if farmer and farmer.fcm_token:
-        try:
-            await send_fcm(
-                token=farmer.fcm_token,
-                title=SUBMIT_FOR_APPROVAL_FARMER_FCM_TITLE,
-                body=_fmt_order_body(SUBMIT_FOR_APPROVAL_FARMER_FCM_BODY_TPL, order),
-                data={
-                    "type": "ORDER_AWAITING_FARMER_APPROVAL",
-                    "order_id": order.id,
-                    "click_action": f"/crop-detail/{order.subscription_id}/orders",
-                },
-            )
-        except Exception as e:
-            _orders_logger.error(
-                f"FCM send raised unexpectedly for farmer {farmer.id}: {e}"
-            )
-    if order.facilitator_user_id:
-        facilitator = (await db.execute(
-            select(User).where(User.id == order.facilitator_user_id)
+    # FCM only for the SEND_TO_FARMER path — a SUBMIT_RESPONSE with
+    # only NA / POSTPONED items surfaces on the farmer's Returned /
+    # Postponed pills naturally on next refresh; no approval action
+    # is pending, so no push nudge is warranted.
+    if action_type == "SEND_TO_FARMER":
+        farmer = (await db.execute(
+            select(User).where(User.id == order.farmer_user_id)
         )).scalar_one_or_none()
-        if facilitator and facilitator.fcm_token:
+        if farmer and farmer.fcm_token:
             try:
                 await send_fcm(
-                    token=facilitator.fcm_token,
-                    title=SUBMIT_FOR_APPROVAL_FACILITATOR_FCM_TITLE,
-                    body=_fmt_order_body(SUBMIT_FOR_APPROVAL_FACILITATOR_FCM_BODY_TPL, order),
+                    token=farmer.fcm_token,
+                    title=SUBMIT_FOR_APPROVAL_FARMER_FCM_TITLE,
+                    body=_fmt_order_body(SUBMIT_FOR_APPROVAL_FARMER_FCM_BODY_TPL, order),
                     data={
                         "type": "ORDER_AWAITING_FARMER_APPROVAL",
                         "order_id": order.id,
-                        "farmer_user_id": order.farmer_user_id,
+                        "click_action": f"/crop-detail/{order.subscription_id}/orders",
                     },
                 )
             except Exception as e:
                 _orders_logger.error(
-                    f"FCM send raised unexpectedly for facilitator "
-                    f"{facilitator.id}: {e}"
+                    f"FCM send raised unexpectedly for farmer {farmer.id}: {e}"
                 )
+        if order.facilitator_user_id:
+            facilitator = (await db.execute(
+                select(User).where(User.id == order.facilitator_user_id)
+            )).scalar_one_or_none()
+            if facilitator and facilitator.fcm_token:
+                try:
+                    await send_fcm(
+                        token=facilitator.fcm_token,
+                        title=SUBMIT_FOR_APPROVAL_FACILITATOR_FCM_TITLE,
+                        body=_fmt_order_body(SUBMIT_FOR_APPROVAL_FACILITATOR_FCM_BODY_TPL, order),
+                        data={
+                            "type": "ORDER_AWAITING_FARMER_APPROVAL",
+                            "order_id": order.id,
+                            "farmer_user_id": order.farmer_user_id,
+                        },
+                    )
+                except Exception as e:
+                    _orders_logger.error(
+                        f"FCM send raised unexpectedly for facilitator "
+                        f"{facilitator.id}: {e}"
+                    )
 
-    return {"order_id": order_id, "status": order.status}
+    return {
+        "order_id": order_id,
+        "status": order.status,
+        "action_type": action_type,
+        "approval_round": next_round,
+        "promoted": {
+            "available": len(pending_available),
+            "not_available": len(pending_na),
+            "postponed": len(pending_postponed),
+        },
+    }
 
 
 @router.put("/dealer/orders/{order_id}/abort")
@@ -6308,18 +6340,26 @@ async def get_dealer_order(
             )
         # Fix 2026-06-01: per-item application window.
         item_df, item_dt = _per_item_dates(i)
+        # 2026-08-18 — Dealer detail renders EFFECTIVE state
+        # (dealer_pending || live) so the dealer's tentative decisions
+        # show as-taken. Live values are only what the farmer sees.
+        eff_brand_cosh_id = _dealer_effective_brand_cosh_id(i)
+        eff_brand_name = _dealer_effective_brand_name(i)
+        eff_given_volume = _dealer_effective_given_volume(i)
+        eff_volume_unit = _dealer_effective_volume_unit(i)
+        eff_price = _dealer_effective_price(i)
         return {
             "id": i.id, "practice_id": i.practice_id,
-            "status": i.status.value if hasattr(i.status, "value") else i.status,
+            "status": _dealer_effective_status_value(i),
             "common_name": common_name,
             "l2_type": l2,
             "display_name": display_name,
-            "brand_cosh_id": i.brand_cosh_id,
-            "brand_name": i.brand_name,
-            "given_volume": float(i.given_volume) if i.given_volume else None,
+            "brand_cosh_id": eff_brand_cosh_id,
+            "brand_name": eff_brand_name,
+            "given_volume": float(eff_given_volume) if eff_given_volume else None,
             "estimated_volume": float(i.estimated_volume) if i.estimated_volume else None,
-            "volume_unit": i.volume_unit,
-            "price": float(i.price) if i.price else None,
+            "volume_unit": eff_volume_unit,
+            "price": float(eff_price) if eff_price else None,
             "relation_id": i.relation_id,
             "relation_type": i.relation_type,
             "relation_role": i.relation_role,
@@ -6672,10 +6712,10 @@ async def get_dealer_order(
             for opt_idx in sorted(parts_data[part_idx].keys()):
                 sorted_items = [it for (_, it) in sorted(parts_data[part_idx][opt_idx], key=lambda x: x[0])]
                 has_locked = any(has_locked_brand_item(it) for it in sorted_items)
-                statuses = [
-                    (it.status.value if hasattr(it.status, "value") else it.status)
-                    for it in sorted_items
-                ]
+                # 2026-08-18 — Option status uses EFFECTIVE per-item status
+                # so tentative picks (dealer_pending_status=AVAILABLE) roll
+                # up correctly on the dealer's card.
+                statuses = [_dealer_effective_status_value(it) for it in sorted_items]
                 if all(s == OrderItemStatus.AVAILABLE.value for s in statuses):
                     option_status = "AVAILABLE"
                 elif all(s == OrderItemStatus.NOT_AVAILABLE.value for s in statuses):
@@ -6773,6 +6813,28 @@ async def get_dealer_order(
         else:
             pkg_picked_up_role = "FARMER"
 
+    # 2026-08-18 — submit_action_type derived from effective state.
+    # Only items in the dealer's decision phase (live PENDING or
+    # POSTPONED) count towards the button decision; items already
+    # past that phase (SFA, APPROVED, NA-submitted, REJECTED) are
+    # excluded via the earlier filter.
+    _dealer_scope = [
+        i for i in items
+        if i.status in _DEALER_TENTATIVE_ELIGIBLE_LIVE_STATUSES
+    ]
+    _undecided_scope = [
+        i for i in _dealer_scope
+        if i.status == OrderItemStatus.PENDING and not i.dealer_pending_status
+    ]
+    _has_pend_avail = any(
+        i.dealer_pending_status == OrderItemStatus.AVAILABLE.value
+        for i in _dealer_scope
+    )
+    _has_pend_any = any(i.dealer_pending_status for i in _dealer_scope)
+    submit_action_type: str | None = None
+    if not _undecided_scope and _has_pend_any:
+        submit_action_type = "SEND_TO_FARMER" if _has_pend_avail else "SUBMIT_RESPONSE"
+
     return {
         "id": order.id, "status": order.status,
         "reference_number": order.reference_number,
@@ -6780,6 +6842,7 @@ async def get_dealer_order(
         "facilitator_user_id": order.facilitator_user_id,
         "date_from": order.date_from, "date_to": order.date_to,
         "created_at": order.created_at,
+        "submit_action_type": submit_action_type,
         # Batch 24 — context the dealer needs to make a call about
         # the order. Hidden from the farmer's view by living on a
         # dealer-side endpoint only.
@@ -8612,10 +8675,12 @@ async def npk_select(
     # duplicate AVAILABLE rows. Farmer/dealer both then see the same
     # brand twice, once in the new AND group and once standalone.
     # Fix: soft-archive any OTHER OrderItem for this practice on this
-    # order that's still in a dealer-editable state (PENDING / AVAILABLE).
-    # Items that have moved past the dealer's hands (SENT_FOR_APPROVAL /
-    # APPROVED / POSTPONED / NOT_AVAILABLE / REJECTED) stay untouched —
-    # re-selection shouldn't rewrite the farmer's decisions.
+    # order that's still in a dealer-editable state. Under the
+    # tentative-until-submit model (2026-08-18), previously-picked
+    # NPK items live at status=PENDING with dealer_pending_status=
+    # AVAILABLE, so the PENDING gate below catches them. Items that
+    # have already been submitted (approval_round set) stay untouched
+    # — re-selection shouldn't rewrite farmer's decisions.
     from datetime import datetime as _dt_orphan, timezone as _tz_orphan
     orphans = (await db.execute(
         select(OrderItem).where(
@@ -8626,14 +8691,22 @@ async def npk_select(
             OrderItem.status.in_(
                 [OrderItemStatus.PENDING, OrderItemStatus.AVAILABLE]
             ),
+            OrderItem.approval_round.is_(None),
         )
     )).scalars().all()
     now_utc = _dt_orphan.now(_tz_orphan.utc)
     for orphan in orphans:
         orphan.archived_at = now_utc
+        _clear_dealer_pending(orphan)
 
     # AND-relation glue. The synthesised relation_id ties all picks
     # together; per spec §3.2 it's automatic — no expert involvement.
+    # 2026-08-18 — Tentative-until-submit: every NPK pick goes into
+    # dealer_pending_* on the target item. Live status stays PENDING
+    # for both the reused item and the freshly-spawned siblings until
+    # the dealer taps Submit. relation_* live fields are still set
+    # (they're structural markers, not decisions).
+    _assert_dealer_may_write_tentative(item)
     relation_id = str(_uuid_npk.uuid4())
     created_items: list[str] = []
     for i, (cn_id, tn_id, kg_total, kg_per_app, price_val) in enumerate(picks):
@@ -8644,30 +8717,26 @@ async def npk_select(
             practice_id=item.practice_id,
             timeline_id=item.timeline_id,
         )
-        target_item.brand_cosh_id = tn_id
-        # The brand_name field carries the EN trade name; resolve quickly
-        # from the cores table so the dealer order detail renders it.
+        # Brand + volume + price go to dealer_pending_* — tentative.
+        target_item.dealer_pending_brand_cosh_id = tn_id
         tn_core = (await db.execute(
             select(_NPKCoshCoreItem).where(_NPKCoshCoreItem.cosh_id == tn_id)
         )).scalar_one_or_none()
         if tn_core is not None:
-            target_item.brand_name = (tn_core.translations or {}).get("en") or tn_id
-        # given_volume = total across the timeline (dealer procures);
-        # estimated_volume = per-application dose (farmer applies each
-        # scheduled day). For chemical NPK both collapse to the same
-        # value because the multiplier is 1.
-        target_item.given_volume = kg_total
+            target_item.dealer_pending_brand_name = (tn_core.translations or {}).get("en") or tn_id
+        target_item.dealer_pending_given_volume = kg_total
+        target_item.dealer_pending_price = price_val
+        target_item.dealer_pending_volume_unit = "kg"
+        target_item.dealer_pending_status = OrderItemStatus.AVAILABLE.value
+        # estimated_volume is a farmer-facing derived value (per-app
+        # dose for advisory). Only committed on submit — store on
+        # dealer_pending would require a mirror column, so keep the
+        # per-app dose on the live column with the understanding that
+        # it's the RECOMMENDED dose regardless of tentative brand.
         target_item.estimated_volume = kg_per_app
-        # 2026-07-13 — Dealer-entered price flows through from the NPK
-        # form. Optional; NULL when not entered (dealer can fill via
-        # Edit Details later).
-        target_item.price = price_val
-        # NPK quantities are kg of product per spec §1.1; pin the unit.
-        target_item.volume_unit = "kg"
-        target_item.status = OrderItemStatus.AVAILABLE
+        # relation_* stamps are structural, not decisions; safe live.
         target_item.relation_id = relation_id
         target_item.relation_type = "AND"
-        # All picks in a single Part/Option (compound AND), positions 1..N.
         target_item.relation_role = f"PART_1__OPT_1__POS_{i + 1}"
         if i > 0:
             db.add(target_item)
@@ -8676,7 +8745,7 @@ async def npk_select(
 
         await _record_event(
             db, lineage_id=target_item.lineage_id,
-            event_type="MARKED_AVAILABLE",
+            event_type="MARKED_AVAILABLE_TENTATIVE",
             actor_user_id=current_user.id, actor_role="DEALER",
             order_id=order_id, order_item_id=target_item.id,
             prev_status=OrderItemStatus.PENDING.value,
@@ -8689,6 +8758,7 @@ async def npk_select(
                 "price": price_val,
                 "volume_unit": "kg",
                 "npk_relation_id": relation_id,
+                "tentative": True,
             },
         )
 
@@ -11476,6 +11546,146 @@ _ORDER_ITEM_ACTIVE_STATUSES = {
     OrderItemStatus.POSTPONED,
     OrderItemStatus.SENT_FOR_APPROVAL,
 }
+
+
+# 2026-08-18 — Tentative-until-submit helpers. Dealer-facing surfaces
+# read the "effective" state which is the pending mirror if set, else
+# the live column. Dealer mutations only write to pending; submit
+# promotes pending → live and stamps approval_round.
+#
+# Live statuses on which the dealer can layer a tentative decision:
+# PENDING (fresh item) and POSTPONED (item already went through a
+# submit round and dealer is now resolving it). AVAILABLE / SFA /
+# APPROVED / NA / REJECTED etc. all mean "already committed and it's
+# not the dealer's turn" — the guard below rejects tentative writes.
+
+_DEALER_TENTATIVE_ELIGIBLE_LIVE_STATUSES = {
+    OrderItemStatus.PENDING,
+    OrderItemStatus.POSTPONED,
+}
+
+
+def _dealer_effective_status(item: OrderItem):
+    """Return dealer_pending_status (as OrderItemStatus enum) if set,
+    else the live status. Dealer-facing surfaces render this."""
+    raw = item.dealer_pending_status
+    if raw:
+        try:
+            return OrderItemStatus(raw)
+        except Exception:
+            return item.status
+    return item.status
+
+
+def _dealer_effective_status_value(item: OrderItem) -> str:
+    v = _dealer_effective_status(item)
+    return v.value if hasattr(v, "value") else str(v)
+
+
+def _dealer_effective_brand_cosh_id(item: OrderItem):
+    return item.dealer_pending_brand_cosh_id if item.dealer_pending_status else item.brand_cosh_id
+
+
+def _dealer_effective_brand_name(item: OrderItem):
+    return item.dealer_pending_brand_name if item.dealer_pending_status else item.brand_name
+
+
+def _dealer_effective_given_volume(item: OrderItem):
+    return item.dealer_pending_given_volume if item.dealer_pending_status else item.given_volume
+
+
+def _dealer_effective_volume_unit(item: OrderItem):
+    return item.dealer_pending_volume_unit if item.dealer_pending_status else item.volume_unit
+
+
+def _dealer_effective_price(item: OrderItem):
+    return item.dealer_pending_price if item.dealer_pending_status else item.price
+
+
+def _assert_dealer_may_write_tentative(item: OrderItem) -> None:
+    """Guard for tentative writes. Live status must be PENDING or
+    POSTPONED — otherwise the item has already been committed past
+    the dealer's decision phase (SFA, APPROVED, NA, REJECTED, etc.)
+    and any dealer tap is a no-op."""
+    if item.status not in _DEALER_TENTATIVE_ELIGIBLE_LIVE_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_code": "ITEM_PAST_DEALER_PHASE",
+                "message": (
+                    "This item has already moved past the dealer's "
+                    "decision phase and cannot be modified."
+                ),
+            },
+        )
+
+
+def _set_dealer_pending(
+    item: OrderItem,
+    status_value: str,
+    brand_cosh_id=None,
+    brand_name=None,
+    given_volume=None,
+    volume_unit=None,
+    price=None,
+    clear_brand_details: bool = False,
+) -> None:
+    """Write a tentative decision to the dealer_pending_* columns.
+    Never touches live status/brand/vol/price. Pass clear_brand_details
+    for non-AVAILABLE statuses so leftover pending brand from an earlier
+    AVAILABLE tap doesn't linger.
+    """
+    item.dealer_pending_status = status_value
+    if clear_brand_details:
+        item.dealer_pending_brand_cosh_id = None
+        item.dealer_pending_brand_name = None
+        item.dealer_pending_given_volume = None
+        item.dealer_pending_volume_unit = None
+        item.dealer_pending_price = None
+        return
+    if brand_cosh_id is not None:
+        item.dealer_pending_brand_cosh_id = brand_cosh_id
+    if brand_name is not None:
+        item.dealer_pending_brand_name = brand_name
+    if given_volume is not None:
+        item.dealer_pending_given_volume = given_volume
+    if volume_unit is not None:
+        item.dealer_pending_volume_unit = volume_unit
+    if price is not None:
+        item.dealer_pending_price = price
+
+
+def _clear_dealer_pending(item: OrderItem) -> None:
+    """Wipe the tentative decision entirely. Used by Change Selection /
+    reset flows. Live status/brand/vol/price stay as-is."""
+    item.dealer_pending_status = None
+    item.dealer_pending_brand_cosh_id = None
+    item.dealer_pending_brand_name = None
+    item.dealer_pending_given_volume = None
+    item.dealer_pending_volume_unit = None
+    item.dealer_pending_price = None
+
+
+def _promote_dealer_pending_to_live(item: OrderItem) -> bool:
+    """Copy dealer_pending_* → live columns. Returns True if any promotion
+    happened (i.e. dealer_pending_status was set). Clears pending after.
+    Caller stamps approval_round separately."""
+    if not item.dealer_pending_status:
+        return False
+    try:
+        item.status = OrderItemStatus(item.dealer_pending_status)
+    except Exception:
+        item.status = item.dealer_pending_status  # str fallback
+    # Brand details only carry over when the tentative status was
+    # AVAILABLE — for POSTPONED / NA there's no brand to promote.
+    if item.dealer_pending_status == OrderItemStatus.AVAILABLE.value:
+        item.brand_cosh_id = item.dealer_pending_brand_cosh_id
+        item.brand_name = item.dealer_pending_brand_name
+        item.given_volume = item.dealer_pending_given_volume
+        item.volume_unit = item.dealer_pending_volume_unit
+        item.price = item.dealer_pending_price
+    _clear_dealer_pending(item)
+    return True
 
 
 async def _update_order_status(db: AsyncSession, order_id: str):
