@@ -11948,7 +11948,18 @@ async def _update_order_status(db: AsyncSession, order_id: str):
     approved = [i for i in items if i.status == OrderItemStatus.APPROVED]
     active = [i for i in items if i.status in _ORDER_ITEM_ACTIVE_STATUSES]
     order = (await db.execute(select(Order).where(Order.id == order_id))).scalar_one()
-    if len(approved) == len(approval_items) and len(approved) > 0:
+    # 2026-08-19 — Additional gate: don't flip to COMPLETED while any
+    # PENDING / AVAILABLE / POSTPONED / SFA items are still in play.
+    # Previously the check considered only the approval-pipeline items
+    # (SFA / APPROVED), so an order with (say) 2 APPROVED + 1 POSTPONED
+    # would flip COMPLETED even though the dealer is still following up
+    # on the postponed item — which then blocked the farmer's Cancel
+    # button (the cancel-eligibility gate refuses on COMPLETED).
+    if (
+        len(approved) == len(approval_items)
+        and len(approved) > 0
+        and len(active) == 0
+    ):
         order.status = OrderStatus.COMPLETED
     elif len(approved) > 0:
         order.status = OrderStatus.PARTIALLY_APPROVED
