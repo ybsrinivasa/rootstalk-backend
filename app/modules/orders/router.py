@@ -6522,6 +6522,7 @@ async def get_dealer_order(
     """
     await _assert_active_dealer(db, current_user.id)
     from app.services.relations import decode_role
+    from app.modules.clients.models import Client
 
     order = (await db.execute(
         select(Order).where(Order.id == order_id, Order.dealer_user_id == current_user.id)
@@ -7081,6 +7082,11 @@ async def get_dealer_order(
     if not _undecided_scope and _has_pend_any:
         submit_action_type = "SEND_TO_FARMER" if _has_pend_avail else "SUBMIT_RESPONSE"
 
+    # 2026-08-19 — Training marker so the detail page can render the
+    # same "This is a Training Order" banner the list page shows.
+    _client_row = (await db.execute(
+        select(Client.is_training).where(Client.id == order.client_id)
+    )).scalar_one_or_none()
     return {
         "id": order.id, "status": order.status,
         "reference_number": order.reference_number,
@@ -7089,6 +7095,7 @@ async def get_dealer_order(
         "date_from": order.date_from, "date_to": order.date_to,
         "created_at": order.created_at,
         "submit_action_type": submit_action_type,
+        "client_is_training": bool(_client_row),
         # Batch 24 — context the dealer needs to make a call about
         # the order. Hidden from the farmer's view by living on a
         # dealer-side endpoint only.
