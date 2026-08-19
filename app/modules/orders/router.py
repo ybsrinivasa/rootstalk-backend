@@ -3540,6 +3540,23 @@ async def list_dealer_orders(
                     batch_pickup_name = facilitator.get("name")
             awaiting_fc = sum(1 for i in batch_items if i.final_confirmed_at is None)
             final_confirmed = sum(1 for i in batch_items if i.final_confirmed_at is not None)
+            # 2026-08-19 — Tentative FC rollup so the packing card's
+            # Submit button can gate/label off a single field.
+            tentative_confirm = sum(
+                1 for i in batch_items
+                if i.final_confirmed_at is None
+                and i.dealer_pending_final_confirmation == "CONFIRM"
+            )
+            tentative_cancel = sum(
+                1 for i in batch_items
+                if i.final_confirmed_at is None
+                and i.dealer_pending_final_confirmation == "CANCEL"
+            )
+            fc_undecided = sum(
+                1 for i in batch_items
+                if i.final_confirmed_at is None
+                and i.dealer_pending_final_confirmation not in ("CONFIRM", "CANCEL")
+            )
             packing_batches.append({
                 "approval_round": round_n,
                 "packing_list_id": pl_row.id if pl_row else None,
@@ -3565,6 +3582,16 @@ async def list_dealer_orders(
                 "awaiting_final_confirmation": awaiting_fc,
                 "final_confirmed": final_confirmed,
                 "all_final_confirmed": awaiting_fc == 0 and final_confirmed > 0,
+                # 2026-08-19 — Tentative FC rollup so the dealer's
+                # packing card renders decision markers + gates the
+                # Submit button without recomputing from items[].
+                "fc_tentative_confirm": tentative_confirm,
+                "fc_tentative_cancel": tentative_cancel,
+                "fc_undecided": fc_undecided,
+                "fc_submit_ready": (
+                    fc_undecided == 0
+                    and (tentative_confirm + tentative_cancel) > 0
+                ),
                 "items": [
                     {
                         "id": i.id,
@@ -3580,6 +3607,10 @@ async def list_dealer_orders(
                             i.final_confirmed_at.isoformat()
                             if i.final_confirmed_at else None
                         ),
+                        # 2026-08-19 — Tentative FC decision (CONFIRM / CANCEL / null)
+                        # so the packing card can render "Marked for FC" /
+                        # "Marked to Cancel" states before batch Submit.
+                        "dealer_pending_final_confirmation": i.dealer_pending_final_confirmation,
                     }
                     for i in batch_items
                 ],
@@ -4680,6 +4711,161 @@ async def undo_final_confirm_item(
     await _update_order_status(db, order_id)
     await db.commit()
     return {"item_id": item_id, "status": item.status, "final_confirmed_at": None}
+
+
+@router.put("/dealer/orders/{order_id}/items/{item_id}/set-fc-pending")
+async def set_fc_pending(
+    order_id: str, item_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Tentative-until-submit for Final Confirmation.
+
+    Body: { "decision": "CONFIRM" | "CANCEL" | null }
+      - "CONFIRM": dealer intends to Final Confirm this item at Submit
+      - "CANCEL":  dealer intends to release this item to NA at Submit
+      - null:       clear the tentative decision
+
+    Only accepts items that are currently APPROVED and not yet
+    Final-Confirmed. Writes to dealer_pending_final_confirmation;
+    live status + final_confirmed_at stay untouched until the dealer
+    taps final-confirm-submit at the batch level.
+    """
+    await _assert_active_dealer(db, current_user.id)
+    await _get_dealer_order(db, order_id, current_user.id)
+    item = await _get_order_item(db, item_id, order_id)
+    if item.status != OrderItemStatus.APPROVED:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "not_approved",
+                "message": "Tentative Final Confirmation is only available on APPROVED items.",
+            },
+        )
+    if item.final_confirmed_at is not None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "already_final_confirmed",
+                "message": "This item has already been Final Confirmed. Use Undo instead.",
+            },
+        )
+    decision = data.get("decision")
+    if decision not in (None, "CONFIRM", "CANCEL"):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_decision",
+                "message": "decision must be 'CONFIRM', 'CANCEL', or null.",
+            },
+        )
+    prev_pending = item.dealer_pending_final_confirmation
+    item.dealer_pending_final_confirmation = decision
+    await _record_event(
+        db, lineage_id=item.lineage_id,
+        event_type="SET_FC_PENDING",
+        actor_user_id=current_user.id, actor_role="DEALER",
+        order_id=order_id, order_item_id=item.id,
+        prev_status=item.status.value if hasattr(item.status, "value") else item.status,
+        new_status=item.status.value if hasattr(item.status, "value") else item.status,
+        metadata={"prev_pending": prev_pending, "new_pending": decision, "tentative": True},
+    )
+    await db.commit()
+    return {"item_id": item_id, "dealer_pending_final_confirmation": decision}
+
+
+@router.put("/dealer/orders/{order_id}/final-confirm-submit")
+async def final_confirm_submit(
+    order_id: str,
+    approval_round: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Batch commit for tentative Final Confirmation decisions.
+
+    Scoped to a specific approval_round (a "batch"). Every APPROVED-
+    not-yet-Final-Confirmed item in that batch must carry a tentative
+    decision ('CONFIRM' or 'CANCEL') before this fires — same gate as
+    the order-level Submit-for-Approval (undecided items block).
+
+    Promotion:
+      - CONFIRM: stamps final_confirmed_at (item enters pickup lifecycle)
+      - CANCEL:  flips item.status to NOT_AVAILABLE (returned to farmer)
+    Clears dealer_pending_final_confirmation on every promoted item.
+    """
+    from datetime import datetime as _dt_fc, timezone as _tz_fc
+    await _assert_active_dealer(db, current_user.id)
+    await _get_dealer_order(db, order_id, current_user.id)
+    batch_items = (await db.execute(
+        select(OrderItem).where(
+            OrderItem.order_id == order_id,
+            OrderItem.approval_round == approval_round,
+            OrderItem.status == OrderItemStatus.APPROVED,
+            OrderItem.final_confirmed_at.is_(None),
+            OrderItem.archived_at.is_(None),
+        )
+    )).scalars().all()
+    if not batch_items:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "nothing_to_submit",
+                "message": "No items awaiting Final Confirmation in this batch.",
+            },
+        )
+    undecided = [
+        i for i in batch_items
+        if i.dealer_pending_final_confirmation not in ("CONFIRM", "CANCEL")
+    ]
+    if undecided:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "undecided_items",
+                "message": (
+                    f"{len(undecided)} item(s) still need a decision "
+                    "(Final Confirm or Cancel) before you can submit."
+                ),
+                "pending_count": len(undecided),
+            },
+        )
+    now_utc = _dt_fc.now(_tz_fc.utc)
+    confirmed = 0
+    cancelled = 0
+    for it in batch_items:
+        decision = it.dealer_pending_final_confirmation
+        prev_status = it.status.value if hasattr(it.status, "value") else it.status
+        if decision == "CONFIRM":
+            it.final_confirmed_at = now_utc
+            new_status = prev_status  # stays APPROVED
+            evt = "FINAL_CONFIRMED"
+            confirmed += 1
+        else:  # CANCEL
+            res = validate_item_transition(it.status, OrderItemStatus.NOT_AVAILABLE.value, DEALER)
+            if not res.allowed:
+                _raise_transition(res)
+            it.status = OrderItemStatus.NOT_AVAILABLE
+            new_status = OrderItemStatus.NOT_AVAILABLE.value
+            evt = "CANCEL_FINAL_CONFIRM"
+            cancelled += 1
+        it.dealer_pending_final_confirmation = None
+        await _record_event(
+            db, lineage_id=it.lineage_id,
+            event_type=evt,
+            actor_user_id=current_user.id, actor_role="DEALER",
+            order_id=order_id, order_item_id=it.id,
+            prev_status=prev_status, new_status=new_status,
+            metadata={"approval_round": approval_round, "via": "batch_submit"},
+        )
+    await _update_order_status(db, order_id)
+    await db.commit()
+    return {
+        "order_id": order_id,
+        "approval_round": approval_round,
+        "confirmed": confirmed,
+        "cancelled": cancelled,
+    }
 
 
 @router.put("/dealer/orders/{order_id}/items/{item_id}/reset")

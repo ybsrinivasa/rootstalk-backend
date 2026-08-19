@@ -187,6 +187,12 @@ class OrderItem(Base):
     dealer_pending_given_volume: Mapped[float] = mapped_column(DECIMAL(10, 4), nullable=True)
     dealer_pending_volume_unit: Mapped[str] = mapped_column(String(50), nullable=True)
     dealer_pending_price: Mapped[float] = mapped_column(DECIMAL(10, 2), nullable=True)
+    # 2026-08-19 — Tentative-until-submit layer for Final Confirmation.
+    # Per-item taps on the Packing card set 'CONFIRM' or 'CANCEL' here;
+    # live final_confirmed_at / status only move at the batch-level
+    # Submit. Same rhythm as dealer_pending_status for the earlier
+    # order-decision layer. NULL = no tentative FC decision yet.
+    dealer_pending_final_confirmation: Mapped[str] = mapped_column(String(10), nullable=True)
     # Per-subscription versioning Phase 3.2: pointer to the locked snapshot in
     # force at order-create time. Nullable for backwards compatibility — orders
     # placed before Phase 3.2 have NULL and fall back to master at read time.
