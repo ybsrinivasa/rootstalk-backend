@@ -223,8 +223,7 @@ async def _hydrate_training_dealer_info(
     read that follows will pick it up. None when no dealer is set."""
     if not dealer_user_id:
         return None
-    from app.modules.auth.models import User
-    from app.modules.clients.models import DealerProfile
+    from app.modules.orders.models import DealerProfile
     user_row = (await db.execute(
         select(User.id, User.name, User.phone).where(User.id == dealer_user_id)
     )).one_or_none()
