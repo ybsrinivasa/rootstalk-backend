@@ -197,8 +197,8 @@ def _serialise_training(child: Client) -> dict:
     """Response shape shared across start / current. Session-role
     slots (`training_expert_user_id`, `training_dealer_user_id`) are
     returned as ids only here; the CA-portal panel resolves names in
-    a separate fetch to keep this helper cheap + free of the User
-    join."""
+    a separate fetch (Expert dropdown for expert; `_hydrate_training_dealer_info`
+    for dealer, since the dealer is entered by phone with no dropdown)."""
     return {
         "id": child.id,
         "parent_client_id": child.parent_client_id,
@@ -210,6 +210,36 @@ def _serialise_training(child: Client) -> dict:
         "training_status": child.training_status,
         "training_expert_user_id": child.training_expert_user_id,
         "training_dealer_user_id": child.training_dealer_user_id,
+    }
+
+
+async def _hydrate_training_dealer_info(
+    db: AsyncSession, dealer_user_id: str | None,
+) -> dict | None:
+    """Fetch the assigned training dealer's display info so the CA
+    portal panel can show name + phone + shop instead of an opaque
+    "Assigned" placeholder. Called by the session-read endpoints
+    only (start / current); the write endpoints don't need it — the
+    read that follows will pick it up. None when no dealer is set."""
+    if not dealer_user_id:
+        return None
+    from app.modules.auth.models import User
+    from app.modules.clients.models import DealerProfile
+    user_row = (await db.execute(
+        select(User.id, User.name, User.phone).where(User.id == dealer_user_id)
+    )).one_or_none()
+    if not user_row:
+        return None
+    profile_row = (await db.execute(
+        select(DealerProfile.shop_name, DealerProfile.shop_address)
+        .where(DealerProfile.user_id == dealer_user_id)
+    )).one_or_none()
+    return {
+        "user_id": user_row.id,
+        "name": user_row.name,
+        "phone": user_row.phone,
+        "shop_name": profile_row.shop_name if profile_row else None,
+        "shop_address": profile_row.shop_address if profile_row else None,
     }
 
 
@@ -388,6 +418,14 @@ async def get_current_training_session(
         return {}
     out = _serialise_training(child)
     out["counts"] = await _training_counts(db, child.id)
+    # 2026-08-19 — Hydrate training dealer info (name + phone + shop)
+    # so the CA panel can render more than an opaque "Assigned" badge.
+    # Expert already resolves via the /onboarded-experts dropdown; the
+    # dealer has no such dropdown (entered by phone), so surface it
+    # here on the session read.
+    out["training_dealer_info"] = await _hydrate_training_dealer_info(
+        db, child.training_dealer_user_id,
+    )
     return out
 
 
