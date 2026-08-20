@@ -5120,6 +5120,15 @@ async def submit_for_approval(
 
     if action_type == "SEND_TO_FARMER":
         order.status = OrderStatus.SENT_FOR_APPROVAL
+    # 2026-08-20 — Re-derive order status after promoting tentative
+    # decisions. SUBMIT_RESPONSE landing on an order that already had
+    # APPROVED items from a prior round can push it to COMPLETED
+    # (nothing active left, all approval_items are approved). Without
+    # this call the order stayed in PROCESSING / PARTIALLY_APPROVED
+    # forever — dashboard pending-orders tile kept counting it while
+    # every pill inside showed 0. Anchor: RT-26-000002 on prod
+    # 2026-08-20.
+    await _update_order_status(db, order_id)
     await db.commit()
 
     # FCM only for the SEND_TO_FARMER path — a SUBMIT_RESPONSE with
