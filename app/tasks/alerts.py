@@ -397,6 +397,92 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
         )
 
 
+async def send_start_date_alert_now(db, subscription_id: str) -> int:
+    """Fire the START_DATE alert synchronously for one subscription.
+
+    Called from the promoter-assignment endpoint so the farmer +
+    promoter get the "please set your sowing date" nudge immediately
+    rather than waiting for the next 11:30 IST batch. The daily task
+    skips PENDING_FARMER_APPROVAL subs entirely — without this
+    synchronous fire the recipients would hear nothing until after
+    the farmer accepts.
+
+    No-op if the subscription already has crop_start_date, or if a
+    START_DATE alert has already been recorded for today. Does NOT
+    commit — the caller is expected to commit as part of its own
+    transaction. Returns the number of Alert rows written.
+    """
+    from datetime import timedelta as _td
+    IST_OFFSET = _td(hours=5, minutes=30)
+    today = (datetime.now(timezone.utc) + IST_OFFSET).date()
+
+    sub = (await db.execute(
+        select(Subscription).where(Subscription.id == subscription_id)
+    )).scalar_one_or_none()
+    if sub is None:
+        return 0
+    if sub.crop_start_date is not None:
+        return 0
+
+    pkg = (await db.execute(
+        select(Package).where(Package.id == sub.package_id)
+    )).scalar_one_or_none()
+    if pkg is None:
+        return 0
+
+    from app.modules.sync.models import CoshCoreItem
+    from app.services.i18n_cosh import pick_translation
+    crop_core = (await db.execute(
+        select(CoshCoreItem).where(CoshCoreItem.cosh_id == pkg.crop_cosh_id)
+    )).scalar_one_or_none() if pkg.crop_cosh_id else None
+    crop_translations = (crop_core.translations or {}) if crop_core else {}
+
+    sub_view = SubscriptionView(
+        subscription_id=sub.id,
+        subscription_type=sub.subscription_type.value if hasattr(sub.subscription_type, "value") else str(sub.subscription_type),
+        farmer_user_id=sub.farmer_user_id,
+        promoter_user_id=sub.promoter_user_id,
+        crop_start_date=None,
+        extra_alert_user_id=sub.extra_alert_user_id,
+        alerts_extra_disabled=sub.alerts_extra_disabled,
+    )
+    recipients = resolve_alert_recipients(sub_view)
+    if not recipients:
+        return 0
+
+    sd_sent_today = await _alert_sent_today(db, sub.id, AlertType.START_DATE, today)
+    if not should_send_start_date_alert(sub_view, sent_today=sd_sent_today):
+        return 0
+
+    user_ids = [r.user_id for r in recipients]
+    users = (await db.execute(
+        select(User).where(User.id.in_(user_ids))
+    )).scalars().all()
+    user_by_id = {u.id: u for u in users}
+
+    await _supersede_prior_sent(db, sub.id, AlertType.START_DATE)
+    written = 0
+    for recipient in recipients:
+        user = user_by_id.get(recipient.user_id)
+        if not user:
+            continue
+        crop_loc = pick_translation(
+            crop_translations, user.language_code or "en", "crop",
+        )
+        sms = START_DATE_ALERT_SMS.format(
+            name=user.name or "Farmer", crop=crop_loc,
+        )
+        fcm_body = START_DATE_ALERT_FCM_BODY.format(crop=crop_loc)
+        await _send_to_recipient(
+            db, sub.id, AlertType.START_DATE, recipient, user,
+            sms_body=sms,
+            fcm_title=START_DATE_ALERT_FCM_TITLE,
+            fcm_body=fcm_body,
+        )
+        written += 1
+    return written
+
+
 async def _run_daily_alerts_with_session(db, today: date | None = None) -> int:
     """Inner loop: takes a session, processes every ACTIVE subscription,
     commits. Split out so integration tests can inject the testcontainer

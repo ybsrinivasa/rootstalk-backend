@@ -2172,6 +2172,23 @@ async def initiate_assignment(
     db.add(assignment)
     await db.commit()
 
+    # 2026-08-21 — fire the START_DATE alert to farmer + promoter
+    # right now, so the assigning promoter (and the farmer) hear
+    # about the sub inside the same evening. The daily-alerts task
+    # skips PENDING_FARMER_APPROVAL subs entirely, so without this
+    # nothing would land until the farmer accepts and the next
+    # 11:30 IST batch runs. Best-effort — alert failures must not
+    # roll back the assignment.
+    try:
+        from app.tasks.alerts import send_start_date_alert_now
+        await send_start_date_alert_now(db, sub.id)
+        await db.commit()
+    except Exception as _e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            f"Synchronous START_DATE alert failed for sub {sub.id}: {_e}"
+        )
+
     # 2026-05-31 — notify the farmer that a Promoter has assigned a
     # package and is awaiting their approval. Without this, the
     # farmer only finds out by chance the next time they open the
