@@ -1935,6 +1935,201 @@ async def discard_returned_items(
     }
 
 
+# ── Payment (UPI v1, 2026-08-21) ─────────────────────────────────────────────
+#
+# Per-batch payment lifecycle. Runs in parallel to the pickup lifecycle —
+# payment can happen any time after the batch is APPROVED (before or after
+# dealer's Final Confirmation, before or after the physical pickup). One
+# BatchPayment row per (order_id, approval_round).
+#
+# Status machine (v1):
+#   PENDING → FARMER_MARKED_PAID → DEALER_CONFIRMED
+#
+# UPI mode uses an intent deep link — no payment gateway integration in v1.
+# Farmer taps a URL like `upi://pay?pa=<vpa>&pn=<name>&am=<amt>&tn=<ref>`
+# which opens their default UPI app pre-filled. Farmer marks paid + optional
+# txn_ref; dealer independently verifies in their own UPI app and confirms.
+
+
+def _upi_intent_url(vpa: str, name: str | None, amount: float, tn: str) -> str:
+    """Build a UPI intent deep link. RFC-style URL that every UPI app on
+    Android opens natively. iOS mostly works with major apps.
+    Amount is rounded to 2 decimals per UPI spec.
+    """
+    from urllib.parse import quote
+    parts = [f"pa={quote(vpa)}"]
+    if name:
+        parts.append(f"pn={quote(name)}")
+    parts.append(f"am={amount:.2f}")
+    parts.append(f"cu=INR")
+    parts.append(f"tn={quote(tn)}")
+    return "upi://pay?" + "&".join(parts)
+
+
+async def _batch_amount(db: AsyncSession, order_id: str, approval_round: int) -> float:
+    """Sum of item.price across APPROVED items in the batch. Unpriced
+    items (item.price IS NULL) don't contribute — dealer omitted price
+    on entry. Payment amount is whatever the dealer priced."""
+    row = (await db.execute(
+        select(func.coalesce(func.sum(OrderItem.price), 0)).where(
+            OrderItem.order_id == order_id,
+            OrderItem.approval_round == approval_round,
+            OrderItem.status == OrderItemStatus.APPROVED,
+            OrderItem.archived_at.is_(None),
+        )
+    )).scalar_one()
+    return float(row or 0)
+
+
+async def _get_or_create_batch_payment(
+    db: AsyncSession, order_id: str, approval_round: int, mode: str, amount: float,
+):
+    """Idempotent BatchPayment upsert. Returns the row. Doesn't commit
+    (caller commits with related changes)."""
+    from app.modules.orders.models import BatchPayment
+    row = (await db.execute(
+        select(BatchPayment).where(
+            BatchPayment.order_id == order_id,
+            BatchPayment.approval_round == approval_round,
+        )
+    )).scalar_one_or_none()
+    if row is None:
+        row = BatchPayment(
+            order_id=order_id,
+            approval_round=approval_round,
+            mode=mode,
+            amount=amount,
+            status="PENDING",
+        )
+        db.add(row)
+        await db.flush()
+    return row
+
+
+@router.get("/farmer/orders/{order_id}/batches/{approval_round}/payment-intent")
+async def get_batch_payment_intent(
+    order_id: str,
+    approval_round: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Returns the UPI intent URL the farmer taps to open their UPI
+    app pre-filled with dealer VPA + exact amount + order-batch note.
+
+    Refuses when:
+      - Order isn't the farmer's
+      - Batch has no APPROVED items (nothing to pay for)
+      - Dealer hasn't set upi_vpa (Pay button should have been hidden)
+    """
+    order = await _get_farmer_order(db, order_id, current_user.id)
+    if not order.dealer_user_id:
+        raise HTTPException(status_code=400, detail={
+            "code": "no_dealer_assigned",
+            "message": "This order has no dealer assigned yet.",
+        })
+    dp = (await db.execute(
+        select(DealerProfile).where(DealerProfile.user_id == order.dealer_user_id)
+    )).scalar_one_or_none()
+    if not dp or not dp.upi_vpa:
+        raise HTTPException(status_code=400, detail={
+            "code": "dealer_upi_not_setup",
+            "message": "This dealer hasn't set up UPI payment yet.",
+        })
+    amount = await _batch_amount(db, order.id, approval_round)
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail={
+            "code": "nothing_to_pay",
+            "message": "No approved items with prices in this batch.",
+        })
+    ref = f"{order.reference_number or order.id[:8]}-B{approval_round}"
+    display_name = dp.payment_display_name or dp.shop_name or "Dealer"
+    return {
+        "upi_url": _upi_intent_url(dp.upi_vpa, display_name, amount, ref),
+        "amount": amount,
+        "dealer_vpa": dp.upi_vpa,
+        "dealer_display_name": display_name,
+        "reference": ref,
+        "approval_round": approval_round,
+    }
+
+
+@router.post("/farmer/orders/{order_id}/batches/{approval_round}/mark-paid")
+async def mark_batch_paid(
+    order_id: str,
+    approval_round: int,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Farmer marks the batch as paid after completing the UPI transfer.
+    Optional txn_ref for the dealer's reconciliation. Creates the
+    BatchPayment row if it doesn't exist yet. Idempotent — a second
+    mark-paid updates the timestamp + ref.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    order = await _get_farmer_order(db, order_id, current_user.id)
+    amount = await _batch_amount(db, order.id, approval_round)
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail={
+            "code": "nothing_to_pay",
+            "message": "No approved items with prices in this batch.",
+        })
+    row = await _get_or_create_batch_payment(db, order.id, approval_round, "UPI", amount)
+    if row.status == "DEALER_CONFIRMED":
+        # Dealer already confirmed — no state to change. Return 200 for
+        # idempotency; farmer's PWA can just refresh.
+        await db.commit()
+        return {"status": row.status, "amount": float(row.amount)}
+    row.status = "FARMER_MARKED_PAID"
+    row.farmer_marked_at = _dt.now(_tz.utc)
+    txn_ref = (data.get("txn_ref") or "").strip() or None
+    if txn_ref:
+        row.txn_ref = txn_ref
+    await db.commit()
+    return {
+        "status": row.status,
+        "amount": float(row.amount),
+        "farmer_marked_at": row.farmer_marked_at.isoformat(),
+        "txn_ref": row.txn_ref,
+    }
+
+
+@router.put("/dealer/orders/{order_id}/batches/{approval_round}/confirm-payment")
+async def confirm_batch_payment(
+    order_id: str,
+    approval_round: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Dealer confirms receipt of the farmer's UPI payment. Requires the
+    farmer to have marked-paid first. Sets status to DEALER_CONFIRMED
+    (terminal for v1)."""
+    from datetime import datetime as _dt, timezone as _tz
+    from app.modules.orders.models import BatchPayment
+    await _assert_active_dealer(db, current_user.id)
+    await _get_dealer_order(db, order_id, current_user.id)
+    row = (await db.execute(
+        select(BatchPayment).where(
+            BatchPayment.order_id == order_id,
+            BatchPayment.approval_round == approval_round,
+        )
+    )).scalar_one_or_none()
+    if row is None or row.status == "PENDING":
+        raise HTTPException(status_code=400, detail={
+            "code": "farmer_not_marked_paid",
+            "message": "The farmer hasn't marked this batch as paid yet.",
+        })
+    if row.status == "DEALER_CONFIRMED":
+        return {"status": row.status}
+    row.status = "DEALER_CONFIRMED"
+    row.dealer_confirmed_at = _dt.now(_tz.utc)
+    await db.commit()
+    return {
+        "status": row.status,
+        "dealer_confirmed_at": row.dealer_confirmed_at.isoformat(),
+    }
+
+
 @router.delete("/farmer/orders/{order_id}")
 async def delete_cancelled_order(
     order_id: str,
@@ -9484,6 +9679,11 @@ async def get_dealer_profile(
         "shop_photo_url": profile.shop_photo_url,
         "shop_gps_lat": float(profile.shop_gps_lat) if profile.shop_gps_lat else None,
         "shop_gps_lng": float(profile.shop_gps_lng) if profile.shop_gps_lng else None,
+        # 2026-08-21 — Payment UPI v1. Farmer's "Pay via UPI" button
+        # gates on upi_vpa being non-empty on this profile.
+        "upi_vpa": profile.upi_vpa,
+        "upi_phone": profile.upi_phone,
+        "payment_display_name": profile.payment_display_name,
         "is_profile_complete": _dealer_profile_complete(profile),
     }
 
@@ -9504,10 +9704,17 @@ async def upsert_dealer_profile(
 
     allowed = ["shop_name", "shop_address", "sell_categories", "pesticide_licence_url",
                "fertiliser_licence_url", "shop_registration_url", "shop_photo_url",
-               "shop_gps_lat", "shop_gps_lng"]
+               "shop_gps_lat", "shop_gps_lng",
+               # 2026-08-21 — Payment UPI v1 setup fields.
+               "upi_vpa", "upi_phone", "payment_display_name"]
     for field in allowed:
         if field in data:
-            setattr(profile, field, data[field])
+            val = data[field]
+            # Trim strings; empty → None so the UPI-VPA-present gate
+            # doesn't fire on a dealer who typed then cleared the field.
+            if isinstance(val, str):
+                val = val.strip() or None
+            setattr(profile, field, val)
 
     await db.commit()
     return {"detail": "Profile saved"}
