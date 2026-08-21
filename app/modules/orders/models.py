@@ -354,6 +354,44 @@ class DealerProfile(Base):
     shop_photo_url: Mapped[str] = mapped_column(Text, nullable=True)
     shop_gps_lat: Mapped[float] = mapped_column(DECIMAL(10, 7), nullable=True)
     shop_gps_lng: Mapped[float] = mapped_column(DECIMAL(10, 7), nullable=True)
+    # 2026-08-21 — Payment v1 (UPI). Dealer enters these on Shop
+    # Details. When upi_vpa is set, the farmer's approval / pickup
+    # cards render a "Pay via UPI" button that builds the standard
+    # `upi://pay?pa=...` intent link. upi_phone is the phone linked
+    # to the dealer's UPI account (may differ from login phone —
+    # some dealers use a separate account for the shop).
+    # payment_display_name is what the farmer sees in their UPI app's
+    # confirmation screen; defaults to shop_name when NULL.
+    upi_vpa: Mapped[str] = mapped_column(String(100), nullable=True)
+    upi_phone: Mapped[str] = mapped_column(String(20), nullable=True)
+    payment_display_name: Mapped[str] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class BatchPayment(Base):
+    """Per-(order, approval_round) payment record. One row per batch;
+    the payment lifecycle runs in parallel to the batch's pickup
+    lifecycle (payment can happen post-approval / pre-FC / at pickup /
+    after — any time from the batch being APPROVED-ready onwards).
+
+    v1 status machine:
+        PENDING → FARMER_MARKED_PAID → DEALER_CONFIRMED
+
+    Refund / dispute states come in a later revision if the field
+    surfaces the need.
+    """
+    __tablename__ = "batch_payments"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    order_id: Mapped[str] = mapped_column(String(36), ForeignKey("orders.id"), nullable=False)
+    approval_round: Mapped[int] = mapped_column(Integer, nullable=False)
+    mode: Mapped[str] = mapped_column(String(20), nullable=False)  # 'UPI' in v1
+    amount: Mapped[float] = mapped_column(DECIMAL(12, 2), nullable=False)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="PENDING")
+    txn_ref: Mapped[str] = mapped_column(String(100), nullable=True)
+    farmer_marked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    dealer_confirmed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
