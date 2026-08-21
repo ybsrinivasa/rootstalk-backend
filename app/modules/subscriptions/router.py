@@ -1716,6 +1716,19 @@ async def set_start_date(
             )
             .values(status=AlertStatus.READ)
         )
+        # 2026-08-21 — fire the INPUT alert synchronously if any
+        # practice window opens on day 0. Without this, a farmer
+        # who sets the start date after 11:30 IST would see no
+        # nudge until the following day even though today has
+        # inputs due.
+        try:
+            from app.tasks.alerts import send_alerts_now_for_subscription
+            await send_alerts_now_for_subscription(db, sub.id)
+        except Exception as _e:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                f"Synchronous INPUT alert on start-date-set failed for sub {sub.id}: {_e}"
+            )
         await db.commit()
         return {"detail": "Start date set", "crop_start_date": sub.crop_start_date}
 
@@ -2180,13 +2193,13 @@ async def initiate_assignment(
     # 11:30 IST batch runs. Best-effort — alert failures must not
     # roll back the assignment.
     try:
-        from app.tasks.alerts import send_start_date_alert_now
-        await send_start_date_alert_now(db, sub.id)
+        from app.tasks.alerts import send_alerts_now_for_subscription
+        await send_alerts_now_for_subscription(db, sub.id)
         await db.commit()
     except Exception as _e:
         import logging as _logging
         _logging.getLogger(__name__).warning(
-            f"Synchronous START_DATE alert failed for sub {sub.id}: {_e}"
+            f"Synchronous alert on assignment failed for sub {sub.id}: {_e}"
         )
 
     # 2026-05-31 — notify the farmer that a Promoter has assigned a
