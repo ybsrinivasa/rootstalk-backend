@@ -3736,7 +3736,13 @@ async def list_dealer_orders(
             i.dealer_pending_status == OrderItemStatus.AVAILABLE.value
             for i in dealer_scope_items
         )
-        has_pending_any = any(i.dealer_pending_status for i in dealer_scope_items)
+        # 2026-08-21 — NOT_NEEDED tentatives are cascade artifacts;
+        # they don't drive the Submit button on their own.
+        has_pending_any = any(
+            i.dealer_pending_status
+            and i.dealer_pending_status != OrderItemStatus.NOT_NEEDED.value
+            for i in dealer_scope_items
+        )
         submit_action_type: str | None = None
         if not undecided_scope and has_pending_any:
             submit_action_type = "SEND_TO_FARMER" if has_pending_avail else "SUBMIT_RESPONSE"
@@ -5298,7 +5304,19 @@ async def submit_for_approval(
         i for i in dealer_scope
         if i.dealer_pending_status == OrderItemStatus.POSTPONED.value
     ]
+    # 2026-08-21 — NOT_NEEDED tentatives come from OR-cascade when the
+    # dealer marks a sibling AVAILABLE. They tag along on submit —
+    # promoted silently, no approval_round (structural marker, not a
+    # farmer-facing decision). Prior gap: these were left in tentative
+    # limbo forever; RT-26-000007 on prod caught in this state.
+    pending_not_needed = [
+        i for i in dealer_scope
+        if i.dealer_pending_status == OrderItemStatus.NOT_NEEDED.value
+    ]
     # Nothing tentative to promote? Reject — there's no work to submit.
+    # NOT_NEEDED alone does NOT count as "something to submit" — it's
+    # a structural cascade artifact that only flushes when some OTHER
+    # tentative (AVAILABLE / NA / POSTPONED) is submitted.
     if not (pending_available or pending_na or pending_postponed):
         raise HTTPException(
             status_code=400,
@@ -5358,6 +5376,10 @@ async def submit_for_approval(
         # POSTPONED items historically do NOT get approval_round — the
         # dealer hasn't yet given the farmer anything to act on. Kept
         # for backward compat with farmer's postponed_count read.
+    for item in pending_not_needed:
+        _promote_dealer_pending_to_live(item)
+        # NOT_NEEDED is an OR-cascade artifact — no approval_round
+        # (structural, not a farmer-communicable decision).
 
     if action_type == "SEND_TO_FARMER":
         order.status = OrderStatus.SENT_FOR_APPROVAL
@@ -5427,6 +5449,7 @@ async def submit_for_approval(
             "available": len(pending_available),
             "not_available": len(pending_na),
             "postponed": len(pending_postponed),
+            "not_needed": len(pending_not_needed),
         },
     }
 
@@ -6884,6 +6907,12 @@ async def get_dealer_order(
             OrderItemStatus.REJECTED, OrderItemStatus.NOT_NEEDED,
             OrderItemStatus.REROUTED, OrderItemStatus.REMOVED,
         )
+        # 2026-08-21 — Also strip items whose effective status is
+        # NOT_NEEDED via dealer_pending (OR-cascade tentative that
+        # got left behind on a prior submit). Dealer never needs to
+        # see these cards — they're structural artifacts, not
+        # decisions.
+        and i.dealer_pending_status != OrderItemStatus.NOT_NEEDED.value
     ]
 
     # Helper for the flat item shape. NOTE: relies on
@@ -7402,7 +7431,15 @@ async def get_dealer_order(
         i.dealer_pending_status == OrderItemStatus.AVAILABLE.value
         for i in _dealer_scope
     )
-    _has_pend_any = any(i.dealer_pending_status for i in _dealer_scope)
+    # 2026-08-21 — NOT_NEEDED tentatives are OR-cascade artifacts, not
+    # farmer-communicable decisions. They shouldn't drive Submit
+    # button visibility on their own — they only tag along when some
+    # other tentative (AVAILABLE / NA / POSTPONED) is being submitted.
+    _has_pend_any = any(
+        i.dealer_pending_status
+        and i.dealer_pending_status != OrderItemStatus.NOT_NEEDED.value
+        for i in _dealer_scope
+    )
     submit_action_type: str | None = None
     if not _undecided_scope and _has_pend_any:
         submit_action_type = "SEND_TO_FARMER" if _has_pend_avail else "SUBMIT_RESPONSE"
