@@ -727,6 +727,10 @@ async def list_subscription_orders(
     # conflated staggered approval rounds and blocked Pickup on the
     # new batch once the prior batch had been received.
     pls_by_order: dict[str, dict[int, PackingList]] = {}
+    # 2026-08-21 — Payment UPI v1: batch-load payment rows for every
+    # order in the farmer's response.
+    batch_payments_map: dict[tuple[str, int], dict] = {}
+    dealer_upi_by_user_id: dict[str, bool] = {}
     if regular_rows:
         regular_ids = [o.id for o in regular_rows]
         pl_rows = (await db.execute(
@@ -735,6 +739,17 @@ async def list_subscription_orders(
         for pl in pl_rows:
             round_key = pl.approval_round or 1
             pls_by_order.setdefault(pl.order_id, {})[round_key] = pl
+        # 2026-08-21 — Batch-load BatchPayment + dealer UPI availability
+        # so per-batch payment payload can render.
+        batch_payments_map = await _load_batch_payments_by_order(db, regular_ids)
+        dealer_uids = {o.dealer_user_id for o in regular_rows if o.dealer_user_id}
+        if dealer_uids:
+            dp_rows = (await db.execute(
+                select(DealerProfile.user_id, DealerProfile.upi_vpa)
+                .where(DealerProfile.user_id.in_(dealer_uids))
+            )).all()
+            for uid, vpa in dp_rows:
+                dealer_upi_by_user_id[uid] = bool(vpa)
         # Lazy-create a PL row per (order, round) with APPROVED items.
         # Mirror of the /dealer/orders path so the farmer sees packing
         # codes as soon as items land in a fresh round.
@@ -1000,6 +1015,14 @@ async def list_subscription_orders(
                 "final_confirmed": final_confirmed,
                 "all_final_confirmed": batch_all_final,
                 "item_count": len(batch_items),
+                # 2026-08-21 — Payment UPI v1: per-batch payment state.
+                "batch_payment": _batch_payment_payload(
+                    batch_payments_map,
+                    o.id,
+                    round_n,
+                    sum(float(i.price) for i in batch_items if i.price),
+                    dealer_upi_by_user_id.get(o.dealer_user_id or "", False),
+                ),
             })
         # 2026-06-21 — Facilitator wins when both are set: a
         # facilitator-routed order is always "with the facilitator"
@@ -3558,6 +3581,19 @@ async def list_dealer_orders(
             round_key = pl.approval_round or 1
             pls_by_order.setdefault(pl.order_id, {})[round_key] = pl
 
+    # 2026-08-21 — Payment UPI v1: batch-load BatchPayment rows for
+    # every order in the response. Also fetch this dealer's own
+    # DealerProfile to know if UPI is set up (drives the "Pay via UPI"
+    # button visibility on the farmer PWA — but the dealer surface
+    # uses it too, e.g. hiding the confirm-receipt UI if no payment
+    # ever hits because UPI isn't configured).
+    batch_payments_map = await _load_batch_payments_by_order(db, order_ids)
+    dealer_upi_available = False
+    _own_profile = (await db.execute(
+        select(DealerProfile.upi_vpa).where(DealerProfile.user_id == current_user.id)
+    )).scalar_one_or_none()
+    dealer_upi_available = bool(_own_profile)
+
     # Lazy-create a PL row per (order, round) that has APPROVED items
     # but no row yet. Ensures the dealer's Final Confirmation + Packing
     # cards render as soon as items land in a new round.
@@ -3786,6 +3822,16 @@ async def list_dealer_orders(
                 "fc_submit_ready": (
                     fc_undecided == 0
                     and (tentative_confirm + tentative_cancel) > 0
+                ),
+                # 2026-08-21 — Payment UPI v1: per-batch payment state.
+                # Amount = sum of item.price across APPROVED items in
+                # the batch (unpriced items don't contribute).
+                "batch_payment": _batch_payment_payload(
+                    batch_payments_map,
+                    o.id,
+                    round_n,
+                    sum(float(i.price) for i in batch_items if i.price),
+                    dealer_upi_available,
                 ),
                 "items": [
                     {
@@ -5626,6 +5672,59 @@ async def _ensure_packing_list(
     return pl
 
 
+async def _load_batch_payments_by_order(
+    db: AsyncSession, order_ids: list[str],
+) -> dict[tuple[str, int], dict]:
+    """Batch-load BatchPayment rows for the given orders and return a
+    dict keyed on (order_id, approval_round). Each value is the payload
+    shape that every read endpoint emits under `batch_payment`.
+    Missing rows yield no entry — caller emits `None` for those.
+    2026-08-21 — Payment UPI v1."""
+    from app.modules.orders.models import BatchPayment
+    if not order_ids:
+        return {}
+    rows = (await db.execute(
+        select(BatchPayment).where(BatchPayment.order_id.in_(order_ids))
+    )).scalars().all()
+    out: dict[tuple[str, int], dict] = {}
+    for r in rows:
+        out[(r.order_id, r.approval_round)] = {
+            "mode": r.mode,
+            "amount": float(r.amount),
+            "status": r.status,
+            "txn_ref": r.txn_ref,
+            "farmer_marked_at": r.farmer_marked_at.isoformat() if r.farmer_marked_at else None,
+            "dealer_confirmed_at": r.dealer_confirmed_at.isoformat() if r.dealer_confirmed_at else None,
+        }
+    return out
+
+
+def _batch_payment_payload(
+    payments_map: dict[tuple[str, int], dict],
+    order_id: str,
+    approval_round: int,
+    batch_amount: float,
+    dealer_upi_available: bool,
+) -> dict:
+    """Compose the per-batch payment payload. Fills in defaults when no
+    BatchPayment row exists yet so the frontend always gets a consistent
+    shape: {amount, status, mode, farmer_marked_at, dealer_confirmed_at,
+    txn_ref, dealer_upi_available}. dealer_upi_available drives the
+    farmer PWA's "Pay via UPI" button visibility."""
+    existing = payments_map.get((order_id, approval_round))
+    if existing:
+        return {**existing, "dealer_upi_available": dealer_upi_available}
+    return {
+        "mode": None,
+        "amount": batch_amount,
+        "status": "PENDING",
+        "txn_ref": None,
+        "farmer_marked_at": None,
+        "dealer_confirmed_at": None,
+        "dealer_upi_available": dealer_upi_available,
+    }
+
+
 async def _default_pl_round(db: AsyncSession, order_id: str) -> int:
     """Fallback resolver — picks the earliest round that still has an
     unresolved APPROVED item on the order. If no APPROVED items exist
@@ -5954,12 +6053,26 @@ async def list_facilitator_orders(
     # detail response for facilitators who want granular actions.
     order_ids = [o.id for o in orders]
     pls_by_order: dict[str, list[PackingList]] = {}
+    # 2026-08-21 — Payment UPI v1: batch-load payment rows so the
+    # facilitator's Pickup card can render "Farmer paid ₹X" and
+    # avoid double-collection.
+    batch_payments_map: dict[tuple[str, int], dict] = {}
+    dealer_upi_by_user_id: dict[str, bool] = {}
     if order_ids:
         plrows = (await db.execute(
             select(PackingList).where(PackingList.order_id.in_(order_ids))
         )).scalars().all()
         for pl in plrows:
             pls_by_order.setdefault(pl.order_id, []).append(pl)
+        batch_payments_map = await _load_batch_payments_by_order(db, order_ids)
+        dealer_uids_fac = {o.dealer_user_id for o in orders if o.dealer_user_id}
+        if dealer_uids_fac:
+            dp_rows_fac = (await db.execute(
+                select(DealerProfile.user_id, DealerProfile.upi_vpa)
+                .where(DealerProfile.user_id.in_(dealer_uids_fac))
+            )).all()
+            for uid, vpa in dp_rows_fac:
+                dealer_upi_by_user_id[uid] = bool(vpa)
 
     def _canonical_pl(oid: str) -> PackingList | None:
         rows = pls_by_order.get(oid, [])
@@ -6084,6 +6197,14 @@ async def list_facilitator_orders(
                 "awaiting_final_confirmation": awaiting_fc,
                 "final_confirmed": final_confirmed,
                 "all_final_confirmed": awaiting_fc == 0 and final_confirmed > 0,
+                # 2026-08-21 — Payment UPI v1: per-batch payment state.
+                "batch_payment": _batch_payment_payload(
+                    batch_payments_map,
+                    o.id,
+                    round_n,
+                    sum(float(i.price) for i in batch_items if i.price),
+                    dealer_upi_by_user_id.get(o.dealer_user_id or "", False),
+                ),
                 "items": [
                     {
                         "id": i.id,
