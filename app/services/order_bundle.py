@@ -439,9 +439,7 @@ async def filter_by_conditional_answers(
         return set()
 
     from app.modules.advisory.models import PracticeConditional
-    from app.modules.subscriptions.models import (
-        ConditionalAnswer as _ConditionalAnswer,
-    )
+    from app.services.conditional_answers import resolve_effective_answers
 
     pc_rows = (await db.execute(
         select(PracticeConditional).where(
@@ -453,16 +451,13 @@ async def filter_by_conditional_answers(
 
     pc_by_practice: dict[str, PracticeConditional] = {pc.practice_id: pc for pc in pc_rows}
 
-    cond_rows = (await db.execute(
-        select(_ConditionalAnswer).where(
-            _ConditionalAnswer.subscription_id == subscription.id,
-            _ConditionalAnswer.answer_date == today,
-        )
-    )).scalars().all()
-    today_answers: dict[str, str] = {
-        r.question_id: (r.answer.value if hasattr(r.answer, "value") else str(r.answer))
-        for r in cond_rows
-    }
+    # 2026-08-22 — use effective answers (YES/NO sticky through the
+    # timeline's lifecycle) so the bundle side stays in sync with what
+    # /farmer/advisory/today surfaces. Without this, day N+1 orders
+    # would drop practices the farmer answered YES to on day N.
+    today_answers: dict[str, str] = await resolve_effective_answers(
+        db, subscription.id, today,
+    )
 
     survivors: set[str] = set()
     for pid in candidate_practice_ids:

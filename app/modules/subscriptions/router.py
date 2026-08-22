@@ -5225,14 +5225,14 @@ async def _today_advisory_for_user(
         # CCA correctly (no-op iteration), and the CHA branches will still
         # populate tl_windows.
 
-        # ── Load today's conditional answers for this subscription ────────────
-        cond_rows = (await db.execute(
-            select(ConditionalAnswer).where(
-                ConditionalAnswer.subscription_id == sub.id,
-                ConditionalAnswer.answer_date == today,
-            )
-        )).scalars().all()
-        today_answers: dict[str, str] = {r.question_id: r.answer for r in cond_rows}
+        # ── Load effective conditional answers for this subscription ──────────
+        # 2026-08-22 — question stickiness: once the farmer answers YES/NO
+        # the answer stands for the rest of the timeline's lifecycle. Only
+        # BLANK re-prompts each day. See services/conditional_answers.py.
+        from app.services.conditional_answers import resolve_effective_answers
+        today_answers: dict[str, str] = await resolve_effective_answers(
+            db, sub.id, today,
+        )
 
         # ── Build CCA timeline stubs from snapshot content (Rules 1-3) ──────
         tl_windows: list[TLWindow] = []
