@@ -70,7 +70,13 @@ async def upload_to_s3(
     5 MB, advisory authoring uses the module defaults."""
     types = allowed_types or ALLOWED_CONTENT_TYPES
     cap = max_size_bytes or MAX_SIZE_BYTES
-    if file.content_type not in types:
+    # Browsers can attach codec params ("audio/webm;codecs=opus",
+    # "audio/mp4;codecs=mp4a.40.2") to the Content-Type on media
+    # captured via MediaRecorder. Match on the bare MIME type — the
+    # codec parameter is descriptive, not restrictive, for our
+    # whitelist purposes.
+    base_ct = (file.content_type or "").split(";", 1)[0].strip()
+    if base_ct not in types:
         # Build a human-readable hint from the active whitelist.
         if types == IMAGE_CONTENT_TYPES:
             hint = "Use JPEG, PNG, WebP, or GIF."
