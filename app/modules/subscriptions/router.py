@@ -3774,11 +3774,20 @@ async def set_alert_preferences(
         await db.commit()
         return {"detail": "Alert preferences updated"}
 
-    # Look up the typed phone. Refuse if it doesn't belong to a
-    # registered Dealer / Facilitator User.
-    target = (await db.execute(
-        select(User).where(User.phone == phone_raw)
-    )).scalar_one_or_none()
+    # Look up the typed phone. Normalise to `+91XXXXXXXXXX` the same
+    # way /platform/lookup-user-by-phone does — historical data has
+    # some rows stored bare and some stored with the +91 prefix, and
+    # the farmer's PhoneVerify chip resolves against the normalised
+    # form. Without normalising here the two endpoints can pick
+    # different User rows for the same typed phone (anchor 2026-08-23
+    # prod: phone 9014883240 had two rows — Facilitator+Farmer on
+    # +91-prefix, Content Manager on bare — Save rejected while the
+    # verify chip said "Facilitator"). Also gate on the 30-day
+    # deleted-user grace via the shared helper.
+    from app.modules.auth.service import get_user_by_phone
+    digits = ''.join(ch for ch in phone_raw if ch.isdigit())
+    normalised = '+91' + digits[-10:] if len(digits) >= 10 else phone_raw
+    target = await get_user_by_phone(db, normalised)
     if target is None:
         raise HTTPException(status_code=422, detail={
             "code": "user_not_found",
