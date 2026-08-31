@@ -15,7 +15,13 @@ from app.modules.auth.models import PhoneOTP
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-OTP_EXPIRE_MINUTES = 10
+# 2026-08-31 — Tightened from 10 minutes to 30 seconds to match the
+# DLT-approved SMS template ("Valid for 30 seconds"). Aligning the
+# server-side TTL with the copy prevents the mismatch where users
+# who take longer than 30s see no error but their OTP would silently
+# be accepted — the DLT copy is defensive/anti-social-engineering,
+# and enforcing it server-side keeps the promise consistent.
+OTP_EXPIRE_SECONDS = 30
 
 
 # ── Passwords ──────────────────────────────────────────────────────────────────
@@ -126,7 +132,7 @@ def generate_otp() -> str:
 async def create_phone_otp(db: AsyncSession, phone: str) -> str:
     await db.execute(delete(PhoneOTP).where(PhoneOTP.phone == phone))
     otp_code = generate_otp()
-    expires_at = datetime.now(timezone.utc) + timedelta(minutes=OTP_EXPIRE_MINUTES)
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=OTP_EXPIRE_SECONDS)
     db.add(PhoneOTP(phone=phone, otp_code=otp_code, expires_at=expires_at))
     await db.commit()
     return otp_code
