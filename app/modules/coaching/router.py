@@ -18,7 +18,8 @@ from app.database import get_db
 from app.dependencies import get_current_user
 from app.modules.coaching import service as coaching_service
 from app.modules.coaching.models import (
-    CoachingSession, CoachingStudent, CoachingStudentInvite,
+    CoachingSession, CoachingSessionStatus, CoachingStudent,
+    CoachingStudentInvite,
 )
 from app.modules.coaching.schemas import (
     AssignPwaRolesRequest, CertificatePublicView, CertifiedRecord,
@@ -272,6 +273,71 @@ async def assign_pwa_roles(
         db, session, student, roles=request.roles,
     )
     return await coaching_service.load_session_detail(db, session)
+
+
+# ── Student reference-client profile (READ-ONLY) ─────────────────────────
+
+
+@router.get("/my/reference-client-profile")
+async def get_my_reference_client_profile(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Read-only view of the reference client's Company Profile,
+    scoped to the caller's coaching session. Powers the "Company
+    Profile" page inside a coaching workspace — instead of showing
+    the workspace's empty shell, we show the reference client's
+    fully-configured profile so the student sees what a real
+    Company Profile looks like.
+
+    Auth: caller must be a CoachingStudent in a non-CLOSED session.
+    404 for non-students / closed-session students. Bypasses the
+    tenant guard cleanly (dedicated endpoint, no path param, so
+    the cross_client_forbidden gate doesn't fire).
+
+    Response shape matches GET /client/{cid}/profile so the existing
+    profile page's data model can consume this endpoint by swapping
+    the URL — no schema changes needed on the frontend.
+    """
+    from app.modules.clients.models import (
+        Client, ClientOrganisationType,
+    )
+    row = (await db.execute(
+        select(CoachingStudent, CoachingSession, Client)
+        .join(CoachingSession, CoachingSession.id == CoachingStudent.session_id)
+        .join(Client, Client.id == CoachingSession.reference_client_id)
+        .where(
+            CoachingStudent.user_id == current_user.id,
+            CoachingSession.status.in_([
+                CoachingSessionStatus.DRAFT.value,
+                CoachingSessionStatus.ACTIVE.value,
+            ]),
+        )
+    )).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Not a coaching student in an active session")
+    _cs, _sess, ref_client = row
+    org_types = (await db.execute(
+        select(ClientOrganisationType.org_type_cosh_id)
+        .where(ClientOrganisationType.client_id == ref_client.id)
+    )).scalars().all()
+    return {
+        "id": ref_client.id, "short_name": ref_client.short_name,
+        "display_name": ref_client.display_name, "tagline": ref_client.tagline,
+        "logo_url": ref_client.logo_url,
+        "primary_colour": ref_client.primary_colour,
+        "secondary_colour": ref_client.secondary_colour,
+        "hq_address": ref_client.hq_address,
+        "gst_number": ref_client.gst_number, "pan_number": ref_client.pan_number,
+        "website": ref_client.website,
+        "support_phone": ref_client.support_phone,
+        "office_phone": ref_client.office_phone,
+        "social_links": ref_client.social_links or {},
+        "org_type_cosh_ids": list(org_types),
+        "ca_name": ref_client.ca_name, "ca_email": ref_client.ca_email,
+        "status": ref_client.status.value,
+        "approved_at": ref_client.approved_at,
+    }
 
 
 # ── Reference-client picker (coach/SA) ───────────────────────────────────

@@ -1091,6 +1091,7 @@ async def load_coaching_context(
         "session_id": session.id,
         "session_status": session.status,
         "coach_name": coach.name or coach.email,
+        "reference_client_id": ref_client.id,
         "reference_client_name": ref_client.full_name,
         "workspace_client_id": student.workspace_client_id,
         "assigned_pwa_roles": student.assigned_pwa_roles or [],
