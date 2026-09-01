@@ -82,6 +82,13 @@ async def _check_client_user(db: AsyncSession, user: User, short_name: str) -> C
 @router.post("/request-otp")
 async def request_otp(request: PhoneOtpRequest, db: AsyncSession = Depends(get_db)):
     """Step 1: generate and send OTP to farmer's phone via Draft4SMS."""
+    # Coaching Sandbox guard: refuse OTP send if this phone belongs to
+    # a coaching student whose session isn't ACTIVE. Prevents students
+    # from triggering (and paying for) an SMS they can't complete
+    # login with. Non-coaching users pass through unchanged.
+    from app.modules.coaching.service import guard_otp_request_for_coaching_phone
+    await guard_otp_request_for_coaching_phone(db, request.phone)
+
     otp_code = await create_phone_otp(db, request.phone)
 
     if _surface_dev_otp():
@@ -118,6 +125,12 @@ async def verify_otp(request: PhoneOtpVerify, db: AsyncSession = Depends(get_db)
     # Auto-restore if soft-deleted within grace window
     if user.deleted_at:
         user.deleted_at = None
+    # Coaching Sandbox guard — same rationale as /request-otp above,
+    # applied here as belt-and-braces in case the OTP was requested
+    # while the session was ACTIVE and consumed after it closed
+    # (rare, but possible with a 30-second OTP + a 30-day session).
+    from app.modules.coaching.service import guard_coaching_student_login
+    await guard_coaching_student_login(db, user.id)
     await start_new_session(db, user)
     return TokenResponse(access_token=_build_token(user))
 
@@ -135,6 +148,10 @@ async def admin_login(request: AdminLoginRequest, db: AsyncSession = Depends(get
     client: Client | None = None
     if request.client_short_name:
         client = await _check_client_user(db, user, request.client_short_name)
+    # Coaching Sandbox guard — student portal logins refused pre-ACTIVE
+    # and post-CLOSED. Coach + non-student portal users pass through.
+    from app.modules.coaching.service import guard_coaching_student_login
+    await guard_coaching_student_login(db, user.id)
     await start_new_session(db, user)
     return TokenResponse(access_token=_build_token(
         user,
@@ -219,6 +236,10 @@ async def verify_email_otp(data: dict, db: AsyncSession = Depends(get_db)):
     client: Client | None = None
     if client_short_name and otp.purpose == "LOGIN":
         client = await _check_client_user(db, user, client_short_name)
+    # Coaching Sandbox guard — student portal-OTP logins refused
+    # pre-ACTIVE / post-CLOSED, same rule as password login above.
+    from app.modules.coaching.service import guard_coaching_student_login
+    await guard_coaching_student_login(db, user.id)
     await db.commit()
     await start_new_session(db, user)
     return TokenResponse(access_token=_build_token(

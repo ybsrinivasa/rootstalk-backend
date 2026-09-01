@@ -42,6 +42,110 @@ from app.modules.coaching.models import (
 from app.modules.platform.models import RoleType, StatusEnum, User
 
 
+# ── Login / OTP gates for coaching students ──────────────────────────────
+
+async def guard_coaching_student_login(
+    db: AsyncSession, user_id: str,
+) -> None:
+    """Refuse login (portal or PWA) if this user is a coaching student
+    whose session isn't ACTIVE. Session lifecycle for the student:
+
+      - Coach approves → CoachingStudent created + session still DRAFT →
+        student MUST NOT be able to log in yet (coach hasn't clicked
+        Start; wait for the session-started email).
+      - Coach clicks Start → session ACTIVE → login allowed.
+      - Coach clicks Close (or 30-day auto-close) → session CLOSED →
+        student loses login access; coach reviews their workspace
+        read-only for certification.
+
+    Non-coaching users pass through unchanged. Same 403 for both
+    "session not started" and "session closed" — students already
+    know the state from the emails they've received, and the
+    generic message avoids leaking session mechanics to non-students.
+    """
+    row = (await db.execute(
+        select(CoachingStudent, CoachingSession)
+        .join(CoachingSession, CoachingSession.id == CoachingStudent.session_id)
+        .where(CoachingStudent.user_id == user_id)
+    )).first()
+    if row is None:
+        return  # not a coaching student
+    _cs, session = row
+    if session.status == CoachingSessionStatus.ACTIVE.value:
+        return
+    if session.status == CoachingSessionStatus.DRAFT.value:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "coaching_session_not_started",
+                "message": (
+                    "Your coaching session has not started yet. Your coach "
+                    "will notify you by email when you can log in."
+                ),
+            },
+        )
+    # CLOSED_MANUAL / CLOSED_AUTO
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "code": "coaching_session_closed",
+            "message": (
+                "Your coaching session has ended. If you need access, "
+                "contact your coach."
+            ),
+        },
+    )
+
+
+async def guard_otp_request_for_coaching_phone(
+    db: AsyncSession, phone: str,
+) -> None:
+    """Refuse OTP send if the phone belongs to a coaching student
+    whose session isn't ACTIVE. Guards the PWA `/auth/request-otp`
+    entry so students in DRAFT / CLOSED sessions can't even trigger
+    an SMS they wouldn't be able to complete login with.
+
+    Phone comparison uses the same normalisation the platform-lookup
+    endpoint uses, matching what we stored at approval time.
+    """
+    try:
+        normalised = normalise_phone(phone)
+    except HTTPException:
+        return  # bad phone shape → let the OTP endpoint's own validation fire
+    row = (await db.execute(
+        select(CoachingStudent, CoachingSession)
+        .join(CoachingSession, CoachingSession.id == CoachingStudent.session_id)
+        .where(CoachingStudent.approved_phone == normalised)
+    )).first()
+    if row is None:
+        return
+    _cs, session = row
+    if session.status == CoachingSessionStatus.ACTIVE.value:
+        return
+    if session.status == CoachingSessionStatus.DRAFT.value:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "coaching_session_not_started",
+                "message": (
+                    "This phone is registered for a coaching session that "
+                    "has not started yet. Your coach will notify you when "
+                    "you can log in."
+                ),
+            },
+        )
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "code": "coaching_session_closed",
+            "message": (
+                "This phone is registered for a coaching session that has "
+                "ended. If you need access, contact your coach."
+            ),
+        },
+    )
+
+
 # ── Auth helpers ──────────────────────────────────────────────────────────
 
 def is_sa_user(user: User) -> bool:

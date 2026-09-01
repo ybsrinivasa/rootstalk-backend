@@ -24,6 +24,7 @@ import app.modules.farmpundit.models  # noqa: F401
 import app.modules.seed_mgmt.models  # noqa: F401
 import app.modules.translations.models  # noqa: F401
 import app.modules.qr.models  # noqa: F401
+import app.modules.coaching.models  # noqa: F401
 
 celery_app = Celery(
     "rootstalk",
@@ -44,6 +45,7 @@ celery_app = Celery(
         "app.tasks.translate_content",
         "app.tasks.training_expiry",
         "app.tasks.promoter_stepdown_expiry",
+        "app.tasks.coaching_expiry",
     ],
 )
 
@@ -155,6 +157,14 @@ celery_app.conf.beat_schedule = {
     "promoter-stepdown-expiry-check": {
         "task": "app.tasks.promoter_stepdown_expiry.sweep_stepdown_requests",
         "schedule": crontab(minute=40),
+    },
+    # Coaching Sandbox (2026-09-01): hourly sweep that flips ACTIVE
+    # coaching sessions past 30 days from started_at to CLOSED_AUTO.
+    # No WINDING_DOWN grace — coaching is practice, no in-flight
+    # commitments. :20 to keep off the other minute-hot slots.
+    "coaching-expiry-check": {
+        "task": "app.tasks.coaching_expiry.sweep_expired_coaching_sessions",
+        "schedule": crontab(minute=20),
     },
 }
 
