@@ -295,20 +295,23 @@ async def start_session(
     coach = (await db.execute(
         select(User).where(User.id == session.coach_user_id)
     )).scalar_one()
-    students = (await db.execute(
-        select(CoachingStudent, User)
+    # Students + their workspaces so the session-started email can
+    # link each student directly to their tenant-branded login.
+    students_rows = (await db.execute(
+        select(CoachingStudent, User, Client)
         .join(User, User.id == CoachingStudent.user_id)
+        .join(Client, Client.id == CoachingStudent.workspace_client_id)
         .where(CoachingStudent.session_id == session.id)
     )).all()
-    portal_url = settings.frontend_base_url or "https://rootstalk.in"
-    for _cs, u in students:
+    base = (settings.frontend_base_url or "https://rootstalk.in").rstrip("/")
+    for _cs, u, workspace in students_rows:
         if u.email:
             send_session_started_email(
                 to_email=u.email,
                 student_name=u.name or "Student",
                 coach_name=coach.name or "your coach",
                 reference_client_name=ref_client.full_name,
-                portal_url=portal_url,
+                portal_url=f"{base}/login/{workspace.short_name.lower()}",
             )
     return session
 
@@ -535,7 +538,13 @@ async def approve_invite(
     ref_client = (await db.execute(
         select(Client).where(Client.id == session.reference_client_id)
     )).scalar_one()
-    portal_url = settings.frontend_base_url or "https://rootstalk.in"
+    # Portal URL routes the student directly to their tenant-branded
+    # login page (LoginForm skips the company-name step when it has
+    # a short_name in the URL). short_name is uppercase in the DB but
+    # per-tenant route params are lowercased — see
+    # rootstalk-client-portal/app/login/[shortName]/page.tsx.
+    base = (settings.frontend_base_url or "https://rootstalk.in").rstrip("/")
+    portal_url = f"{base}/login/{workspace.short_name.lower()}"
     send_student_credentials_email(
         to_email=invite.email,
         student_name=student_name,
@@ -1095,7 +1104,7 @@ async def _load_activity_counts(
     """
     if not workspace_client_ids:
         return {}
-    from app.modules.advisory.models import Package, Practice
+    from app.modules.advisory.models import Package, Practice, Timeline
     from app.modules.subscriptions.models import Subscription
     from app.modules.orders.models import Order
     from app.modules.farmpundit.models import Query
@@ -1115,10 +1124,15 @@ async def _load_activity_counts(
         if cid in result:
             result[cid]["packages"] = cnt
 
-    # Practices authored inside the workspace (via Package client_id)
+    # Practices authored inside the workspace. Practice → Timeline →
+    # Package chain (Practice doesn't hold client_id directly, and
+    # Timeline is polymorphic across CCA/PG/SP/QA — for coaching
+    # counts we scope via Package's client_id which covers the CCA
+    # authoring path students exercise).
     for cid, cnt in (await db.execute(
         select(Package.client_id, func.count(Practice.id))
-        .join(Practice, Practice.package_id == Package.id)
+        .join(Timeline, Timeline.package_id == Package.id)
+        .join(Practice, Practice.timeline_id == Timeline.id)
         .where(Package.client_id.in_(workspace_client_ids))
         .group_by(Package.client_id)
     )).all():
