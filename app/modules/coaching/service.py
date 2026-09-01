@@ -582,12 +582,15 @@ def _build_workspace_client(
 
     Naming: workspace `full_name` includes the student's name for
     easy identification in coach's roster; `short_name` is a
-    deterministic slug (COACH-<sessionid_short>-<studentid_short>) so
+    deterministic slug (co<sessionid_short><studentid_short>) so
     it fits the 12-char column limit AND is unique per (session,
-    student) — the DB unique constraint on short_name enforces this."""
-    session_short = session.id.replace("-", "")[:4].upper()
-    student_short = student_user.id.replace("-", "")[:4].upper()
-    short_name = f"CO{session_short}{student_short}"[:12]
+    student) — the DB unique constraint on short_name enforces this.
+    LOWERCASE because the login lookup does `Client.short_name ==
+    short_name.lower()` — real clients also store lowercase per
+    clients/router.py (line 344)."""
+    session_short = session.id.replace("-", "")[:4]
+    student_short = student_user.id.replace("-", "")[:4]
+    short_name = f"co{session_short}{student_short}"[:12]
 
     return Client(
         id=new_uuid(),
