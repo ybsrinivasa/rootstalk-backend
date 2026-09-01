@@ -274,6 +274,41 @@ async def assign_pwa_roles(
     return await coaching_service.load_session_detail(db, session)
 
 
+# ── Reference-client picker (coach/SA) ───────────────────────────────────
+
+
+@router.get("/reference-clients")
+async def list_reference_clients(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_coach_or_sa),
+):
+    """Coach-scoped list of clients eligible to be the reference for
+    a new coaching session. Only ACTIVE real clients (not training
+    children, not coaching workspaces) — those are the only ones
+    that make sense as a reference for grooming students to work
+    with. Narrow response (id, full_name, short_name) — coach only
+    needs to pick, not manage.
+
+    Exists because /admin/clients is SA-only; without this a non-SA
+    COACH user gets a 403 + empty picker when trying to create a
+    session (SA works fine either way).
+    """
+    from app.modules.clients.models import Client, ClientStatus
+    rows = (await db.execute(
+        select(Client.id, Client.full_name, Client.short_name)
+        .where(
+            Client.status == ClientStatus.ACTIVE,
+            Client.is_training.is_(False),
+            Client.is_coaching.is_(False),
+        )
+        .order_by(Client.full_name)
+    )).all()
+    return [
+        {"id": r.id, "full_name": r.full_name, "short_name": r.short_name}
+        for r in rows
+    ]
+
+
 # ── Certificate generation + registry (coach/SA auth) ────────────────────
 
 
