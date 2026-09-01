@@ -74,6 +74,35 @@ async def _check_client_user(db: AsyncSession, user: User, short_name: str) -> C
     )).scalar_one_or_none()
     if not cu:
         raise HTTPException(status_code=401, detail="This email is not registered with this company")
+    # 2026-09-01 — Coaching Sandbox lockout: if this workspace is a
+    # coaching workspace whose session has CLOSED, refuse login for
+    # every user (student + every SE/FM/RM the student invited).
+    # Without this gate, a Subject Expert the student added would
+    # still be able to log in after the coach closed the session and
+    # continue authoring in an unsupervised "zombie" workspace.
+    # Student's own login is already blocked by
+    # guard_coaching_student_login; this covers every other
+    # ClientUser in the same workspace.
+    if client.is_coaching and client.parent_session_id:
+        from app.modules.coaching.models import (
+            CoachingSession, OPEN_SESSION_STATUSES,
+        )
+        session_status = (await db.execute(
+            select(CoachingSession.status)
+            .where(CoachingSession.id == client.parent_session_id)
+        )).scalar_one_or_none()
+        if session_status and session_status not in {s.value for s in OPEN_SESSION_STATUSES}:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "coaching_workspace_closed",
+                    "message": (
+                        "This coaching workspace has been closed by the "
+                        "coach. If you need continued access, please "
+                        "contact your coach."
+                    ),
+                },
+            )
     return client
 
 
