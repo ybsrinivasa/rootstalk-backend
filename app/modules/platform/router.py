@@ -13,7 +13,16 @@ from app.modules.auth.service import hash_password
 
 router = APIRouter(tags=["Platform"])
 
-NEYTIRI_ROLES = {RoleType.CONTENT_MANAGER, RoleType.RELATIONSHIP_MANAGER, RoleType.BUSINESS_MANAGER}
+NEYTIRI_ROLES = {
+    RoleType.CONTENT_MANAGER,
+    RoleType.RELATIONSHIP_MANAGER,
+    RoleType.BUSINESS_MANAGER,
+    # 2026-09-01 — Coaching Sandbox role. Grantable to any Neytiri
+    # staff user via /admin/users. Non-exclusive with CM/RM/BM
+    # (a CM can also be a COACH). SA is implicit coach (no explicit
+    # grant needed).
+    RoleType.COACH,
+}
 
 
 @router.get("/platform/languages", response_model=list[LanguageOut])
