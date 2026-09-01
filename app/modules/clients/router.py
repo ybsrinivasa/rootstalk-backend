@@ -1520,12 +1520,21 @@ async def add_portal_user(
     concern — no welcome email is sent on this path.
     """
     from app.modules.auth.service import hash_password
+    from app.modules.coaching.service import guard_coaching_workspace_onboarding
 
     client = (await db.execute(
         select(Client).where(Client.id == client_id)
     )).scalar_one_or_none()
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
+
+    # Coaching Sandbox — refuse to invite anyone but the student
+    # themselves into an is_coaching workspace. Prevents unsolicited
+    # invite emails to real people and prevents attaching real users'
+    # identities to the practice workspace. No-op for real clients.
+    await guard_coaching_workspace_onboarding(
+        db, client_id, target_email=request.email,
+    )
 
     existing_user = (await db.execute(
         select(User).where(User.email == request.email)
@@ -2260,6 +2269,14 @@ async def register_promoter(
             },
         )
     phone = '+91' + digits[-10:]
+
+    # Coaching Sandbox — inside an is_coaching workspace, only the
+    # student's own approved phone can be onboarded as
+    # dealer/facilitator. No-op for real clients.
+    from app.modules.coaching.service import guard_coaching_workspace_onboarding
+    await guard_coaching_workspace_onboarding(
+        db, client_id, target_phone=phone,
+    )
 
     user = (await db.execute(
         select(User).where(User.phone == phone)

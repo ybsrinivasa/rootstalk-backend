@@ -2045,6 +2045,7 @@ async def initiate_assignment(
         farmer-respond path calls `refund_to_promoter` (see B2 wiring).
     """
     from app.modules.auth.service import get_user_by_phone
+    from app.modules.coaching.service import guard_coaching_workspace_onboarding
     from app.services.promoter_pool import (
         consume_for_assignment, get_promoter_balance,
     )
@@ -2069,6 +2070,14 @@ async def initiate_assignment(
                 "message": "client_id is required for Dealer-Promoter assignments.",
             })
         effective_client_id = request.client_id
+
+    # Coaching Sandbox — inside an is_coaching workspace, the student
+    # (acting as facilitator/dealer promoter) may only assign advisory
+    # to their own approved phone. Blocks leaking real strangers'
+    # phones into the practice workspace. No-op for real clients.
+    await guard_coaching_workspace_onboarding(
+        db, effective_client_id, target_phone=request.farmer_phone,
+    )
 
     # 2026-08-10 — stepdown-request block. Once a promoter requests to
     # step down, they can't take on NEW farmers even before the CA

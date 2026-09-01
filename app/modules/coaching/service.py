@@ -661,6 +661,93 @@ def normalise_phone(input_phone: str) -> str:
     return "+91" + digits[-10:]
 
 
+async def guard_coaching_workspace_onboarding(
+    db: AsyncSession,
+    client_id: str,
+    *,
+    target_phone: Optional[str] = None,
+    target_email: Optional[str] = None,
+) -> None:
+    """Refuse to onboard any external phone/email into a coaching
+    workspace. No-op for real (non-coaching) clients.
+
+    Every downstream invite/onboard path (portal SE/CM/RM/FM invites,
+    PWA facilitator promoter-assign, FM dealer/facilitator
+    onboarding) normally accepts any phone/email. Inside a coaching
+    workspace that would either (a) attach a real stranger's identity
+    to the student's workspace — so the stranger's own PWA login
+    would surface the coaching workspace's subscriptions — or (b)
+    fire an unsolicited rootsTALK invitation email to a real person
+    who never consented. Both are leaks that cross the client
+    boundary; especially harmful because coaching is per-reference-
+    client, so a leak here also leaks the identity of the sponsoring
+    real client.
+
+    Exception: the student's OWN approved phone / registered email
+    is allowed — needed for cross-role practice (the student assigns
+    themselves as farmer via their own facilitator persona, etc.).
+    Aligns with the existing DEALER/FACILITATOR exclusion relaxation
+    for coaching workspaces.
+    """
+    client = await db.get(Client, client_id)
+    if client is None or not client.is_coaching:
+        return
+
+    student = (await db.execute(
+        select(CoachingStudent).where(
+            CoachingStudent.workspace_client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if student is None:
+        # Defensive: coaching workspace with no student row shouldn't
+        # exist (approve_invite provisions both atomically). If it
+        # somehow does, refuse — safer than silently allowing.
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "coaching_external_onboarding_forbidden",
+                "message": (
+                    "Onboarding into a coaching workspace is restricted to "
+                    "the assigned student's own registered contact."
+                ),
+            },
+        )
+
+    student_user = await db.get(User, student.user_id)
+
+    if target_phone is not None:
+        normalized_target = normalise_phone(target_phone)
+        normalized_student = normalise_phone(student.approved_phone or "")
+        if normalized_target != normalized_student:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "coaching_external_onboarding_forbidden",
+                    "message": (
+                        "In a coaching workspace, only the student's own "
+                        "registered phone can be onboarded into other roles. "
+                        "Use your own approved phone to practise cross-role "
+                        "scenarios."
+                    ),
+                },
+            )
+
+    if target_email is not None:
+        typed = (target_email or "").strip().lower()
+        student_email = ((student_user.email if student_user else "") or "").strip().lower()
+        if typed != student_email:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "coaching_external_onboarding_forbidden",
+                    "message": (
+                        "In a coaching workspace, only the student's own "
+                        "registered email can be added as a portal user."
+                    ),
+                },
+            )
+
+
 # ── Public student self-registration ─────────────────────────────────────
 
 async def load_invite_by_token(
