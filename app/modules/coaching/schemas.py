@@ -110,3 +110,40 @@ class CreatedInviteResponse(BaseModel):
     status: str
     invite_link: str
     expires_at: datetime
+
+
+# ── Public student-facing schemas (no auth on these endpoints) ────────────
+
+class InviteContextResponse(BaseModel):
+    """Returned by GET /coaching/join/{token} — everything the student's
+    self-registration form needs to render context before they submit.
+
+    Deliberately omits sensitive coach details (email, id) and
+    reference client internals (id) — just the display info that
+    helps the student trust the invite is legit."""
+    email: str
+    coach_name: Optional[str]
+    reference_client_name: str
+    status: str
+    expires_at: datetime
+    already_submitted: bool
+    can_submit: bool
+
+
+class StudentRegistrationForm(BaseModel):
+    """Body for POST /coaching/join/{token}/submit — the student's
+    self-registration form. All fields required by design; the coach
+    needs each of these to make the enrolment decision."""
+    name: str = Field(min_length=2, max_length=255)
+    year_of_birth: int = Field(ge=1930, le=2015)
+    address: str = Field(min_length=5, max_length=1000)
+    organization: str = Field(min_length=2, max_length=255)
+    phone: str = Field(min_length=10, max_length=20)
+
+
+class SubmitInviteResponse(BaseModel):
+    """Returned after successful submit — student sees a confirmation
+    that the coach will review their submission."""
+    status: str
+    submitted_at: datetime
+    message: str

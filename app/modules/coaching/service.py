@@ -545,6 +545,91 @@ def normalise_phone(input_phone: str) -> str:
     return "+91" + digits[-10:]
 
 
+# ── Public student self-registration ─────────────────────────────────────
+
+async def load_invite_by_token(
+    db: AsyncSession, token: str,
+) -> tuple[CoachingStudentInvite, CoachingSession, Client, User]:
+    """Look up an invite by its emailed token, along with the context
+    the student's form needs to render (coach + reference client).
+    404 for missing token — same shape as expired/consumed to avoid
+    token-enumeration attacks.
+    """
+    invite = (await db.execute(
+        select(CoachingStudentInvite).where(
+            CoachingStudentInvite.invite_token == token,
+        )
+    )).scalar_one_or_none()
+    if invite is None:
+        raise HTTPException(status_code=404, detail="Invite not found")
+    session = (await db.execute(
+        select(CoachingSession).where(CoachingSession.id == invite.session_id)
+    )).scalar_one()
+    ref_client = (await db.execute(
+        select(Client).where(Client.id == session.reference_client_id)
+    )).scalar_one()
+    coach = (await db.execute(
+        select(User).where(User.id == session.coach_user_id)
+    )).scalar_one()
+    return invite, session, ref_client, coach
+
+
+def can_submit_invite(
+    invite: CoachingStudentInvite, session: CoachingSession,
+) -> bool:
+    """Student is allowed to submit / re-submit only while the invite
+    is INVITED or SUBMITTED (re-submit lets them fix a typo before
+    coach reviews), the invite hasn't expired, and the session is
+    still DRAFT (invites become inert once the coach clicks Start).
+    """
+    if invite.is_expired():
+        return False
+    if session.status != CoachingSessionStatus.DRAFT.value:
+        return False
+    return invite.status in (
+        CoachingInviteStatus.INVITED.value,
+        CoachingInviteStatus.SUBMITTED.value,
+    )
+
+
+async def submit_student_form(
+    db: AsyncSession, token: str, form: dict,
+) -> CoachingStudentInvite:
+    """Public endpoint's write side. Stores the form JSON, flips
+    invite to SUBMITTED, stamps submitted_at. Rejects with 422 if
+    the phone is already a real user (approved-phone exclusivity,
+    caught here as a UX win instead of waiting for the coach to
+    reject the invite)."""
+    invite, session, _ref, _coach = await load_invite_by_token(db, token)
+    if not can_submit_invite(invite, session):
+        # Message tuned per specific failure so the student knows why.
+        if invite.is_expired():
+            msg = "This invite has expired. Please ask the coach to send a fresh one."
+        elif session.status != CoachingSessionStatus.DRAFT.value:
+            msg = "This coaching session has already started; new students cannot join it."
+        else:
+            msg = "This invite is no longer active."
+        raise HTTPException(status_code=409, detail=msg)
+
+    # Fail-fast on phone availability so student can correct on the spot
+    # instead of getting a rejection email later.
+    approved_phone = normalise_phone(form.get("phone", ""))
+    await _ensure_phone_available_for_student(db, approved_phone)
+
+    invite.submitted_form = {
+        "name": form.get("name", "").strip(),
+        "year_of_birth": form.get("year_of_birth"),
+        "address": form.get("address", "").strip(),
+        "organization": form.get("organization", "").strip(),
+        "phone": approved_phone,
+    }
+    invite.status = CoachingInviteStatus.SUBMITTED.value
+    invite.submitted_at = utcnow()
+    await db.commit()
+    await db.refresh(invite)
+    return invite
+
+
 # ── PWA role assignment ──────────────────────────────────────────────────
 
 _VALID_PWA_ROLES = {

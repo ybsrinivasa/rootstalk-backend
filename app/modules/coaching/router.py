@@ -22,8 +22,9 @@ from app.modules.coaching.models import (
 )
 from app.modules.coaching.schemas import (
     AssignPwaRolesRequest, CertifyStudentRequest, CreateSessionRequest,
-    CreatedInviteResponse, InviteStudentRequest, SessionDetail,
-    SessionListItem,
+    CreatedInviteResponse, InviteContextResponse, InviteStudentRequest,
+    SessionDetail, SessionListItem, StudentRegistrationForm,
+    SubmitInviteResponse,
 )
 from app.modules.platform.models import User
 
@@ -271,6 +272,62 @@ async def assign_pwa_roles(
         db, session, student, roles=request.roles,
     )
     return await coaching_service.load_session_detail(db, session)
+
+
+# ── Public student self-registration endpoints (NO AUTH) ─────────────────
+# The student receives the token via emailed invite link. These two
+# endpoints DELIBERATELY do NOT depend on require_coach_or_sa or
+# get_current_user — the whole point is that the student registers
+# BEFORE they have a user account. Token possession is the auth.
+
+
+@router.get("/join/{token}", response_model=InviteContextResponse)
+async def get_invite_context(
+    token: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Public — the student's self-registration form calls this to
+    render context (coach name, reference client name) and to check
+    whether the invite is still actionable. Returns 404 for any
+    invalid / unknown token (no distinction between never-existed
+    and expired-and-scrubbed — prevents token enumeration)."""
+    invite, session, ref_client, coach = (
+        await coaching_service.load_invite_by_token(db, token)
+    )
+    return InviteContextResponse(
+        email=invite.email,
+        coach_name=coach.name,
+        reference_client_name=ref_client.full_name,
+        status=invite.status,
+        expires_at=invite.expires_at,
+        already_submitted=invite.status == "SUBMITTED",
+        can_submit=coaching_service.can_submit_invite(invite, session),
+    )
+
+
+@router.post("/join/{token}/submit", response_model=SubmitInviteResponse)
+async def submit_invite_form(
+    token: str,
+    form: StudentRegistrationForm,
+    db: AsyncSession = Depends(get_db),
+):
+    """Public — student submits the self-registration form. Fails
+    fast with 422 if the phone is already tied to a real user
+    (approved-phone exclusivity) so the student can correct on the
+    spot. On success, the invite flips to SUBMITTED and the coach
+    sees it in their pending-approvals queue."""
+    invite = await coaching_service.submit_student_form(
+        db, token, form=form.model_dump(),
+    )
+    return SubmitInviteResponse(
+        status=invite.status,
+        submitted_at=invite.submitted_at,
+        message=(
+            "Your details have been submitted. Your coach will review "
+            "them and you will receive a confirmation email once you "
+            "are enrolled."
+        ),
+    )
 
 
 @router.post(
