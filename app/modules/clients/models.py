@@ -158,6 +158,22 @@ class Client(Base):
         String(36), ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
     )
+    # 2026-09-01 — Coaching Sandbox v1. When True, this Client is an
+    # isolated coaching workspace owned by a single student in a
+    # CoachingSession. `parent_client_id` points at the session's
+    # reference client (the real org the student is being groomed to
+    # join); `parent_session_id` points at the session. Real-farmer /
+    # real-CA read paths must filter `is_coaching = false` (or query
+    # v_real_clients, which excludes both training + coaching). See
+    # alembic e7b1c4a09d52_coaching_sandbox and
+    # project_rootstalk_coaching_sandbox_2026_09_01.md.
+    is_coaching: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false", default=False,
+    )
+    parent_session_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("coaching_sessions.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
     # 2026-07-05 — QR Product Authentication: the Cosh
     # `input_manufacturers` cosh_id this client corresponds to. Set
     # by the SA at approval or via the edit modal — deterministic

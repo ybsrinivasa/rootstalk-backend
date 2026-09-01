@@ -28,6 +28,11 @@ class RoleType(str, enum.Enum):
     CONTENT_MANAGER = "CONTENT_MANAGER"
     RELATIONSHIP_MANAGER = "RELATIONSHIP_MANAGER"
     BUSINESS_MANAGER = "BUSINESS_MANAGER"
+    # 2026-09-01 — Coaching Sandbox role. Grants ability to create
+    # CoachingSessions in the SA portal. Non-exclusive with any other
+    # role. SA is implicit coach (no explicit grant needed); every
+    # other user needs SA to grant this role.
+    COACH = "COACH"
 
 
 class StatusEnum(str, enum.Enum):
