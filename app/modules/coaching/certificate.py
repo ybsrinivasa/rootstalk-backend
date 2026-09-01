@@ -26,10 +26,32 @@ import io
 from datetime import datetime
 from typing import Optional
 
+import qrcode
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.units import cm
+from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen.canvas import Canvas
+
+
+def _make_qr_png(payload: str) -> io.BytesIO:
+    """Render a QR PNG for the given payload. Error-correction level M
+    (~15% redundancy) — enough to survive light scuffing / print
+    artifacts while keeping the QR small enough for the cert footer.
+    Black on white for maximum scanner compatibility across cameras
+    and lighting conditions."""
+    qr = qrcode.QRCode(
+        version=None,  # auto-size based on payload length
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=10, border=2,
+    )
+    qr.add_data(payload)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
 
 
 # Fixed aspects-covered list — every certificate carries the same
@@ -188,12 +210,29 @@ def render_certificate_pdf(
     c.setFillColor(colors.HexColor("#666666"))
     c.drawString(sig_x, sig_y - 0.4 * cm, "Coach")
 
+    # ── QR code (bottom-left) — encodes the verify URL so a scanner
+    # lands directly on the verification page. Harder to substitute
+    # than a text URL a forger might swap for a lookalike domain.
+    # Sized ~2.4cm — small enough not to visually dominate, big
+    # enough for a mid-range phone camera to lock on quickly.
+    qr_size = 2.4 * cm
+    qr_x = inner_margin + 0.4 * cm
+    qr_y = 2.5 * cm
+    qr_buf = _make_qr_png(verification_url)
+    c.drawImage(ImageReader(qr_buf), qr_x, qr_y, qr_size, qr_size)
+    # Tiny caption under the QR so a verifier who's never seen a QR
+    # code knows what to do with it.
+    c.setFont("Helvetica-Oblique", 6.5)
+    c.setFillColor(colors.HexColor("#666666"))
+    c.drawString(qr_x, qr_y - 0.3 * cm, "Scan to verify")
+
     # ── Certificate number + verify URL (footer) ──────────────────────
+    # Left column starts to the right of the QR to avoid collision.
     c.setFont("Helvetica", 7.5)
     c.setFillColor(colors.HexColor("#999999"))
     footer_y = 1.7 * cm
     c.drawString(
-        inner_margin + 0.2 * cm, footer_y,
+        qr_x + qr_size + 0.6 * cm, footer_y,
         f"Certificate No: {certificate_number}",
     )
     c.drawRightString(
