@@ -637,6 +637,14 @@ async def get_me(request: Request, current_user: User = Depends(get_current_user
     token_client_id = token_client_id_pre
     token_client_short_name = getattr(request.state, "token_client_short_name", None)
 
+    # Coaching Sandbox context (2026-09-01). Returns non-null only
+    # for users who are coaching students in a currently-OPEN session.
+    # PWA + Portal use this to render the persistent purple banner
+    # 'You're in a coaching session — this is practice.' Non-students
+    # get None and no banner ever renders.
+    from app.modules.coaching.service import load_coaching_context
+    coaching_context = await load_coaching_context(db, current_user)
+
     return {
         "id": current_user.id,
         "email": current_user.email,
@@ -679,6 +687,7 @@ async def get_me(request: Request, current_user: User = Depends(get_current_user
         # subscribe + ask-expert i18n templates.
         "subscription_amount_inr": settings.subscription_amount_paise // 100,
         "query_amount_inr": settings.query_amount_paise // 100,
+        "coaching_context": coaching_context,
     }
 
 

@@ -31,8 +31,16 @@ class AssignPwaRolesRequest(BaseModel):
 
 
 class CertifyStudentRequest(BaseModel):
-    """Body for POST /coaching/sessions/{id}/students/{student_id}/certify."""
+    """Body for POST /coaching/sessions/{id}/students/{student_id}/certify.
+
+    Two shapes:
+      - `{"certified": true, "grade": "GOOD"}` — mark certified with grade
+      - `{"certified": false}` — uncertify (clears both grade + certified_at)
+
+    Grade must be one of SATISFACTORY / GOOD / EXCELLENT when certifying.
+    """
     certified: bool
+    grade: Optional[str] = None
 
 
 # ── Response bodies ───────────────────────────────────────────────────────
@@ -73,6 +81,18 @@ class InviteDetail(BaseModel):
     expires_at: datetime
 
 
+class StudentActivityCounts(BaseModel):
+    """Summary counts of what a student built in their workspace —
+    surfaced on the coach's session detail so they have enough context
+    to certify. V1 counts: packages authored, practices authored,
+    subscriptions (farmers), orders, queries."""
+    packages: int
+    practices: int
+    subscriptions: int
+    orders: int
+    queries: int
+
+
 class StudentDetail(BaseModel):
     id: str
     user_id: str
@@ -83,7 +103,9 @@ class StudentDetail(BaseModel):
     approved_phone: str
     assigned_pwa_roles: list[str]
     certified_at: Optional[datetime]
+    grade: Optional[str]  # SATISFACTORY | GOOD | EXCELLENT | null
     created_at: datetime
+    counts: StudentActivityCounts
 
 
 class SessionDetail(BaseModel):

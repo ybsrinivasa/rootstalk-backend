@@ -790,14 +790,19 @@ async def assign_pwa_roles(
 
 # ── Certification ────────────────────────────────────────────────────────
 
+_VALID_GRADES = {"SATISFACTORY", "GOOD", "EXCELLENT"}
+
+
 async def set_certification(
     db: AsyncSession, session: CoachingSession, student: CoachingStudent,
-    coach: User, certified: bool,
+    coach: User, certified: bool, grade: Optional[str] = None,
 ) -> CoachingStudent:
-    """Certification lands post-close per plan — coach reviews student
-    work in the (now read-only) workspace and marks pass/fail. Toggling
-    is allowed (correct a mistake) but locks in the certified_by user
-    each time so the audit trail is clear."""
+    """Certification lands post-close per plan. Coach reviews student
+    work in the (now read-only) workspace and marks a grade:
+      - certified=True  + grade=SATISFACTORY/GOOD/EXCELLENT → certified
+      - certified=False → not certified (clears grade + certified_at)
+    Toggling is allowed (correct a mistake); the certified_by field
+    always reflects the caller of the most recent set."""
     if session.status not in (
         CoachingSessionStatus.CLOSED_MANUAL.value,
         CoachingSessionStatus.CLOSED_AUTO.value,
@@ -807,14 +812,131 @@ async def set_certification(
             detail="Certification is only meaningful after the session has closed.",
         )
     if certified:
+        if not grade or grade not in _VALID_GRADES:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "grade_required",
+                    "message": "Grade must be one of SATISFACTORY, GOOD, or EXCELLENT.",
+                },
+            )
         student.certified_at = utcnow()
         student.certified_by_user_id = coach.id
+        student.grade = grade
     else:
         student.certified_at = None
         student.certified_by_user_id = None
+        student.grade = None
     await db.commit()
     await db.refresh(student)
     return student
+
+
+async def load_coaching_context(
+    db: AsyncSession, user: User,
+) -> Optional[dict]:
+    """Return the PWA/portal context for a coaching student user, or
+    None if the user isn't one. Used by /auth/me so the PWA can
+    render a persistent 'You're in a coaching session — this is
+    practice' banner across every screen.
+
+    Only returns context for the current OPEN session — if the
+    student's session has closed and they somehow still hold a
+    valid token, context is None (login gates would already have
+    kicked them out).
+    """
+    open_statuses = [s.value for s in OPEN_SESSION_STATUSES]
+    row = (await db.execute(
+        select(CoachingStudent, CoachingSession, Client, User)
+        .join(CoachingSession, CoachingSession.id == CoachingStudent.session_id)
+        .join(Client, Client.id == CoachingSession.reference_client_id)
+        .join(User, User.id == CoachingSession.coach_user_id)
+        .where(
+            CoachingStudent.user_id == user.id,
+            CoachingSession.status.in_(open_statuses),
+        )
+    )).first()
+    if row is None:
+        return None
+    student, session, ref_client, coach = row
+    return {
+        "session_id": session.id,
+        "session_status": session.status,
+        "coach_name": coach.name or coach.email,
+        "reference_client_name": ref_client.full_name,
+        "workspace_client_id": student.workspace_client_id,
+        "assigned_pwa_roles": student.assigned_pwa_roles or [],
+    }
+
+
+async def _load_activity_counts(
+    db: AsyncSession, workspace_client_ids: list[str],
+) -> dict[str, dict[str, int]]:
+    """Batch-fetch per-workspace activity counts for the session
+    detail view. One query per counted entity, GROUP BY client_id,
+    keyed back by workspace_client_id. Zero counts fill in for
+    workspaces that have no rows in a given table.
+    """
+    if not workspace_client_ids:
+        return {}
+    from app.modules.advisory.models import Package, Practice
+    from app.modules.subscriptions.models import Subscription
+    from app.modules.orders.models import Order
+    from app.modules.farmpundit.models import Query
+
+    result: dict[str, dict[str, int]] = {
+        cid: {"packages": 0, "practices": 0, "subscriptions": 0,
+              "orders": 0, "queries": 0}
+        for cid in workspace_client_ids
+    }
+
+    # Packages authored inside the workspace
+    for cid, cnt in (await db.execute(
+        select(Package.client_id, func.count(Package.id))
+        .where(Package.client_id.in_(workspace_client_ids))
+        .group_by(Package.client_id)
+    )).all():
+        if cid in result:
+            result[cid]["packages"] = cnt
+
+    # Practices authored inside the workspace (via Package client_id)
+    for cid, cnt in (await db.execute(
+        select(Package.client_id, func.count(Practice.id))
+        .join(Practice, Practice.package_id == Package.id)
+        .where(Package.client_id.in_(workspace_client_ids))
+        .group_by(Package.client_id)
+    )).all():
+        if cid in result:
+            result[cid]["practices"] = cnt
+
+    # Subscriptions (each subscription is a farmer in the workspace)
+    for cid, cnt in (await db.execute(
+        select(Subscription.client_id, func.count(Subscription.id))
+        .where(Subscription.client_id.in_(workspace_client_ids))
+        .group_by(Subscription.client_id)
+    )).all():
+        if cid in result:
+            result[cid]["subscriptions"] = cnt
+
+    # Orders placed inside the workspace
+    for cid, cnt in (await db.execute(
+        select(Order.client_id, func.count(Order.id))
+        .where(Order.client_id.in_(workspace_client_ids))
+        .group_by(Order.client_id)
+    )).all():
+        if cid in result:
+            result[cid]["orders"] = cnt
+
+    # Queries submitted inside the workspace
+    for cid, cnt in (await db.execute(
+        select(Query.client_id, func.count(Query.id))
+        .where(Query.client_id.in_(workspace_client_ids))
+        .group_by(Query.client_id)
+    )).all():
+        if cid in result:
+            result[cid]["queries"] = cnt
+
+    return result
 
 
 # ── Listing + detail loaders ─────────────────────────────────────────────
@@ -906,6 +1028,11 @@ async def load_session_detail(
         .order_by(CoachingStudent.created_at)
     )).all()
 
+    # Batch-fetch per-workspace activity counts for the coach's
+    # certification review. Zero-fills workspaces with no activity.
+    workspace_ids = [wc.id for _cs, _u, wc in students_rows]
+    counts_by_workspace = await _load_activity_counts(db, workspace_ids)
+
     return {
         "id": session.id,
         "reference_client": {
@@ -946,7 +1073,12 @@ async def load_session_detail(
                 "approved_phone": cs.approved_phone,
                 "assigned_pwa_roles": cs.assigned_pwa_roles or [],
                 "certified_at": cs.certified_at,
+                "grade": cs.grade,
                 "created_at": cs.created_at,
+                "counts": counts_by_workspace.get(cs.workspace_client_id, {
+                    "packages": 0, "practices": 0, "subscriptions": 0,
+                    "orders": 0, "queries": 0,
+                }),
             }
             for cs, u, wc in students_rows
         ],

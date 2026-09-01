@@ -53,6 +53,23 @@ class CoachingSessionStatus(str, enum.Enum):
     CLOSED_AUTO = "CLOSED_AUTO"
 
 
+class CoachingGrade(str, enum.Enum):
+    """Certification grade — set alongside `certified_at` on the
+    CoachingStudent row. Only rows with both `grade` non-NULL AND
+    `certified_at` non-NULL are considered certified. Uncertifying
+    clears both.
+
+    Locked with user 2026-09-01:
+      SATISFACTORY — met the bar
+      GOOD         — exceeded expectations
+      EXCELLENT    — outstanding
+    Absence of a grade (NULL) means Not Certified.
+    """
+    SATISFACTORY = "SATISFACTORY"
+    GOOD = "GOOD"
+    EXCELLENT = "EXCELLENT"
+
+
 class CoachingInviteStatus(str, enum.Enum):
     """Invite lifecycle: INVITED (coach created, email sent) →
     SUBMITTED (student filled the form) → APPROVED (coach approved,
@@ -262,6 +279,9 @@ class CoachingStudent(Base):
         String(36), ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
     )
+    # Certification grade — SATISFACTORY / GOOD / EXCELLENT. Set
+    # alongside certified_at; NULL = not certified. See CoachingGrade.
+    grade: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False,

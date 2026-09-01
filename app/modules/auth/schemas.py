@@ -79,6 +79,13 @@ class UserOut(BaseModel):
     # "₹20" in i18n strings. Defaults match production values.
     subscription_amount_inr: int = 199
     query_amount_inr: int = 20
+    # Coaching Sandbox context (2026-09-01). None for non-students;
+    # for coaching students in an OPEN session, holds session status
+    # + coach name + reference client name + workspace_client_id +
+    # assigned_pwa_roles. Drives the persistent purple banner across
+    # every PWA/portal screen. WITHOUT this being declared on the
+    # schema Pydantic strips it from the response.
+    coaching_context: Optional[dict] = None
 
     class Config:
         from_attributes = True

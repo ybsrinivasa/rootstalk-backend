@@ -357,6 +357,7 @@ async def certify_student(
     if student is None:
         raise HTTPException(status_code=404, detail="Student not found")
     await coaching_service.set_certification(
-        db, session, student, coach=current_user, certified=request.certified,
+        db, session, student, coach=current_user,
+        certified=request.certified, grade=request.grade,
     )
     return await coaching_service.load_session_detail(db, session)
