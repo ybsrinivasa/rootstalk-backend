@@ -146,6 +146,7 @@ def _subscription_scope(client_id: str) -> Select:
         .where(
             Subscription.client_id == client_id,
             Client.is_training.is_(False),
+            Client.is_coaching.is_(False),
         )
     )
 
@@ -3776,6 +3777,7 @@ def _query_scope(client_id: str) -> Select:
         .where(
             Query.client_id == client_id,
             Client.is_training.is_(False),
+            Client.is_coaching.is_(False),
         )
     )
 

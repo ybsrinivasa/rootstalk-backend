@@ -333,6 +333,10 @@ async def get_client_by_token(db: AsyncSession, token: str) -> Client | None:
             # onboarding_link_token, so the equality above already
             # excludes them. Explicit filter as defensive belt.
             Client.is_training.is_(False),
+            # 2026-09-01 — Coaching workspaces likewise born without
+            # an onboarding_link_token (student is CA via a separate
+            # provisioning path). Belt-and-braces alongside training.
+            Client.is_coaching.is_(False),
         )
     )
     client = result.scalar_one_or_none()

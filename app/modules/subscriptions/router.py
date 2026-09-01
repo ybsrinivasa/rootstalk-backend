@@ -1334,6 +1334,7 @@ async def discover_crops(
             # line above already excludes them. Explicit is_training
             # filter as defensive belt for any future refactor.
             Client.is_training.is_(False),
+            Client.is_coaching.is_(False),
         )
         .distinct()
     )
@@ -1410,6 +1411,7 @@ async def discover_crops_and_companies(
             # hidden_from_discovery doesn't silently leak training
             # clients into farmer discovery.
             Client.is_training.is_(False),
+            Client.is_coaching.is_(False),
         )
         .distinct()
     )).all()
@@ -1528,6 +1530,7 @@ async def discover_companies(
             # 2026-07-24 — Defensive belt; training is COMPANY_PAYS so
             # the line above already excludes them.
             Client.is_training.is_(False),
+            Client.is_coaching.is_(False),
         )
         .distinct()
     )
@@ -1540,6 +1543,7 @@ async def discover_companies(
                 Client.id == client_id,
                 Client.status == ClientStatus.ACTIVE,
                 Client.is_training.is_(False),
+                Client.is_coaching.is_(False),
             )
         )).scalar_one_or_none()
         if client:
