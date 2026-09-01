@@ -832,6 +832,222 @@ async def set_certification(
     return student
 
 
+# ── Digital certificate ──────────────────────────────────────────────────
+
+async def generate_certificate(
+    db: AsyncSession, session: CoachingSession, student: CoachingStudent,
+) -> CoachingStudent:
+    """Generate a certificate PDF, upload to S3, email to the student,
+    persist the certificate_number + generated_at + pdf_url. Idempotent
+    on the certificate_number — regeneration (e.g. grade updated)
+    keeps the same number so verification URLs stay stable across
+    regenerations.
+
+    Preconditions:
+      - Student must be certified (grade + certified_at set)
+      - Session must be CLOSED (grading happens post-close, so this
+        holds by the certification precondition)
+
+    Failure modes:
+      - S3 not configured → PDF is still generated + emailed, but no
+        pdf_url stored. Caller can retry.
+      - Email delivery fails → PDF url stays, generated_at bumps,
+        student can re-download from the SA portal.
+    """
+    from app.modules.coaching.certificate import render_certificate_pdf
+    from app.modules.coaching.emails import send_certificate_email
+    from app.modules.media.router import upload_to_s3
+
+    if not (student.certified_at and student.grade):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "not_certified",
+                "message": "Student must be certified with a grade before generating a certificate.",
+            },
+        )
+    if session.closed_at is None or session.started_at is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "session_not_closed",
+                "message": "Certificates can only be generated after the session has closed.",
+            },
+        )
+
+    # Compose the certificate context
+    ref_client = (await db.execute(
+        select(Client).where(Client.id == session.reference_client_id)
+    )).scalar_one()
+    coach = (await db.execute(
+        select(User).where(User.id == session.coach_user_id)
+    )).scalar_one()
+    student_user = (await db.execute(
+        select(User).where(User.id == student.user_id)
+    )).scalar_one()
+
+    # Preserve certificate_number across regenerations so verification
+    # URLs stay stable if the coach corrects a grade.
+    if not student.certificate_number:
+        student.certificate_number = new_uuid()
+
+    verification_url = build_verification_url(student.certificate_number)
+    pdf_bytes = render_certificate_pdf(
+        student_name=student_user.name or "Coaching Student",
+        reference_client_name=ref_client.full_name,
+        coach_name=coach.name or coach.email or "rootsTALK Coach",
+        session_started_at=session.started_at,
+        session_closed_at=session.closed_at,
+        grade=student.grade,
+        certificate_number=student.certificate_number,
+        verification_url=verification_url,
+    )
+
+    # Upload to S3 for a stable public URL. If S3 isn't configured
+    # (dev), upload_to_s3 returns a placeholder URL — good enough
+    # for local testing but the coach will see the placeholder in
+    # the SA portal.
+    pdf_filename = f"rootsTALK-certificate-{student.certificate_number}.pdf"
+    try:
+        from fastapi import UploadFile
+        import io
+        # upload_to_s3 expects an UploadFile; build one from our bytes.
+        upload_file = UploadFile(
+            filename=pdf_filename,
+            file=io.BytesIO(pdf_bytes),
+        )
+        # UploadFile's content_type comes from the header on real
+        # uploads; set it explicitly here.
+        upload_file.headers = {"content-type": "application/pdf"}  # type: ignore[attr-defined]
+        # Route through upload_to_s3 with the coaching-certs folder.
+        # Allowed types filter — reuse the module's default which
+        # accepts application/pdf as document.
+        s3_result = await upload_to_s3(upload_file, folder="coaching-certificates")
+        student.certificate_pdf_url = s3_result.get("url")
+    except Exception as e:
+        # PDF generation succeeded; S3 upload failed. Don't lose the
+        # certification progress — log + continue, coach can retry
+        # the generate button which uploads again.
+        import logging
+        logging.getLogger(__name__).warning(
+            f"Certificate S3 upload failed for student {student.id}: {e}"
+        )
+
+    student.certificate_generated_at = utcnow()
+    await db.commit()
+    await db.refresh(student)
+
+    # Email delivery is best-effort — student can re-download via the
+    # SA-portal "resend certificate" button (Phase 6c if needed).
+    if student_user.email:
+        send_certificate_email(
+            to_email=student_user.email,
+            student_name=student_user.name or "Coaching Student",
+            coach_name=coach.name or coach.email or "rootsTALK Coach",
+            reference_client_name=ref_client.full_name,
+            grade=student.grade,
+            pdf_bytes=pdf_bytes,
+            pdf_filename=pdf_filename,
+            verification_url=verification_url,
+        )
+    return student
+
+
+def build_verification_url(cert_number: str) -> str:
+    """Public verification URL. On prod resolves to the client-portal
+    domain per `settings.frontend_base_url` (same host that serves the
+    student self-registration form)."""
+    base = settings.frontend_base_url or "https://rootstalk.in"
+    return f"{base.rstrip('/')}/verify/{cert_number}"
+
+
+async def load_certified_students(
+    db: AsyncSession, current_user: User,
+) -> list[dict]:
+    """Registry query for the SA-portal `/coaching/certified` page.
+    Returns all certified students across all sessions (SA scope); a
+    non-SA coach sees only certifications from their own sessions."""
+    q = (
+        select(CoachingStudent, User, CoachingSession, Client, User)
+        .join(User, User.id == CoachingStudent.user_id)
+        .join(CoachingSession, CoachingSession.id == CoachingStudent.session_id)
+        .join(Client, Client.id == CoachingSession.reference_client_id)
+        .where(CoachingStudent.certified_at.is_not(None))
+    )
+    # SQLAlchemy alias for the second User join (coach). Trick: use
+    # a distinct alias so the ORM knows which User row to bind to
+    # the coach column.
+    from sqlalchemy.orm import aliased
+    CoachUser = aliased(User)
+    q = (
+        select(CoachingStudent, User, CoachingSession, Client, CoachUser)
+        .join(User, User.id == CoachingStudent.user_id)
+        .join(CoachingSession, CoachingSession.id == CoachingStudent.session_id)
+        .join(Client, Client.id == CoachingSession.reference_client_id)
+        .join(CoachUser, CoachUser.id == CoachingSession.coach_user_id)
+        .where(CoachingStudent.certified_at.is_not(None))
+        .order_by(CoachingStudent.certified_at.desc())
+    )
+    if not is_sa_user(current_user):
+        q = q.where(CoachingSession.coach_user_id == current_user.id)
+
+    rows = (await db.execute(q)).all()
+    return [
+        {
+            "id": cs.id,
+            "certificate_number": cs.certificate_number,
+            "student_name": student.name,
+            "student_email": student.email,
+            "reference_client_name": ref_client.full_name,
+            "reference_client_short_name": ref_client.short_name,
+            "coach_name": coach.name or coach.email,
+            "session_id": sess.id,
+            "session_started_at": sess.started_at,
+            "session_closed_at": sess.closed_at,
+            "grade": cs.grade,
+            "certified_at": cs.certified_at,
+            "certificate_generated_at": cs.certificate_generated_at,
+            "certificate_pdf_url": cs.certificate_pdf_url,
+        }
+        for cs, student, sess, ref_client, coach in rows
+    ]
+
+
+async def load_certificate_public(
+    db: AsyncSession, certificate_number: str,
+) -> Optional[dict]:
+    """Public verification lookup — no auth. Returns the certificate
+    context if the number resolves, or None. Deliberately narrow —
+    doesn't leak email / phone / workspace ids to the public verifier."""
+    from sqlalchemy.orm import aliased
+    CoachUser = aliased(User)
+    row = (await db.execute(
+        select(CoachingStudent, User, CoachingSession, Client, CoachUser)
+        .join(User, User.id == CoachingStudent.user_id)
+        .join(CoachingSession, CoachingSession.id == CoachingStudent.session_id)
+        .join(Client, Client.id == CoachingSession.reference_client_id)
+        .join(CoachUser, CoachUser.id == CoachingSession.coach_user_id)
+        .where(
+            CoachingStudent.certificate_number == certificate_number,
+            CoachingStudent.certified_at.is_not(None),
+        )
+    )).first()
+    if row is None:
+        return None
+    cs, student, sess, ref_client, coach = row
+    return {
+        "certificate_number": cs.certificate_number,
+        "student_name": student.name,
+        "reference_client_name": ref_client.full_name,
+        "coach_name": coach.name or coach.email,
+        "session_started_at": sess.started_at,
+        "session_closed_at": sess.closed_at,
+        "grade": cs.grade,
+        "certified_at": cs.certified_at,
+        "certificate_generated_at": cs.certificate_generated_at,
+    }
+
+
 async def load_coaching_context(
     db: AsyncSession, user: User,
 ) -> Optional[dict]:
@@ -1079,6 +1295,9 @@ async def load_session_detail(
                     "packages": 0, "practices": 0, "subscriptions": 0,
                     "orders": 0, "queries": 0,
                 }),
+                "certificate_number": cs.certificate_number,
+                "certificate_generated_at": cs.certificate_generated_at,
+                "certificate_pdf_url": cs.certificate_pdf_url,
             }
             for cs, u, wc in students_rows
         ],

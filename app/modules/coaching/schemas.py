@@ -106,6 +106,44 @@ class StudentDetail(BaseModel):
     grade: Optional[str]  # SATISFACTORY | GOOD | EXCELLENT | null
     created_at: datetime
     counts: StudentActivityCounts
+    # Digital certificate — non-null once the coach clicks Generate.
+    certificate_number: Optional[str] = None
+    certificate_generated_at: Optional[datetime] = None
+    certificate_pdf_url: Optional[str] = None
+
+
+class CertifiedRecord(BaseModel):
+    """One row in the SA-portal `/coaching/certified` registry.
+    Batch-loaded via load_certified_students."""
+    id: str
+    certificate_number: Optional[str]
+    student_name: Optional[str]
+    student_email: Optional[str]
+    reference_client_name: str
+    reference_client_short_name: str
+    coach_name: Optional[str]
+    session_id: str
+    session_started_at: Optional[datetime]
+    session_closed_at: Optional[datetime]
+    grade: str
+    certified_at: datetime
+    certificate_generated_at: Optional[datetime]
+    certificate_pdf_url: Optional[str]
+
+
+class CertificatePublicView(BaseModel):
+    """Public verification response for the /verify/{cert_number}
+    page. Deliberately narrow — no email/phone/workspace/coach-email
+    leaked to the public verifier."""
+    certificate_number: str
+    student_name: Optional[str]
+    reference_client_name: str
+    coach_name: Optional[str]
+    session_started_at: Optional[datetime]
+    session_closed_at: Optional[datetime]
+    grade: str
+    certified_at: datetime
+    certificate_generated_at: Optional[datetime]
 
 
 class SessionDetail(BaseModel):

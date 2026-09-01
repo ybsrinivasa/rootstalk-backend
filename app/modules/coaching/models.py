@@ -283,6 +283,21 @@ class CoachingStudent(Base):
     # alongside certified_at; NULL = not certified. See CoachingGrade.
     grade: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
 
+    # Digital certificate (2026-09-01). Only meaningful when
+    # certified_at + grade are set. certificate_number doubles as the
+    # public verification slug at /verify/<cert_number>. Regeneration
+    # (e.g. grade updated) refreshes generated_at + pdf_url and keeps
+    # the same certificate_number so verification URLs stay stable.
+    certificate_number: Mapped[Optional[str]] = mapped_column(
+        String(36), unique=True, nullable=True,
+    )
+    certificate_generated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    certificate_pdf_url: Mapped[Optional[str]] = mapped_column(
+        String(2048), nullable=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False,
     )

@@ -3,7 +3,111 @@ Two audiences:
   - Prospective student: invite link → self-registration form
   - Approved student: portal login credentials + PWA phone reminder
 """
+import logging
+import smtplib
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+from app.config import settings
 from app.modules.clients.service import _send_email
+
+logger = logging.getLogger(__name__)
+
+
+def _send_email_with_pdf_attachment(
+    to: str, subject: str, html: str, plain: str,
+    pdf_bytes: bytes, pdf_filename: str,
+) -> bool:
+    """Coaching certificate delivery — same SMTP path as `_send_email`
+    but with a PDF attached. Kept coaching-local because the base
+    `_send_email` intentionally doesn't grow attachment support (the
+    other callers — onboarding, reset, welcome — never need it)."""
+    if not settings.email_smtp_user or not settings.email_smtp_pass:
+        logger.error(
+            "Certificate email to %s skipped: EMAIL_SMTP_USER / _PASS not "
+            "configured. Subject was: %s", to, subject,
+        )
+        return False
+    try:
+        msg = MIMEMultipart("mixed")
+        msg["Subject"] = subject
+        msg["From"] = settings.email_from or settings.email_smtp_user
+        msg["To"] = to
+        # Body as an alternative-part so both plain + html render
+        body = MIMEMultipart("alternative")
+        body.attach(MIMEText(plain, "plain"))
+        body.attach(MIMEText(html, "html"))
+        msg.attach(body)
+        # PDF attachment
+        att = MIMEApplication(pdf_bytes, _subtype="pdf")
+        att.add_header(
+            "Content-Disposition", "attachment", filename=pdf_filename,
+        )
+        msg.attach(att)
+        with smtplib.SMTP(settings.email_smtp_host, settings.email_smtp_port) as s:
+            s.ehlo(); s.starttls()
+            s.login(settings.email_smtp_user, settings.email_smtp_pass)
+            s.sendmail(msg["From"], to, msg.as_string())
+        return True
+    except Exception as e:
+        logger.error(f"Certificate email send failed to {to}: {e}")
+        return False
+
+
+def send_certificate_email(
+    to_email: str,
+    student_name: str,
+    coach_name: str,
+    reference_client_name: str,
+    grade: str,
+    pdf_bytes: bytes,
+    pdf_filename: str,
+    verification_url: str,
+) -> bool:
+    """Emails the freshly-generated certificate PDF to the student.
+    Body mentions grade + coach + reference client + verification URL
+    so the certificate context is captured in the email even before
+    the recipient opens the attachment."""
+    grade_labels = {
+        "SATISFACTORY": "Satisfactory",
+        "GOOD": "Good",
+        "EXCELLENT": "Excellent",
+    }
+    grade_label = grade_labels.get(grade, grade)
+    subject = (
+        f"Your rootsTALK coaching certificate — {grade_label}"
+    )
+    plain = f"""Congratulations, {student_name}!
+
+Your rootsTALK Coaching Program certificate is attached to this email.
+
+Grade: {grade_label}
+Coached by: {coach_name}
+Context: {reference_client_name}
+
+You can verify the authenticity of this certificate at any time via:
+{verification_url}
+
+RootsTalk — Neytiri Eywafarm Agritech"""
+    html = f"""
+<body style="font-family:sans-serif;padding:32px;background:#F7F5F0">
+  <div style="max-width:540px;margin:0 auto;background:#fff;padding:32px;border-radius:12px;border:1px solid #DDD0B8">
+    <h2 style="color:#7D4196;margin:0 0 8px">Congratulations, {student_name}!</h2>
+    <p style="color:#333">Your rootsTALK Coaching Program certificate is attached to this email.</p>
+    <table style="background:#f8fafc;border-radius:8px;padding:16px;margin:16px 0;border-collapse:collapse;width:100%">
+      <tr><td style="padding:4px 8px;color:#666"><strong>Grade:</strong></td><td style="padding:4px 8px">{grade_label}</td></tr>
+      <tr><td style="padding:4px 8px;color:#666"><strong>Coached by:</strong></td><td style="padding:4px 8px">{coach_name}</td></tr>
+      <tr><td style="padding:4px 8px;color:#666"><strong>Context:</strong></td><td style="padding:4px 8px">{reference_client_name}</td></tr>
+    </table>
+    <p style="color:#666;font-size:13px">You can verify the authenticity of this certificate at any time:</p>
+    <p><a href="{verification_url}" style="color:#7D4196;word-break:break-all">{verification_url}</a></p>
+    <p style="color:#999;font-size:11px;margin-top:24px">RootsTalk — Neytiri Eywafarm Agritech</p>
+  </div>
+</body>"""
+    return _send_email_with_pdf_attachment(
+        to_email, subject, html, plain, pdf_bytes, pdf_filename,
+    )
 
 
 def send_student_invite_email(

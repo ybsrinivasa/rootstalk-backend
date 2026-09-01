@@ -21,10 +21,10 @@ from app.modules.coaching.models import (
     CoachingSession, CoachingStudent, CoachingStudentInvite,
 )
 from app.modules.coaching.schemas import (
-    AssignPwaRolesRequest, CertifyStudentRequest, CreateSessionRequest,
-    CreatedInviteResponse, InviteContextResponse, InviteStudentRequest,
-    SessionDetail, SessionListItem, StudentRegistrationForm,
-    SubmitInviteResponse,
+    AssignPwaRolesRequest, CertificatePublicView, CertifiedRecord,
+    CertifyStudentRequest, CreateSessionRequest, CreatedInviteResponse,
+    InviteContextResponse, InviteStudentRequest, SessionDetail,
+    SessionListItem, StudentRegistrationForm, SubmitInviteResponse,
 )
 from app.modules.platform.models import User
 
@@ -272,6 +272,70 @@ async def assign_pwa_roles(
         db, session, student, roles=request.roles,
     )
     return await coaching_service.load_session_detail(db, session)
+
+
+# ── Certificate generation + registry (coach/SA auth) ────────────────────
+
+
+@router.post(
+    "/sessions/{session_id}/students/{student_id}/certificate/generate",
+    response_model=SessionDetail,
+)
+async def generate_student_certificate(
+    session_id: str,
+    student_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_coach_or_sa),
+):
+    """Generate the PDF certificate, upload to S3, email it to the
+    student. Idempotent on the certificate_number — regeneration
+    keeps the same number so verification URLs stay stable across
+    grade corrections."""
+    session = await coaching_service.require_session_owner(
+        db, session_id, current_user,
+    )
+    student = (await db.execute(
+        select(CoachingStudent).where(
+            CoachingStudent.id == student_id,
+            CoachingStudent.session_id == session.id,
+        )
+    )).scalar_one_or_none()
+    if student is None:
+        raise HTTPException(status_code=404, detail="Student not found")
+    await coaching_service.generate_certificate(db, session, student)
+    return await coaching_service.load_session_detail(db, session)
+
+
+@router.get("/certified", response_model=list[CertifiedRecord])
+async def list_certified_students(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_coach_or_sa),
+):
+    """SA-portal registry: all certified students across sessions.
+    SA sees everything; a non-SA coach sees only their own sessions'
+    certifications."""
+    return await coaching_service.load_certified_students(db, current_user)
+
+
+# ── Public certificate verification (NO AUTH) ────────────────────────────
+
+
+@router.get(
+    "/certificates/{certificate_number}",
+    response_model=CertificatePublicView,
+)
+async def get_certificate_public(
+    certificate_number: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Public verification endpoint — anyone with the certificate
+    number (from the PDF footer or QR code) can query this to confirm
+    authenticity. Returns narrow set of fields — no email, phone,
+    workspace id, or coach email leaked."""
+    data = await coaching_service.load_certificate_public(db, certificate_number)
+    if data is None:
+        raise HTTPException(status_code=404, detail="Certificate not found")
+    return data
 
 
 # ── Public student self-registration endpoints (NO AUTH) ─────────────────
