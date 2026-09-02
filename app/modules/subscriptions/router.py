@@ -1319,7 +1319,27 @@ async def discover_crops(
     matches the district. They onboard farmers via promoters."""
     from app.modules.advisory.models import PackageLocation, PackageStatus
     from app.modules.clients.models import Client, PaymentModel
+    from app.modules.coaching.service import get_coaching_student_for_user
     from app.modules.sync.models import CoshCoreItem
+    from sqlalchemy import and_, or_
+
+    # Coaching Sandbox — a student's coaching workspace is
+    # is_coaching=true + COMPANY_PAYS, so the real-farmer filter
+    # chain hides it. Surface the student's OWN workspace here so
+    # they can self-subscribe to packages they've authored. Real
+    # users get None → filter is byte-identical to before.
+    coaching_student = await get_coaching_student_for_user(db, current_user.id)
+    student_workspace_id = coaching_student.workspace_client_id if coaching_student else None
+
+    real_client_filter = and_(
+        Client.payment_model == PaymentModel.FARMER_PAYS,
+        Client.is_training.is_(False),
+        Client.is_coaching.is_(False),
+    )
+    client_filter = (
+        or_(real_client_filter, Client.id == student_workspace_id)
+        if student_workspace_id else real_client_filter
+    )
 
     result = await db.execute(
         select(Package.crop_cosh_id)
@@ -1329,12 +1349,7 @@ async def discover_crops(
             Package.client_id != None,  # noqa
             Package.status == PackageStatus.ACTIVE,
             PackageLocation.district_cosh_id == district_cosh_id,
-            Client.payment_model == PaymentModel.FARMER_PAYS,
-            # 2026-07-24 — Training children are COMPANY_PAYS so the
-            # line above already excludes them. Explicit is_training
-            # filter as defensive belt for any future refactor.
-            Client.is_training.is_(False),
-            Client.is_coaching.is_(False),
+            client_filter,
         )
         .distinct()
     )
@@ -1390,6 +1405,24 @@ async def discover_crops_and_companies(
     # they can self-subscribe. The /farmer/discover/crops and
     # /farmer/discover/companies endpoints (which feed the subscribe
     # flow) keep the FARMER_PAYS filter.
+    # Coaching Sandbox — see /farmer/discover/crops for the
+    # rationale. Same shape: surface the student's own workspace
+    # via OR clause; real users get None so behaviour is unchanged.
+    from app.modules.coaching.service import get_coaching_student_for_user
+    from sqlalchemy import and_, or_
+    coaching_student = await get_coaching_student_for_user(db, current_user.id)
+    student_workspace_id = coaching_student.workspace_client_id if coaching_student else None
+    real_client_filter = and_(
+        Client.status == ClientStatus.ACTIVE,
+        Client.hidden_from_discovery.is_(False),
+        Client.is_training.is_(False),
+        Client.is_coaching.is_(False),
+    )
+    client_filter = (
+        or_(real_client_filter, Client.id == student_workspace_id)
+        if student_workspace_id else real_client_filter
+    )
+
     pkg_rows = (await db.execute(
         select(Package.crop_cosh_id, Package.client_id)
         .join(PackageLocation, PackageLocation.package_id == Package.id)
@@ -1397,21 +1430,7 @@ async def discover_crops_and_companies(
         .where(
             Package.status == PackageStatus.ACTIVE,
             PackageLocation.district_cosh_id == district_cosh_id,
-            Client.status == ClientStatus.ACTIVE,
-            # 2026-07-04 — SA can flag internal / testing / demo
-            # COMPANY_PAYS clients (e.g. Testorg on prod) as hidden
-            # from farmer discovery. Only surface applies; the
-            # subscribe-flow endpoints already filter to FARMER_PAYS
-            # so they're naturally unaffected.
-            Client.hidden_from_discovery.is_(False),
-            # 2026-07-24 — Training children are hidden_from_discovery=True
-            # by default (set at start_training_session), so the line
-            # above already excludes them. Explicit is_training=False
-            # here is belt-and-braces so a future default change on
-            # hidden_from_discovery doesn't silently leak training
-            # clients into farmer discovery.
-            Client.is_training.is_(False),
-            Client.is_coaching.is_(False),
+            client_filter,
         )
         .distinct()
     )).all()
@@ -1517,6 +1536,23 @@ async def discover_companies(
     a promoter (dealer/facilitator) onboarding."""
     from app.modules.advisory.models import PackageLocation, PackageStatus
     from app.modules.clients.models import Client, ClientStatus, PaymentModel
+    from app.modules.coaching.service import get_coaching_student_for_user
+    from sqlalchemy import and_, or_
+
+    # Coaching Sandbox — surface the student's own workspace in the
+    # subscribe-picker; real users see the same filter as before.
+    coaching_student = await get_coaching_student_for_user(db, current_user.id)
+    student_workspace_id = coaching_student.workspace_client_id if coaching_student else None
+    real_pkg_filter = and_(
+        Client.payment_model == PaymentModel.FARMER_PAYS,
+        Client.is_training.is_(False),
+        Client.is_coaching.is_(False),
+    )
+    pkg_client_filter = (
+        or_(real_pkg_filter, Client.id == student_workspace_id)
+        if student_workspace_id else real_pkg_filter
+    )
+
     result = await db.execute(
         select(Package.client_id)
         .join(PackageLocation, PackageLocation.package_id == Package.id)
@@ -1526,15 +1562,20 @@ async def discover_companies(
             Package.crop_cosh_id == crop_cosh_id,
             Package.status == PackageStatus.ACTIVE,
             PackageLocation.district_cosh_id == district_cosh_id,
-            Client.payment_model == PaymentModel.FARMER_PAYS,
-            # 2026-07-24 — Defensive belt; training is COMPANY_PAYS so
-            # the line above already excludes them.
-            Client.is_training.is_(False),
-            Client.is_coaching.is_(False),
+            pkg_client_filter,
         )
         .distinct()
     )
     client_ids = result.scalars().all()
+
+    real_detail_filter = and_(
+        Client.is_training.is_(False),
+        Client.is_coaching.is_(False),
+    )
+    detail_client_filter = (
+        or_(real_detail_filter, Client.id == student_workspace_id)
+        if student_workspace_id else real_detail_filter
+    )
 
     companies = []
     for client_id in client_ids:
@@ -1542,8 +1583,7 @@ async def discover_companies(
             select(Client).where(
                 Client.id == client_id,
                 Client.status == ClientStatus.ACTIVE,
-                Client.is_training.is_(False),
-                Client.is_coaching.is_(False),
+                detail_client_filter,
             )
         )).scalar_one_or_none()
         if client:
@@ -1587,19 +1627,31 @@ async def create_subscription(
     endpoint with 422 — farmers must instead be assigned via Promoter.
     """
     from app.modules.clients.models import PaymentModel as _PaymentModel
+    from app.modules.coaching.service import get_coaching_student_for_user
 
     client = (await db.execute(
         select(Client).where(Client.id == request.client_id)
     )).scalar_one_or_none()
     if client is None:
         raise HTTPException(status_code=404, detail="Client not found")
-    # 2026-07-24 — Training Sandbox: farmers can never self-subscribe to
-    # a training client. They enter a training session only via a
-    # Promoter invitation (Commit G). Explicit refusal with a training-
-    # specific code so the PWA can show the right message rather than
-    # the generic "Company Pays" one that the COMPANY_PAYS check below
-    # would otherwise deliver (training clients are COMPANY_PAYS too).
-    if client.is_training:
+
+    # Coaching Sandbox — a coaching student self-subscribing to
+    # their OWN workspace bypasses both the is_training refusal
+    # (coaching workspaces aren't training but we want the same
+    # "no external self-subscribe" posture for real farmers) and
+    # the COMPANY_PAYS refusal (coaching workspaces are COMPANY_PAYS
+    # by construction — there's no Razorpay payment path here). The
+    # subscription lands ACTIVE directly so the student can proceed
+    # with the flow without a payment step. Verified: the current
+    # user must BE the student for this workspace — any other user
+    # falls through to the normal (existing) refusals.
+    coaching_student = await get_coaching_student_for_user(db, current_user.id)
+    is_own_coaching_workspace = (
+        coaching_student is not None
+        and coaching_student.workspace_client_id == client.id
+    )
+
+    if client.is_training and not is_own_coaching_workspace:
         raise HTTPException(
             status_code=422,
             detail={
@@ -1610,7 +1662,10 @@ async def create_subscription(
                 ),
             },
         )
-    if client.payment_model == _PaymentModel.COMPANY_PAYS:
+    if (
+        client.payment_model == _PaymentModel.COMPANY_PAYS
+        and not is_own_coaching_workspace
+    ):
         raise HTTPException(
             status_code=422,
             detail={
@@ -1624,13 +1679,22 @@ async def create_subscription(
             },
         )
 
+    # Coaching sandbox skips the WAITLISTED / pay-to-activate gate —
+    # there's no Razorpay path for is_coaching workspaces (memory
+    # note: coaching payment feature is out of scope for v1). Real
+    # farmer subscriptions still land WAITLISTED as before.
+    initial_status = (
+        SubscriptionStatus.ACTIVE if is_own_coaching_workspace
+        else SubscriptionStatus.WAITLISTED
+    )
+
     sub = Subscription(
         farmer_user_id=current_user.id,
         client_id=request.client_id,
         package_id=request.package_id,
         promoter_user_id=request.promoter_user_id,
         subscription_type=request.subscription_type,
-        status=SubscriptionStatus.WAITLISTED,
+        status=initial_status,
     )
     db.add(sub)
     await db.flush()
@@ -1641,7 +1705,11 @@ async def create_subscription(
         "id": sub.id,
         "status": sub.status,
         "reference_number": sub.reference_number,
-        "message": "Subscription created — please complete payment to activate.",
+        "message": (
+            "Subscription active (coaching sandbox — no payment needed)."
+            if is_own_coaching_workspace else
+            "Subscription created — please complete payment to activate."
+        ),
     }
 
 
