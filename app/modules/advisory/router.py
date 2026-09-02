@@ -155,7 +155,19 @@ async def _assert_can_edit_client_advisory(
     from app.modules.clients.models import (
         CMClientAssignment, CMRights, ClientUser, ClientUserRole,
     )
+    from app.modules.coaching.service import get_coaching_student_for_workspace
     from app.modules.platform.models import StatusEnum
+
+    # Coaching Sandbox — inside an is_coaching workspace the CA (=
+    # the student themselves) can edit CCA / PG / SP / QA. The only
+    # ClientUser that can exist in a coaching workspace is the
+    # student (add_portal_user + CA-exclusivity guards enforce no
+    # others), and cross-tenant JWT boundary already validated
+    # upstream, so this bypass can only run for the student on
+    # their own workspace. No-op for real clients — helper returns
+    # None and the standard SE / CM-EDIT gate below runs unchanged.
+    if await get_coaching_student_for_workspace(db, client_id) is not None:
+        return
 
     cu = (await db.execute(
         select(ClientUser).where(
@@ -228,7 +240,14 @@ async def _assert_can_publish_client_advisory(
     from app.modules.clients.models import (
         ClientUser, ClientUserRole,
     )
+    from app.modules.coaching.service import get_coaching_student_for_workspace
     from app.modules.platform.models import StatusEnum
+
+    # Coaching Sandbox — same shape as the edit gate above: inside
+    # an is_coaching workspace, the student (sole CA of their
+    # workspace) can also publish. Real clients unaffected.
+    if await get_coaching_student_for_workspace(db, client_id) is not None:
+        return
 
     is_se = (await db.execute(
         select(ClientUser.id).where(
