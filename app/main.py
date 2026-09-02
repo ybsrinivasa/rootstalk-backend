@@ -1,8 +1,27 @@
 import logging
+import sys
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
+
+# Route app.* loggers to stdout at INFO. Uvicorn configures its own
+# `uvicorn` / `uvicorn.access` loggers but leaves the root logger
+# alone, so `logger.info(...)` calls from any app module silently
+# vanish in prod — bit us during the 2026-09-01 OTP delivery
+# investigation for +919480396607, where sms_service's
+# `Draft4SMS response for X: Y` line never surfaced despite the
+# code path clearly running. Scoped to the "app" logger (and all
+# submodules by inheritance) so third-party libraries keep their
+# own defaults.
+_app_logger = logging.getLogger("app")
+if not _app_logger.handlers:
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    ))
+    _app_logger.addHandler(_handler)
+_app_logger.setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
 
