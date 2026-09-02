@@ -87,7 +87,26 @@ def _build_token(
 
 
 async def start_new_session(db: AsyncSession, user: User) -> str:
-    """Generate a new session_id, store on user, return it. Invalidates all previous tokens."""
+    """Generate a new session_id, store on user, return it. Invalidates all previous tokens.
+
+    Coaching Sandbox exception: coaching students need CONCURRENT
+    sessions across portal (CA authoring) + PWA (farmer / dealer /
+    facilitator / expert cross-role practice). Rotating the
+    session_id on every login would kick out the other surface —
+    the team's "PWA keeps signing out frequently" complaint. Skip
+    the rotation for coaching students so both tokens stay valid
+    in parallel. Safety floor: `guard_coaching_student_login`
+    still refuses login outside ACTIVE sessions, so a closed
+    coaching workspace can't onboard new tokens.
+    """
+    from app.modules.coaching.service import get_coaching_student_for_user
+    if await get_coaching_student_for_user(db, user.id) is not None:
+        # No-op for coaching students. Preserve any existing session_id
+        # (returned unchanged) so their in-flight tokens stay valid;
+        # new tokens minted after this call carry the same (or no) jti
+        # and pass the single-device check trivially.
+        return user.current_session_id or ""
+
     new_session_id = secrets.token_hex(16)
     user.current_session_id = new_session_id
     await db.commit()
