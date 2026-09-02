@@ -76,6 +76,7 @@ def validate_publish_readiness(
     author_count: int,
     has_pv: bool,
     siblings_with_shared_districts: list[dict],
+    require_author: bool = True,
 ) -> list[MissingPublishField]:
     """Pure: collect every reason the package can't publish today.
     Empty list = ready.
@@ -88,6 +89,14 @@ def validate_publish_readiness(
     Only DRAFT/ACTIVE siblings sharing at least one district should
     be in this list — INACTIVE siblings are filtered out by the
     async wrapper.
+
+    `require_author` defaults True (real-client rule: at least one
+    SE must be credited). The coaching-sandbox wrapper passes False
+    so a coaching student's package can publish without an author —
+    the student is CA of their workspace and can't add an SE (my
+    earlier guards block adding anyone else, and CA-exclusivity
+    blocks adding themselves as SE), so this requirement would be
+    unfulfillable in coaching.
     """
     missing: list[MissingPublishField] = []
 
@@ -113,7 +122,7 @@ def validate_publish_readiness(
             "no_locations",
             "At least one (state, district) location must be assigned.",
         ))
-    if author_count == 0:
+    if require_author and author_count == 0:
         missing.append(MissingPublishField(
             "no_authors",
             "At least one Subject Expert must be credited as an author.",
@@ -205,7 +214,19 @@ async def assert_package_publish_ready(
 ) -> None:
     """Async wrapper. Loads counts + sibling data, delegates to the
     pure validator, raises `PublishBlockedError` if any requirement
-    is unmet."""
+    is unmet.
+
+    Coaching Sandbox: if the package's client is is_coaching, drop
+    the "at least one SE author" requirement — the student can't
+    fulfil it (see require_author in validate_publish_readiness).
+    Real clients unaffected (get_coaching_student_for_workspace
+    returns None → require_author stays True).
+    """
+    from app.modules.coaching.service import get_coaching_student_for_workspace
+    is_coaching_workspace = (
+        await get_coaching_student_for_workspace(db, package.client_id)
+    ) is not None
+
     location_count = (await db.execute(
         select(func.count()).select_from(PackageLocation).where(
             PackageLocation.package_id == package.id,
@@ -288,6 +309,7 @@ async def assert_package_publish_ready(
         author_count=author_count,
         has_pv=has_pv,
         siblings_with_shared_districts=siblings_with_shared,
+        require_author=not is_coaching_workspace,
     )
 
     # Batch 4E: dangling conditional-question gate.
