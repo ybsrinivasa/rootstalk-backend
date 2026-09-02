@@ -709,6 +709,36 @@ async def get_coaching_student_for_user(
     )).scalar_one_or_none()
 
 
+async def get_coaching_visible_client_ids(
+    db: AsyncSession, user_id: str,
+) -> Optional[list[str]]:
+    """For a coaching student, return the client IDs they should
+    see in farmer-discovery pickers:
+        1. Their own coaching workspace (subscribable — the whole
+           point of coaching practice).
+        2. The session's reference client (browsable only — lets
+           the student see what a real, fully-configured client's
+           advisory looks like as a teaching reference).
+    Real (non-coaching) users return None — callers should use
+    their normal filter chain unchanged.
+
+    Subscribing to the reference client is REFUSED at
+    create_subscription (a student subscribing to a real client
+    would silently pollute that client's farmer base with
+    coaching-context data — orders, queries, alerts — which would
+    entangle real business flow with practice flow). The reference
+    client is intentionally browsable-only.
+    """
+    student = await get_coaching_student_for_user(db, user_id)
+    if student is None:
+        return None
+    workspace = await db.get(Client, student.workspace_client_id)
+    ids = [student.workspace_client_id]
+    if workspace is not None and workspace.parent_client_id:
+        ids.append(workspace.parent_client_id)
+    return ids
+
+
 async def guard_coaching_workspace_onboarding(
     db: AsyncSession,
     client_id: str,

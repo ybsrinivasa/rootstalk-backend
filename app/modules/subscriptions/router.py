@@ -1319,27 +1319,24 @@ async def discover_crops(
     matches the district. They onboard farmers via promoters."""
     from app.modules.advisory.models import PackageLocation, PackageStatus
     from app.modules.clients.models import Client, PaymentModel
-    from app.modules.coaching.service import get_coaching_student_for_user
+    from app.modules.coaching.service import get_coaching_visible_client_ids
     from app.modules.sync.models import CoshCoreItem
-    from sqlalchemy import and_, or_
+    from sqlalchemy import and_
 
-    # Coaching Sandbox — a student's coaching workspace is
-    # is_coaching=true + COMPANY_PAYS, so the real-farmer filter
-    # chain hides it. Surface the student's OWN workspace here so
-    # they can self-subscribe to packages they've authored. Real
-    # users get None → filter is byte-identical to before.
-    coaching_student = await get_coaching_student_for_user(db, current_user.id)
-    student_workspace_id = coaching_student.workspace_client_id if coaching_student else None
-
-    real_client_filter = and_(
-        Client.payment_model == PaymentModel.FARMER_PAYS,
-        Client.is_training.is_(False),
-        Client.is_coaching.is_(False),
-    )
-    client_filter = (
-        or_(real_client_filter, Client.id == student_workspace_id)
-        if student_workspace_id else real_client_filter
-    )
+    # Coaching Sandbox — restrict discovery to {own workspace,
+    # reference client} for coaching students. Prevents accidental
+    # subscription to unrelated real companies (which would pollute
+    # their farmer base with coaching orders/queries/alerts). Real
+    # users get None → normal filter chain unchanged.
+    coaching_visible_ids = await get_coaching_visible_client_ids(db, current_user.id)
+    if coaching_visible_ids is not None:
+        client_filter = Client.id.in_(coaching_visible_ids)
+    else:
+        client_filter = and_(
+            Client.payment_model == PaymentModel.FARMER_PAYS,
+            Client.is_training.is_(False),
+            Client.is_coaching.is_(False),
+        )
 
     result = await db.execute(
         select(Package.crop_cosh_id)
@@ -1405,23 +1402,21 @@ async def discover_crops_and_companies(
     # they can self-subscribe. The /farmer/discover/crops and
     # /farmer/discover/companies endpoints (which feed the subscribe
     # flow) keep the FARMER_PAYS filter.
-    # Coaching Sandbox — see /farmer/discover/crops for the
-    # rationale. Same shape: surface the student's own workspace
-    # via OR clause; real users get None so behaviour is unchanged.
-    from app.modules.coaching.service import get_coaching_student_for_user
-    from sqlalchemy import and_, or_
-    coaching_student = await get_coaching_student_for_user(db, current_user.id)
-    student_workspace_id = coaching_student.workspace_client_id if coaching_student else None
-    real_client_filter = and_(
-        Client.status == ClientStatus.ACTIVE,
-        Client.hidden_from_discovery.is_(False),
-        Client.is_training.is_(False),
-        Client.is_coaching.is_(False),
-    )
-    client_filter = (
-        or_(real_client_filter, Client.id == student_workspace_id)
-        if student_workspace_id else real_client_filter
-    )
+    # Coaching Sandbox — see /farmer/discover/crops for rationale.
+    # Same shape: coaching student sees ONLY own workspace + reference
+    # client. Real users get None → normal filter chain unchanged.
+    from app.modules.coaching.service import get_coaching_visible_client_ids
+    from sqlalchemy import and_
+    coaching_visible_ids = await get_coaching_visible_client_ids(db, current_user.id)
+    if coaching_visible_ids is not None:
+        client_filter = Client.id.in_(coaching_visible_ids)
+    else:
+        client_filter = and_(
+            Client.status == ClientStatus.ACTIVE,
+            Client.hidden_from_discovery.is_(False),
+            Client.is_training.is_(False),
+            Client.is_coaching.is_(False),
+        )
 
     pkg_rows = (await db.execute(
         select(Package.crop_cosh_id, Package.client_id)
@@ -1536,22 +1531,26 @@ async def discover_companies(
     a promoter (dealer/facilitator) onboarding."""
     from app.modules.advisory.models import PackageLocation, PackageStatus
     from app.modules.clients.models import Client, ClientStatus, PaymentModel
-    from app.modules.coaching.service import get_coaching_student_for_user
-    from sqlalchemy import and_, or_
+    from app.modules.coaching.service import get_coaching_visible_client_ids
+    from sqlalchemy import and_
 
-    # Coaching Sandbox — surface the student's own workspace in the
-    # subscribe-picker; real users see the same filter as before.
-    coaching_student = await get_coaching_student_for_user(db, current_user.id)
-    student_workspace_id = coaching_student.workspace_client_id if coaching_student else None
-    real_pkg_filter = and_(
-        Client.payment_model == PaymentModel.FARMER_PAYS,
-        Client.is_training.is_(False),
-        Client.is_coaching.is_(False),
-    )
-    pkg_client_filter = (
-        or_(real_pkg_filter, Client.id == student_workspace_id)
-        if student_workspace_id else real_pkg_filter
-    )
+    # Coaching Sandbox — restrict to {own workspace, reference
+    # client} for coaching students. Real users see the normal
+    # FARMER_PAYS + non-training + non-coaching filter unchanged.
+    coaching_visible_ids = await get_coaching_visible_client_ids(db, current_user.id)
+    if coaching_visible_ids is not None:
+        pkg_client_filter = Client.id.in_(coaching_visible_ids)
+        detail_client_filter = Client.id.in_(coaching_visible_ids)
+    else:
+        pkg_client_filter = and_(
+            Client.payment_model == PaymentModel.FARMER_PAYS,
+            Client.is_training.is_(False),
+            Client.is_coaching.is_(False),
+        )
+        detail_client_filter = and_(
+            Client.is_training.is_(False),
+            Client.is_coaching.is_(False),
+        )
 
     result = await db.execute(
         select(Package.client_id)
@@ -1567,15 +1566,6 @@ async def discover_companies(
         .distinct()
     )
     client_ids = result.scalars().all()
-
-    real_detail_filter = and_(
-        Client.is_training.is_(False),
-        Client.is_coaching.is_(False),
-    )
-    detail_client_filter = (
-        or_(real_detail_filter, Client.id == student_workspace_id)
-        if student_workspace_id else real_detail_filter
-    )
 
     companies = []
     for client_id in client_ids:
@@ -1635,21 +1625,31 @@ async def create_subscription(
     if client is None:
         raise HTTPException(status_code=404, detail="Client not found")
 
-    # Coaching Sandbox — a coaching student self-subscribing to
-    # their OWN workspace bypasses both the is_training refusal
-    # (coaching workspaces aren't training but we want the same
-    # "no external self-subscribe" posture for real farmers) and
-    # the COMPANY_PAYS refusal (coaching workspaces are COMPANY_PAYS
-    # by construction — there's no Razorpay payment path here). The
-    # subscription lands ACTIVE directly so the student can proceed
-    # with the flow without a payment step. Verified: the current
-    # user must BE the student for this workspace — any other user
-    # falls through to the normal (existing) refusals.
+    # Coaching Sandbox — a coaching student may ONLY subscribe to
+    # their own workspace. Reference client (visible in the picker
+    # for BROWSING) is refused here — subscribing would pollute
+    # the real client's farmer base with coaching-context orders
+    # and queries, which would entangle real business flow with
+    # practice flow. Every other real client is also refused (they
+    # shouldn't even appear in the picker after the coaching-scoped
+    # discovery filter, but this is defence-in-depth).
     coaching_student = await get_coaching_student_for_user(db, current_user.id)
     is_own_coaching_workspace = (
         coaching_student is not None
         and coaching_student.workspace_client_id == client.id
     )
+    if coaching_student is not None and not is_own_coaching_workspace:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "coaching_subscribe_own_workspace_only",
+                "message": (
+                    "In a coaching session you can only subscribe to "
+                    "packages in your own workspace. Real companies "
+                    "and the reference client are browse-only."
+                ),
+            },
+        )
 
     if client.is_training and not is_own_coaching_workspace:
         raise HTTPException(
