@@ -8505,6 +8505,27 @@ async def try_another_dealer(
     new_dealer_id = data.get("dealer_user_id")
     if not new_dealer_id:
         raise HTTPException(status_code=422, detail="dealer_user_id required")
+
+    # Coaching Sandbox — defence-in-depth against a direct API call
+    # that bypasses the (already-restricted) picker. In an is_coaching
+    # workspace, the new dealer must be the student themselves.
+    # No-op for real clients — helper returns None.
+    from app.modules.coaching.service import get_coaching_student_for_workspace
+    coaching_ctx = await get_coaching_student_for_workspace(db, order.client_id)
+    if coaching_ctx is not None:
+        _student, student_user = coaching_ctx
+        if new_dealer_id != student_user.id:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "coaching_external_onboarding_forbidden",
+                    "message": (
+                        "In a coaching workspace, orders can only be "
+                        "re-routed to the student's own dealer self."
+                    ),
+                },
+            )
+
     item.status = OrderItemStatus.PENDING
     item.brand_cosh_id = None
     item.brand_name = None
@@ -11606,6 +11627,39 @@ async def nearby_dealers(
                     )
                 )).all()
                 has_locked = bool(locked_practices)
+
+    # Coaching Sandbox — if this facilitator is forwarding for an
+    # order/context whose client is a coaching workspace, return
+    # ONLY the student themselves (their dealer profile). Prevents
+    # forwarding real orders into the practice workspace's dealer
+    # list AND vice versa. No-op for real clients — the helper
+    # returns None and existing code runs unchanged.
+    if target_client_id:
+        from app.modules.coaching.service import get_coaching_student_for_workspace
+        coaching_ctx = await get_coaching_student_for_workspace(db, target_client_id)
+        if coaching_ctx is not None:
+            _student, student_user = coaching_ctx
+            profile = (await db.execute(
+                select(DealerProfile).where(DealerProfile.user_id == student_user.id)
+            )).scalar_one_or_none()
+            if not profile or not profile.shop_gps_lat or not profile.shop_gps_lng:
+                return []
+            dist = _haversine(
+                lat, lng,
+                float(profile.shop_gps_lat), float(profile.shop_gps_lng),
+            )
+            return [{
+                "user_id": student_user.id,
+                "name": student_user.name,
+                "phone": student_user.phone,
+                "shop_name": profile.shop_name,
+                "shop_address": profile.shop_address,
+                "sell_categories": profile.sell_categories or [],
+                "distance_km": round(dist, 1),
+                "shop_gps_lat": float(profile.shop_gps_lat),
+                "shop_gps_lng": float(profile.shop_gps_lng),
+                "tier": "LOCKED_MATCH" if has_locked else "FIRST_DEALER_ADVANTAGE",
+            }]
 
     # Build the onboarded-dealer pool.
     onboarded_q = select(ClientPromoter).where(

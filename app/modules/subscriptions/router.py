@@ -2946,6 +2946,9 @@ async def delegate_lookup(
     """
     from app.modules.auth.service import get_user_by_phone
     from app.modules.clients.models import Client, ClientPromoter
+    from app.modules.coaching.service import (
+        get_coaching_student_for_user, normalise_phone,
+    )
 
     target = await get_user_by_phone(db, phone)
     if target is None:
@@ -2956,7 +2959,27 @@ async def delegate_lookup(
                 "message": "No user found with this phone number.",
             },
         )
-    if target.id == current_user.id:
+
+    # Coaching Sandbox — a coaching student may only look up their
+    # OWN approved phone. Prevents probing real users' identity +
+    # org associations. Also allows self-lookup (skipping the normal
+    # delegate_is_self block) so cross-role practice works.
+    # No-op for real users — get_coaching_student_for_user returns
+    # None and the normal delegate_is_self check runs.
+    coaching_student = await get_coaching_student_for_user(db, current_user.id)
+    if coaching_student is not None:
+        if normalise_phone(phone) != normalise_phone(coaching_student.approved_phone):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "coaching_external_onboarding_forbidden",
+                    "message": (
+                        "In a coaching workspace, only your own registered "
+                        "phone can be looked up as a payment delegate."
+                    ),
+                },
+            )
+    elif target.id == current_user.id:
         raise HTTPException(
             status_code=422,
             detail={
@@ -3030,7 +3053,27 @@ async def delegate_payment(
         resolved_user_id = delegate_user.id
     if not resolved_user_id:
         raise HTTPException(status_code=422, detail="Provide either requested_from_user_id or delegate_phone.")
-    if resolved_user_id == current_user.id:
+
+    # Coaching Sandbox — a coaching student may only delegate to
+    # THEMSELVES (their own facilitator/dealer persona). Any other
+    # target user is refused. The normal delegate_is_self block is
+    # inverted for coaching students — self is the ONLY allowed
+    # target so cross-role practice works. No-op for real users.
+    from app.modules.coaching.service import get_coaching_student_for_user
+    coaching_student = await get_coaching_student_for_user(db, current_user.id)
+    if coaching_student is not None:
+        if resolved_user_id != current_user.id:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "coaching_external_onboarding_forbidden",
+                    "message": (
+                        "In a coaching workspace, payment requests can "
+                        "only be sent to your own facilitator/dealer self."
+                    ),
+                },
+            )
+    elif resolved_user_id == current_user.id:
         # Self-delegation shouldn't be possible from the PWA — frontend
         # blocks it before submit — but guard the backend too so a
         # direct API call can't create a self-targeted row.
@@ -6472,6 +6515,41 @@ async def nearby_dealers_for_farmer(
     )).scalar_one_or_none()
     if not sub:
         raise HTTPException(status_code=404, detail="Subscription not found")
+
+    # Coaching Sandbox — in an is_coaching workspace, the dealer
+    # picker returns ONLY the student themselves (if they've self-
+    # registered as a dealer). Prevents leaking real system-wide
+    # dealers into the practice workspace's ordering flow. No-op
+    # for real clients — the helper returns None and existing code
+    # runs unchanged.
+    from app.modules.coaching.service import get_coaching_student_for_workspace
+    coaching_ctx = await get_coaching_student_for_workspace(db, sub.client_id)
+    if coaching_ctx is not None:
+        _student, student_user = coaching_ctx
+        profile = (await db.execute(
+            select(DealerProfile).where(DealerProfile.user_id == student_user.id)
+        )).scalar_one_or_none()
+        if not profile or not profile.shop_gps_lat or not profile.shop_gps_lng:
+            return []
+        farmer_lat = lat or (float(current_user.gps_lat) if current_user.gps_lat else 0.0)
+        farmer_lng = lng or (float(current_user.gps_lng) if current_user.gps_lng else 0.0)
+        dist = _haversine_sub(
+            farmer_lat, farmer_lng,
+            float(profile.shop_gps_lat), float(profile.shop_gps_lng),
+        )
+        return [{
+            "user_id": student_user.id,
+            "name": student_user.name,
+            "phone": student_user.phone,
+            "shop_name": profile.shop_name,
+            "shop_address": profile.shop_address,
+            "sell_categories": profile.sell_categories or [],
+            "distance_km": round(dist, 1),
+            "is_promoter": True,
+            "is_training_dealer": False,
+            "shop_gps_lat": float(profile.shop_gps_lat),
+            "shop_gps_lng": float(profile.shop_gps_lng),
+        }]
 
     # Resolve the variety's client_id for the brand-lock filter. We
     # narrow on `variety.client_id`, not `sub.client_id`, because the

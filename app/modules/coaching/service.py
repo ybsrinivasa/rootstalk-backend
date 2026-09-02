@@ -661,6 +661,54 @@ def normalise_phone(input_phone: str) -> str:
     return "+91" + digits[-10:]
 
 
+async def get_coaching_student_for_workspace(
+    db: AsyncSession, workspace_client_id: str,
+) -> Optional[tuple["CoachingStudent", User]]:
+    """If `workspace_client_id` points at a coaching workspace,
+    return the student that owns it + their User row. Returns None
+    for real (non-coaching) clients — callers use that as the
+    "run the normal (non-coaching) picker" signal.
+
+    Used by dealer / facilitator picker endpoints that need to
+    short-circuit to "only the student themselves" inside a
+    coaching workspace, without changing the code path for real
+    clients.
+    """
+    client = await db.get(Client, workspace_client_id)
+    if client is None or not client.is_coaching:
+        return None
+    student = (await db.execute(
+        select(CoachingStudent).where(
+            CoachingStudent.workspace_client_id == workspace_client_id,
+        )
+    )).scalar_one_or_none()
+    if student is None:
+        return None
+    student_user = await db.get(User, student.user_id)
+    if student_user is None:
+        return None
+    return (student, student_user)
+
+
+async def get_coaching_student_for_user(
+    db: AsyncSession, user_id: str,
+) -> Optional["CoachingStudent"]:
+    """If `user_id` belongs to a coaching student, return their
+    CoachingStudent row. Real (non-coaching) users return None so
+    the caller keeps its existing behaviour unchanged.
+
+    Login is already blocked outside ACTIVE sessions
+    (`guard_coaching_student_login`), so any caller reaching a
+    logged-in endpoint AND finding a CoachingStudent row here can
+    treat the session as active without re-checking.
+    """
+    return (await db.execute(
+        select(CoachingStudent).where(
+            CoachingStudent.user_id == user_id,
+        )
+    )).scalar_one_or_none()
+
+
 async def guard_coaching_workspace_onboarding(
     db: AsyncSession,
     client_id: str,
