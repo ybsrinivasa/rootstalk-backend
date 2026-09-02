@@ -563,6 +563,19 @@ async def invite_pundit(
     re-invite at will (user direction 2026-05-27).
     """
     await _assert_portal_member(db, current_user.id, client_id)
+
+    # Coaching Sandbox — inside an is_coaching workspace, only the
+    # student's own approved phone can be onboarded as Primary /
+    # Panel Expert. Resolves the target user's phone from the
+    # supplied pundit_user_id and delegates to the shared guard.
+    # No-op for real clients.
+    from app.modules.coaching.service import guard_coaching_workspace_onboarding
+    target_user = await db.get(User, request.pundit_user_id)
+    await guard_coaching_workspace_onboarding(
+        db, client_id,
+        target_phone=(target_user.phone if target_user else "") or "",
+    )
+
     profile = (await db.execute(
         select(FarmPunditProfile).where(FarmPunditProfile.user_id == request.pundit_user_id)
     )).scalar_one_or_none()
