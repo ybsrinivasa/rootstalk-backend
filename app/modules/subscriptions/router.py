@@ -1319,18 +1319,20 @@ async def discover_crops(
     matches the district. They onboard farmers via promoters."""
     from app.modules.advisory.models import PackageLocation, PackageStatus
     from app.modules.clients.models import Client, PaymentModel
-    from app.modules.coaching.service import get_coaching_visible_client_ids
+    from app.modules.coaching.service import get_coaching_student_for_user
     from app.modules.sync.models import CoshCoreItem
     from sqlalchemy import and_
 
-    # Coaching Sandbox — restrict discovery to {own workspace,
-    # reference client} for coaching students. Prevents accidental
-    # subscription to unrelated real companies (which would pollute
-    # their farmer base with coaching orders/queries/alerts). Real
-    # users get None → normal filter chain unchanged.
-    coaching_visible_ids = await get_coaching_visible_client_ids(db, current_user.id)
-    if coaching_visible_ids is not None:
-        client_filter = Client.id.in_(coaching_visible_ids)
+    # Coaching Sandbox — crop LIST is restricted to the student's
+    # OWN workspace crops (the ones they've authored). Reference
+    # client's crops don't appear here, so the student can't cross
+    # into a real company's advisory via the crop path. Reference
+    # is still reachable via the Companies picker's "Explore
+    # advisory" button. Real users get None → normal filter chain
+    # unchanged.
+    coaching_student = await get_coaching_student_for_user(db, current_user.id)
+    if coaching_student is not None:
+        client_filter = Client.id == coaching_student.workspace_client_id
     else:
         client_filter = and_(
             Client.payment_model == PaymentModel.FARMER_PAYS,
@@ -1402,41 +1404,89 @@ async def discover_crops_and_companies(
     # they can self-subscribe. The /farmer/discover/crops and
     # /farmer/discover/companies endpoints (which feed the subscribe
     # flow) keep the FARMER_PAYS filter.
-    # Coaching Sandbox — see /farmer/discover/crops for rationale.
-    # Same shape: coaching student sees ONLY own workspace + reference
-    # client. Real users get None → normal filter chain unchanged.
-    from app.modules.coaching.service import get_coaching_visible_client_ids
+    # Coaching Sandbox — split filter model:
+    #   - CROPS list = student's own workspace crops ONLY (prevents
+    #     the student from cross-navigating into a real company's
+    #     advisory via a crop the reference client also publishes).
+    #   - COMPANIES list = {workspace, reference} (reference stays
+    #     reachable as a card so student can "Explore advisory"
+    #     directly).
+    # Real users get None on both helpers → normal filter chain
+    # runs unchanged.
+    from app.modules.coaching.service import (
+        get_coaching_student_for_user, get_coaching_visible_client_ids,
+    )
     from sqlalchemy import and_
+    coaching_student = await get_coaching_student_for_user(db, current_user.id)
     coaching_visible_ids = await get_coaching_visible_client_ids(db, current_user.id)
-    if coaching_visible_ids is not None:
-        client_filter = Client.id.in_(coaching_visible_ids)
+
+    if coaching_student is not None:
+        crops_client_filter = Client.id == coaching_student.workspace_client_id
+        companies_client_filter = Client.id.in_(coaching_visible_ids)
     else:
-        client_filter = and_(
+        real_filter = and_(
             Client.status == ClientStatus.ACTIVE,
             Client.hidden_from_discovery.is_(False),
             Client.is_training.is_(False),
             Client.is_coaching.is_(False),
         )
+        crops_client_filter = real_filter
+        companies_client_filter = real_filter
 
-    pkg_rows = (await db.execute(
+    # CROP-side query — only rows that count toward the crop LIST.
+    crop_pkg_rows = (await db.execute(
         select(Package.crop_cosh_id, Package.client_id)
         .join(PackageLocation, PackageLocation.package_id == Package.id)
         .join(Client, Client.id == Package.client_id)
         .where(
             Package.status == PackageStatus.ACTIVE,
             PackageLocation.district_cosh_id == district_cosh_id,
-            client_filter,
+            crops_client_filter,
         )
         .distinct()
     )).all()
 
+    # COMPANY-side query — rows that count toward the companies list.
+    # For real users this is the same as crop_pkg_rows (same filter);
+    # for coaching students it's a superset (workspace + reference).
+    if coaching_student is not None:
+        company_pkg_rows = (await db.execute(
+            select(Package.crop_cosh_id, Package.client_id)
+            .join(PackageLocation, PackageLocation.package_id == Package.id)
+            .join(Client, Client.id == Package.client_id)
+            .where(
+                Package.status == PackageStatus.ACTIVE,
+                PackageLocation.district_cosh_id == district_cosh_id,
+                companies_client_filter,
+            )
+            .distinct()
+        )).all()
+    else:
+        company_pkg_rows = crop_pkg_rows
+
+    # crop_to_clients only lists clients that publish crops in the
+    # crops LIST — for coaching, that means workspace at minimum
+    # (reference client may also appear if it publishes the same
+    # workspace-crop, which is fine).
+    workspace_crop_ids = {crop_id for crop_id, _ in crop_pkg_rows if crop_id}
     crop_to_clients: dict[str, set[str]] = {}
     client_to_crops: dict[str, set[str]] = {}
-    for crop_id, client_id in pkg_rows:
+    for crop_id, client_id in company_pkg_rows:
         if not crop_id or not client_id:
             continue
-        crop_to_clients.setdefault(crop_id, set()).add(client_id)
+        # Only surface (crop → client) mappings for crops that appear
+        # in the crops list. Reference-client's non-shared crops are
+        # excluded — student reaches them via the company card, not
+        # the crop-cross-filter.
+        if crop_id in workspace_crop_ids:
+            crop_to_clients.setdefault(crop_id, set()).add(client_id)
         client_to_crops.setdefault(client_id, set()).add(crop_id)
+    # Ensure workspace crops with no rows in company_pkg_rows (edge
+    # case: workspace has a crop that only appears in crop_pkg_rows
+    # if filters diverge — for real users this never happens since
+    # both queries are identical; belt-and-braces).
+    for c in workspace_crop_ids:
+        crop_to_clients.setdefault(c, set())
 
     # Resolve crop names from Cosh, preferring the farmer's language.
     lang = current_user.language_code or "en"
@@ -1531,16 +1581,20 @@ async def discover_companies(
     a promoter (dealer/facilitator) onboarding."""
     from app.modules.advisory.models import PackageLocation, PackageStatus
     from app.modules.clients.models import Client, ClientStatus, PaymentModel
-    from app.modules.coaching.service import get_coaching_visible_client_ids
+    from app.modules.coaching.service import get_coaching_student_for_user
     from sqlalchemy import and_
 
-    # Coaching Sandbox — restrict to {own workspace, reference
-    # client} for coaching students. Real users see the normal
-    # FARMER_PAYS + non-training + non-coaching filter unchanged.
-    coaching_visible_ids = await get_coaching_visible_client_ids(db, current_user.id)
-    if coaching_visible_ids is not None:
-        pkg_client_filter = Client.id.in_(coaching_visible_ids)
-        detail_client_filter = Client.id.in_(coaching_visible_ids)
+    # Coaching Sandbox — since /discover/crops returns only
+    # workspace crops, this endpoint (companies-per-crop) is
+    # naturally called with a workspace crop. Restrict to workspace
+    # only — even if the reference client incidentally publishes
+    # the same crop, don't surface it here (the reference client
+    # is browsable via the Companies picker card, not the crop
+    # path). Real users see the normal filter chain unchanged.
+    coaching_student = await get_coaching_student_for_user(db, current_user.id)
+    if coaching_student is not None:
+        pkg_client_filter = Client.id == coaching_student.workspace_client_id
+        detail_client_filter = Client.id == coaching_student.workspace_client_id
     else:
         pkg_client_filter = and_(
             Client.payment_model == PaymentModel.FARMER_PAYS,
