@@ -34,6 +34,7 @@ from app.modules.coaching.emails import (
     send_student_invite_email,
 )
 from app.modules.coaching.models import (
+    COACHING_STARTER_POOL_UNITS,
     CoachingInviteStatus, CoachingSession, CoachingSessionStatus,
     CoachingStudent, CoachingStudentInvite, INVITE_EXPIRY_DAYS,
     OPEN_SESSION_STATUSES, SESSION_DURATION_DAYS, new_invite_token,
@@ -526,6 +527,23 @@ async def approve_invite(
         assigned_pwa_roles=[],
     )
     db.add(coaching_student)
+
+    # Coaching Sandbox — seed the workspace's SubscriptionPool with
+    # COACHING_STARTER_POOL_UNITS units so the student can practise
+    # the CA → allocate-to-Promoter → assign-to-Farmer flow without
+    # ever hitting Razorpay (which is blocked for coaching
+    # workspaces at the topup endpoints). The row is marked by a
+    # note so anyone reading pool history can tell coach-seed rows
+    # from real Razorpay top-ups.
+    from app.modules.subscriptions.models import SubscriptionPool
+    db.add(SubscriptionPool(
+        id=new_uuid(),
+        client_id=workspace.id,
+        units_purchased=COACHING_STARTER_POOL_UNITS,
+        units_consumed=0,
+        purchased_by_user_id=coach.id,
+        note="COACHING_STARTER_POOL",
+    ))
 
     invite.status = CoachingInviteStatus.APPROVED.value
     invite.approved_at = utcnow()

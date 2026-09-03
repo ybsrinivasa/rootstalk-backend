@@ -96,6 +96,12 @@ INVITE_EXPIRY_DAYS = 14
 # Auto-close window after a session moves to ACTIVE.
 SESSION_DURATION_DAYS = 30
 
+# Coaching Sandbox — subscription units auto-granted to a student's
+# workspace at approval time (2026-09-03). Lets the student practise
+# the CA → F-P/D-P → Farmer assignment flow without ever hitting the
+# Razorpay top-up path (which is blocked for coaching workspaces).
+COACHING_STARTER_POOL_UNITS = 50
+
 
 # ── Tables ────────────────────────────────────────────────────────────────
 

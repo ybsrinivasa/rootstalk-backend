@@ -959,6 +959,25 @@ async def create_pool_payment_order(
     """
     from app.services.payment_service import create_pool_topup_order
     from app.services.subscription_pricing import quote_for
+
+    # Coaching Sandbox — coaching workspaces are pre-seeded with a
+    # starter pool at approval time and can't top up more. This is
+    # deliberate: the sandbox is for practice, not billing. Real
+    # clients unaffected.
+    from app.modules.coaching.service import get_coaching_student_for_workspace
+    if await get_coaching_student_for_workspace(db, client_id) is not None:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "coaching_pool_topup_disabled",
+                "message": (
+                    "Purchasing new subscription units is disabled in a "
+                    "coaching workspace. Your workspace was pre-loaded "
+                    "with practice units."
+                ),
+            },
+        )
+
     try:
         q = quote_for(request.units)
     except ValueError as exc:
@@ -996,6 +1015,23 @@ async def verify_pool_payment(
         fetch_order_amount_paise, verify_payment_signature,
     )
     from app.services.subscription_pricing import quote_for
+
+    # Coaching Sandbox — defence-in-depth. create-order refuses for
+    # coaching workspaces so verify shouldn't be reachable, but if a
+    # stale Razorpay callback lands here, refuse the credit rather
+    # than adding units to a coaching pool via a live-payment path.
+    from app.modules.coaching.service import get_coaching_student_for_workspace
+    if await get_coaching_student_for_workspace(db, client_id) is not None:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "coaching_pool_topup_disabled",
+                "message": (
+                    "Coaching workspace pools are seeded at approval "
+                    "time and cannot receive Razorpay top-ups."
+                ),
+            },
+        )
 
     if not verify_payment_signature(
         request.razorpay_order_id,
