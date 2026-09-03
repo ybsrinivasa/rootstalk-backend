@@ -11985,6 +11985,7 @@ async def _build_eligible_recipients_payload(
     """
     from math import radians, sin, cos, asin, sqrt
     from app.modules.clients.models import ClientPromoter
+    from app.modules.coaching.service import get_coaching_student_for_workspace
 
     cat_to_plural = {"PESTICIDE": "PESTICIDES", "FERTILIZER": "FERTILISERS"}
     required_plural = cat_to_plural.get((category or "").upper())
@@ -11997,6 +11998,80 @@ async def _build_eligible_recipients_payload(
     else:
         farmer_lat = float(current_user.gps_lat) if current_user.gps_lat else 0.0
         farmer_lng = float(current_user.gps_lng) if current_user.gps_lng else 0.0
+
+    def _dist_km_null(lat1, lon1, lat2, lon2):
+        """Distance helper that tolerates missing GPS — returns 0.0
+        when either endpoint is missing so the row is kept."""
+        if not (lat1 and lon1 and lat2 and lon2):
+            return 0.0
+        rlat1, rlon1, rlat2, rlon2 = map(radians, [lat1, lon1, lat2, lon2])
+        a = sin((rlat2 - rlat1) / 2) ** 2 + cos(rlat1) * cos(rlat2) * sin((rlon2 - rlon1) / 2) ** 2
+        return 2 * 6371 * asin(sqrt(a))
+
+    # Coaching Sandbox — inside a coaching workspace, return ONLY
+    # the student themselves as both dealer + facilitator (when they
+    # have the respective role registrations). Don't gate on GPS —
+    # students often haven't completed location setup; distance is
+    # meaningless with a single recipient. Real clients fall through
+    # to the standard logic below.
+    coaching_ctx = await get_coaching_student_for_workspace(db, client_id)
+    if coaching_ctx is not None:
+        _student, student_user = coaching_ctx
+        cp_rows = (await db.execute(
+            select(ClientPromoter).where(
+                ClientPromoter.client_id == client_id,
+                ClientPromoter.user_id == student_user.id,
+                ClientPromoter.status == "ACTIVE",
+            )
+        )).scalars().all()
+        roles = {cp.promoter_type for cp in cp_rows}
+        c_dealers: list[dict] = []
+        c_facilitators: list[dict] = []
+        if "DEALER" in roles:
+            profile = (await db.execute(
+                select(DealerProfile).where(DealerProfile.user_id == student_user.id)
+            )).scalar_one_or_none()
+            if profile:
+                gps_ok = bool(profile.shop_gps_lat and profile.shop_gps_lng)
+                dist = _dist_km_null(
+                    farmer_lat, farmer_lng,
+                    float(profile.shop_gps_lat) if gps_ok else 0.0,
+                    float(profile.shop_gps_lng) if gps_ok else 0.0,
+                )
+                c_dealers.append({
+                    "user_id": student_user.id,
+                    "name": student_user.name,
+                    "phone": student_user.phone,
+                    "shop_name": profile.shop_name,
+                    "is_training_dealer": False,
+                    "shop_address": profile.shop_address,
+                    "sell_categories": profile.sell_categories or [],
+                    "distance_km": round(dist, 1),
+                    "shop_gps_lat": float(profile.shop_gps_lat) if gps_ok else None,
+                    "shop_gps_lng": float(profile.shop_gps_lng) if gps_ok else None,
+                })
+        if "FACILITATOR" in roles:
+            gps_ok = bool(student_user.gps_lat and student_user.gps_lng)
+            dist = _dist_km_null(
+                farmer_lat, farmer_lng,
+                float(student_user.gps_lat) if gps_ok else 0.0,
+                float(student_user.gps_lng) if gps_ok else 0.0,
+            )
+            c_facilitators.append({
+                "user_id": student_user.id,
+                "name": student_user.name,
+                "phone": student_user.phone,
+                "distance_km": round(dist, 1),
+                "gps_lat": float(student_user.gps_lat) if gps_ok else None,
+                "gps_lng": float(student_user.gps_lng) if gps_ok else None,
+            })
+        return {
+            "category": (category or "").upper() or None,
+            "has_locked_brand": has_locked,
+            "locked_brand_explainer": None,
+            "dealers": c_dealers,
+            "facilitators": c_facilitators,
+        }
 
     def _dist_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         rlat1, rlon1, rlat2, rlon2 = map(radians, [lat1, lon1, lat2, lon2])

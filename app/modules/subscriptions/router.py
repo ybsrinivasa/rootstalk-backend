@@ -6651,14 +6651,19 @@ async def nearby_dealers_for_farmer(
         profile = (await db.execute(
             select(DealerProfile).where(DealerProfile.user_id == student_user.id)
         )).scalar_one_or_none()
-        if not profile or not profile.shop_gps_lat or not profile.shop_gps_lng:
+        # Coaching: don't gate on shop GPS. Students often haven't
+        # completed shop location setup; distance is meaningless when
+        # there's only one recipient. Real farmers still get the GPS
+        # filter — this branch is coaching-only.
+        if not profile:
             return []
+        gps_ok = bool(profile.shop_gps_lat and profile.shop_gps_lng)
         farmer_lat = lat or (float(current_user.gps_lat) if current_user.gps_lat else 0.0)
         farmer_lng = lng or (float(current_user.gps_lng) if current_user.gps_lng else 0.0)
         dist = _haversine_sub(
             farmer_lat, farmer_lng,
             float(profile.shop_gps_lat), float(profile.shop_gps_lng),
-        )
+        ) if gps_ok else 0.0
         return [{
             "user_id": student_user.id,
             "name": student_user.name,
@@ -6669,8 +6674,8 @@ async def nearby_dealers_for_farmer(
             "distance_km": round(dist, 1),
             "is_promoter": True,
             "is_training_dealer": False,
-            "shop_gps_lat": float(profile.shop_gps_lat),
-            "shop_gps_lng": float(profile.shop_gps_lng),
+            "shop_gps_lat": float(profile.shop_gps_lat) if gps_ok else None,
+            "shop_gps_lng": float(profile.shop_gps_lng) if gps_ok else None,
         }]
 
     # Resolve the variety's client_id for the brand-lock filter. We
@@ -6817,6 +6822,7 @@ async def nearby_facilitators_for_farmer(
     are excluded — the picker is a reference list of vetted recipients
     for the order's client."""
     from app.modules.clients.models import ClientPromoter
+    from app.modules.coaching.service import get_coaching_student_for_workspace
     from app.services.training import resolve_package_client_id
     sub = (await db.execute(
         select(Subscription).where(
@@ -6831,6 +6837,42 @@ async def nearby_facilitators_for_farmer(
     farmer_lng = lng or (float(current_user.gps_lng) if current_user.gps_lng else 0.0)
 
     promoter_user_id = await _get_promoter(db, subscription_id, PromoterType.FACILITATOR)
+
+    # Coaching Sandbox — if this is a coaching workspace, return
+    # ONLY the student (if they've onboarded themselves as a
+    # facilitator). Don't gate on User.gps_lat/lng — students often
+    # haven't completed location setup and distance is meaningless
+    # when there's only one recipient. Real farmers hit the standard
+    # onboarded-facilitator query below (unchanged).
+    coaching_ctx = await get_coaching_student_for_workspace(db, sub.client_id)
+    if coaching_ctx is not None:
+        _student, student_user = coaching_ctx
+        # Must have an ACTIVE FACILITATOR ClientPromoter row at
+        # the workspace — this is the "onboarded" gate.
+        cp_exists = (await db.execute(
+            select(ClientPromoter.id).where(
+                ClientPromoter.client_id == sub.client_id,
+                ClientPromoter.user_id == student_user.id,
+                ClientPromoter.promoter_type == "FACILITATOR",
+                ClientPromoter.status == "ACTIVE",
+            ).limit(1)
+        )).scalar_one_or_none()
+        if cp_exists is None:
+            return []
+        gps_ok = bool(student_user.gps_lat and student_user.gps_lng)
+        dist = _haversine_sub(
+            farmer_lat, farmer_lng,
+            float(student_user.gps_lat), float(student_user.gps_lng),
+        ) if gps_ok else 0.0
+        return [{
+            "user_id": student_user.id,
+            "name": student_user.name,
+            "phone": student_user.phone,
+            "distance_km": round(dist, 1),
+            "is_promoter": True,
+            "gps_lat": float(student_user.gps_lat) if gps_ok else None,
+            "gps_lng": float(student_user.gps_lng) if gps_ok else None,
+        }]
 
     # Training subs inherit the parent's onboarded facilitators.
     effective_client_id = await resolve_package_client_id(db, sub.client_id)
