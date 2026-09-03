@@ -486,8 +486,14 @@ async def approve_invite(
             status_code=422,
             detail="Student's submitted form is missing name or phone.",
         )
-    approved_phone = normalise_phone(phone_raw)
-    await _ensure_phone_available_for_student(db, approved_phone)
+    submitted_phone = normalise_phone(phone_raw)
+    # On prod, refuses (422) if the phone belongs to a real user.
+    # On staging/dev, returns either the submitted phone (if free) or
+    # a synthesised +91999xxxxxxx disposable so testers can reuse
+    # their own real numbers across sessions. Downstream User row +
+    # CoachingStudent.approved_phone + credentials email all use the
+    # returned value (`approved_phone`).
+    approved_phone = await _ensure_phone_available_for_student(db, submitted_phone)
 
     # Provision the student's User (portal login = email + password).
     plain_password = secrets.token_urlsafe(12)
@@ -628,19 +634,33 @@ def _build_workspace_client(
 
 async def _ensure_phone_available_for_student(
     db: AsyncSession, phone: str,
-) -> None:
+) -> str:
     """Approved-phone exclusivity: the phone the student registered
-    with must not already belong to any real user. If it does, the
-    coach must reject the invite and ask the student to use a
-    different number.
+    with must not already belong to any real user.
+
+    Prod behaviour: raise 422 `phone_already_a_real_user` on
+    collision — the coach must ask the student for a different
+    number. This preserves the "student phone is exclusively theirs
+    during the session" promise for real cohorts.
+
+    Non-prod (staging/dev) behaviour: on collision, auto-synthesise
+    a disposable phone in the `+91999xxxxxxx` spare range and return
+    that instead of the submitted phone. Testers can reuse their own
+    real numbers across sessions without hitting the collision — the
+    synth phone will just be used for the coaching User row + PWA
+    login (via dev_otp mode; no real SMS goes out to a spare-range
+    number anyway).
+
+    Returns the phone to actually use for the coaching student's
+    User row. Caller MUST use the return value rather than the
+    submitted `phone` when creating User + CoachingStudent —
+    otherwise the DB unique constraint on User.phone will still
+    trip.
 
     Non-coaching users only — a phone tied to another CoachingStudent
     is caught separately by the unique User.phone constraint at
-    insert time, but real-user detection is the important defensive
-    layer since the entire "student phone is exclusively theirs
-    during the session" promise depends on it.
+    insert time.
     """
-    from sqlalchemy import exists
     from app.modules.subscriptions.models import Subscription  # noqa: F401 (registry)
     # Check any User row currently holding this phone that ISN'T
     # itself a student in an OPEN session.
@@ -655,7 +675,11 @@ async def _ensure_phone_available_for_student(
             User.id.notin_(student_user_subq),
         )
     )).scalar_one_or_none()
-    if conflict is not None:
+    if conflict is None:
+        return phone
+
+    # Collision detected.
+    if settings.environment == "production":
         raise HTTPException(
             status_code=422,
             detail={
@@ -667,6 +691,24 @@ async def _ensure_phone_available_for_student(
                 ),
             },
         )
+
+    # Non-prod fallback — synthesise a disposable phone in the
+    # +91999xxxxxxx spare range. Loop until we land on one that
+    # isn't taken (very unlikely to iterate more than once).
+    for _ in range(10):
+        candidate = f"+91999{secrets.randbelow(10_000_000):07d}"
+        existing = (await db.execute(
+            select(User.id).where(User.phone == candidate).limit(1)
+        )).scalar_one_or_none()
+        if existing is None:
+            return candidate
+    # If ten random tries all collided (astronomically unlikely),
+    # give up loudly so the tester sees the problem rather than
+    # getting a mysterious IntegrityError.
+    raise HTTPException(
+        status_code=500,
+        detail="Failed to synthesise a disposable phone for coaching student.",
+    )
 
 
 def normalise_phone(input_phone: str) -> str:
@@ -950,8 +992,13 @@ async def submit_student_form(
             msg = "This invite is no longer active."
         raise HTTPException(status_code=409, detail=msg)
 
-    # Fail-fast on phone availability so student can correct on the spot
-    # instead of getting a rejection email later.
+    # Fail-fast on phone availability so student can correct on the
+    # spot instead of getting a rejection email later. On prod this
+    # raises 422 for collisions; on staging/dev it returns a
+    # (possibly synthesised) fallback we discard here — the actual
+    # synthesis happens at approve time on that same call so
+    # submitted_form.phone stays as what the student typed (coach
+    # UI shows the real submitted number, not a random synth).
     approved_phone = normalise_phone(form.get("phone", ""))
     await _ensure_phone_available_for_student(db, approved_phone)
 
