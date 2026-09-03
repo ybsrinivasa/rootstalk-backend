@@ -480,11 +480,20 @@ async def claim_role(
     # combinations are fine; only this pair is mutually exclusive.
     # Per the "first deliberate exception" to
     # feedback_users_wear_multiple_role_hats.md.
+    #
+    # 2026-09-03 — Coaching Sandbox bypass. Students need to
+    # practise cross-role scenarios (farmer sends order to their own
+    # dealer / facilitator persona). The conflict-of-interest concern
+    # doesn't apply inside an isolated coaching workspace — every
+    # order originates from and routes to the same student. Real
+    # users still hit the exclusion below.
+    from app.modules.coaching.service import get_coaching_student_for_user
+    coaching_student = await get_coaching_student_for_user(db, current_user.id)
     CONFLICT = {
         RoleType.DEALER: RoleType.FACILITATOR,
         RoleType.FACILITATOR: RoleType.DEALER,
     }
-    if role_type in CONFLICT:
+    if role_type in CONFLICT and coaching_student is None:
         conflicting = CONFLICT[role_type]
         has_conflict_role = (await db.execute(
             select(UserRole).where(
