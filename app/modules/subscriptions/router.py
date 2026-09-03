@@ -804,6 +804,20 @@ async def promoter_farmer_locations(
     support lands. Refuses if the farmer hasn't registered."""
     await _resolve_promoter_locked_client(db, current_user)  # gate
     from app.modules.auth.service import get_user_by_phone
+    from app.modules.coaching.service import (
+        get_coaching_student_for_user, normalise_phone,
+    )
+
+    # Coaching Sandbox — silence non-self lookups (see
+    # /promoter/farmer-lookup for rationale).
+    coaching_student = await get_coaching_student_for_user(db, current_user.id)
+    if coaching_student is not None:
+        if normalise_phone(phone) != normalise_phone(coaching_student.approved_phone):
+            raise HTTPException(
+                status_code=404,
+                detail="Farmer not registered. Ask them to install the RootsTalk app first.",
+            )
+
     farmer = await get_user_by_phone(db, phone)
     if not farmer:
         raise HTTPException(
@@ -2741,6 +2755,23 @@ async def promoter_farmer_lookup(
 ):
     """Check if farmer is registered and return their basic info for promoter assignment."""
     from app.modules.auth.service import get_user_by_phone
+    from app.modules.coaching.service import (
+        get_coaching_student_for_user, normalise_phone,
+    )
+
+    # Coaching Sandbox — a coaching student wearing the Facilitator-
+    # Promoter hat may only look up their own approved phone.
+    # Prevents real farmer identities (name, id, state, district)
+    # leaking into the coaching PWA. Self-lookup falls through so
+    # the student can practise assigning packages to themselves.
+    coaching_student = await get_coaching_student_for_user(db, current_user.id)
+    if coaching_student is not None:
+        if normalise_phone(phone) != normalise_phone(coaching_student.approved_phone):
+            raise HTTPException(
+                status_code=404,
+                detail="No farmer found with this phone number. They must register in the RootsTalk app first.",
+            )
+
     farmer = await get_user_by_phone(db, phone)
     if not farmer:
         raise HTTPException(status_code=404, detail="No farmer found with this phone number. They must register in the RootsTalk app first.")
