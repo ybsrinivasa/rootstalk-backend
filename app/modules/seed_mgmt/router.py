@@ -626,7 +626,15 @@ async def lookup_seed_recipient(
     if target is None:
         return {"found": False, "reason": "phone_not_registered", "phone": normalised}
 
-    if target.id == current_user.id:
+    # Coaching Sandbox — silence non-self lookups; allow self-lookup
+    # to fall through so student can send seed order to their own
+    # dealer/facilitator persona. No-op for real farmers.
+    from app.modules.coaching.service import get_coaching_student_for_user
+    coaching_student = await get_coaching_student_for_user(db, current_user.id)
+    if coaching_student is not None and target.id != current_user.id:
+        return {"found": False, "reason": "phone_not_registered", "phone": normalised}
+
+    if target.id == current_user.id and coaching_student is None:
         return {
             "found": True,
             "user_id": target.id,
@@ -755,6 +763,15 @@ async def place_seed_order(
             status_code=400,
             detail="Seed order cannot specify both dealer_user_id and facilitator_user_id",
         )
+
+    # Coaching Sandbox — refuse any recipient user_id that isn't the
+    # student themselves. No-op for real farmers.
+    from app.modules.coaching.service import guard_coaching_order_recipient
+    await guard_coaching_order_recipient(
+        db, current_user.id,
+        dealer_user_id=dealer_user_id,
+        facilitator_user_id=facilitator_user_id,
+    )
 
     # Brand-lock guard (Point 3a, 2026-06-18). Seed varieties are
     # always brand-locked: a SEED order can only be sent to a dealer
@@ -2160,6 +2177,16 @@ async def facilitator_route_seed_to_dealer(
     dealer_user_id = data.get("dealer_user_id")
     if not dealer_user_id:
         raise HTTPException(status_code=422, detail="dealer_user_id required")
+
+    # Coaching Sandbox — refuse any onward routing to a dealer that
+    # isn't the student themselves. Key off the order's farmer_user_id
+    # (which is the student when the order originated in a coaching
+    # workspace).
+    from app.modules.coaching.service import guard_coaching_order_recipient
+    await guard_coaching_order_recipient(
+        db, order.farmer_user_id, dealer_user_id=dealer_user_id,
+    )
+
     await _assert_active_dealer(db, dealer_user_id)
     if not await _is_dealer_onboarded_by_client(
         db, dealer_user_id, order.client_id,
@@ -2225,7 +2252,15 @@ async def facilitator_lookup_dealer_for_seed_order(
     if target is None:
         return {"found": False, "reason": "phone_not_registered", "phone": normalised}
 
-    if target.id == current_user.id:
+    # Coaching Sandbox — silence non-self lookups; allow self so the
+    # student wearing facilitator hat can route the seed order to
+    # their own dealer persona.
+    from app.modules.coaching.service import get_coaching_student_for_user
+    coaching_student = await get_coaching_student_for_user(db, current_user.id)
+    if coaching_student is not None and target.id != current_user.id:
+        return {"found": False, "reason": "phone_not_registered", "phone": normalised}
+
+    if target.id == current_user.id and coaching_student is None:
         return {
             "found": True, "user_id": target.id, "phone": target.phone,
             "name": target.name, "can_receive": False, "reason": "self",

@@ -709,6 +709,46 @@ async def get_coaching_student_for_user(
     )).scalar_one_or_none()
 
 
+async def guard_coaching_order_recipient(
+    db: AsyncSession,
+    farmer_user_id: str,
+    *,
+    dealer_user_id: Optional[str] = None,
+    facilitator_user_id: Optional[str] = None,
+) -> None:
+    """Refuse to route an order (or forward one) to any user that
+    isn't the coaching student themselves.
+
+    Companion to the picker + payment-request guards. Those blocked
+    the discovery / lookup paths for straight cases, but the order-
+    create endpoints (create_order, dbs-bulk, seed-order create,
+    PUT /send, facilitator forward) take dealer_user_id /
+    facilitator_user_id straight from the request body — the PWA
+    can populate them via the lookup-by-phone endpoints, which
+    return a real user's user_id even for a typed number.
+
+    Called from every order-create / order-forward site. No-op for
+    real farmers (get_coaching_student_for_user returns None); for
+    coaching students, refuses any user_id that isn't their own.
+    """
+    student = await get_coaching_student_for_user(db, farmer_user_id)
+    if student is None:
+        return
+    for candidate in (dealer_user_id, facilitator_user_id):
+        if candidate is not None and candidate != farmer_user_id:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "coaching_external_onboarding_forbidden",
+                    "message": (
+                        "In a coaching session, orders can only be sent "
+                        "to yourself in your dealer / facilitator role. "
+                        "Use your own registered phone."
+                    ),
+                },
+            )
+
+
 async def get_coaching_visible_client_ids(
     db: AsyncSession, user_id: str,
 ) -> Optional[list[str]]:

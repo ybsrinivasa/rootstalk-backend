@@ -211,6 +211,15 @@ async def create_order(
     if not sub:
         raise HTTPException(status_code=404, detail="Subscription not found")
 
+    # Coaching Sandbox — refuse any recipient user_id that isn't the
+    # student themselves. No-op for real farmers.
+    from app.modules.coaching.service import guard_coaching_order_recipient
+    await guard_coaching_order_recipient(
+        db, current_user.id,
+        dealer_user_id=request.dealer_user_id,
+        facilitator_user_id=request.facilitator_user_id,
+    )
+
     # ── Timeline-type integrity: orders must NOT mix DBS / DAS / CALENDAR ─
     # 2026-06-30 — CHA / QA timelines (DAYS_AFTER_DETECTION /
     # DAYS_AFTER_RESPONSE) are EXCLUDED from this rule per user
@@ -2419,6 +2428,15 @@ async def create_dbs_bulk_order(
     if not sub:
         raise HTTPException(status_code=404, detail="Subscription not found")
 
+    # Coaching Sandbox — refuse any recipient user_id that isn't the
+    # student themselves. No-op for real farmers.
+    from app.modules.coaching.service import guard_coaching_order_recipient
+    await guard_coaching_order_recipient(
+        db, current_user.id,
+        dealer_user_id=request.dealer_user_id,
+        facilitator_user_id=request.facilitator_user_id,
+    )
+
     # Annual-only gate.
     package = (await db.execute(
         select(Package).where(Package.id == sub.package_id)
@@ -2651,6 +2669,15 @@ async def send_draft_order(
             status_code=422,
             detail="Pick exactly one — dealer or facilitator.",
         )
+
+    # Coaching Sandbox — refuse any recipient user_id that isn't the
+    # student themselves. No-op for real farmers.
+    from app.modules.coaching.service import guard_coaching_order_recipient
+    await guard_coaching_order_recipient(
+        db, current_user.id,
+        dealer_user_id=body.dealer_user_id,
+        facilitator_user_id=body.facilitator_user_id,
+    )
 
     # ── Locked-brand gate (Orders V2 Batch 5) ────────────────────
     # If even one item is brand-locked, the recipient dealer must
@@ -2968,7 +2995,20 @@ async def lookup_recipient_for_new_order(
     if target is None:
         return {"found": False, "reason": "phone_not_registered", "phone": normalised}
 
-    if target.id == current_user.id:
+    # Coaching Sandbox — silence any lookup that isn't the student
+    # themselves. Prevents leaking real dealer / facilitator details
+    # (name, phone, state, district, role) into the coaching PWA.
+    # For self-lookup: skip the normal "self" refusal below and fall
+    # through to the role-check so the student CAN send to their own
+    # dealer/facilitator persona (that's the whole point of coaching
+    # cross-role practice). No-op for real farmers — coaching_student
+    # is None and the standard self-refusal below runs.
+    from app.modules.coaching.service import get_coaching_student_for_user
+    coaching_student = await get_coaching_student_for_user(db, current_user.id)
+    if coaching_student is not None and target.id != current_user.id:
+        return {"found": False, "reason": "phone_not_registered", "phone": normalised}
+
+    if target.id == current_user.id and coaching_student is None:
         return {
             "found": True,
             "user_id": target.id,
@@ -3084,7 +3124,14 @@ async def lookup_recipient_for_forward(
     if target is None:
         return {"found": False, "reason": "phone_not_registered", "phone": normalised}
 
-    if target.id == current_user.id:
+    # Coaching Sandbox — silence non-self lookups; allow self-lookup
+    # to fall through so student can send to their own persona.
+    from app.modules.coaching.service import get_coaching_student_for_user
+    coaching_student = await get_coaching_student_for_user(db, current_user.id)
+    if coaching_student is not None and target.id != current_user.id:
+        return {"found": False, "reason": "phone_not_registered", "phone": normalised}
+
+    if target.id == current_user.id and coaching_student is None:
         return {
             "found": True, "user_id": target.id, "phone": target.phone,
             "name": target.name, "can_receive": False, "reason": "self",
@@ -6332,6 +6379,18 @@ async def route_order_to_dealer(
     dealer_user_id = data.get("dealer_user_id")
     if not dealer_user_id:
         raise HTTPException(status_code=422, detail="dealer_user_id required")
+
+    # Coaching Sandbox — if the order's FARMER is a coaching student
+    # (which implies the facilitator IS the same student), refuse
+    # any onward routing to a dealer user_id other than themselves.
+    # Key off the order's farmer_user_id, not current_user (though
+    # they're the same in coaching by construction).
+    from app.modules.coaching.service import guard_coaching_order_recipient
+    await guard_coaching_order_recipient(
+        db, order.farmer_user_id,
+        dealer_user_id=dealer_user_id,
+    )
+
     # 2026-06-06 — Spec: facilitators can only forward to dealers,
     # never to another facilitator. Guard recipient is an active
     # dealer (the picker UI is dealer-only, but the endpoint took
@@ -11505,7 +11564,15 @@ async def facilitator_lookup_dealer_for_order(
     if target is None:
         return {"found": False, "reason": "phone_not_registered", "phone": normalised}
 
-    if target.id == current_user.id:
+    # Coaching Sandbox — facilitator (=student) looking up a dealer.
+    # Silence any lookup that isn't the student themselves so real
+    # dealer details don't leak into the coaching PWA.
+    from app.modules.coaching.service import get_coaching_student_for_user
+    coaching_student = await get_coaching_student_for_user(db, current_user.id)
+    if coaching_student is not None and target.id != current_user.id:
+        return {"found": False, "reason": "phone_not_registered", "phone": normalised}
+
+    if target.id == current_user.id and coaching_student is None:
         return {
             "found": True, "user_id": target.id, "phone": target.phone,
             "name": target.name, "can_receive": False, "reason": "self",
