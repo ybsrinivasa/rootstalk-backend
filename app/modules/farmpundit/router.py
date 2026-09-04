@@ -3729,7 +3729,34 @@ async def _get_next_pundit_for_query(
     client_id: str,
     subscription_id: str,
 ) -> Optional[FarmPunditProfile]:
-    """BL-12a: Full priority routing — preference → Promoter-Pundit → round-robin."""
+    """BL-12a: Full priority routing — preference → Promoter-Pundit → round-robin.
+
+    Coaching Sandbox exception (2026-09-04): inside is_coaching
+    workspaces, routing is simplified — always land the query on the
+    sole ACTIVE Primary Expert at the workspace, ignoring farmer
+    preference and any Promoter-Pundit designation on the assigning
+    promoter. User decision: "let student be functional as a Primary
+    Expert only. Even if a Promoter-Pundit has assigned the crop,
+    let the query reach the Student-Primary Expert only." Makes
+    testing predictable + sidesteps the mutual-exclusion schema
+    limitation (one role per user per client). Real clients run the
+    full BL-12a chain unchanged.
+    """
+    from app.modules.coaching.service import get_coaching_student_for_workspace
+    if await get_coaching_student_for_workspace(db, client_id) is not None:
+        primary = (await db.execute(
+            select(ClientFarmPundit).where(
+                ClientFarmPundit.client_id == client_id,
+                ClientFarmPundit.role == PunditRole.PRIMARY,
+                ClientFarmPundit.status == "ACTIVE",
+            ).limit(1)
+        )).scalar_one_or_none()
+        if primary is None:
+            return None
+        return (await db.execute(
+            select(FarmPunditProfile).where(FarmPunditProfile.id == primary.pundit_id)
+        )).scalar_one_or_none()
+
     # Load all company pundits
     all_cp = (await db.execute(
         select(ClientFarmPundit).where(ClientFarmPundit.client_id == client_id)
