@@ -3063,13 +3063,31 @@ async def lookup_recipient_for_new_order(
         "has_locked_brand": has_locked,
     }
 
+    # 2026-09-08 — Training Dealer EXCLUSIVITY. In a training sub,
+    # only the designated Training Dealer may receive dealer orders;
+    # every other dealer (even other real dealers of the same org) is
+    # refused. Facilitator role stays permissive (facilitators aren't
+    # under the same exclusivity). Anchor: TestOrg training —
+    # facilitator + farmer must only reach Subbu (the designated
+    # Training Dealer). GPS-side handled by the picker; here we just
+    # gate can_receive.
+    from app.modules.clients.models import Client as _Client
+    _td_row = (await db.execute(
+        select(_Client.training_dealer_user_id, _Client.is_training)
+        .where(_Client.id == sub.client_id)
+    )).first()
+    is_training_sub = bool(_td_row and _td_row.is_training)
+    training_dealer_id = _td_row.training_dealer_user_id if _td_row else None
+
     # Role precedence. Same shape as the seed-order lookup, except
     # the DEALER onboarded-check fires only when has_locked is True
     # (regular orders without a locked brand are open to any active
     # dealer in the right licence category).
     dealer_allowed = False
     if "DEALER" in roles_held:
-        if not has_locked:
+        if is_training_sub and training_dealer_id:
+            dealer_allowed = (target.id == training_dealer_id)
+        elif not has_locked:
             dealer_allowed = True
         elif await _is_dealer_onboarded_by_client(
             db, target.id, sub.client_id,
@@ -3078,6 +3096,12 @@ async def lookup_recipient_for_new_order(
 
     if dealer_allowed:
         return {**base, "role": "DEALER", "can_receive": True, "reason": "ok"}
+    # In a training sub with a designated Training Dealer, dealer-only
+    # users who aren't the Training Dealer are refused with a
+    # training-specific reason before the FACILITATOR fallback below.
+    if is_training_sub and training_dealer_id and "DEALER" in roles_held and "FACILITATOR" not in roles_held:
+        return {**base, "role": "DEALER", "can_receive": False,
+                "reason": "not_training_dealer"}
     if "FACILITATOR" in roles_held:
         return {**base, "role": "FACILITATOR", "can_receive": True, "reason": "ok"}
     if "DEALER" in roles_held:
@@ -11632,6 +11656,25 @@ async def facilitator_lookup_dealer_for_order(
         return {**base, "role": None, "can_receive": False,
                 "reason": "not_dealer_or_facilitator"}
 
+    # 2026-09-08 — Training Dealer EXCLUSIVITY parity. If this is a
+    # training order and a Training Dealer is designated, refuse any
+    # dealer that isn't them — even other real dealers of the same
+    # org must be blocked so training orders can't leak to real
+    # dealers. GPS optional (training-dealer often skips shop-GPS
+    # setup). Anchor: Subbu (Training Dealer for TestOrg) — facilitator
+    # typing a real dealer's phone got can_receive=True; needs to be
+    # blocked.
+    from app.modules.clients.models import Client as _Client
+    _td_row = (await db.execute(
+        select(_Client.training_dealer_user_id, _Client.is_training)
+        .where(_Client.id == order.client_id)
+    )).first()
+    if _td_row and _td_row.is_training and _td_row.training_dealer_user_id:
+        if target.id != _td_row.training_dealer_user_id:
+            return {**base, "role": "DEALER", "can_receive": False,
+                    "reason": "not_training_dealer"}
+        return {**base, "role": "DEALER", "can_receive": True, "reason": "ok"}
+
     if has_locked and not await _is_dealer_onboarded_by_client(
         db, target.id, order.client_id,
     ):
@@ -11742,6 +11785,53 @@ async def nearby_dealers(
                 "shop_gps_lng": float(profile.shop_gps_lng),
                 "tier": "LOCKED_MATCH" if has_locked else "FIRST_DEALER_ADVANTAGE",
             }]
+
+    # 2026-09-08 — Training Dealer EXCLUSIVITY (parity with the
+    # farmer picker's 2026-08-09 branch). When the facilitator is
+    # forwarding a training-child order AND the CA has designated a
+    # Training Dealer on that child, return ONLY that dealer — even
+    # other real onboarded dealers of the parent org must be hidden
+    # so training orders can't leak to real dealers. GPS gate waived
+    # for the training-dealer path (they often skip shop-GPS setup;
+    # anchor: Subbu, Training Dealer for TestOrg — not appearing in
+    # picker). If the Training Dealer designation is missing OR the
+    # DealerProfile row doesn't exist, fall through to the normal
+    # onboarded-dealer path (user's OK from 2026-08-09 rule — don't
+    # strand the facilitator with an empty list).
+    if target_client_id:
+        from app.modules.clients.models import Client as _Client
+        _training_dealer_user_id = (await db.execute(
+            select(_Client.training_dealer_user_id)
+            .where(_Client.id == target_client_id, _Client.is_training == True)  # noqa: E712
+        )).scalar_one_or_none()
+        if _training_dealer_user_id:
+            td_profile = (await db.execute(
+                select(DealerProfile).where(DealerProfile.user_id == _training_dealer_user_id)
+            )).scalar_one_or_none()
+            td_user = (await db.execute(
+                select(User).where(User.id == _training_dealer_user_id)
+            )).scalar_one_or_none()
+            if td_profile and td_user:
+                gps_ok = bool(td_profile.shop_gps_lat and td_profile.shop_gps_lng)
+                dist = _haversine(
+                    lat, lng,
+                    float(td_profile.shop_gps_lat), float(td_profile.shop_gps_lng),
+                ) if gps_ok else 0.0
+                return [{
+                    "user_id": td_user.id,
+                    "name": td_user.name,
+                    "phone": td_user.phone,
+                    "shop_name": td_profile.shop_name,
+                    "shop_address": td_profile.shop_address,
+                    "sell_categories": td_profile.sell_categories or [],
+                    "distance_km": round(dist, 1),
+                    "shop_gps_lat": float(td_profile.shop_gps_lat) if gps_ok else None,
+                    "shop_gps_lng": float(td_profile.shop_gps_lng) if gps_ok else None,
+                    "tier": "LOCKED_MATCH" if has_locked else "FIRST_DEALER_ADVANTAGE",
+                }]
+            # Fall through: designated Training Dealer's profile is
+            # missing — same fallback as the farmer picker so we don't
+            # leave the facilitator with an empty list.
 
     # Build the onboarded-dealer pool.
     onboarded_q = select(ClientPromoter).where(
