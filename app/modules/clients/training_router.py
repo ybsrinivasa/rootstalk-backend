@@ -780,6 +780,24 @@ async def invite_farmer_to_training(
     db.add(assignment)
     await db.commit()
 
+    # 2026-09-08 — Fire the START_DATE alert synchronously, matching
+    # the real `/promoter/assignments/initiate` behaviour (subscriptions
+    # /router.py:2380-2388). The daily-alerts task skips subs whose
+    # PromoterAssignment is PENDING_FARMER_APPROVAL, so without this
+    # inline call training-sandbox subs never get the START_DATE nudge
+    # to farmer + promoter — the real-vs-training parity gap the user
+    # hit 2026-09-08. Best-effort; alert failures don't roll back the
+    # assignment.
+    try:
+        from app.tasks.alerts import send_alerts_now_for_subscription
+        await send_alerts_now_for_subscription(db, sub.id)
+        await db.commit()
+    except Exception as _e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            f"Synchronous alert on training assignment failed for sub {sub.id}: {_e}"
+        )
+
     # [Training]-prefixed FCM to the farmer. Same shape as the real
     # PROMOTER_ASSIGNMENT_RECEIVED push so the PWA's existing
     # handler can render it — the training marker travels via
