@@ -3008,7 +3008,16 @@ async def lookup_recipient_for_new_order(
     if coaching_student is not None and target.id != current_user.id:
         return {"found": False, "reason": "phone_not_registered", "phone": normalised}
 
-    if target.id == current_user.id and coaching_student is None:
+    # 2026-09-08 — Training Sandbox: same "allow self-lookup" as
+    # coaching. Training-facilitator/dealer often IS the same user
+    # as the training-farmer (the participant plays both sides to
+    # learn the flow). Real farmers still hit the self-refusal
+    # below. Anchor: IDF facilitator Raghu (+916361748007) hit
+    # `reason: self` when looking up himself for sub TR-26-000002.
+    from app.services.training import is_training_client
+    is_training_sub = await is_training_client(db, sub.client_id)
+
+    if target.id == current_user.id and coaching_student is None and not is_training_sub:
         return {
             "found": True,
             "user_id": target.id,
@@ -3131,7 +3140,13 @@ async def lookup_recipient_for_forward(
     if coaching_student is not None and target.id != current_user.id:
         return {"found": False, "reason": "phone_not_registered", "phone": normalised}
 
-    if target.id == current_user.id and coaching_student is None:
+    # 2026-09-08 — Training Sandbox: allow self-lookup for training
+    # orders (same rationale as coaching — participant plays both
+    # sides).
+    from app.services.training import is_training_client
+    is_training_order = await is_training_client(db, order.client_id)
+
+    if target.id == current_user.id and coaching_student is None and not is_training_order:
         return {
             "found": True, "user_id": target.id, "phone": target.phone,
             "name": target.name, "can_receive": False, "reason": "self",

@@ -6840,6 +6840,12 @@ async def nearby_dealers_for_farmer(
         # missing GPS — fall through to the normal picker so the farmer
         # isn't stuck with an empty list.
 
+    # 2026-09-08 — Waive shop GPS gate for training subs. Same
+    # rationale as the facilitator picker below.
+    is_training_sub_row = (await db.execute(
+        select(Client.is_training).where(Client.id == sub.client_id)
+    )).scalar_one_or_none()
+    is_training_sub = bool(is_training_sub_row)
     profiles = (await db.execute(select(DealerProfile))).scalars().all()
     results = []
     for profile in profiles:
@@ -6847,10 +6853,11 @@ async def nearby_dealers_for_farmer(
             continue
         if onboarded_dealer_ids is not None and profile.user_id not in onboarded_dealer_ids:
             continue
-        if not profile.shop_gps_lat or not profile.shop_gps_lng:
+        gps_ok = bool(profile.shop_gps_lat and profile.shop_gps_lng)
+        if not gps_ok and not is_training_sub:
             continue
         dist = _haversine_sub(farmer_lat, farmer_lng,
-                              float(profile.shop_gps_lat), float(profile.shop_gps_lng))
+                              float(profile.shop_gps_lat), float(profile.shop_gps_lng)) if gps_ok else 0.0
         dealer = (await db.execute(select(User).where(User.id == profile.user_id))).scalar_one_or_none()
         if dealer:
             results.append({
@@ -6863,8 +6870,8 @@ async def nearby_dealers_for_farmer(
                 "distance_km": round(dist, 1),
                 "is_promoter": dealer.id == promoter_user_id,
                 "is_training_dealer": False,
-                "shop_gps_lat": float(profile.shop_gps_lat),
-                "shop_gps_lng": float(profile.shop_gps_lng),
+                "shop_gps_lat": float(profile.shop_gps_lat) if gps_ok else None,
+                "shop_gps_lng": float(profile.shop_gps_lng) if gps_ok else None,
             })
 
     # Promoter > distance. (Training Dealer exclusivity is handled
@@ -6953,23 +6960,33 @@ async def nearby_facilitators_for_farmer(
     if not onboarded_ids:
         return []
 
+    # 2026-09-08 — Waive GPS gate for training subs. Training
+    # participants often skip GPS setup (they log in at events
+    # from someone else's phone; the facilitator persona might
+    # be the same user as the farmer). Anchor: IDF facilitator
+    # Raghu (+916361748007) — real ACTIVE FACILITATOR at IDF —
+    # was silently dropped from Raghu-farmer's training sub
+    # picker because his User.gps_lat/lng were NULL.
+    is_training_sub = effective_client_id != sub.client_id
+
     facilitators = (await db.execute(
         select(User).where(User.id.in_(onboarded_ids))
     )).scalars().all()
     results = []
     for fac in facilitators:
-        if not fac.gps_lat or not fac.gps_lng:
+        gps_ok = bool(fac.gps_lat and fac.gps_lng)
+        if not gps_ok and not is_training_sub:
             continue
         dist = _haversine_sub(farmer_lat, farmer_lng,
-                              float(fac.gps_lat), float(fac.gps_lng))
+                              float(fac.gps_lat), float(fac.gps_lng)) if gps_ok else 0.0
         results.append({
             "user_id": fac.id,
             "name": fac.name,
             "phone": fac.phone,
             "distance_km": round(dist, 1),
             "is_promoter": fac.id == promoter_user_id,
-            "gps_lat": float(fac.gps_lat),
-            "gps_lng": float(fac.gps_lng),
+            "gps_lat": float(fac.gps_lat) if gps_ok else None,
+            "gps_lng": float(fac.gps_lng) if gps_ok else None,
         })
 
     results.sort(key=lambda x: (0 if x["is_promoter"] else 1, x["distance_km"]))
