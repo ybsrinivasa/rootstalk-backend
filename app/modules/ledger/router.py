@@ -20,6 +20,7 @@ from app.database import get_db
 from app.dependencies import get_current_user, require_roles
 from app.modules.advisory.models import Package, Practice
 from app.modules.clients.models import Client
+from app.modules.coaching.service import get_coaching_student_for_user
 from app.modules.ledger.models import DealerFarmerNote, DealerManualSale, new_uuid
 from app.modules.ledger.schemas import (
     FarmerDetail, FarmerInfoUpdateRequest, LedgerEntry, ManualSaleCreateRequest,
@@ -203,6 +204,20 @@ async def get_roster(
     if not farmer_ids:
         return RosterResponse(farmers=[], total_count=0)
 
+    # Coaching-sandbox isolation: strip any coaching student out of
+    # the roster before hydrating User rows. Guards against the case
+    # where a dealer somehow accumulated a picked-up PL / manual
+    # entry against a coaching-student user_id (shouldn't happen in
+    # normal flow, but defensive here so the roster never leaks a
+    # coaching identity into a real dealer's world).
+    from app.modules.coaching.models import CoachingStudent  # local to avoid cycles
+    coaching_ids = set((await db.execute(
+        select(CoachingStudent.user_id).where(CoachingStudent.user_id.in_(farmer_ids))
+    )).scalars().all())
+    farmer_ids -= coaching_ids
+    if not farmer_ids:
+        return RosterResponse(farmers=[], total_count=0)
+
     # Hydrate user rows.
     users = (await db.execute(
         select(User).where(User.id.in_(farmer_ids))
@@ -281,6 +296,11 @@ async def get_farmer_detail(
     if not await _dealer_has_farmer_in_roster(db, dealer_id, user_id):
         raise HTTPException(status_code=404, detail={"code": "farmer_not_in_roster", "message": "This farmer is not in your ledger."})
 
+    # Coaching-sandbox isolation — never expose a coaching student's
+    # profile / history via the real dealer ledger.
+    if await get_coaching_student_for_user(db, user_id) is not None:
+        raise HTTPException(status_code=404, detail={"code": "farmer_not_in_roster"})
+
     farmer = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
     if not farmer:
         raise HTTPException(status_code=404, detail={"code": "farmer_not_found"})
@@ -343,7 +363,7 @@ async def get_farmer_detail(
             "package_id": pkg.id if pkg else None,
             "crop_name": crop_name,
             "crop_start_date": start_date,
-            "advising_company": client.name if client else None,
+            "advising_company": (client.display_name or client.full_name) if client else None,
         }
 
     entries: list[LedgerEntry] = []
@@ -554,6 +574,12 @@ async def lookup_phone(
     normalised = _normalise_phone(body.phone)
     user = (await db.execute(select(User).where(User.phone == normalised))).scalar_one_or_none()
     if not user:
+        return PhoneLookupResponse(found=False)
+    # Coaching-sandbox isolation: pretend coaching students don't
+    # exist in real dealer surfaces. Prevents identity + address
+    # leak of an isolated coaching workspace user into a real
+    # dealer's ledger.
+    if await get_coaching_student_for_user(db, user.id) is not None:
         return PhoneLookupResponse(found=False)
     cosh_ids = {c for c in (user.state_cosh_id, user.district_cosh_id) if c}
     names = await _resolve_cosh_names(db, cosh_ids, current_user.language_code or "en")
