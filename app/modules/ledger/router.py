@@ -472,6 +472,28 @@ async def get_farmer_detail(
             ))
 
     # ── Anonymised other-shop rows ─────────────────────────────
+    # Farmer privacy gate: only surface cross-dealer purchases when
+    # the farmer has explicitly opted in. Default is False; when
+    # False, the dealer sees no other-shop rows at all (silent —
+    # no "opted out" hint, to keep the dealer-facing view trust-
+    # preserving on both sides).
+    if not farmer.share_cross_dealer_purchases:
+        entries.sort(key=lambda e: e.date, reverse=True)
+        return FarmerDetail(
+            user_id=farmer.id,
+            name=farmer.name,
+            phone=farmer.phone,
+            photo_url=farmer.photo_url,
+            state_cosh_id=farmer.state_cosh_id,
+            district_cosh_id=farmer.district_cosh_id,
+            sub_district=farmer.sub_district_cosh_id,
+            state_name=names.get(farmer.state_cosh_id) if farmer.state_cosh_id else None,
+            district_name=names.get(farmer.district_cosh_id) if farmer.district_cosh_id else None,
+            note=note_row.note if note_row else None,
+            is_claimed=farmer.self_registered_at is not None,
+            entries=entries,
+        )
+
     # RT-mediated purchases by this farmer at OTHER dealers, tied to a sub.
     other_rows = (await db.execute(
         select(

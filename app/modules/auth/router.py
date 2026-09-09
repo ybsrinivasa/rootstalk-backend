@@ -726,6 +726,7 @@ async def get_me(request: Request, current_user: User = Depends(get_current_user
         "subscription_amount_inr": settings.subscription_amount_paise // 100,
         "query_amount_inr": settings.query_amount_paise // 100,
         "coaching_context": coaching_context,
+        "share_cross_dealer_purchases": bool(current_user.share_cross_dealer_purchases),
     }
 
 
@@ -777,6 +778,11 @@ async def update_my_profile(
                   "photo_url"]:
         if data.get(field) is not None:
             setattr(user, field, data[field])
+    # 2026-09-09 — Farmer privacy toggle for the dealer's Farmer
+    # Ledger. Accept explicit True/False (including False, which
+    # `data.get(...) is not None` handles correctly).
+    if "share_cross_dealer_purchases" in data:
+        user.share_cross_dealer_purchases = bool(data["share_cross_dealer_purchases"])
     # GPS fields are Decimal
     if data.get("gps_lat") is not None:
         from decimal import Decimal

@@ -95,6 +95,14 @@ class User(Base):
     self_registered_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )
+    # Farmer-controlled: when True, dealers viewing this farmer's
+    # ledger see anonymised "Purchased From Another Dealer" rows
+    # (brand + manufacturer + qty only). Default False — farmer
+    # must opt in via their PWA profile. Read by the ledger detail
+    # endpoint; toggled via PUT /auth/me/profile.
+    share_cross_dealer_purchases: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False, server_default="false",
+    )
 
     roles: Mapped[list["UserRole"]] = relationship("UserRole", back_populates="user")
 

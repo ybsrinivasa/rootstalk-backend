@@ -86,6 +86,10 @@ class UserOut(BaseModel):
     # every PWA/portal screen. WITHOUT this being declared on the
     # schema Pydantic strips it from the response.
     coaching_context: Optional[dict] = None
+    # 2026-09-09 — Farmer privacy: when True, dealers viewing this
+    # farmer's ledger see anonymised "Purchased From Another Dealer"
+    # rows. Default False. Farmer toggles it on their PWA profile.
+    share_cross_dealer_purchases: bool = False
 
     class Config:
         from_attributes = True
