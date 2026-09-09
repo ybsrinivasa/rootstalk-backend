@@ -1,5 +1,15 @@
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+
+# 2026-09-09 — Price becomes mandatory when the dealer marks an item
+# AVAILABLE, but only for orders CREATED after this timestamp. Older
+# orders were placed under the earlier "price optional" contract; we
+# grandfather them so the dealer isn't blocked mid-flow on in-flight
+# work. Fade-in coverage: a handful of pre-cutoff orders may still
+# submit with null prices for a few days as the queue drains — this
+# matches user intent 2026-09-09.
+PRICE_MANDATORY_SINCE = datetime(2026, 9, 9, 19, 0, tzinfo=timezone.utc)
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,6 +26,15 @@ from app.modules.orders.models import (
 )
 from app.services.order_events import record_event as _record_event
 from app.modules.subscriptions.models import Subscription
+
+
+def _price_required_for_order(order: "Order") -> bool:
+    """True if this order was created on/after PRICE_MANDATORY_SINCE.
+    Drives (a) client-side red-asterisk + Submit disable and (b) the
+    backend submit-for-approval gate that rejects null-price
+    AVAILABLE items."""
+    return bool(order.created_at) and order.created_at >= PRICE_MANDATORY_SINCE
+
 from app.modules.sync.models import VolumeFormula
 from app.modules.advisory.models import Package, Practice, Element, Timeline
 from app.services.bl06_volume_calc import calculate_volume
@@ -3999,6 +4018,9 @@ async def list_dealer_orders(
             "created_at": o.created_at,
             "item_status_counts": counts,
             "submit_action_type": submit_action_type,
+            # 2026-09-09 — Drives PWA's mandatory-price UI. True for
+            # orders created on/after PRICE_MANDATORY_SINCE.
+            "price_required": _price_required_for_order(o),
             # 2026-08-17 — Per-batch Pickup lifecycle. Primary source
             # for the new Final Confirmation + Packing + Pickup pills.
             "packing_batches": packing_batches,
@@ -5455,6 +5477,28 @@ async def submit_for_approval(
             item.dealer_pending_price = item_data["price"]
         if not item.dealer_pending_given_volume:
             raise HTTPException(status_code=422, detail=f"given_volume missing for item {item.id}")
+
+    # 2026-09-09 — Price mandatory for orders created on/after
+    # PRICE_MANDATORY_SINCE. Rejects submit when any AVAILABLE item
+    # has a NULL dealer_pending_price. ₹0 is allowed (explicit free /
+    # promo choice). Grandfathered for pre-cutoff orders per user.
+    if _price_required_for_order(order):
+        missing_price = [
+            i for i in pending_available
+            if i.dealer_pending_price is None
+        ]
+        if missing_price:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error_code": "PRICE_REQUIRED",
+                    "message": (
+                        f"{len(missing_price)} item(s) need a price before you "
+                        "can send the order to the farmer."
+                    ),
+                    "item_ids": [i.id for i in missing_price],
+                },
+            )
 
     action_type = "SEND_TO_FARMER" if pending_available else "SUBMIT_RESPONSE"
 
@@ -7588,6 +7632,8 @@ async def get_dealer_order(
         "date_from": order.date_from, "date_to": order.date_to,
         "created_at": order.created_at,
         "submit_action_type": submit_action_type,
+        # 2026-09-09 — Mandatory-price gate for the dealer's UI.
+        "price_required": _price_required_for_order(order),
         "client_is_training": bool(_client_row),
         # Batch 24 — context the dealer needs to make a call about
         # the order. Hidden from the farmer's view by living on a
