@@ -69,6 +69,12 @@ class FarmerDetail(BaseModel):
     state_name: Optional[str] = None
     district_name: Optional[str] = None
     note: Optional[str] = None
+    # True when the farmer has completed PWA self-registration
+    # (password_hash set). Claimed farmers own their own profile —
+    # the dealer cannot edit their name/address. False for
+    # dealer-added unclaimed farmers, which stay editable by any
+    # dealer (shared canonical, last-write-wins).
+    is_claimed: bool = False
     entries: list[LedgerEntry]
 
 

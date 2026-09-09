@@ -559,6 +559,7 @@ async def get_farmer_detail(
         state_name=names.get(farmer.state_cosh_id) if farmer.state_cosh_id else None,
         district_name=names.get(farmer.district_cosh_id) if farmer.district_cosh_id else None,
         note=note_row.note if note_row else None,
+        is_claimed=bool(farmer.password_hash),
         entries=entries,
     )
 
@@ -757,6 +758,17 @@ async def update_farmer_info(
     farmer = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
     if not farmer:
         raise HTTPException(status_code=404, detail={"code": "farmer_not_found"})
+
+    # Farmer owns their profile once they've self-registered on the
+    # PWA. Dealer edits become an override the farmer never asked for.
+    if farmer.password_hash:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "farmer_is_claimed",
+                "message": "This farmer is registered on RootsTalk and manages their own profile. Only they can update these details.",
+            },
+        )
 
     updates = body.model_dump(exclude_unset=True)
     if "name" in updates and updates["name"]:
