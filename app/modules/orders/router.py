@@ -8,7 +8,14 @@ from typing import Optional
 # work. Fade-in coverage: a handful of pre-cutoff orders may still
 # submit with null prices for a few days as the queue drains — this
 # matches user intent 2026-09-09.
-PRICE_MANDATORY_SINCE = datetime(2026, 9, 9, 19, 0, tzinfo=timezone.utc)
+#
+# Set to midnight UTC of the deploy day, so every order created on
+# or after 2026-09-09 (any time zone) is post-cutoff. Yesterday's
+# in-flight orders are grandfathered. (Earlier value of 19:00 UTC
+# was accidentally in the future when we first deployed — user
+# reported new orders created around 14:26 UTC still slipping
+# through without price; corrected same evening.)
+PRICE_MANDATORY_SINCE = datetime(2026, 9, 9, 0, 0, tzinfo=timezone.utc)
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
