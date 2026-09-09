@@ -390,6 +390,15 @@ class BatchPayment(Base):
     amount: Mapped[float] = mapped_column(DECIMAL(12, 2), nullable=False)
     status: Mapped[str] = mapped_column(String(30), nullable=False, default="PENDING")
     txn_ref: Mapped[str] = mapped_column(String(100), nullable=True)
+    # 2026-09-09 — v1.1 simplification. `amount` is the quoted total
+    # for the batch; `paid_amount` is what the farmer actually paid
+    # (may differ due to rounding, counter discount, etc.). Set on
+    # FARMER_MARKED_PAID. `screenshot_url` is the optional S3 URL
+    # of the farmer-uploaded payment confirmation, for dispute
+    # evidence only — dealer's confirm-payment tap is the source
+    # of truth.
+    paid_amount: Mapped[float] = mapped_column(DECIMAL(12, 2), nullable=True)
+    screenshot_url: Mapped[str] = mapped_column(Text, nullable=True)
     farmer_marked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     dealer_confirmed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

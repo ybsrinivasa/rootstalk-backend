@@ -2094,19 +2094,45 @@ async def mark_batch_paid(
     current_user: User = Depends(get_current_user),
 ):
     """Farmer marks the batch as paid after completing the UPI transfer.
-    Optional txn_ref for the dealer's reconciliation. Creates the
-    BatchPayment row if it doesn't exist yet. Idempotent — a second
-    mark-paid updates the timestamp + ref.
+
+    v1.1 (2026-09-09): txn_ref and paid_amount are now REQUIRED —
+    the payment surface only opens on the Pickup pill and the
+    farmer has already tapped Copy UPI ID + paid externally by the
+    time they hit this endpoint. screenshot_url is optional
+    (dispute evidence only).
+
+    Idempotent — a second mark-paid updates all fields. Row is
+    created if missing.
     """
     from datetime import datetime as _dt, timezone as _tz
     order = await _get_farmer_order(db, order_id, current_user.id)
-    amount = await _batch_amount(db, order.id, approval_round)
-    if amount <= 0:
+    quoted_amount = await _batch_amount(db, order.id, approval_round)
+    if quoted_amount <= 0:
         raise HTTPException(status_code=400, detail={
             "code": "nothing_to_pay",
             "message": "No approved items with prices in this batch.",
         })
-    row = await _get_or_create_batch_payment(db, order.id, approval_round, "UPI", amount)
+
+    txn_ref = (data.get("txn_ref") or "").strip()
+    if not txn_ref:
+        raise HTTPException(status_code=422, detail={
+            "code": "txn_ref_required",
+            "message": "Enter the UPI transaction ID from your payment app.",
+        })
+
+    try:
+        paid_amount = float(data.get("paid_amount") or 0)
+    except (TypeError, ValueError):
+        paid_amount = 0.0
+    if paid_amount <= 0:
+        raise HTTPException(status_code=422, detail={
+            "code": "paid_amount_required",
+            "message": "Enter the amount you paid.",
+        })
+
+    screenshot_url = (data.get("screenshot_url") or "").strip() or None
+
+    row = await _get_or_create_batch_payment(db, order.id, approval_round, "UPI", quoted_amount)
     if row.status == "DEALER_CONFIRMED":
         # Dealer already confirmed — no state to change. Return 200 for
         # idempotency; farmer's PWA can just refresh.
@@ -2114,15 +2140,18 @@ async def mark_batch_paid(
         return {"status": row.status, "amount": float(row.amount)}
     row.status = "FARMER_MARKED_PAID"
     row.farmer_marked_at = _dt.now(_tz.utc)
-    txn_ref = (data.get("txn_ref") or "").strip() or None
-    if txn_ref:
-        row.txn_ref = txn_ref
+    row.txn_ref = txn_ref
+    row.paid_amount = paid_amount
+    if screenshot_url is not None:
+        row.screenshot_url = screenshot_url
     await db.commit()
     return {
         "status": row.status,
         "amount": float(row.amount),
+        "paid_amount": float(row.paid_amount) if row.paid_amount is not None else None,
         "farmer_marked_at": row.farmer_marked_at.isoformat(),
         "txn_ref": row.txn_ref,
+        "screenshot_url": row.screenshot_url,
     }
 
 
@@ -5802,6 +5831,8 @@ async def _load_batch_payments_by_order(
             "amount": float(r.amount),
             "status": r.status,
             "txn_ref": r.txn_ref,
+            "paid_amount": float(r.paid_amount) if r.paid_amount is not None else None,
+            "screenshot_url": r.screenshot_url,
             "farmer_marked_at": r.farmer_marked_at.isoformat() if r.farmer_marked_at else None,
             "dealer_confirmed_at": r.dealer_confirmed_at.isoformat() if r.dealer_confirmed_at else None,
         }
@@ -5828,6 +5859,8 @@ def _batch_payment_payload(
         "amount": batch_amount,
         "status": "PENDING",
         "txn_ref": None,
+        "paid_amount": None,
+        "screenshot_url": None,
         "farmer_marked_at": None,
         "dealer_confirmed_at": None,
         "dealer_upi_available": dealer_upi_available,
