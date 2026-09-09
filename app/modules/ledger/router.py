@@ -559,7 +559,7 @@ async def get_farmer_detail(
         state_name=names.get(farmer.state_cosh_id) if farmer.state_cosh_id else None,
         district_name=names.get(farmer.district_cosh_id) if farmer.district_cosh_id else None,
         note=note_row.note if note_row else None,
-        is_claimed=bool(farmer.password_hash),
+        is_claimed=farmer.self_registered_at is not None,
         entries=entries,
     )
 
@@ -761,7 +761,7 @@ async def update_farmer_info(
 
     # Farmer owns their profile once they've self-registered on the
     # PWA. Dealer edits become an override the farmer never asked for.
-    if farmer.password_hash:
+    if farmer.self_registered_at is not None:
         raise HTTPException(
             status_code=403,
             detail={

@@ -176,13 +176,25 @@ async def verify_phone_otp(db: AsyncSession, phone: str, otp_code: str) -> bool:
 
 
 async def get_or_create_farmer(db: AsyncSession, phone: str) -> User:
-    """Get existing user by phone, or create a new Farmer."""
+    """Get existing user by phone, or create a new Farmer.
+
+    Also stamps `self_registered_at` — either on creation, or on
+    the first OTP login for a pre-existing user that was created
+    by another flow (typically the dealer's Farmer Ledger manual
+    entry). This is the "user proved ownership of this phone"
+    signal used to gate whether a dealer may edit their profile.
+    """
+    from datetime import datetime, timezone
     user = await get_user_by_phone(db, phone)
+    now = datetime.now(timezone.utc)
     if not user:
-        user = User(phone=phone)
+        user = User(phone=phone, self_registered_at=now)
         db.add(user)
         await db.flush()
         db.add(UserRole(user_id=user.id, role_type=RoleType.FARMER, status=StatusEnum.ACTIVE))
         await db.commit()
         user = await get_user_by_phone(db, phone)
+    elif user.self_registered_at is None:
+        user.self_registered_at = now
+        await db.commit()
     return user

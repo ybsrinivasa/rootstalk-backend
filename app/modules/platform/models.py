@@ -88,6 +88,13 @@ class User(Base):
     facilitator_declared_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )
+    # Set once, in the OTP verify-and-login flow, the first time
+    # this user proves ownership of their phone. Never cleared by
+    # logout. Distinguishes PWA-self-registered users from rows
+    # created by other flows (e.g. dealer's ledger manual entry).
+    self_registered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
 
     roles: Mapped[list["UserRole"]] = relationship("UserRole", back_populates="user")
 
