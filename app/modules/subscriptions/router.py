@@ -2923,13 +2923,44 @@ async def get_assignment_details(
     )).scalar_one_or_none()
 
     # Parameter-variable selections for this package (plain-language summary)
+    # 2026-09-10 — Localise via parameter_translations + variable_translations
+    # when an APPROVED row exists for the user's language; fall back to the
+    # English base name otherwise. Same posture as pick_translation.
+    from sqlalchemy import and_ as _and_pv
+    from app.modules.advisory.models import (
+        ParameterTranslation, VariableTranslation, TranslationStatus,
+    )
+    _lang = current_user.language_code or "en"
     pvs = (await db.execute(
-        select(PackageVariable, Parameter, Variable)
+        select(
+            PackageVariable, Parameter, Variable,
+            ParameterTranslation.name.label("param_loc"),
+            VariableTranslation.name.label("var_loc"),
+        )
         .join(Parameter, Parameter.id == PackageVariable.parameter_id)
         .join(Variable, Variable.id == PackageVariable.variable_id)
+        .outerjoin(
+            ParameterTranslation,
+            _and_pv(
+                ParameterTranslation.parameter_id == Parameter.id,
+                ParameterTranslation.language_code == _lang,
+                ParameterTranslation.translation_status == TranslationStatus.APPROVED,
+            ),
+        )
+        .outerjoin(
+            VariableTranslation,
+            _and_pv(
+                VariableTranslation.variable_id == Variable.id,
+                VariableTranslation.language_code == _lang,
+                VariableTranslation.translation_status == TranslationStatus.APPROVED,
+            ),
+        )
         .where(PackageVariable.package_id == sub.package_id)
     )).all()
-    pv_summary = [{"parameter": p.name, "variable": v.name} for _, p, v in pvs]
+    pv_summary = [
+        {"parameter": param_loc or p.name, "variable": var_loc or v.name}
+        for _, p, v, param_loc, var_loc in pvs
+    ]
 
     promoter = (await db.execute(
         select(User).where(User.id == assignment.promoter_user_id)
