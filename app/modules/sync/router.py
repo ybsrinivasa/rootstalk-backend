@@ -311,10 +311,18 @@ async def list_cosh_india_locations(
             CoshCoreItem.core_type.in_(["state_list", "district_list"]),
         )
     )).all()
+    # 2026-09-10 — Localise state/district names to the caller's
+    # language. `translations` is a dict like {"en": "Kolar",
+    # "kn": "ಕೋಲಾರ", ...}. Fall back to English when the target
+    # language's translation is missing so we never render null.
+    lang = (current_user.language_code or "en")
     state_names: dict[str, str] = {}
     district_names: dict[str, str] = {}
     for cosh_id, core_type, translations in cores:
-        name = (translations or {}).get("en") if isinstance(translations, dict) else None
+        if isinstance(translations, dict):
+            name = translations.get(lang) or translations.get("en")
+        else:
+            name = None
         if core_type == "state_list":
             state_names[cosh_id] = name
         elif core_type == "district_list":
