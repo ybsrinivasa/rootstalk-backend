@@ -2923,13 +2923,21 @@ async def get_assignment_details(
     )).scalar_one_or_none()
 
     # Parameter-variable selections for this package (plain-language summary)
-    # 2026-09-10 — Localise via parameter_translations + variable_translations
-    # when an APPROVED row exists for the user's language; fall back to the
-    # English base name otherwise. Same posture as pick_translation.
+    # 2026-09-10 — Three-tier localisation, precedence:
+    #   1. Cosh-synced P/V → `cosh_core_items.translations[lang]` (Cosh path,
+    #      same source the promoter's guided-step reads from).
+    #   2. Custom (SE-authored) P/V → `parameter_translations` /
+    #      `variable_translations` with translation_status=APPROVED.
+    #   3. Fall back to the English base name.
+    # Splitting these was necessary because Cosh-synced rows never populate
+    # the RootsTalk translation tables — a `parameter_translations`-only join
+    # left every Cosh P/V rendering English on the farmer's review screen
+    # while the promoter (Cosh path) already showed Kannada for the same row.
     from sqlalchemy import and_ as _and_pv
     from app.modules.advisory.models import (
         ParameterTranslation, VariableTranslation, TranslationStatus,
     )
+    from app.modules.sync.models import CoshCoreItem
     _lang = current_user.language_code or "en"
     pvs = (await db.execute(
         select(
@@ -2957,8 +2965,36 @@ async def get_assignment_details(
         )
         .where(PackageVariable.package_id == sub.package_id)
     )).all()
+
+    # Batch-load Cosh translations for every cosh_id referenced by this
+    # package's P/V so we can layer them ahead of the SE-authored fallback.
+    _cosh_ids = {
+        cid
+        for _, p, v, _, _ in pvs
+        for cid in (p.cosh_id, v.cosh_id)
+        if cid
+    }
+    _cosh_map: dict[str, dict] = {}
+    if _cosh_ids:
+        _rows = (await db.execute(
+            select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
+            .where(CoshCoreItem.cosh_id.in_(_cosh_ids))
+        )).all()
+        for _cid, _tr in _rows:
+            _cosh_map[_cid] = _tr or {}
+
+    def _pv_localise(base: str, cosh_id: str | None, loc: str | None) -> str:
+        if cosh_id and cosh_id in _cosh_map:
+            picked = pick_translation(_cosh_map[cosh_id], _lang, base)
+            if picked and picked != base:
+                return picked
+        return loc or base
+
     pv_summary = [
-        {"parameter": param_loc or p.name, "variable": var_loc or v.name}
+        {
+            "parameter": _pv_localise(p.name, p.cosh_id, param_loc),
+            "variable": _pv_localise(v.name, v.cosh_id, var_loc),
+        }
         for _, p, v, param_loc, var_loc in pvs
     ]
 
