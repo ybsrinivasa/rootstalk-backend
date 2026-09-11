@@ -79,6 +79,7 @@ async def _compute_window(
     period_from: datetime,
     period_to: datetime,
     client_ids: list[str],
+    client_filter_active: bool,
     state_cosh_id: Optional[str],
     district_cosh_id: Optional[str],
 ) -> dict:
@@ -86,16 +87,27 @@ async def _compute_window(
 
     `client_ids` is the pre-resolved allowed set (empty list means
     "no clients match filter" → every client-scoped count returns 0).
+    `client_filter_active` = True when the URL explicitly narrowed
+    clients (partial subset OR explicit zero via `__none__`). When True,
+    `farmers_newly_registered` also honours the client filter — a
+    farmer counts only if they ended up subscribed to at least one of
+    the filtered clients. When False (default all-clients view), the
+    metric stays client-agnostic so newly-registered farmers who
+    haven't subscribed to anything yet still appear.
     """
+    nr_client_filter = client_ids if client_filter_active else None
+
     if not client_ids:
         # No clients survive the filter → every client-scoped count is 0.
-        # Only farmers_newly_registered is client-agnostic and may still
-        # be non-zero; run it directly.
+        # `farmers_newly_registered` is client-agnostic only when the
+        # user hasn't narrowed by client at all; here the empty list
+        # comes from an explicit narrow, so it too returns 0.
         empty = {k: 0 for k in _METRIC_KEYS}
         empty["farmers_newly_registered"] = await _count_farmers_newly_registered(
             db,
             period_from=period_from, period_to=period_to,
             state_cosh_id=state_cosh_id, district_cosh_id=district_cosh_id,
+            client_ids=nr_client_filter,
         )
         return empty
 
@@ -147,6 +159,7 @@ async def _compute_window(
         db,
         period_from=period_from, period_to=period_to,
         state_cosh_id=state_cosh_id, district_cosh_id=district_cosh_id,
+        client_ids=nr_client_filter,
     )
 
     # ── 3. Active subscriptions (point-in-time at period_to) ────────
@@ -331,9 +344,16 @@ async def _count_farmers_newly_registered(
     db: AsyncSession, *,
     period_from: datetime, period_to: datetime,
     state_cosh_id: Optional[str], district_cosh_id: Optional[str],
+    client_ids: Optional[list[str]] = None,
 ) -> int:
-    """Client-agnostic — a farmer registers before subscribing to any
-    company, so the client filter doesn't apply here."""
+    """Count farmers who self-registered in the window.
+
+    `client_ids` semantics:
+      None → no client filter (platform-wide count; the default view).
+      list → count only farmers who ended up subscribed to at least one
+             of the given clients (any subscription status, any time).
+             An empty list correctly returns 0.
+    """
     q = (
         select(func.count(distinct(User.id)))
         .join(UserRole, UserRole.user_id == User.id)
@@ -348,6 +368,13 @@ async def _count_farmers_newly_registered(
         q = q.where(User.state_cosh_id == state_cosh_id)
     if district_cosh_id:
         q = q.where(User.district_cosh_id == district_cosh_id)
+    if client_ids is not None:
+        q = q.where(
+            select(Subscription.id).where(
+                Subscription.farmer_user_id == User.id,
+                Subscription.client_id.in_(client_ids),
+            ).exists()
+        )
     return int((await db.execute(q)).scalar_one() or 0)
 
 
@@ -402,6 +429,11 @@ async def sa_reports_summary(
             detail="period_from must be strictly before period_to",
         )
 
+    # "Explicit client filter" = the URL had ?client_ids= at all
+    # (including the __none__ sentinel). Absent → default view (all
+    # real clients), where farmers_newly_registered stays platform-wide
+    # so we don't hide farmers who registered but haven't subscribed yet.
+    client_filter_active = client_ids is not None
     requested_ids = _parse_ids_csv(client_ids)
     resolved_ids = await _resolved_client_ids(
         db, requested_ids, include_sandboxes,
@@ -411,6 +443,7 @@ async def sa_reports_summary(
         db,
         period_from=period_from, period_to=period_to,
         client_ids=resolved_ids,
+        client_filter_active=client_filter_active,
         state_cosh_id=state_cosh_id, district_cosh_id=district_cosh_id,
     )
 
@@ -422,6 +455,7 @@ async def sa_reports_summary(
         db,
         period_from=prior_from, period_to=prior_to,
         client_ids=resolved_ids,
+        client_filter_active=client_filter_active,
         state_cosh_id=state_cosh_id, district_cosh_id=district_cosh_id,
     )
 
