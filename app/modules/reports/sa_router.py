@@ -1,13 +1,24 @@
 """Super-Admin cross-platform Reports.
 
-One dashboard endpoint returning 13 headline metrics with an optional
-prior-window comparison. Filters: date window, location (state +
-district on the *relevant* user's own address), client multi-select,
-and an escape-hatch toggle for sandbox clients.
+Response shape:
 
-Sandbox (is_training / is_coaching) clients are excluded from every
-count by default — SA can flip the toggle to include them when
-sanity-checking QA activity.
+    {
+      "generated_at": "...",
+      "filters_applied": {...},
+      "prior_window": {...},
+      "platform_totals": { ...5 tiles snapshot-as-of-today... },
+      "current":  { ...windowed + client-scoped tiles... },
+      "prior":    { ...same shape as current... },
+    }
+
+**Platform Totals** live above the client filter on the UI. They ignore
+the date + client filter and are always a snapshot as-of-now; only
+Location applies. Sandbox toggle applies (excludes is_training + is_coaching
+clients unless flipped on).
+
+**Current / Prior** honour the full filter set (date + location + client).
+The prior window is the immediately-preceding equal-length window used
+for the per-tile delta.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -51,16 +62,29 @@ def _parse_ids_csv(csv: Optional[str]) -> Optional[list[str]]:
     return ids or None
 
 
+async def _all_real_client_ids(
+    db: AsyncSession, include_sandboxes: bool,
+) -> list[str]:
+    """The 'all real clients' set used for Platform Totals scope."""
+    q = select(Client.id)
+    if not include_sandboxes:
+        q = q.where(
+            Client.is_training.is_(False),
+            Client.is_coaching.is_(False),
+        )
+    return [row[0] for row in (await db.execute(q)).all()]
+
+
 async def _resolved_client_ids(
     db: AsyncSession,
     requested: Optional[list[str]],
     include_sandboxes: bool,
 ) -> list[str]:
-    """Return the client-id set the counts should be scoped to.
+    """Return the client-id set that windowed counts should be scoped to.
 
-    When `requested` is empty → all clients (subject to sandbox filter).
-    When it's supplied → intersect with the sandbox filter so a caller
-    can't accidentally pull sandbox data via an explicit id list.
+    When `requested` is None → all clients (subject to sandbox filter).
+    When supplied → intersect with the sandbox filter so a caller can't
+    smuggle sandbox data through an explicit id list.
     """
     q = select(Client.id)
     if not include_sandboxes:
@@ -73,35 +97,160 @@ async def _resolved_client_ids(
     return [row[0] for row in (await db.execute(q)).all()]
 
 
-async def _compute_window(
-    db: AsyncSession,
-    *,
-    period_from: datetime,
-    period_to: datetime,
-    client_ids: list[str],
-    client_filter_active: bool,
+# ── Platform Totals (snapshot as-of-now, Location-filtered) ─────────
+
+async def _compute_platform_totals(
+    db: AsyncSession, *,
+    real_cids: list[str],
     state_cosh_id: Optional[str],
     district_cosh_id: Optional[str],
 ) -> dict:
-    """Run every count for one window and return the payload dict.
+    """5 tiles rendered above the client filter. Snapshot as-of-now.
+    Location applies (against the relevant entity's own User row).
+    Client filter deliberately does NOT apply — these are the
+    "how big are we?" numbers scoped only to real (non-sandbox) clients.
+    """
+    def _user_loc(query):
+        if state_cosh_id:
+            query = query.where(User.state_cosh_id == state_cosh_id)
+        if district_cosh_id:
+            query = query.where(User.district_cosh_id == district_cosh_id)
+        return query
 
-    `client_ids` is the pre-resolved allowed set (empty list means
-    "no clients match filter" → every client-scoped count returns 0).
-    `client_filter_active` = True when the URL explicitly narrowed
-    clients (partial subset OR explicit zero via `__none__`). When True,
-    `farmers_newly_registered` also honours the client filter — a
-    farmer counts only if they ended up subscribed to at least one of
-    the filtered clients. When False (default all-clients view), the
-    metric stays client-agnostic so newly-registered farmers who
-    haven't subscribed to anything yet still appear.
+    # ── Total Registered Farmers (has FARMER role, self_registered_at set) ──
+    q = (
+        select(func.count(distinct(User.id)))
+        .join(UserRole, UserRole.user_id == User.id)
+        .where(
+            UserRole.role_type == RoleType.FARMER,
+            User.self_registered_at.is_not(None),
+        )
+    )
+    total_registered_farmers = int((await db.execute(_user_loc(q))).scalar_one() or 0)
+
+    if not real_cids:
+        # Nothing else to count (every remaining tile joins on real clients).
+        return {
+            "total_registered_farmers": total_registered_farmers,
+            "total_subscribed_farmers": 0,
+            "total_active_subscriptions": 0,
+            "total_active_dealers": 0,
+            "total_active_facilitators": 0,
+        }
+
+    # ── Total Subscribed Farmers (any subscription to any real client, ever) ──
+    q = (
+        select(func.count(distinct(Subscription.farmer_user_id)))
+        .join(User, User.id == Subscription.farmer_user_id)
+        .where(Subscription.client_id.in_(real_cids))
+    )
+    total_subscribed_farmers = int((await db.execute(_user_loc(q))).scalar_one() or 0)
+
+    # ── Total Active Subscriptions (currently ACTIVE, real clients) ──
+    q = (
+        select(func.count(Subscription.id))
+        .join(User, User.id == Subscription.farmer_user_id)
+        .where(
+            Subscription.status == SubscriptionStatus.ACTIVE,
+            Subscription.client_id.in_(real_cids),
+        )
+    )
+    total_active_subscriptions = int((await db.execute(_user_loc(q))).scalar_one() or 0)
+
+    # ── Total Active Dealers (distinct users on ≥1 real client, ACTIVE link) ──
+    async def _active_team_count(promoter_type: str) -> int:
+        q = (
+            select(func.count(distinct(ClientPromoter.user_id)))
+            .join(User, User.id == ClientPromoter.user_id)
+            .where(
+                ClientPromoter.promoter_type == promoter_type,
+                ClientPromoter.status == "ACTIVE",
+                ClientPromoter.client_id.in_(real_cids),
+            )
+        )
+        return int((await db.execute(_user_loc(q))).scalar_one() or 0)
+
+    total_active_dealers = await _active_team_count("DEALER")
+    total_active_facilitators = await _active_team_count("FACILITATOR")
+
+    return {
+        "total_registered_farmers": total_registered_farmers,
+        "total_subscribed_farmers": total_subscribed_farmers,
+        "total_active_subscriptions": total_active_subscriptions,
+        "total_active_dealers": total_active_dealers,
+        "total_active_facilitators": total_active_facilitators,
+    }
+
+
+# ── Windowed / Client-scoped tiles ──────────────────────────────────
+
+_METRIC_KEYS = (
+    "farmers_active", "farmers_newly_registered",
+    "active_subscriptions_in_window", "subscriptions_created",
+    "purchase_orders_generated",
+    "dealers_onboarded", "facilitators_onboarded",
+    "facilitator_promoters_designated", "dealer_promoters_designated",
+    "promoter_pundits", "primary_experts", "panel_experts",
+    "queries_raised", "queries_responded", "queries_pending",
+    "pests_diagnosed",
+)
+
+
+async def _count_farmers_newly_registered(
+    db: AsyncSession, *,
+    period_from: datetime, period_to: datetime,
+    state_cosh_id: Optional[str], district_cosh_id: Optional[str],
+    client_ids: Optional[list[str]] = None,
+) -> int:
+    """Farmers who self-registered in the window.
+
+    `client_ids`:
+      None → no client filter (default all-clients view).
+      list → count only farmers who ended up subscribed to at least one
+             of the given clients (any status, any time). Empty → 0.
+    """
+    q = (
+        select(func.count(distinct(User.id)))
+        .join(UserRole, UserRole.user_id == User.id)
+        .where(
+            UserRole.role_type == RoleType.FARMER,
+            User.self_registered_at.is_not(None),
+            User.self_registered_at >= period_from,
+            User.self_registered_at < period_to,
+        )
+    )
+    if state_cosh_id:
+        q = q.where(User.state_cosh_id == state_cosh_id)
+    if district_cosh_id:
+        q = q.where(User.district_cosh_id == district_cosh_id)
+    if client_ids is not None:
+        q = q.where(
+            select(Subscription.id).where(
+                Subscription.farmer_user_id == User.id,
+                Subscription.client_id.in_(client_ids),
+            ).exists()
+        )
+    return int((await db.execute(q)).scalar_one() or 0)
+
+
+async def _compute_window(
+    db: AsyncSession, *,
+    period_from: datetime, period_to: datetime,
+    client_ids: list[str],
+    client_filter_active: bool,
+    state_cosh_id: Optional[str], district_cosh_id: Optional[str],
+) -> dict:
+    """Run every windowed / client-scoped count and return the payload dict.
+
+    `client_ids` is the pre-resolved allowed set (empty list means no
+    clients survive the filter → every client-scoped count returns 0).
+    `client_filter_active` = the URL had an explicit ?client_ids= (any
+    value, including the __none__ sentinel). Controls whether
+    farmers_newly_registered honours the client filter.
     """
     nr_client_filter = client_ids if client_filter_active else None
 
     if not client_ids:
-        # No clients survive the filter → every client-scoped count is 0.
-        # `farmers_newly_registered` is client-agnostic only when the
-        # user hasn't narrowed by client at all; here the empty list
-        # comes from an explicit narrow, so it too returns 0.
         empty = {k: 0 for k in _METRIC_KEYS}
         empty["farmers_newly_registered"] = await _count_farmers_newly_registered(
             db,
@@ -112,14 +261,7 @@ async def _compute_window(
         return empty
 
     cids = client_ids
-
-    # Farmer-address filter alias for reuse.
     _in_win = lambda col: and_(col >= period_from, col < period_to)  # noqa: E731
-
-    # ── Farmer / subscription joins ──────────────────────────────────
-    _farmer_loc_join = (
-        Subscription.__table__.join(User, User.id == Subscription.farmer_user_id)
-    )
 
     def _farmer_loc_filter(query):
         if state_cosh_id:
@@ -131,8 +273,6 @@ async def _compute_window(
     def _team_loc_filter(query, user_id_col):
         if not (state_cosh_id or district_cosh_id):
             return query
-        # Join User for the team member's own address (dealer /
-        # facilitator / promoter / pundit).
         query = query.join(User, User.id == user_id_col)
         if state_cosh_id:
             query = query.where(User.state_cosh_id == state_cosh_id)
@@ -140,7 +280,7 @@ async def _compute_window(
             query = query.where(User.district_cosh_id == district_cosh_id)
         return query
 
-    # ── 1. Farmers — active (any ACTIVE subscription as of period_to) ──
+    # ── 1. Farmers — active as-of period_to ──
     q = (
         select(func.count(distinct(Subscription.farmer_user_id)))
         .join(User, User.id == Subscription.farmer_user_id)
@@ -154,7 +294,7 @@ async def _compute_window(
     q = _farmer_loc_filter(q)
     farmers_active = int((await db.execute(q)).scalar_one() or 0)
 
-    # ── 2. Farmers — newly registered (User.self_registered_at in window) ──
+    # ── 2. Farmers — newly registered in window ──
     farmers_newly_registered = await _count_farmers_newly_registered(
         db,
         period_from=period_from, period_to=period_to,
@@ -162,21 +302,23 @@ async def _compute_window(
         client_ids=nr_client_filter,
     )
 
-    # ── 3. Active subscriptions (point-in-time at period_to) ────────
+    # ── 3. Active subscriptions in window (active for at least some part) ──
+    # A subscription counts if it became ACTIVE (subscription_date set)
+    # before period_to AND wasn't already lapsed before period_from.
     q = (
         select(func.count(Subscription.id))
         .join(User, User.id == Subscription.farmer_user_id)
         .where(
-            Subscription.status == SubscriptionStatus.ACTIVE,
             Subscription.client_id.in_(cids),
-            Subscription.created_at < period_to,
-            or_(Subscription.lapsed_at.is_(None), Subscription.lapsed_at >= period_to),
+            Subscription.subscription_date.is_not(None),
+            Subscription.subscription_date < period_to,
+            or_(Subscription.lapsed_at.is_(None), Subscription.lapsed_at > period_from),
         )
     )
     q = _farmer_loc_filter(q)
-    active_subscriptions = int((await db.execute(q)).scalar_one() or 0)
+    active_subscriptions_in_window = int((await db.execute(q)).scalar_one() or 0)
 
-    # ── 4. Total subscriptions created in window ────────────────────
+    # ── 4. Subscriptions created in window ──
     q = (
         select(func.count(Subscription.id))
         .join(User, User.id == Subscription.farmer_user_id)
@@ -186,10 +328,10 @@ async def _compute_window(
         )
     )
     q = _farmer_loc_filter(q)
-    total_subscriptions = int((await db.execute(q)).scalar_one() or 0)
+    subscriptions_created = int((await db.execute(q)).scalar_one() or 0)
 
-    # ── 5 / 7. Dealers + Facilitators onboarded (ClientPromoter) ───
-    async def _cp_count(promoter_type: str) -> int:
+    # ── 5 / 6. Dealers + Facilitators onboarded (in window) ──
+    async def _cp_onboarded(promoter_type: str) -> int:
         q = (
             select(func.count(ClientPromoter.id))
             .where(
@@ -202,10 +344,10 @@ async def _compute_window(
         q = _team_loc_filter(q, ClientPromoter.user_id)
         return int((await db.execute(q)).scalar_one() or 0)
 
-    dealers_onboarded = await _cp_count("DEALER")
-    facilitators_onboarded = await _cp_count("FACILITATOR")
+    dealers_onboarded = await _cp_onboarded("DEALER")
+    facilitators_onboarded = await _cp_onboarded("FACILITATOR")
 
-    # ── 6. Purchase orders created in window ────────────────────────
+    # ── 7. Purchase orders generated in window ──
     q = (
         select(func.count(Order.id))
         .join(User, User.id == Order.farmer_user_id)
@@ -217,19 +359,24 @@ async def _compute_window(
     q = _farmer_loc_filter(q)
     purchase_orders_generated = int((await db.execute(q)).scalar_one() or 0)
 
-    # ── 8. Promoters designated (PromoterAssignment.assigned_at in win) ──
-    q = (
-        select(func.count(distinct(PromoterAssignment.promoter_user_id)))
-        .join(Subscription, Subscription.id == PromoterAssignment.subscription_id)
-        .where(
-            _in_win(PromoterAssignment.assigned_at),
-            Subscription.client_id.in_(cids),
+    # ── 8 / 9. Promoters designated in window, split by type ──
+    async def _promoters_designated(promoter_type: str) -> int:
+        q = (
+            select(func.count(distinct(PromoterAssignment.promoter_user_id)))
+            .join(Subscription, Subscription.id == PromoterAssignment.subscription_id)
+            .where(
+                _in_win(PromoterAssignment.assigned_at),
+                PromoterAssignment.promoter_type == promoter_type,
+                Subscription.client_id.in_(cids),
+            )
         )
-    )
-    q = _team_loc_filter(q, PromoterAssignment.promoter_user_id)
-    promoters_designated = int((await db.execute(q)).scalar_one() or 0)
+        q = _team_loc_filter(q, PromoterAssignment.promoter_user_id)
+        return int((await db.execute(q)).scalar_one() or 0)
 
-    # ── 9. Promoter-Pundits / Primary / Panel Experts (ClientFarmPundit) ──
+    facilitator_promoters_designated = await _promoters_designated("FACILITATOR")
+    dealer_promoters_designated = await _promoters_designated("DEALER")
+
+    # ── 10 / 11 / 12. Pundit roles onboarded in window ──
     async def _pundit_count(role: PunditRole) -> int:
         q = (
             select(func.count(ClientFarmPundit.id))
@@ -255,7 +402,7 @@ async def _compute_window(
     primary_experts = await _pundit_count(PunditRole.PRIMARY)
     panel_experts = await _pundit_count(PunditRole.PANEL)
 
-    # ── 10. Queries raised in window ────────────────────────────────
+    # ── 13. Queries raised in window ──
     q = (
         select(func.count(FarmerQuery.id))
         .join(User, User.id == FarmerQuery.farmer_user_id)
@@ -267,7 +414,7 @@ async def _compute_window(
     q = _farmer_loc_filter(q)
     queries_raised = int((await db.execute(q)).scalar_one() or 0)
 
-    # ── 11. Queries responded to (QueryResponse.created_at in win) ──
+    # ── 14. Queries responded (first response in window) ──
     q = (
         select(func.count(distinct(QueryResponse.query_id)))
         .join(FarmerQuery, FarmerQuery.id == QueryResponse.query_id)
@@ -280,9 +427,7 @@ async def _compute_window(
     q = _farmer_loc_filter(q)
     queries_responded = int((await db.execute(q)).scalar_one() or 0)
 
-    # ── 12. Queries pending response (raised ≤ period_to, no response) ──
-    # Point-in-time "still open" — surfaces the SLA gap the SA cares
-    # about. Correlated NOT EXISTS keeps this cheap on current volumes.
+    # ── 15. Queries pending as-of period_to (raised, no response) ──
     q = (
         select(func.count(FarmerQuery.id))
         .join(User, User.id == FarmerQuery.farmer_user_id)
@@ -297,7 +442,7 @@ async def _compute_window(
     q = _farmer_loc_filter(q)
     queries_pending = int((await db.execute(q)).scalar_one() or 0)
 
-    # ── 13. Pests diagnosed (DiagnosisSession reached DIAGNOSED in win) ──
+    # ── 16. Pests diagnosed in window ──
     q = (
         select(func.count(DiagnosisSession.id))
         .join(Subscription, Subscription.id == DiagnosisSession.subscription_id)
@@ -314,12 +459,13 @@ async def _compute_window(
     return {
         "farmers_active": farmers_active,
         "farmers_newly_registered": farmers_newly_registered,
-        "active_subscriptions": active_subscriptions,
-        "total_subscriptions": total_subscriptions,
+        "active_subscriptions_in_window": active_subscriptions_in_window,
+        "subscriptions_created": subscriptions_created,
+        "purchase_orders_generated": purchase_orders_generated,
         "dealers_onboarded": dealers_onboarded,
         "facilitators_onboarded": facilitators_onboarded,
-        "purchase_orders_generated": purchase_orders_generated,
-        "promoters_designated": promoters_designated,
+        "facilitator_promoters_designated": facilitator_promoters_designated,
+        "dealer_promoters_designated": dealer_promoters_designated,
         "promoter_pundits": promoter_pundits,
         "primary_experts": primary_experts,
         "panel_experts": panel_experts,
@@ -330,53 +476,7 @@ async def _compute_window(
     }
 
 
-_METRIC_KEYS = (
-    "farmers_active", "farmers_newly_registered", "active_subscriptions",
-    "total_subscriptions", "dealers_onboarded", "facilitators_onboarded",
-    "purchase_orders_generated", "promoters_designated",
-    "promoter_pundits", "primary_experts", "panel_experts",
-    "queries_raised", "queries_responded", "queries_pending",
-    "pests_diagnosed",
-)
-
-
-async def _count_farmers_newly_registered(
-    db: AsyncSession, *,
-    period_from: datetime, period_to: datetime,
-    state_cosh_id: Optional[str], district_cosh_id: Optional[str],
-    client_ids: Optional[list[str]] = None,
-) -> int:
-    """Count farmers who self-registered in the window.
-
-    `client_ids` semantics:
-      None → no client filter (platform-wide count; the default view).
-      list → count only farmers who ended up subscribed to at least one
-             of the given clients (any subscription status, any time).
-             An empty list correctly returns 0.
-    """
-    q = (
-        select(func.count(distinct(User.id)))
-        .join(UserRole, UserRole.user_id == User.id)
-        .where(
-            UserRole.role_type == RoleType.FARMER,
-            User.self_registered_at.is_not(None),
-            User.self_registered_at >= period_from,
-            User.self_registered_at < period_to,
-        )
-    )
-    if state_cosh_id:
-        q = q.where(User.state_cosh_id == state_cosh_id)
-    if district_cosh_id:
-        q = q.where(User.district_cosh_id == district_cosh_id)
-    if client_ids is not None:
-        q = q.where(
-            select(Subscription.id).where(
-                Subscription.farmer_user_id == User.id,
-                Subscription.client_id.in_(client_ids),
-            ).exists()
-        )
-    return int((await db.execute(q)).scalar_one() or 0)
-
+# ── Endpoints ────────────────────────────────────────────────────────
 
 @router.get("/admin/sa/reports/clients")
 async def sa_reports_clients(
@@ -403,21 +503,16 @@ async def sa_reports_summary(
     state_cosh_id: Optional[str] = Query(None),
     district_cosh_id: Optional[str] = Query(None),
     client_ids: Optional[str] = Query(
-        None, description="Comma-separated client ids; empty = all real clients",
+        None, description="Comma-separated client ids; empty = all real clients; __none__ = explicit zero",
     ),
     include_sandboxes: bool = Query(False),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Headline SA metrics with a prior-period comparison.
-
-    Both windows are inclusive of `period_from`, exclusive of `period_to`
-    so the prior window can be computed as
-    `[period_from - delta, period_from)` without off-by-one issues.
-    """
+    """SA headline metrics: platform_totals (snapshot, above client
+    filter on the UI) + current / prior windowed sections (below)."""
     _require_sa(current_user)
 
-    # Default window: last 30 days ending now (UTC).
     now_utc = datetime.now(timezone.utc)
     if period_to is None:
         period_to = now_utc
@@ -429,14 +524,19 @@ async def sa_reports_summary(
             detail="period_from must be strictly before period_to",
         )
 
-    # "Explicit client filter" = the URL had ?client_ids= at all
-    # (including the __none__ sentinel). Absent → default view (all
-    # real clients), where farmers_newly_registered stays platform-wide
-    # so we don't hide farmers who registered but haven't subscribed yet.
     client_filter_active = client_ids is not None
     requested_ids = _parse_ids_csv(client_ids)
     resolved_ids = await _resolved_client_ids(
         db, requested_ids, include_sandboxes,
+    )
+
+    # Platform totals scope: all real clients (or +sandbox if toggled).
+    # NOT narrowed by the user's client selection — see module docstring.
+    real_cids = await _all_real_client_ids(db, include_sandboxes)
+    platform_totals = await _compute_platform_totals(
+        db,
+        real_cids=real_cids,
+        state_cosh_id=state_cosh_id, district_cosh_id=district_cosh_id,
     )
 
     current = await _compute_window(
@@ -447,7 +547,6 @@ async def sa_reports_summary(
         state_cosh_id=state_cosh_id, district_cosh_id=district_cosh_id,
     )
 
-    # Prior window of equal length, immediately preceding.
     delta = period_to - period_from
     prior_to = period_from
     prior_from = period_from - delta
@@ -473,6 +572,7 @@ async def sa_reports_summary(
             "period_from": prior_from.isoformat(),
             "period_to": prior_to.isoformat(),
         },
+        "platform_totals": platform_totals,
         "current": current,
         "prior": prior,
     }
