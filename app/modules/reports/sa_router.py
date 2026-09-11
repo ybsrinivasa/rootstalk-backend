@@ -191,7 +191,8 @@ _METRIC_KEYS = (
     "dealers_onboarded", "facilitators_onboarded",
     "facilitator_promoters_designated", "dealer_promoters_designated",
     "promoter_pundits", "primary_experts", "panel_experts",
-    "queries_raised", "queries_responded", "queries_pending",
+    "queries_raised", "queries_raised_responded", "queries_raised_pending",
+    "queries_responded", "queries_pending",
     "pests_diagnosed",
 )
 
@@ -414,6 +415,26 @@ async def _compute_window(
     q = _farmer_loc_filter(q)
     queries_raised = int((await db.execute(q)).scalar_one() or 0)
 
+    # ── 13a. Split of the raised-in-window subset (breakdown shown in
+    # the Queries Raised tile as a subtitle). Both subsets evaluate the
+    # response status as-of period_to, so responded + pending always
+    # equals queries_raised.
+    q = (
+        select(func.count(FarmerQuery.id))
+        .join(User, User.id == FarmerQuery.farmer_user_id)
+        .where(
+            _in_win(FarmerQuery.created_at),
+            FarmerQuery.client_id.in_(cids),
+            select(QueryResponse.id).where(
+                QueryResponse.query_id == FarmerQuery.id,
+                QueryResponse.created_at < period_to,
+            ).exists(),
+        )
+    )
+    q = _farmer_loc_filter(q)
+    queries_raised_responded = int((await db.execute(q)).scalar_one() or 0)
+    queries_raised_pending = queries_raised - queries_raised_responded
+
     # ── 14. Queries responded (first response in window) ──
     q = (
         select(func.count(distinct(QueryResponse.query_id)))
@@ -470,6 +491,8 @@ async def _compute_window(
         "primary_experts": primary_experts,
         "panel_experts": panel_experts,
         "queries_raised": queries_raised,
+        "queries_raised_responded": queries_raised_responded,
+        "queries_raised_pending": queries_raised_pending,
         "queries_responded": queries_responded,
         "queries_pending": queries_pending,
         "pests_diagnosed": pests_diagnosed,
