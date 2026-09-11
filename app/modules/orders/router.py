@@ -7128,6 +7128,11 @@ async def get_dealer_order(
         # show as-taken. Live values are only what the farmer sees.
         eff_brand_cosh_id = _dealer_effective_brand_cosh_id(i)
         eff_brand_name = _dealer_effective_brand_name(i)
+        # Prefer the Cosh-localised brand name when it's present for this
+        # cosh_id + language. Falls through to the stored English name
+        # (missing translation OR non-Cosh manual entry).
+        if eff_brand_cosh_id and cosh_name_by_id.get(eff_brand_cosh_id):
+            eff_brand_name = cosh_name_by_id[eff_brand_cosh_id]
         eff_given_volume = _dealer_effective_given_volume(i)
         eff_volume_unit = _dealer_effective_volume_unit(i)
         eff_price = _dealer_effective_price(i)
@@ -7409,6 +7414,14 @@ async def get_dealer_order(
                   "vol_per_plant_unit_ref", "common_name_ref"):
             if spec[k]:
                 cosh_refs_needed.add(spec[k])
+        # 2026-09-11 — Also resolve brand names to the dealer's language.
+        # Brand names are stored on OrderItem (denormalised at pick time
+        # from the English Cosh label). Reading back via Cosh translations
+        # keeps the display consistent with the brand picker's Kannada
+        # names, and retro-fixes historic items picked in English.
+        eff_brand_cosh_id = _dealer_effective_brand_cosh_id(it)
+        if eff_brand_cosh_id:
+            cosh_refs_needed.add(eff_brand_cosh_id)
 
     lang = current_user.language_code or "en"
     cosh_name_by_id: dict[str, str] = {}
