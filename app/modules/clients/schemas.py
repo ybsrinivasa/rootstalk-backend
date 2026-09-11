@@ -139,6 +139,11 @@ class ClientOut(BaseModel):
     # response_model validation tolerant of routes that haven't been
     # updated.
     org_type_cosh_ids: List[str] = []
+    # 2026-09-11 — Sandbox markers so the SA Companies list can split
+    # coaching workspaces + training clients into their own tabs and
+    # keep the real-companies view uncluttered.
+    is_coaching: bool = False
+    is_training: bool = False
 
     class Config:
         from_attributes = True
