@@ -262,22 +262,27 @@ class BrandOptionsResult:
                 "unit_options_by_family": UNIT_OPTIONS_BY_FAMILY,
                 "units_by_brand": self.units_by_brand,
             }
-        # Hide empty groups per user spec (2026-05-31).
+        # Hide empty groups per user spec (2026-05-31). `key` is a stable
+        # identifier the PWA maps to a translated label; `label` stays
+        # as the English fallback so legacy consumers keep working.
         groups = []
         if self.group_recommended:
             groups.append({
+                "key": "recommended",
                 "label": "Recommended Brands",
                 "brands": [{"cosh_id": b.cosh_id, "name": b.name,
                             "manufacturer": b.manufacturer} for b in self.group_recommended],
             })
         if self.group_my:
             groups.append({
+                "key": "my",
                 "label": "My Brands",
                 "brands": [{"cosh_id": b.cosh_id, "name": b.name,
                             "manufacturer": b.manufacturer} for b in self.group_my],
             })
         if self.group_other:
             groups.append({
+                "key": "other",
                 "label": "Other Brands",
                 "brands": [{"cosh_id": b.cosh_id, "name": b.name,
                             "manufacturer": b.manufacturer} for b in self.group_other],
