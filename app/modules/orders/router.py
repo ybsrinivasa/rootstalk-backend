@@ -2998,6 +2998,7 @@ async def lookup_recipient_for_new_order(
     phone: str,
     category: str,
     practice_ids: str = "",
+    intended_role: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
     lang: str = Depends(get_locale),
@@ -3133,6 +3134,19 @@ async def lookup_recipient_for_new_order(
     )).first()
     is_training_sub = bool(_td_row and _td_row.is_training)
     training_dealer_id = _td_row.training_dealer_user_id if _td_row else None
+
+    # 2026-09-12 — `intended_role` respects the tab the farmer picked
+    # (Dealers vs Facilitators) BEFORE typing the phone. When the
+    # target holds both DEALER + FACILITATOR (multi-role users, or a
+    # coaching student playing both personas), the default precedence
+    # would silently return DEALER — a farmer on the Facilitators tab
+    # would then have their typed phone routed as a dealer order. When
+    # `intended_role` is passed, we filter the roles set to just that
+    # role before running the precedence checks below. Absent →
+    # legacy precedence (DEALER first, then FACILITATOR).
+    _intent = (intended_role or "").upper() or None
+    if _intent in ("DEALER", "FACILITATOR"):
+        roles_held = {r for r in roles_held if r == _intent}
 
     # Role precedence. Same shape as the seed-order lookup, except
     # the DEALER onboarded-check fires only when has_locked is True
