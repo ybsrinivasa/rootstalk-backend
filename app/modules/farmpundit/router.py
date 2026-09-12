@@ -2997,6 +2997,18 @@ async def add_promoter_pundit(
             ),
         })
 
+    # Coaching Sandbox — refuse designating anyone but the student
+    # themselves as a Promoter-Pundit at their workspace. Implicit
+    # safety already exists via the FACILITATOR pre-check below
+    # (coaching workspace can only ever have the student's own
+    # ClientPromoter row), but this explicit guard is defense in
+    # depth so a future refactor that loosens the pre-check doesn't
+    # silently open a leak. No-op for real clients.
+    from app.modules.coaching.service import guard_coaching_workspace_onboarding
+    await guard_coaching_workspace_onboarding(
+        db, client_id, target_phone=phone,
+    )
+
     # §14.2: must already be a Facilitator-Promoter at this client.
     is_fp = (await db.execute(
         select(ClientPromoter).where(
