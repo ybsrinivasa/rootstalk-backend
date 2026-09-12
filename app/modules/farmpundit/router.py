@@ -1175,7 +1175,28 @@ async def list_farmer_queries(
         if touched:
             await db.commit()
 
-    return [{"id": q.id, "title": q.title, "status": q.status, "severity": q.severity,
+    # 2026-09-12 — Resolve the query_type_name in the farmer's language
+    # via Cosh translations, same pattern the pundit-side detail already
+    # uses. Falls back to the English title stored at submit time. Old
+    # queries + queries whose type has no kn translation still work.
+    from app.modules.sync.models import CoshCoreItem
+    from app.services.i18n_cosh import pick_translation
+    lang = current_user.language_code or "en"
+    type_ids = {q.query_type_cosh_id for q in queries if q.query_type_cosh_id}
+    type_name_by_id: dict[str, str] = {}
+    if type_ids:
+        for cid, tr in (await db.execute(
+            select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
+            .where(CoshCoreItem.cosh_id.in_(type_ids))
+        )).all():
+            label = pick_translation(tr, lang, "") if isinstance(tr, dict) else None
+            if label:
+                type_name_by_id[cid] = label
+
+    def _display_title(q) -> str:
+        return type_name_by_id.get(q.query_type_cosh_id) or q.title
+
+    return [{"id": q.id, "title": _display_title(q), "status": q.status, "severity": q.severity,
              "subscription_id": q.subscription_id,
              "expires_at": q.expires_at, "created_at": q.created_at} for q in queries]
 
