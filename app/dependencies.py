@@ -54,6 +54,36 @@ async def get_current_user(
     # surface the bound client to the frontend).
     request.state.token_client_id = token_client_id
     request.state.token_client_short_name = payload.get("client_short_name")
+
+    # 2026-09-12 — Coaching Sandbox: force-logout if the caller is a
+    # coaching student whose session isn't ACTIVE. Login-time guards
+    # (`guard_coaching_student_login`) already refuse fresh logins on
+    # non-ACTIVE sessions, but that leaves an already-authenticated
+    # student able to keep making requests with an existing JWT until
+    # it expires (30-day TTL). This check applies to every
+    # authenticated request; one extra DB round-trip only for users
+    # that actually have a CoachingStudent row (rare + small
+    # population). Non-coaching users pass through unchanged.
+    from app.modules.coaching.service import (
+        get_coaching_student_for_user,
+    )
+    from app.modules.coaching.models import CoachingSession, CoachingSessionStatus
+    coaching_student = await get_coaching_student_for_user(db, user.id)
+    if coaching_student is not None:
+        session = await db.get(CoachingSession, coaching_student.session_id)
+        if session is None or session.status != CoachingSessionStatus.ACTIVE.value:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={
+                    "code": "coaching_session_ended",
+                    "message": (
+                        "Your coaching session has ended. Sign in again "
+                        "with your real phone if you'd like to keep using "
+                        "RootsTalk."
+                    ),
+                },
+            )
+
     return user
 
 

@@ -240,6 +240,36 @@ async def reject_student_invite(
     return await coaching_service.load_session_detail(db, session)
 
 
+@router.post(
+    "/sessions/{session_id}/invites/{invite_id}/regenerate",
+    response_model=SessionDetail,
+)
+async def regenerate_student_invite(
+    session_id: str,
+    invite_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_coach_or_sa),
+):
+    """Void the current invite and create a fresh one with a new
+    token for the same email. Pre-approval only — usable while the
+    invite is INVITED or SUBMITTED, refused for APPROVED / REJECTED
+    / VOID. See `regenerate_invite` service for the full semantics.
+    """
+    session = await coaching_service.require_session_owner(
+        db, session_id, current_user,
+    )
+    invite = (await db.execute(
+        select(CoachingStudentInvite).where(
+            CoachingStudentInvite.id == invite_id,
+            CoachingStudentInvite.session_id == session.id,
+        )
+    )).scalar_one_or_none()
+    if invite is None:
+        raise HTTPException(status_code=404, detail="Invite not found")
+    await coaching_service.regenerate_invite(db, invite, coach=current_user)
+    return await coaching_service.load_session_detail(db, session)
+
+
 # ── Student endpoints ────────────────────────────────────────────────────
 
 @router.put(

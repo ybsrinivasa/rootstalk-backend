@@ -10,7 +10,7 @@ from typing import Optional
 
 from sqlalchemy import (
     String, DateTime, ForeignKey, Index, JSON, UniqueConstraint,
-    CheckConstraint,
+    CheckConstraint, text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -75,11 +75,18 @@ class CoachingInviteStatus(str, enum.Enum):
     SUBMITTED (student filled the form) → APPROVED (coach approved,
     CoachingStudent + workspace provisioned) or REJECTED (coach said
     no). Expiry independent of status — an INVITED or SUBMITTED
-    invite can also expire without decision."""
+    invite can also expire without decision.
+
+    VOID (2026-09-12): coach regenerated the link before approval.
+    The old invite becomes VOID and a fresh row is created with a new
+    token; VOID rows are excluded from anti-dupe checks so the new
+    invite for the same email passes.
+    """
     INVITED = "INVITED"
     SUBMITTED = "SUBMITTED"
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
+    VOID = "VOID"
 
 
 # Sessions that are still in play (not closed). Used all over the
@@ -219,11 +226,18 @@ class CoachingStudentInvite(Base):
     )
 
     __table_args__ = (
-        UniqueConstraint(
-            "session_id", "email", name="uq_coaching_invite_session_email",
+        # Partial-unique via a raw Index rather than UniqueConstraint
+        # so the regenerate-link flow (which sets old invite → VOID +
+        # creates a fresh row) can carry the same email. See migration
+        # d1a8e4b0f9c3.
+        Index(
+            "uq_coaching_invite_session_email_live",
+            "session_id", "email",
+            unique=True,
+            postgresql_where=text("status <> 'VOID'"),
         ),
         CheckConstraint(
-            "status IN ('INVITED', 'SUBMITTED', 'APPROVED', 'REJECTED')",
+            "status IN ('INVITED', 'SUBMITTED', 'APPROVED', 'REJECTED', 'VOID')",
             name="chk_coaching_invite_status",
         ),
         Index(

@@ -115,10 +115,23 @@ async def request_otp(request: PhoneOtpRequest, db: AsyncSession = Depends(get_d
     # a coaching student whose session isn't ACTIVE. Prevents students
     # from triggering (and paying for) an SMS they can't complete
     # login with. Non-coaching users pass through unchanged.
-    from app.modules.coaching.service import guard_otp_request_for_coaching_phone
+    from app.modules.coaching.service import (
+        guard_otp_request_for_coaching_phone,
+        is_active_coaching_temp_phone,
+    )
     await guard_otp_request_for_coaching_phone(db, request.phone)
 
     otp_code = await create_phone_otp(db, request.phone)
+
+    # 2026-09-12 — Coaching temp-phone path (+913XXXXXXXXX for a
+    # student in an ACTIVE session): skip SMS entirely (the +913
+    # range isn't routable by any real carrier) and surface the OTP
+    # in the response body so the PWA can auto-fill / display it
+    # in-app. Prod-safe: the gate is precise (checks CoachingStudent
+    # + session status), so no real user's OTP can leak.
+    if await is_active_coaching_temp_phone(db, request.phone):
+        logger.info(f"[COACHING TEMP] OTP for {request.phone}: {otp_code}")
+        return {"detail": "OTP sent.", "dev_otp": otp_code, "coaching_temp": True}
 
     if _surface_dev_otp():
         logger.info(f"[NON-PROD] OTP for {request.phone}: {otp_code}")

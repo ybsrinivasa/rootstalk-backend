@@ -98,6 +98,36 @@ async def guard_coaching_student_login(
     )
 
 
+async def is_active_coaching_temp_phone(
+    db: AsyncSession, phone: str,
+) -> bool:
+    """Return True iff `phone` is a `+913…` coaching temp phone that
+    belongs to a CoachingStudent whose session is ACTIVE.
+
+    Drives two behaviours in the OTP request path:
+      1. Skip SMS entirely (real carriers can't route +913 numbers).
+      2. Surface the OTP in the response body so the PWA can auto-fill
+         / display it in-app for the student. This is safe on prod
+         because the gate is precise — only fires for a phone that
+         matches an active coaching student.
+    """
+    if not phone or not phone.startswith("+913"):
+        return False
+    try:
+        normalised = normalise_phone(phone)
+    except HTTPException:
+        return False
+    row = (await db.execute(
+        select(CoachingStudent, CoachingSession)
+        .join(CoachingSession, CoachingSession.id == CoachingStudent.session_id)
+        .where(CoachingStudent.approved_phone == normalised)
+    )).first()
+    if row is None:
+        return False
+    _cs, session = row
+    return session.status == CoachingSessionStatus.ACTIVE.value
+
+
 async def guard_otp_request_for_coaching_phone(
     db: AsyncSession, phone: str,
 ) -> None:
@@ -400,6 +430,7 @@ async def create_invite(
         select(CoachingStudentInvite).where(
             CoachingStudentInvite.session_id == session.id,
             func.lower(CoachingStudentInvite.email) == email_lower,
+            CoachingStudentInvite.status != CoachingInviteStatus.VOID.value,
         )
     )).scalar_one_or_none()
     if existing is not None:
@@ -410,6 +441,43 @@ async def create_invite(
                 "message": (
                     f"{email_lower} has already been invited to this session "
                     f"(status: {existing.status})."
+                ),
+            },
+        )
+
+    # 2026-09-12 — Cross-session anti-dupe (user's Rule A). Refuse if
+    # this email is already on a live invite in ANOTHER open coaching
+    # session (DRAFT or ACTIVE). Prevents accidental double-invite
+    # across parallel sessions. VOID + REJECTED invites don't count
+    # (student was released from those); post-CLOSED sessions also
+    # don't count (student is free to be invited to a new refresher).
+    open_statuses = [s.value for s in OPEN_SESSION_STATUSES]
+    live_invite_statuses = [
+        CoachingInviteStatus.INVITED.value,
+        CoachingInviteStatus.SUBMITTED.value,
+        CoachingInviteStatus.APPROVED.value,
+    ]
+    cross_session_row = (await db.execute(
+        select(CoachingStudentInvite, CoachingSession)
+        .join(CoachingSession, CoachingSession.id == CoachingStudentInvite.session_id)
+        .where(
+            func.lower(CoachingStudentInvite.email) == email_lower,
+            CoachingStudentInvite.session_id != session.id,
+            CoachingStudentInvite.status.in_(live_invite_statuses),
+            CoachingSession.status.in_(open_statuses),
+        ).limit(1)
+    )).first()
+    if cross_session_row is not None:
+        _inv, other_session = cross_session_row
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "email_already_in_another_open_session",
+                "message": (
+                    f"{email_lower} is already a student in another open "
+                    f"coaching session (status: {other_session.status}). "
+                    f"Wait for that session to close before inviting them "
+                    f"to a new one."
                 ),
             },
         )
@@ -480,20 +548,22 @@ async def approve_invite(
 
     form = invite.submitted_form or {}
     student_name = (form.get("name") or "").strip()
-    phone_raw = (form.get("phone") or "").strip()
-    if not student_name or not phone_raw:
+    if not student_name:
         raise HTTPException(
             status_code=422,
-            detail="Student's submitted form is missing name or phone.",
+            detail="Student's submitted form is missing name.",
         )
-    submitted_phone = normalise_phone(phone_raw)
-    # On prod, refuses (422) if the phone belongs to a real user.
-    # On staging/dev, returns either the submitted phone (if free) or
-    # a synthesised +91999xxxxxxx disposable so testers can reuse
-    # their own real numbers across sessions. Downstream User row +
-    # CoachingStudent.approved_phone + credentials email all use the
-    # returned value (`approved_phone`).
-    approved_phone = await _ensure_phone_available_for_student(db, submitted_phone)
+    # 2026-09-12 — Temp-number scheme (replaces the prod-collision +
+    # staging-synth logic in `_ensure_phone_available_for_student`).
+    # Student's submitted phone is informational only — the coach uses
+    # it for context but it never becomes the login phone. Instead,
+    # every approved student gets a fresh `+913XXXXXXXXX` disposable
+    # from `generate_temp_coaching_phone` — safe sentinel range that
+    # cannot collide with any real number. This kills the whole class
+    # of "same tester phone across sessions" bugs (see the 2026-09-12
+    # data-fix pattern) and lets the coach ship the login phone in the
+    # credentials email without worrying about phone availability.
+    approved_phone = await generate_temp_coaching_phone(db)
 
     # Provision the student's User (portal login = email + password).
     plain_password = secrets.token_urlsafe(12)
@@ -708,6 +778,50 @@ async def _ensure_phone_available_for_student(
     raise HTTPException(
         status_code=500,
         detail="Failed to synthesise a disposable phone for coaching student.",
+    )
+
+
+async def generate_temp_coaching_phone(db: AsyncSession) -> str:
+    """Generate a globally-unique coaching temp phone in the
+    `+913XXXXXXXXX` range — 10 digits after +91, first digit '3'.
+
+    Real Indian mobile numbers start with 6/7/8/9, so '3' is a safe
+    sentinel range that cannot collide with any real phone. Range size
+    is 1B (`+913000000000` — `+913999999999`) against a tiny population
+    of coaching students, so collision retry is a near-impossibility
+    but we loop as a defensive belt-and-braces.
+
+    Ties into the coaching sandbox's approved-phone lifecycle:
+    - Coach approves a student → this fn assigns the temp phone,
+      stored on both `User.phone` and `CoachingStudent.approved_phone`.
+    - Session flips to ACTIVE → the phone becomes usable (existing
+      `guard_coaching_student_login` + `guard_otp_request_for_coaching_phone`
+      handle this atomically).
+    - Login uses the temp phone; OTP is surfaced in-app (see
+      `_should_surface_otp_in_response`); no SMS ever leaves for a
+      `+913…` number.
+    - Session closes → temp phone deactivates naturally via the login
+      + otp-request guards.
+    """
+    from app.modules.platform.models import User
+    for _ in range(20):
+        # 9 random digits after the leading '3' → 10 total digits after +91.
+        candidate = f"+913{secrets.randbelow(1_000_000_000):09d}"
+        existing = (await db.execute(
+            select(User.id).where(User.phone == candidate).limit(1)
+        )).scalar_one_or_none()
+        if existing is None:
+            return candidate
+    raise HTTPException(
+        status_code=500,
+        detail={
+            "code": "coaching_temp_phone_generation_failed",
+            "message": (
+                "Could not allocate a unique temp coaching phone after "
+                "20 attempts. This is a near-impossibility — investigate "
+                "whether the +913XXXXXXXXX range is somehow saturated."
+            ),
+        },
     )
 
 
@@ -958,29 +1072,116 @@ async def load_invite_by_token(
 def can_submit_invite(
     invite: CoachingStudentInvite, session: CoachingSession,
 ) -> bool:
-    """Student is allowed to submit / re-submit only while the invite
-    is INVITED or SUBMITTED (re-submit lets them fix a typo before
-    coach reviews), the invite hasn't expired, and the session is
+    """Student is allowed to submit ONLY while the invite is INVITED
+    (single-use — once SUBMITTED, the link closes and the student
+    can't re-submit), the invite hasn't expired, and the session is
     still DRAFT (invites become inert once the coach clicks Start).
+
+    2026-09-12 — Tightened from INVITED-or-SUBMITTED to INVITED-only.
+    If the student needs to fix an error post-submit, the coach uses
+    the regenerate-link endpoint which voids the old invite and
+    creates a fresh one.
     """
     if invite.is_expired():
         return False
     if session.status != CoachingSessionStatus.DRAFT.value:
         return False
-    return invite.status in (
+    return invite.status == CoachingInviteStatus.INVITED.value
+
+
+async def regenerate_invite(
+    db: AsyncSession, invite: CoachingStudentInvite, coach: User,
+) -> tuple[CoachingStudentInvite, str]:
+    """Void the current invite and create a fresh one for the same
+    email + session. New token, new expiry, INVITED status. Sends a
+    fresh emailed link.
+
+    Pre-approval only — a coach can regenerate while the invite is
+    INVITED (student never opened it) or SUBMITTED (student filled it
+    but coach wants a redo). Once APPROVED, the CoachingStudent is
+    already provisioned and this endpoint refuses — coach must remove
+    the student and re-invite fresh from scratch. Also refused if
+    the invite is already VOID or REJECTED (nothing to regenerate).
+
+    Returns (new_invite, full_invite_link) — same shape as
+    `create_invite`.
+    """
+    session = (await db.execute(
+        select(CoachingSession).where(CoachingSession.id == invite.session_id)
+    )).scalar_one()
+    if session.status != CoachingSessionStatus.DRAFT.value:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "session_not_draft",
+                "message": (
+                    "Cannot regenerate invites after the session has started."
+                ),
+            },
+        )
+    if invite.status not in (
         CoachingInviteStatus.INVITED.value,
         CoachingInviteStatus.SUBMITTED.value,
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "invite_not_regeneratable",
+                "message": (
+                    f"Cannot regenerate an invite in status {invite.status}. "
+                    f"Regenerate is allowed only on INVITED or SUBMITTED "
+                    f"invites. For APPROVED students, remove the student "
+                    f"and re-invite fresh."
+                ),
+            },
+        )
+
+    # Void the old row (audit trail preserved). Partial-unique index
+    # on (session_id, email) excludes VOID rows, so the fresh insert
+    # below won't collide.
+    invite.status = CoachingInviteStatus.VOID.value
+    await db.flush()
+
+    fresh_invite = CoachingStudentInvite(
+        id=new_uuid(),
+        session_id=session.id,
+        email=invite.email,
+        invite_token=new_invite_token(),
+        status=CoachingInviteStatus.INVITED.value,
+        expires_at=utcnow() + timedelta(days=INVITE_EXPIRY_DAYS),
     )
+    db.add(fresh_invite)
+    await db.commit()
+    await db.refresh(fresh_invite)
+
+    link = build_invite_link(fresh_invite.invite_token)
+    # Best-effort — coach can re-copy the link from the response if
+    # the email delivery fails.
+    ref_client = (await db.execute(
+        select(Client).where(Client.id == session.reference_client_id)
+    )).scalar_one()
+    send_student_invite_email(
+        to_email=fresh_invite.email,
+        invite_link=link,
+        coach_name=coach.name or "Your coach",
+        reference_client_name=ref_client.full_name,
+    )
+    return fresh_invite, link
 
 
 async def submit_student_form(
     db: AsyncSession, token: str, form: dict,
 ) -> CoachingStudentInvite:
     """Public endpoint's write side. Stores the form JSON, flips
-    invite to SUBMITTED, stamps submitted_at. Rejects with 422 if
-    the phone is already a real user (approved-phone exclusivity,
-    caught here as a UX win instead of waiting for the coach to
-    reject the invite)."""
+    invite to SUBMITTED, stamps submitted_at.
+
+    2026-09-12 — Phone is now purely informational. Under the temp-
+    number scheme, `generate_temp_coaching_phone` allocates the actual
+    login phone at coach-approval time. Whatever the student types
+    here is stored verbatim so the coach can see it as context (e.g.
+    to reach the student out-of-band), but it never affects login.
+    No normalisation, no availability check, no rejection.
+    """
     invite, session, _ref, _coach = await load_invite_by_token(db, token)
     if not can_submit_invite(invite, session):
         # Message tuned per specific failure so the student knows why.
@@ -992,22 +1193,12 @@ async def submit_student_form(
             msg = "This invite is no longer active."
         raise HTTPException(status_code=409, detail=msg)
 
-    # Fail-fast on phone availability so student can correct on the
-    # spot instead of getting a rejection email later. On prod this
-    # raises 422 for collisions; on staging/dev it returns a
-    # (possibly synthesised) fallback we discard here — the actual
-    # synthesis happens at approve time on that same call so
-    # submitted_form.phone stays as what the student typed (coach
-    # UI shows the real submitted number, not a random synth).
-    approved_phone = normalise_phone(form.get("phone", ""))
-    await _ensure_phone_available_for_student(db, approved_phone)
-
     invite.submitted_form = {
-        "name": form.get("name", "").strip(),
+        "name": (form.get("name") or "").strip(),
         "year_of_birth": form.get("year_of_birth"),
-        "address": form.get("address", "").strip(),
-        "organization": form.get("organization", "").strip(),
-        "phone": approved_phone,
+        "address": (form.get("address") or "").strip(),
+        "organization": (form.get("organization") or "").strip(),
+        "phone": (form.get("phone") or "").strip(),
     }
     invite.status = CoachingInviteStatus.SUBMITTED.value
     invite.submitted_at = utcnow()
