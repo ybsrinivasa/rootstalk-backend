@@ -1434,6 +1434,62 @@ def build_verification_url(cert_number: str) -> str:
     return f"{base.rstrip('/')}/verify/{cert_number}"
 
 
+async def mint_coach_view_token(
+    db: AsyncSession, session: CoachingSession, student: CoachingStudent,
+    coach: User,
+) -> dict:
+    """Mint a short-lived, read-only JWT so the coach can open the
+    student's workspace in a new tab without logging the student out
+    or exposing the student's login credentials.
+
+    The token acts AS the student (sub=student.user_id, roles=student
+    roles, client_id=workspace) plus `coach_view=True` which
+    `get_current_user` uses to refuse mutating requests. Deliberately
+    works for CLOSED sessions too — post-close certification review
+    is a legitimate viewing window.
+
+    Response includes `portal_url` (the client-portal root; the coach's
+    browser appends the token as a URL fragment during handoff so it
+    isn't logged in HTTP referrer / server access logs).
+    """
+    from app.modules.auth.service import create_coach_view_token
+    from sqlalchemy.orm import selectinload
+
+    workspace = await db.get(Client, student.workspace_client_id)
+    if workspace is None:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    # Fresh load of the student user with roles, needed for the
+    # `roles` claim on the minted JWT.
+    student_user = (await db.execute(
+        select(User)
+        .options(selectinload(User.roles))
+        .where(User.id == student.user_id)
+    )).scalar_one()
+
+    token = create_coach_view_token(
+        student_user=student_user,
+        workspace_client_id=workspace.id,
+        workspace_short_name=workspace.short_name,
+        coach_user_id=coach.id,
+    )
+
+    base = (settings.frontend_base_url or "https://rootstalk.in").rstrip("/")
+    # Client-portal root — the handoff logic lives there. The coach's
+    # browser opens the URL with `#coach_view_token=<token>` appended
+    # as a fragment (fragments never travel to the server), the root
+    # page reads + strips the fragment, then redirects to /dashboard.
+    portal_url = f"{base}/"
+
+    return {
+        "token": token,
+        "portal_url": portal_url,
+        "workspace_short_name": workspace.short_name,
+        "workspace_display_name": workspace.display_name or workspace.full_name,
+        "student_name": student_user.name,
+        "expires_in_seconds": 60 * 60,
+    }
+
+
 async def load_certified_students(
     db: AsyncSession, current_user: User,
 ) -> list[dict]:

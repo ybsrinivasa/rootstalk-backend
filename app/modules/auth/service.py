@@ -43,6 +43,45 @@ def create_access_token(data: dict) -> str:
     return jwt.encode(payload, settings.secret_key, algorithm=settings.algorithm)
 
 
+def create_coach_view_token(
+    *,
+    student_user: User,
+    workspace_client_id: str,
+    workspace_short_name: str,
+    coach_user_id: str,
+    ttl_minutes: int = 60,
+) -> str:
+    """Mint a short-lived, read-only JWT that lets a coach open a
+    student's workspace in the CA portal without logging the student
+    out or handing over the student's real credentials.
+
+    Shape mirrors a normal portal-issued token: `sub=student.user_id`
+    + `client_id` + `client_short_name` bind the token to the
+    workspace. Two coach-view-specific claims:
+
+    - `coach_view=True`: `get_current_user` refuses any mutating
+      HTTP method on tokens carrying this claim (403
+      coach_view_read_only) and skips the coaching-session-status
+      force-logout check so the coach can revisit CLOSED workspaces.
+    - `coach_view_by`: the coach's user_id, kept for audit.
+
+    Deliberately omits `jti`: the student's single-device session
+    binding stays whatever it was, and this token doesn't rotate it.
+    Short TTL (default 1h) keeps blast radius small.
+    """
+    active_roles = [r.role_type.value for r in student_user.roles if r.status == StatusEnum.ACTIVE]
+    payload = {
+        "sub": student_user.id,
+        "roles": active_roles,
+        "client_id": workspace_client_id,
+        "client_short_name": workspace_short_name,
+        "coach_view": True,
+        "coach_view_by": coach_user_id,
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes),
+    }
+    return jwt.encode(payload, settings.secret_key, algorithm=settings.algorithm)
+
+
 def decode_token(token: str) -> Optional[dict]:
     try:
         return jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])

@@ -526,6 +526,68 @@ async def submit_invite_form(
 
 
 @router.post(
+    "/sessions/{session_id}/students/{student_id}/view-workspace",
+)
+async def view_student_workspace(
+    session_id: str,
+    student_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_coach_or_sa),
+):
+    """Mint a short-lived, read-only JWT the coach can use to open
+    the student's workspace in a new tab. Refuses if the coach doesn't
+    own the session (require_session_owner conflates
+    unauthorised/missing) or if the student isn't in the session.
+
+    Works on ACTIVE and CLOSED sessions — post-close viewing is a
+    legitimate certification-review window. The read-only guarantee
+    is enforced at request time by `get_current_user`, which refuses
+    any non-safe HTTP method on tokens carrying `coach_view=True`.
+    """
+    session = await coaching_service.require_session_owner(
+        db, session_id, current_user,
+    )
+    student = (await db.execute(
+        select(CoachingStudent).where(
+            CoachingStudent.id == student_id,
+            CoachingStudent.session_id == session.id,
+        )
+    )).scalar_one_or_none()
+    if student is None:
+        raise HTTPException(status_code=404, detail="Student not found")
+    return await coaching_service.mint_coach_view_token(
+        db, session, student, coach=current_user,
+    )
+
+
+@router.post(
+    "/certified/{coaching_student_id}/view-workspace",
+)
+async def view_certified_student_workspace(
+    coaching_student_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_coach_or_sa),
+):
+    """Same as `sessions/{sid}/students/{stid}/view-workspace`, but
+    addressable by CoachingStudent id alone — powers the "View" button
+    on `/coaching/certified`, which lists across sessions and doesn't
+    have a session_id column handy in the row. Ownership check is
+    routed through the parent session so a coach can only view
+    students in sessions they own (SA sees all)."""
+    student = (await db.execute(
+        select(CoachingStudent).where(CoachingStudent.id == coaching_student_id)
+    )).scalar_one_or_none()
+    if student is None:
+        raise HTTPException(status_code=404, detail="Student not found")
+    session = await coaching_service.require_session_owner(
+        db, student.session_id, current_user,
+    )
+    return await coaching_service.mint_coach_view_token(
+        db, session, student, coach=current_user,
+    )
+
+
+@router.post(
     "/sessions/{session_id}/students/{student_id}/certify",
     response_model=SessionDetail,
 )

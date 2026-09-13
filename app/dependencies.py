@@ -55,6 +55,36 @@ async def get_current_user(
     request.state.token_client_id = token_client_id
     request.state.token_client_short_name = payload.get("client_short_name")
 
+    # 2026-09-12 — Coach-view tokens (minted by
+    # POST /coaching/sessions/{sid}/students/{stid}/view-workspace)
+    # let a coach read a student's workspace without logging the
+    # student out. Two guarantees enforced here:
+    #   (1) READ-ONLY: refuse any non-safe HTTP method. The token
+    #       carries the student's identity + roles, so without this
+    #       gate the coach could write via any endpoint the student
+    #       could hit.
+    #   (2) BYPASS the coaching-student session-status check below —
+    #       the coach must be able to revisit CLOSED workspaces
+    #       (certification review, grading, etc.); the normal
+    #       "coaching_session_ended" force-logout applies only to
+    #       the student's own OTP-issued token.
+    is_coach_view = bool(payload.get("coach_view"))
+    if is_coach_view:
+        if request.method not in ("GET", "HEAD", "OPTIONS"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "code": "coach_view_read_only",
+                    "message": (
+                        "This is a read-only coach view of the student's "
+                        "workspace. Changes are not permitted."
+                    ),
+                },
+            )
+        request.state.coach_view = True
+        request.state.coach_view_by = payload.get("coach_view_by")
+        return user
+
     # 2026-09-12 — Coaching Sandbox: force-logout if the caller is a
     # coaching student whose session isn't ACTIVE. Login-time guards
     # (`guard_coaching_student_login`) already refuse fresh logins on
