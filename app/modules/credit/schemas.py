@@ -83,6 +83,14 @@ class DealerPortfolioRow(BaseModel):
     pending_confirm_count: int       # entries needing dealer's action
     oldest_overdue_days: Optional[int] = None  # 0+ if there's overdue open credit
     trust: TrustScore
+    # True when the farmer has completed OTP self-registration on
+    # RootsTalk (`User.self_registered_at IS NOT NULL`). False for
+    # dealer-created unclaimed farmers who haven't installed / signed
+    # in yet — those farmers won't see the credit in-app or receive
+    # push notifications until they self-register. The UI surfaces this
+    # as a badge on the farmer card + a banner on the per-farmer detail
+    # page so the dealer knows the farmer's silence isn't disagreement.
+    is_farmer_registered: bool = False
 
 
 class DealerPortfolioResponse(BaseModel):
@@ -136,6 +144,11 @@ class AccountDetail(BaseModel):
     entries: list[EntryOut]
     can_add_opening_balance: bool        # dealer only + no confirmed OB yet
     is_active: bool
+    # Populated in the dealer view. True when the farmer has completed
+    # OTP self-registration; False for dealer-created unclaimed farmers.
+    # NULL in the farmer view (a farmer looking at their own account
+    # is by definition registered — the field carries no information).
+    is_farmer_registered: Optional[bool] = None
 
 
 # ── Create / edit entries ────────────────────────────────────────────

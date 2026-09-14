@@ -157,6 +157,7 @@ async def dealer_portfolio(
                 open_overdue_count=trust.open_overdue_count,
                 open_overdue_total_paise=trust.open_overdue_total_paise,
             ),
+            is_farmer_registered=bool(farmer and farmer.self_registered_at is not None),
         ))
         if confirmed > 0:
             total += confirmed
@@ -228,6 +229,7 @@ async def dealer_account_detail(
             entries=[],
             can_add_opening_balance=True,
             is_active=True,
+            is_farmer_registered=bool(farmer and farmer.self_registered_at is not None),
         )
 
     entries = await credit_service.list_entries_for_account(db, account.id)
@@ -262,6 +264,7 @@ async def dealer_account_detail(
         entries=[_entry_to_out(e) for e in entries],
         can_add_opening_balance=not has_opening,
         is_active=account.is_active,
+        is_farmer_registered=bool(farmer and farmer.self_registered_at is not None),
     )
 
 
