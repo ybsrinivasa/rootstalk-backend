@@ -25,6 +25,7 @@ import app.modules.seed_mgmt.models  # noqa: F401
 import app.modules.translations.models  # noqa: F401
 import app.modules.qr.models  # noqa: F401
 import app.modules.coaching.models  # noqa: F401
+import app.modules.credit.models  # noqa: F401
 
 celery_app = Celery(
     "rootstalk",
@@ -46,6 +47,7 @@ celery_app = Celery(
         "app.tasks.training_expiry",
         "app.tasks.promoter_stepdown_expiry",
         "app.tasks.coaching_expiry",
+        "app.tasks.credit_reminders",
     ],
 )
 
@@ -165,6 +167,27 @@ celery_app.conf.beat_schedule = {
     "coaching-expiry-check": {
         "task": "app.tasks.coaching_expiry.sweep_expired_coaching_sessions",
         "schedule": crontab(minute=20),
+    },
+    # CMS v1.1 (2026-09-14): daily dealer digest at 14:30 UTC = 20:00
+    # IST — end of the working day, when dealers are most likely to
+    # review their credit book. Silent if the dealer has nothing to
+    # act on (no push spam).
+    "credit-dealer-daily-digest": {
+        "task": "app.tasks.credit_reminders.dispatch_dealer_daily_digest",
+        "schedule": crontab(hour=14, minute=30),
+    },
+    # CMS v1.1: weekly overdue nudge to dealers, Monday 02:30 UTC =
+    # 08:00 IST. Only fires if the dealer has non-zero outstanding.
+    "credit-dealer-weekly-overdue": {
+        "task": "app.tasks.credit_reminders.dispatch_dealer_weekly_overdue",
+        "schedule": crontab(hour=2, minute=30, day_of_week=1),
+    },
+    # CMS v1.1: weekly summary to farmers, Sunday 02:30 UTC = 08:00
+    # IST. Only fires if the farmer has non-zero total owed (or an
+    # upcoming/overdue credit worth surfacing).
+    "credit-farmer-weekly-summary": {
+        "task": "app.tasks.credit_reminders.dispatch_farmer_weekly_summary",
+        "schedule": crontab(hour=2, minute=30, day_of_week=0),
     },
 }
 

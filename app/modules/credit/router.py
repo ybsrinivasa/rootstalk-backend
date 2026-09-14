@@ -18,10 +18,11 @@ The coaching sandbox is enforced inside the service layer via
 account against a coaching-student farmer (and vice versa); coaching
 students play both sides as themselves within their own workspace.
 """
-from datetime import date, timezone
+from datetime import date, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -42,6 +43,7 @@ from app.modules.credit.schemas import (
     FarmerPortfolioRow, ProposeVoidRequest, ReminderPrefOut,
     ReminderPrefUpdate, TrustScore, UpdateProposedEntryRequest,
 )
+from app.modules.credit.statement import render_statement_pdf
 from app.modules.credit.trust_score import compute_trust_for_account
 from app.modules.orders.models import DealerProfile
 from app.modules.platform.models import RoleType, User
@@ -359,6 +361,73 @@ async def dealer_create_payment(
     await credit_notifications.push_entry_proposed(db, entry, account)
     balance = await _load_balance(db, entry.account_id, InitiatorParty.DEALER.value)
     return EntryActionResponse(entry=_entry_to_out(entry), balance=balance)
+
+
+@router.get(
+    "/dealer/credit/farmers/{farmer_user_id}/statement.pdf",
+)
+async def dealer_farmer_statement(
+    farmer_user_id: str,
+    from_date: date = Query(..., alias="from"),
+    to_date: date = Query(..., alias="to"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_dealer),
+):
+    """Generate a dealer-signed PDF statement of the farmer's account
+    for the given date range. Returns the raw PDF as inline octet
+    stream — the dealer's client can open, download, or share it.
+
+    Sanity: from_date must be <= to_date; range max 2 years to
+    keep the render bounded. Includes only CONFIRMED entries. The
+    opening-balance-carried-forward for from_date is auto-computed
+    from all earlier confirmed entries.
+    """
+    if from_date > to_date:
+        raise HTTPException(422, detail="from_date must be <= to_date")
+    if (to_date - from_date).days > 730:
+        raise HTTPException(422, detail="Date range too wide — please split into two years or less.")
+
+    account = await credit_service.get_account_by_pair(
+        db, dealer_user_id=current_user.id, farmer_user_id=farmer_user_id,
+    )
+    if account is None:
+        raise HTTPException(404, detail="Credit account not found")
+
+    # Load every CONFIRMED entry on the account — the renderer needs
+    # them all to compute the opening balance carried forward for
+    # `from_date`.
+    entries = list((await db.execute(
+        select(CreditEntry).where(
+            CreditEntry.account_id == account.id,
+            CreditEntry.status == CreditEntryStatus.CONFIRMED.value,
+        )
+    )).scalars().all())
+
+    farmer = await db.get(User, farmer_user_id)
+    dealer_profile = (await db.execute(
+        select(DealerProfile).where(DealerProfile.user_id == current_user.id)
+    )).scalar_one_or_none()
+
+    pdf_bytes = render_statement_pdf(
+        dealer_name=current_user.name or current_user.email or "Dealer",
+        dealer_phone=current_user.phone,
+        shop_name=dealer_profile.shop_name if dealer_profile else None,
+        shop_address=dealer_profile.shop_address if dealer_profile else None,
+        farmer_name=(farmer.name if farmer else None) or "Farmer",
+        farmer_phone=farmer.phone if farmer else None,
+        account_opened_at=account.opened_at,
+        all_confirmed_entries=entries,
+        from_date=from_date,
+        to_date=to_date,
+    )
+    filename = f"statement-{(farmer.name or 'farmer').replace(' ', '_')}-{from_date}-to-{to_date}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'inline; filename="{filename}"',
+        },
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════
