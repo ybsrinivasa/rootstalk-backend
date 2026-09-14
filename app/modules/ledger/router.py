@@ -23,9 +23,11 @@ from app.modules.clients.models import Client
 from app.modules.coaching.service import get_coaching_student_for_user
 from app.modules.ledger.models import DealerFarmerNote, DealerManualSale, new_uuid
 from app.modules.ledger.schemas import (
-    FarmerDetail, FarmerInfoUpdateRequest, LedgerEntry, ManualSaleCreateRequest,
-    ManualSaleResponse, ManualSaleUpdateRequest, NewFarmerFields, NoteUpdateRequest,
-    PhoneLookupRequest, PhoneLookupResponse, RosterFarmer, RosterResponse,
+    BatchSaleItem, FarmerDetail, FarmerInfoUpdateRequest, LedgerEntry,
+    ManualSaleCreateRequest, ManualSaleResponse, ManualSalesBatchCreateRequest,
+    ManualSalesBatchResponse, ManualSaleUpdateRequest, NewFarmerFields,
+    NoteUpdateRequest, PhoneLookupRequest, PhoneLookupResponse, RosterFarmer,
+    RosterResponse,
 )
 from app.modules.orders.models import Order, OrderItem, PackingList, SeedOrder
 from app.modules.platform.models import RoleType, StatusEnum, User, UserRole
@@ -688,6 +690,69 @@ async def create_manual_sale(
     db.add(sale)
     await db.commit()
     return ManualSaleResponse(id=sale.id, farmer_user_id=farmer_id)
+
+
+# ── POST /dealer/ledger/manual-sales-batch — create N items in one go ─
+# Add Sale v2 (2026-09-14). See docs/AddSale_v2_scoping.md. All-or-
+# nothing single transaction; shared sale_date across items; ≤ 20
+# items per batch (enforced by the schema).
+
+@router.post("/manual-sales-batch", response_model=ManualSalesBatchResponse)
+async def create_manual_sales_batch(
+    body: ManualSalesBatchCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_dealer),
+):
+    dealer_id = current_user.id
+    if bool(body.farmer_user_id) == bool(body.new_farmer):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_farmer_ref",
+                "message": "Provide exactly one of farmer_user_id or new_farmer.",
+            },
+        )
+
+    # Resolve the farmer first — if this fails, no sales get created.
+    if body.new_farmer:
+        farmer = await _create_farmer_user(db, body.new_farmer)
+        farmer_id = farmer.id
+    else:
+        farmer_id = body.farmer_user_id  # type: ignore[assignment]
+        exists = (await db.execute(
+            select(User.id).where(User.id == farmer_id)
+        )).scalar_one_or_none()
+        if not exists:
+            raise HTTPException(status_code=404, detail={"code": "farmer_not_found"})
+
+    # Build every row before flushing so any per-item validation error
+    # aborts the batch cleanly. Preserve the order the client submitted
+    # them in — response echoes sale_ids in the same order.
+    sales: list[DealerManualSale] = []
+    for item in body.sales:
+        sales.append(DealerManualSale(
+            id=new_uuid(),
+            dealer_user_id=dealer_id,
+            farmer_user_id=farmer_id,
+            category=item.category,
+            product_name=item.product_name.strip(),
+            brand=(item.brand or None),
+            manufacturer=(item.manufacturer or None),
+            qty=item.qty,
+            unit=item.unit.strip(),
+            price=item.price,
+            sale_date=body.sale_date,
+            notes=(item.notes or None),
+        ))
+
+    for s in sales:
+        db.add(s)
+    await db.commit()
+
+    return ManualSalesBatchResponse(
+        farmer_user_id=farmer_id,
+        sale_ids=[s.id for s in sales],
+    )
 
 
 # ── PATCH /dealer/ledger/manual-sale/{id} ─────────────────────────

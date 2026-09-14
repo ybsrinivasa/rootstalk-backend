@@ -143,6 +143,38 @@ class ManualSaleResponse(BaseModel):
     farmer_user_id: str
 
 
+# ── Batch create (Add Sale v2, 2026-09-14) ──────────────────────────
+# Same shape as ManualSaleCreateRequest but with `sale_date` lifted to
+# the batch level (shared across items — a farmer's visit is one event)
+# and `sale` replaced with a `sales` list. All-or-nothing at the DB
+# transaction level; ≤ 20 items per batch.
+
+class BatchSaleItem(BaseModel):
+    """One line in a batch — no sale_date (shared at the batch level)."""
+    category: Literal["SEED", "PESTICIDE", "FERTILIZER"]
+    product_name: str = Field(..., min_length=1, max_length=255)
+    brand: Optional[str] = Field(None, max_length=255)
+    manufacturer: Optional[str] = Field(None, max_length=255)
+    qty: Decimal
+    unit: str = Field(..., min_length=1, max_length=20)
+    price: Optional[Decimal] = None
+    notes: Optional[str] = None
+
+
+class ManualSalesBatchCreateRequest(BaseModel):
+    """Exactly one of farmer_user_id / new_farmer required. `sales`
+    is 1..20 items; every item shares the batch-level `sale_date`."""
+    farmer_user_id: Optional[str] = None
+    new_farmer: Optional[NewFarmerFields] = None
+    sale_date: date
+    sales: list[BatchSaleItem] = Field(..., min_length=1, max_length=20)
+
+
+class ManualSalesBatchResponse(BaseModel):
+    farmer_user_id: str
+    sale_ids: list[str]  # in the order submitted
+
+
 # ── Personal note ───────────────────────────────────────────────────
 
 class NoteUpdateRequest(BaseModel):
