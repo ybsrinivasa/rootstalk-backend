@@ -31,7 +31,7 @@ from app.modules.ledger.schemas import (
 )
 from app.modules.orders.models import Order, OrderItem, PackingList, SeedOrder
 from app.modules.platform.models import RoleType, StatusEnum, User, UserRole
-from app.modules.subscriptions.models import Subscription, SubscriptionStatus
+from app.modules.subscriptions.models import Subscription
 from app.modules.sync.models import CoshCoreItem
 
 
@@ -40,26 +40,19 @@ router = APIRouter(prefix="/dealer/ledger", tags=["Farmer Ledger"])
 require_dealer = require_roles(RoleType.DEALER)
 
 
-# ── Sub-status filter mapping ─────────────────────────────────────
+# ── Time-based filter (2026-09-14) ────────────────────────────────
+# Reframed from subscription-status ("active" / "completed") to
+# entry-date buckets. Rationale: manual sales + cross-shop items
+# have no subscription and were previously visible only under the
+# All tab. Uniform date bucketing gives every source first-class
+# treatment.
+#
+# LEDGER_RECENT_DAYS = 90 → one full crop cycle for most annual
+# Indian crops. Long enough to cover normal buying rhythm, short
+# enough that "Recent" reads current.
 
-_ACTIVE_STATUSES = {
-    SubscriptionStatus.ACTIVE,
-    SubscriptionStatus.WAITLISTED,
-    SubscriptionStatus.SUSPENDED,
-}
-_COMPLETED_STATUSES = {
-    SubscriptionStatus.LAPSED,
-    SubscriptionStatus.UNSUBSCRIBED,
-    SubscriptionStatus.CANCELLED,
-}
-
-
-def _sub_statuses_for_filter(filter_: str) -> Optional[set[SubscriptionStatus]]:
-    if filter_ == "active":
-        return _ACTIVE_STATUSES
-    if filter_ == "completed":
-        return _COMPLETED_STATUSES
-    return None  # "all" — no restriction
+LEDGER_RECENT_DAYS = 90
+LEDGER_WINDOW_DAYS = 365   # existing 12-month cap; unchanged
 
 
 # ── Phone normalisation ───────────────────────────────────────────
@@ -289,7 +282,7 @@ async def get_roster(
 @router.get("/farmers/{user_id}", response_model=FarmerDetail)
 async def get_farmer_detail(
     user_id: str,
-    filter: Literal["active", "completed", "all"] = "active",
+    filter: Literal["recent", "older", "all"] = "recent",
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_dealer),
 ):
@@ -319,21 +312,19 @@ async def get_farmer_detail(
         )
     )).scalar_one_or_none()
 
-    # 12-month cutoff for the ledger detail.
+    # 12-month cutoff for the ledger detail — bounds the "All" tab too.
     today = date.today()
-    twelve_months_ago = today - timedelta(days=365)
+    twelve_months_ago = today - timedelta(days=LEDGER_WINDOW_DAYS)
+    recent_cutoff = today - timedelta(days=LEDGER_RECENT_DAYS)
     cutoff_ts = datetime.combine(twelve_months_ago, datetime.min.time(), tzinfo=timezone.utc)
 
-    # Which subs are in-scope for the filter?
-    sub_status_filter = _sub_statuses_for_filter(filter)
-
-    # Grab all farmer's subs; we'll filter per row after fetching context.
-    subs_q = select(Subscription).where(Subscription.farmer_user_id == user_id)
-    if sub_status_filter is not None:
-        subs_q = subs_q.where(Subscription.status.in_(sub_status_filter))
-    subs = (await db.execute(subs_q)).scalars().all()
+    # All subs on this farmer — fetched purely for hydrating per-row
+    # crop / advising-company context. No status-based filter any more;
+    # the time-based bucketing is applied post-fetch at the entry level.
+    subs = (await db.execute(
+        select(Subscription).where(Subscription.farmer_user_id == user_id)
+    )).scalars().all()
     sub_by_id = {s.id: s for s in subs}
-    in_scope_sub_ids = set(sub_by_id.keys())
 
     # Package lookup for crop + advising company.
     pkg_ids = {s.package_id for s in subs if s.package_id}
@@ -401,8 +392,6 @@ async def get_farmer_detail(
         l1_by_practice = {}
 
     for r in own_rows:
-        if r.subscription_id and r.subscription_id not in in_scope_sub_ids:
-            continue
         entries.append(LedgerEntry(
             source="own",
             date=r.picked_up_at.date(),
@@ -434,8 +423,6 @@ async def get_farmer_detail(
         )
     )).all()
     for r in own_seed:
-        if r.subscription_id and r.subscription_id not in in_scope_sub_ids:
-            continue
         entries.append(LedgerEntry(
             source="own",
             date=r.picked_up_at.date(),
@@ -450,28 +437,28 @@ async def get_farmer_detail(
         ))
 
     # ── Own manual entries ─────────────────────────────────────
-    # Manual entries have NO sub tie; only appear under "all" filter.
-    if filter == "all":
-        manual = (await db.execute(
-            select(DealerManualSale).where(
-                DealerManualSale.dealer_user_id == dealer_id,
-                DealerManualSale.farmer_user_id == user_id,
-                DealerManualSale.sale_date >= twelve_months_ago,
-            )
-        )).scalars().all()
-        for m in manual:
-            entries.append(LedgerEntry(
-                source="own_manual",
-                date=m.sale_date,
-                category=m.category,
-                product_name=m.product_name,
-                brand=m.brand,
-                manufacturer=m.manufacturer,
-                qty=m.qty,
-                unit=m.unit,
-                price=m.price,
-                manual_sale_id=m.id,
-            ))
+    # Manual entries fetched unconditionally within the 12-month
+    # window; the tab-level date bucket is applied at the end.
+    manual = (await db.execute(
+        select(DealerManualSale).where(
+            DealerManualSale.dealer_user_id == dealer_id,
+            DealerManualSale.farmer_user_id == user_id,
+            DealerManualSale.sale_date >= twelve_months_ago,
+        )
+    )).scalars().all()
+    for m in manual:
+        entries.append(LedgerEntry(
+            source="own_manual",
+            date=m.sale_date,
+            category=m.category,
+            product_name=m.product_name,
+            brand=m.brand,
+            manufacturer=m.manufacturer,
+            qty=m.qty,
+            unit=m.unit,
+            price=m.price,
+            manual_sale_id=m.id,
+        ))
 
     # ── Anonymised other-shop rows ─────────────────────────────
     # Farmer privacy gate: only surface cross-dealer purchases when
@@ -480,6 +467,11 @@ async def get_farmer_detail(
     # no "opted out" hint, to keep the dealer-facing view trust-
     # preserving on both sides).
     if not farmer.share_cross_dealer_purchases:
+        # Apply the same time-based tab filter as the full-render path.
+        if filter == "recent":
+            entries = [e for e in entries if e.date >= recent_cutoff]
+        elif filter == "older":
+            entries = [e for e in entries if e.date < recent_cutoff]
         entries.sort(key=lambda e: e.date, reverse=True)
         return FarmerDetail(
             user_id=farmer.id,
@@ -523,7 +515,10 @@ async def get_farmer_detail(
             l1_by_practice[pid] = l1
 
     for r in other_rows:
-        if not r.subscription_id or r.subscription_id not in in_scope_sub_ids:
+        # Cross-shop rows without a subscription context are still
+        # excluded — they'd have no crop pill to display and are
+        # extremely rare (orphan RT sales that lost their sub link).
+        if not r.subscription_id:
             continue
         entries.append(LedgerEntry(
             source="other_shop",
@@ -555,7 +550,7 @@ async def get_farmer_detail(
         )
     )).all()
     for r in other_seed:
-        if not r.subscription_id or r.subscription_id not in in_scope_sub_ids:
+        if not r.subscription_id:
             continue
         entries.append(LedgerEntry(
             source="other_shop",
@@ -569,6 +564,14 @@ async def get_farmer_detail(
             price=None,
             **_sub_context(r.subscription_id),
         ))
+
+    # Apply time-based tab filter uniformly across all sources.
+    if filter == "recent":
+        entries = [e for e in entries if e.date >= recent_cutoff]
+    elif filter == "older":
+        entries = [e for e in entries if e.date < recent_cutoff]
+    # "all" — no additional filter; still bounded by the 12-month
+    # window applied at query time.
 
     entries.sort(key=lambda e: e.date, reverse=True)
 
