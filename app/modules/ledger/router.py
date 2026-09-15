@@ -654,6 +654,36 @@ async def _create_farmer_user(db: AsyncSession, new: NewFarmerFields) -> User:
     return user
 
 
+# ── POST /dealer/ledger/farmers — create a farmer without a sale ──
+# Standalone helper used by flows that need to reach a new farmer
+# without going through Add Sale — currently: CMS "+ New credit
+# account" entry point on the credit portfolio, so a dealer can
+# start recording credit against a walk-in without having to
+# invent a fake sale first. Reuses `_create_farmer_user` for the
+# same phone-normalisation + phone-already-exists 409 behaviour.
+
+@router.post("/farmers", response_model=PhoneLookupResponse, status_code=201)
+async def create_farmer(
+    body: NewFarmerFields,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_dealer),
+):
+    farmer = await _create_farmer_user(db, body)
+    await db.commit()
+    # Return the same shape as `POST /dealer/ledger/lookup-phone` so
+    # the frontend can route straight into the found-farmer path.
+    return PhoneLookupResponse(
+        found=True,
+        user_id=farmer.id,
+        name=farmer.name,
+        phone=farmer.phone,
+        photo_url=farmer.photo_url,
+        state_cosh_id=farmer.state_cosh_id,
+        district_cosh_id=farmer.district_cosh_id,
+        sub_district=farmer.sub_district_cosh_id,
+    )
+
+
 @router.post("/manual-sale", response_model=ManualSaleResponse)
 async def create_manual_sale(
     body: ManualSaleCreateRequest,
