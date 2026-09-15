@@ -622,6 +622,7 @@ async def lookup_phone(
         sub_district=user.sub_district_cosh_id,
         state_name=names.get(user.state_cosh_id) if user.state_cosh_id else None,
         district_name=names.get(user.district_cosh_id) if user.district_cosh_id else None,
+        is_claimed=user.self_registered_at is not None,
     )
 
 
@@ -681,6 +682,7 @@ async def create_farmer(
         state_cosh_id=farmer.state_cosh_id,
         district_cosh_id=farmer.district_cosh_id,
         sub_district=farmer.sub_district_cosh_id,
+        is_claimed=False,  # freshly dealer-created — farmer hasn't self-registered
     )
 
 

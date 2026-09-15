@@ -95,6 +95,12 @@ class PhoneLookupResponse(BaseModel):
     sub_district: Optional[str] = None
     state_name: Optional[str] = None
     district_name: Optional[str] = None
+    # True when the farmer has completed OTP self-registration
+    # (`User.self_registered_at IS NOT NULL`). Callers gate flows on
+    # this — CMS "+ New credit" for example refuses to open an
+    # account against an unclaimed number and prompts the dealer to
+    # invite the farmer via SMS instead.
+    is_claimed: bool = False
 
 
 # ── Manual sale create / update / delete ────────────────────────────
