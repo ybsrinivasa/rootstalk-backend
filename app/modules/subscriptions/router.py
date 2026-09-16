@@ -5136,6 +5136,11 @@ async def get_advisory_cluster(
             "package_name": pkg.name,
             "crop_cosh_id": pkg.crop_cosh_id,
             "crop_start_date": sub.crop_start_date,
+            # 2026-09-16 (v1.6 fix): the daily endpoint carries a
+            # `day_offset` field that the header card renders as
+            # 'Today · Day N'. Cluster response needs it too; without
+            # it the card reads 'Day undefined'.
+            "day_offset": (today - crop_start).days,
             "reference_number": sub.reference_number,
             "advisory_only_mode": bool(sub.advisory_only_mode),
             "dealer_list_enabled": bool(sub.dealer_list_enabled),
