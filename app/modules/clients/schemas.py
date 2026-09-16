@@ -17,6 +17,10 @@ class ClientInitiate(BaseModel):
     ca_email: EmailStr
     is_manufacturer: bool = False
     payment_model: PaymentModel  # mandatory — spec §11.1
+    # Advisory-Only Mode (2026-09-16) — see docs/AdvisoryOnly_v1_scoping.md.
+    advisory_only_mode: bool = False
+    dealer_list_enabled: bool = False  # meaningful only when advisory_only_mode=True
+    subscription_fee_paise: Optional[int] = None  # override for flat pricing
 
 
 # ── CA submits their side ──────────────────────────────────────────────────────
@@ -78,6 +82,12 @@ class ClientEdit(BaseModel):
     cosh_manufacturer_id: Optional[str] = None
     # Org types — replaces the existing list when provided
     org_type_cosh_ids: Optional[List[str]] = None
+    # Advisory-Only Mode (2026-09-16) — see
+    # docs/AdvisoryOnly_v1_scoping.md. Flippable anytime; existing
+    # subscriptions keep the mode captured when they were created.
+    advisory_only_mode: Optional[bool] = None
+    dealer_list_enabled: Optional[bool] = None
+    subscription_fee_paise: Optional[int] = None
 
 
 class ClientStatusUpdate(BaseModel):
@@ -120,6 +130,10 @@ class ClientOut(BaseModel):
     # 2026-07-05 — Cosh input_manufacturers cosh_id for the QR
     # portfolio picker. NULL until SA links it via the edit modal.
     cosh_manufacturer_id: Optional[str] = None
+    # 2026-09-16 — Advisory-Only Mode. See docs/AdvisoryOnly_v1_scoping.md.
+    advisory_only_mode: bool = False
+    dealer_list_enabled: bool = False
+    subscription_fee_paise: Optional[int] = None
     status: ClientStatus
     ca_name: str
     ca_phone: str

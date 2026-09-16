@@ -350,6 +350,12 @@ async def initiate_onboarding(
         status=ClientStatus.PENDING_REVIEW,
         onboarding_link_token=token,
         onboarding_link_expires_at=expires_at,
+        # Advisory-Only Mode (2026-09-16). Defaults to False; the fee
+        # override is None (traditional bulk-discount pricing). SA can
+        # tick + set at initiate time OR later via ClientEdit.
+        advisory_only_mode=request.advisory_only_mode,
+        dealer_list_enabled=request.dealer_list_enabled,
+        subscription_fee_paise=request.subscription_fee_paise,
     )
     db.add(client)
     await db.commit()
@@ -1045,6 +1051,13 @@ async def get_client_info_by_id(
         # on /home/[clientId] to render the training banner + suppress
         # any "real world" affordances.
         "is_training": bool(client.is_training),
+        # 2026-09-16 — Advisory-Only Mode marker. Farmer PWA reads this
+        # on the client picker (subscribe flow) to render the
+        # "Advisory Only" chip. Per-subscription behaviour is driven by
+        # Subscription.advisory_only_mode (snapshot), not this field.
+        "advisory_only_mode": bool(client.advisory_only_mode),
+        "dealer_list_enabled": bool(client.dealer_list_enabled),
+        "subscription_fee_paise": client.subscription_fee_paise,
     }
 
 
