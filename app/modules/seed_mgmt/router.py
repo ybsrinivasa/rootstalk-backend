@@ -561,7 +561,37 @@ async def browse_seed_varieties(
                     cosh_ids.add(cid)
     names = await resolve_names_by_cosh_id(db, cosh_ids, lang) if cosh_ids else {}
 
-    return [_variety_out(v, dus_names=names) for v in varieties]
+    # 2026-09-16 — Advisory-Only Mode: enrich each variety with the
+    # authoring client's contact fields so the PWA's read-only variant
+    # can surface a "How to buy" block (Client name + phone + address
+    # + website). No harm rendering these on traditional subs either
+    # — the PWA just doesn't call attention to them.
+    from app.modules.clients.models import Client as _Client
+    client_ids = {v.client_id for v in varieties if v.client_id}
+    client_contact: dict[str, dict] = {}
+    if client_ids:
+        rows = (await db.execute(
+            select(
+                _Client.id, _Client.display_name, _Client.full_name,
+                _Client.support_phone, _Client.office_phone,
+                _Client.hq_address, _Client.website,
+            ).where(_Client.id.in_(client_ids))
+        )).all()
+        for cid, disp, full, sphone, ophone, addr, web in rows:
+            client_contact[cid] = {
+                "client_display_name": disp or full,
+                "client_phone": sphone or ophone,
+                "client_address": addr,
+                "client_website": web,
+            }
+
+    out = []
+    for v in varieties:
+        row = _variety_out(v, dus_names=names)
+        contact = client_contact.get(v.client_id) or {}
+        row.update(contact)
+        out.append(row)
+    return out
 
 
 # ── Farmer: Lookup a recipient by phone ───────────────────────────────────────
