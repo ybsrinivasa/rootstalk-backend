@@ -1706,6 +1706,12 @@ async def discover_companies(
                 "tagline": client.tagline,
                 "logo_url": client.logo_url,
                 "primary_colour": client.primary_colour,
+                # 2026-09-16 — Advisory-Only Mode. Farmer PWA client
+                # picker uses these to render the "Advisory Only" chip
+                # + flat pricing preview at the payment step.
+                "advisory_only_mode": bool(client.advisory_only_mode),
+                "dealer_list_enabled": bool(client.dealer_list_enabled),
+                "subscription_fee_paise": client.subscription_fee_paise,
             })
     return companies
 
@@ -4823,6 +4829,12 @@ async def my_subscriptions(
             # the way they already were.
             "lapsed_at": s.lapsed_at,
             "updated_at": s.updated_at,
+            # 2026-09-16 — Advisory-Only Mode snapshot. Drives the
+            # "Advisory Only" chip on subscription cards + gates all
+            # order/payment UI. Snapshot at subscribe time; safe to
+            # read live for this render.
+            "advisory_only_mode": bool(s.advisory_only_mode),
+            "dealer_list_enabled": bool(s.dealer_list_enabled),
         })
     return out
 
