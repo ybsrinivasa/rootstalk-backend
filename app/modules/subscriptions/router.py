@@ -5026,6 +5026,205 @@ async def get_today_advisory(
     )
 
 
+# ── Cluster navigation for Advisory-Only Mode (2026-09-16, v1.6) ─────────────
+# Instead of a single-day walker, the farmer navigates through non-overlapping
+# clusters of active timelines. A cluster = a set of fixed-window timelines
+# (DAS/DBS/CALENDAR) whose date ranges transitively overlap. Frequency /
+# event-triggered timelines don't participate — they go into an "ongoing"
+# panel. Farmer taps Prev/Today/Next to step chapter-by-chapter through the
+# crop lifecycle without seeing the same practice twice.
+@router.get("/farmer/advisory/cluster")
+async def get_advisory_cluster(
+    subscription_id: str,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return the advisory for one *cluster* of overlapping timelines.
+
+    `offset=0` = the cluster containing today (or the most recent past
+    cluster if today falls in a gap). `offset=+N` steps N clusters
+    forward; `offset=-N` steps N backward. 404 if the requested offset
+    lies past either end of the crop.
+
+    Response shape:
+      {
+        subscription_id, client_id, package_id, package_name, ...
+        cluster: {
+          offset, position ('past'|'current'|'future'),
+          day_from, day_to,       # 0-indexed day-of-crop
+          date_from, date_to,     # calendar ISO
+          has_prev, has_next,     # navigation affordances
+          index, total, current_index,
+        },
+        timelines: [ TimelineItem, ... ],       # cluster's timelines
+        ongoing_timelines: [ TimelineItem, ... ] # frequency + event-triggered
+      }
+    """
+    from app.services.snapshot_render import (
+        metadata_from_master_cca, cca_calendar_dates,
+    )
+    from app.modules.advisory.models import TimelineStatus
+
+    sub = await db.get(Subscription, subscription_id)
+    if sub is None or sub.farmer_user_id != current_user.id:
+        raise HTTPException(status_code=403, detail={"code": "forbidden"})
+    if sub.status != SubscriptionStatus.ACTIVE:
+        raise HTTPException(status_code=400, detail={"code": "sub_not_active"})
+    if sub.crop_start_date is None:
+        raise HTTPException(status_code=400, detail={"code": "no_crop_start"})
+    pkg = (await db.execute(
+        select(Package).where(Package.id == sub.package_id, Package.status == "ACTIVE"),
+    )).scalar_one_or_none()
+    if pkg is None:
+        raise HTTPException(status_code=404, detail={"code": "no_package"})
+
+    crop_start = (sub.crop_start_date.date()
+                  if hasattr(sub.crop_start_date, 'date')
+                  else sub.crop_start_date)
+    today = date.today()
+    lang = current_user.language_code or "en"
+
+    # Load all ACTIVE timelines for the package, separate ongoing from fixed.
+    tls = (await db.execute(
+        select(Timeline).where(
+            Timeline.package_id == pkg.id,
+            Timeline.status == TimelineStatus.ACTIVE,
+        )
+    )).scalars().all()
+
+    ONGOING_FROM_TYPES = {"DAYS_AFTER_DETECTION", "DAYS_AFTER_RESPONSE"}
+    ongoing_tl_ids: set = set()
+    fixed_ranges: list[tuple[str, date, date]] = []
+    for tl in tls:
+        ft = tl.from_type.value if hasattr(tl.from_type, 'value') else str(tl.from_type)
+        if ft in ONGOING_FROM_TYPES:
+            ongoing_tl_ids.add(tl.id)
+            continue
+        meta = metadata_from_master_cca(tl)
+        fd, td = cca_calendar_dates(meta, crop_start, today)
+        fixed_ranges.append((tl.id, fd, td))
+
+    # Sort by from_date; cluster by transitive overlap (a timeline joins the
+    # current cluster if its from_date <= the cluster's running max to_date).
+    fixed_ranges.sort(key=lambda x: x[1])
+    clusters: list[dict] = []
+    for tl_id, fd, td in fixed_ranges:
+        if clusters and fd <= clusters[-1]['to']:
+            clusters[-1]['tl_ids'].add(tl_id)
+            if td > clusters[-1]['to']:
+                clusters[-1]['to'] = td
+        else:
+            clusters.append({'tl_ids': {tl_id}, 'from': fd, 'to': td})
+
+    # Load ongoing practices (call today's advisory once, filter to ongoing).
+    ongoing_day = await _today_advisory_for_user(
+        db, farmer_user_id=current_user.id,
+        only_subscription_id=subscription_id, lang=lang, for_date=today,
+    )
+    ongoing_timelines_out: list[dict] = []
+    if ongoing_day and ongoing_day[0].get('timelines'):
+        for tl in ongoing_day[0]['timelines']:
+            if tl.get('id') in ongoing_tl_ids:
+                ongoing_timelines_out.append(tl)
+
+    def _base_payload() -> dict:
+        return {
+            "subscription_id": sub.id,
+            "client_id": sub.client_id,
+            "package_id": sub.package_id,
+            "package_name": pkg.name,
+            "crop_cosh_id": pkg.crop_cosh_id,
+            "crop_start_date": sub.crop_start_date,
+            "reference_number": sub.reference_number,
+            "advisory_only_mode": bool(sub.advisory_only_mode),
+            "dealer_list_enabled": bool(sub.dealer_list_enabled),
+        }
+
+    if not clusters:
+        # Degenerate: no fixed-window timelines at all.
+        return {
+            **_base_payload(),
+            "cluster": None,
+            "timelines": [],
+            "ongoing_timelines": ongoing_timelines_out,
+        }
+
+    # Find the cluster containing today. If today falls in a gap between
+    # clusters, use the most recent past cluster so the farmer sees what
+    # they most recently worked on.
+    current_idx: Optional[int] = None
+    for i, c in enumerate(clusters):
+        if c['from'] <= today <= c['to']:
+            current_idx = i
+            break
+    if current_idx is None:
+        past = [i for i, c in enumerate(clusters) if c['to'] < today]
+        current_idx = past[-1] if past else 0
+
+    target_idx = current_idx + offset
+    if target_idx < 0 or target_idx >= len(clusters):
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "cluster_out_of_range"},
+        )
+    target = clusters[target_idx]
+
+    # Aggregate practices for the target cluster by walking each day and
+    # merging by practice id. Reuses _today_advisory_for_user so BL-02/03/04,
+    # snapshots, ack-marks, and conditional-question flow all behave
+    # identically to the daily view.
+    merged: dict = {}  # tl_id -> {tl_meta_from_first_hit, practices: {pid: p}}
+    day = target['from']
+    while day <= target['to']:
+        day_data = await _today_advisory_for_user(
+            db, farmer_user_id=current_user.id,
+            only_subscription_id=subscription_id, lang=lang, for_date=day,
+        )
+        if day_data and day_data[0].get('timelines'):
+            for tl in day_data[0]['timelines']:
+                if tl.get('id') not in target['tl_ids']:
+                    continue
+                bucket = merged.setdefault(tl['id'], {**tl, 'practices': {}})
+                for p in tl.get('practices', []):
+                    # Dedupe by practice id — a practice recurring across
+                    # days of the cluster surfaces once. Its occurrence_date
+                    # stays first-seen so the farmer knows when it starts.
+                    bucket['practices'].setdefault(p['id'], p)
+        day += timedelta(days=1)
+
+    cluster_timelines_out: list[dict] = []
+    for t in merged.values():
+        practices_list = list(t['practices'].values())
+        practices_list.sort(
+            key=lambda p: (p.get('occurrence_date') or '', p.get('display_order') or 0),
+        )
+        cluster_timelines_out.append({**t, 'practices': practices_list})
+
+    return {
+        **_base_payload(),
+        "cluster": {
+            "offset": offset,
+            "position": (
+                "past" if target_idx < current_idx
+                else "future" if target_idx > current_idx
+                else "current"
+            ),
+            "day_from": (target['from'] - crop_start).days,
+            "day_to": (target['to'] - crop_start).days,
+            "date_from": target['from'].isoformat(),
+            "date_to": target['to'].isoformat(),
+            "has_prev": target_idx > 0,
+            "has_next": target_idx < len(clusters) - 1,
+            "index": target_idx,
+            "total": len(clusters),
+            "current_index": current_idx,
+        },
+        "timelines": cluster_timelines_out,
+        "ongoing_timelines": ongoing_timelines_out,
+    }
+
+
 # ── Practice acknowledgement: "I've done this" tick ───────────────────────────
 # Three actions, all upserts on the same composite key.
 #   mark   — green tick. Counts off the badge. Reveals "Delete" button.
