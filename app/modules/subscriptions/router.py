@@ -6699,6 +6699,13 @@ async def _today_advisory_for_user(
             "crop_start_date": sub.crop_start_date,
             "day_offset": day_offset,
             "reference_number": sub.reference_number,
+            # Advisory-Only Mode (2026-09-16, v1.3 mirror). Snapshotted
+            # on Subscription at create; surfaced here so the two
+            # promoter render surfaces (facilitator + dealer
+            # promoted-farmers views) can swap in the relaxed element
+            # filter without a second API call.
+            "advisory_only_mode": bool(sub.advisory_only_mode),
+            "dealer_list_enabled": bool(sub.dealer_list_enabled),
             "timelines": timeline_data,
         })
 
