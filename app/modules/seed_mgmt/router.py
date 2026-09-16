@@ -737,6 +737,22 @@ async def place_seed_order(
     if not sub:
         raise HTTPException(status_code=404, detail="Subscription not found")
 
+    # Advisory-Only Mode (2026-09-16): no in-app seed-order flow.
+    # Farmer sees varietal info + how-to-buy contact on their Seed
+    # Varieties tile and buys offline.
+    if sub.advisory_only_mode:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "advisory_only_no_orders",
+                "message": (
+                    "This subscription is in advisory-only mode. "
+                    "See the recommended seed varieties in the app and "
+                    "purchase from any dealer or company of your choice."
+                ),
+            },
+        )
+
     variety = (await db.execute(
         select(SeedVariety).where(SeedVariety.id == data["variety_id"])
     )).scalar_one_or_none()

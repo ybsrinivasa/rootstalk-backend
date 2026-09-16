@@ -343,15 +343,20 @@ async def get_pool_quote(
         MAX_UNITS, MIN_UNITS, quote_for,
     )
     from app.config import settings as _s
+    # Advisory-Only Mode (2026-09-16): when the client has a flat-fee
+    # override set, skip the volume-discount formula. See scoping §10.
+    client_row = await db.get(Client, client_id)
+    fee_override = client_row.subscription_fee_paise if client_row else None
+    per_unit_paise = fee_override if fee_override is not None else _s.subscription_amount_paise
     try:
-        q = quote_for(units)
+        q = quote_for(units, per_unit_paise_override=fee_override)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
     return {
         "client_id": client_id,
         "units": q.units,
-        "per_unit_gross_paise": _s.subscription_amount_paise,
+        "per_unit_gross_paise": per_unit_paise,
         "gross_paise": q.gross_paise,
         "discount_paise": q.discount_paise,
         "total_paise": q.total_paise,
@@ -362,6 +367,9 @@ async def get_pool_quote(
         "gross_rupees": f"{q.gross_paise / 100:.2f}",
         "discount_rupees": f"{q.discount_paise / 100:.2f}",
         "total_rupees": f"{q.total_paise / 100:.2f}",
+        # Flag for the CA-portal preview UI to render "No bulk discount —
+        # flat pricing" instead of the discount tier breakdown.
+        "flat_pricing": fee_override is not None,
     }
 
 
@@ -978,8 +986,12 @@ async def create_pool_payment_order(
             },
         )
 
+    # Advisory-Only Mode flat-fee override (2026-09-16). Same logic as
+    # the quote endpoint above.
+    _client_row = await db.get(Client, client_id)
+    _fee_override = _client_row.subscription_fee_paise if _client_row else None
     try:
-        q = quote_for(request.units)
+        q = quote_for(request.units, per_unit_paise_override=_fee_override)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
@@ -1043,8 +1055,15 @@ async def verify_pool_payment(
             detail="Payment verification failed — invalid signature",
         )
 
+    # Advisory-Only Mode flat-fee override (2026-09-16). Re-computed
+    # here from the current Client value; must match whatever was used
+    # at create-order time. If the SA flipped the flag between order
+    # and verify (edge case), the amount-mismatch check below catches
+    # it and refuses the credit — safe fail-closed.
+    _client_row = await db.get(Client, client_id)
+    _fee_override = _client_row.subscription_fee_paise if _client_row else None
     try:
-        q = quote_for(request.units)
+        q = quote_for(request.units, per_unit_paise_override=_fee_override)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
@@ -3311,6 +3330,23 @@ async def delegate_payment(
 ):
     sub = await _get_subscription(db, subscription_id, current_user.id)
 
+    # Advisory-Only Mode (2026-09-16): dealer/facilitator payment
+    # routing is hidden in the PWA; block the backend too so a direct
+    # API call can't sneak a delegate payment onto an advisory-only
+    # sub. Farmer must pay directly via /payment/create-order.
+    if sub.advisory_only_mode:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "advisory_only_no_delegate_payment",
+                "message": (
+                    "This subscription's client is in advisory-only mode. "
+                    "Please pay directly for your subscription — the "
+                    "dealer/facilitator payment channel is disabled."
+                ),
+            },
+        )
+
     # Resolve delegate user — either by explicit ID or by phone number
     resolved_user_id = request.requested_from_user_id
     if not resolved_user_id and request.delegate_phone:
@@ -3530,6 +3566,21 @@ async def create_payment_share_link(
     from app.services.payment_service import create_subscription_payment_link
 
     sub = await _get_subscription(db, subscription_id, current_user.id)
+
+    # Advisory-Only Mode (2026-09-16): share-link payment routing is
+    # hidden in the PWA; block the backend too so a direct API call
+    # can't sneak a share-link onto an advisory-only sub.
+    if sub.advisory_only_mode:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "advisory_only_no_share_link",
+                "message": (
+                    "This subscription's client is in advisory-only mode. "
+                    "Share-link payments are disabled — please pay directly."
+                ),
+            },
+        )
 
     existing_pending = (await db.execute(
         select(SubscriptionPaymentRequest).where(
@@ -3950,12 +4001,18 @@ async def create_payment_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Create a RazorPay order so the farmer can pay Rs. 199 to activate their subscription."""
+    """Create a RazorPay order so the farmer can pay to activate their
+    subscription. Amount is the snapshotted `sub.subscription_fee_paise`
+    when set (Advisory-Only Mode clients — flat ₹99); else falls back
+    to the global default (₹199 in prod, ₹1 in test)."""
     from app.services.payment_service import create_subscription_order
     sub = await _get_subscription(db, subscription_id, current_user.id)
     if sub.status == SubscriptionStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Subscription is already active")
-    order = create_subscription_order(receipt=subscription_id[:20])
+    order = create_subscription_order(
+        receipt=subscription_id[:20],
+        amount_paise_override=sub.subscription_fee_paise,
+    )
     return order
 
 
@@ -4936,16 +4993,24 @@ def _is_uuid(s: str | None) -> bool:
 
 @router.get("/farmer/advisory/today")
 async def get_today_advisory(
+    for_date: Optional[date] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Return today's active practices for all the farmer's ACTIVE subscriptions.
-    Applies BL-04 (DAS/DBS window) + BL-02 (conditional filtering) +
-    BL-03 (deduplication across CCA + triggered CHA timelines).
+    """Return today's active practices for all the farmer's ACTIVE
+    subscriptions. Applies BL-04 (DAS/DBS window) + BL-02 (conditional
+    filtering) + BL-03 (deduplication across CCA + triggered CHA
+    timelines).
+
+    Optional `for_date=YYYY-MM-DD` query param renders the view AS IF
+    the given date were today — powers the date picker on the advisory
+    screen for Advisory-Only Mode farmers (2026-09-16). Defaults to
+    today when omitted; traditional behaviour unchanged.
     """
     return await _today_advisory_for_user(
         db, farmer_user_id=current_user.id, only_subscription_id=None,
         lang=current_user.language_code or "en",
+        for_date=for_date,
     )
 
 
@@ -5419,6 +5484,7 @@ async def _today_advisory_for_user(
     farmer_user_id: str,
     only_subscription_id: Optional[str] = None,
     lang: str = "en",
+    for_date: Optional[date] = None,
 ):
     """Shared kernel for the today-advisory view.
 
@@ -5429,9 +5495,15 @@ async def _today_advisory_for_user(
     single sub (still gated on farmer_user_id + ACTIVE + crop_start)
     and the result is the one-element list — caller is expected to
     pick out [0] and handle the empty case.
+
+    `for_date` (Advisory-Only Mode, 2026-09-16): renders the view AS
+    IF the given date were today. Enables the date picker on the
+    advisory screen so farmers on advisory-only subs can look ahead
+    (plan input purchases) or back. Defaults to date.today() —
+    traditional behaviour unchanged.
     """
     l2_name_loc = await _l2_name_loc_map(db, lang)
-    today = date.today()
+    today = for_date if for_date is not None else date.today()
 
     # All ACTIVE subscriptions with a crop_start_date — narrowed if
     # the caller asked for one specific assignment.

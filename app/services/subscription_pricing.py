@@ -59,15 +59,36 @@ class Quote:
         return self.total_paise // self.units
 
 
-def quote_for(units: int) -> Quote:
+def quote_for(units: int, *, per_unit_paise_override: int | None = None) -> Quote:
     """Return a Quote for the given unit count. Raises ValueError on
-    out-of-range input."""
+    out-of-range input.
+
+    When `per_unit_paise_override` is provided (non-None), the volume-
+    discount formula is skipped and the total is a flat multiplication:
+    `units × per_unit_paise_override`. Used by Advisory-Only Mode
+    clients where the SA has set `Client.subscription_fee_paise` (see
+    docs/AdvisoryOnly_v1_scoping.md §4.3). `gross_paise` in the returned
+    Quote reflects the override × units so the CA-portal preview shows
+    the correct per-unit number; `discount_paise = 0`.
+    """
     if not isinstance(units, int) or isinstance(units, bool):
         raise ValueError("units must be an integer")
     if units < MIN_UNITS:
         raise ValueError(f"units must be at least {MIN_UNITS}")
     if units > MAX_UNITS:
         raise ValueError(f"units must not exceed {MAX_UNITS}")
+
+    # Flat-fee path (Advisory-Only Mode). No discount, no formula.
+    if per_unit_paise_override is not None:
+        if per_unit_paise_override < 0:
+            raise ValueError("per_unit_paise_override must be non-negative")
+        total = units * per_unit_paise_override
+        return Quote(
+            units=units,
+            gross_paise=total,
+            discount_paise=0,
+            total_paise=total,
+        )
 
     gross_paise = units * _per_unit_gross_paise()
 

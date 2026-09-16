@@ -45,6 +45,12 @@ INPUT_ALERT_SMS = (
     "RootsTalk: {name}, an input is due today for your {crop} "
     "advisory. Open RootsTalk to place your order."
 )
+# Advisory-Only Mode variant (2026-09-16): no in-app order flow;
+# CTA points at RootsTalk for input details, farmer buys offline.
+INPUT_ALERT_SMS_ADVISORY_ONLY = (
+    "RootsTalk: {name}, an input is due today for your {crop} "
+    "advisory. Input details are in RootsTalk — purchase from any local dealer."
+)
 
 # FCM payloads — short title for the lock-screen banner, body
 # tightened from the SMS version (no "RootsTalk:" prefix, no
@@ -59,6 +65,10 @@ INPUT_ALERT_FCM_TITLE = "Input due today"
 INPUT_ALERT_FCM_BODY = (
     "An input is due today for your {crop} advisory. Open RootsTalk to place "
     "your order."
+)
+INPUT_ALERT_FCM_BODY_ADVISORY_ONLY = (
+    "An input is due today for your {crop} advisory. Input details are in "
+    "RootsTalk — purchase from any local dealer."
 )
 
 # Order statuses that suppress an INPUT alert. Mirrors the set in
@@ -378,6 +388,13 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
     # firing day. See _supersede_prior_sent for context.
     await _supersede_prior_sent(db, sub.id, AlertType.INPUT)
 
+    # Advisory-Only Mode (2026-09-16): use the CTA-neutral variant of
+    # both the SMS and FCM body. No in-app order flow to point at;
+    # farmer buys inputs offline. See scoping §14.
+    is_advisory_only = bool(getattr(sub, "advisory_only_mode", False))
+    sms_template = INPUT_ALERT_SMS_ADVISORY_ONLY if is_advisory_only else INPUT_ALERT_SMS
+    fcm_template = INPUT_ALERT_FCM_BODY_ADVISORY_ONLY if is_advisory_only else INPUT_ALERT_FCM_BODY
+
     for recipient in recipients:
         user = user_by_id.get(recipient.user_id)
         if not user:
@@ -385,10 +402,10 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
         crop_loc = pick_translation(
             crop_translations, user.language_code or "en", "crop",
         )
-        sms = INPUT_ALERT_SMS.format(
+        sms = sms_template.format(
             name=user.name or "Farmer", crop=crop_loc,
         )
-        fcm_body = INPUT_ALERT_FCM_BODY.format(crop=crop_loc)
+        fcm_body = fcm_template.format(crop=crop_loc)
         await _send_to_recipient(
             db, sub.id, AlertType.INPUT, recipient, user,
             sms_body=sms,

@@ -16,10 +16,18 @@ def _client() -> razorpay.Client:
     ))
 
 
-def create_subscription_order(receipt: str) -> dict:
-    """Create a RazorPay order for the subscription fee. Returns order details."""
+def create_subscription_order(
+    receipt: str, *, amount_paise_override: int | None = None,
+) -> dict:
+    """Create a RazorPay order for the subscription fee. Returns order details.
+
+    `amount_paise_override` (Advisory-Only Mode, 2026-09-16) lets the
+    caller charge a per-client flat fee (from Subscription.subscription_
+    fee_paise) instead of the global settings default. When None, falls
+    back to `settings.subscription_amount_paise` — traditional behaviour.
+    """
     client = _client()
-    amount = settings.subscription_amount_paise
+    amount = amount_paise_override if amount_paise_override is not None else settings.subscription_amount_paise
     order = client.order.create({
         "amount": amount,
         "currency": "INR",

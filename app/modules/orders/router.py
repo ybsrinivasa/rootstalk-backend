@@ -237,6 +237,22 @@ async def create_order(
     if not sub:
         raise HTTPException(status_code=404, detail="Subscription not found")
 
+    # Advisory-Only Mode (2026-09-16): no in-app order flow for these
+    # subs. UI hides all order-placement CTAs across CCA / CHA / Q&A /
+    # Pundit surfaces; this backend guard is the defence-in-depth catch
+    # for any direct API call that slips past.
+    if sub.advisory_only_mode:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "advisory_only_no_orders",
+                "message": (
+                    "This subscription is in advisory-only mode. "
+                    "Purchase inputs directly from any dealer of your choice."
+                ),
+            },
+        )
+
     # Coaching Sandbox — refuse any recipient user_id that isn't the
     # student themselves. No-op for real farmers.
     from app.modules.coaching.service import guard_coaching_order_recipient
@@ -2482,6 +2498,22 @@ async def create_dbs_bulk_order(
     )).scalar_one_or_none()
     if not sub:
         raise HTTPException(status_code=404, detail="Subscription not found")
+
+    # Advisory-Only Mode (2026-09-16): no in-app order flow for these
+    # subs. UI hides all order-placement CTAs across CCA / CHA / Q&A /
+    # Pundit surfaces; this backend guard is the defence-in-depth catch
+    # for any direct API call that slips past.
+    if sub.advisory_only_mode:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "advisory_only_no_orders",
+                "message": (
+                    "This subscription is in advisory-only mode. "
+                    "Purchase inputs directly from any dealer of your choice."
+                ),
+            },
+        )
 
     # Coaching Sandbox — refuse any recipient user_id that isn't the
     # student themselves. No-op for real farmers.
