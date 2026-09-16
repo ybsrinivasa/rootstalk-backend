@@ -7156,6 +7156,94 @@ async def nearby_facilitators_for_farmer(
     return results[:5]
 
 
+# ── Farmer: Brands screen (Advisory-Only Mode) ────────────────────────────────
+
+@router.get("/farmer/subscriptions/{subscription_id}/practices/{practice_id}/brands")
+async def get_practice_brands_farmer(
+    subscription_id: str,
+    practice_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Farmer-facing brand-catalog listing for a specific recommended
+    input. Powers the Advisory-Only Mode Brands button on the advisory
+    screen (fertilisers/pesticides). Refuses if the subscription is
+    not in advisory_only_mode — traditional subs use the brand-lock
+    order flow instead.
+
+    Data source is the same Cosh catalog that drives the dealer's
+    brand-picker via `bl07_brand_options.get_brand_options`. For the
+    farmer view, we flatten the grouped result into a single list —
+    the farmer has no dealer-preference concept, and no OR-group
+    auto-close mechanics apply here.
+
+    Response shape:
+      {
+        "is_locked": bool,
+        "locked_brand_name": str | null,   # only when is_locked=True
+        "brands": [{name, manufacturer}, ...],
+        "client_name": str,                 # for the disclaimer footer
+      }
+    """
+    from app.services.bl07_brand_options import get_brand_options
+
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    if not sub.advisory_only_mode:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "brands_screen_advisory_only",
+                "message": (
+                    "The Brands screen is only available for advisory-only "
+                    "subscriptions."
+                ),
+            },
+        )
+
+    # Client name for the disclaimer footer.
+    client = (await db.execute(
+        select(Client).where(Client.id == sub.client_id)
+    )).scalar_one_or_none()
+    client_name = (client.display_name or client.full_name) if client else ""
+
+    # Reuse the dealer-side query. Passing farmer_user_id yields zero
+    # DealerRelationship rows → every brand lands in group_other, which
+    # we then flatten. Preferred/manufacturer scoring is meaningless
+    # for a farmer, so we drop it.
+    result = await get_brand_options(
+        db, practice_id, current_user.id,
+        lang=current_user.language_code or "en",
+    )
+    if result.is_locked:
+        return {
+            "is_locked": True,
+            "locked_brand_name": result.locked_brand_name,
+            "brands": [
+                {"name": result.locked_brand_name, "manufacturer": None}
+            ] if result.locked_brand_name else [],
+            "client_name": client_name,
+        }
+    flat = []
+    for grp in (result.group_recommended, result.group_my, result.group_other):
+        for opt in (grp or []):
+            flat.append({"name": opt.name, "manufacturer": opt.manufacturer})
+    # Sort alphabetically by brand name for a stable, unbiased order.
+    flat.sort(key=lambda b: (b["name"] or "").lower())
+    return {
+        "is_locked": False,
+        "locked_brand_name": None,
+        "brands": flat,
+        "client_name": client_name,
+    }
+
+
 # ── Farmer: Pre-start inputs (DBS practices + seed varieties) ─────────────────
 
 @router.get("/farmer/subscriptions/{subscription_id}/pre-start-inputs")
