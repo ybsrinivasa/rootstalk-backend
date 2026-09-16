@@ -2,8 +2,8 @@ import uuid
 import enum
 from datetime import datetime, timezone
 from sqlalchemy import (
-    String, Text, Boolean, DateTime, ForeignKey, Index,
-    Enum as SAEnum, JSON, UniqueConstraint
+    String, Text, Boolean, DateTime, ForeignKey, Index, Integer,
+    Enum as SAEnum, JSON, UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database import Base
@@ -118,6 +118,33 @@ class Client(Base):
     # appear on a farmer's district-scoped discovery list.
     hidden_from_discovery: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="false", default=False,
+    )
+    # 2026-09-16 — Advisory-Only Mode v1. When True, farmers subscribed
+    # to this client see recommended input details up front (no brand-
+    # lock), get a Brands button per fertiliser/pesticide + a
+    # Recommended Seed Varieties tile, and cannot place in-app orders.
+    # Snapshot on Subscription at create so flipping this later doesn't
+    # disturb existing subs. See docs/AdvisoryOnly_v1_scoping.md.
+    advisory_only_mode: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false", default=False,
+    )
+    # Optional add-on to advisory_only_mode. When both True, farmer's
+    # crop dashboard also shows a "Nearby Dealers" tile — read-only
+    # list of 5 nearest onboarded dealers (Call + Map, no Orders).
+    # Meaningful only when advisory_only_mode is True; SA-portal UI
+    # greys this out otherwise.
+    dealer_list_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false", default=False,
+    )
+    # Per-unit subscription fee override in paise. NULL → existing
+    # bulk-discount pricing logic applies (traditional clients).
+    # Non-null → flat `qty × subscription_fee_paise` on both
+    # FARMER_PAYS and COMPANY_PAYS pool top-up flows; bulk-discount
+    # table skipped. SA-portal defaults this to 9900 (₹99) when the
+    # Advisory-only checkbox is ticked, but the SA can override per
+    # client. Snapshot on Subscription at create.
+    subscription_fee_paise: Mapped[int] = mapped_column(
+        Integer, nullable=True,
     )
     # 2026-07-24 — Training Sandbox V1. When True, this Client is a
     # shadow training child of `parent_client_id` — created by the CA

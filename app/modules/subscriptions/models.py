@@ -118,6 +118,25 @@ class Subscription(Base):
     )
     subscription_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     lapsed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 2026-09-16 — Advisory-Only Mode snapshot columns. Captured from
+    # the Client's own flags at subscription create time; immutable
+    # after. Flipping the Client flag later doesn't disturb existing
+    # subs. Every UI touchpoint reads from THIS sub's snapshot — never
+    # global. See docs/AdvisoryOnly_v1_scoping.md.
+    advisory_only_mode: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false", default=False,
+    )
+    dealer_list_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false", default=False,
+    )
+    # Per-unit subscription fee in paise, snapshotted at create.
+    # NULL = existing bulk-discount pricing logic was used (traditional
+    # sub). Non-null = flat pricing was applied at subscribe / top-up
+    # time. Read for reports + statement rendering; do NOT re-consult
+    # the Client's value.
+    subscription_fee_paise: Mapped[int] = mapped_column(
+        Integer, nullable=True,
+    )
     # CA Admin test-data cleanup (2026-06-28). NULL = active; non-NULL
     # = soft-deleted at that time. Read paths automatically filter
     # `deleted_at IS NULL` via the session-level event listener in

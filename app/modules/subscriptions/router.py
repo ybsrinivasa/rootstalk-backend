@@ -1792,6 +1792,10 @@ async def create_subscription(
         else SubscriptionStatus.WAITLISTED
     )
 
+    # Advisory-Only Mode snapshot (2026-09-16): capture the Client's
+    # current flags + fee at subscribe time so the sub is immune to
+    # later Client-side toggles. See docs/AdvisoryOnly_v1_scoping.md.
+    _client_for_snapshot = await db.get(Client, request.client_id)
     sub = Subscription(
         farmer_user_id=current_user.id,
         client_id=request.client_id,
@@ -1799,6 +1803,9 @@ async def create_subscription(
         promoter_user_id=request.promoter_user_id,
         subscription_type=request.subscription_type,
         status=initial_status,
+        advisory_only_mode=bool(_client_for_snapshot and _client_for_snapshot.advisory_only_mode),
+        dealer_list_enabled=bool(_client_for_snapshot and _client_for_snapshot.dealer_list_enabled),
+        subscription_fee_paise=(_client_for_snapshot.subscription_fee_paise if _client_for_snapshot else None),
     )
     db.add(sub)
     await db.flush()
@@ -2338,6 +2345,8 @@ async def initiate_assignment(
     # "awaiting farmer's nod"). Per user direction: drop WAITLISTED
     # from the Promoter path; the "awaiting farmer approval" state
     # lives only on the PromoterAssignment row.
+    # Advisory-Only Mode snapshot (see farmer subscribe path above).
+    _client_for_snapshot = await db.get(Client, effective_client_id)
     sub = Subscription(
         farmer_user_id=farmer.id,
         client_id=effective_client_id,
@@ -2346,6 +2355,9 @@ async def initiate_assignment(
         subscription_type=SubscriptionType.ASSIGNED,
         status=SubscriptionStatus.ACTIVE,
         subscription_date=now,
+        advisory_only_mode=bool(_client_for_snapshot and _client_for_snapshot.advisory_only_mode),
+        dealer_list_enabled=bool(_client_for_snapshot and _client_for_snapshot.dealer_list_enabled),
+        subscription_fee_paise=(_client_for_snapshot.subscription_fee_paise if _client_for_snapshot else None),
     )
     # Only persist + stamp _confirmed_at when the caller actually
     # provided the measure. Neither branch is the new default — the
