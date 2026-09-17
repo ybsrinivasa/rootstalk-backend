@@ -699,6 +699,14 @@ class PracticeAcknowledgement(Base):
     hidden_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )
+    # 2026-09-17 (v1.8) — Advisory-Only Mode two-stage ack. Set when the
+    # farmer taps "I've purchased this" on an INPUT practice. Traditional
+    # flow leaves this NULL — purchase there is tracked by the order /
+    # fulfilment pipeline. See feedback_symbols_beat_text_labels_for_low_literacy.md
+    # for the surrounding UX rationale.
+    purchased_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow,
     )

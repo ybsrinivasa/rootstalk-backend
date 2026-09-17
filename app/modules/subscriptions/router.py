@@ -5299,6 +5299,15 @@ async def _upsert_practice_ack(
                 detail="Cannot hide a practice that hasn't been marked done",
             )
         ack.hidden_at = now
+    # 2026-09-17 (v1.8) — Advisory-Only two-stage ack.
+    elif action == "purchase":
+        ack.purchased_at = now
+    elif action == "unpurchase":
+        ack.purchased_at = None
+        # Un-marking purchase also un-marks done — you can't be "done"
+        # with an input you no longer say you bought. Keeps the state
+        # machine coherent.
+        ack.marked_at = None
     else:
         raise HTTPException(status_code=400, detail=f"Unknown action: {action}")
 
@@ -5311,6 +5320,7 @@ async def _upsert_practice_ack(
         "ack_status": (
             "HIDDEN" if ack.hidden_at else "MARKED" if ack.marked_at else "ACTIVE"
         ),
+        "purchased_at": ack.purchased_at.isoformat() if ack.purchased_at else None,
     }
 
 
@@ -5339,6 +5349,30 @@ async def hide_practice(
     current_user: User = Depends(get_current_user),
 ):
     return await _upsert_practice_ack(db, current_user.id, body, "hide")
+
+
+@router.post("/farmer/practice-ack/purchase")
+async def purchase_practice(
+    body: _PracticeAckBody,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Advisory-Only Mode (v1.8) — farmer marks 'I've purchased this'
+    for an INPUT practice. Ungated by date (farmer can pre-buy for a
+    future recommendation)."""
+    return await _upsert_practice_ack(db, current_user.id, body, "purchase")
+
+
+@router.post("/farmer/practice-ack/unpurchase")
+async def unpurchase_practice(
+    body: _PracticeAckBody,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Advisory-Only Mode (v1.8) — farmer un-marks purchase. Also
+    un-marks 'done' since you can't have applied what you haven't
+    bought."""
+    return await _upsert_practice_ack(db, current_user.id, body, "unpurchase")
 
 
 # ── Dashboard attention counts ────────────────────────────────────────────────
@@ -6833,6 +6867,10 @@ async def _today_advisory_for_user(
                     # Practice ack state + the occurrence_date the PWA
                     # must echo back on mark/unmark/hide calls.
                     "ack_status": ack_status,
+                    # v1.8 (2026-09-17): 'I've purchased this' state for
+                    # advisory-only INPUT practices. NULL in traditional
+                    # flow (purchase there is tracked by the order pipeline).
+                    "purchased_at": ack.purchased_at.isoformat() if (ack and ack.purchased_at) else None,
                     "occurrence_date": occ_date.isoformat(),
                 })
             tl_entry: dict = {
