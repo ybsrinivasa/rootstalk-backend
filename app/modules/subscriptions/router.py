@@ -7533,20 +7533,27 @@ async def get_practice_brands_author(
     only. Empty brand list surfaces as-is — that IS the actionable
     feedback ("nothing for this chemistry, please add").
     """
-    from app.modules.advisory.models import Practice, Package
+    from app.modules.advisory.models import Practice, Package, Timeline
     from app.modules.advisory.router import (
         _assert_sa_or_cm, _assert_can_view_client_advisory,
     )
     from app.services.bl07_brand_options import get_brand_options
     from fastapi import HTTPException
 
+    # Practice → Timeline → Package → client_id. Practice itself has no
+    # direct package_id; the FK chain goes via Timeline.
     practice = (await db.execute(
         select(Practice).where(Practice.id == practice_id)
     )).scalar_one_or_none()
     if practice is None:
         raise HTTPException(status_code=404, detail="Practice not found")
+    timeline = (await db.execute(
+        select(Timeline).where(Timeline.id == practice.timeline_id)
+    )).scalar_one_or_none()
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
     package = (await db.execute(
-        select(Package).where(Package.id == practice.package_id)
+        select(Package).where(Package.id == timeline.package_id)
     )).scalar_one_or_none()
     if package is None:
         raise HTTPException(status_code=404, detail="Package not found")
