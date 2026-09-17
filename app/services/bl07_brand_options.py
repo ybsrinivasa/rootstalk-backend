@@ -415,6 +415,27 @@ async def get_brand_options(
     )
     recommended_cosh_id = _el_field(recommended_el, "cosh_ref") if recommended_el else None
 
+    # 2026-09-17 (v1.9) — strict filter by SE-authored AI conc + Formulation.
+    # See feedback_ai_conc_dosage_safety.md for the safety rationale. When
+    # the practice has AI conc or Formulation authored (both mandatory on
+    # CHEMICAL_PESTICIDES and CHEMICAL_HERBICIDES per l2_element_rules),
+    # brands that don't match are excluded. Applies to both farmer and
+    # dealer surfaces — same brand catalog, same safety concern.
+    ai_conc_el = next(
+        (e for e in elements
+         if _el_field(e, "element_type") in ("AI_CONCENTRATION", "ai_concentration")
+         and _el_field(e, "cosh_ref")),
+        None,
+    )
+    ai_conc_cosh_id = _el_field(ai_conc_el, "cosh_ref") if ai_conc_el else None
+    formulation_el = next(
+        (e for e in elements
+         if _el_field(e, "element_type") in ("FORMULATION", "formulation")
+         and _el_field(e, "cosh_ref")),
+        None,
+    )
+    formulation_cosh_id = _el_field(formulation_el, "cosh_ref") if formulation_el else None
+
     # Fix 2026-06-01: brands are NOT stored as Core rows with
     # parent_cosh_id pointing at the common name. They live in the
     # `trade_names` Core + `tradename_commonname` Connect chain. We
@@ -422,7 +443,11 @@ async def get_brand_options(
     # walk, 13k+ trade-name dataset). See app/services/brand_cache.py.
     if common_name_cosh_id:
         from app.services.brand_cache import get_brands_for_common_name
-        all_brands = await get_brands_for_common_name(db, common_name_cosh_id)
+        all_brands = await get_brands_for_common_name(
+            db, common_name_cosh_id,
+            formulation_cosh_id=formulation_cosh_id,
+            ai_concentration_cosh_id=ai_conc_cosh_id,
+        )
     else:
         all_brands = []
 

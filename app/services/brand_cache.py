@@ -25,9 +25,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.modules.orders.models import BrandLookupCache
 from app.modules.sync.models import CoshConnectRow, CoshCoreItem
 from app.services.cosh_constants import (
+    COSH_AI_CORE,
     COSH_COMMON_NAMES_CORE,
     COSH_FORMULATIONS_CORE,
     COSH_INPUT_MANUFACTURERS_CORE,
+    COSH_TRADENAME_AI_CONNECT,
     COSH_TRADENAME_COMMONNAME_CONNECT,
     COSH_TRADENAME_FORMULATION_CONNECT,
     COSH_TRADENAME_MANUFACTURER_CONNECT,
@@ -84,6 +86,24 @@ async def rebuild_brand_cache(db: AsyncSession) -> int:
         if tn and fmt:
             tn_to_formulation.setdefault(tn, fmt)
 
+    # 2026-09-17 (v1.9) — tradename → a.i. concentration. Same 1-to-1
+    # assumption as formulation (`.setdefault` keeps the first if a
+    # trade name has multiple in Cosh). Powers strict AI-% filtering
+    # on the Brands endpoints.
+    tnai_rows = (await db.execute(
+        select(CoshConnectRow).where(
+            CoshConnectRow.connect_type == COSH_TRADENAME_AI_CONNECT,
+            CoshConnectRow.status == "active",
+        )
+    )).scalars().all()
+    tn_to_ai: dict[str, str] = {}
+    for r in tnai_rows:
+        ep = {e.get("role"): e.get("cosh_id") for e in (r.endpoints or [])}
+        tn = ep.get(COSH_TRADE_NAMES_CORE)
+        ai = ep.get(COSH_AI_CORE)
+        if tn and ai:
+            tn_to_ai.setdefault(tn, ai)
+
     # tradename → [unit cosh_ids]. One or more units per trade name
     # (e.g. Captaf sold in both 100 g and 1 kg packs).
     tnu_rows = (await db.execute(
@@ -110,6 +130,7 @@ async def rebuild_brand_cache(db: AsyncSession) -> int:
                 needed_cosh_ids.add(cid)
     needed_cosh_ids.update(tn_to_mfr.values())
     needed_cosh_ids.update(tn_to_formulation.values())
+    needed_cosh_ids.update(tn_to_ai.values())
     for unit_list in tn_to_unit_ids.values():
         needed_cosh_ids.update(unit_list)
 
@@ -154,6 +175,7 @@ async def rebuild_brand_cache(db: AsyncSession) -> int:
         seen.add(key)
         mfr_id = tn_to_mfr.get(tn)
         fmt_id = tn_to_formulation.get(tn)
+        ai_id = tn_to_ai.get(tn)
         # Build the unit list once; the cache row mirrors what the
         # /brand-options endpoint surfaces straight to the PWA dropdown.
         # `translations` per unit lets read sites localise the dropdown
@@ -186,6 +208,12 @@ async def rebuild_brand_cache(db: AsyncSession) -> int:
             formulation_translations=(
                 translations_by_id.get(fmt_id, {}) if fmt_id else None
             ),
+            # v1.9 — see BrandLookupCache column docstring.
+            ai_concentration_cosh_id=ai_id,
+            ai_concentration_display=en_name.get(ai_id) if ai_id else None,
+            ai_concentration_translations=(
+                translations_by_id.get(ai_id, {}) if ai_id else None
+            ),
             units=units,
             refreshed_at=now,
         ))
@@ -196,20 +224,46 @@ async def rebuild_brand_cache(db: AsyncSession) -> int:
 
 async def get_brands_for_common_name(
     db: AsyncSession, common_name_cosh_id: str,
+    *,
+    formulation_cosh_id: str | None = None,
+    ai_concentration_cosh_id: str | None = None,
 ) -> list[BrandLookupCache]:
     """Returns cached brand rows for one common name. Lazy bootstrap
-    on empty cache so the first hit after a deploy still works."""
+    on empty cache so the first hit after a deploy still works.
+
+    2026-09-17 (v1.9) — optional strict filters. When the practice has
+    authored a specific formulation or a.i. concentration, pass them
+    here and the returned list is restricted to brands whose cache row
+    matches. Dosage is directly proportional to a.i. %; surfacing the
+    wrong-% brand puts the farmer at risk of over/under-dosing. Same
+    logic applies for formulation (application method + unit family
+    depend on it). Strict: brands with NULL matching column are
+    excluded when the caller passes a filter — data gap is separately
+    tracked, not silently ignored.
+    """
+    def _apply_filters(q):
+        if formulation_cosh_id:
+            q = q.where(BrandLookupCache.formulation_cosh_id == formulation_cosh_id)
+        if ai_concentration_cosh_id:
+            q = q.where(
+                BrandLookupCache.ai_concentration_cosh_id == ai_concentration_cosh_id,
+            )
+        return q
+
     rows = (await db.execute(
-        select(BrandLookupCache).where(
-            BrandLookupCache.common_name_cosh_id == common_name_cosh_id,
+        _apply_filters(
+            select(BrandLookupCache).where(
+                BrandLookupCache.common_name_cosh_id == common_name_cosh_id,
+            )
         ).order_by(BrandLookupCache.trade_name)
     )).scalars().all()
     if rows:
         return list(rows)
 
     # No rows for this CN — could be a Cosh gap OR an empty cache.
-    # Check whether the cache has ANY rows; if so, the CN is genuinely
-    # uncovered. If not, the cache hasn't been built yet — bootstrap.
+    # Check whether the cache has ANY rows; if so, the CN (or the
+    # CN + filters combo) is genuinely uncovered. If not, the cache
+    # hasn't been built yet — bootstrap.
     any_row = (await db.execute(
         select(BrandLookupCache).limit(1)
     )).scalar_one_or_none()
@@ -218,8 +272,10 @@ async def get_brands_for_common_name(
 
     await rebuild_brand_cache(db)
     rows = (await db.execute(
-        select(BrandLookupCache).where(
-            BrandLookupCache.common_name_cosh_id == common_name_cosh_id,
+        _apply_filters(
+            select(BrandLookupCache).where(
+                BrandLookupCache.common_name_cosh_id == common_name_cosh_id,
+            )
         ).order_by(BrandLookupCache.trade_name)
     )).scalars().all()
     return list(rows)

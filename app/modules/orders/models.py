@@ -481,6 +481,14 @@ class BrandLookupCache(Base):
     formulation_cosh_id: Mapped[str] = mapped_column(String(100), nullable=True)
     formulation_name: Mapped[str] = mapped_column(String(500), nullable=True)
     formulation_translations: Mapped[dict] = mapped_column(JSON, nullable=True)
+    # 2026-09-17 (v1.9) — a.i. concentration surfaced on the cache so
+    # the Brands endpoints can filter strictly by matching %. Dosage is
+    # directly proportional to a.i., showing wrong-% brands is unsafe.
+    # Filled on `/admin/brand-cache/refresh`; NULL until first refresh
+    # after the migration lands.
+    ai_concentration_cosh_id: Mapped[str] = mapped_column(String(100), nullable=True)
+    ai_concentration_display: Mapped[str] = mapped_column(String(200), nullable=True)
+    ai_concentration_translations: Mapped[dict] = mapped_column(JSON, nullable=True)
     # Fix 2026-06-01 — sourced from Cosh's tradenames_units Connect.
     # Each trade name has 1-2 allowed pack units (e.g. {"cosh_id":...,
     # "name":"kg"}). Replaces the formulation-class inference for the
