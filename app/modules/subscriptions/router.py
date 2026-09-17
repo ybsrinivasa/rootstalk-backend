@@ -7485,11 +7485,81 @@ async def get_practice_brands_farmer(
             flat.append({"name": opt.name, "manufacturer": opt.manufacturer})
     # Sort alphabetically by brand name for a stable, unbiased order.
     flat.sort(key=lambda b: (b["name"] or "").lower())
+    # v1.9.2 (2026-09-17) — resolve the practice's chemistry pieces
+    # (Common Name / AI concentration / Formulation) so the PWA can
+    # render them at the TOP of the Brands page. Every brand on the
+    # filtered list shares these values by definition; showing them
+    # per row was redundant. See feedback on symbol/repetition avoidance.
+    chemistry = await _resolve_practice_chemistry(
+        db, practice_id, current_user.language_code or "en",
+    )
     return {
         "is_locked": False,
         "locked_brand_name": None,
         "brands": flat,
         "client_name": client_name,
+        **chemistry,
+    }
+
+
+async def _resolve_practice_chemistry(
+    db: AsyncSession, practice_id: str, lang: str,
+) -> dict:
+    """v1.9.2 helper — load practice elements + resolve cascade
+    cosh_refs to friendly display names for COMMON_NAME +
+    AI_CONCENTRATION + FORMULATION + FORMULATION_AI_CONC. Returns a
+    dict with 4 fields (any may be None). Used by the farmer Brands
+    endpoint so the chemistry can render as a top-of-page identifier
+    without repeating per row.
+    """
+    from app.modules.advisory.models import Element
+    from app.modules.sync.models import CoshCoreItem
+    from app.services.i18n_cosh import pick_translation
+
+    elements = (await db.execute(
+        select(Element).where(Element.practice_id == practice_id)
+    )).scalars().all()
+
+    def _find(type_name: str):
+        return next(
+            (e for e in elements
+             if (e.element_type or "").upper() == type_name),
+            None,
+        )
+
+    cn = _find("COMMON_NAME")
+    ai = _find("AI_CONCENTRATION")
+    fmt = _find("FORMULATION")
+    combined = _find("FORMULATION_AI_CONC")
+
+    # Batch-resolve cosh_ref UUIDs to friendly Cosh translations.
+    cosh_ids: set[str] = set()
+    for el in (cn, ai, fmt):
+        if el and el.cosh_ref and _is_uuid(el.cosh_ref):
+            cosh_ids.add(el.cosh_ref)
+    resolved: dict[str, str] = {}
+    if cosh_ids:
+        cores = (await db.execute(
+            select(CoshCoreItem).where(CoshCoreItem.cosh_id.in_(cosh_ids))
+        )).scalars().all()
+        for c in cores:
+            label = pick_translation(c.translations or {}, lang, c.cosh_id)
+            resolved[c.cosh_id] = label
+
+    def _display(el) -> str | None:
+        if el is None:
+            return None
+        if el.value and el.value.strip():
+            return el.value.strip()
+        if el.cosh_ref:
+            return resolved.get(el.cosh_ref) or el.cosh_ref
+        return None
+
+    return {
+        "practice_common_name": _display(cn),
+        "practice_ai_display": _display(ai),
+        "practice_formulation_display": _display(fmt),
+        "practice_combined_display": _display(combined),
     }
 
 
