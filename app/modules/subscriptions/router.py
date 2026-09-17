@@ -7194,12 +7194,25 @@ async def nearby_dealers_for_farmer(
     # Pre-compute the onboarded-dealer allow-list for the brand-lock
     # case. Cheaper than calling `_is_dealer_onboarded_by_client` per
     # dealer in the loop below (which would issue one query per row).
+    #
+    # 2026-09-17 — Advisory-Only Mode also filters to the sub's client's
+    # onboarded dealers. The tile is positioned as "Nearby Dealers" but
+    # its purpose in advisory-only is to PROMOTE the client's own
+    # dealers (universities, KVKs surfacing their vetted retail network).
+    # Without this scope, farmers would see random unrelated dealers.
+    # Empty list is fine — the tile disappears rather than misleading.
+    # Traditional flow (no advisory_only_mode) unchanged: still returns
+    # all nearby dealers with matching sell_categories so the order-
+    # picker keeps working.
     onboarded_dealer_ids: Optional[set[str]] = None
-    if brand_lock_client_id:
+    scope_client_id = brand_lock_client_id or (
+        sub.client_id if sub.advisory_only_mode else None
+    )
+    if scope_client_id:
         from app.modules.clients.models import ClientPromoter
         onboarded_rows = (await db.execute(
             select(ClientPromoter.user_id).where(
-                ClientPromoter.client_id == brand_lock_client_id,
+                ClientPromoter.client_id == scope_client_id,
                 ClientPromoter.promoter_type == "DEALER",
                 ClientPromoter.status == "ACTIVE",
             )
