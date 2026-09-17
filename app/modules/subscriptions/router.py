@@ -7515,6 +7515,90 @@ async def get_practice_brands_farmer(
     }
 
 
+@router.get("/practices/{practice_id}/brands")
+async def get_practice_brands_author(
+    practice_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Advisory-Only v1.10 (2026-09-17) — SE / CA / CM view of the
+    filtered Cosh brand catalog for a practice they've authored. Uses
+    the same strict filter (Common Name + AI% + Formulation) as the
+    farmer's Brands page, so package authors can verify their preferred
+    brands are in the Cosh catalog for the exact chemistry they picked,
+    and can report gaps to the RootsTalk team.
+
+    Auth: SA / CM (unconditional) OR SE / CA / CM-EDIT of the
+    package's client. Global-package practices are visible to SA / CM
+    only. Empty brand list surfaces as-is — that IS the actionable
+    feedback ("nothing for this chemistry, please add").
+    """
+    from app.modules.advisory.models import Practice, Package
+    from app.modules.advisory.router import (
+        _assert_sa_or_cm, _assert_can_view_client_advisory,
+    )
+    from app.services.bl07_brand_options import get_brand_options
+    from fastapi import HTTPException
+
+    practice = (await db.execute(
+        select(Practice).where(Practice.id == practice_id)
+    )).scalar_one_or_none()
+    if practice is None:
+        raise HTTPException(status_code=404, detail="Practice not found")
+    package = (await db.execute(
+        select(Package).where(Package.id == practice.package_id)
+    )).scalar_one_or_none()
+    if package is None:
+        raise HTTPException(status_code=404, detail="Package not found")
+
+    # Auth: try SA/CM first (universal). If that fails, fall through
+    # to client-scoped SE/CA/CM-EDIT check when the package has a
+    # client. Global packages (client_id=NULL) allow SA/CM only.
+    is_sa_or_cm = True
+    try:
+        await _assert_sa_or_cm(db, current_user)
+    except HTTPException:
+        is_sa_or_cm = False
+    if not is_sa_or_cm:
+        if not package.client_id:
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "practice_brands_forbidden"},
+            )
+        await _assert_can_view_client_advisory(
+            db, current_user.id, package.client_id,
+        )
+
+    # Reuse the dealer-side query. SE users have no DealerRelationships,
+    # so every brand lands in `group_other` — flatten to a single list.
+    result = await get_brand_options(
+        db, practice_id, current_user.id,
+        lang=current_user.language_code or "en",
+    )
+    flat: list[dict] = []
+    if result.is_locked:
+        # Locked brand — return just the one.
+        flat.append({
+            "name": result.locked_brand_name,
+            "manufacturer": None,
+        })
+    else:
+        for grp in (result.group_recommended, result.group_my, result.group_other):
+            for opt in (grp or []):
+                flat.append({"name": opt.name, "manufacturer": opt.manufacturer})
+        flat.sort(key=lambda b: (b["name"] or "").lower())
+
+    chemistry = await _resolve_practice_chemistry(
+        db, practice_id, current_user.language_code or "en",
+    )
+    return {
+        "is_locked": result.is_locked,
+        "locked_brand_name": result.locked_brand_name if result.is_locked else None,
+        "brands": flat,
+        **chemistry,
+    }
+
+
 async def _resolve_practice_chemistry(
     db: AsyncSession, practice_id: str, lang: str,
 ) -> dict:
