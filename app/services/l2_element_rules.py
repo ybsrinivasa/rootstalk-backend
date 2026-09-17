@@ -203,14 +203,18 @@ _FORMULATION_AI_AUTOCASCADE_MANDATORY: tuple[FieldRule, ...] = (
         source="cosh_cascade:formulation_for_brand",
         mandatory=True,
         cascade_from=("COMMON_NAME",),
-        cascade_optional_inputs=("BRAND_NAME",),
+        # v1.11 — AI_CONCENTRATION added as optional cross-filter so
+        # picking AI narrows Formulation to valid combos (bidirectional
+        # with AI's own optional_inputs below).
+        cascade_optional_inputs=("BRAND_NAME", "AI_CONCENTRATION"),
     ),
     FieldRule(
         "AI_CONCENTRATION",
         source="cosh_cascade:ai_concentration_for_brand",
         mandatory=True,
         cascade_from=("COMMON_NAME",),
-        cascade_optional_inputs=("BRAND_NAME",),
+        # v1.11 — FORMULATION added as optional cross-filter.
+        cascade_optional_inputs=("BRAND_NAME", "FORMULATION"),
     ),
 )
 

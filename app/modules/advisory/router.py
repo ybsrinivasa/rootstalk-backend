@@ -5750,6 +5750,7 @@ async def cosh_formulations(
     common_name: Optional[str] = None,
     trade_name: Optional[str] = None,
     l2: Optional[str] = None,
+    ai_concentration: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -5757,11 +5758,17 @@ async def cosh_formulations(
     that one trade name; otherwise spans all trade names sharing the
     given `common_name`.
 
-    Optional `l2` opts into the Batch 39D completeness filter."""
+    Optional `l2` opts into the Batch 39D completeness filter.
+
+    v1.11 (2026-09-17) — optional `ai_concentration` cross-filter
+    narrows the returned formulations to those on TNs that also match
+    the given AI. Powers strict AI ↔ Formulation cascade narrowing so
+    SEs can't pick combos no brand carries."""
     from app.services.cosh_options_view import list_formulations
     return await list_formulations(
         db, common_name_cosh_id=common_name, trade_name_cosh_id=trade_name,
         l2_type=l2,
+        ai_concentration_cosh_id=ai_concentration,
     )
 
 
@@ -5785,14 +5792,20 @@ async def cosh_ai_concentrations(
     common_name: Optional[str] = None,
     trade_name: Optional[str] = None,
     l2: Optional[str] = None,
+    formulation: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Optional `l2` opts into the Batch 39D completeness filter."""
+    """Optional `l2` opts into the Batch 39D completeness filter.
+
+    v1.11 (2026-09-17) — optional `formulation` cross-filter narrows
+    the returned AI values to those on TNs that also match the given
+    Formulation. Powers strict AI ↔ Formulation cascade narrowing."""
     from app.services.cosh_options_view import list_ai_concentrations
     return await list_ai_concentrations(
         db, common_name_cosh_id=common_name, trade_name_cosh_id=trade_name,
         l2_type=l2,
+        formulation_cosh_id=formulation,
     )
 
 

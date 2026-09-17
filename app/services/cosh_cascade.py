@@ -158,8 +158,9 @@ async def formulation_for_brand(
     db: AsyncSession,
     brand_cosh_id: Optional[str],
     common_name_cosh_id: Optional[str] = None,
+    ai_concentration_cosh_id: Optional[str] = None,
 ) -> list[CascadeOption]:
-    """Formulations under a (brand, common_name) context.
+    """Formulations under a (brand, common_name[, ai_concentration]) context.
 
     Routing (Batches 27/29/31, 2026-05-14):
       1. brand provided AND the legacy `brand` Core has it →
@@ -172,6 +173,11 @@ async def formulation_for_brand(
       3. brand not provided AND common_name provided → cosh_options_view
          CN-only span.
       4. both missing → empty.
+
+    v1.11 (2026-09-17) — `ai_concentration_cosh_id` is an optional
+    cross-filter; when set the returned formulations are narrowed to
+    those on TNs whose CN + AI matches. Ignored on the legacy-brand
+    fast path (brand.metadata already pins a single formulation).
     """
     if brand_cosh_id:
         brand = (await db.execute(
@@ -201,12 +207,16 @@ async def formulation_for_brand(
                 db,
                 common_name_cosh_id=common_name_cosh_id,
                 trade_name_cosh_id=brand_cosh_id,
+                ai_concentration_cosh_id=ai_concentration_cosh_id,
             )
             return [CascadeOption(value=i["cosh_id"], label=i["name"]) for i in items]
         return []
     if common_name_cosh_id:
         from app.services.cosh_options_view import list_formulations
-        items = await list_formulations(db, common_name_cosh_id=common_name_cosh_id)
+        items = await list_formulations(
+            db, common_name_cosh_id=common_name_cosh_id,
+            ai_concentration_cosh_id=ai_concentration_cosh_id,
+        )
         return [CascadeOption(value=i["cosh_id"], label=i["name"]) for i in items]
     return []
 
@@ -215,11 +225,17 @@ async def ai_concentration_for_brand(
     db: AsyncSession,
     brand_cosh_id: Optional[str],
     common_name_cosh_id: Optional[str] = None,
+    formulation_cosh_id: Optional[str] = None,
 ) -> list[CascadeOption]:
     """a.i. concentration values. Same routing as
     `formulation_for_brand` — legacy `brand` Core first; on miss
     AND common_name set, fall through to the new-shape lookup
-    with both CN and TN filters (Batch 31)."""
+    with both CN and TN filters (Batch 31).
+
+    v1.11 (2026-09-17) — `formulation_cosh_id` is an optional
+    cross-filter; when set the returned AI values are narrowed to
+    those on TNs whose CN + Formulation matches. Ignored on the
+    legacy-brand fast path (brand.metadata already pins one AI)."""
     if brand_cosh_id:
         brand = (await db.execute(
             select(CoshCoreItem).where(
@@ -240,6 +256,7 @@ async def ai_concentration_for_brand(
                 db,
                 common_name_cosh_id=common_name_cosh_id,
                 trade_name_cosh_id=brand_cosh_id,
+                formulation_cosh_id=formulation_cosh_id,
             )
             return [CascadeOption(value=i["cosh_id"], label=i["name"]) for i in items]
         return []
@@ -247,6 +264,7 @@ async def ai_concentration_for_brand(
         from app.services.cosh_options_view import list_ai_concentrations
         items = await list_ai_concentrations(
             db, common_name_cosh_id=common_name_cosh_id,
+            formulation_cosh_id=formulation_cosh_id,
         )
         return [CascadeOption(value=i["cosh_id"], label=i["name"]) for i in items]
     return []
@@ -309,13 +327,19 @@ async def list_cascade_options(
             db, inputs.get("COMMON_NAME"), inputs.get("MANUFACTURER"),
         )
     if cascade_name == "formulation_for_brand":
+        # v1.11 — pass AI as cross-filter so Formulation narrows when
+        # SE has already picked AI.
         return await formulation_for_brand(
             db, inputs.get("BRAND_NAME"),
             common_name_cosh_id=inputs.get("COMMON_NAME"),
+            ai_concentration_cosh_id=inputs.get("AI_CONCENTRATION"),
         )
     if cascade_name == "ai_concentration_for_brand":
+        # v1.11 — pass Formulation as cross-filter so AI narrows when
+        # SE has already picked Formulation.
         return await ai_concentration_for_brand(
             db, inputs.get("BRAND_NAME"),
             common_name_cosh_id=inputs.get("COMMON_NAME"),
+            formulation_cosh_id=inputs.get("FORMULATION"),
         )
     raise ValueError(f"Unknown cascade: {cascade_name}")

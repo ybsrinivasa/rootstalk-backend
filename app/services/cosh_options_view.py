@@ -458,6 +458,47 @@ async def _trade_names_for_common_name(
     return tn_ids
 
 
+async def _trade_names_for_formulation(
+    db: AsyncSession, formulation_cosh_id: str,
+) -> set[str]:
+    """Internal: set of trade_name cosh_ids that use the given
+    formulation. Mirror of `_trade_names_for_common_name` for the
+    tradename_formulation Connect. Underpins v1.11 cross-filter
+    (AI narrows by Formulation)."""
+    rows = await _walk_connect(
+        db, connect_type=COSH_TRADENAME_FORMULATION_CONNECT,
+    )
+    tn_ids: set[str] = set()
+    for r in rows:
+        ep = {e.get("role"): e.get("cosh_id") for e in (r.endpoints or [])}
+        if ep.get(COSH_FORMULATIONS_CORE) != formulation_cosh_id:
+            continue
+        tn = ep.get(COSH_TRADE_NAMES_CORE)
+        if tn:
+            tn_ids.add(tn)
+    return tn_ids
+
+
+async def _trade_names_for_ai(
+    db: AsyncSession, ai_cosh_id: str,
+) -> set[str]:
+    """Internal: set of trade_name cosh_ids that have the given
+    a.i. concentration. Mirror of the above for tradename_ai Connect.
+    Underpins v1.11 cross-filter (Formulation narrows by AI)."""
+    rows = await _walk_connect(
+        db, connect_type=COSH_TRADENAME_AI_CONNECT,
+    )
+    tn_ids: set[str] = set()
+    for r in rows:
+        ep = {e.get("role"): e.get("cosh_id") for e in (r.endpoints or [])}
+        if ep.get(COSH_AI_CORE) != ai_cosh_id:
+            continue
+        tn = ep.get(COSH_TRADE_NAMES_CORE)
+        if tn:
+            tn_ids.add(tn)
+    return tn_ids
+
+
 async def _trade_names_for_manufacturer(
     db: AsyncSession, manufacturer_cosh_id: str,
 ) -> set[str]:
@@ -580,6 +621,8 @@ async def _resolve_trade_name_filter(
     common_name_cosh_id: Optional[str],
     trade_name_cosh_id: Optional[str],
     l2_type: Optional[str] = None,
+    formulation_cosh_id: Optional[str] = None,
+    ai_concentration_cosh_id: Optional[str] = None,
 ) -> Optional[set[str]]:
     """Resolve the trade-name set to filter by, based on whether SE
     has picked Common Name only, or Common Name + Trade Name.
@@ -592,7 +635,16 @@ async def _resolve_trade_name_filter(
     `l2_type` opts into the Batch 39D completeness filter. When set,
     the CN-only branch intersects with the L2's complete-TN set; the
     TN-specific branch trusts the caller (the TN was surfaced by an
-    earlier dropdown that already applied the filter)."""
+    earlier dropdown that already applied the filter).
+
+    v1.11 (2026-09-17) — `formulation_cosh_id` and
+    `ai_concentration_cosh_id` are optional cross-filters. When either
+    is set, the returned TN set intersects with TNs having that
+    formulation (via tradename_formulation Connect) and/or AI (via
+    tradename_ai Connect). Powers the AI ↔ Formulation cascade
+    narrowing so an SE picking CN + Formulation gets only the AI
+    values that exist for actual trade names of that CN + Formulation
+    combo — and can't pick an invalid combo no brand carries."""
     if trade_name_cosh_id:
         return {trade_name_cosh_id}
     if common_name_cosh_id:
@@ -600,6 +652,14 @@ async def _resolve_trade_name_filter(
         complete_tns = await _complete_trade_names_for_l2(db, l2_type)
         if complete_tns is not None:
             tn_ids &= complete_tns
+        # v1.11 cross-filters. Strict intersection — empty set here
+        # means "no TN of this CN has your other picks" and the caller
+        # returns [] (dropdown collapses) which forces the SE to
+        # revisit their combo.
+        if formulation_cosh_id:
+            tn_ids &= await _trade_names_for_formulation(db, formulation_cosh_id)
+        if ai_concentration_cosh_id:
+            tn_ids &= await _trade_names_for_ai(db, ai_concentration_cosh_id)
         return tn_ids
     return None
 
@@ -658,11 +718,17 @@ async def list_formulations(
     common_name_cosh_id: Optional[str] = None,
     trade_name_cosh_id: Optional[str] = None,
     l2_type: Optional[str] = None,
+    ai_concentration_cosh_id: Optional[str] = None,
 ) -> list[dict]:
     """Formulations filtered by SE's selection: when only Common Name
     is set, span all trade names sharing that common name; when Trade
     Name is set, narrow to just that one. `l2_type` opts into the
     Batch 39D completeness filter.
+
+    v1.11 (2026-09-17) — optional `ai_concentration_cosh_id` narrows
+    the returned formulations to those on TNs whose CN + AI matches.
+    Prevents SE from picking a Formulation that no real brand offers
+    for the chosen CN + AI combo.
 
     Special case (2026-05-22): NPK Dosages L2s carry no Common Name on
     the Practice; they route through the `formulations_L2_npk` Connect
@@ -671,6 +737,7 @@ async def list_formulations(
         return await _list_formulations_for_npk_l2(db, l2_type=l2_type)
     tn_filter = await _resolve_trade_name_filter(
         db, common_name_cosh_id, trade_name_cosh_id, l2_type,
+        ai_concentration_cosh_id=ai_concentration_cosh_id,
     )
     if tn_filter is None or not tn_filter:
         return []
@@ -688,11 +755,19 @@ async def list_ai_concentrations(
     common_name_cosh_id: Optional[str] = None,
     trade_name_cosh_id: Optional[str] = None,
     l2_type: Optional[str] = None,
+    formulation_cosh_id: Optional[str] = None,
 ) -> list[dict]:
     """a.i. (%) options. Same filter logic as formulations. `l2_type`
-    opts into the Batch 39D completeness filter."""
+    opts into the Batch 39D completeness filter.
+
+    v1.11 (2026-09-17) — optional `formulation_cosh_id` narrows the
+    returned AI values to those on TNs whose CN + Formulation matches.
+    Prevents SE from picking an AI that no real brand offers for the
+    chosen CN + Formulation combo (e.g. Imidacloprid + FS + 10 —
+    Cosh has no such trade name)."""
     tn_filter = await _resolve_trade_name_filter(
         db, common_name_cosh_id, trade_name_cosh_id, l2_type,
+        formulation_cosh_id=formulation_cosh_id,
     )
     if tn_filter is None or not tn_filter:
         return []
