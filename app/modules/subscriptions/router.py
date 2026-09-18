@@ -1831,6 +1831,7 @@ async def create_subscription(
         advisory_only_mode=bool(_client_for_snapshot and _client_for_snapshot.advisory_only_mode),
         dealer_list_enabled=bool(_client_for_snapshot and _client_for_snapshot.dealer_list_enabled),
         subscription_fee_paise=(_client_for_snapshot.subscription_fee_paise if _client_for_snapshot else None),
+        input_alert_lead_days=(_client_for_snapshot.input_alert_lead_days if _client_for_snapshot else None),
     )
     db.add(sub)
     await db.flush()
@@ -2383,6 +2384,7 @@ async def initiate_assignment(
         advisory_only_mode=bool(_client_for_snapshot and _client_for_snapshot.advisory_only_mode),
         dealer_list_enabled=bool(_client_for_snapshot and _client_for_snapshot.dealer_list_enabled),
         subscription_fee_paise=(_client_for_snapshot.subscription_fee_paise if _client_for_snapshot else None),
+        input_alert_lead_days=(_client_for_snapshot.input_alert_lead_days if _client_for_snapshot else None),
     )
     # Only persist + stamp _confirmed_at when the caller actually
     # provided the measure. Neither branch is the new default — the
@@ -5359,8 +5361,27 @@ async def purchase_practice(
 ):
     """Advisory-Only Mode (v1.8) — farmer marks 'I've purchased this'
     for an INPUT practice. Ungated by date (farmer can pre-buy for a
-    future recommendation)."""
-    return await _upsert_practice_ack(db, current_user.id, body, "purchase")
+    future recommendation).
+
+    v1.13 (2026-09-18) — vanish-on-ack. After the purchase is
+    recorded, calls `clear_input_alerts_if_no_due_remaining` (which
+    branches on advisory_only_mode and consults purchased_at as the
+    "already handled" signal for advisory-only subs). Mirrors the
+    order-create → alert-clear path in Regular Mode. Best-effort — a
+    failure to clear the alert must never roll back the ack.
+    """
+    result = await _upsert_practice_ack(db, current_user.id, body, "purchase")
+    try:
+        from app.tasks.alerts import clear_input_alerts_if_no_due_remaining
+        cleared = await clear_input_alerts_if_no_due_remaining(db, body.subscription_id)
+        if cleared:
+            await db.commit()
+    except Exception as _e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            f"Vanish-on-ack failed for sub {body.subscription_id}: {_e}"
+        )
+    return result
 
 
 @router.post("/farmer/practice-ack/unpurchase")

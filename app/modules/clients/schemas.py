@@ -21,6 +21,10 @@ class ClientInitiate(BaseModel):
     advisory_only_mode: bool = False
     dealer_list_enabled: bool = False  # meaningful only when advisory_only_mode=True
     subscription_fee_paise: Optional[int] = None  # override for flat pricing
+    # v1.13 (2026-09-18) — INPUT alert pre-window lead time (days).
+    # NULL → code default 2; explicit 0 → no pre-alert. Only consulted
+    # when advisory_only_mode=True.
+    input_alert_lead_days: Optional[int] = None
 
 
 # ── CA submits their side ──────────────────────────────────────────────────────
@@ -88,6 +92,7 @@ class ClientEdit(BaseModel):
     advisory_only_mode: Optional[bool] = None
     dealer_list_enabled: Optional[bool] = None
     subscription_fee_paise: Optional[int] = None
+    input_alert_lead_days: Optional[int] = None
 
 
 class ClientStatusUpdate(BaseModel):
@@ -134,6 +139,7 @@ class ClientOut(BaseModel):
     advisory_only_mode: bool = False
     dealer_list_enabled: bool = False
     subscription_fee_paise: Optional[int] = None
+    input_alert_lead_days: Optional[int] = None
     status: ClientStatus
     ca_name: str
     ca_phone: str

@@ -356,6 +356,7 @@ async def initiate_onboarding(
         advisory_only_mode=request.advisory_only_mode,
         dealer_list_enabled=request.dealer_list_enabled,
         subscription_fee_paise=request.subscription_fee_paise,
+        input_alert_lead_days=request.input_alert_lead_days,
     )
     db.add(client)
     await db.commit()
@@ -1058,6 +1059,7 @@ async def get_client_info_by_id(
         "advisory_only_mode": bool(client.advisory_only_mode),
         "dealer_list_enabled": bool(client.dealer_list_enabled),
         "subscription_fee_paise": client.subscription_fee_paise,
+        "input_alert_lead_days": client.input_alert_lead_days,
     }
 
 

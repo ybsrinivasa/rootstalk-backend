@@ -25,7 +25,7 @@ decisions. The live Celery task in `app/tasks/alerts.py` does the I/O.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from typing import Optional
 
 from app.services.snapshot_render import TimelineMetadata, cca_window_active
@@ -126,6 +126,7 @@ def find_input_practices_due_today(
     timelines: list[TimelineWindow],
     day_offset: int,
     today_date: Optional[date] = None,
+    lead_days: int = 0,
 ) -> list[str]:
     """Return the IDs of all INPUT practices whose timeline window is
     active today.
@@ -139,7 +140,23 @@ def find_input_practices_due_today(
     fire INPUT alerts when today's day-of-year falls in the
     [from_value, to_value] window. Pre-D callers that omit `today_date`
     keep the legacy behaviour: CALENDAR rows skip.
+
+    v1.13 (2026-09-18): `lead_days` shifts the earliest-active edge by
+    N days (advisory-only pre-window alerts). A practice with authored
+    window `[from, to]` is "due" when today ∈ `[from - lead_days, to]`.
+    Implemented as `cca_window_active(meta, day_offset + lead_days,
+    today_date + lead_days)` — makes today "look like" it's N days
+    later to the window check, so day-N-before-open becomes day-open.
+    lead_days=0 (default) is byte-identical to the pre-v1.13
+    behaviour — Regular Mode subs are unaffected.
     """
+    if lead_days < 0:
+        lead_days = 0
+    shifted_day_offset = day_offset + lead_days
+    shifted_today_date = (
+        today_date + timedelta(days=lead_days)
+        if today_date is not None else None
+    )
     out: list[str] = []
     for tl in timelines:
         meta = TimelineMetadata(
@@ -147,8 +164,33 @@ def find_input_practices_due_today(
             from_value=tl.from_value,
             to_value=tl.to_value,
         )
-        if cca_window_active(meta, day_offset, today_date=today_date):
+        if cca_window_active(meta, shifted_day_offset, today_date=shifted_today_date):
             out.extend(tl.input_practice_ids)
+    return out
+
+
+def practice_windows_open_today(
+    timelines: list[TimelineWindow],
+    day_offset: int,
+    today_date: Optional[date] = None,
+) -> set[str]:
+    """Return practice IDs whose window is TRULY open today (no lead
+    shift). Used by the "soon" vs "today" copy picker: if `find_input_
+    practices_due_today` returned practices via the lead-days shift
+    but none of those windows is open today, the alert copy switches
+    to "soon"; otherwise "today". Byte-identical to
+    `find_input_practices_due_today(..., lead_days=0)` — kept as a
+    named helper for read-site clarity.
+    """
+    out: set[str] = set()
+    for tl in timelines:
+        meta = TimelineMetadata(
+            from_type=tl.from_type,
+            from_value=tl.from_value,
+            to_value=tl.to_value,
+        )
+        if cca_window_active(meta, day_offset, today_date=today_date):
+            out.update(tl.input_practice_ids)
     return out
 
 

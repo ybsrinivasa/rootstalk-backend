@@ -146,6 +146,18 @@ class Client(Base):
     subscription_fee_paise: Mapped[int] = mapped_column(
         Integer, nullable=True,
     )
+    # v1.13 (2026-09-18) — Advisory-Only Mode INPUT alerts fire N days
+    # BEFORE the practice's authored window opens, so a farmer buying
+    # inputs offline has travel/shop-hours lead time. NULL → code
+    # default 2; explicit 0 → no pre-alert (fire on window-open day
+    # only, matching Regular Mode). Meaningful only when
+    # advisory_only_mode is True; the alerts engine ignores this
+    # column for non-advisory-only subs. Snapshot on Subscription at
+    # create so flipping the client-level value later doesn't shift
+    # existing subs' alert cadence.
+    input_alert_lead_days: Mapped[int] = mapped_column(
+        Integer, nullable=True,
+    )
     # 2026-07-24 — Training Sandbox V1. When True, this Client is a
     # shadow training child of `parent_client_id` — created by the CA
     # via POST /client/{cid}/training/start, lives for 12 days, then

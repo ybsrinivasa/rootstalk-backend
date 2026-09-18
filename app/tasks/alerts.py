@@ -29,9 +29,32 @@ from app.modules.subscriptions.models import (
 )
 from app.services.bl09_alerts import (
     AlertRecipientSpec, ConfiguredRecipient, SubscriptionView, TimelineWindow,
-    find_input_practices_due_today, resolve_alert_recipients,
+    find_input_practices_due_today, practice_windows_open_today,
+    resolve_alert_recipients,
     should_send_input_alert, should_send_start_date_alert,
 )
+
+# v1.13 (2026-09-18) — default when Client / Subscription's
+# `input_alert_lead_days` is NULL. Explicit 0 (SA-set) disables the
+# pre-alert; explicit N uses that value. See scoping in
+# project_rootstalk_advisory_only_v1 memory.
+DEFAULT_INPUT_ALERT_LEAD_DAYS_ADVISORY_ONLY = 2
+
+
+def _resolve_input_alert_lead_days(sub) -> int:
+    """Read the effective INPUT-alert lead-days for this sub.
+
+    NULL → DEFAULT_INPUT_ALERT_LEAD_DAYS_ADVISORY_ONLY (2). Explicit
+    0 → no pre-alert (fire on window-open day only, matching Regular
+    Mode). Explicit N → N days. Caller is responsible for gating on
+    `sub.advisory_only_mode` — this helper does not check the mode.
+    """
+    val = getattr(sub, "input_alert_lead_days", None)
+    if val is None:
+        return DEFAULT_INPUT_ALERT_LEAD_DAYS_ADVISORY_ONLY
+    if val < 0:
+        return 0
+    return int(val)
 from app.services.fcm_service import send_fcm
 from app.services.sms_service import send_sms
 
@@ -51,6 +74,21 @@ INPUT_ALERT_SMS_ADVISORY_ONLY = (
     "RootsTalk: {name}, an input is due today for your {crop} "
     "advisory. Input details are in RootsTalk — purchase from any local dealer."
 )
+# v1.13 (2026-09-18) — Two body variants for the advisory-only INPUT
+# alert, chosen at send time by whether ANY due-set practice's window
+# is truly open today (TODAY variant) vs all firings are pre-window
+# from the lead_days shift (SOON variant). TODAY replaces the earlier
+# INPUT_ALERT_SMS_ADVISORY_ONLY when the window is genuinely open.
+INPUT_ALERT_SMS_ADVISORY_ONLY_TODAY = (
+    "RootsTalk: {name}, an input is due for purchase today for your "
+    "{crop} advisory. Input details are in RootsTalk — purchase from "
+    "any local dealer."
+)
+INPUT_ALERT_SMS_ADVISORY_ONLY_SOON = (
+    "RootsTalk: {name}, an input will be due for purchase soon for your "
+    "{crop} advisory. Input details are in RootsTalk — purchase from "
+    "any local dealer."
+)
 
 # FCM payloads — short title for the lock-screen banner, body
 # tightened from the SMS version (no "RootsTalk:" prefix, no
@@ -69,6 +107,19 @@ INPUT_ALERT_FCM_BODY = (
 INPUT_ALERT_FCM_BODY_ADVISORY_ONLY = (
     "An input is due today for your {crop} advisory. Input details are in "
     "RootsTalk — purchase from any local dealer."
+)
+# v1.13 (2026-09-18) — Two FCM variants (title + body) for
+# advisory-only INPUT: TODAY when a window is open today, SOON when
+# the alert is firing purely on the lead_days pre-window shift.
+INPUT_ALERT_FCM_TITLE_ADVISORY_ONLY_TODAY = "Due for purchase today"
+INPUT_ALERT_FCM_TITLE_ADVISORY_ONLY_SOON = "Due for purchase soon"
+INPUT_ALERT_FCM_BODY_ADVISORY_ONLY_TODAY = (
+    "An input is due for purchase today for your {crop} advisory. "
+    "Open RootsTalk for details and purchase from any local dealer."
+)
+INPUT_ALERT_FCM_BODY_ADVISORY_ONLY_SOON = (
+    "An input will be due for purchase soon for your {crop} advisory. "
+    "Open RootsTalk for details and plan your visit to a local dealer."
 )
 
 # Order statuses that suppress an INPUT alert. Mirrors the set in
@@ -183,19 +234,57 @@ async def _load_active_order_practice_ids(db, subscription_id: str) -> set[str]:
     return set(rows)
 
 
+async def _load_purchased_practice_ids(
+    db, subscription_id: str, today_date: date,
+) -> set[str]:
+    """Practice IDs the farmer has already "purchased" via the v1.8
+    Advisory-Only Mode two-stage ack (`purchased_at IS NOT NULL` on
+    the PracticeAcknowledgement for an occurrence <= today). These
+    suppress today's INPUT alert in advisory-only mode — the analogue
+    of _load_active_order_practice_ids in Regular Mode.
+
+    Only rows whose `occurrence_date <= today_date` count. A future
+    occurrence isn't yet the alert's target so shouldn't retroactively
+    silence today's nudge.
+    """
+    from app.modules.advisory.models import PracticeAcknowledgement
+    rows = (await db.execute(
+        select(PracticeAcknowledgement.practice_id).where(
+            PracticeAcknowledgement.subscription_id == subscription_id,
+            PracticeAcknowledgement.purchased_at.is_not(None),
+            PracticeAcknowledgement.occurrence_date <= today_date,
+        )
+    )).scalars().all()
+    return set(rows)
+
+
 async def clear_input_alerts_if_no_due_remaining(
     db, subscription_id: str, today_date: date | None = None,
 ) -> int:
     """Flip SENT INPUT alerts on this subscription to READ when no
-    INPUT practice is still both due-today AND not-yet-ordered.
+    INPUT practice is still both due-today AND not-yet-handled.
+
+    "Handled" branches on the sub's mode (v1.13, 2026-09-18):
+      • Regular Mode → an active order exists for the practice
+        (existing rule, `_load_active_order_practice_ids`).
+      • Advisory-Only Mode → the farmer has tapped "I've purchased
+        this" on the practice (`_load_purchased_practice_ids` reading
+        `PracticeAcknowledgement.purchased_at`).
+
+    The "due today" check also honours the sub's `input_alert_lead_days`
+    for advisory-only subs so the vanish criteria match the fire
+    criteria — a pre-window firing must be vanishable by the matching
+    pre-window purchase.
 
     The promoter's `/promoter/me/incoming-alerts` filters status=SENT,
     so once we flip, the row vanishes from their list immediately.
-    Called from two places:
+    Called from:
       • The daily-alerts task — handles "timeline window closed today"
         (a practice that was due yesterday no longer matches).
-      • The order-create endpoint — handles "farmer placed the order"
-        (the practice is now suppressed by _SUPPRESSING_ORDER_STATUSES).
+      • The order-create endpoint (Regular Mode) — handles "farmer
+        placed the order".
+      • The purchase-ack endpoint (Advisory-Only Mode, v1.13) —
+        handles "farmer tapped 'I've purchased this'".
 
     Returns the number of alert rows flipped. Safe to call repeatedly —
     only acts on SENT rows so a second call is a no-op."""
@@ -215,14 +304,22 @@ async def clear_input_alerts_if_no_due_remaining(
         # daily task (gated on crop_start_date). Nothing to do.
         return 0
 
+    is_advisory_only = bool(getattr(sub, "advisory_only_mode", False))
+    lead_days = _resolve_input_alert_lead_days(sub) if is_advisory_only else 0
+
     timelines = await _load_timeline_windows(db, sub.package_id)
     crop_start = sub.crop_start_date.date()
     day_offset = (today_date - crop_start).days
     due_pids = find_input_practices_due_today(
-        timelines, day_offset, today_date=today_date,
+        timelines, day_offset, today_date=today_date, lead_days=lead_days,
     )
-    ordered_pids = await _load_active_order_practice_ids(db, subscription_id)
-    still_outstanding = [p for p in due_pids if p not in ordered_pids]
+    if is_advisory_only:
+        handled_pids = await _load_purchased_practice_ids(
+            db, subscription_id, today_date,
+        )
+    else:
+        handled_pids = await _load_active_order_practice_ids(db, subscription_id)
+    still_outstanding = [p for p in due_pids if p not in handled_pids]
     if still_outstanding:
         return 0
 
@@ -360,8 +457,21 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
     # DAS/DBS use day_offset; CALENDAR uses today_date inside
     # cca_window_active. Same code path for annual + perennial.
     day_offset = (today - crop_start).days
+
+    # Advisory-Only Mode v1.13 (2026-09-18) — pre-window INPUT alerts.
+    # Fire lead_days BEFORE the practice's authored from-edge so a
+    # farmer buying inputs offline has travel + shop-hours lead time.
+    # Regular subs (advisory_only_mode=False) always use lead_days=0
+    # — the alerts engine is byte-identical to the pre-v1.13 behaviour
+    # for them. Advisory-only subs use `sub.input_alert_lead_days`
+    # (client-snapshot at sub-create), defaulting to 2 when NULL.
+    # Explicit 0 disables the pre-alert (matches Regular Mode cadence
+    # for that specific advisory-only sub).
+    is_advisory_only = bool(getattr(sub, "advisory_only_mode", False))
+    lead_days = _resolve_input_alert_lead_days(sub) if is_advisory_only else 0
+
     due_practice_ids = find_input_practices_due_today(
-        timelines, day_offset, today_date=today,
+        timelines, day_offset, today_date=today, lead_days=lead_days,
     )
     if not due_practice_ids:
         # No INPUT practice is due today — the window has closed for
@@ -372,14 +482,22 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
         await clear_input_alerts_if_no_due_remaining(db, sub.id, today)
         return
 
-    ordered_pids = await _load_active_order_practice_ids(db, sub.id)
+    # v1.13 — vanish-on-ack for advisory-only mode. In advisory-only
+    # there are no orders; the "already handled" signal is the farmer's
+    # own "I've purchased this" ack (v1.8) via PracticeAcknowledgement.
+    # purchased_at. Regular Mode still uses the order pipeline.
+    handled_pids: set[str]
+    if is_advisory_only:
+        handled_pids = await _load_purchased_practice_ids(db, sub.id, today)
+    else:
+        handled_pids = await _load_active_order_practice_ids(db, sub.id)
     # Even when due practices exist, if every one of them has been
-    # ordered, clear stale SENT alerts before deciding whether to
-    # send today.
+    # handled (ordered / purchased), clear stale SENT alerts before
+    # deciding whether to send today.
     await clear_input_alerts_if_no_due_remaining(db, sub.id, today)
     in_sent_today = await _alert_sent_today(db, sub.id, AlertType.INPUT, today)
     if not should_send_input_alert(
-        sub_view, due_practice_ids, ordered_pids, sent_today=in_sent_today,
+        sub_view, due_practice_ids, handled_pids, sent_today=in_sent_today,
     ):
         return
 
@@ -391,9 +509,34 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
     # Advisory-Only Mode (2026-09-16): use the CTA-neutral variant of
     # both the SMS and FCM body. No in-app order flow to point at;
     # farmer buys inputs offline. See scoping §14.
-    is_advisory_only = bool(getattr(sub, "advisory_only_mode", False))
-    sms_template = INPUT_ALERT_SMS_ADVISORY_ONLY if is_advisory_only else INPUT_ALERT_SMS
-    fcm_template = INPUT_ALERT_FCM_BODY_ADVISORY_ONLY if is_advisory_only else INPUT_ALERT_FCM_BODY
+    # v1.13 (2026-09-18): within advisory-only, split the copy into
+    # "today" (at least one due-set practice's window is truly open
+    # today) vs "soon" (all due-set practices are pre-window firings
+    # from the lead_days shift). Soon → "Due for purchase soon". Today
+    # → "Due for purchase today". Registers the "buy now" urgency
+    # instantly on the notification banner without reading the whole
+    # line.
+    if is_advisory_only:
+        open_now_pids = practice_windows_open_today(
+            timelines, day_offset, today_date=today,
+        )
+        any_open_today = any(pid in open_now_pids for pid in due_practice_ids)
+        sms_template = (
+            INPUT_ALERT_SMS_ADVISORY_ONLY_TODAY if any_open_today
+            else INPUT_ALERT_SMS_ADVISORY_ONLY_SOON
+        )
+        fcm_template = (
+            INPUT_ALERT_FCM_BODY_ADVISORY_ONLY_TODAY if any_open_today
+            else INPUT_ALERT_FCM_BODY_ADVISORY_ONLY_SOON
+        )
+        fcm_title = (
+            INPUT_ALERT_FCM_TITLE_ADVISORY_ONLY_TODAY if any_open_today
+            else INPUT_ALERT_FCM_TITLE_ADVISORY_ONLY_SOON
+        )
+    else:
+        sms_template = INPUT_ALERT_SMS
+        fcm_template = INPUT_ALERT_FCM_BODY
+        fcm_title = INPUT_ALERT_FCM_TITLE
 
     for recipient in recipients:
         user = user_by_id.get(recipient.user_id)
@@ -409,7 +552,7 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
         await _send_to_recipient(
             db, sub.id, AlertType.INPUT, recipient, user,
             sms_body=sms,
-            fcm_title=INPUT_ALERT_FCM_TITLE,
+            fcm_title=fcm_title,
             fcm_body=fcm_body,
         )
 

@@ -137,6 +137,13 @@ class Subscription(Base):
     subscription_fee_paise: Mapped[int] = mapped_column(
         Integer, nullable=True,
     )
+    # v1.13 (2026-09-18) — snapshot of Client.input_alert_lead_days at
+    # create. Only consulted by the alerts engine when
+    # advisory_only_mode is True. NULL → code default 2; explicit 0 →
+    # no pre-alert. Read by `_process_subscription` in app/tasks/alerts.py.
+    input_alert_lead_days: Mapped[int] = mapped_column(
+        Integer, nullable=True,
+    )
     # CA Admin test-data cleanup (2026-06-28). NULL = active; non-NULL
     # = soft-deleted at that time. Read paths automatically filter
     # `deleted_at IS NULL` via the session-level event listener in
