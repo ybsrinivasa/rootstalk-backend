@@ -5228,6 +5228,17 @@ async def get_advisory_cluster(
             key=lambda p: (p.get('occurrence_date') or '', p.get('display_order') or 0),
         )
         cluster_timelines_out.append({**t, 'practices': practices_list})
+    # 2026-09-18 bug fix — sort visible timelines by earliest calendar
+    # from_date so overlapping timelines within a cluster surface in
+    # the sequence the farmer's field intuition expects (earliest
+    # starting on top). Prior default was SE-authored display_order,
+    # which surfaced a Sep-19-starting timeline above a Sep-18-starting
+    # one when both fell inside the same cluster window. `from_date`
+    # is an ISO string here; lexicographic sort == calendar sort for
+    # YYYY-MM-DD. `id` as deterministic tie-break for reproducibility.
+    cluster_timelines_out.sort(
+        key=lambda t: (t.get('from_date') or '', t.get('id') or ''),
+    )
 
     return {
         **_base_payload(),
@@ -7026,6 +7037,17 @@ async def _today_advisory_for_user(
                 tl_entry["problem_name"] = cha_meta["problem_name"]
                 tl_entry["triggered_at"] = cha_meta["triggered_at"]
             timeline_data.append(tl_entry)
+
+        # 2026-09-18 bug fix — sort visible timelines by earliest
+        # calendar from_date so a Sep-18-starting timeline surfaces
+        # above a Sep-19-starting one on the farmer's advisory screen,
+        # even when the SE authored them in reverse order. Same rule
+        # as the cluster endpoint; kept here so callers hitting the
+        # daily view directly (F-P promoted-farmer / non-cluster
+        # rendering paths) get the same ordering.
+        timeline_data.sort(
+            key=lambda t: (t.get('from_date') or '', t.get('id') or ''),
+        )
 
         pkg_type_val = (
             pkg.package_type.value if hasattr(pkg.package_type, "value")

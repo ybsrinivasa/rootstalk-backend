@@ -461,11 +461,44 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
     crop_translations = (crop_core.translations or {}) if crop_core else {}
 
     crop_start = sub.crop_start_date.date() if sub.crop_start_date else None
+
+    # 2026-09-18 bug fix — sync-fire path was leaking Alert rows to the
+    # promoter on subs whose PromoterAssignment is still
+    # PENDING_FARMER_APPROVAL (Farmer hadn't accepted). The daily task
+    # skips these subs entirely (see `_run_daily_alerts_with_session`
+    # at line ~691), but `send_alerts_now_for_subscription` bypasses
+    # that gate — it delegates straight to here. Effect: promoter
+    # opened `/promoter/me/incoming-alerts` seconds after assigning
+    # and saw a START_DATE alert on an assignment the farmer hadn't
+    # even seen yet.
+    # Fix: when the assignment is still pending farmer approval, drop
+    # the promoter from the fallback recipient set so the auto-promoter
+    # branch of `resolve_alert_recipients` is a no-op. Farmer still
+    # receives SMS + FCM (the "please open the app and act" nudge).
+    # Farmer's explicit `extra_alert_user_id` (if set) also still gets
+    # the alert — that's the farmer's active choice, not a fallback,
+    # and the resolver already prefers it.
+    # Once the farmer accepts → assignment flips ACTIVE → next daily
+    # beat naturally includes the promoter again.
+    effective_promoter_user_id = sub.promoter_user_id
+    if effective_promoter_user_id is not None:
+        from app.modules.subscriptions.models import (
+            AssignmentStatus, PromoterAssignment,
+        )
+        pending_assignment = (await db.execute(
+            select(PromoterAssignment.id).where(
+                PromoterAssignment.subscription_id == sub.id,
+                PromoterAssignment.status == AssignmentStatus.PENDING_FARMER_APPROVAL,
+            )
+        )).first()
+        if pending_assignment is not None:
+            effective_promoter_user_id = None
+
     sub_view = SubscriptionView(
         subscription_id=sub.id,
         subscription_type=sub.subscription_type.value if hasattr(sub.subscription_type, "value") else str(sub.subscription_type),
         farmer_user_id=sub.farmer_user_id,
-        promoter_user_id=sub.promoter_user_id,
+        promoter_user_id=effective_promoter_user_id,
         crop_start_date=crop_start,
         extra_alert_user_id=sub.extra_alert_user_id,
         alerts_extra_disabled=sub.alerts_extra_disabled,
