@@ -269,6 +269,7 @@ def render_cca_from_content(
                 for e in (p.get("elements") or [])
             ],
             frequency_days=p.get("frequency_days"),
+            is_brand_locked=bool(p.get("is_brand_locked", False)),
         )
         for p in visible_practices
     ]
@@ -324,6 +325,7 @@ def render_cha_from_content(content: dict) -> list[PStub]:
                 for e in (p.get("elements") or [])
             ],
             frequency_days=p.get("frequency_days"),
+            is_brand_locked=bool(p.get("is_brand_locked", False)),
         )
         for p in practices
     ]

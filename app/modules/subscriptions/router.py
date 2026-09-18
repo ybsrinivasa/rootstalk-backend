@@ -6618,6 +6618,48 @@ async def _today_advisory_for_user(
             tl_windows, committed_practice_ids=committed_ids,
         )
 
+        # Brand-Lock in Advisory-Only Mode (v1.12) — surface locked
+        # brand + manufacturer per locked practice so the PWA
+        # PracticeCard can render the "must-buy-this-brand" strip.
+        # Walks dedup survivors, collects raw BRAND_NAME cosh_refs on
+        # locked practices, and batch-resolves manufacturer/brand
+        # names via BrandLookupCache. Separate from the APPROVED
+        # order-item lookup above because an advisory-only sub has
+        # no orders — every locked practice would otherwise miss the
+        # manufacturer surface.
+        locked_brand_ids: set[str] = set()
+        locked_brand_raw_by_practice: dict[str, str] = {}
+        for _dedup_tl in deduped:
+            for _p in _dedup_tl.visible_practices:
+                if not _p.is_brand_locked:
+                    continue
+                for _el in _p.elements:
+                    if (_el.element_type or "").upper() == "BRAND_NAME" and _el.cosh_ref:
+                        locked_brand_raw_by_practice[_p.id] = _el.cosh_ref
+                        locked_brand_ids.add(_el.cosh_ref)
+                        break
+        locked_brand_name_by_id: dict[str, str | None] = {}
+        locked_mfr_name_by_id: dict[str, str | None] = {}
+        if locked_brand_ids:
+            mfr_locked_rows = (await db.execute(
+                select(
+                    BrandLookupCache.trade_name_cosh_id,
+                    BrandLookupCache.trade_name,
+                    BrandLookupCache.trade_name_translations,
+                    BrandLookupCache.manufacturer_name,
+                    BrandLookupCache.manufacturer_translations,
+                ).where(BrandLookupCache.trade_name_cosh_id.in_(locked_brand_ids))
+            )).all()
+            for tn_id, tn_en, tn_tr, mfr_en, mfr_tr in mfr_locked_rows:
+                if tn_id not in locked_brand_name_by_id and tn_en:
+                    locked_brand_name_by_id[tn_id] = pick_translation(
+                        tn_tr or {}, lang, tn_en,
+                    )
+                if tn_id not in locked_mfr_name_by_id and mfr_en:
+                    locked_mfr_name_by_id[tn_id] = pick_translation(
+                        mfr_tr or {}, lang, mfr_en,
+                    )
+
         # 2026-06-29 — Phase 1 window absorption.
         # When BL-03 marks a TL as fully absorbed by another TL (every
         # practice it had got suppressed by matches in the same other
@@ -6846,6 +6888,7 @@ async def _today_advisory_for_user(
                 if ack and ack.hidden_at is not None:
                     continue  # farmer "deleted" — invisible to them
                 ack_status = "MARKED" if (ack and ack.marked_at is not None) else "ACTIVE"
+                _locked_brand_ref = locked_brand_raw_by_practice.get(p.id)
                 tl_practices_out.append({
                     "id": p.id, "l0_type": p.l0_type,
                     "l1_type": p.l1_type, "l2_type": p.l2_type,
@@ -6872,6 +6915,21 @@ async def _today_advisory_for_user(
                     # flow (purchase there is tracked by the order pipeline).
                     "purchased_at": ack.purchased_at.isoformat() if (ack and ack.purchased_at) else None,
                     "occurrence_date": occ_date.isoformat(),
+                    # Brand-Lock (v1.12) — is_brand_locked passes through
+                    # from the SE authoring intent; locked_brand_name +
+                    # locked_manufacturer_name resolved above from
+                    # BrandLookupCache so the advisory-only PracticeCard
+                    # can render Brand + Manufacturer prominently and
+                    # disable the Brands button.
+                    "is_brand_locked": p.is_brand_locked,
+                    "locked_brand_name": (
+                        locked_brand_name_by_id.get(_locked_brand_ref)
+                        if _locked_brand_ref else None
+                    ),
+                    "locked_manufacturer_name": (
+                        locked_mfr_name_by_id.get(_locked_brand_ref)
+                        if _locked_brand_ref else None
+                    ),
                 })
             tl_entry: dict = {
                 "id": tl.id,
