@@ -333,6 +333,77 @@ async def clear_input_alerts_if_no_due_remaining(
     return res.rowcount or 0
 
 
+async def supersede_alerts_for_removed_recipients(
+    db, subscription_id: str,
+) -> int:
+    """Flip SENT Alert rows on this sub whose recipient is NO LONGER in
+    the current resolved recipient set to READ.
+
+    Called from `POST /farmer/subscriptions/{id}/alert-preferences`
+    right after the sub's `extra_alert_user_id` / `alerts_extra_disabled`
+    change. Handles all three transitions cleanly:
+      • Promoter (fallback) → new extra recipient: promoter's SENT rows
+        vanish immediately.
+      • Extra A → Extra B: A's SENT rows vanish immediately.
+      • Any recipient → disabled: extra's SENT rows vanish immediately.
+
+    Pre-2026-09-18 the endpoint just wrote the new state; stale SENT
+    rows for the old recipient stayed on their alerts-incoming feed
+    until the next daily beat's `_supersede_prior_sent` swept them.
+    Farmer report: "when a farmer sets a different dealer, this
+    promoter should not get any alert."
+
+    Self-healing — reads the CURRENT (post-mutation) recipient set
+    via the pure `resolve_alert_recipients`, so it doesn't need the
+    caller to pass the old set. Safe to call from any preference-
+    changing site.
+
+    The farmer's own Alert row (audit + supersede tracking) is
+    preserved — it's already invisible to the dealer/promoter feed
+    via the query-side filter added in the sibling bug fix, and
+    dropping it here would break `_alert_sent_today` idempotency.
+
+    Returns the number of rows flipped.
+    """
+    from sqlalchemy import update as sa_update
+    from app.modules.subscriptions.models import Subscription
+
+    sub = (await db.execute(
+        select(Subscription).where(Subscription.id == subscription_id)
+    )).scalar_one_or_none()
+    if sub is None:
+        return 0
+
+    sub_view = SubscriptionView(
+        subscription_id=sub.id,
+        subscription_type=(
+            sub.subscription_type.value
+            if hasattr(sub.subscription_type, "value")
+            else str(sub.subscription_type)
+        ),
+        farmer_user_id=sub.farmer_user_id,
+        promoter_user_id=sub.promoter_user_id,
+        crop_start_date=sub.crop_start_date.date() if sub.crop_start_date else None,
+        extra_alert_user_id=sub.extra_alert_user_id,
+        alerts_extra_disabled=sub.alerts_extra_disabled,
+    )
+    current_recipient_ids = {
+        r.user_id for r in resolve_alert_recipients(sub_view)
+    }
+    if not current_recipient_ids:
+        # Defensive — never expect this in practice (farmer is always
+        # in the set), but if it happens, don't flip everything.
+        return 0
+    res = await db.execute(
+        sa_update(Alert).where(
+            Alert.subscription_id == subscription_id,
+            Alert.status == AlertStatus.SENT,
+            Alert.recipient_user_id.notin_(current_recipient_ids),
+        ).values(status=AlertStatus.READ)
+    )
+    return res.rowcount or 0
+
+
 async def _send_to_recipient(
     db, sub_id: str, alert_type: AlertType, recipient: AlertRecipientSpec,
     user: User, sms_body: str, fcm_title: str, fcm_body: str,

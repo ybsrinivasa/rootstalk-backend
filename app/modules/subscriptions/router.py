@@ -2573,6 +2573,16 @@ async def my_incoming_alerts(
             Alert.recipient_user_id == current_user.id,
             Alert.status == AlertStatus.SENT,
             Subscription.status == SubscriptionStatus.ACTIVE,
+            # 2026-09-18 bug fix — the farmer's own Alert row is
+            # written for internal audit + supersede tracking, not for
+            # promoter/dealer/facilitator consumption. Excluding it
+            # here means a user who wears BOTH the farmer AND the
+            # dealer/facilitator hat (like 9901399939) doesn't see
+            # his own SELF-sub alerts on the dealer alerts-incoming
+            # feed. The FARMER always receives SMS + FCM via the
+            # notification channels — that's the "farmer receiving
+            # an alert" contract.
+            Alert.recipient_user_id != Subscription.farmer_user_id,
         )
         .order_by(Alert.sent_at.desc())
     )).all()
@@ -4141,6 +4151,7 @@ async def set_alert_preferences(
     changed theirs).
     """
     from app.modules.platform.models import UserRole, RoleType, StatusEnum
+    from app.tasks.alerts import supersede_alerts_for_removed_recipients
 
     sub = await _get_subscription(db, subscription_id, current_user.id)
     disabled = bool(data.get("disabled"))
@@ -4152,6 +4163,12 @@ async def set_alert_preferences(
         sub.extra_alert_phone = None
         sub.extra_alert_name = None
         await db.commit()
+        # 2026-09-18 — self-heal stale SENT alerts for recipients no
+        # longer in the resolved set (promoter fallback, previous
+        # extra) so they vanish from those users' alerts-incoming
+        # feeds immediately, not on the next daily beat.
+        await supersede_alerts_for_removed_recipients(db, sub.id)
+        await db.commit()
         return {"detail": "Alert preferences updated"}
 
     sub.alerts_extra_disabled = False
@@ -4160,6 +4177,8 @@ async def set_alert_preferences(
         sub.extra_alert_user_id = None
         sub.extra_alert_phone = None
         sub.extra_alert_name = None
+        await db.commit()
+        await supersede_alerts_for_removed_recipients(db, sub.id)
         await db.commit()
         return {"detail": "Alert preferences updated"}
 
@@ -4205,6 +4224,8 @@ async def set_alert_preferences(
     sub.extra_alert_user_id = target.id
     sub.extra_alert_phone = target.phone
     sub.extra_alert_name = target.name
+    await db.commit()
+    await supersede_alerts_for_removed_recipients(db, sub.id)
     await db.commit()
     return {"detail": "Alert preferences updated"}
 
