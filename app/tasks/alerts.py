@@ -146,39 +146,58 @@ def _start_of_today_utc(today: date) -> datetime:
     return (ist_midnight_naive - ist_offset).replace(tzinfo=timezone.utc)
 
 
-async def _alert_sent_today(db, subscription_id: str, alert_type: AlertType, today: date) -> bool:
-    row = (await db.execute(
-        select(Alert).where(
-            Alert.subscription_id == subscription_id,
-            Alert.alert_type == alert_type,
-            Alert.sent_at >= _start_of_today_utc(today),
-        )
-    )).first()
+async def _alert_sent_today(
+    db, subscription_id: str, alert_type: AlertType, today: date,
+    recipient_user_id: str | None = None,
+) -> bool:
+    """Has an Alert row been written for this (sub, type) today?
+
+    2026-09-18 — `recipient_user_id` optional param scopes the check
+    to a specific recipient. Enables the "new recipient added mid-day"
+    scenario (e.g. farmer just accepted a promoter assignment — the
+    promoter wasn't a recipient during the sync-fire on assign but
+    IS now; needs their own row without the farmer's earlier row
+    blocking it). Called at recipient-level from `_process_subscription`
+    since 2026-09-18; the sub-level call still exists for the
+    legacy "did any fire happen today" question but is not used by
+    the write path any more.
+    """
+    q = select(Alert).where(
+        Alert.subscription_id == subscription_id,
+        Alert.alert_type == alert_type,
+        Alert.sent_at >= _start_of_today_utc(today),
+    )
+    if recipient_user_id is not None:
+        q = q.where(Alert.recipient_user_id == recipient_user_id)
+    row = (await db.execute(q)).first()
     return row is not None
 
 
 async def _supersede_prior_sent(
-    db, subscription_id: str, alert_type: AlertType,
+    db, subscription_id: str, alert_type: AlertType, today: date,
 ) -> int:
-    """Before firing today's alert for this (subscription, type),
-    flip any earlier SENT rows to READ so the recipient sees exactly
-    one pending alert per subscription — not one per day the alert
-    has been firing.
+    """Flip PRIOR-DAY SENT rows on this (sub, type) to READ before
+    today's alert lands. Today's rows are preserved — the per-recipient
+    idempotency check in `_process_subscription` handles same-day
+    double-writes.
 
-    Pre-2026-06-22 the daily task could pile up N rows on the same
-    subscription if the input window stayed open and the farmer hadn't
-    placed every order yet (user report: dealer saw 5 INPUT alerts on
-    DE-26-000002 across 19–22 Jun, all for the same Chilli sub).
-    `clear_input_alerts_if_no_due_remaining` only clears when *all*
-    due practices are ordered; this helper handles the in-between
-    case where the alert is still relevant but yesterday's row is
-    redundant. Audit trail preserved as READ. Returns the rowcount."""
+    2026-06-22 — introduced to fix the day-over-day pile-up bug
+    (dealer saw 5 INPUT alerts on DE-26-000002 across 19–22 Jun).
+    2026-09-18 — added `today` param and the `sent_at < today`
+    predicate so a same-day re-fire (e.g. sync alert after farmer
+    accepts a promoter assignment) doesn't silently supersede the
+    already-SENT recipients' rows. Without this, the second fire
+    would flip everyone's SENT → READ and only the NEW recipient
+    would get a fresh SENT row — existing recipients' alerts would
+    vanish from their feeds without cause. Returns the rowcount.
+    """
     from sqlalchemy import update as sa_update
     res = await db.execute(
         sa_update(Alert).where(
             Alert.subscription_id == subscription_id,
             Alert.alert_type == alert_type,
             Alert.status == AlertStatus.SENT,
+            Alert.sent_at < _start_of_today_utc(today),
         ).values(status=AlertStatus.READ)
     )
     return res.rowcount or 0
@@ -528,14 +547,24 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
     # (project_rootstalk_perennial_rules.md). Until the farmer sets it
     # the START_DATE alert is the only nudge; INPUT advisory isn't
     # renderable for either package type.
-    sd_sent_today = await _alert_sent_today(db, sub.id, AlertType.START_DATE, today)
-    if should_send_start_date_alert(sub_view, sent_today=sd_sent_today):
-        # Newest-only: supersede yesterday's SENT row before writing today's.
-        await _supersede_prior_sent(db, sub.id, AlertType.START_DATE)
+    # 2026-09-18 — per-recipient idempotency. The prior sub-level
+    # `_alert_sent_today` check blocked the "new recipient added
+    # mid-day" case (farmer accepts a promoter assignment → promoter
+    # is now a recipient but the farmer's earlier row silenced the
+    # whole (sub, type) for today, so promoter never got their own
+    # row). Now we supersede prior DAYS' rows once, then iterate
+    # recipients and check per-recipient before writing.
+    if should_send_start_date_alert(sub_view, sent_today=False):
+        await _supersede_prior_sent(db, sub.id, AlertType.START_DATE, today)
         for recipient in recipients:
             user = user_by_id.get(recipient.user_id)
             if not user:
                 continue
+            if await _alert_sent_today(
+                db, sub.id, AlertType.START_DATE, today,
+                recipient_user_id=recipient.user_id,
+            ):
+                continue  # this recipient already has a row today
             crop_loc = pick_translation(
                 crop_translations, user.language_code or "en", "crop",
             )
@@ -599,16 +628,22 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
     # handled (ordered / purchased), clear stale SENT alerts before
     # deciding whether to send today.
     await clear_input_alerts_if_no_due_remaining(db, sub.id, today)
-    in_sent_today = await _alert_sent_today(db, sub.id, AlertType.INPUT, today)
+    # 2026-09-18 — per-recipient idempotency (see START_DATE branch).
+    # Sub-level `sent_today` check gone; per-recipient check happens
+    # inside the recipient loop below. Note: `should_send_input_alert`
+    # still evaluates the "any unhandled practice remains" gate, but
+    # we now pass `sent_today=False` since the same-day-double-write
+    # protection lives in the per-recipient check.
     if not should_send_input_alert(
-        sub_view, due_practice_ids, handled_pids, sent_today=in_sent_today,
+        sub_view, due_practice_ids, handled_pids, sent_today=False,
     ):
         return
 
-    # Newest-only: supersede prior SENT INPUT rows on this sub so the
-    # recipient sees one pending alert per subscription, not one per
-    # firing day. See _supersede_prior_sent for context.
-    await _supersede_prior_sent(db, sub.id, AlertType.INPUT)
+    # Supersede PRIOR-DAY SENT INPUT rows so each recipient sees one
+    # pending alert per sub — not one per firing day. Today's rows
+    # (already SENT to some recipients) are preserved; per-recipient
+    # check below prevents double-writes.
+    await _supersede_prior_sent(db, sub.id, AlertType.INPUT, today)
 
     # Advisory-Only Mode (2026-09-16): use the CTA-neutral variant of
     # both the SMS and FCM body. No in-app order flow to point at;
@@ -646,6 +681,11 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
         user = user_by_id.get(recipient.user_id)
         if not user:
             continue
+        if await _alert_sent_today(
+            db, sub.id, AlertType.INPUT, today,
+            recipient_user_id=recipient.user_id,
+        ):
+            continue  # this recipient already has an INPUT row today
         crop_loc = pick_translation(
             crop_translations, user.language_code or "en", "crop",
         )

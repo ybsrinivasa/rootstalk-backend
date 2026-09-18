@@ -3190,6 +3190,23 @@ async def respond_to_assignment(
             pass
 
     await db.commit()
+    # 2026-09-18 — On accept, sync-fire alerts so the promoter (who
+    # was suppressed on the /promoter/assignments/initiate sync-fire
+    # while assignment was PENDING_FARMER_APPROVAL) receives their
+    # START_DATE alert immediately, not tomorrow at 11:30 IST.
+    # Per-recipient idempotency in `_process_subscription` ensures
+    # the farmer's earlier same-day row is not re-written. Best-
+    # effort — alert failure must not roll back the acceptance.
+    if approved:
+        try:
+            from app.tasks.alerts import send_alerts_now_for_subscription
+            await send_alerts_now_for_subscription(db, subscription_id)
+            await db.commit()
+        except Exception as _e:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                f"Post-acceptance alert fire failed for sub {subscription_id}: {_e}"
+            )
     # 2026-07-16 — Push the promoter so they know how the farmer
     # decided (accept unblocks advisory, reject refunds the unit).
     # Fire-and-forget; skipped silently if promoter hasn't registered
