@@ -25,6 +25,10 @@ class ClientInitiate(BaseModel):
     # NULL → code default 2; explicit 0 → no pre-alert. Only consulted
     # when advisory_only_mode=True.
     input_alert_lead_days: Optional[int] = None
+    # v2 (2026-09-22) — Checkbox 3. Meaningful only when
+    # advisory_only_mode=True. NULL / False = pure Advisory-Only; True
+    # = hybrid (inputs upfront + in-app orders like Regular Mode).
+    in_app_orders_enabled: Optional[bool] = None
 
 
 # ── CA submits their side ──────────────────────────────────────────────────────
@@ -93,6 +97,7 @@ class ClientEdit(BaseModel):
     dealer_list_enabled: Optional[bool] = None
     subscription_fee_paise: Optional[int] = None
     input_alert_lead_days: Optional[int] = None
+    in_app_orders_enabled: Optional[bool] = None
 
 
 class ClientStatusUpdate(BaseModel):
@@ -140,6 +145,7 @@ class ClientOut(BaseModel):
     dealer_list_enabled: bool = False
     subscription_fee_paise: Optional[int] = None
     input_alert_lead_days: Optional[int] = None
+    in_app_orders_enabled: Optional[bool] = None
     status: ClientStatus
     ca_name: str
     ca_phone: str

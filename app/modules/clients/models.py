@@ -158,6 +158,19 @@ class Client(Base):
     input_alert_lead_days: Mapped[int] = mapped_column(
         Integer, nullable=True,
     )
+    # v2 (2026-09-22) — Checkbox 3 "Enable in-app ordering". When True
+    # AND advisory_only_mode=True, farmers on this client get the Order
+    # button + Orders tile back (Regular Mode-style order flow) while
+    # retaining the show-inputs-upfront advisory-only experience.
+    # Alerts and QR product-auth also switch to Regular Mode behaviour
+    # for these subs. NULL / False on non-advisory-only clients is a
+    # no-op (Regular flows always pass through). Snapshot on
+    # Subscription at create so client-level flips don't shift existing
+    # subs' order eligibility. See
+    # project_rootstalk_advisory_only_v2_checkbox3_scoping.md.
+    in_app_orders_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=True,
+    )
     # 2026-07-24 — Training Sandbox V1. When True, this Client is a
     # shadow training child of `parent_client_id` — created by the CA
     # via POST /client/{cid}/training/start, lives for 12 days, then

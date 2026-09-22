@@ -144,6 +144,14 @@ class Subscription(Base):
     input_alert_lead_days: Mapped[int] = mapped_column(
         Integer, nullable=True,
     )
+    # v2 (2026-09-22) — snapshot of Client.in_app_orders_enabled at
+    # create. Only consulted when advisory_only_mode is True (Regular
+    # subs already have in-app orders). NULL / False = pure Advisory-
+    # Only Mode (v1 behaviour, no orders); True = hybrid (Advisory-
+    # Only + in-app orders like Regular).
+    in_app_orders_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=True,
+    )
     # CA Admin test-data cleanup (2026-06-28). NULL = active; non-NULL
     # = soft-deleted at that time. Read paths automatically filter
     # `deleted_at IS NULL` via the session-level event listener in

@@ -323,8 +323,18 @@ async def clear_input_alerts_if_no_due_remaining(
         # daily task (gated on crop_start_date). Nothing to do.
         return 0
 
+    # v2 (2026-09-22 Checkbox 3) — three modes now:
+    #   Regular: !advisory_only_mode → order-only vanish, lead_days=0.
+    #   Pure Advisory-Only: advisory_only_mode AND !in_app_orders_enabled
+    #     → purchased-ack vanish, lead_days from client override.
+    #   Hybrid (Checkbox 3): advisory_only_mode AND in_app_orders_enabled
+    #     → union vanish (order OR purchased-ack), lead_days=0.
+    # Derive `is_pure_advisory_only` once to keep the three gates in
+    # sync (body copy + lead_days + vanish trigger).
     is_advisory_only = bool(getattr(sub, "advisory_only_mode", False))
-    lead_days = _resolve_input_alert_lead_days(sub) if is_advisory_only else 0
+    in_app_orders_on = bool(getattr(sub, "in_app_orders_enabled", False))
+    is_pure_advisory_only = is_advisory_only and not in_app_orders_on
+    lead_days = _resolve_input_alert_lead_days(sub) if is_pure_advisory_only else 0
 
     timelines = await _load_timeline_windows(db, sub.package_id)
     crop_start = sub.crop_start_date.date()
@@ -332,10 +342,17 @@ async def clear_input_alerts_if_no_due_remaining(
     due_pids = find_input_practices_due_today(
         timelines, day_offset, today_date=today_date, lead_days=lead_days,
     )
-    if is_advisory_only:
+    if is_pure_advisory_only:
         handled_pids = await _load_purchased_practice_ids(
             db, subscription_id, today_date,
         )
+    elif is_advisory_only:
+        # Hybrid — union: order-handled OR purchased-ack. Dual signal.
+        order_handled = await _load_active_order_practice_ids(db, subscription_id)
+        ack_handled = await _load_purchased_practice_ids(
+            db, subscription_id, today_date,
+        )
+        handled_pids = order_handled | ack_handled
     else:
         handled_pids = await _load_active_order_practice_ids(db, subscription_id)
     still_outstanding = [p for p in due_pids if p not in handled_pids]
@@ -592,16 +609,17 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
     day_offset = (today - crop_start).days
 
     # Advisory-Only Mode v1.13 (2026-09-18) — pre-window INPUT alerts.
-    # Fire lead_days BEFORE the practice's authored from-edge so a
-    # farmer buying inputs offline has travel + shop-hours lead time.
-    # Regular subs (advisory_only_mode=False) always use lead_days=0
-    # — the alerts engine is byte-identical to the pre-v1.13 behaviour
-    # for them. Advisory-only subs use `sub.input_alert_lead_days`
-    # (client-snapshot at sub-create), defaulting to 2 when NULL.
-    # Explicit 0 disables the pre-alert (matches Regular Mode cadence
-    # for that specific advisory-only sub).
+    # v2 (2026-09-22 Checkbox 3) — three modes:
+    #   Regular: order-only vanish, lead_days=0, standard body.
+    #   Pure Advisory-Only: purchased-ack vanish, client lead_days,
+    #     SOON/TODAY body variants.
+    #   Hybrid: union vanish (order OR ack), lead_days=0, standard body.
+    # `is_pure_advisory_only` derived once to keep body/lead/vanish
+    # in sync across the three sites below.
     is_advisory_only = bool(getattr(sub, "advisory_only_mode", False))
-    lead_days = _resolve_input_alert_lead_days(sub) if is_advisory_only else 0
+    in_app_orders_on = bool(getattr(sub, "in_app_orders_enabled", False))
+    is_pure_advisory_only = is_advisory_only and not in_app_orders_on
+    lead_days = _resolve_input_alert_lead_days(sub) if is_pure_advisory_only else 0
 
     due_practice_ids = find_input_practices_due_today(
         timelines, day_offset, today_date=today, lead_days=lead_days,
@@ -615,13 +633,15 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
         await clear_input_alerts_if_no_due_remaining(db, sub.id, today)
         return
 
-    # v1.13 — vanish-on-ack for advisory-only mode. In advisory-only
-    # there are no orders; the "already handled" signal is the farmer's
-    # own "I've purchased this" ack (v1.8) via PracticeAcknowledgement.
-    # purchased_at. Regular Mode still uses the order pipeline.
+    # Vanish "handled" set per mode. Hybrid unions order pipeline +
+    # farmer ack — either signal counts as handled for this sub.
     handled_pids: set[str]
-    if is_advisory_only:
+    if is_pure_advisory_only:
         handled_pids = await _load_purchased_practice_ids(db, sub.id, today)
+    elif is_advisory_only:
+        order_handled = await _load_active_order_practice_ids(db, sub.id)
+        ack_handled = await _load_purchased_practice_ids(db, sub.id, today)
+        handled_pids = order_handled | ack_handled
     else:
         handled_pids = await _load_active_order_practice_ids(db, sub.id)
     # Even when due practices exist, if every one of them has been
@@ -655,7 +675,11 @@ async def _process_subscription(db, sub: Subscription, today: date) -> None:
     # → "Due for purchase today". Registers the "buy now" urgency
     # instantly on the notification banner without reading the whole
     # line.
-    if is_advisory_only:
+    # v2 (2026-09-22 Checkbox 3): hybrid mode subs use Regular Mode
+    # copy — "Open RootsTalk to place your order" — because the farmer
+    # has the in-app order path available. `is_pure_advisory_only`
+    # (not is_advisory_only) drives the CTA-neutral variant.
+    if is_pure_advisory_only:
         open_now_pids = practice_windows_open_today(
             timelines, day_offset, today_date=today,
         )

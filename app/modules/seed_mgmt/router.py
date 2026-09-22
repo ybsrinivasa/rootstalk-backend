@@ -770,7 +770,9 @@ async def place_seed_order(
     # Advisory-Only Mode (2026-09-16): no in-app seed-order flow.
     # Farmer sees varietal info + how-to-buy contact on their Seed
     # Varieties tile and buys offline.
-    if sub.advisory_only_mode:
+    # v2 (2026-09-22 Checkbox 3): hybrid mode subs get the in-app
+    # seed-order flow back — inputs upfront + Regular Mode ordering.
+    if sub.advisory_only_mode and not sub.in_app_orders_enabled:
         raise HTTPException(
             status_code=403,
             detail={

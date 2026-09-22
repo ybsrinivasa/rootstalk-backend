@@ -1832,6 +1832,7 @@ async def create_subscription(
         dealer_list_enabled=bool(_client_for_snapshot and _client_for_snapshot.dealer_list_enabled),
         subscription_fee_paise=(_client_for_snapshot.subscription_fee_paise if _client_for_snapshot else None),
         input_alert_lead_days=(_client_for_snapshot.input_alert_lead_days if _client_for_snapshot else None),
+        in_app_orders_enabled=(bool(_client_for_snapshot.in_app_orders_enabled) if (_client_for_snapshot and _client_for_snapshot.in_app_orders_enabled is not None) else None),
     )
     db.add(sub)
     await db.flush()
@@ -2385,6 +2386,7 @@ async def initiate_assignment(
         dealer_list_enabled=bool(_client_for_snapshot and _client_for_snapshot.dealer_list_enabled),
         subscription_fee_paise=(_client_for_snapshot.subscription_fee_paise if _client_for_snapshot else None),
         input_alert_lead_days=(_client_for_snapshot.input_alert_lead_days if _client_for_snapshot else None),
+        in_app_orders_enabled=(bool(_client_for_snapshot.in_app_orders_enabled) if (_client_for_snapshot and _client_for_snapshot.in_app_orders_enabled is not None) else None),
     )
     # Only persist + stamp _confirmed_at when the caller actually
     # provided the measure. Neither branch is the new default — the
@@ -4875,6 +4877,8 @@ async def my_subscriptions(
             # read live for this render.
             "advisory_only_mode": bool(s.advisory_only_mode),
             "dealer_list_enabled": bool(s.dealer_list_enabled),
+            # v2 (2026-09-22 Checkbox 3) — hybrid mode flag.
+            "in_app_orders_enabled": bool(s.in_app_orders_enabled) if s.in_app_orders_enabled is not None else False,
         })
     return out
 
@@ -5184,6 +5188,7 @@ async def get_advisory_cluster(
             "reference_number": sub.reference_number,
             "advisory_only_mode": bool(sub.advisory_only_mode),
             "dealer_list_enabled": bool(sub.dealer_list_enabled),
+            "in_app_orders_enabled": bool(sub.in_app_orders_enabled) if sub.in_app_orders_enabled is not None else False,
         }
 
     if not clusters:
@@ -5441,7 +5446,50 @@ async def unpurchase_practice(
 ):
     """Advisory-Only Mode (v1.8) — farmer un-marks purchase. Also
     un-marks 'done' since you can't have applied what you haven't
-    bought."""
+    bought.
+
+    v2 (2026-09-22 Checkbox 3) — if the practice has an APPROVED
+    OrderItem on a received PackingList (`farmer_received_at` set),
+    refuse the unpurchase. Once the input is physically in the
+    farmer's hands via the in-app order flow, the "I've purchased
+    this" state is a hard truth — cannot be flipped off. The PWA
+    disables the checkbox for these practices, so this backend
+    guard is defence-in-depth for stale clients / direct API
+    calls.
+    """
+    # Check if the practice is locked by a received in-app order
+    # before letting the ack change.
+    from app.modules.orders.models import Order, OrderItem, PackingList
+    from sqlalchemy import and_ as sa_and, func as sa_func
+    received_row = (await db.execute(
+        select(OrderItem.id)
+        .join(Order, Order.id == OrderItem.order_id)
+        .outerjoin(
+            PackingList,
+            sa_and(
+                PackingList.order_id == Order.id,
+                sa_func.coalesce(PackingList.approval_round, 1)
+                    == sa_func.coalesce(OrderItem.approval_round, 1),
+            ),
+        )
+        .where(
+            Order.subscription_id == body.subscription_id,
+            OrderItem.practice_id == body.practice_id,
+            OrderItem.status == "APPROVED",
+            PackingList.farmer_received_at.is_not(None),
+        )
+    )).first()
+    if received_row is not None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "unpurchase_locked_by_order",
+                "message": (
+                    "This input was received via an in-app order and "
+                    "cannot be marked un-purchased."
+                ),
+            },
+        )
     return await _upsert_practice_ack(db, current_user.id, body, "unpurchase")
 
 
@@ -6342,6 +6390,28 @@ async def _today_advisory_for_user(
             .order_by(OrderItem.updated_at.desc())
         )
         active_items_rows = active_items_q.all()
+        # v2 (2026-09-22 Checkbox 3) — "purchase locked by order" set.
+        # A practice is `purchase_locked_by_order` when it has at least
+        # one APPROVED OrderItem whose PackingList row carries a non-
+        # NULL `farmer_received_at`. Same predicate every report uses
+        # for "sale marker." Once received, the "I've purchased this"
+        # checkbox on the advisory-only + hybrid PWA auto-ticks and
+        # locks (farmer cannot untick). Derived from the same rows we
+        # already loaded — no extra query. Applies to Regular Mode
+        # subs too but the PWA only reads the flag in advisory-only
+        # (in Regular Mode the checkbox itself isn't rendered).
+        purchase_locked_practice_ids: set[str] = set()
+        for _it, _ord, _pl in active_items_rows:
+            if not _it.practice_id:
+                continue
+            _status_str = (
+                _it.status.value if hasattr(_it.status, "value") else _it.status
+            )
+            if _status_str != "APPROVED":
+                continue
+            if _pl is not None and _pl.farmer_received_at is not None:
+                purchase_locked_practice_ids.add(_it.practice_id)
+
         # 2026-06-06 — Manufacturer lookup batched for the advisory
         # render so APPROVED practice cards can display "Brand · by
         # Manufacturer" without per-practice round-trips. Source =
@@ -7000,6 +7070,15 @@ async def _today_advisory_for_user(
                         locked_mfr_name_by_id.get(_locked_brand_ref)
                         if _locked_brand_ref else None
                     ),
+                    # v2 (2026-09-22 Checkbox 3) — auto-tick + lock the
+                    # "I've purchased this" checkbox once the item has
+                    # been physically received via an in-app order
+                    # (PackingList.farmer_received_at set). Once True,
+                    # the PWA renders the checkbox as ticked + disabled;
+                    # the unpurchase endpoint refuses to clear the ack.
+                    "purchase_locked_by_order": (
+                        p.id in purchase_locked_practice_ids
+                    ),
                 })
             tl_entry: dict = {
                 "id": tl.id,
@@ -7087,6 +7166,12 @@ async def _today_advisory_for_user(
             # filter without a second API call.
             "advisory_only_mode": bool(sub.advisory_only_mode),
             "dealer_list_enabled": bool(sub.dealer_list_enabled),
+            # v2 (2026-09-22 Checkbox 3) — hybrid mode marker. When
+            # True (only meaningful alongside advisory_only_mode=True),
+            # the PWA re-enables the Order button on PracticeCard and
+            # the Orders tile on Crop Dashboard while keeping the
+            # inputs-shown-upfront layout of pure Advisory-Only.
+            "in_app_orders_enabled": bool(sub.in_app_orders_enabled) if sub.in_app_orders_enabled is not None else False,
             "timelines": timeline_data,
         })
 

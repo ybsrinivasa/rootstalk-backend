@@ -241,7 +241,11 @@ async def create_order(
     # subs. UI hides all order-placement CTAs across CCA / CHA / Q&A /
     # Pundit surfaces; this backend guard is the defence-in-depth catch
     # for any direct API call that slips past.
-    if sub.advisory_only_mode:
+    # v2 (2026-09-22 Checkbox 3): when the sub's client has opted into
+    # `in_app_orders_enabled`, the block lifts — hybrid mode farmers
+    # get the full Regular Mode order flow while retaining the
+    # inputs-shown-upfront advisory-only experience.
+    if sub.advisory_only_mode and not sub.in_app_orders_enabled:
         raise HTTPException(
             status_code=403,
             detail={
@@ -2503,7 +2507,11 @@ async def create_dbs_bulk_order(
     # subs. UI hides all order-placement CTAs across CCA / CHA / Q&A /
     # Pundit surfaces; this backend guard is the defence-in-depth catch
     # for any direct API call that slips past.
-    if sub.advisory_only_mode:
+    # v2 (2026-09-22 Checkbox 3): when the sub's client has opted into
+    # `in_app_orders_enabled`, the block lifts — hybrid mode farmers
+    # get the full Regular Mode order flow while retaining the
+    # inputs-shown-upfront advisory-only experience.
+    if sub.advisory_only_mode and not sub.in_app_orders_enabled:
         raise HTTPException(
             status_code=403,
             detail={

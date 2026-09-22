@@ -357,6 +357,7 @@ async def initiate_onboarding(
         dealer_list_enabled=request.dealer_list_enabled,
         subscription_fee_paise=request.subscription_fee_paise,
         input_alert_lead_days=request.input_alert_lead_days,
+        in_app_orders_enabled=request.in_app_orders_enabled,
     )
     db.add(client)
     await db.commit()
@@ -1060,6 +1061,7 @@ async def get_client_info_by_id(
         "dealer_list_enabled": bool(client.dealer_list_enabled),
         "subscription_fee_paise": client.subscription_fee_paise,
         "input_alert_lead_days": client.input_alert_lead_days,
+        "in_app_orders_enabled": bool(client.in_app_orders_enabled) if client.in_app_orders_enabled is not None else False,
     }
 
 
