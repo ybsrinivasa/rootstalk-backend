@@ -7191,6 +7191,7 @@ async def _today_advisory_for_user(
                         purchased_mfr_name_by_id.get(ack.purchased_brand_cosh_id)
                         if (ack and ack.purchased_brand_cosh_id) else None
                     ),
+                    "purchased_brand_cosh_id": (ack.purchased_brand_cosh_id if ack else None),
                     "purchased_brand_text": (ack.purchased_brand_text if ack else None),
                     "purchased_photo_url": (ack.purchased_photo_url if ack else None),
                 })
