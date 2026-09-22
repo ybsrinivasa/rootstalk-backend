@@ -707,6 +707,24 @@ class PracticeAcknowledgement(Base):
     purchased_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )
+    # v2 Checkbox 3 follow-up (2026-09-22) — capture the actual brand
+    # the farmer bought when they tap "I've purchased this". Prevents
+    # the mis-attribution when the SE authored a recommended brand
+    # (non-locked) but the farmer bought a different one of the same
+    # Common Name / AI / Formulation. Cosh-catalog picks go into
+    # `purchased_brand_cosh_id`; free-text "Other" picks go into
+    # `purchased_brand_text` (a MissingBrandReport is written
+    # alongside so SA can close the catalog gap). Photo is optional
+    # ground truth via /media/upload?folder=purchase-photos.
+    purchased_brand_cosh_id: Mapped[str | None] = mapped_column(
+        String(100), nullable=True,
+    )
+    purchased_brand_text: Mapped[str | None] = mapped_column(
+        String(500), nullable=True,
+    )
+    purchased_photo_url: Mapped[str | None] = mapped_column(
+        String(1000), nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow,
     )

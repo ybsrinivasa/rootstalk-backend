@@ -5298,6 +5298,14 @@ class _PracticeAckBody(BaseModel):
     timeline_lineage_id: str
     practice_id: str
     occurrence_date: date
+    # v2 Checkbox 3 follow-up (2026-09-22) — brand + photo captured on
+    # purchase acks. Ignored by non-purchase actions. Only one of
+    # `purchased_brand_cosh_id` (Cosh-catalog pick) or
+    # `purchased_brand_text` (Other typing) should be set; the free-
+    # text path also writes a MissingBrandReport for SA follow-up.
+    purchased_brand_cosh_id: Optional[str] = None
+    purchased_brand_text: Optional[str] = None
+    purchased_photo_url: Optional[str] = None
 
 
 async def _upsert_practice_ack(
@@ -5358,12 +5366,24 @@ async def _upsert_practice_ack(
     # 2026-09-17 (v1.8) — Advisory-Only two-stage ack.
     elif action == "purchase":
         ack.purchased_at = now
+        # v2 Checkbox 3 follow-up (2026-09-22) — capture the brand
+        # (and optional photo) the farmer actually bought. Only one
+        # of cosh_id / text should be set; endpoint enforces this.
+        ack.purchased_brand_cosh_id = body.purchased_brand_cosh_id
+        ack.purchased_brand_text = body.purchased_brand_text
+        ack.purchased_photo_url = body.purchased_photo_url
     elif action == "unpurchase":
         ack.purchased_at = None
         # Un-marking purchase also un-marks done — you can't be "done"
         # with an input you no longer say you bought. Keeps the state
         # machine coherent.
         ack.marked_at = None
+        # v2 (2026-09-22) — clear the captured brand + photo so a fresh
+        # purchase re-opens the picker (matches the farmer's mental
+        # model: un-tick = start over on this practice).
+        ack.purchased_brand_cosh_id = None
+        ack.purchased_brand_text = None
+        ack.purchased_photo_url = None
     else:
         raise HTTPException(status_code=400, detail=f"Unknown action: {action}")
 
@@ -5423,8 +5443,48 @@ async def purchase_practice(
     "already handled" signal for advisory-only subs). Mirrors the
     order-create → alert-clear path in Regular Mode. Best-effort — a
     failure to clear the alert must never roll back the ack.
+
+    v2 Checkbox 3 follow-up (2026-09-22) — brand + optional photo
+    captured on purchase. Enforces one-of (cosh_id / text) so the
+    payload has a single source of truth. Free-text 'Other' path
+    also writes a MissingBrandReport (source=FARMER) so SA can close
+    the catalog gap.
     """
+    # Invariant: exactly zero-or-one of the two brand fields.
+    if body.purchased_brand_cosh_id and body.purchased_brand_text:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "brand_ambiguous",
+                "message": (
+                    "Pick either a catalog brand OR type an Other brand — "
+                    "not both."
+                ),
+            },
+        )
     result = await _upsert_practice_ack(db, current_user.id, body, "purchase")
+
+    # Free-text brand path → open a MissingBrandReport so SA can add
+    # the brand to Cosh (or link it to an existing catalog row). Same
+    # table used by the dealer-side brand-form flow (2026-07-04);
+    # source='FARMER' distinguishes the origin.
+    if body.purchased_brand_text and (body.purchased_brand_text or "").strip():
+        try:
+            from app.modules.orders.models import MissingBrandReport
+            report = MissingBrandReport(
+                dealer_user_id=current_user.id,
+                brand_name_reported=body.purchased_brand_text.strip(),
+                photos=[body.purchased_photo_url] if body.purchased_photo_url else [],
+                source="FARMER",
+            )
+            db.add(report)
+            await db.commit()
+        except Exception as _e:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                f"MissingBrandReport (farmer) write failed: {_e}"
+            )
+
     try:
         from app.tasks.alerts import clear_input_alerts_if_no_due_remaining
         cleared = await clear_input_alerts_if_no_due_remaining(db, body.subscription_id)
@@ -6800,6 +6860,41 @@ async def _today_advisory_for_user(
                         mfr_tr or {}, lang, mfr_en,
                     )
 
+        # v2 Checkbox 3 follow-up (2026-09-22) — parallel batch for
+        # brand names the FARMER themselves recorded on the purchase
+        # ack (via the picker's Cosh-catalog pick). Not the same as
+        # the SE-authored brand — this is what the farmer actually
+        # bought. Feeds the "Purchased: {brand} by {manufacturer}"
+        # display on the practice card once ack'd. Free-text picks
+        # are exposed directly from ack.purchased_brand_text (no
+        # BrandLookupCache lookup needed).
+        purchased_brand_ids: set[str] = {
+            a.purchased_brand_cosh_id
+            for a in ack_rows
+            if a.purchased_brand_cosh_id
+        }
+        purchased_brand_name_by_id: dict[str, str | None] = {}
+        purchased_mfr_name_by_id: dict[str, str | None] = {}
+        if purchased_brand_ids:
+            pb_rows = (await db.execute(
+                select(
+                    BrandLookupCache.trade_name_cosh_id,
+                    BrandLookupCache.trade_name,
+                    BrandLookupCache.trade_name_translations,
+                    BrandLookupCache.manufacturer_name,
+                    BrandLookupCache.manufacturer_translations,
+                ).where(BrandLookupCache.trade_name_cosh_id.in_(purchased_brand_ids))
+            )).all()
+            for tn_id, tn_en, tn_tr, mfr_en, mfr_tr in pb_rows:
+                if tn_id not in purchased_brand_name_by_id and tn_en:
+                    purchased_brand_name_by_id[tn_id] = pick_translation(
+                        tn_tr or {}, lang, tn_en,
+                    )
+                if tn_id not in purchased_mfr_name_by_id and mfr_en:
+                    purchased_mfr_name_by_id[tn_id] = pick_translation(
+                        mfr_tr or {}, lang, mfr_en,
+                    )
+
         # 2026-06-29 — Phase 1 window absorption.
         # When BL-03 marks a TL as fully absorbed by another TL (every
         # practice it had got suppressed by matches in the same other
@@ -7079,6 +7174,25 @@ async def _today_advisory_for_user(
                     "purchase_locked_by_order": (
                         p.id in purchase_locked_practice_ids
                     ),
+                    # v2 Checkbox 3 follow-up (2026-09-22) — the brand
+                    # (and optional photo) the farmer recorded on this
+                    # ack. Cosh-catalog picks come with resolved
+                    # display names from BrandLookupCache; free-text
+                    # picks come through as `purchased_brand_text`.
+                    # Both are NULL when no ack has been recorded or
+                    # the ack has no brand attached (legacy pre-v2
+                    # rows). The PWA card renders "Purchased: {brand}
+                    # by {manufacturer}" when set.
+                    "purchased_brand_name": (
+                        purchased_brand_name_by_id.get(ack.purchased_brand_cosh_id)
+                        if (ack and ack.purchased_brand_cosh_id) else None
+                    ),
+                    "purchased_brand_manufacturer_name": (
+                        purchased_mfr_name_by_id.get(ack.purchased_brand_cosh_id)
+                        if (ack and ack.purchased_brand_cosh_id) else None
+                    ),
+                    "purchased_brand_text": (ack.purchased_brand_text if ack else None),
+                    "purchased_photo_url": (ack.purchased_photo_url if ack else None),
                 })
             tl_entry: dict = {
                 "id": tl.id,
@@ -7719,7 +7833,14 @@ async def get_practice_brands_farmer(
     flat = []
     for grp in (result.group_recommended, result.group_my, result.group_other):
         for opt in (grp or []):
-            flat.append({"name": opt.name, "manufacturer": opt.manufacturer})
+            # v2 (2026-09-22) — cosh_id added so the purchase-brand
+            # picker can record `purchased_brand_cosh_id` on the ack.
+            # Existing readers ignore the extra field (JSON additive).
+            flat.append({
+                "cosh_id": opt.cosh_id,
+                "name": opt.name,
+                "manufacturer": opt.manufacturer,
+            })
     # Sort alphabetically by brand name for a stable, unbiased order.
     flat.sort(key=lambda b: (b["name"] or "").lower())
     # v1.9.2 (2026-09-17) — resolve the practice's chemistry pieces
@@ -7730,11 +7851,46 @@ async def get_practice_brands_farmer(
     chemistry = await _resolve_practice_chemistry(
         db, practice_id, current_user.language_code or "en",
     )
+    # v2 Checkbox 3 follow-up (2026-09-22) — resolve the SE's
+    # recommended brand (BRAND_NAME element on the practice, when
+    # present and non-locked) so the Brands screen can highlight it
+    # at the top ("Recommended by [Client]: [Brand] by [Manufacturer]").
+    # Frontend uses the same info to power the "not locked, may
+    # substitute" note.
+    from app.modules.advisory.models import Element
+    from app.modules.orders.models import BrandLookupCache
+    from app.services.i18n_cosh import pick_translation
+    brand_el = (await db.execute(
+        select(Element).where(
+            Element.practice_id == practice_id,
+            Element.element_type == "BRAND_NAME",
+        )
+    )).scalars().first()
+    recommended_brand_name: str | None = None
+    recommended_manufacturer_name: str | None = None
+    if brand_el and brand_el.cosh_ref:
+        lang = current_user.language_code or "en"
+        row = (await db.execute(
+            select(
+                BrandLookupCache.trade_name,
+                BrandLookupCache.trade_name_translations,
+                BrandLookupCache.manufacturer_name,
+                BrandLookupCache.manufacturer_translations,
+            ).where(BrandLookupCache.trade_name_cosh_id == brand_el.cosh_ref)
+        )).first()
+        if row:
+            tn_en, tn_tr, mfr_en, mfr_tr = row
+            if tn_en:
+                recommended_brand_name = pick_translation(tn_tr or {}, lang, tn_en)
+            if mfr_en:
+                recommended_manufacturer_name = pick_translation(mfr_tr or {}, lang, mfr_en)
     return {
         "is_locked": False,
         "locked_brand_name": None,
         "brands": flat,
         "client_name": client_name,
+        "recommended_brand_name": recommended_brand_name,
+        "recommended_manufacturer_name": recommended_manufacturer_name,
         **chemistry,
     }
 

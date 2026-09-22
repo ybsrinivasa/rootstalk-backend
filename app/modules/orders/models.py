@@ -557,5 +557,13 @@ class MissingBrandReport(Base):
     reviewed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )
+    # v2 Checkbox 3 follow-up (2026-09-22) — distinguishes DEALER
+    # submissions (existing dealer brand-form flow + order-context
+    # picker) from FARMER submissions (advisory-only picker's "Other"
+    # typing path). Backfilled to 'DEALER' on upgrade for existing
+    # rows. SA queue can filter / sort by this.
+    source: Mapped[str | None] = mapped_column(
+        String(20), nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
