@@ -1642,16 +1642,32 @@ async def add_portal_user(
     await db.commit()
     await db.refresh(cu)
 
-    if is_new_user and settings.email_smtp_user:
+    # 2026-09-24: also email the existing-user case (a new role added
+    # on top of an existing account). Previously only the new-user
+    # branch was wired, so an SE promoted to FM (or any similar
+    # role-add) had no email trail — they only found out on their next
+    # login, if at all. Password NOT included in the role-added email
+    # since the user's already got one.
+    if settings.email_smtp_user:
         login_url = f"{_base_url()}/login/{client.short_name}"
-        await send_portal_user_welcome_email(
-            email=user.email,
-            name=user.name,
-            company_name=client.full_name,
-            login_url=login_url,
-            password=request.password,
-            role_value=cu.role.value,
-        )
+        if is_new_user:
+            await send_portal_user_welcome_email(
+                email=user.email,
+                name=user.name,
+                company_name=client.full_name,
+                login_url=login_url,
+                password=request.password,
+                role_value=cu.role.value,
+            )
+        else:
+            from app.modules.clients.service import send_portal_role_added_email
+            await send_portal_role_added_email(
+                email=user.email,
+                name=user.name,
+                company_name=client.full_name,
+                login_url=login_url,
+                role_value=cu.role.value,
+            )
 
     return PortalUserOut(
         id=user.id,

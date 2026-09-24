@@ -140,6 +140,51 @@ RootsTalk — Neytiri Eywafarm Agritech"""
     _send_email(email, subject, html, plain)
 
 
+async def send_portal_role_added_email(
+    *, email: str, name: str | None, company_name: str,
+    login_url: str, role_value: str,
+):
+    """Email an existing portal user when a NEW role has been added
+    to their account at a client.
+
+    Distinct from `send_portal_user_welcome_email` (that one includes
+    the initial password because it's a brand-new account). This one
+    is sent when the user already has an account here — a CA added
+    another role on top. No password disclosure; the user logs in
+    with their existing credentials.
+
+    Added 2026-09-24 — previously the add_portal_user endpoint sent
+    NO email in the existing-user case, so an SE promoted to FM (or
+    similar) had no way of knowing until they happened to log in.
+    """
+    role_display = humanize_client_user_role(role_value)
+    subject = f"New role added — {company_name}"
+    plain = f"""Hi {name or ''},
+
+You have been given the {role_display} role at {company_name} on RootsTalk.
+
+Login URL: {login_url}
+Email: {email}
+Role added: {role_display}
+
+Sign in with your existing password to use the new role.
+
+RootsTalk — Neytiri Eywafarm Agritech"""
+    html = f"""
+<body style="font-family:sans-serif;padding:32px">
+  <h2>New role added on RootsTalk</h2>
+  <p>Hi {name or ''},</p>
+  <p>You have been given the <strong>{role_display}</strong> role at <strong>{company_name}</strong>.</p>
+  <table style="background:#f8fafc;border-radius:8px;padding:16px;margin:16px 0">
+    <tr><td><strong>Login URL:</strong></td><td><a href="{login_url}">{login_url}</a></td></tr>
+    <tr><td><strong>Email:</strong></td><td>{email}</td></tr>
+    <tr><td><strong>Role added:</strong></td><td>{role_display}</td></tr>
+  </table>
+  <p style="color:#666;font-size:12px">Sign in with your existing password to use the new role.</p>
+</body>"""
+    _send_email(email, subject, html, plain)
+
+
 async def send_ca_credentials_email(
     ca_email: str, ca_name: str, login_url: str, password: str,
 ):

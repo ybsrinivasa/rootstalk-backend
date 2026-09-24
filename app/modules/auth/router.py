@@ -65,13 +65,19 @@ async def _check_client_user(db: AsyncSession, user: User, short_name: str) -> C
     )).scalar_one_or_none()
     if not client:
         raise HTTPException(status_code=403, detail="This company account is inactive or not found")
+    # 2026-09-24: `.scalars().first()` — a user may hold MULTIPLE
+    # ACTIVE ClientUser rows in the same client (multi-role: SE + FM
+    # + SDM for example). `.scalar_one_or_none()` crashed with
+    # MultipleResultsFound in that case, locking multi-role portal
+    # users out of login entirely. Same fix pattern already applied
+    # to /auth/me at line ~610.
     cu = (await db.execute(
         select(ClientUser).where(
             ClientUser.client_id == client.id,
             ClientUser.user_id == user.id,
             ClientUser.status == StatusEnum.ACTIVE,
         )
-    )).scalar_one_or_none()
+    )).scalars().first()
     if not cu:
         raise HTTPException(status_code=401, detail="This email is not registered with this company")
     # 2026-09-01 — Coaching Sandbox lockout: if this workspace is a
