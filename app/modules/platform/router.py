@@ -192,25 +192,47 @@ async def create_neytiri_user(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """SA: create a CM, RM, or BM user. Sends credentials by email."""
+    """SA: create a CM / RM / BM / COACH user. Sends credentials by
+    email. COACH may be assigned alone or in combination with any of
+    the other three roles (non-exclusive by design)."""
     if not data.get("email"):
         raise HTTPException(status_code=422, detail="email is required")
     roles = data.get("roles", [])
+    # Defensive: some clients may send a single-role string instead of
+    # a list of one. Normalise to a list before validating.
+    if isinstance(roles, str):
+        roles = [roles]
     if not roles:
         raise HTTPException(status_code=422, detail="at least one role required")
 
     valid_roles = [r for r in roles if r in [t.value for t in NEYTIRI_ROLES]]
     if not valid_roles:
-        raise HTTPException(status_code=422, detail="roles must be CM, RM, or BM")
+        raise HTTPException(
+            status_code=422,
+            detail="roles must be one of CONTENT_MANAGER, RELATIONSHIP_MANAGER, BUSINESS_MANAGER, COACH",
+        )
 
     existing = (await db.execute(select(User).where(User.email == data["email"]))).scalar_one_or_none()
     if existing:
         raise HTTPException(status_code=409, detail="A user with this email already exists")
 
+    # 2026-09-24: normalise empty-string phone to NULL. The SA UI form
+    # initialises `phone: ''` and sends "" when the field is left
+    # blank. User.phone is `unique=True`, and Postgres treats "" as a
+    # distinct string (not NULL) — so the SECOND user created without
+    # a phone would hit an IntegrityError on the empty-string phone.
+    # NULL values are exempt from the unique constraint, so casting
+    # "" → NULL lets multiple users be created without a phone
+    # (typical for Coach-only accounts that don't need SMS access).
+    phone_raw = data.get("phone")
+    phone_normalised = phone_raw.strip() if isinstance(phone_raw, str) else phone_raw
+    if phone_normalised == "":
+        phone_normalised = None
+
     temp_password = secrets.token_urlsafe(10)
     user = User(
         name=data.get("name"),
-        phone=data.get("phone"),
+        phone=phone_normalised,
         email=data["email"],
         password_hash=hash_password(temp_password),
         language_code="en",
