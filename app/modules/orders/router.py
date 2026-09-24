@@ -8203,6 +8203,13 @@ async def list_missing_brand_reports(
             "dealer_user_id": r.dealer_user_id,
             "dealer_name": u.name if u else None,
             "dealer_phone": u.phone if u else None,
+            # 2026-09-24: expose the source (DEALER | FARMER) so the SA
+            # UI can badge each report and adapt copy (placeholder,
+            # header text) — critical since the "Other" path on the
+            # farmer purchase-ack now writes reports with source=FARMER
+            # (v2 Checkbox 3 arc). Column has been present + backfilled
+            # DEALER for legacy rows since c8b4d7f2e691.
+            "source": r.source.value if hasattr(r.source, "value") else r.source,
             "order_item_id": r.order_item_id,
             "brand_name_reported": r.brand_name_reported,
             "manufacturer_name": r.manufacturer_name,
