@@ -62,7 +62,13 @@ class TimelineValidationError(Exception):
 def validate_timeline_direction(
     *, from_type: str, from_value: int, to_value: int,
 ) -> None:
-    """DBS: from > to. DAS / CALENDAR: to > from."""
+    """DBS: from > to. DAS: to > from. CALENDAR: to >= from.
+
+    DAS/DBS use HALF-OPEN semantics — `from == to` is a zero-day
+    window and is rejected. CALENDAR stays SE-inclusive at the
+    interface (the SE picks actual day-of-year values and "day 200"
+    is included), so `from == to` is a valid single-day TL.
+    """
     if from_type == FROM_TYPE_DBS:
         if to_value >= from_value:
             raise TimelineValidationError(
@@ -70,12 +76,19 @@ def validate_timeline_direction(
                 f"DBS timeline: from_value ({from_value}) must be greater "
                 f"than to_value ({to_value}).",
             )
-    else:
+    elif from_type == FROM_TYPE_DAS:
         if to_value <= from_value:
             raise TimelineValidationError(
                 "timeline_invalid_direction",
-                f"{from_type} timeline: to_value ({to_value}) must be "
+                f"DAS timeline: to_value ({to_value}) must be "
                 f"greater than from_value ({from_value}).",
+            )
+    else:  # CALENDAR
+        if to_value < from_value:
+            raise TimelineValidationError(
+                "timeline_invalid_direction",
+                f"CALENDAR timeline: to_value ({to_value}) must be "
+                f"greater than or equal to from_value ({from_value}).",
             )
 
 

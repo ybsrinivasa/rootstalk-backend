@@ -22,8 +22,10 @@ def test_dbs_direction_from_greater_than_to_passes():
     validate_timeline_direction(from_type="DBS", from_value=15, to_value=8)
 
 
-def test_dbs_direction_from_equal_to_to_fails():
-    """Equal counts as same day; not enough range."""
+def test_dbs_zero_day_window_rejected():
+    """2026-09-25 — half-open DBS: from==to would render nothing.
+    Explicitly named around the zero-day-window concept so a future
+    refactor of the direction rule can't silently allow it."""
     with pytest.raises(TimelineValidationError) as ei:
         validate_timeline_direction(from_type="DBS", from_value=8, to_value=8)
     assert ei.value.code == "timeline_invalid_direction"
@@ -41,7 +43,10 @@ def test_das_direction_to_greater_than_from_passes():
     validate_timeline_direction(from_type="DAS", from_value=0, to_value=8)
 
 
-def test_das_direction_to_equal_to_from_fails():
+def test_das_zero_day_window_rejected():
+    """2026-09-25 — half-open DAS: "3 to 3" renders nothing.
+    Explicitly named around the zero-day-window concept so a future
+    refactor of the direction rule can't silently allow it."""
     with pytest.raises(TimelineValidationError) as ei:
         validate_timeline_direction(from_type="DAS", from_value=5, to_value=5)
     assert ei.value.code == "timeline_invalid_direction"
@@ -53,10 +58,21 @@ def test_das_direction_to_less_than_from_fails():
     assert ei.value.code == "timeline_invalid_direction"
 
 
-def test_calendar_direction_uses_das_rule():
-    """CALENDAR follows the DAS rule (to > from): values are
-    day-of-year ints, time moves forward."""
+def test_calendar_direction_from_less_than_to_passes():
+    """CALENDAR values are day-of-year ints; time moves forward."""
     validate_timeline_direction(from_type="CALENDAR", from_value=10, to_value=50)
+
+
+def test_calendar_direction_same_day_passes():
+    """2026-09-25 — CALENDAR stays SE-inclusive at the interface
+    (the SE picks actual dates; "day 200" is included). A same-day
+    CALENDAR TL is a legitimate single-day event (spray day,
+    festival) and must be allowed."""
+    validate_timeline_direction(from_type="CALENDAR", from_value=200, to_value=200)
+
+
+def test_calendar_direction_from_greater_than_to_fails():
+    """Reverse ranges on the calendar year are still rejected."""
     with pytest.raises(TimelineValidationError):
         validate_timeline_direction(from_type="CALENDAR", from_value=50, to_value=10)
 
