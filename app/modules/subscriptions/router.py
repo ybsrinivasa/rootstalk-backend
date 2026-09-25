@@ -6461,6 +6461,17 @@ async def _today_advisory_for_user(
         # subs too but the PWA only reads the flag in advisory-only
         # (in Regular Mode the checkbox itself isn't rendered).
         purchase_locked_practice_ids: set[str] = set()
+        # 2026-09-25: also capture the OrderItem's brand for each
+        # auto-received practice so the advisory card can render
+        # "Purchased: {brand}" without the farmer having to re-enter
+        # it via the Brands screen. Applies to any in-app order (both
+        # direct-dealer and facilitator-routed) once the packing list
+        # is picked up. Manual ack brand still takes precedence when
+        # set — farmer's own record wins over the dealer's mediated
+        # brand, so a farmer who bought offline + ack'd manually keeps
+        # what they recorded even if a later in-app receipt covers
+        # the same practice.
+        received_brand_by_practice_id: dict[str, str] = {}
         for _it, _ord, _pl in active_items_rows:
             if not _it.practice_id:
                 continue
@@ -6471,6 +6482,8 @@ async def _today_advisory_for_user(
                 continue
             if _pl is not None and _pl.farmer_received_at is not None:
                 purchase_locked_practice_ids.add(_it.practice_id)
+                if _it.brand_cosh_id and _it.practice_id not in received_brand_by_practice_id:
+                    received_brand_by_practice_id[_it.practice_id] = _it.brand_cosh_id
 
         # 2026-06-06 — Manufacturer lookup batched for the advisory
         # render so APPROVED practice cards can display "Brand · by
@@ -7124,6 +7137,16 @@ async def _today_advisory_for_user(
                     continue  # farmer "deleted" — invisible to them
                 ack_status = "MARKED" if (ack and ack.marked_at is not None) else "ACTIVE"
                 _locked_brand_ref = locked_brand_raw_by_practice.get(p.id)
+                # 2026-09-25: effective purchased-brand cosh_id — manual
+                # ack takes precedence when set, else fall back to the
+                # brand from the received in-app order (populated via
+                # `received_brand_by_practice_id` above). Powers the
+                # auto-capture of "Purchased: {brand}" on the advisory
+                # card without a manual Brands-screen trip.
+                _effective_purchased_brand = (
+                    (ack.purchased_brand_cosh_id if ack else None)
+                    or received_brand_by_practice_id.get(p.id)
+                )
                 tl_practices_out.append({
                     "id": p.id, "l0_type": p.l0_type,
                     "l1_type": p.l1_type, "l2_type": p.l2_type,
@@ -7183,15 +7206,23 @@ async def _today_advisory_for_user(
                     # the ack has no brand attached (legacy pre-v2
                     # rows). The PWA card renders "Purchased: {brand}
                     # by {manufacturer}" when set.
+                    # Name + manufacturer resolved from BOTH the manual-
+                    # ack batch (`purchased_brand_name_by_id`) AND the
+                    # order-brand batch (`brand_loc` / `manufacturer_by_
+                    # brand`, both keyed by trade_name_cosh_id). Same
+                    # BrandLookupCache under the hood; either dict will
+                    # have the entry when the cosh_id is APPROVED.
                     "purchased_brand_name": (
-                        purchased_brand_name_by_id.get(ack.purchased_brand_cosh_id)
-                        if (ack and ack.purchased_brand_cosh_id) else None
+                        (purchased_brand_name_by_id.get(_effective_purchased_brand)
+                         or brand_loc.get(_effective_purchased_brand))
+                        if _effective_purchased_brand else None
                     ),
                     "purchased_brand_manufacturer_name": (
-                        purchased_mfr_name_by_id.get(ack.purchased_brand_cosh_id)
-                        if (ack and ack.purchased_brand_cosh_id) else None
+                        (purchased_mfr_name_by_id.get(_effective_purchased_brand)
+                         or manufacturer_by_brand.get(_effective_purchased_brand))
+                        if _effective_purchased_brand else None
                     ),
-                    "purchased_brand_cosh_id": (ack.purchased_brand_cosh_id if ack else None),
+                    "purchased_brand_cosh_id": _effective_purchased_brand,
                     "purchased_brand_text": (ack.purchased_brand_text if ack else None),
                     "purchased_photo_url": (ack.purchased_photo_url if ack else None),
                 })
