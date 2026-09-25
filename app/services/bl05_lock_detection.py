@@ -73,7 +73,9 @@ def detect_lock(
 
     Returns LockResult with lock type details.
     """
-    viewed_locked = timeline.from_date <= today <= timeline.to_date
+    # 2026-09-25 — half-open windows: `to_date` is exclusive, so the
+    # VIEWED-lock trigger day is `from_date <= today < to_date`.
+    viewed_locked = timeline.from_date <= today < timeline.to_date
 
     po_locked = any(
         item.timeline_id == timeline.id and item.status in ACTIVE_ORDER_STATUSES

@@ -76,31 +76,29 @@ def cca_window_active(
 ) -> bool:
     """Mirrors the BL-04 check in `/farmer/advisory/today` for CCA timelines.
 
-    DAS: from_value <= day_offset <= to_value (positive offsets, from < to).
-    DBS: -from_value <= day_offset <= -max(to_value, 1).
+    2026-09-25 — half-open interval semantics. SE convention is that
+    "3 to 4 DAS" means only day 3 (nobody writes "3 to 3"). Same for
+    DBS. `to_value` is now the FIRST day PAST the window (exclusive
+    endpoint). CALENDAR stays inclusive at the interface because the
+    SE picks actual dates and "day 200" means "day 200 is included."
+
+    DAS: from_value <= day_offset < to_value (positive offsets, from < to).
+    DBS: -from_value <= day_offset < -to_value (negative offsets;
+         to_value=0 naturally excludes day 0 without the old clamp).
          Production convention has `from_value > to_value` for DBS rows
-         (e.g. from=15, to=8 means "active 15 to 8 days before sowing").
-         day_offset is negative pre-sowing.
-         BL-17 boundary rule (2026-06-02): DBS closes at midnight of
-         (crop_start - 1) — i.e. DBS never covers crop_start itself even
-         when to_value == 0. Without `max(to_value, 1)`, to=0 would let
-         day_offset=0 pass through and overlap a DAS 0→N timeline on
-         the sowing day. Fixed across all four call sites
-         (cca_window_active here + in snapshot_sweep,
-         cca_calendar_dates below, bl17.compute_window, bl17.to_day_offset_range).
+         (e.g. from=15, to=8 means "active days 15 down to 9 pre-sowing").
     CALENDAR (Alerts D, 2026-05-29): PERENNIAL packages anchor to the
          calendar year — `from_value` / `to_value` are day-of-year
          bounds (1-365/366). Active when today's day-of-year falls in
-         [from_value, to_value]. Requires `today_date`; callers
-         without a calendar context (e.g. snapshot resolution) get
-         False, matching the pre-2026-05-29 defer-CALENDAR behaviour
-         so the snapshot reads continue to no-op CALENDAR rows.
+         [from_value, to_value] INCLUSIVE — SE-picked calendar dates
+         mean what they say (day 200 is included). Requires `today_date`;
+         callers without a calendar context get False.
     Unknown: False.
     """
     if meta.from_type == "DAS":
-        return meta.from_value <= day_offset <= meta.to_value
+        return meta.from_value <= day_offset < meta.to_value
     if meta.from_type == "DBS":
-        return -meta.from_value <= day_offset <= -max(meta.to_value, 1)
+        return -meta.from_value <= day_offset < -meta.to_value
     if meta.from_type == "CALENDAR":
         if today_date is None:
             return False
@@ -113,18 +111,26 @@ def cca_calendar_dates(
     meta: TimelineMetadata, crop_start: date,
     today: Optional[date] = None,
 ) -> tuple[date, date]:
-    """Compute (from_date, to_date) used by BL-03 + the response payload.
+    """Compute (from_date, to_date_exclusive) used by BL-03 + the payload.
 
-    CALENDAR (Perennial): `from_value` / `to_value` are day-of-year
-    (1..365/366). Window resolves to `today.year`. Bug fix
-    2026-06-18 — this branch previously fell through to
-    `(crop_start, crop_start)`, which made the date range shown on
-    the farmer's advisory card collapse to a single day at the
-    sowing date instead of the actual calendar window the timeline
-    covers; BL-03 dedup also lost its overlap signal because every
-    CALENDAR timeline reported the same one-day window. Now mirrors
-    the equivalent `_timeline_window` logic in
-    `app/services/order_bundle.py`.
+    2026-09-25 — half-open interval convention: `to_date` is the FIRST
+    day PAST the window (exclusive endpoint). Downstream predicates
+    (overlap, cluster, VIEWED-lock) all use `<` on the upper bound.
+
+    DAS: `to_date = crop_start + to_value` — was already this shape
+         (no code change), but the INTERPRETATION shifted from
+         inclusive-of-to_value to exclusive.
+    DBS: `to_date = crop_start - to_value` — dropped the old
+         `max(to_value, 1)` clamp: with exclusive semantics, to_value=0
+         gives to_date = crop_start = day 0, which is the exclusive
+         boundary — day 0 is never covered by DBS naturally.
+    CALENDAR (Perennial): SE picks actual day-of-year values
+         inclusively ("day 200 = day 200 covered"). Normalise to
+         half-open internally by adding one day: `to_date = year_start +
+         to_value` days (matches the "day (to_value+1)" as the first
+         excluded day). Downstream predicates then compose uniformly.
+         Bug fix 2026-06-18 kept: no more fall-through to (crop_start,
+         crop_start) for CALENDAR.
     """
     if meta.from_type == "DAS":
         return (
@@ -132,11 +138,9 @@ def cca_calendar_dates(
             crop_start + timedelta(days=meta.to_value),
         )
     if meta.from_type == "DBS":
-        # BL-17 boundary rule: DBS closes the day BEFORE crop_start
-        # when to_value == 0. Otherwise closes to_value days before.
         return (
             crop_start - timedelta(days=meta.from_value),
-            crop_start - timedelta(days=max(meta.to_value, 1)),
+            crop_start - timedelta(days=meta.to_value),
         )
     if meta.from_type == "CALENDAR":
         if today is None:
@@ -144,7 +148,7 @@ def cca_calendar_dates(
         year_start = date(today.year, 1, 1)
         return (
             year_start + timedelta(days=int(meta.from_value) - 1),
-            year_start + timedelta(days=int(meta.to_value) - 1),
+            year_start + timedelta(days=int(meta.to_value)),
         )
     return (crop_start, crop_start)
 

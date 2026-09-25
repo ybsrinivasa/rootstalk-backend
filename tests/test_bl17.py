@@ -16,8 +16,9 @@ from app.services.bl17_timeline_boundary import (
 # ── compute_window: time-of-day boundaries ────────────────────────────────────
 
 def test_das_window_opens_at_midnight_and_closes_at_end_of_day():
-    """The headline boundary spec — DAS opens at 00:00:00 of
-    (start + from_value), closes at 23:59:59 of (start + to_value)."""
+    """2026-09-25 — half-open convention. DAS 10-20 covers days 10..19
+    (10 days). opens_at = 00:00:00 of (start + from_value); closes_at
+    = 23:59:59 of (start + to_value - 1), i.e. the LAST INCLUSIVE day."""
     crop_start = date(2026, 5, 1)
     out = compute_window(
         from_type="DAS", from_value=10, to_value=20,
@@ -25,23 +26,24 @@ def test_das_window_opens_at_midnight_and_closes_at_end_of_day():
     )
     assert out is not None
     assert out.opens_at == datetime(2026, 5, 11, 0, 0, 0, tzinfo=timezone.utc)
-    assert out.closes_at == datetime(2026, 5, 21, 23, 59, 59, tzinfo=timezone.utc)
+    # to_value=20 exclusive → last inclusive day = May 1 + 19 = May 20.
+    assert out.closes_at == datetime(2026, 5, 20, 23, 59, 59, tzinfo=timezone.utc)
 
 
 def test_dbs_window_uses_production_from_greater_than_to_convention():
-    """DBS production convention: from=15, to=8 means 'active 15 → 8
-    days before sowing'. opens_at is the EARLIER date (start - from);
-    closes_at is the LATER date (start - to). Verified by the BL-04
-    audit; pinned here too."""
+    """2026-09-25 — half-open convention. DBS 15-8 covers days 15..9
+    pre-sowing (7 days) — to_value=8 is exclusive. opens_at is the
+    EARLIER date (start - from); closes_at is 23:59:59 of the LAST
+    INCLUSIVE day (start - (to+1))."""
     crop_start = date(2026, 5, 1)
     out = compute_window(
         from_type="DBS", from_value=15, to_value=8,
         crop_start=crop_start, timeline_id="t1",
     )
     assert out is not None
-    # 15 days before May 1 = April 16; 8 days before = April 23.
+    # 15 days before May 1 = April 16; last inclusive = April 22 (9 days before).
     assert out.opens_at == datetime(2026, 4, 16, 0, 0, 0, tzinfo=timezone.utc)
-    assert out.closes_at == datetime(2026, 4, 23, 23, 59, 59, tzinfo=timezone.utc)
+    assert out.closes_at == datetime(2026, 4, 22, 23, 59, 59, tzinfo=timezone.utc)
     assert out.opens_at < out.closes_at
 
 
@@ -100,11 +102,12 @@ def test_single_timeline_has_no_conflicts():
 
 
 def test_adjacent_das_timelines_have_no_gap_no_overlap():
-    """Spec rule: (5-10) and (11-20) are adjacent — day 11 starts
-    where day 10 ended, no day uncovered, no day double-covered."""
+    """2026-09-25 — half-open. DAS 5-10 covers 5..9; DAS 10-20 covers
+    10..19. Day 10 belongs only to the second window. Adjacent —
+    no gap, no overlap."""
     out = find_timeline_conflicts([
         TimelineSpec("t1", "DAS", 5, 10),
-        TimelineSpec("t2", "DAS", 11, 20),
+        TimelineSpec("t2", "DAS", 10, 20),
     ])
     assert out == []
 
@@ -112,9 +115,8 @@ def test_adjacent_das_timelines_have_no_gap_no_overlap():
 # ── find_timeline_conflicts: gap detection ───────────────────────────────────
 
 def test_das_gap_is_detected():
-    """(0-10) and (15-30) — days 11/12/13/14 have no coverage. Spec
-    says 'no gaps' — pre-audit the live router didn't enforce this
-    at all."""
+    """2026-09-25 — half-open. DAS 0-10 covers 0..9; DAS 15-30 covers
+    15..29. Days 10, 11, 12, 13, 14 uncovered = 5-day gap."""
     out = find_timeline_conflicts([
         TimelineSpec("t1", "DAS", 0, 10),
         TimelineSpec("t2", "DAS", 15, 30),
@@ -123,37 +125,34 @@ def test_das_gap_is_detected():
     assert out[0].kind == "GAP"
     assert out[0].timeline_a_id == "t1"
     assert out[0].timeline_b_id == "t2"
-    assert "4-day gap" in out[0].detail
+    assert "5-day gap" in out[0].detail
 
 
 def test_dbs_to_das_gap_is_detected_across_sowing_day():
-    """Mixed DBS + DAS timelines on the same package. DBS covers
-    -15..-8 (8 days before to 1 day before — wait, -15..-8 includes
-    8 days; check). DAS covers 0..30. Day -7..-1 (week before
-    sowing) and day 0 itself fall through. Day 0 is actually day
-    offset 0, which IS in the DAS range (0..30). So the gap is
-    -7..-1 — 7 days uncovered."""
+    """2026-09-25 — half-open. DBS 15-8 covers days 15..9 pre-sowing
+    (7 days, -15..-9 offsets); DAS 0-30 covers days 0..29 (30 days).
+    Gap: -8, -7, -6, -5, -4, -3, -2, -1 = 8 days uncovered."""
     out = find_timeline_conflicts([
-        TimelineSpec("dbs", "DBS", 15, 8),     # covers -15 to -8
-        TimelineSpec("das", "DAS", 0, 30),     # covers 0 to 30
+        TimelineSpec("dbs", "DBS", 15, 8),     # covers -15..-9
+        TimelineSpec("das", "DAS", 0, 30),     # covers 0..29
     ])
     assert len(out) == 1
     assert out[0].kind == "GAP"
-    # Gap from -8 to 0 → 7 days uncovered (-7, -6, -5, -4, -3, -2, -1).
-    assert "7-day gap" in out[0].detail
+    assert "8-day gap" in out[0].detail
 
 
 # ── find_timeline_conflicts: overlap detection ───────────────────────────────
 
 def test_partial_das_overlap_is_detected():
-    """(5-10) and (8-15) overlap on days 8/9/10."""
+    """2026-09-25 — half-open. DAS 5-10 covers 5..9; DAS 8-15 covers
+    8..14. Overlap on days 8, 9 → detail shows [8, 9]."""
     out = find_timeline_conflicts([
         TimelineSpec("t1", "DAS", 5, 10),
         TimelineSpec("t2", "DAS", 8, 15),
     ])
     assert len(out) == 1
     assert out[0].kind == "OVERLAP"
-    assert "[8, 10]" in out[0].detail
+    assert "[8, 9]" in out[0].detail
 
 
 def test_full_das_enclosure_is_detected_as_overlap():
@@ -176,12 +175,24 @@ def test_identical_das_timelines_are_overlap():
     assert out[0].kind == "OVERLAP"
 
 
-def test_zero_day_overlap_at_the_boundary_is_overlap_not_gap():
-    """(5-10) and (10-15) share day 10 — that's a 1-day overlap, not
-    adjacency. Adjacency requires the second to start at end+1."""
+def test_half_open_boundary_touch_is_no_conflict():
+    """2026-09-25 — half-open convention. (5-10) covers days 5–9;
+    (10-15) covers days 10–14. They TOUCH at day 10 but the day
+    belongs to only the second window. Neither overlap nor gap —
+    clean adjacency."""
     out = find_timeline_conflicts([
         TimelineSpec("t1", "DAS", 5, 10),
         TimelineSpec("t2", "DAS", 10, 15),
+    ])
+    assert out == []
+
+
+def test_true_overlap_still_detected():
+    """(5-10) covers days 5-9; (9-15) covers days 9-14 — day 9
+    shared. Overlap."""
+    out = find_timeline_conflicts([
+        TimelineSpec("t1", "DAS", 5, 10),
+        TimelineSpec("t2", "DAS", 9, 15),
     ])
     assert len(out) == 1
     assert out[0].kind == "OVERLAP"
@@ -194,11 +205,13 @@ def test_calendar_timelines_are_skipped_not_reported():
     with DAS/DBS timelines. Skipped from the conflict walk; the
     package may still validate as clean if all DAS/DBS timelines
     fit. CALENDAR conflict detection is a separate concern (deferred
-    elsewhere too — cca_window_active also defers CALENDAR)."""
+    elsewhere too — cca_window_active also defers CALENDAR).
+    2026-09-25: DAS (0-10) covers days 0..9, DAS (10-20) covers
+    days 10..19 — truly adjacent under half-open convention."""
     out = find_timeline_conflicts([
         TimelineSpec("das", "DAS", 0, 10),
         TimelineSpec("cal", "CALENDAR", 5, 8),
-        TimelineSpec("das2", "DAS", 11, 20),
+        TimelineSpec("das2", "DAS", 10, 20),
     ])
     # DAS+DAS are adjacent (no conflict). CALENDAR skipped.
     assert out == []
@@ -208,12 +221,14 @@ def test_calendar_timelines_are_skipped_not_reported():
 
 def test_multiple_conflicts_all_reported():
     """Three timelines: two adjacent (clean), then a gap, then an
-    overlap — both conflicts surfaced in the output."""
+    overlap — both conflicts surfaced in the output.
+    2026-09-25: DAS (0-10) covers 0..9, DAS (10-20) covers 10..19 —
+    truly adjacent. DAS (25-30) leaves days 20..24 as a 5-day gap."""
     out = find_timeline_conflicts([
         TimelineSpec("a", "DAS", 0, 10),
-        TimelineSpec("b", "DAS", 11, 20),    # adjacent to a
-        TimelineSpec("c", "DAS", 25, 30),    # 4-day gap from b
-        TimelineSpec("d", "DAS", 28, 40),    # overlaps c on 28..30
+        TimelineSpec("b", "DAS", 10, 20),    # adjacent to a
+        TimelineSpec("c", "DAS", 25, 30),    # 5-day gap from b
+        TimelineSpec("d", "DAS", 28, 40),    # overlaps c on 28,29
     ])
     kinds = sorted(c.kind for c in out)
     assert kinds == ["GAP", "OVERLAP"]

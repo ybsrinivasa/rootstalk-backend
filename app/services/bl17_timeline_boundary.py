@@ -91,16 +91,23 @@ def compute_window(
     """Return (opens_at, closes_at) for a DAS or DBS timeline given a
     specific crop_start. Returns None for CALENDAR (no anchor).
 
+    2026-09-25 — half-open convention. `to_value` is the FIRST day
+    PAST the window (exclusive). `close_date` computed here is the
+    LAST INCLUSIVE day, i.e. `to_value - 1`, so `closes_at` stays
+    at 23:59:59 of that day (consumers of `closes_at` — PWA
+    countdowns, scheduled jobs — expect an inclusive last-second).
+
     DAS: opens_at = (crop_start + from_value) at 00:00:00 UTC,
-         closes_at = (crop_start + to_value) at 23:59:59 UTC.
+         closes_at = (crop_start + to_value - 1) at 23:59:59 UTC.
     DBS: opens_at = (crop_start - from_value) at 00:00:00 UTC,
-         closes_at = (crop_start - max(to_value, 1)) at 23:59:59 UTC.
-         The clamp keeps DBS strictly pre-sowing — see module docstring.
+         closes_at = (crop_start - to_value - 1) at 23:59:59 UTC.
+         Old `max(to_value, 1)` clamp dropped — with exclusive
+         semantics, to_value=0 gives close_date = crop_start - 1
+         (day 1 pre-sowing), which naturally never covers the sowing
+         day. Clean.
 
     Production DBS convention is from > to (e.g. from=15, to=8 means
-    "active 15 → 8 days before sowing"). With that convention,
-    `crop_start - from_value < crop_start - to_value`, so opens_at is
-    correctly before closes_at.
+    "active days 15 down to 9 pre-sowing" under the new semantics).
 
     UTC timezone is used everywhere — same convention as the rest of
     the codebase (BL-09 alerts day-boundary fix, etc.).
@@ -108,10 +115,10 @@ def compute_window(
     from datetime import timedelta
     if from_type == "DAS":
         open_date = crop_start + timedelta(days=from_value)
-        close_date = crop_start + timedelta(days=to_value)
+        close_date = crop_start + timedelta(days=to_value - 1)
     elif from_type == "DBS":
         open_date = crop_start - timedelta(days=from_value)
-        close_date = crop_start - timedelta(days=max(to_value, 1))
+        close_date = crop_start - timedelta(days=to_value + 1)
     else:
         return None
     return TimelineWindow(
@@ -126,16 +133,19 @@ def compute_window(
 def to_day_offset_range(
     from_type: str, from_value: int, to_value: int,
 ) -> Optional[tuple[int, int]]:
-    """Convert a timeline's (from, to) into a (start, end) day-offset
-    range relative to crop_start. Returns None for CALENDAR.
+    """Convert a timeline's (from, to) into a (start, end_exclusive)
+    day-offset range relative to crop_start. Returns None for CALENDAR.
+
+    2026-09-25 — half-open convention. The returned `end` is the
+    FIRST offset PAST the window (exclusive). `find_timeline_conflicts`
+    uses this with strict `<` on the overlap check.
 
     DAS: returns (from_value, to_value) — positive offsets, increasing.
-    DBS: returns (-from_value, -max(to_value, 1)) — negative offsets.
-         Production convention from > to means -from < -to, so the
-         tuple is still (smaller, larger). The `max(to_value, 1)` clamp
-         keeps DBS strictly pre-sowing and makes adjacent DBS 10→0 /
-         DAS 0→8 pairs land on offsets (-10, -1) and (0, 8) — no
-         spurious overlap warning on day 0.
+         Under new semantics, `to_value` is exclusive.
+    DBS: returns (-from_value, -to_value) — negative offsets.
+         Old `max(to_value, 1)` clamp dropped: with exclusive
+         semantics, to_value=0 gives end = 0 (crop_start), so DBS
+         naturally never overlaps DAS on the sowing day.
 
     Used by `find_timeline_conflicts` because gap/overlap is a
     structural property of the timeline configuration — it must hold
@@ -145,7 +155,7 @@ def to_day_offset_range(
     if from_type == "DAS":
         return (from_value, to_value)
     if from_type == "DBS":
-        return (-from_value, -max(to_value, 1))
+        return (-from_value, -to_value)
     return None
 
 
@@ -154,20 +164,17 @@ def to_day_offset_range(
 def find_timeline_conflicts(timelines: list[TimelineSpec]) -> list[Conflict]:
     """Detect GAP and OVERLAP conflicts across a Package's timelines.
 
-    Treats each (DAS, DBS) timeline as a closed integer interval on
-    the day-offset number line (DAS: positive, DBS: negative).
-    CALENDAR timelines are skipped — no anchor.
+    2026-09-25 — half-open convention. `to_day_offset_range` returns
+    (start, end_exclusive). Two timelines:
+    - OVERLAP if the second STARTS STRICTLY BEFORE the first's
+      exclusive end: `b_start < a_end`. Adjacent-touching timelines
+      (b_start == a_end) share only the boundary point — no
+      inclusive day is shared, so NOT an overlap.
+    - GAP if the second starts strictly after the first ends:
+      `b_start > a_end`. Gap days = `b_start - a_end`.
+    - Otherwise (b_start == a_end): adjacent, no conflict.
 
-    Walks the timelines in order of opens_at (start-offset ascending)
-    and compares each adjacent pair. Two timelines are:
-    - OVERLAP if the second starts at or before the first ends:
-      `b_start <= a_end`. Captures both partial overlap (b_start ==
-      a_end) and full enclosure.
-    - GAP if the second starts more than one day after the first ends:
-      `b_start > a_end + 1`. Adjacent (`b_start == a_end + 1`) is
-      considered "no gap" — the spec wants no day uncovered, not
-      day-fractions.
-    - Otherwise no conflict.
+    CALENDAR timelines are skipped — no anchor.
 
     Returns a list of `Conflict` records — empty if the Package's
     timelines are clean. Used as soft validation at Package save
@@ -186,18 +193,21 @@ def find_timeline_conflicts(timelines: list[TimelineSpec]) -> list[Conflict]:
     for i in range(len(rangeable) - 1):
         a_spec, (a_start, a_end) = rangeable[i]
         b_spec, (b_start, b_end) = rangeable[i + 1]
-        if b_start <= a_end:
+        if b_start < a_end:
             conflicts.append(Conflict(
                 timeline_a_id=a_spec.timeline_id,
                 timeline_b_id=b_spec.timeline_id,
                 kind="OVERLAP",
                 detail=(
+                    # Report last-inclusive endpoints (a_end - 1,
+                    # min(a_end, b_end) - 1) to match the SE's
+                    # mental model of the range they authored.
                     f"timelines overlap on day-offsets "
-                    f"[{b_start}, {min(a_end, b_end)}]"
+                    f"[{b_start}, {min(a_end, b_end) - 1}]"
                 ),
             ))
-        elif b_start > a_end + 1:
-            gap_days = b_start - a_end - 1
+        elif b_start > a_end:
+            gap_days = b_start - a_end
             conflicts.append(Conflict(
                 timeline_a_id=a_spec.timeline_id,
                 timeline_b_id=b_spec.timeline_id,

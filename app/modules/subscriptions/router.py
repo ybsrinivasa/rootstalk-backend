@@ -5150,11 +5150,15 @@ async def get_advisory_cluster(
         fixed_ranges.append((tl.id, fd, td))
 
     # Sort by from_date; cluster by transitive overlap (a timeline joins the
-    # current cluster if its from_date <= the cluster's running max to_date).
+    # current cluster if its from_date is STRICTLY BEFORE the cluster's
+    # running max to_date).
+    # 2026-09-25 — half-open windows: `to_date` is exclusive, so
+    # adjacent-touching timelines (TL1's to_date == TL2's from_date)
+    # do NOT cluster. Strict `<` is required.
     fixed_ranges.sort(key=lambda x: x[1])
     clusters: list[dict] = []
     for tl_id, fd, td in fixed_ranges:
-        if clusters and fd <= clusters[-1]['to']:
+        if clusters and fd < clusters[-1]['to']:
             clusters[-1]['tl_ids'].add(tl_id)
             if td > clusters[-1]['to']:
                 clusters[-1]['to'] = td
@@ -5694,12 +5698,15 @@ async def get_dashboard_attention(
     # 2026-06-20 — Per-sub urgency tier derived from the timelines
     # the farmer is actually seeing today.
     #   RED    — at least one timeline with ≥1 ACTIVE practice ends
-    #            today (to_date == today). Last chance to act.
-    #   YELLOW — penultimate day (to_date == today + 1).
+    #            today (today is the LAST INCLUSIVE day of the window).
+    #   YELLOW — penultimate day.
     #   null   — neither.
-    # The advisory card-window is the natural source. Orders / seeds
-    # use it secondarily through the per-sub rollup below.
-    tomorrow = today_date + timedelta(days=1)
+    # 2026-09-25 — half-open windows: `to_date` is the FIRST day PAST
+    # the window (exclusive). Last inclusive day = to_date - 1. So
+    # RED fires when `tl_to == today + 1` (today is last-inclusive),
+    # YELLOW when `tl_to == today + 2` (today is penultimate).
+    day_after_today = today_date + timedelta(days=1)
+    day_after_tomorrow = today_date + timedelta(days=2)
     urgency_by_sub: dict[str, str] = {}
     for day in advisory:
         sub_id = day.get("subscription_id")
@@ -5750,9 +5757,9 @@ async def get_dashboard_attention(
                 tl_to = date.fromisoformat(tl_to_str)
             except (TypeError, ValueError):
                 continue
-            if tl_to == today_date:
+            if tl_to == day_after_today:
                 has_red = True
-            elif tl_to == tomorrow:
+            elif tl_to == day_after_tomorrow:
                 has_yellow = True
         advisory_by_sub[sub_id] = count
         if has_red:

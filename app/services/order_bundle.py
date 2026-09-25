@@ -133,15 +133,13 @@ def _timeline_window(
     if ftype == "DBS":
         if crop_start is None:
             return None
-        # BL-17 boundary rule: DBS closes the day BEFORE crop_start
-        # when to_value == 0. `max(to_value, 1)` clamp keeps DBS
-        # strictly pre-sowing so it doesn't bleed into a DAS-only
-        # date-range order and trip the timing-type mix guard in
-        # POST /farmer/orders. Mirrors the same clamp in
-        # snapshot_render, snapshot_sweep, and bl17_timeline_boundary.
+        # 2026-09-25 — half-open: to_value=0 gives to_date = crop_start
+        # (exclusive), so DBS naturally never covers day 0. Old
+        # `max(to_value, 1)` clamp becomes redundant + wrong (would
+        # produce an off-by-one under exclusive semantics).
         return (
             crop_start - timedelta(days=int(tl.from_value)),
-            crop_start - timedelta(days=max(int(tl.to_value), 1)),
+            crop_start - timedelta(days=int(tl.to_value)),
         )
     if ftype == "CALENDAR":
         if today is None:
@@ -149,9 +147,12 @@ def _timeline_window(
         if tl.from_value > tl.to_value:
             return None  # wrap-around unsupported in V1
         year_start = date(today.year, 1, 1)
+        # 2026-09-25 — SE picks calendar dates inclusively ("day 200 =
+        # day 200 covered"); we normalise to half-open internally by
+        # adding one day so downstream predicates compose with DAS/DBS.
         return (
             year_start + timedelta(days=int(tl.from_value) - 1),
-            year_start + timedelta(days=int(tl.to_value) - 1),
+            year_start + timedelta(days=int(tl.to_value)),
         )
     return None
 
@@ -159,12 +160,15 @@ def _timeline_window(
 def windows_overlap(
     a_from: date, a_to: date, b_from: date, b_to: date,
 ) -> bool:
-    """Inclusive overlap — one shared day is enough. Order-of-
-    endpoints agnostic so DBS-shaped (from > to in date terms)
-    timelines compose correctly."""
+    """2026-09-25 — half-open overlap: inputs are `[from, to)` where
+    `to` is the exclusive endpoint. Two intervals overlap iff each
+    starts strictly BEFORE the other ends. Adjacent-touching
+    intervals ([0,3) and [3,6)) do NOT overlap. Order-of-endpoints
+    agnostic so DBS-shaped ranges (from > to in date terms after
+    _timeline_window flips them) compose correctly."""
     a_lo, a_hi = (a_from, a_to) if a_from <= a_to else (a_to, a_from)
     b_lo, b_hi = (b_from, b_to) if b_from <= b_to else (b_to, b_from)
-    return a_lo <= b_hi and b_lo <= a_hi
+    return a_lo < b_hi and b_lo < a_hi
 
 
 async def _build_timeline_windows_for_dedup(

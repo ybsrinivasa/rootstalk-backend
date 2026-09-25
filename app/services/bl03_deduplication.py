@@ -707,7 +707,10 @@ def _or_relations_on_tl(
 
 
 def _tls_overlap_windows(a: TimelineWindow, b: TimelineWindow) -> bool:
-    return a.from_date <= b.to_date and b.from_date <= a.to_date
+    # 2026-09-25 — half-open windows: `to_date` is exclusive. Strict
+    # `<` on both sides so adjacent-touching timelines (TL1 ends where
+    # TL2 starts) are correctly not overlapping.
+    return a.from_date < b.to_date and b.from_date < a.to_date
 
 
 def _extend_or_create_merge_group(

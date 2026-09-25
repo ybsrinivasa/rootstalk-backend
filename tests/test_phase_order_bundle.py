@@ -33,9 +33,20 @@ from tests.factories import (
 
 # ── Pure-function checks ────────────────────────────────────────────────────
 
-def test_windows_overlap_one_shared_day_is_enough():
-    assert windows_overlap(
+def test_windows_overlap_half_open_boundary_touch_is_not_overlap():
+    # 2026-09-25 — half-open convention: to_date is EXCLUSIVE.
+    # [10, 15) and [15, 30) share only the boundary point (day 15
+    # is in the second window, NOT in the first). Not an overlap.
+    assert not windows_overlap(
         date(2026, 5, 10), date(2026, 5, 15),
+        date(2026, 5, 15), date(2026, 5, 30),
+    )
+
+
+def test_windows_overlap_true_overlap_still_detected():
+    # [10, 16) and [15, 30) share day 15 in both. Overlap.
+    assert windows_overlap(
+        date(2026, 5, 10), date(2026, 5, 16),
         date(2026, 5, 15), date(2026, 5, 30),
     )
 
