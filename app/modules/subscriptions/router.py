@@ -5384,6 +5384,16 @@ async def _upsert_practice_ack(
         ack.purchased_brand_cosh_id = None
         ack.purchased_brand_text = None
         ack.purchased_photo_url = None
+    elif action == "photo":
+        # 2026-09-25: photo-only update for the auto-lock case
+        # (purchase_locked_by_order = true — practice was received
+        # via an in-app order). The Brands screen is disabled in
+        # this case (brand is truth-of-record from the dealer's
+        # AVAILABLE pick), but the farmer may still want to attach
+        # a verification photo of the received product. Sets ONLY
+        # purchased_photo_url — doesn't touch purchased_at, marked_
+        # at, or the brand fields. Null clears the existing photo.
+        ack.purchased_photo_url = body.purchased_photo_url
     else:
         raise HTTPException(status_code=400, detail=f"Unknown action: {action}")
 
@@ -5551,6 +5561,25 @@ async def unpurchase_practice(
             },
         )
     return await _upsert_practice_ack(db, current_user.id, body, "unpurchase")
+
+
+@router.post("/farmer/practice-ack/photo")
+async def photo_practice(
+    body: _PracticeAckBody,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """2026-09-25: attach (or clear) a photo on a practice ack without
+    changing any other state.
+
+    Used when the practice was auto-locked by an in-app order receipt
+    (`purchase_locked_by_order = true`) — the Brands screen is
+    disabled in that case since the brand is truth-of-record from
+    the dealer, but the farmer may still want to attach a verification
+    photo of the received product. Pass `purchased_photo_url = null`
+    to clear an existing photo.
+    """
+    return await _upsert_practice_ack(db, current_user.id, body, "photo")
 
 
 # ── Dashboard attention counts ────────────────────────────────────────────────
