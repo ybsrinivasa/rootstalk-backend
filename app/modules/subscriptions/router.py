@@ -5371,7 +5371,16 @@ async def _upsert_practice_ack(
         # of cosh_id / text should be set; endpoint enforces this.
         ack.purchased_brand_cosh_id = body.purchased_brand_cosh_id
         ack.purchased_brand_text = body.purchased_brand_text
-        ack.purchased_photo_url = body.purchased_photo_url
+        # 2026-09-25: photo capture moved OUT of the Brands screen
+        # and into the practice-card inline affordance (unified with
+        # the auto-lock case for consistency). This action now
+        # preserves an existing purchased_photo_url when the body
+        # doesn't include one — so a brand-only edit from the Brands
+        # screen doesn't clobber a photo captured inline. Explicit
+        # unpurchase still clears the photo (below); that path is
+        # the "start over" gesture.
+        if body.purchased_photo_url is not None:
+            ack.purchased_photo_url = body.purchased_photo_url
     elif action == "unpurchase":
         ack.purchased_at = None
         # Un-marking purchase also un-marks done — you can't be "done"
