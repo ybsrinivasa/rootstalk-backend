@@ -7334,8 +7334,15 @@ async def _today_advisory_for_user(
                 # exclusive, so today >= to_date means the last
                 # inclusive day has elapsed. PWA uses this to render
                 # past-window TLs read-only (no Order, no ack, Brands
-                # list visible for reference only).
-                "past_window": today >= to_d,
+                # list visible for reference only). Compared against
+                # the ACTUAL current date (not the render-target
+                # `today` local) so that the cluster endpoint —
+                # which invokes this kernel with `for_date=<day-in-
+                # cluster>` while walking a past cluster — still
+                # marks those TLs as past-window. Using the render-
+                # target date would evaluate today (=cluster day)
+                # against to_d and miss the actual elapse.
+                "past_window": date.today() >= to_d,
             }
             # 2026-07-02 — Phase 2C: expose the member origins that got
             # merged into this anchor so the PWA can render a subtle
