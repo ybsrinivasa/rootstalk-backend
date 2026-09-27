@@ -8018,6 +8018,47 @@ async def get_practice_brands_farmer(
                 recommended_brand_name = pick_translation(tn_tr or {}, lang, tn_en)
             if mfr_en:
                 recommended_manufacturer_name = pick_translation(mfr_tr or {}, lang, mfr_en)
+    # 2026-09-27 — past-window flag drives the Brands screen's
+    # read-only mode. Look up the practice's TL and check whether
+    # today is >= its half-open exclusive to_date. Uses the frozen
+    # snapshot first (so mid-season TL edits by the SE don't shift
+    # what the farmer sees); falls back to the live master. False
+    # when the TL / subscription lacks anchoring info.
+    past_window = False
+    try:
+        from app.modules.subscriptions.snapshot_models import LockedTimelineSnapshot
+        from app.services.snapshot_render import (
+            cca_calendar_dates, metadata_from_content,
+        )
+
+        tl_row = (await db.execute(
+            select(Timeline).join(
+                Practice, Practice.timeline_id == Timeline.id,
+            ).where(Practice.id == practice_id)
+        )).scalars().first()
+        if tl_row is not None and sub.crop_start_date is not None:
+            snap = (await db.execute(
+                select(LockedTimelineSnapshot).where(
+                    LockedTimelineSnapshot.subscription_id == sub.id,
+                    LockedTimelineSnapshot.lineage_id == tl_row.lineage_id,
+                    LockedTimelineSnapshot.source == "CCA",
+                )
+            )).scalars().first()
+            if snap is not None:
+                meta = metadata_from_content(snap.content)
+            else:
+                meta = metadata_from_content({"timeline": {
+                    "from_type": tl_row.from_type,
+                    "from_value": int(tl_row.from_value),
+                    "to_value": int(tl_row.to_value),
+                }})
+            today_d = date.today()
+            _, to_d = cca_calendar_dates(meta, sub.crop_start_date, today_d)
+            past_window = today_d >= to_d
+    except Exception:
+        # Never let a diagnostic lookup break brand rendering.
+        past_window = False
+
     return {
         "is_locked": False,
         "locked_brand_name": None,
@@ -8025,6 +8066,7 @@ async def get_practice_brands_farmer(
         "client_name": client_name,
         "recommended_brand_name": recommended_brand_name,
         "recommended_manufacturer_name": recommended_manufacturer_name,
+        "past_window": past_window,
         **chemistry,
     }
 
