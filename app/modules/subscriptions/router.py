@@ -5331,6 +5331,54 @@ async def _upsert_practice_ack(
     if sub is None:
         raise HTTPException(status_code=404, detail="Subscription not found")
 
+    # Past-window guard (2026-09-27) — mutating acks are rejected once
+    # the TL's half-open window has closed. today >= to_date (exclusive)
+    # means the last inclusive day has elapsed. `hide` still allowed:
+    # that's a UI cleanup gesture on an already-marked practice, not a
+    # new purchase claim.
+    if action in ("mark", "unmark", "purchase", "unpurchase", "photo"):
+        from app.modules.subscriptions.snapshot_models import LockedTimelineSnapshot
+        from app.services.snapshot_render import (
+            cca_calendar_dates, metadata_from_content,
+        )
+
+        meta = None
+        snap = (await db.execute(
+            select(LockedTimelineSnapshot).where(
+                LockedTimelineSnapshot.subscription_id == body.subscription_id,
+                LockedTimelineSnapshot.lineage_id == body.timeline_lineage_id,
+                LockedTimelineSnapshot.source == "CCA",
+            )
+        )).scalars().first()
+        if snap is not None:
+            meta = metadata_from_content(snap.content)
+        else:
+            tl_row = (await db.execute(
+                select(Timeline).where(
+                    Timeline.lineage_id == body.timeline_lineage_id,
+                )
+            )).scalars().first()
+            if tl_row is not None:
+                meta = metadata_from_content({"timeline": {
+                    "from_type": tl_row.from_type,
+                    "from_value": int(tl_row.from_value),
+                    "to_value": int(tl_row.to_value),
+                }})
+        if meta is not None and sub.crop_start_date is not None:
+            today_d = date.today()
+            _, to_d = cca_calendar_dates(meta, sub.crop_start_date, today_d)
+            if today_d >= to_d:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error_code": "past_window_locked",
+                        "message": (
+                            "This timeline's window has closed. "
+                            "Past windows are read-only."
+                        ),
+                    },
+                )
+
     ack = (await db.execute(
         select(PracticeAcknowledgement).where(
             PracticeAcknowledgement.subscription_id == body.subscription_id,
@@ -7282,6 +7330,12 @@ async def _today_advisory_for_user(
                 "day_number": day_num,
                 "suppressed_count": len(dedup_tl.suppressed),
                 "practices": tl_practices_out,
+                # 2026-09-27 — half-open past cutoff. `to_date` is
+                # exclusive, so today >= to_date means the last
+                # inclusive day has elapsed. PWA uses this to render
+                # past-window TLs read-only (no Order, no ack, Brands
+                # list visible for reference only).
+                "past_window": today >= to_d,
             }
             # 2026-07-02 — Phase 2C: expose the member origins that got
             # merged into this anchor so the PWA can render a subtle
