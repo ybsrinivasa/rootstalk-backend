@@ -5214,9 +5214,43 @@ async def get_advisory_cluster(
             break
     if current_idx is None:
         past = [i for i, c in enumerate(clusters) if c['to'] < today]
-        current_idx = past[-1] if past else 0
+        if past:
+            current_idx = past[-1]
+        else:
+            # 2026-09-27 — today is BEFORE every cluster (typical
+            # pre-sowing case: crop starts tomorrow, no DBS TL
+            # covers today). Signal "no current cluster" with a
+            # sentinel index; the offset=0 payload renders as an
+            # empty state so the farmer isn't shown a future
+            # cluster labelled misleadingly as "NOW". Forward
+            # navigation still works via offset += 1.
+            current_idx = -1
 
     target_idx = current_idx + offset
+    if current_idx == -1 and target_idx == -1:
+        # Explicit empty state: farmer opened advisory before any
+        # cluster begins. Return a cluster payload with no timelines
+        # so the PWA can render "no advisory for today" while
+        # keeping the nav visible (has_next=True steps forward to
+        # the first upcoming cluster).
+        return {
+            **_base_payload(),
+            "cluster": {
+                "offset": 0,
+                "position": "before_start",
+                "day_from": None,
+                "day_to": None,
+                "date_from": None,
+                "date_to": None,
+                "has_prev": False,
+                "has_next": len(clusters) > 0,
+                "index": -1,
+                "total": len(clusters),
+                "current_index": current_idx,
+            },
+            "timelines": [],
+            "ongoing_timelines": ongoing_timelines_out,
+        }
     if target_idx < 0 or target_idx >= len(clusters):
         raise HTTPException(
             status_code=404,
