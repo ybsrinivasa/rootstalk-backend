@@ -5204,46 +5204,52 @@ async def get_advisory_cluster(
             "ongoing_timelines": ongoing_timelines_out,
         }
 
-    # Find the cluster containing today. If today falls in a gap between
-    # clusters, use the most recent past cluster so the farmer sees what
-    # they most recently worked on.
+    # Find the cluster containing today. Half-open: today is in a
+    # cluster iff c['from'] <= today < c['to'] (matches the per-TL
+    # past_window logic exactly, so cluster "current" and TL
+    # "past_window" can't disagree).
     current_idx: Optional[int] = None
     for i, c in enumerate(clusters):
-        if c['from'] <= today <= c['to']:
+        if c['from'] <= today < c['to']:
             current_idx = i
             break
+    # 2026-09-27 — when no cluster covers today, distinguish three
+    # shapes so the empty-state UX matches farmer intent:
+    #   - gap between past and future clusters → show most-recent
+    #     past so the farmer sees what they last worked on;
+    #   - today is BEFORE every cluster (pre-sowing, no DBS TL) →
+    #     empty state, current_idx = -1;
+    #   - today is AFTER every cluster (crop cycle concluded) →
+    #     empty state, current_idx = len(clusters).
+    # Both empty-state sentinels return the empty payload at
+    # offset=0; forward/backward nav still reaches the actual
+    # clusters.
     if current_idx is None:
-        past = [i for i, c in enumerate(clusters) if c['to'] < today]
-        if past:
-            current_idx = past[-1]
+        past_indices = [i for i, c in enumerate(clusters) if c['to'] <= today]
+        future_indices = [i for i, c in enumerate(clusters) if today < c['from']]
+        if past_indices and future_indices:
+            current_idx = past_indices[-1]
+        elif future_indices and not past_indices:
+            current_idx = -1
+        elif past_indices and not future_indices:
+            current_idx = len(clusters)
         else:
-            # 2026-09-27 — today is BEFORE every cluster (typical
-            # pre-sowing case: crop starts tomorrow, no DBS TL
-            # covers today). Signal "no current cluster" with a
-            # sentinel index; the offset=0 payload renders as an
-            # empty state so the farmer isn't shown a future
-            # cluster labelled misleadingly as "NOW". Forward
-            # navigation still works via offset += 1.
             current_idx = -1
 
     target_idx = current_idx + offset
-    if current_idx == -1 and target_idx == -1:
-        # Explicit empty state: farmer opened advisory before any
-        # cluster begins. Return a cluster payload with no timelines
-        # so the PWA can render "no advisory for today" while
-        # keeping the nav visible (has_next=True steps forward to
-        # the first upcoming cluster).
+
+    def _empty_cluster_payload(position: str) -> dict:
         return {
             **_base_payload(),
             "cluster": {
                 "offset": 0,
-                "position": "before_start",
+                "position": position,
                 "day_from": None,
                 "day_to": None,
                 "date_from": None,
                 "date_to": None,
-                "has_prev": False,
-                "has_next": len(clusters) > 0,
+                "has_prev": len(clusters) > 0 and position == "after_end",
+                "has_next": len(clusters) > 0 and position == "before_start",
                 "index": -1,
                 "total": len(clusters),
                 "current_index": current_idx,
@@ -5251,6 +5257,11 @@ async def get_advisory_cluster(
             "timelines": [],
             "ongoing_timelines": ongoing_timelines_out,
         }
+
+    if current_idx == -1 and target_idx == -1:
+        return _empty_cluster_payload("before_start")
+    if current_idx == len(clusters) and target_idx == len(clusters):
+        return _empty_cluster_payload("after_end")
     if target_idx < 0 or target_idx >= len(clusters):
         raise HTTPException(
             status_code=404,
