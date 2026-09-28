@@ -5411,7 +5411,18 @@ async def _upsert_practice_ack(
                 }})
         if meta is not None and sub.crop_start_date is not None:
             today_d = date.today()
-            _, to_d = cca_calendar_dates(meta, sub.crop_start_date, today_d)
+            # 2026-09-28 — normalise crop_start_date to `date` before
+            # feeding cca_calendar_dates. Some subs store it as a
+            # `datetime`; the helper propagates the input type, and
+            # comparing a `date` against a `datetime` further down
+            # raises TypeError → 500 on every mutating ack. Cluster
+            # endpoint does the same `.date()` conversion.
+            crop_start = (
+                sub.crop_start_date.date()
+                if hasattr(sub.crop_start_date, 'date')
+                else sub.crop_start_date
+            )
+            _, to_d = cca_calendar_dates(meta, crop_start, today_d)
             if today_d >= to_d:
                 raise HTTPException(
                     status_code=422,
@@ -8105,7 +8116,16 @@ async def get_practice_brands_farmer(
                     "to_value": int(tl_row.to_value),
                 }})
             today_d = date.today()
-            _, to_d = cca_calendar_dates(meta, sub.crop_start_date, today_d)
+            # 2026-09-28 — normalise crop_start_date to `date`; some
+            # subs store it as datetime and the type propagates
+            # through cca_calendar_dates, breaking the >= compare
+            # further down. Same fix pattern as _upsert_practice_ack.
+            crop_start = (
+                sub.crop_start_date.date()
+                if hasattr(sub.crop_start_date, 'date')
+                else sub.crop_start_date
+            )
+            _, to_d = cca_calendar_dates(meta, crop_start, today_d)
             past_window = today_d >= to_d
     except Exception:
         # Never let a diagnostic lookup break brand rendering.
