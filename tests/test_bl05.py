@@ -331,3 +331,126 @@ def test_bl05_cha_timeline_locked_when_today_inside():
     assert result.viewed_locked
     assert result.locked
     assert result.lock_type == LockType.VIEWED
+
+
+# ── 2026-09-28: MANUAL_ACK lock (Advisory-Only offline-purchase record) ──────
+
+def test_bl05_manual_ack_only_triggers_lock():
+    """Advisory-Only ack (purchased_at IS NOT NULL) on a past TL
+    should lock it: farmer's declaration of purchase must survive a
+    crop_start shift even without an in-app order or today-in-window."""
+    tl = TimelineDateRange(
+        id="TL_A", from_date=D(2026, 4, 1), to_date=D(2026, 4, 5),
+        lineage_id="ln-A",
+    )
+    today = D(2026, 4, 20)   # past-window; VIEWED off
+    result = detect_lock(
+        tl, today, active_order_items=[],
+        manual_ack_lineage_ids={"ln-A"},
+    )
+    assert result.locked is True
+    assert result.lock_type == LockType.MANUAL_ACK
+    assert result.manual_ack_locked is True
+    assert result.viewed_locked is False
+    assert result.po_locked is False
+
+
+def test_bl05_po_lock_takes_precedence_over_manual_ack():
+    """When both PO and MANUAL_ACK trigger, PO wins for the display
+    lock_type. Both flags still surface for callers that want to
+    render both reasons."""
+    tl = TimelineDateRange(
+        id="TL_A", from_date=D(2026, 4, 1), to_date=D(2026, 4, 5),
+        lineage_id="ln-A",
+    )
+    today = D(2026, 4, 20)
+    result = detect_lock(
+        tl, today,
+        active_order_items=[order_item("TL_A", D(2026, 4, 2), D(2026, 4, 4))],
+        manual_ack_lineage_ids={"ln-A"},
+    )
+    assert result.locked is True
+    assert result.lock_type == LockType.PURCHASE_ORDER
+    assert result.po_locked is True
+    assert result.manual_ack_locked is True
+
+
+def test_bl05_manual_ack_beats_viewed_for_lock_type():
+    """When VIEWED and MANUAL_ACK trigger (TL is both active today
+    AND has a recorded manual purchase), MANUAL_ACK is the more
+    informative reason — it's a farmer-action signal — so it takes
+    precedence over the time-based VIEWED trigger."""
+    tl = TimelineDateRange(
+        id="TL_A", from_date=D(2026, 4, 1), to_date=D(2026, 4, 10),
+        lineage_id="ln-A",
+    )
+    today = D(2026, 4, 5)     # inside window → VIEWED
+    result = detect_lock(
+        tl, today, active_order_items=[],
+        manual_ack_lineage_ids={"ln-A"},
+    )
+    assert result.locked is True
+    assert result.lock_type == LockType.MANUAL_ACK
+    assert result.viewed_locked is True
+    assert result.manual_ack_locked is True
+
+
+def test_bl05_manual_ack_ignored_without_lineage_id():
+    """A TimelineDateRange without a lineage_id can't be matched
+    against the ack set. Falls through cleanly — the caller just
+    won't get MANUAL_ACK protection for that TL. Backward-compat
+    contract for older callers that haven't wired lineage_id yet."""
+    tl = TimelineDateRange(
+        id="TL_A", from_date=D(2026, 4, 1), to_date=D(2026, 4, 5),
+        lineage_id=None,
+    )
+    today = D(2026, 4, 20)
+    result = detect_lock(
+        tl, today, active_order_items=[],
+        manual_ack_lineage_ids={"ln-A"},
+    )
+    assert result.locked is False
+    assert result.lock_type == LockType.NONE
+
+
+def test_bl05_manual_ack_shift_preserves_content():
+    """compute_date_shifts: a TL with a manual-ack lock has its dates
+    shifted like any other TL, but content_updated stays False —
+    matching the PO-lock behaviour. This is what protects the
+    farmer's ack from being orphaned by an SE mid-shift edit."""
+    tl = TimelineDateRange(
+        id="TL_A", from_date=D(2026, 4, 1), to_date=D(2026, 4, 5),
+        lineage_id="ln-A",
+    )
+    old_start = D(2026, 4, 1)
+    new_start = D(2026, 4, 3)
+    today = D(2026, 4, 20)
+    results, delta = compute_date_shifts(
+        [tl], old_start, new_start, today,
+        active_order_items=[],
+        manual_ack_lineage_ids={"ln-A"},
+    )
+    assert delta == 2
+    r = results[0]
+    assert r.new_from_date == D(2026, 4, 3)
+    assert r.new_to_date == D(2026, 4, 7)
+    assert r.was_locked is True
+    assert r.content_updated is False
+
+
+def test_bl05_no_manual_ack_set_leaves_lock_off():
+    """Passing manual_ack_lineage_ids=None (or omitting it entirely
+    for backward compat) means MANUAL_ACK never triggers. Existing
+    callers that haven't been updated remain byte-identical."""
+    tl = TimelineDateRange(
+        id="TL_A", from_date=D(2026, 4, 1), to_date=D(2026, 4, 5),
+        lineage_id="ln-A",
+    )
+    today = D(2026, 4, 20)
+    r_none = detect_lock(tl, today, active_order_items=[], manual_ack_lineage_ids=None)
+    r_empty = detect_lock(tl, today, active_order_items=[], manual_ack_lineage_ids=set())
+    r_positional = detect_lock(tl, today, [])
+    for r in (r_none, r_empty, r_positional):
+        assert r.locked is False
+        assert r.lock_type == LockType.NONE
+        assert r.manual_ack_locked is False

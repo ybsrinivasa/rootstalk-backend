@@ -1989,6 +1989,10 @@ async def set_start_date(
     # Build timeline date ranges (compute dates relative to old start)
     from datetime import timedelta
     tl_ranges: list[TimelineDateRange] = []
+    # 2026-09-28 — track CCA TL lineage_ids so we can shift only
+    # CCA-anchored acks below (CHA acks are triggered_at-anchored
+    # and must not move on crop_start change).
+    cca_lineage_ids: set[str] = set()
     for tl in timelines:
         if tl.from_type.value == "DAS":
             from_d = old_start + timedelta(days=tl.from_value)
@@ -1999,7 +2003,12 @@ async def set_start_date(
             to_d = old_start - timedelta(days=max(tl.to_value, 1))
         else:
             continue
-        tl_ranges.append(TimelineDateRange(id=tl.id, from_date=from_d, to_date=to_d))
+        tl_ranges.append(TimelineDateRange(
+            id=tl.id, from_date=from_d, to_date=to_d,
+            lineage_id=tl.lineage_id,
+        ))
+        if tl.lineage_id:
+            cca_lineage_ids.add(tl.lineage_id)
 
     # ── Also include triggered CHA timelines (PG/SP) for lock detection ─────────
     # Per spec §6.6: "Both conditions apply equally to CCA and CHA timelines."
@@ -2030,6 +2039,7 @@ async def set_start_date(
                 to_d = triggered_d + timedelta(days=sp_tl.to_value)
                 tl_ranges.append(TimelineDateRange(
                     id=sp_tl.id, from_date=from_d, to_date=to_d, is_cha=True,
+                    lineage_id=sp_tl.lineage_id,
                 ))
         elif cha.recommendation_type == "PG":
             pg_timelines = (await db.execute(
@@ -2040,6 +2050,7 @@ async def set_start_date(
                 to_d = triggered_d + timedelta(days=pg_tl.to_value)
                 tl_ranges.append(TimelineDateRange(
                     id=pg_tl.id, from_date=from_d, to_date=to_d, is_cha=True,
+                    lineage_id=pg_tl.lineage_id,
                 ))
         elif cha.recommendation_type == "QA":
             # UCAT pipe-3: Q&A timelines live in pg_timelines too,
@@ -2054,10 +2065,32 @@ async def set_start_date(
                 to_d = triggered_d + timedelta(days=qa_tl.to_value)
                 tl_ranges.append(TimelineDateRange(
                     id=qa_tl.id, from_date=from_d, to_date=to_d, is_cha=True,
+                    lineage_id=qa_tl.lineage_id,
                 ))
 
+    # 2026-09-28 — MANUAL_ACK lock signal. Advisory-Only Mode
+    # farmers record offline purchases via
+    # PracticeAcknowledgement.purchased_at (no OrderItem created).
+    # Feed the set of TL lineage_ids carrying any purchased_at row
+    # into compute_date_shifts so those TLs get their content
+    # frozen through the shift — matches the PO-lock behaviour for
+    # in-app orders. Only Advisory-Only subs write purchased_at;
+    # Regular Mode never does, so this query yields an empty set
+    # there and the guard is a no-op.
+    from app.modules.advisory.models import PracticeAcknowledgement
+    manual_ack_lineage_rows = (await db.execute(
+        select(PracticeAcknowledgement.timeline_lineage_id).where(
+            PracticeAcknowledgement.subscription_id == sub.id,
+            PracticeAcknowledgement.purchased_at.is_not(None),
+        ).distinct()
+    )).scalars().all()
+    manual_ack_lineage_ids = {lid for lid in manual_ack_lineage_rows if lid}
+
     # Compute shifts
-    shifts, delta_days = compute_date_shifts(tl_ranges, old_start, new_start, today, active_items)
+    shifts, delta_days = compute_date_shifts(
+        tl_ranges, old_start, new_start, today, active_items,
+        manual_ack_lineage_ids=manual_ack_lineage_ids,
+    )
 
     # Update start date (use the parsed datetime, not the raw string)
     sub.crop_start_date = new_start_dt
@@ -2113,6 +2146,27 @@ async def set_start_date(
                     new_status=None,
                     metadata={"reason": "dbs_start_date_advanced"},
                 )
+
+    # 2026-09-28 — shift PracticeAcknowledgement.occurrence_date on
+    # CCA acks by delta_days so they stay attached to the same TL
+    # after the calendar slide. Ack rows key on (sub, lineage_id,
+    # practice_id, occurrence_date); without this shift, the ack's
+    # occurrence_date would no longer match the newly-computed
+    # rendering date and the farmer would see previously-recorded
+    # purchases disappear. Skip CHA-anchored acks — CHA TLs are
+    # triggered_at-anchored and don't move on crop_start change,
+    # so their acks must not move either. Also skip when delta_days
+    # is zero.
+    if delta_days != 0 and cca_lineage_ids:
+        cca_ack_rows = (await db.execute(
+            select(PracticeAcknowledgement).where(
+                PracticeAcknowledgement.subscription_id == sub.id,
+                PracticeAcknowledgement.timeline_lineage_id.in_(cca_lineage_ids),
+            )
+        )).scalars().all()
+        for ack in cca_ack_rows:
+            if ack.occurrence_date is not None:
+                ack.occurrence_date = ack.occurrence_date + timedelta(days=delta_days)
 
     # BL-05b step 7: for dealer-postponed items whose timeline shifted,
     # the dealer's `postponed_until` must also shift by `delta_days`.
