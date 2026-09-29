@@ -5346,6 +5346,99 @@ async def get_advisory_cluster(
                     bucket['practices'].setdefault(p['id'], p)
         day += timedelta(days=1)
 
+    # 2026-09-29 — Cluster-level BL-03 dedup pass.
+    # The day-by-day walk above calls _today_advisory_for_user
+    # per-day, and BL-03 dedup runs inside each call using only the
+    # TLs that are "active on that day." When two TLs in the cluster
+    # share an identity but never both have today-in-window on the
+    # same day (e.g., TL_A covers Days 0-9, TL_B covers Days 5-19 —
+    # dedup on Day 0 sees only TL_A; dedup on Day 5 sees both but
+    # setdefault has already frozen Day 0's un-suppressed
+    # standalone), the standalone A stays in the merged output next
+    # to TL_B's AND(A+B). Farmer sees a redundant recommendation.
+    # Fix: run one more BL-03 pass on the CLUSTER-aggregated set
+    # (each TL's actual full window is used, so all overlapping
+    # pairs are considered together). Use `visible_practices` as
+    # the survivor set and drop everything else from `merged`.
+    # CHA TLs are triggered_at-anchored (not in fixed_ranges); they
+    # skip this pass and rely on the per-day dedup that already
+    # handles them.
+    from app.services.bl03_deduplication import (
+        deduplicate_advisory as _cluster_dedup,
+        TimelineWindow as _CTLW,
+        PracticeStub as _CPStub,
+        PracticeElement as _CPEl,
+    )
+    from app.services.order_bundle import IN_FLIGHT_ITEM_STATUSES as _IF
+    from app.modules.orders.models import Order
+
+    cluster_committed_items = (await db.execute(
+        select(OrderItem).join(Order, Order.id == OrderItem.order_id).where(
+            Order.subscription_id == sub.id,
+            OrderItem.status.in_(_IF),
+        )
+    )).scalars().all()
+    cluster_committed_ids = {it.practice_id for it in cluster_committed_items}
+
+    _ranges_by_id = {tid: (fd, td) for tid, fd, td in fixed_ranges}
+
+    def _to_cluster_stub(p: dict) -> _CPStub:
+        return _CPStub(
+            id=p.get('id'),
+            l0_type=p.get('l0_type') or '',
+            l1_type=p.get('l1_type'),
+            l2_type=p.get('l2_type'),
+            display_order=int(p.get('display_order') or 0),
+            is_special_input=bool(p.get('is_special_input')),
+            relation_id=p.get('relation_id'),
+            relation_role=p.get('relation_role'),
+            relation_type=p.get('relation_type'),
+            frequency_days=p.get('frequency_days'),
+            is_brand_locked=bool(p.get('is_brand_locked')),
+            elements=[
+                _CPEl(
+                    element_type=e.get('element_type'),
+                    cosh_ref=e.get('cosh_ref'),
+                    value=e.get('value'),
+                    unit_cosh_id=e.get('unit_cosh_id'),
+                )
+                for e in (p.get('elements') or [])
+            ],
+        )
+
+    _cluster_tls_for_dedup: list[_CTLW] = []
+    for tl_id, tl_data in merged.items():
+        fd_td = _ranges_by_id.get(tl_id)
+        if fd_td is None:
+            # CHA/QA TL (triggered_at-anchored). Not in fixed_ranges.
+            # Per-day dedup already covered its interactions.
+            continue
+        fd, td = fd_td
+        _cluster_tls_for_dedup.append(_CTLW(
+            id=tl_id,
+            name=tl_data.get('name') or '',
+            from_date=fd,
+            to_date=td,
+            created_at=fd,  # tie-break; consistent within this call.
+            practices=[_to_cluster_stub(p) for p in (tl_data.get('practices') or {}).values()],
+            source=tl_data.get('source') or 'CCA',
+            lineage_id=tl_data.get('lineage_id'),
+        ))
+
+    if _cluster_tls_for_dedup:
+        _cluster_dedup_results = _cluster_dedup(
+            _cluster_tls_for_dedup,
+            committed_practice_ids=cluster_committed_ids,
+        )
+        for _dr in _cluster_dedup_results:
+            _surviving = {p.id for p in _dr.visible_practices}
+            _bucket = merged.get(_dr.timeline.id, {}).get('practices')
+            if not _bucket:
+                continue
+            for _pid in list(_bucket.keys()):
+                if _pid not in _surviving:
+                    _bucket.pop(_pid, None)
+
     cluster_timelines_out: list[dict] = []
     for t in merged.values():
         practices_list = list(t['practices'].values())
