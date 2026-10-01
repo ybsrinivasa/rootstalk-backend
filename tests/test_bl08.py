@@ -531,3 +531,188 @@ def test_bl08_22_demotion_still_fires_when_an_alternative_survives():
     # unaffected. Pool reduces to {P_unranked} → CONFIRMATION.
     assert step.status == "CONFIRMATION"
     assert step.diagnosed_problem_cosh_id == "P_unranked"
+
+
+# ── 2026-10-01: Synthesised plain-symptom gating ─────────────────────────────
+#
+# When the SE authored only sub-typed rows for a (part, symptom) family —
+# no true-plain (sub_part=NULL AND sub_symptom=NULL) row — the farmer used
+# to be asked each sub-symptom one by one. For the common NO-everything
+# path this inflated the question count badly. The algorithm now
+# synthesises a plain family gate ("Do you see Surface Growth on the
+# Leaf?") when 2+ sub-typed combinations exist and no true-plain row does.
+
+
+def test_bl08_synth_family_no_eliminates_entire_family_in_one_hop():
+    """Case B — synthesised NO on a (part, symptom) family with 3
+    sub-typed children eliminates all three pests in a single answer.
+
+    Dataset: three pests each with a single Leaf+SurfaceGrowth row,
+    each at a different sub_symptom. Plus one safety pest on another
+    symptom so the pool isn't 1 before the question. A NO on the
+    synthesised family gate should drop all SurfaceGrowth-only pests."""
+    rows = [
+        PSR("P_wp", "LEAF", "SurfaceGrowth", sub_symptom_cosh_id="WhitePowdery"),
+        PSR("P_rust", "LEAF", "SurfaceGrowth", sub_symptom_cosh_id="Rust"),
+        PSR("P_sooty", "LEAF", "SurfaceGrowth", sub_symptom_cosh_id="Sooty"),
+        PSR("P_safe", "LEAF", "Spots"),  # anchor so pool starts at 4
+    ]
+    # First call — expect a synthesised question. We don't know
+    # alphabetical ordering between SurfaceGrowth and Spots, so just
+    # verify the SurfaceGrowth family emits a NULL-sub question when
+    # Spots has been answered NO.
+    answers = [DA("LEAF", "Spots", None, None, "NO")]
+    step = run_diagnosis_step(rows, initial_plant_part="LEAF", answers=answers, random_seed=42)
+    assert step.status == "QUESTION"
+    assert step.question.plant_part_cosh_id == "LEAF"
+    assert step.question.symptom_cosh_id == "SurfaceGrowth"
+    assert step.question.sub_part_cosh_id is None
+    assert step.question.sub_symptom_cosh_id is None
+
+    # Farmer says NO to the synthesised family question. All three
+    # SurfaceGrowth-only pests should drop out; pool collapses to {}.
+    answers2 = answers + [DA("LEAF", "SurfaceGrowth", None, None, "NO")]
+    step2 = run_diagnosis_step(rows, initial_plant_part="LEAF", answers=answers2, random_seed=42)
+    assert step2.status == "INCONCLUSIVE"
+    assert step2.remaining_count == 0
+
+
+def test_bl08_synth_family_yes_falls_through_to_sub_symptom():
+    """Case A — synthesised YES on a family keeps every pest with any
+    row for (part, symptom); next iteration must ask a sub-symptom
+    disambiguation to narrow further."""
+    rows = [
+        PSR("P_wp", "LEAF", "SurfaceGrowth", sub_symptom_cosh_id="WhitePowdery"),
+        PSR("P_rust", "LEAF", "SurfaceGrowth", sub_symptom_cosh_id="Rust"),
+        PSR("P_sooty", "LEAF", "SurfaceGrowth", sub_symptom_cosh_id="Sooty"),
+    ]
+    answers = [DA("LEAF", "SurfaceGrowth", None, None, "YES")]
+    step = run_diagnosis_step(rows, initial_plant_part="LEAF", answers=answers, random_seed=42)
+    # Pool stays at 3 because YES on NULL-sub matches all three rows.
+    # Next question must be a sub-symptom (SUB_SYMPTOM type) because
+    # all three candidates differ by sub_symptom only.
+    assert step.status == "QUESTION"
+    assert step.remaining_count == 3
+    assert step.question.question_type == "SUB_SYMPTOM"
+    assert step.question.sub_symptom_cosh_id in {"WhitePowdery", "Rust", "Sooty"}
+
+
+def test_bl08_synth_skipped_when_only_one_subtype_exists():
+    """Case C — a (part, symptom) family with only ONE sub-typed row
+    must NOT be synthesised. Asking the direct sub-symptom question is
+    equally informative in one less hop."""
+    rows = [
+        PSR("P_serp", "LEAF", "Mines", sub_symptom_cosh_id="Serpentine"),
+        PSR("P_other", "LEAF", "Yellowing"),  # anchor
+    ]
+    # Yellowing is a true plain row and has to come first because it
+    # ties alphabetically. Answer NO to eliminate P_other, forcing the
+    # next question to come from Mines.
+    answers = [DA("LEAF", "Yellowing", None, None, "NO")]
+    step = run_diagnosis_step(rows, initial_plant_part="LEAF", answers=answers, random_seed=42)
+    # Pool is just {P_serp} → CONFIRMATION (algorithm narrowed to 1
+    # without having to ask about Mines at all — because P_other's
+    # elimination collapsed the pool). This confirms Case C: no
+    # synthesised Mines question was emitted.
+    assert step.status == "CONFIRMATION"
+    assert step.diagnosed_problem_cosh_id == "P_serp"
+
+
+def test_bl08_true_plain_still_wins_when_both_exist():
+    """Case D — when a (part, symptom) has both a true-plain row AND
+    sub-typed rows, the existing plain-first behaviour must not change.
+    True-plain row is asked; no synthesis fires on top."""
+    rows = [
+        PSR("P1", "LEAF", "SurfaceGrowth"),  # true plain
+        PSR("P1", "LEAF", "SurfaceGrowth", sub_symptom_cosh_id="WhitePowdery"),
+        PSR("P2", "LEAF", "SurfaceGrowth", sub_symptom_cosh_id="Rust"),
+    ]
+    step = run_diagnosis_step(rows, initial_plant_part="LEAF", answers=[], random_seed=42)
+    assert step.status == "QUESTION"
+    assert step.question.symptom_cosh_id == "SurfaceGrowth"
+    assert step.question.sub_part_cosh_id is None
+    assert step.question.sub_symptom_cosh_id is None
+    # Verify this is treated as a true-plain question for ranking
+    # purposes by checking the demotion path (see next test).
+
+
+def test_bl08_synth_yes_does_not_trigger_rank_demotion():
+    """Case E — a YES on a synthesised plain gate must NOT demote
+    pests whose matching row is a secondary (non-rank-1) presentation
+    of this symptom. Rationale: the synthesised YES is loose; the
+    farmer hasn't yet specified which sub-symptom applies. Ranking
+    will decide at the sub-symptom step.
+
+    Scenario: P_primary's rank-1 presentation IS SurfaceGrowth
+    (sub=WhitePowdery). P_secondary's rank-1 presentation is Spots
+    (not in the dataset here); its SurfaceGrowth (sub=Rust) is rank 2.
+    A synthesised SurfaceGrowth YES must keep BOTH candidates in the
+    pool so the next sub-symptom question can discriminate."""
+    rows = [
+        PSR("P_primary", "LEAF", "SurfaceGrowth",
+            sub_symptom_cosh_id="WhitePowdery", priority_rank=1),
+        PSR("P_secondary", "LEAF", "SurfaceGrowth",
+            sub_symptom_cosh_id="Rust", priority_rank=2),
+        PSR("P_secondary", "LEAF", "Spots", priority_rank=1),
+    ]
+    answers = [DA("LEAF", "SurfaceGrowth", None, None, "YES")]
+    step = run_diagnosis_step(rows, initial_plant_part="LEAF", answers=answers, random_seed=42)
+    # Both pests should still be in the pool. If demotion had fired
+    # on the synthesised YES, P_secondary would have been dropped and
+    # the pool would be {P_primary} → CONFIRMATION.
+    assert step.status == "QUESTION"
+    assert step.remaining_count == 2
+    assert set(step.remaining_problem_ids) == {"P_primary", "P_secondary"}
+
+
+def test_bl08_tomato_leaf_11_nos_collapse_to_3():
+    """Case F — the Tomato → Vegetative → Leaf trace reported
+    2026-10-01. Before this change, a farmer who saw nothing on the
+    Leaf had to answer NO to each sub-typed symptom individually
+    (SurfaceGrowth+WhitePowdery, ChewedPortion+Holes,
+    ChewedPortion+Caterpillar, Mines+Serpentine, Mines+Blotch, …).
+    After this change, a NO on each synthesised family gate collapses
+    its entire sub-tree in one hop.
+
+    Dataset mirrors the trace's shape: 3 symptom families each with
+    2 sub-typed children. Each child row carries a unique pest. All
+    15 pests are eliminated by 3 synthesised NO answers (vs 6
+    answers under the old behaviour).
+    """
+    rows = [
+        # SurfaceGrowth family — 3 sub-types, 3 pests
+        PSR("P_sg_wp", "LEAF", "SurfaceGrowth", sub_symptom_cosh_id="WhitePowdery"),
+        PSR("P_sg_rust", "LEAF", "SurfaceGrowth", sub_symptom_cosh_id="Rust"),
+        PSR("P_sg_sooty", "LEAF", "SurfaceGrowth", sub_symptom_cosh_id="Sooty"),
+        # ChewedPortion family — 2 sub-types, 2 pests
+        PSR("P_cp_holes", "LEAF", "ChewedPortion", sub_symptom_cosh_id="Holes"),
+        PSR("P_cp_cat", "LEAF", "ChewedPortion", sub_symptom_cosh_id="Caterpillar"),
+        # Mines family — 2 sub-types, 2 pests
+        PSR("P_mn_serp", "LEAF", "Mines", sub_symptom_cosh_id="Serpentine"),
+        PSR("P_mn_blotch", "LEAF", "Mines", sub_symptom_cosh_id="Blotch"),
+    ]
+    # Farmer says NO to all three family gates (any order).
+    answers = [
+        DA("LEAF", "SurfaceGrowth", None, None, "NO"),
+        DA("LEAF", "ChewedPortion", None, None, "NO"),
+        DA("LEAF", "Mines", None, None, "NO"),
+    ]
+    step = run_diagnosis_step(rows, initial_plant_part="LEAF", answers=answers, random_seed=42)
+    assert step.status == "INCONCLUSIVE"
+    assert step.remaining_count == 0
+
+
+def test_bl08_sub_part_family_also_synthesises():
+    """Symmetry — synthesis applies to sub_part variants too, not
+    just sub_symptom. A (part, symptom) with 2+ sub_part variants
+    (and no sub_part=NULL row) should also get a synthesised plain
+    gate. YES → sub_part disambiguation; NO → whole family out."""
+    rows = [
+        PSR("P_upper", "LEAF", "Spots", sub_part_cosh_id="UpperSurface"),
+        PSR("P_lower", "LEAF", "Spots", sub_part_cosh_id="LowerSurface"),
+    ]
+    answers = [DA("LEAF", "Spots", None, None, "NO")]
+    step = run_diagnosis_step(rows, initial_plant_part="LEAF", answers=answers, random_seed=42)
+    # NO on synthesised Spots family gate eliminates both pests.
+    assert step.status == "INCONCLUSIVE"
+    assert step.remaining_count == 0

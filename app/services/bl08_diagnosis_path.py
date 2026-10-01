@@ -282,25 +282,53 @@ def _apply_answers(rows: list[ProblemSymptomRow], answers: list[DiagnosisAnswer]
                 if _row_matches(r, answer)
             }
 
-            # Tentatively compute new demotions from this answer.
+            # 2026-10-01 — Synthesised plain-gate detection. A YES
+            # answer with NULL sub fields whose (part, symptom)
+            # combination has NO true-plain row in the master set
+            # was asked as a synthesised family gate — not a real
+            # primary-symptom match. Skip rank demotion for this
+            # answer: the follow-up sub-symptom question will give
+            # the farmer the chance to specify a sub-typed match,
+            # and ranking logic should run against THAT specific
+            # answer, not the loose family-level YES. (If a true-
+            # plain row DOES exist for (part, symptom), this answer
+            # was a real plain-symptom match and demotion applies
+            # normally.)
+            is_synthesised_plain = (
+                answer.sub_part_cosh_id is None
+                and answer.sub_symptom_cosh_id is None
+                and not any(
+                    r.plant_part_cosh_id == answer.plant_part_cosh_id
+                    and r.symptom_cosh_id == answer.symptom_cosh_id
+                    and r.sub_part_cosh_id is None
+                    and r.sub_symptom_cosh_id is None
+                    for r in rows
+                )
+            )
+
+            # Tentatively compute new demotions from this answer —
+            # unless this is a synthesised plain-gate YES, in which
+            # case ranking logic defers to the follow-up sub-symptom
+            # answer (see the is_synthesised_plain comment above).
             new_demotions: set[str] = set()
-            for p in matching_problems:
-                if p in demoted or p not in problem_min_rank:
-                    continue
-                top = problem_min_rank[p]
-                # Best (lowest) rank among rows of p that match this answer,
-                # taken from the master set so demotion is independent of
-                # how many of p's rows are still in `active`.
-                matching_ranks = [
-                    r.priority_rank for r in rows
-                    if r.problem_cosh_id == p
-                    and r.priority_rank is not None
-                    and _row_matches(r, answer)
-                ]
-                # No ranked match (only unranked rows of a ranked problem
-                # matched this answer) ⇒ treat as below top priority.
-                if not matching_ranks or min(matching_ranks) > top:
-                    new_demotions.add(p)
+            if not is_synthesised_plain:
+                for p in matching_problems:
+                    if p in demoted or p not in problem_min_rank:
+                        continue
+                    top = problem_min_rank[p]
+                    # Best (lowest) rank among rows of p that match this answer,
+                    # taken from the master set so demotion is independent of
+                    # how many of p's rows are still in `active`.
+                    matching_ranks = [
+                        r.priority_rank for r in rows
+                        if r.problem_cosh_id == p
+                        and r.priority_rank is not None
+                        and _row_matches(r, answer)
+                    ]
+                    # No ranked match (only unranked rows of a ranked problem
+                    # matched this answer) ⇒ treat as below top priority.
+                    if not matching_ranks or min(matching_ranks) > top:
+                        new_demotions.add(p)
 
             # Demotion-into-emptiness guard: only commit the new
             # demotions if AT LEAST ONE matching problem survives them
@@ -368,27 +396,96 @@ def _find_next_plain_symptom(
     1. Appears in the most distinct problems (maximises discrimination)
     2. Has not already been answered
     3. Uses only base (non-sub) combinations first
+
+    2026-10-01 — Synthesised plain-symptom gating. The original rule
+    required a true-plain row (sub_part=NULL AND sub_symptom=NULL) in
+    the catalogue to ask a plain-symptom question. When the SE
+    authored only sub-typed rows for a (part, symptom) — e.g.
+    (Leaf + SurfaceGrowth + WhitePowdery), (Leaf + SurfaceGrowth +
+    Rust), (Leaf + SurfaceGrowth + Sooty) with no plain row — the
+    farmer was asked each sub-symptom one by one. For the common
+    "farmer doesn't have the pest" path this means N NO answers to
+    collapse one family. We now synthesise a plain gating question
+    for any (part, symptom) with 2+ distinct sub-typed combinations
+    and no true-plain row. A YES falls through to the existing
+    sub-symptom disambiguation (`_disambiguate`); a NO eliminates
+    every pest whose only rows for this (part, symptom) are
+    sub-typed — one answer collapses the whole family. See the
+    synthesised-plain demotion skip in `_apply_answers` for the
+    priority-rank interaction.
+
+    Synthesis is skipped when only 1 sub-typed combination exists
+    (asking the direct sub question is equally informative in one
+    less hop).
     """
-    relevant = [
+    problem_set = set(problem_ids)
+
+    # True-plain candidates (existing behaviour) — rows with both
+    # sub fields NULL. Count rows == distinct problems with a plain
+    # row because each pest has at most one plain row per
+    # (part, symptom).
+    plain_relevant = [
         r for r in rows
-        if r.problem_cosh_id in set(problem_ids)
+        if r.problem_cosh_id in problem_set
         and r.plant_part_cosh_id == plant_part
         and r.sub_part_cosh_id is None
         and r.sub_symptom_cosh_id is None
     ]
-
-    counts = Counter()
-    for r in relevant:
+    plain_counts: Counter = Counter()
+    for r in plain_relevant:
         combo = (r.plant_part_cosh_id, r.symptom_cosh_id, None, None)
         if combo not in answered:
-            counts[r.symptom_cosh_id] += 1
+            plain_counts[r.symptom_cosh_id] += 1
 
-    if not counts:
+    # Synthesised candidates — scan every row on this (plant_part)
+    # across the active pool to detect (symptom)s that have no
+    # true-plain row but 2+ distinct sub-typed combinations.
+    symptom_has_plain: dict[str, bool] = {}
+    symptom_subtyped_combos: dict[str, set[tuple]] = {}
+    symptom_problems: dict[str, set[str]] = {}
+    for r in rows:
+        if r.problem_cosh_id not in problem_set:
+            continue
+        if r.plant_part_cosh_id != plant_part:
+            continue
+        sym = r.symptom_cosh_id
+        symptom_problems.setdefault(sym, set()).add(r.problem_cosh_id)
+        if r.sub_part_cosh_id is None and r.sub_symptom_cosh_id is None:
+            symptom_has_plain[sym] = True
+        else:
+            symptom_subtyped_combos.setdefault(sym, set()).add(
+                (r.sub_part_cosh_id, r.sub_symptom_cosh_id)
+            )
+
+    synth_counts: Counter = Counter()
+    for sym, combos in symptom_subtyped_combos.items():
+        if symptom_has_plain.get(sym):
+            continue  # true-plain path already handles this symptom
+        if len(combos) < 2:
+            continue  # single sub-type — direct question is better
+        combo = (plant_part, sym, None, None)
+        if combo in answered:
+            continue
+        # Count distinct problems with ANY row for (part, symptom).
+        # That's the YES/NO family size — the farmer's answer
+        # applies to all of them.
+        synth_counts[sym] = len(symptom_problems[sym])
+
+    # Max-information across both pools; alphabetical on ties.
+    # When a symptom has candidates in both pools (shouldn't happen
+    # because synthesis is gated on `not symptom_has_plain`), prefer
+    # the true-plain count.
+    merged: dict[str, int] = {}
+    for sym, c in plain_counts.items():
+        merged[sym] = c
+    for sym, c in synth_counts.items():
+        merged.setdefault(sym, c)
+
+    if not merged:
         return None
 
-    max_count = max(counts.values())
-    candidates = sorted(s for s, c in counts.items() if c == max_count)
-    chosen_symptom = candidates[0]  # deterministic: alphabetical on tie
+    max_count = max(merged.values())
+    chosen_symptom = sorted(s for s, c in merged.items() if c == max_count)[0]
 
     return DiagnosisQuestion(
         plant_part_cosh_id=plant_part,
