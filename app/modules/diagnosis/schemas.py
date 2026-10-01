@@ -81,6 +81,17 @@ class AIDirectDiagnoseRequest(BaseModel):
     language_code: str = "en"
 
 
+class AIGeneralSuggestionsRequest(BaseModel):
+    """2026-10-01 — Fallback for the direct-AI path when the catalogue
+    had no confident match. Same image shape as the diagnose request;
+    output is read-only farmer guidance (not advisory-bridged)."""
+    subscription_id: str
+    crop_cosh_id: str
+    crop_stage_cosh_id: Optional[str] = None
+    images: list[AIDirectImage]
+    language_code: str = "en"
+
+
 class CommitToAdvisoryRequest(BaseModel):
     """Body of POST /diagnosis/{session_id}/commit-to-advisory.
 

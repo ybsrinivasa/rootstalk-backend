@@ -39,6 +39,7 @@ from app.dependencies import get_current_user
 from app.modules.diagnosis.models import DiagnosisSession
 from app.modules.diagnosis.schemas import (
     AIDirectDiagnoseRequest,
+    AIGeneralSuggestionsRequest,
     AnswerRequest,
     CommitToAdvisoryRequest,
     ExplainSymptomRequest,
@@ -67,6 +68,7 @@ from app.services.claude_service import (
     check_symptom_in_image,
     enrich_problem_with_description,
     explain_symptom,
+    generate_general_management_suggestions,
     language_name_for,
 )
 from app.services.diagnosis_images import (
@@ -1089,6 +1091,57 @@ async def ai_direct_diagnose(
         for c in catalogue if c.get("pest_cosh_id")
     ]
 
+    # 2026-10-01 — Pest-stage structured symptom data for the AI.
+    # Load the pest_diagnosis_chain rows for this crop+stage, group by
+    # pest, and resolve part/symptom/sub_part/sub_symptom cosh_ids to
+    # farmer-friendly names. Claude gets a per-pest signature table so
+    # it can compare photo evidence against structured expert knowledge
+    # instead of relying on general training data.
+    lang = current_user.language_code or "en"
+    psrows = await _load_problem_symptom_rows(
+        db, request.crop_cosh_id, request.crop_stage_cosh_id,
+    )
+    # Scope rows to the pests that survived the catalogue dedupe above
+    # — same signal the AI gets through known_ids.
+    known_set = set(known_ids)
+    psrows = [r for r in psrows if r.problem_cosh_id in known_set]
+
+    name_ids: set[str] = set()
+    for r in psrows:
+        if r.part_cosh_id: name_ids.add(r.part_cosh_id)
+        if r.symptom_cosh_id: name_ids.add(r.symptom_cosh_id)
+        if r.sub_part_cosh_id: name_ids.add(r.sub_part_cosh_id)
+        if r.sub_symptom_cosh_id: name_ids.add(r.sub_symptom_cosh_id)
+    name_map = await resolve_names_by_cosh_id(db, name_ids, lang) if name_ids else {}
+
+    def _display(cid: Optional[str]) -> Optional[str]:
+        if not cid:
+            return None
+        return name_map.get(cid) or cid
+
+    # Build {pest_cosh_id: [symptom-signature-strings]}. Dedup same
+    # signatures across pest-stages — the AI doesn't need the same
+    # row twice. Order: alphabetical on the signature within a pest.
+    pest_signatures: dict[str, list[str]] = {}
+    for r in psrows:
+        part = _display(r.part_cosh_id)
+        sym = _display(r.symptom_cosh_id)
+        sub_part = _display(r.sub_part_cosh_id)
+        sub_sym = _display(r.sub_symptom_cosh_id)
+        if not part or not sym:
+            continue
+        extras = []
+        if sub_part: extras.append(sub_part)
+        if sub_sym: extras.append(sub_sym)
+        sig = f"{part} → {sym}"
+        if extras:
+            sig += f" ({', '.join(extras)})"
+        pest_signatures.setdefault(r.problem_cosh_id, [])
+        if sig not in pest_signatures[r.problem_cosh_id]:
+            pest_signatures[r.problem_cosh_id].append(sig)
+    for pid in pest_signatures:
+        pest_signatures[pid].sort()
+
     crop_name = await resolve_name_for_cosh_id(
         db, request.crop_cosh_id, request.language_code,
     ) or request.crop_cosh_id
@@ -1102,6 +1155,7 @@ async def ai_direct_diagnose(
         crop_stage_name=stage_name,
         known_problem_ids=known_ids,
         known_problem_names=known_names,
+        pest_signatures=pest_signatures,
         language_code=request.language_code,
     )
 
@@ -1148,6 +1202,56 @@ async def ai_direct_diagnose(
         "problem_info": problem_info,
         "subscription_id": request.subscription_id,
         "committed_to_advisory": False,
+    }
+
+
+@router.post("/diagnosis/ai-general-suggestions")
+async def ai_general_suggestions(
+    request: AIGeneralSuggestionsRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """2026-10-01 — Fallback for the direct-AI path when the catalogue
+    had no confident match. Generates safe, conservative general
+    guidance (cultural + biological first, chemical categories only
+    as last resort — never a specific brand or dose). Output is prose
+    paragraphs rendered read-only in the PWA; NOT bridged into the
+    Advisory pipeline (RootsTalk's advisory surface stays strictly
+    expert-curated).
+
+    The farmer should still raise an Expert query — this is holding
+    guidance for the wait, not a substitute. The PWA primary CTA
+    remains "Ask the Expert"; this endpoint powers the secondary
+    "Get AI suggestions" affordance.
+    """
+    from app.modules.subscriptions.models import Subscription
+
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == request.subscription_id,
+            Subscription.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    crop_name = await resolve_name_for_cosh_id(
+        db, request.crop_cosh_id, request.language_code,
+    ) or request.crop_cosh_id
+    stage_name = await resolve_name_for_cosh_id(
+        db, request.crop_stage_cosh_id, request.language_code,
+    ) if request.crop_stage_cosh_id else None
+
+    result = await generate_general_management_suggestions(
+        images=[{"base64": i.base64, "media_type": i.media_type} for i in request.images],
+        crop_name=crop_name,
+        crop_stage_name=stage_name,
+        language_code=request.language_code,
+        language_name=language_name_for(request.language_code),
+    )
+    return {
+        "subscription_id": request.subscription_id,
+        **result.to_dict(),
     }
 
 

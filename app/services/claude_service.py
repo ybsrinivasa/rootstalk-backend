@@ -204,6 +204,7 @@ async def analyze_crop_images_constrained(
     crop_stage_name: Optional[str],
     known_problem_ids: list[str],
     known_problem_names: list[str],
+    pest_signatures: Optional[dict[str, list[str]]] = None,
     language_code: str = "en",
 ) -> ImageAnalysisResult:
     """Direct-AI diagnose path (alternative to BL-08 Q&A): farmer uploads
@@ -261,9 +262,29 @@ async def analyze_crop_images_constrained(
     try:
         import anthropic
 
+        # 2026-10-01 — Per-pest signature lines (part → symptom (sub…)
+        # tuples) give Claude structured expert knowledge to anchor
+        # the photo evidence against. Falls back to pest-only lines
+        # when the caller didn't supply signatures (defence in depth
+        # for older callers / tests).
+        def _problem_line(pid: str, name: str) -> str:
+            if pest_signatures and pid in pest_signatures and pest_signatures[pid]:
+                sig_block = "\n    ".join(
+                    f"• {s}" for s in pest_signatures[pid]
+                )
+                return f"- {pid}: {name}\n    {sig_block}"
+            return f"- {pid}: {name}"
+
         problems_list = "\n".join(
-            f"- {pid}: {name}"
+            _problem_line(pid, name)
             for pid, name in zip(known_problem_ids, known_problem_names)
+        )
+        signatures_note = (
+            "\n\nEach problem below is followed by the plant parts and "
+            "symptoms it is known to show on this crop at this stage "
+            "(expert-curated signatures). Compare the photos against "
+            "these signatures when deciding."
+            if pest_signatures else ""
         )
         stage_clause = (
             f" The crop is currently in the **{crop_stage_name}** stage."
@@ -279,7 +300,7 @@ Below is the EXHAUSTIVE list of problems that are known to affect this crop at t
 
 Do NOT invent a problem name or cosh_id outside the list. Do NOT guess if the photos are ambiguous — refer to an expert instead.
 
-Problem catalogue for {crop_name}:
+Problem catalogue for {crop_name}:{signatures_note}
 {problems_list}
 
 Write exactly 2 plain sentences describing what you see — simple language a farmer with no technical background can understand, no jargon.
@@ -369,6 +390,127 @@ If you cannot match any listed problem, set needs_expert=true, problem_name=null
             symptoms_observed=[],
             needs_expert=True,
         )
+
+
+# ── General management suggestions (no catalogue match) ──────────────────────
+
+class GeneralSuggestionsResult:
+    """Result of the AI's general-guidance pass when no catalogue
+    match is possible. Deliberately NOT shaped like a diagnosis — the
+    PWA renders this read-only, no commit-to-advisory, no inputs
+    bridge."""
+    def __init__(
+        self,
+        guidance: str,
+        unavailable: bool = False,
+    ):
+        self.guidance = guidance
+        self.unavailable = unavailable
+
+    def to_dict(self) -> dict:
+        return {
+            "guidance": self.guidance,
+            "unavailable": self.unavailable,
+        }
+
+
+async def generate_general_management_suggestions(
+    images: list[dict],
+    crop_name: str,
+    crop_stage_name: Optional[str],
+    language_code: str = "en",
+    language_name: Optional[str] = None,
+) -> GeneralSuggestionsResult:
+    """2026-10-01 — AI-generated general guidance for cases where the
+    curated catalogue has no match for what the farmer uploaded.
+
+    SAFETY-FIRST PROMPT. Priorities in order:
+      1. Cultural practices (sanitation, pruning, drainage, rotation).
+      2. Biological / organic controls (neem, trichoderma, BT, yellow
+         sticky traps, pheromone traps, bagging).
+      3. ONLY if clearly necessary: broad chemical categories
+         ("a systemic fungicide") — never a specific brand or
+         molecule, because banned-list rules vary by Indian state.
+
+    The output is prose paragraphs, not a structured recommendation.
+    No cosh_ids, no doses, no brand names. The PWA renders this as a
+    read-only textbox with an explicit disclaimer; it is NOT bridged
+    to the Advisory pipeline. Keeps RootsTalk's advisory surface
+    strictly expert-curated.
+
+    When ANTHROPIC_API_KEY is missing or Claude errors out,
+    `unavailable=True` so the PWA can gracefully fall back to just the
+    expert CTA.
+    """
+    if language_name is None:
+        language_name = language_name_for(language_code)
+
+    if not settings.anthropic_api_key:
+        return GeneralSuggestionsResult(
+            guidance="", unavailable=True,
+        )
+
+    if not images:
+        return GeneralSuggestionsResult(
+            guidance="", unavailable=True,
+        )
+
+    try:
+        import anthropic
+
+        stage_clause = (
+            f" in the {crop_stage_name} stage"
+            if crop_stage_name else ""
+        )
+        prompt = f"""You are a cautious agronomist helping an Indian smallholder farmer. A photo of their {crop_name} crop{stage_clause} did not match any problem in our curated catalogue. Our Science team will review this case, but in the meantime please share conservative, broadly-safe guidance the farmer can act on while they wait for the expert.
+
+Rules you MUST follow:
+1. Prioritise CULTURAL practices first (sanitation, pruning, drainage, watering changes, spacing, crop rotation).
+2. Then BIOLOGICAL / ORGANIC controls (neem oil / neem seed kernel extract, Trichoderma, Pseudomonas, Bacillus thuringiensis, pheromone traps, yellow / blue sticky traps, bagging of fruit, hand-picking of visible pests).
+3. ONLY if the issue clearly cannot be addressed by (1) + (2), you may mention a broad chemical CATEGORY ("a systemic fungicide", "a contact insecticide"). You MUST NEVER name a specific brand, specific molecule, dose, dilution, or application frequency — banned-list rules vary by state in India, and dose errors harm crops.
+4. If the photo is unclear or you have no useful suggestion, say so plainly in one sentence.
+5. Keep the whole response under 180 words. Simple sentences. No jargon.
+6. Write in {language_name}.
+
+Begin the response with one line acknowledging that this is general guidance and the expert will be best placed to confirm. Then give 2 to 4 short tips, each as its own paragraph. Finish with one line encouraging the farmer to still raise an Expert query so a specialist can verify.
+
+Return plain text only — NO JSON, NO markdown headers, NO lists with asterisks or dashes. Paragraphs separated by blank lines."""
+
+        content_blocks: list[dict] = []
+        for img in images:
+            content_blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": img.get("media_type", "image/jpeg"),
+                    "data": img["base64"],
+                },
+            })
+        content_blocks.append({"type": "text", "text": prompt})
+
+        client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=600,
+            messages=[{"role": "user", "content": content_blocks}],
+        )
+        raw = response.content[0].text.strip()
+
+        # Defence: strip any stray leading/trailing JSON braces the
+        # model might include despite the prompt. Prose only.
+        if raw.startswith("{") or raw.startswith("```"):
+            # Model slipped — try to pull a prose field out, else fall
+            # back to unavailable so the PWA doesn't show garbage.
+            logger.warning("General-suggestions response looked structured, discarding: %s", raw[:120])
+            return GeneralSuggestionsResult(guidance="", unavailable=True)
+
+        return GeneralSuggestionsResult(
+            guidance=raw,
+            unavailable=False,
+        )
+    except Exception as e:
+        logger.error(f"Claude general-suggestions failed: {e}")
+        return GeneralSuggestionsResult(guidance="", unavailable=True)
 
 
 # ── Problem description ────────────────────────────────────────────────────────
