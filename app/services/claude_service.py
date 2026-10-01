@@ -394,6 +394,31 @@ If you cannot match any listed problem, set needs_expert=true, problem_name=null
 
 # ── General management suggestions (no catalogue match) ──────────────────────
 
+class SymptomCheckResult:
+    """Result of the AI's symptom-check pass — describes what it sees
+    in the photos, plus an optional tentative problem name. The PWA
+    shows symptoms first (farmer confirms "yes, that's what I see
+    too"), THEN reveals the tentative name as a soft hypothesis. Name
+    is explicitly framed as unverified; the Expert channel stays
+    primary throughout."""
+    def __init__(
+        self,
+        symptoms_description: str,
+        tentative_name: Optional[str] = None,
+        unavailable: bool = False,
+    ):
+        self.symptoms_description = symptoms_description
+        self.tentative_name = tentative_name
+        self.unavailable = unavailable
+
+    def to_dict(self) -> dict:
+        return {
+            "symptoms_description": self.symptoms_description,
+            "tentative_name": self.tentative_name,
+            "unavailable": self.unavailable,
+        }
+
+
 class GeneralSuggestionsResult:
     """Result of the AI's general-guidance pass when no catalogue
     match is possible. Deliberately NOT shaped like a diagnosis — the
@@ -414,10 +439,113 @@ class GeneralSuggestionsResult:
         }
 
 
+async def check_crop_symptoms_and_name(
+    images: list[dict],
+    crop_name: str,
+    crop_stage_name: Optional[str],
+    language_code: str = "en",
+    language_name: Optional[str] = None,
+) -> SymptomCheckResult:
+    """2026-10-01 — Describe what the AI sees + offer a tentative
+    problem name. Called when the catalogue returned needs_expert
+    (direct-AI diagnose couldn't match any curated pest).
+
+    Why separate from `generate_general_management_suggestions`:
+    the PWA shows symptoms FIRST and asks the farmer "yes, that's
+    what I see too?" before revealing any name. If the farmer says
+    no, the AI misread the photo — we route to Expert / retry and
+    never show the name. This structure respects the farmer's
+    judgment and avoids anchoring on a potentially-wrong label.
+
+    Tentative name is explicitly framed as unverified in the PWA.
+    The Expert channel stays primary. When Claude can't produce a
+    farmer-friendly name (ambiguous photo), `tentative_name=None`
+    and the PWA falls back to showing just the general suggestions
+    without a name.
+    """
+    if language_name is None:
+        language_name = language_name_for(language_code)
+
+    if not settings.anthropic_api_key or not images:
+        return SymptomCheckResult(symptoms_description="", unavailable=True)
+
+    try:
+        import anthropic
+
+        stage_clause = (
+            f" in the {crop_stage_name} stage"
+            if crop_stage_name else ""
+        )
+        prompt = f"""You are a cautious agronomist helping an Indian smallholder farmer. A farmer uploaded photos of their {crop_name} crop{stage_clause}. The photos did NOT match any problem in our curated catalogue, so our Science team will review this case — but we want to share our initial observations with the farmer first.
+
+Please return TWO things:
+
+1. "symptoms_description" — 2 to 3 plain sentences describing EXACTLY what you see in the photos. Simple language. No pest names here. Just visible features: which leaves/parts are affected, what colour change / pattern / spots / insects / lesions you see, how widespread it appears. The farmer will confirm whether this matches what he is seeing on the ground before we reveal any possible cause. Write in {language_name}.
+
+2. "tentative_name" — ONE short phrase (2 to 4 words) naming what you THINK the problem could possibly be. Use the simple English name (e.g., "Early Blight", "Powdery Mildew", "Mealy Bug infestation"). No Latin binomials. No scientific jargon. If you genuinely cannot form a confident guess, set to null — do NOT invent a name just to fill the field. Prefer null when uncertain.
+
+Rules:
+- Both outputs are tentative — the farmer will verify.
+- Do NOT prescribe treatment here. That is a separate step.
+- Keep symptoms_description under 60 words.
+
+Respond with ONLY valid JSON, no other text:
+{{
+  "symptoms_description": "First sentence about what you see. Second sentence about pattern or spread. Optional third.",
+  "tentative_name": "Short name OR null"
+}}"""
+
+        content_blocks: list[dict] = []
+        for img in images:
+            content_blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": img.get("media_type", "image/jpeg"),
+                    "data": img["base64"],
+                },
+            })
+        content_blocks.append({"type": "text", "text": prompt})
+
+        client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=400,
+            messages=[{"role": "user", "content": content_blocks}],
+        )
+        raw = response.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        parsed = json.loads(raw)
+
+        symptoms = (parsed.get("symptoms_description") or "").strip()
+        tentative = parsed.get("tentative_name")
+        if isinstance(tentative, str):
+            tentative = tentative.strip() or None
+        else:
+            tentative = None
+
+        if not symptoms:
+            return SymptomCheckResult(symptoms_description="", unavailable=True)
+
+        return SymptomCheckResult(
+            symptoms_description=symptoms,
+            tentative_name=tentative,
+            unavailable=False,
+        )
+    except Exception as e:
+        logger.error(f"Claude symptom-check failed: {e}")
+        return SymptomCheckResult(symptoms_description="", unavailable=True)
+
+
 async def generate_general_management_suggestions(
     images: list[dict],
     crop_name: str,
     crop_stage_name: Optional[str],
+    tentative_name: Optional[str] = None,
+    symptoms_description: Optional[str] = None,
     language_code: str = "en",
     language_name: Optional[str] = None,
 ) -> GeneralSuggestionsResult:
@@ -462,7 +590,25 @@ async def generate_general_management_suggestions(
             f" in the {crop_stage_name} stage"
             if crop_stage_name else ""
         )
-        prompt = f"""You are a cautious agronomist helping an Indian smallholder farmer. A photo of their {crop_name} crop{stage_clause} did not match any problem in our curated catalogue. Our Science team will review this case, but in the meantime please share conservative, broadly-safe guidance the farmer can act on while they wait for the expert.
+        # 2026-10-01 — Context block anchors the guidance to the
+        # farmer-confirmed symptoms and the tentative name shown to
+        # him. Keeps the plan coherent with what he just saw and
+        # agreed to on the symptom-check screen. Both fields are
+        # optional — missing values fall through to the generic
+        # catalogue-less prompt.
+        context_block = ""
+        if symptoms_description:
+            context_block += f"\n\nThe farmer confirmed he is seeing: {symptoms_description}"
+        if tentative_name:
+            context_block += (
+                f"\n\nOur tentative view (unverified, to be confirmed by "
+                f"the Expert) is that this could be **{tentative_name}**. "
+                f"Shape your suggestions around managing that possibility, "
+                f"but keep them broadly safe — treatments that would still "
+                f"help even if the exact problem turns out to be slightly "
+                f"different."
+            )
+        prompt = f"""You are a cautious agronomist helping an Indian smallholder farmer. A photo of their {crop_name} crop{stage_clause} did not match any problem in our curated catalogue. Our Science team will review this case, but in the meantime please share conservative, broadly-safe guidance the farmer can act on while they wait for the expert.{context_block}
 
 Rules you MUST follow:
 1. Prioritise CULTURAL practices first (sanitation, pruning, drainage, watering changes, spacing, crop rotation).

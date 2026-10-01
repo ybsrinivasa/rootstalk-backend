@@ -40,6 +40,7 @@ from app.modules.diagnosis.models import DiagnosisSession
 from app.modules.diagnosis.schemas import (
     AIDirectDiagnoseRequest,
     AIGeneralSuggestionsRequest,
+    AISymptomCheckRequest,
     AnswerRequest,
     CommitToAdvisoryRequest,
     ExplainSymptomRequest,
@@ -65,6 +66,7 @@ from app.services.bl08_diagnosis_path import (
 from app.services.claude_service import (
     analyze_crop_image,
     analyze_crop_images_constrained,
+    check_crop_symptoms_and_name,
     check_symptom_in_image,
     enrich_problem_with_description,
     explain_symptom,
@@ -1205,19 +1207,69 @@ async def ai_direct_diagnose(
     }
 
 
+@router.post("/diagnosis/ai-symptom-check")
+async def ai_symptom_check(
+    request: AISymptomCheckRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """2026-10-01 — Step 1 of the AI-fallback flow. Returns a plain-
+    English description of what the AI sees in the photos (farmer-
+    verifiable from his own field) plus an optional tentative problem
+    name. PWA shows symptoms FIRST and asks the farmer to confirm —
+    the name is held back until the farmer agrees the symptoms
+    match. Respects the farmer's judgment and avoids anchoring on a
+    potentially-wrong label.
+    """
+    from app.modules.subscriptions.models import Subscription
+
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == request.subscription_id,
+            Subscription.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    crop_name = await resolve_name_for_cosh_id(
+        db, request.crop_cosh_id, request.language_code,
+    ) or request.crop_cosh_id
+    stage_name = await resolve_name_for_cosh_id(
+        db, request.crop_stage_cosh_id, request.language_code,
+    ) if request.crop_stage_cosh_id else None
+
+    result = await check_crop_symptoms_and_name(
+        images=[{"base64": i.base64, "media_type": i.media_type} for i in request.images],
+        crop_name=crop_name,
+        crop_stage_name=stage_name,
+        language_code=request.language_code,
+        language_name=language_name_for(request.language_code),
+    )
+    return {
+        "subscription_id": request.subscription_id,
+        **result.to_dict(),
+    }
+
+
 @router.post("/diagnosis/ai-general-suggestions")
 async def ai_general_suggestions(
     request: AIGeneralSuggestionsRequest,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """2026-10-01 — Fallback for the direct-AI path when the catalogue
-    had no confident match. Generates safe, conservative general
+    """2026-10-01 — Step 3 of the AI-fallback flow (Step 2 is a PWA-
+    only choice screen). Generates safe, conservative general
     guidance (cultural + biological first, chemical categories only
     as last resort — never a specific brand or dose). Output is prose
     paragraphs rendered read-only in the PWA; NOT bridged into the
     Advisory pipeline (RootsTalk's advisory surface stays strictly
     expert-curated).
+
+    `tentative_name` + `symptoms_description` (from the preceding
+    ai-symptom-check call) anchor the guidance to what the farmer
+    just confirmed. Both are optional — missing context falls back
+    to the generic catalogue-less prompt.
 
     The farmer should still raise an Expert query — this is holding
     guidance for the wait, not a substitute. The PWA primary CTA
@@ -1246,6 +1298,8 @@ async def ai_general_suggestions(
         images=[{"base64": i.base64, "media_type": i.media_type} for i in request.images],
         crop_name=crop_name,
         crop_stage_name=stage_name,
+        tentative_name=request.tentative_name,
+        symptoms_description=request.symptoms_description,
         language_code=request.language_code,
         language_name=language_name_for(request.language_code),
     )

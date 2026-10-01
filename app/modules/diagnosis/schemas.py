@@ -81,14 +81,33 @@ class AIDirectDiagnoseRequest(BaseModel):
     language_code: str = "en"
 
 
-class AIGeneralSuggestionsRequest(BaseModel):
-    """2026-10-01 — Fallback for the direct-AI path when the catalogue
-    had no confident match. Same image shape as the diagnose request;
-    output is read-only farmer guidance (not advisory-bridged)."""
+class AISymptomCheckRequest(BaseModel):
+    """2026-10-01 — Step 1 of the AI-fallback flow when the catalogue
+    had no confident match. Returns a plain-English description of
+    what the AI sees + optional tentative problem name. PWA asks the
+    farmer to confirm symptoms before revealing the name."""
     subscription_id: str
     crop_cosh_id: str
     crop_stage_cosh_id: Optional[str] = None
     images: list[AIDirectImage]
+    language_code: str = "en"
+
+
+class AIGeneralSuggestionsRequest(BaseModel):
+    """2026-10-01 — Fallback for the direct-AI path when the catalogue
+    had no confident match. Same image shape as the diagnose request;
+    output is read-only farmer guidance (not advisory-bridged).
+
+    `tentative_name` and `symptoms_description` are optional context
+    from the preceding symptom-check call — they let the AI generate
+    guidance that is coherent with what the farmer just confirmed.
+    """
+    subscription_id: str
+    crop_cosh_id: str
+    crop_stage_cosh_id: Optional[str] = None
+    images: list[AIDirectImage]
+    tentative_name: Optional[str] = None
+    symptoms_description: Optional[str] = None
     language_code: str = "en"
 
 
