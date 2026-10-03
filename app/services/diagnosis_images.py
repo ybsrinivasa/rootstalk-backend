@@ -169,14 +169,18 @@ async def build_google_images_query(
     )).scalars().all()
     by_id = {r.cosh_id: r for r in rows}
 
+    # 2026-10-03 — Wrap multi-word terms in quotes so Google treats
+    # them as a phrase match. "Fruit Fly" surfaces the pest; Fruit
+    # Fly (unquoted) surfaces unrelated pages about fruit + flies.
+    # Single-word terms are left bare — no phrase to lock.
     parts: list[str] = []
     for cid in lookups:
         row = by_id.get(cid)
         if not row:
             continue
-        name = pick_translation(row.translations, language_code, "")
+        name = (pick_translation(row.translations, language_code, "") or "").strip()
         if name:
-            parts.append(name)
+            parts.append(f'"{name}"' if " " in name else name)
     return " ".join(parts).strip()
 
 
