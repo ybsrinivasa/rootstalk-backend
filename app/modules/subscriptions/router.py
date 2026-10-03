@@ -3280,6 +3280,16 @@ async def respond_to_assignment(
         else:
             title = "Farmer declined your assignment"
             body = "The farmer declined the subscription. The unit is back in your allocation."
+        # 2026-10-03 — Pre-existing click_action pointed at /promoter/farmers
+        # which is NOT a real PWA route (only /dealer/promoted-farmers/
+        # and /facilitator/promoted-farmers/ exist). Caused a 404 post-tap
+        # on the acceptance confirmation toast. assignment.promoter_type is
+        # already on the row — branch on it to pick the right role-specific
+        # subscription detail route.
+        if assignment.promoter_type == "FACILITATOR":
+            click_action = f"/facilitator/promoted-farmers/{subscription_id}"
+        else:
+            click_action = f"/dealer/promoted-farmers/{subscription_id}"
         try:
             await send_fcm(
                 token=promoter.fcm_token,
@@ -3287,7 +3297,7 @@ async def respond_to_assignment(
                 data={
                     "type": "ASSIGNMENT_ACCEPTED" if approved else "ASSIGNMENT_REJECTED",
                     "subscription_id": subscription_id,
-                    "click_action": "/promoter/farmers",
+                    "click_action": click_action,
                 },
             )
         except Exception:
