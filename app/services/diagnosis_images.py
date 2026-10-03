@@ -169,18 +169,32 @@ async def build_google_images_query(
     )).scalars().all()
     by_id = {r.cosh_id: r for r in rows}
 
-    # 2026-10-03 — Wrap multi-word terms in quotes so Google treats
-    # them as a phrase match. "Fruit Fly" surfaces the pest; Fruit
-    # Fly (unquoted) surfaces unrelated pages about fruit + flies.
-    # Single-word terms are left bare — no phrase to lock.
+    # 2026-10-03 — Query hygiene for Google Images:
+    #   * multi-word terms wrapped in double quotes → phrase match.
+    #     "Fruit Fly" surfaces the pest; Fruit Fly (unquoted) returns
+    #     unrelated pages about fruit + flies.
+    #   * symptom terms get " symptom" bundled INSIDE the quoted
+    #     phrase. Field test: `"Shape Change" Fruit Cucumber` returned
+    #     Amazon fruit-shaping molds and PNAS gene-expression papers;
+    #     `"Shape Change symptom" Fruit Cucumber` returned Cornell
+    #     Vegetables, ResearchGate, Gardening Know How — real agri/
+    #     pathology references. The word "symptom" anchors Google into
+    #     the right domain.
+    symptom_ids = {cid for cid in (symptom_cosh_id, sub_symptom_cosh_id) if cid}
     parts: list[str] = []
     for cid in lookups:
         row = by_id.get(cid)
         if not row:
             continue
         name = (pick_translation(row.translations, language_code, "") or "").strip()
-        if name:
-            parts.append(f'"{name}"' if " " in name else name)
+        if not name:
+            continue
+        if cid in symptom_ids:
+            parts.append(f'"{name} symptom"')
+        elif " " in name:
+            parts.append(f'"{name}"')
+        else:
+            parts.append(name)
     return " ".join(parts).strip()
 
 
