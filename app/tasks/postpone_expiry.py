@@ -163,7 +163,10 @@ async def _sweep_expired_postpones_with_session(db, now=None) -> int:
                         token=f.fcm_token,
                         title=POSTPONE_EXPIRED_FCM_TITLE,
                         body=POSTPONE_EXPIRED_FCM_BODY,
-                        data={"type": "POSTPONE_EXPIRED"},
+                        data={
+                            "type": "POSTPONE_EXPIRED",
+                            "click_action": "/orders",
+                        },
                     )
                 except Exception as e:
                     logger.error(f"FCM send raised for farmer {f.id}: {e}")
@@ -248,7 +251,10 @@ async def _sweep_postpone_warnings_with_session(db, now=None) -> int:
                 token=d.fcm_token,
                 title=POSTPONE_WARNING_FCM_TITLE,
                 body=POSTPONE_WARNING_FCM_BODY,
-                data={"type": "POSTPONE_WARNING_24H"},
+                data={
+                    "type": "POSTPONE_WARNING_24H",
+                    "click_action": "/dealer/postponed",
+                },
             )
             pushed += 1
         except Exception as e:

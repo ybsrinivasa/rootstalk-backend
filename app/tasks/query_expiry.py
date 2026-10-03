@@ -76,6 +76,7 @@ async def _expire_queries_with_session(db, now=None) -> int:
                         "type": "QUERY_EXPIRED",
                         "query_id": query.id,
                         "subscription_id": query.subscription_id,
+                        "click_action": f"/crop-detail/{query.subscription_id}/queries",
                     },
                 )
             except Exception as e:

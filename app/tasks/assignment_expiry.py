@@ -152,6 +152,7 @@ async def _expire_assignments_with_session(db, now=None) -> int:
                     "type": "PROMOTER_ASSIGNMENT_AUTO_EXPIRED",
                     "assignment_id": a.id,
                     "subscription_id": a.subscription_id,
+                    "click_action": "/",
                 },
             )
         except Exception:

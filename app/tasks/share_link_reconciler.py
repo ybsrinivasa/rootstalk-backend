@@ -171,6 +171,7 @@ async def _reconcile_share_link_payments_with_session(
                             "subscription_id": pr.subscription_id,
                             "reference_number": sub.reference_number if sub else "",
                             "via": "reconciler",
+                            "click_action": f"/advisory/{pr.subscription_id}",
                         },
                     )
                 except Exception:

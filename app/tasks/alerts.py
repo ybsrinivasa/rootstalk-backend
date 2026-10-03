@@ -457,12 +457,25 @@ async def _send_to_recipient(
         except Exception as e:
             logger.error(f"SMS send failed to {user.phone}: {e}")
     if user.fcm_token:
+        # 2026-10-03 — Tap-through target. Farmers get their crop
+        # advisory for this subscription (the START_DATE / INPUT
+        # alert is about work due on that advisory). LOCAL_PERSON
+        # recipients (dealer / facilitator promoter mirroring the
+        # farmer's advisory) land on the app root — the role-aware
+        # home routes them to their own feed. Future refinement:
+        # look up ClientPromoter.promoter_type and route to
+        # /dealer/alerts-incoming or /facilitator/alerts-incoming.
+        if recipient.role == "FARMER":
+            click_action = f"/advisory/{sub_id}"
+        else:
+            click_action = "/"
         try:
             await send_fcm(
                 token=user.fcm_token, title=fcm_title, body=fcm_body,
                 data={
                     "alert_type": alert_type.value if hasattr(alert_type, "value") else str(alert_type),
                     "subscription_id": sub_id,
+                    "click_action": click_action,
                 },
             )
         except Exception as e:
