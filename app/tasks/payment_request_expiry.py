@@ -82,6 +82,7 @@ async def _expire_payment_requests_with_session(db, now=None) -> int:
                     "type": "PAYMENT_REQUEST_AUTO_EXPIRED",
                     "subscription_id": pr.subscription_id,
                     "payment_request_id": pr.id,
+                    "click_action": "/home",
                 },
             )
         except Exception:

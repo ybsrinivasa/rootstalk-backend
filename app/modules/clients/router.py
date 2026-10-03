@@ -3000,7 +3000,11 @@ async def revoke_promoter(
                 token=promoter_user.fcm_token,
                 title=title,
                 body=body,
-                data={"type": "PROMOTER_ROLE_ENDED", "client_id": client_id},
+                data={
+                    "type": "PROMOTER_ROLE_ENDED",
+                    "client_id": client_id,
+                    "click_action": "/",
+                },
             )
     except Exception as exc:   # noqa: BLE001
         import logging

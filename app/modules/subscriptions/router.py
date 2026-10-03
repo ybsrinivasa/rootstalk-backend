@@ -2505,6 +2505,7 @@ async def initiate_assignment(
                     "type": "PROMOTER_ASSIGNMENT_RECEIVED",
                     "subscription_id": sub.id,
                     "assignment_id": assignment.id,
+                    "click_action": f"/assignment/{sub.id}",
                 },
             )
         except Exception:
@@ -2875,6 +2876,7 @@ async def promoter_cancel_assignment(
                     "type": "PROMOTER_ASSIGNMENT_WITHDRAWN",
                     "assignment_id": assignment.id,
                     "subscription_id": sub.id,
+                    "click_action": "/home",
                 },
             )
         except Exception:
@@ -3558,6 +3560,7 @@ async def delegate_payment(
                     "type": "PAYMENT_REQUEST_RECEIVED",
                     "payment_request_id": pr.id,
                     "subscription_id": subscription_id,
+                    "click_action": "/",
                 },
             )
         except Exception:
@@ -3780,6 +3783,7 @@ async def cancel_delegation(
                     data={
                         "type": "PAYMENT_REQUEST_CANCELLED_BY_FARMER",
                         "subscription_id": sub.id,
+                        "click_action": "/",
                     },
                 )
             except Exception:
@@ -3980,6 +3984,7 @@ async def decline_payment(
                     "type": "PAYMENT_REQUEST_DECLINED",
                     "subscription_id": pr.subscription_id,
                     "payment_request_id": pr.id,
+                    "click_action": "/home",
                 },
             )
         except Exception:
@@ -4453,6 +4458,7 @@ async def dealer_verify_payment(
                     "type": "SUBSCRIPTION_ACTIVATED",
                     "subscription_id": pr.subscription_id,
                     "reference_number": sub.reference_number if sub else "",
+                    "click_action": f"/advisory/{pr.subscription_id}",
                 },
             )
         except Exception:
@@ -4584,6 +4590,7 @@ async def razorpay_webhook(
                         "type": "SUBSCRIPTION_ACTIVATED",
                         "subscription_id": pr.subscription_id,
                         "reference_number": sub.reference_number if sub else "",
+                        "click_action": f"/advisory/{pr.subscription_id}",
                     },
                 )
             except Exception:
@@ -4608,6 +4615,7 @@ async def razorpay_webhook(
                         "type": "PAYMENT_REQUEST_AUTO_EXPIRED",
                         "subscription_id": pr.subscription_id,
                         "payment_request_id": pr.id,
+                        "click_action": "/home",
                     },
                 )
             except Exception:

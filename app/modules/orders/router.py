@@ -5652,6 +5652,7 @@ async def submit_for_approval(
                             "type": "ORDER_AWAITING_FARMER_APPROVAL",
                             "order_id": order.id,
                             "farmer_user_id": order.farmer_user_id,
+                            "click_action": f"/facilitator/orders/{order.id}",
                         },
                     )
                 except Exception as e:
@@ -6144,6 +6145,7 @@ async def farmer_mark_packing_received(
                         data={
                             "type": "ORDER_RECEIVED_BY_FARMER",
                             "order_id": order.id,
+                            "click_action": f"/dealer/orders/{order.id}",
                         },
                     )
                 except Exception as e:
@@ -12175,6 +12177,7 @@ async def facilitator_decline_payment(
                     "type": "PAYMENT_REQUEST_DECLINED",
                     "subscription_id": req.subscription_id,
                     "payment_request_id": req.id,
+                    "click_action": "/home",
                 },
             )
         except Exception:

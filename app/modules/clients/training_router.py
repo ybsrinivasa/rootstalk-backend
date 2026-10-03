@@ -829,6 +829,7 @@ async def invite_farmer_to_training(
                     "subscription_id": sub.id,
                     "assignment_id": assignment.id,
                     "is_training": "true",
+                    "click_action": f"/assignment/{sub.id}",
                 },
             )
         except Exception:
