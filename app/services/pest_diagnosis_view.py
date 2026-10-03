@@ -189,8 +189,26 @@ async def _list_dimension(
     name_by_id = await _resolve_core_names(
         db, core_type=core_type, cosh_ids=cosh_ids, lang=lang,
     )
+    # 2026-10-03 — Also resolve the English name alongside the
+    # localised one. PWA uses `name_en` for emoji lookup on the
+    # stage / plant-part pickers (the lookup is a substring match
+    # on English keywords like "root", "leaf", "reproductive"),
+    # which previously collapsed to the default sprout for every
+    # non-English locale. `name` stays the farmer-facing display
+    # value in `lang`. Skip the extra query when the user is
+    # already on English.
+    if lang != "en":
+        name_en_by_id = await _resolve_core_names(
+            db, core_type=core_type, cosh_ids=cosh_ids, lang="en",
+        )
+    else:
+        name_en_by_id = name_by_id
     items = [
-        {"cosh_id": c, "name": name_by_id.get(c, c)}
+        {
+            "cosh_id": c,
+            "name": name_by_id.get(c, c),
+            "name_en": name_en_by_id.get(c, name_by_id.get(c, c)),
+        }
         for c in cosh_ids if c in name_by_id
     ]
     return sorted(items, key=lambda x: x["name"].casefold())
