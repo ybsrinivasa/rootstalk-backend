@@ -4668,6 +4668,12 @@ async def my_subscriptions(
     lang = current_user.language_code or "en"
     crop_ids = {crop for _, crop in pkg_by_id.values() if crop}
     crop_name_by_id: dict[str, str | None] = {}
+    # 2026-10-03 — Also carry the English crop name alongside the
+    # localised one. The Google Images "see photos" affordance on the
+    # diagnose screens searches better with English terms (specialised
+    # agri databases index primarily in English); the farmer sees the
+    # localised crop name on-screen but the search URL uses English.
+    crop_name_en_by_id: dict[str, str | None] = {}
     if crop_ids:
         name_rows = (await db.execute(
             select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
@@ -4676,8 +4682,10 @@ async def my_subscriptions(
         for cosh_id, translations in name_rows:
             if isinstance(translations, dict):
                 crop_name_by_id[cosh_id] = pick_translation(translations, lang, "")
+                crop_name_en_by_id[cosh_id] = pick_translation(translations, "en", "")
             else:
                 crop_name_by_id[cosh_id] = None
+                crop_name_en_by_id[cosh_id] = None
 
     # ── Client identity per subscription. Surfaced so inside
     # screens (advisory, diagnose, ask-expert, …) can render a
@@ -4902,6 +4910,9 @@ async def my_subscriptions(
             "package_name": pkg_name,
             "crop_cosh_id": crop_cosh_id,
             "crop_name": crop_name_by_id.get(crop_cosh_id) if crop_cosh_id else None,
+            # 2026-10-03 — English name for the diagnose Google Images
+            # search affordance; see crop_name_en_by_id above.
+            "crop_name_en": crop_name_en_by_id.get(crop_cosh_id) if crop_cosh_id else None,
             "client_display_name": client.get("client_display_name"),
             "client_logo_url": client.get("client_logo_url"),
             "client_primary_colour": client.get("client_primary_colour"),

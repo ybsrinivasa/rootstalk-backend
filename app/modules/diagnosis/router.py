@@ -395,6 +395,11 @@ async def _get_problem_info(
             return {
                 "cosh_id": problem_cosh_id,
                 "name": pick_translation(pg.translations, lang, problem_cosh_id),
+                # 2026-10-03 — Carry the English name explicitly for
+                # Google Images search on the diagnose screens (better
+                # agri-reference hits in English). Falls back to the
+                # localised name when English is missing.
+                "name_en": pick_translation(pg.translations, "en", "") or pick_translation(pg.translations, lang, problem_cosh_id),
                 "translations": pg.translations,
                 "type": "problem_group",
                 "parent_cosh_id": pg.parent_cosh_id,
@@ -412,17 +417,20 @@ async def _get_problem_info(
             return {
                 "cosh_id": problem_cosh_id,
                 "name": pick_translation(any_core.translations, lang, problem_cosh_id),
+                "name_en": pick_translation(any_core.translations, "en", "") or pick_translation(any_core.translations, lang, problem_cosh_id),
                 "translations": any_core.translations,
                 "type": any_core.core_type,
             }
         return {
             "cosh_id": problem_cosh_id,
             "name": problem_cosh_id,
+            "name_en": problem_cosh_id,
             "type": "unknown",
         }
     return {
         "cosh_id": problem_cosh_id,
         "name": pick_translation(sp.translations, lang, problem_cosh_id),
+        "name_en": pick_translation(sp.translations, "en", "") or pick_translation(sp.translations, lang, problem_cosh_id),
         "translations": sp.translations,
         "type": "specific_problem",
         "parent_cosh_id": sp.parent_cosh_id,
@@ -1495,6 +1503,11 @@ async def get_reference_images(
         sub_symptom_cosh_id=request.sub_symptom_cosh_id,
         language_code=request.language_code,
     )
+    # 2026-10-03 — Force English for Google Images search. Agricultural
+    # reference databases (TNAU, CABI, KAU, Plantwise, USDA) index
+    # primarily in English, so even a Kannada farmer gets dramatically
+    # better reference hits on an English query than on a localised one.
+    # Independent of the farmer's PWA language.
     query = await build_google_images_query(
         db,
         crop_cosh_id=request.crop_cosh_id,
@@ -1502,7 +1515,7 @@ async def get_reference_images(
         symptom_cosh_id=request.symptom_cosh_id,
         sub_part_cosh_id=request.sub_part_cosh_id,
         sub_symptom_cosh_id=request.sub_symptom_cosh_id,
-        language_code=request.language_code,
+        language_code="en",
     )
     return {
         "images": [
