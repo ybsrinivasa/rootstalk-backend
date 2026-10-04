@@ -42,6 +42,34 @@ def _indic_budget(language_code: str | None, english_budget: int) -> int:
     return english_budget
 
 
+def _log_llm_usage(response, *, callsite: str, language_code: str | None, cap: int) -> None:
+    """Log Claude response usage + stop_reason for cost / truncation
+    monitoring. Grep `claude_usage` to aggregate per-callsite spend.
+    `stop=max_tokens` means the cap was hit and output may be
+    truncated — raise this callsite's _indic_budget argument.
+
+    Never raises; a telemetry failure must not break the API path."""
+    try:
+        logger.info(
+            "claude_usage callsite=%s lang=%s stop=%s in=%d out=%d cap=%d",
+            callsite,
+            language_code or "en",
+            response.stop_reason,
+            response.usage.input_tokens,
+            response.usage.output_tokens,
+            cap,
+        )
+        if response.stop_reason == "max_tokens":
+            logger.warning(
+                "claude_usage HIT_CAP callsite=%s lang=%s cap=%d output_tokens=%d — "
+                "output may be truncated. Raise the _indic_budget baseline "
+                "for this callsite.",
+                callsite, language_code or "en", cap, response.usage.output_tokens,
+            )
+    except Exception as e:
+        logger.debug("claude_usage log failed: %s", e)
+
+
 # ── Data structures ────────────────────────────────────────────────────────────
 
 class ImageAnalysisResult:
@@ -156,9 +184,10 @@ Respond with ONLY valid JSON, no other text:
 }}"""
 
         client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        cap = _indic_budget(language_code, 512)
         response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=_indic_budget(language_code, 512),
+            max_tokens=cap,
             messages=[
                 {
                     "role": "user",
@@ -179,6 +208,8 @@ Respond with ONLY valid JSON, no other text:
                 }
             ],
         )
+        _log_llm_usage(response, callsite="analyze_crop_image",
+                       language_code=language_code, cap=cap)
 
         raw = response.content[0].text.strip()
 
@@ -356,11 +387,14 @@ If you cannot match any listed problem, set needs_expert=true, problem_name=null
         content_blocks.append({"type": "text", "text": prompt})
 
         client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        cap = _indic_budget(language_code, 600)
         response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=_indic_budget(language_code, 600),
+            max_tokens=cap,
             messages=[{"role": "user", "content": content_blocks}],
         )
+        _log_llm_usage(response, callsite="analyze_crop_images_constrained",
+                       language_code=language_code, cap=cap)
         raw = response.content[0].text.strip()
 
         if raw.startswith("```"):
@@ -532,11 +566,14 @@ Respond with ONLY valid JSON, no other text:
         content_blocks.append({"type": "text", "text": prompt})
 
         client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        cap = _indic_budget(language_code, 400)
         response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=_indic_budget(language_code, 400),
+            max_tokens=cap,
             messages=[{"role": "user", "content": content_blocks}],
         )
+        _log_llm_usage(response, callsite="check_crop_symptoms_and_name",
+                       language_code=language_code, cap=cap)
         raw = response.content[0].text.strip()
         if raw.startswith("```"):
             raw = raw.split("```")[1]
@@ -659,11 +696,14 @@ Return plain text only — NO JSON, NO markdown headers, NO lists with asterisks
         content_blocks.append({"type": "text", "text": prompt})
 
         client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        cap = _indic_budget(language_code, 600)
         response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=_indic_budget(language_code, 600),
+            max_tokens=cap,
             messages=[{"role": "user", "content": content_blocks}],
         )
+        _log_llm_usage(response, callsite="generate_general_management_suggestions",
+                       language_code=language_code, cap=cap)
         raw = response.content[0].text.strip()
 
         # Defence: strip any stray leading/trailing JSON braces the
@@ -731,11 +771,14 @@ Rules:
 Output ONLY the 2 sentences, nothing else."""
 
         client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        cap = _indic_budget(language_code, 150)
         response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=_indic_budget(language_code, 150),
+            max_tokens=cap,
             messages=[{"role": "user", "content": prompt}],
         )
+        _log_llm_usage(response, callsite="describe_crop_problem",
+                       language_code=language_code, cap=cap)
 
         description = response.content[0].text.strip()
 
@@ -808,11 +851,14 @@ Rules:
 Output ONLY the 2 sentences, nothing else."""
 
         client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        cap = _indic_budget(language_code, 200)
         response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=_indic_budget(language_code, 200),
+            max_tokens=cap,
             messages=[{"role": "user", "content": prompt}],
         )
+        _log_llm_usage(response, callsite="explain_symptom",
+                       language_code=language_code, cap=cap)
         return response.content[0].text.strip()
     except Exception as e:
         logger.error(f"Claude symptom explanation failed: {e}")
@@ -910,9 +956,10 @@ Output ONLY this JSON (no markdown, no preamble):
 {{"verdict": "YES|NO|UNCERTAIN", "confidence": "HIGH|MEDIUM|LOW", "reasoning": "..."}}"""
 
         client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        cap = _indic_budget(language_code, 350)
         response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=_indic_budget(language_code, 350),
+            max_tokens=cap,
             messages=[{
                 "role": "user",
                 "content": [
@@ -928,6 +975,8 @@ Output ONLY this JSON (no markdown, no preamble):
                 ],
             }],
         )
+        _log_llm_usage(response, callsite="check_symptom_in_image",
+                       language_code=language_code, cap=cap)
         raw = response.content[0].text.strip()
         # Tolerate stray code fences if the model wraps the JSON.
         if raw.startswith("```"):
