@@ -706,10 +706,21 @@ Rules:
 
 Output ONLY the 2 sentences, nothing else."""
 
+        # 2026-10-04 — Indic scripts tokenise ~3-5× less efficiently than
+        # English in Claude's BPE tokeniser (trained on English corpus).
+        # A 2-sentence output that fits comfortably in 150 tokens for
+        # English runs 400-700 tokens in Kannada / Hindi / Tamil / etc.
+        # Prior budget of 150 caused mid-word truncation on Indic locales
+        # — reported for kn 2026-10-04 ("ಹಣ್ಣಿನ ನೊ" cut off before "ಣ").
+        # Raise budget to 600 for Indic locales; keep 150 for English
+        # (cheaper + still enough).
+        _INDIC_LOCALES = {"hi", "kn", "ta", "te", "ml", "mr", "gu",
+                          "pa", "or", "bn", "as", "ur"}
+        max_tokens = 600 if language_code in _INDIC_LOCALES else 150
         client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
         response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=150,
+            max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],
         )
 
