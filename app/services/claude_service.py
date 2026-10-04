@@ -17,6 +17,30 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+# 2026-10-04 — Indic scripts tokenise ~3-5× less efficiently than English
+# in Claude's BPE tokeniser (trained on English corpus). Any Claude call
+# that produces farmer-facing text in `language_code` needs to inflate
+# max_tokens for Indic locales or risk mid-word truncation.
+# Reported for kn 2026-10-04 ("ಹಣ್ಣಿನ ನೊ" cut off before "ಣ" on the
+# diagnose confirming card at max_tokens=150).
+# Gotcha captured in feedback_claude_indic_token_inflation.md.
+_INDIC_LOCALES = frozenset({
+    "hi", "kn", "ta", "te", "ml", "mr", "gu",
+    "pa", "or", "bn", "as", "ur",
+})
+
+
+def _indic_budget(language_code: str | None, english_budget: int) -> int:
+    """Return max_tokens inflated 4× for Indic locales.
+
+    Rule of thumb: covers 3-5× tokeniser inflation with headroom.
+    English + Latin-script locales keep the baseline budget. Use at
+    every Claude callsite that produces user-facing text in the
+    farmer's language."""
+    if (language_code or "").strip() in _INDIC_LOCALES:
+        return english_budget * 4
+    return english_budget
+
 
 # ── Data structures ────────────────────────────────────────────────────────────
 
@@ -134,7 +158,7 @@ Respond with ONLY valid JSON, no other text:
         client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
         response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=512,
+            max_tokens=_indic_budget(language_code, 512),
             messages=[
                 {
                     "role": "user",
@@ -334,7 +358,7 @@ If you cannot match any listed problem, set needs_expert=true, problem_name=null
         client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
         response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=600,
+            max_tokens=_indic_budget(language_code, 600),
             messages=[{"role": "user", "content": content_blocks}],
         )
         raw = response.content[0].text.strip()
@@ -510,7 +534,7 @@ Respond with ONLY valid JSON, no other text:
         client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
         response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=400,
+            max_tokens=_indic_budget(language_code, 400),
             messages=[{"role": "user", "content": content_blocks}],
         )
         raw = response.content[0].text.strip()
@@ -637,7 +661,7 @@ Return plain text only — NO JSON, NO markdown headers, NO lists with asterisks
         client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
         response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=600,
+            max_tokens=_indic_budget(language_code, 600),
             messages=[{"role": "user", "content": content_blocks}],
         )
         raw = response.content[0].text.strip()
@@ -706,21 +730,10 @@ Rules:
 
 Output ONLY the 2 sentences, nothing else."""
 
-        # 2026-10-04 — Indic scripts tokenise ~3-5× less efficiently than
-        # English in Claude's BPE tokeniser (trained on English corpus).
-        # A 2-sentence output that fits comfortably in 150 tokens for
-        # English runs 400-700 tokens in Kannada / Hindi / Tamil / etc.
-        # Prior budget of 150 caused mid-word truncation on Indic locales
-        # — reported for kn 2026-10-04 ("ಹಣ್ಣಿನ ನೊ" cut off before "ಣ").
-        # Raise budget to 600 for Indic locales; keep 150 for English
-        # (cheaper + still enough).
-        _INDIC_LOCALES = {"hi", "kn", "ta", "te", "ml", "mr", "gu",
-                          "pa", "or", "bn", "as", "ur"}
-        max_tokens = 600 if language_code in _INDIC_LOCALES else 150
         client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
         response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=max_tokens,
+            max_tokens=_indic_budget(language_code, 150),
             messages=[{"role": "user", "content": prompt}],
         )
 
@@ -797,7 +810,7 @@ Output ONLY the 2 sentences, nothing else."""
         client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
         response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=200,
+            max_tokens=_indic_budget(language_code, 200),
             messages=[{"role": "user", "content": prompt}],
         )
         return response.content[0].text.strip()
@@ -899,7 +912,7 @@ Output ONLY this JSON (no markdown, no preamble):
         client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
         response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=350,
+            max_tokens=_indic_budget(language_code, 350),
             messages=[{
                 "role": "user",
                 "content": [
