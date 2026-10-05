@@ -5278,12 +5278,32 @@ async def get_advisory_cluster(
             "in_app_orders_enabled": bool(sub.in_app_orders_enabled) if sub.in_app_orders_enabled is not None else False,
         }
 
+    # 2026-10-05 — Advisory-Only Mode farmers who diagnose a problem
+    # get a TriggeredCHAEntry created by /commit-to-advisory, which
+    # _today_advisory_for_user surfaces as a `cha-{src}-{tl_id}`
+    # timeline. These are triggered_at-anchored (not in `fixed_ranges`,
+    # not in any CCA cluster's `tl_ids`) so the cluster response used
+    # to drop them silently. Collect today's active CHA TLs once and
+    # include them in every return path below.
+    cha_tls_active_today: list[dict] = []
+    today_data = await _today_advisory_for_user(
+        db, farmer_user_id=current_user.id,
+        only_subscription_id=subscription_id, lang=lang, for_date=today,
+    )
+    if today_data and today_data[0].get('timelines'):
+        cha_tls_active_today = [
+            tl for tl in today_data[0]['timelines']
+            if isinstance(tl.get('id'), str) and tl['id'].startswith('cha-')
+        ]
+
     if not clusters:
-        # Degenerate: no fixed-window timelines at all.
+        # Degenerate: no fixed-window CCA timelines at all. Any active
+        # CHA still gets surfaced so the farmer sees their diagnosed
+        # treatment recommendations.
         return {
             **_base_payload(),
             "cluster": None,
-            "timelines": [],
+            "timelines": cha_tls_active_today,
             "ongoing_timelines": ongoing_timelines_out,
         }
 
@@ -5337,7 +5357,10 @@ async def get_advisory_cluster(
                 "total": len(clusters),
                 "current_index": current_idx,
             },
-            "timelines": [],
+            # Pre-sowing / post-crop empty state still surfaces active
+            # CHA so a diagnosed problem is visible when today falls
+            # in a cluster gap.
+            "timelines": list(cha_tls_active_today),
             "ongoing_timelines": ongoing_timelines_out,
         }
 
@@ -5365,9 +5388,16 @@ async def get_advisory_cluster(
         )
         if day_data and day_data[0].get('timelines'):
             for tl in day_data[0]['timelines']:
-                if tl.get('id') not in target['tl_ids']:
+                tl_id = tl.get('id')
+                # 2026-10-05 — CHA TLs are triggered_at-anchored, not
+                # in `fixed_ranges`, so they're never in `target['tl_ids']`.
+                # Pass them through: `_today_advisory_for_user` already
+                # pre-filtered them to "active on `day`" so if they
+                # come through, they belong in the response.
+                is_cha_tl = isinstance(tl_id, str) and tl_id.startswith('cha-')
+                if tl_id not in target['tl_ids'] and not is_cha_tl:
                     continue
-                bucket = merged.setdefault(tl['id'], {**tl, 'practices': {}})
+                bucket = merged.setdefault(tl_id, {**tl, 'practices': {}})
                 for p in tl.get('practices', []):
                     # Dedupe by practice id — a practice recurring across
                     # days of the cluster surfaces once. Its occurrence_date
