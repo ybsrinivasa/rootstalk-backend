@@ -8296,8 +8296,9 @@ async def get_practice_brands_farmer(
     past_window = False
     try:
         from app.modules.subscriptions.snapshot_models import LockedTimelineSnapshot
+        from app.modules.subscriptions.models import TriggeredCHAEntry
         from app.services.snapshot_render import (
-            cca_calendar_dates, metadata_from_content,
+            cca_calendar_dates, cha_calendar_dates, metadata_from_content,
         )
 
         tl_row = (await db.execute(
@@ -8305,34 +8306,92 @@ async def get_practice_brands_farmer(
                 Practice, Practice.timeline_id == Timeline.id,
             ).where(Practice.id == practice_id)
         )).scalars().first()
-        if tl_row is not None and sub.crop_start_date is not None:
-            snap = (await db.execute(
-                select(LockedTimelineSnapshot).where(
-                    LockedTimelineSnapshot.subscription_id == sub.id,
-                    LockedTimelineSnapshot.lineage_id == tl_row.lineage_id,
-                    LockedTimelineSnapshot.source == "CCA",
+        if tl_row is not None:
+            # 2026-10-06 — Branch on CHA vs CCA. A Timeline attached to
+            # an SP / PG / standard_response is a CHA/QA timeline; its
+            # window anchors to the TriggeredCHAEntry.triggered_at (NOT
+            # crop_start) and its frozen snapshot has source=SP/PG/QA
+            # (NOT CCA). Pre-fix this branch hardcoded source="CCA" and
+            # fell through to `cca_calendar_dates(meta, crop_start)`
+            # which has no handler for from_type="DAYS_AFTER_DETECTION"
+            # — returned (crop_start, crop_start) and made every CHA
+            # practice look past-window the moment crop_start passed.
+            # Advisory page `_today_advisory_for_user` already handles
+            # CHAs correctly via `cha_calendar_dates`; this bug only
+            # bit the Brands tap-through on CHA practices.
+            tcha = (await db.execute(
+                select(TriggeredCHAEntry).where(
+                    TriggeredCHAEntry.subscription_id == sub.id,
+                    TriggeredCHAEntry.status == "ACTIVE",
+                    TriggeredCHAEntry.recommendation_id.in_([
+                        rid for rid in (
+                            tl_row.sp_recommendation_id,
+                            tl_row.pg_recommendation_id,
+                            tl_row.standard_response_id,
+                        ) if rid
+                    ]),
                 )
-            )).scalars().first()
-            if snap is not None:
-                meta = metadata_from_content(snap.content)
-            else:
-                meta = metadata_from_content({"timeline": {
-                    "from_type": tl_row.from_type,
-                    "from_value": int(tl_row.from_value),
-                    "to_value": int(tl_row.to_value),
-                }})
+            )).scalars().first() if any((
+                tl_row.sp_recommendation_id,
+                tl_row.pg_recommendation_id,
+                tl_row.standard_response_id,
+            )) else None
+
             today_d = date.today()
-            # 2026-09-28 — normalise crop_start_date to `date`; some
-            # subs store it as datetime and the type propagates
-            # through cca_calendar_dates, breaking the >= compare
-            # further down. Same fix pattern as _upsert_practice_ack.
-            crop_start = (
-                sub.crop_start_date.date()
-                if hasattr(sub.crop_start_date, 'date')
-                else sub.crop_start_date
-            )
-            _, to_d = cca_calendar_dates(meta, crop_start, today_d)
-            past_window = today_d >= to_d
+            if tcha is not None:
+                # CHA/QA path — snapshot source matches the trigger
+                # type; window anchors to triggered_at.
+                snap = (await db.execute(
+                    select(LockedTimelineSnapshot).where(
+                        LockedTimelineSnapshot.subscription_id == sub.id,
+                        LockedTimelineSnapshot.lineage_id == tl_row.lineage_id,
+                        LockedTimelineSnapshot.source == tcha.recommendation_type,
+                    )
+                )).scalars().first()
+                if snap is not None:
+                    meta = metadata_from_content(snap.content)
+                else:
+                    meta = metadata_from_content({"timeline": {
+                        "from_type": tl_row.from_type,
+                        "from_value": int(tl_row.from_value),
+                        "to_value": int(tl_row.to_value),
+                    }})
+                triggered_d = (
+                    tcha.triggered_at.date()
+                    if hasattr(tcha.triggered_at, "date")
+                    else tcha.triggered_at
+                )
+                _, to_d = cha_calendar_dates(meta, triggered_d)
+                past_window = today_d >= to_d
+            elif sub.crop_start_date is not None:
+                # CCA path — snapshot source=CCA; window anchors to
+                # crop_start.
+                snap = (await db.execute(
+                    select(LockedTimelineSnapshot).where(
+                        LockedTimelineSnapshot.subscription_id == sub.id,
+                        LockedTimelineSnapshot.lineage_id == tl_row.lineage_id,
+                        LockedTimelineSnapshot.source == "CCA",
+                    )
+                )).scalars().first()
+                if snap is not None:
+                    meta = metadata_from_content(snap.content)
+                else:
+                    meta = metadata_from_content({"timeline": {
+                        "from_type": tl_row.from_type,
+                        "from_value": int(tl_row.from_value),
+                        "to_value": int(tl_row.to_value),
+                    }})
+                # 2026-09-28 — normalise crop_start_date to `date`; some
+                # subs store it as datetime and the type propagates
+                # through cca_calendar_dates, breaking the >= compare
+                # further down. Same fix pattern as _upsert_practice_ack.
+                crop_start = (
+                    sub.crop_start_date.date()
+                    if hasattr(sub.crop_start_date, 'date')
+                    else sub.crop_start_date
+                )
+                _, to_d = cca_calendar_dates(meta, crop_start, today_d)
+                past_window = today_d >= to_d
     except Exception:
         # Never let a diagnostic lookup break brand rendering.
         past_window = False
