@@ -6466,6 +6466,46 @@ async def _today_advisory_for_user(
                 )
             )).scalars().all()
 
+        # 2026-10-06 — Dedupe CHA entries by (recommendation_type,
+        # recommendation_id) BEFORE the TLWindow loop. A farmer who
+        # re-diagnoses the same problem creates a second
+        # TriggeredCHAEntry pointing to the same recommendation; both
+        # would emit TLWindows with identical ids (cha-{src}-{tl.id}
+        # is derived from the Timeline, not the entry). BL-03 dedup
+        # then (a) suppresses the "later" practice as a duplicate
+        # of the "earlier" one, (b) finds the later TL has zero
+        # visible practices + a single-governor suppression →
+        # `absorbed_into` the earlier TL. But because both TLs
+        # share the same id, `absorbed_skip.add(absorbed_id)` adds
+        # the common id — and the response filter at line 7471
+        # (`if tl.id in absorbed_skip: continue`) drops BOTH the
+        # absorbing AND absorbed TLs. Net effect: the diagnosed
+        # advisory VANISHES even though two ACTIVE CHA entries
+        # exist in the DB.
+        #
+        # Keep the most recent triggered_at per (type, rec_id) so
+        # the window anchors to the latest diagnosis (farmer's
+        # fresh timestamp). Earlier entries stay ACTIVE in the DB
+        # (not touched) — a future commit-endpoint-side change
+        # should supersede them to inactive but that's a separate
+        # cleanup. For now the read-path dedup is sufficient to
+        # restore the farmer's visible advisory.
+        if cha_entries:
+            _seen_rec_keys: set[tuple[str, str]] = set()
+            _cha_latest_first = sorted(
+                cha_entries,
+                key=lambda c: c.triggered_at,
+                reverse=True,
+            )
+            _dedup: list = []
+            for _c in _cha_latest_first:
+                _key = (_c.recommendation_type, _c.recommendation_id)
+                if _key in _seen_rec_keys:
+                    continue
+                _seen_rec_keys.add(_key)
+                _dedup.append(_c)
+            cha_entries = _dedup
+
         # Localise CHA problem labels on the read path. The stored
         # `cha.problem_name` is a snapshot — diagnosis used to write
         # the English string (cha_hierarchy.py:81 hardcoded `.get("en")`
