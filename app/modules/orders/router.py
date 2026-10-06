@@ -12019,14 +12019,24 @@ async def nearby_dealers(
         select(DealerProfile).where(DealerProfile.user_id.in_(onboarded_user_ids))
     )).scalars().all()
 
-    category_map = {"PESTICIDE": "PESTICIDES", "FERTILISER": "FERTILISERS", "SEED": "SEEDS"}
-    required_cat = category_map.get(order_type or "", "") if order_type else None
+    # 2026-10-06 — mirror the farmer-facing nearby-dealers union
+    # change (subscriptions/router.py :7934). "SEED" matches both
+    # SEEDS and SEEDLINGS so nurseries selling live transplants
+    # surface alongside packeted-seed dealers on the facilitator
+    # picker too. Also added FERTILIZER spelling parity.
+    category_map: dict[str, list[str]] = {
+        "PESTICIDE": ["PESTICIDES"],
+        "FERTILISER": ["FERTILISERS"],
+        "FERTILIZER": ["FERTILISERS"],
+        "SEED": ["SEEDS", "SEEDLINGS"],
+    }
+    required_cats = category_map.get(order_type or "") if order_type else None
 
     results = []
     for profile in profiles:
-        if required_cat:
+        if required_cats:
             cats = profile.sell_categories or []
-            if required_cat not in cats:
+            if not (set(required_cats) & set(cats)):
                 continue
         if not profile.shop_gps_lat or not profile.shop_gps_lng:
             continue

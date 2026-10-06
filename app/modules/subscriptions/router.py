@@ -7922,13 +7922,22 @@ async def nearby_dealers_for_farmer(
     # Accept both spellings (FERTILISER, FERTILIZER) — the rest of the
     # platform is mixed and the Orders V2 redesign standardises on
     # FERTILIZER, but legacy callers still send FERTILISER.
-    category_map = {
-        "PESTICIDE": "PESTICIDES",
-        "FERTILISER": "FERTILISERS",
-        "FERTILIZER": "FERTILISERS",
-        "SEED": "SEEDS",
+    # 2026-10-06 — order_type now maps to a LIST of acceptable
+    # sell_categories, matching the union/dealer-mental-model the
+    # product owner treats as atomic. "SEED" historically matched
+    # only "SEEDS"; nurseries that sell live transplants only tick
+    # "SEEDLINGS" in Shop Profile and were previously excluded from
+    # every seed-stage recipient list. User direction 2026-10-06
+    # treats Seeds + Seedlings as a single category — on seed
+    # variety-details surfaces (informational) and on seed order
+    # picker (nurseries can decline if they can't fulfil).
+    category_map: dict[str, list[str]] = {
+        "PESTICIDE": ["PESTICIDES"],
+        "FERTILISER": ["FERTILISERS"],
+        "FERTILIZER": ["FERTILISERS"],
+        "SEED": ["SEEDS", "SEEDLINGS"],
     }
-    required_cat = category_map.get((order_type or "").upper()) if order_type else None
+    required_cats = category_map.get((order_type or "").upper()) if order_type else None
 
     # Pre-compute the onboarded-dealer allow-list for the brand-lock
     # case. Cheaper than calling `_is_dealer_onboarded_by_client` per
@@ -8014,7 +8023,7 @@ async def nearby_dealers_for_farmer(
     profiles = (await db.execute(select(DealerProfile))).scalars().all()
     results = []
     for profile in profiles:
-        if required_cat and required_cat not in (profile.sell_categories or []):
+        if required_cats and not (set(required_cats) & set(profile.sell_categories or [])):
             continue
         if onboarded_dealer_ids is not None and profile.user_id not in onboarded_dealer_ids:
             continue
