@@ -5469,10 +5469,35 @@ async def get_advisory_cluster(
     for tl_id, tl_data in merged.items():
         fd_td = _ranges_by_id.get(tl_id)
         if fd_td is None:
-            # CHA/QA TL (triggered_at-anchored). Not in fixed_ranges.
-            # Per-day dedup already covered its interactions.
-            continue
-        fd, td = fd_td
+            # 2026-10-07 — CHA/QA TLs are not in `fixed_ranges` because
+            # they're triggered_at-anchored, not package-attached. The
+            # original (2026-09-29) cluster-dedup pass skipped them with
+            # the comment "per-day dedup already covered its interactions."
+            # That assumption breaks on the boundary day when CCA's
+            # half-open window just closed and the CHA is still alive —
+            # the per-day call for that day has no CCA governor, so BL-03
+            # can't suppress the CHA practice, the CHA TL leaks into
+            # `merged` with its (duplicated) practices, and the farmer
+            # sees input A recommended twice (once in CCA, once in CHA)
+            # across the cluster.
+            # Fix: include CHA/QA TLs in the cluster-level pass too,
+            # using their OWN window dates from the TL dict (not from
+            # fixed_ranges). BL-03 then sees CCA + CHA in the same pass
+            # with their full windows and correctly suppresses the
+            # overlap. Repro: DE-26-000443 (Beet Root, Leaf Hopper SP
+            # recommendation sharing Acephate + Blue sticky traps with
+            # the package's Timeline 1).
+            from_s = tl_data.get('from_date')
+            to_s = tl_data.get('to_date')
+            if not from_s or not to_s:
+                continue
+            try:
+                fd = date.fromisoformat(from_s) if isinstance(from_s, str) else from_s
+                td = date.fromisoformat(to_s) if isinstance(to_s, str) else to_s
+            except ValueError:
+                continue
+        else:
+            fd, td = fd_td
         _cluster_tls_for_dedup.append(_CTLW(
             id=tl_id,
             name=tl_data.get('name') or '',
