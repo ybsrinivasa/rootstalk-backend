@@ -49,18 +49,34 @@ class PracticeStub:
     def primary_identity_ref(self) -> Optional[str]:
         """
         Identity key for deduplication.
-        For INPUT practices: the cosh_ref of the COMMON_NAME or BRAND element.
-        Returns None if no Cosh-sourced identity can be found.
+        - INPUT practices: cosh_ref of COMMON_NAME / BRAND /
+          ACTIVE_INGREDIENT (falls back to any cosh_ref).
+        - NON_INPUT ITK practices: cosh_ref of ITK_NAME. Added
+          2026-10-08 — ITKs (indigenous technical knowledge, e.g.,
+          Brahmastra, Jeevamrutham) are prepared concoctions the
+          farmer makes + applies at a specific dosage. If the SE
+          authored overlapping timelines that both recommend the
+          same ITK, we want them to dedupe exactly like duplicate
+          INPUT pesticides — farmer shouldn't be told to prepare +
+          apply the same ITK twice. OBSERVATION, INSTRUCTION, MEDIA
+          and other NON_INPUT practices without ITK_NAME keep
+          returning None so they stay un-deduped (always shown).
+        Returns None when no Cosh-sourced identity can be found.
         """
-        if self.l0_type != "INPUT":
+        if self.l0_type == "INPUT":
+            for el in self.elements:
+                if el.element_type in ("COMMON_NAME", "BRAND", "ACTIVE_INGREDIENT") and el.cosh_ref:
+                    return el.cosh_ref
+            # Fallback: any element with a cosh_ref
+            for el in self.elements:
+                if el.cosh_ref:
+                    return el.cosh_ref
             return None
-        for el in self.elements:
-            if el.element_type in ("COMMON_NAME", "BRAND", "ACTIVE_INGREDIENT") and el.cosh_ref:
-                return el.cosh_ref
-        # Fallback: any element with a cosh_ref
-        for el in self.elements:
-            if el.cosh_ref:
-                return el.cosh_ref
+        if self.l0_type == "NON_INPUT":
+            for el in self.elements:
+                if el.element_type == "ITK_NAME" and el.cosh_ref:
+                    return el.cosh_ref
+            return None
         return None
 
 
@@ -281,7 +297,12 @@ def deduplicate_advisory(
         for p in tl_target.practices:
             if p.relation_id != relation_id:
                 continue
-            if p.l0_type != "INPUT":
+            # 2026-10-08 — Accept NON_INPUT (ITK) in addition to
+            # INPUT. ITKs are prepared concoctions the farmer makes
+            # + applies at a dosage; a duplicate across TLs should
+            # suppress just like duplicate INPUT. INSTRUCTION +
+            # MEDIA (no identity_ref) still skipped.
+            if p.l0_type not in ("INPUT", "NON_INPUT"):
                 continue
             if p.is_special_input:
                 continue
@@ -301,7 +322,12 @@ def deduplicate_advisory(
                 continue  # No overlap — skip (also prevents chain suppression)
 
             for p_later in tl_later.practices:
-                if p_later.l0_type != "INPUT":
+                # 2026-10-08 — Accept NON_INPUT (ITK) alongside INPUT.
+                # `primary_identity_ref` returns an id for NON_INPUT
+                # only when the practice has an ITK_NAME element;
+                # other NON_INPUT (observations, soil tests)
+                # return None and naturally skip below.
+                if p_later.l0_type not in ("INPUT", "NON_INPUT"):
                     continue
                 if p_later.is_special_input:
                     continue
@@ -311,7 +337,7 @@ def deduplicate_advisory(
                     continue
 
                 for p_earlier in tl_earlier.practices:
-                    if p_earlier.l0_type != "INPUT":
+                    if p_earlier.l0_type not in ("INPUT", "NON_INPUT"):
                         continue
                     if p_earlier.is_special_input:
                         continue
