@@ -315,32 +315,41 @@ async def list_cosh_india_locations(
     # language. `translations` is a dict like {"en": "Kolar",
     # "kn": "ಕೋಲಾರ", ...}. Fall back to English when the target
     # language's translation is missing so we never render null.
+    # 2026-10-10 — Also emit `name_en` so the picker's typeahead
+    # filter can match the farmer's input against both scripts (he
+    # might type "Mandya" with an English keyboard while the UI is
+    # in Kannada, or vice versa).
     lang = (current_user.language_code or "en")
-    state_names: dict[str, str] = {}
-    district_names: dict[str, str] = {}
+    state_names: dict[str, tuple[str | None, str | None]] = {}
+    district_names: dict[str, tuple[str | None, str | None]] = {}
     for cosh_id, core_type, translations in cores:
+        name_en: str | None = None
+        name: str | None = None
         if isinstance(translations, dict):
-            name = translations.get(lang) or translations.get("en")
-        else:
-            name = None
+            name_en = translations.get("en")
+            name = translations.get(lang) or name_en
         if core_type == "state_list":
-            state_names[cosh_id] = name
+            state_names[cosh_id] = (name, name_en)
         elif core_type == "district_list":
-            district_names[cosh_id] = name
+            district_names[cosh_id] = (name, name_en)
 
     by_state: dict[str, list[dict]] = {}
     for sid, did in pairs:
+        d_name, d_name_en = district_names.get(did, (None, None))
         by_state.setdefault(sid, []).append({
             "cosh_id": did,
-            "name": district_names.get(did),
+            "name": d_name,
+            "name_en": d_name_en,
         })
 
     states = []
     for sid, districts in by_state.items():
         districts.sort(key=lambda d: (d["name"] or "").lower())
+        s_name, s_name_en = state_names.get(sid, (None, None))
         states.append({
             "cosh_id": sid,
-            "name": state_names.get(sid),
+            "name": s_name,
+            "name_en": s_name_en,
             "districts": districts,
         })
     states.sort(key=lambda s: (s["name"] or "").lower())
