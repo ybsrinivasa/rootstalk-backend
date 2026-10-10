@@ -1918,10 +1918,24 @@ async def create_parameter(
     )
     db.add(param)
     await db.flush()
+    created_vars: list[Variable] = []
     for v in request.variables:
-        db.add(Variable(parameter_id=param.id, name=v.name))
+        var = Variable(parameter_id=param.id, name=v.name, client_id=client_id)
+        db.add(var)
+        created_vars.append(var)
     await db.commit()
     await db.refresh(param)
+    # Fire auto-translate tasks after commit so the task sees the
+    # committed rows. One per Parameter + one per Variable; each is
+    # independent so a Claude failure on one locale/row doesn't block
+    # the rest. Failures are logged in the task; farmer PWA falls back
+    # to English on missing translations.
+    from app.tasks.translate_pv import (
+        translate_parameter_name_task, translate_variable_name_task,
+    )
+    translate_parameter_name_task.delay(param.id)
+    for var in created_vars:
+        translate_variable_name_task.delay(var.id)
     return param
 
 
@@ -2010,6 +2024,8 @@ async def create_variable(
     db.add(var)
     await db.commit()
     await db.refresh(var)
+    from app.tasks.translate_pv import translate_variable_name_task
+    translate_variable_name_task.delay(var.id)
     return var
 
 
@@ -2040,8 +2056,24 @@ async def update_client_parameter(
             "message": "Cosh-mirrored parameters can't be edited; Cosh is the source of truth.",
         })
     update_data = request.model_dump(exclude_unset=True)
+    name_changed = (
+        "name" in update_data and update_data["name"] != param.name
+    )
     for field, value in update_data.items():
         setattr(param, field, value)
+    if name_changed:
+        # Option-2 rename policy (user 2026-10-10): downgrade existing
+        # translations to PENDING but keep SE's text so manual-edit work
+        # isn't lost. CA portal surfaces a stale indicator + Regenerate
+        # button per language — SE picks whether to re-draft via Claude
+        # or hand-edit the stale text.
+        existing_translations = (await db.execute(
+            select(ParameterTranslation).where(
+                ParameterTranslation.parameter_id == parameter_id,
+            )
+        )).scalars().all()
+        for t in existing_translations:
+            t.translation_status = TranslationStatus.PENDING
     await db.commit()
     await db.refresh(param)
     return param
@@ -2266,7 +2298,7 @@ async def approve_parameter_translation(
     if existing:
         if "name" in data:
             existing.name = data["name"]
-        existing.translation_status = TranslationStatus.EXPERT_VALIDATED
+        existing.translation_status = TranslationStatus.APPROVED
         existing.approved_by = current_user.id
         existing.approved_at = datetime.now(timezone.utc)
     else:
@@ -2274,13 +2306,13 @@ async def approve_parameter_translation(
             parameter_id=parameter_id,
             language_code=lang_code,
             name=data.get("name", ""),
-            translation_status=TranslationStatus.EXPERT_VALIDATED,
+            translation_status=TranslationStatus.APPROVED,
             approved_by=current_user.id,
             approved_at=datetime.now(timezone.utc),
         )
         db.add(existing)
     await db.commit()
-    return {"language_code": lang_code, "status": "EXPERT_VALIDATED"}
+    return {"language_code": lang_code, "status": TranslationStatus.APPROVED.value}
 
 
 @router.get("/client/{client_id}/parameters/{parameter_id}/variables/{variable_id}/translations")
@@ -2313,17 +2345,84 @@ async def approve_variable_translation(
     if existing:
         if "name" in data:
             existing.name = data["name"]
-        existing.translation_status = TranslationStatus.EXPERT_VALIDATED
+        existing.translation_status = TranslationStatus.APPROVED
     else:
         existing = VariableTranslation(
             variable_id=variable_id,
             language_code=lang_code,
             name=data.get("name", ""),
-            translation_status=TranslationStatus.EXPERT_VALIDATED,
+            translation_status=TranslationStatus.APPROVED,
         )
         db.add(existing)
     await db.commit()
-    return {"language_code": lang_code, "status": "EXPERT_VALIDATED"}
+    return {"language_code": lang_code, "status": TranslationStatus.APPROVED.value}
+
+
+# ── CA-portal Regenerate buttons: refire Claude for a Custom P/V ─────────────
+
+@router.post(
+    "/client/{client_id}/parameters/{parameter_id}/translations/regenerate",
+    status_code=202,
+)
+async def regenerate_parameter_translations(
+    client_id: str, parameter_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Fire the Claude auto-translate task for this Parameter's name
+    across every TARGET_LOCALE. Overwrites existing rows with fresh
+    APPROVED output. Mirrors the pattern SE sees in CA-portal review
+    UIs for other content-translation entities."""
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    param = (await db.execute(
+        select(Parameter).where(
+            Parameter.id == parameter_id, Parameter.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if param is None:
+        raise HTTPException(status_code=404, detail="Parameter not found")
+    if param.source != ParameterSource.CUSTOM:
+        raise HTTPException(status_code=422, detail={
+            "code": "cosh_mirrored_parameter_readonly",
+            "message": "Cosh-mirrored parameters can't be re-translated.",
+        })
+    from app.tasks.translate_pv import translate_parameter_name_task
+    translate_parameter_name_task.delay(parameter_id)
+    return {"queued": True}
+
+
+@router.post(
+    "/client/{client_id}/parameters/{parameter_id}/variables/{variable_id}/translations/regenerate",
+    status_code=202,
+)
+async def regenerate_variable_translations(
+    client_id: str, parameter_id: str, variable_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Symmetric to the Parameter regenerate above, for one Variable.
+    Refuses Cosh-shipped variables (cosh_id non-NULL) and other
+    clients' customs — only this client's own custom variables are
+    re-translatable."""
+    await _assert_ca_param_writable(db, client_id, parameter_id)
+    var = (await db.execute(
+        select(Variable).where(
+            Variable.id == variable_id,
+            Variable.parameter_id == parameter_id,
+        )
+    )).scalar_one_or_none()
+    if var is None:
+        raise HTTPException(status_code=404, detail="Variable not found")
+    if var.cosh_id is not None:
+        raise HTTPException(status_code=422, detail={
+            "code": "cosh_mirrored_variable_readonly",
+            "message": "Cosh-mirrored variables can't be re-translated.",
+        })
+    if var.client_id is not None and var.client_id != client_id:
+        raise HTTPException(status_code=404, detail="Variable not found")
+    from app.tasks.translate_pv import translate_variable_name_task
+    translate_variable_name_task.delay(variable_id)
+    return {"queued": True}
 
 
 @router.get("/client/{client_id}/packages/{package_id}/variables")

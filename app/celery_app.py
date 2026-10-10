@@ -44,6 +44,7 @@ celery_app = Celery(
         "app.tasks.postpone_expiry",
         "app.tasks.timeline_archive",
         "app.tasks.translate_content",
+        "app.tasks.translate_pv",
         "app.tasks.training_expiry",
         "app.tasks.promoter_stepdown_expiry",
         "app.tasks.coaching_expiry",

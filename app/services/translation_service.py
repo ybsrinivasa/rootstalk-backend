@@ -55,6 +55,8 @@ FIELD_KIND_LABELS = {
     "standard_response.question_text": "the question a farmer would ask (used in a curated Q&A library)",
     "seed_variety.description_points": "bullet points describing a seed variety's qualities",
     "conditional_question.question_text": "a short yes/no question the farmer answers to steer the advisory (e.g. 'Has it rained in the last 2 days?')",
+    "parameter.name": "a short noun phrase that labels one guided-elimination parameter the farmer sees as a dropdown header (e.g. 'Irrigation Method', 'Soil Type'). Translate as a short noun phrase, title-case or sentence-case per the target language's convention. Do NOT translate into a full sentence; keep it a label.",
+    "variable.name": "a short noun phrase for one answer option under a parameter (e.g. 'Drip' or 'Flood' under 'Irrigation Method'). Translate as a short label the farmer taps, matching the parent parameter's register. Do NOT expand into a sentence.",
 }
 
 

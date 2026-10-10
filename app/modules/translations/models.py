@@ -46,6 +46,14 @@ class EntityType:
     # Save-time trigger on client-side + global CQ create/update; read
     # path swaps in the today advisory endpoint.
     CONDITIONAL_QUESTION_TEXT = "conditional_question.question_text"
+    # 2026-10-10 — Custom Parameter / Variable names authored at CA
+    # scope. These write to the legacy per-domain tables
+    # (parameter_translations / variable_translations) rather than
+    # content_translations — see per-domain-tables-stay-put note at
+    # the top of this file. Entity-type strings are declared here so
+    # the Celery task router stays symmetric with other entities.
+    PARAMETER_NAME = "parameter.name"
+    VARIABLE_NAME = "variable.name"
 
 
 def hash_source(text: str | None) -> str:
