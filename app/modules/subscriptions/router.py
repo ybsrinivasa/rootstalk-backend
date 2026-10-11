@@ -1392,6 +1392,36 @@ async def guided_elimination_step(
                 tr_map.get((EntityType.PACKAGE_DESCRIPTION, step.package.id))
                 or step.package.description
             )
+        # 2026-10-11 — Full P/V signature of the resolved Package.
+        # BL-01 only surfaces the discriminating parameters as
+        # questions; it stops asking the moment the pool narrows to
+        # one package. But the SE assigned every P/V on that Package
+        # for a reason, and the farmer/promoter should see the
+        # complete characterisation before accepting. Two buckets:
+        #   - "answered" = parameter_id was in the inbound `answers`
+        #     query string (promoter actively picked it)
+        #   - "inherited" = parameter is on the resolved package's
+        #     fingerprint but was NOT asked (covers both BL-01
+        #     auto-selection on single-option parameters AND
+        #     parameters that would have been asked next had the
+        #     pool not already narrowed to this one package)
+        # Sorted by Parameter.display_order so UI renders in the
+        # natural crop-signature order the SE arranged.
+        answered_param_ids = set(parsed_answers.keys())
+        all_parameters = []
+        param_order_by_id = {pr.id: int(pr.display_order or 0) for pr in param_rows}
+        param_name_by_id = {
+            pr.id: param_legacy.get(pr.id) or _localised_name(pr.name, pr.cosh_id)
+            for pr in param_rows
+        }
+        for pid, vid in step.package.variable_map.items():
+            all_parameters.append({
+                "parameter_name": param_name_by_id.get(pid, pid),
+                "variable_name": variable_names.get(vid, vid),
+                "source": "answered" if pid in answered_param_ids else "inherited",
+                "display_order": param_order_by_id.get(pid, 0),
+            })
+        all_parameters.sort(key=lambda x: (x["display_order"], x["parameter_name"]))
         return {
             "done": True,
             "package": {
@@ -1401,6 +1431,7 @@ async def guided_elimination_step(
             },
             "summary": step.summary,        # plain-language variable names
             "auto_selected": step.auto_selected,
+            "all_parameters": all_parameters,
         }
 
     # Question step
