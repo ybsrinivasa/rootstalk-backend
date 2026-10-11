@@ -1252,8 +1252,15 @@ async def guided_elimination_step(
     # ── Load Kannada / Hindi / etc. parameter+variable names via Cosh ────
     # Parameter and Variable rows mirror Cosh entities; their Kannada
     # names live on `cosh_core_items.translations` keyed by `cosh_id`.
-    # Custom (non-Cosh) rows fall through to the local `.name` column.
+    # Custom (non-Cosh, cosh_id IS NULL) rows have their translations in
+    # the legacy per-domain tables (`parameter_translations` /
+    # `variable_translations`), written by the Claude auto-translate
+    # task (`tasks/translate_pv.py`) on Custom P/V create/regenerate.
+    # Fallback chain: Cosh → legacy per-domain → English `.name`.
     from app.modules.sync.models import CoshCoreItem
+    from app.modules.advisory.models import (
+        ParameterTranslation, VariableTranslation, TranslationStatus,
+    )
     from app.services.i18n_cosh import pick_translation
     lang = current_user.language_code or "en"
     pv_cosh_ids = {pr.cosh_id for pr in param_rows if pr.cosh_id}
@@ -1266,6 +1273,22 @@ async def guided_elimination_step(
         for cid, tr in rows:
             cosh_translations[cid] = tr or {}
 
+    # Legacy per-domain translations for Custom parameters only.
+    param_custom_ids = {pr.id for pr in param_rows if not pr.cosh_id}
+    param_legacy: dict[str, str] = {}
+    if param_custom_ids and lang != "en":
+        rows = (await db.execute(
+            select(ParameterTranslation.parameter_id, ParameterTranslation.name)
+            .where(
+                ParameterTranslation.parameter_id.in_(param_custom_ids),
+                ParameterTranslation.language_code == lang,
+                ParameterTranslation.translation_status == TranslationStatus.APPROVED,
+            )
+        )).all()
+        for pid, name in rows:
+            if name:
+                param_legacy[pid] = name
+
     def _localised_name(local_name: str, cosh_id: str | None) -> str:
         if cosh_id and cosh_id in cosh_translations:
             return pick_translation(cosh_translations[cosh_id], lang, local_name)
@@ -1273,7 +1296,8 @@ async def guided_elimination_step(
 
     parameters: list[ServiceParameterOption] = [
         ServiceParameterOption(
-            id=pr.id, name=_localised_name(pr.name, pr.cosh_id),
+            id=pr.id,
+            name=param_legacy.get(pr.id) or _localised_name(pr.name, pr.cosh_id),
             display_order=int(pr.display_order or 0),
         )
         for pr in param_rows
@@ -1294,8 +1318,29 @@ async def guided_elimination_step(
         )).all()
         for cid, tr in rows:
             cosh_translations[cid] = tr or {}
+
+    # Legacy per-domain translations for Custom variables only. Covers
+    # both pure-custom variables (parent parameter is CUSTOM) and the
+    # Batch CC case: Cosh parameter with a per-client custom variable
+    # (variable.cosh_id NULL even though parameter.cosh_id SET).
+    var_custom_ids = {v.id for v in var_rows if not v.cosh_id}
+    var_legacy: dict[str, str] = {}
+    if var_custom_ids and lang != "en":
+        rows = (await db.execute(
+            select(VariableTranslation.variable_id, VariableTranslation.name)
+            .where(
+                VariableTranslation.variable_id.in_(var_custom_ids),
+                VariableTranslation.language_code == lang,
+                VariableTranslation.translation_status == TranslationStatus.APPROVED,
+            )
+        )).all()
+        for vid, name in rows:
+            if name:
+                var_legacy[vid] = name
+
     variable_names: dict[str, str] = {
-        v.id: _localised_name(v.name, v.cosh_id) for v in var_rows
+        v.id: var_legacy.get(v.id) or _localised_name(v.name, v.cosh_id)
+        for v in var_rows
     }
 
     # ── Run the algorithm ────────────────────────────────────────────────
