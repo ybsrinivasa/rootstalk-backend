@@ -56,7 +56,30 @@ FIELD_KIND_LABELS = {
     "seed_variety.description_points": "bullet points describing a seed variety's qualities",
     "conditional_question.question_text": "a short yes/no question the farmer answers to steer the advisory (e.g. 'Has it rained in the last 2 days?')",
     "parameter.name": "a short noun phrase that labels one guided-elimination parameter the farmer sees as a dropdown header (e.g. 'Irrigation Method', 'Soil Type'). Translate as a short noun phrase, title-case or sentence-case per the target language's convention. Do NOT translate into a full sentence; keep it a label.",
-    "variable.name": "a short noun phrase for one answer option under a parameter (e.g. 'Drip' or 'Flood' under 'Irrigation Method'). Translate as a short label the farmer taps, matching the parent parameter's register. Do NOT expand into a sentence.",
+    "variable.name": (
+        "a short noun phrase for one answer option under a parameter "
+        "(e.g. 'Drip' or 'Flood' under 'Irrigation Method'). Translate as "
+        "a short label the farmer taps, matching the parent parameter's "
+        "register. Do NOT expand into a sentence.\n\n"
+        "IMPORTANT — Transliteration rule for naming classifications: "
+        "when the parent parameter indicates classification BY NAME "
+        "(e.g. 'Variety', 'Variety Cultivated', 'Cultivar', 'Breed', "
+        "'Brand', 'Trade Name', 'Product Name', 'Hybrid Name'), the "
+        "variable is a proper name — TRANSLITERATE it into the target "
+        "script instead of either translating semantically or preserving "
+        "the English spelling. The farmer should be able to read the "
+        "English sound aloud using their local script, so it matches "
+        "what the dealer or seed packet says. In this case the "
+        "preserve-proper-nouns rule above is OVERRIDDEN by this "
+        "transliteration rule.\n"
+        "Examples (under parent 'Variety Cultivated'):\n"
+        "- Variable 'Fiery Red' → hi 'फिएरी रेड', kn 'ಫಯರಿ ರೆಡ್', ta 'ஃபையரி ரெட்'\n"
+        "- Variable 'Calm Ocean' → hi 'काम ओशन', kn 'ಕಾಮ್ ಓಷನ್', ta 'காம் ஓஷன்'\n"
+        "- Variable 'Pusa Ruby' → hi 'पूसा रूबी', kn 'ಪೂಸಾ ರೂಬಿ', ta 'பூசா ரூபி'\n"
+        "For parent parameters that are NOT naming classifications "
+        "(e.g. 'Irrigation Method', 'Cultivation Type', 'Soil Type'), "
+        "translate the variable semantically into the local language as usual."
+    ),
 }
 
 
