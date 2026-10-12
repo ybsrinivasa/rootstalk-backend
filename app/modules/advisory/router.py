@@ -1718,13 +1718,30 @@ async def set_package_locations(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """CCA Step 2 / Batch 2D: changing locations can newly create a
-    shared district with a sibling that has the same P/V fingerprint.
-    After the new location set is in place, run the uniqueness check
-    against DRAFT/ACTIVE siblings and refuse the save if any conflict
-    surfaces. Spec §4.2."""
+    """CCA Step 2 — set the Package's served districts.
+
+    2026-10-12: §4.2 invariants (parameter-set consistency + fingerprint
+    uniqueness across shared-district siblings) moved from save-time
+    to publish-time. Rationale: during authoring, intermediate states
+    legitimately violate §4.2 (e.g. SE sets up Package A fully, then
+    starts Package B with the same district — second write would
+    always 422 on an identical-empty fingerprint). The invariants are
+    still enforced at `publish_package`, which is the only moment
+    they actually matter (BL-01 only sees ACTIVE packages). ACTIVE
+    packages themselves are frozen — SE must clone to a new DRAFT
+    version to edit the signature or locations. INACTIVE packages
+    stay editable to support the footprint-cascade recovery path.
+    See `publish_package` for the publish-time check."""
     await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     pkg = await _get_package(db, package_id, client_id)
+    if pkg.status == PackageStatus.ACTIVE:
+        raise HTTPException(status_code=422, detail={
+            "code": "active_package_readonly",
+            "message": (
+                "ACTIVE packages cannot be edited directly. Clone to a "
+                "new DRAFT version to change the signature or locations."
+            ),
+        })
     existing = (await db.execute(
         select(PackageLocation).where(PackageLocation.package_id == package_id)
     )).scalars().all()
@@ -1732,17 +1749,6 @@ async def set_package_locations(
         await db.delete(loc)
     for loc in locations:
         db.add(PackageLocation(package_id=package_id, **loc.model_dump()))
-    await db.flush()
-
-    try:
-        await assert_pv_unique_for_package(db, package=pkg)
-    except PVConflictError as e:
-        _raise_pv_conflict(e)
-    try:
-        await assert_pv_consistency_for_package(db, package=pkg)
-    except PVConsistencyError as e:
-        _raise_pv_consistency(e)
-
     await db.commit()
     return {"detail": f"{len(locations)} locations saved"}
 
@@ -2462,15 +2468,24 @@ async def set_package_variables(
 ):
     """Set the parameter→variable fingerprint for a Package.
 
-    CCA Step 2 / Batch 2D (spec §4.2): after the new fingerprint is
-    in place, refuse the save if any DRAFT/ACTIVE sibling under the
-    same `(client, crop)` shares at least one district AND has an
-    identical fingerprint. Guided elimination is non-deterministic
-    otherwise — the farmer answers all the questions and ends up
-    with two PoPs the system can't distinguish.
+    2026-10-12: §4.2 invariants moved from save-time to publish-time
+    (see `set_package_locations` for the full rationale). SE can now
+    author across many DRAFTs with intermediate states that would
+    violate §4.2 — the invariants are still enforced at
+    `publish_package`. ACTIVE packages are frozen — clone-to-DRAFT
+    required for any signature change. INACTIVE stays editable for
+    the footprint-cascade recovery path.
     """
     await _assert_can_edit_client_advisory(db, current_user.id, client_id)
     pkg = await _get_package(db, package_id, client_id)
+    if pkg.status == PackageStatus.ACTIVE:
+        raise HTTPException(status_code=422, detail={
+            "code": "active_package_readonly",
+            "message": (
+                "ACTIVE packages cannot be edited directly. Clone to a "
+                "new DRAFT version to change the signature or locations."
+            ),
+        })
     # Visibility check — every assignment must reference a parameter
     # that's visible to this client (Cosh-global OR own Custom) and a
     # variable that's visible under it (Cosh-sourced on a Cosh parent,
@@ -2538,16 +2553,6 @@ async def set_package_variables(
             parameter_id=assignment["parameter_id"],
             variable_id=assignment["variable_id"],
         ))
-    await db.flush()
-
-    try:
-        await assert_pv_unique_for_package(db, package=pkg)
-    except PVConflictError as e:
-        _raise_pv_conflict(e)
-    try:
-        await assert_pv_consistency_for_package(db, package=pkg)
-    except PVConsistencyError as e:
-        _raise_pv_consistency(e)
 
     await db.commit()
     return {"detail": f"{len(request.assignments)} parameter-variable assignments saved"}
