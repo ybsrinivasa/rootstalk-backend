@@ -48,6 +48,7 @@ _ALLOWED_ENTITY_TYPES = frozenset({
     EntityType.ELEMENT_VALUE,
     EntityType.STANDARD_RESPONSE_QUESTION,
     EntityType.SEED_VARIETY_DESCRIPTION_POINTS,
+    EntityType.CONDITIONAL_QUESTION_TEXT,
 })
 
 
@@ -83,6 +84,11 @@ async def _current_source(
             return None
         import json as _json
         return _json.dumps(pts or [], ensure_ascii=False)
+    if entity_type == EntityType.CONDITIONAL_QUESTION_TEXT:
+        from app.modules.advisory.models import ConditionalQuestion
+        return (await db.execute(
+            select(ConditionalQuestion.question_text).where(ConditionalQuestion.id == entity_id)
+        )).scalar_one_or_none()
     return None
 
 
