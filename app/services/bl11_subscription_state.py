@@ -51,7 +51,20 @@ _TRANSITIONS: dict[tuple[str, str], frozenset[str]] = {
     ("WAITLISTED", "ACTIVE"):     frozenset({FARMER, DEALER}),
 
     # Rejection of a promoter assignment by the farmer.
+    #
+    # 2026-10-14 — ACTIVE source added. Option A (2026-05-30) changed
+    # promoter-initiated subs to land ACTIVE at initiate time
+    # (kitty consumed up-front, no WAITLISTED intermediate — see
+    # `subscriptions/router.py::initiate_assignment` docstring).
+    # Reject still goes through this edge; the BL11 table wasn't
+    # updated at the time, which left every decline since 2026-05-30
+    # 400'ing with ILLEGAL_TRANSITION. Also covers coaching subs,
+    # which land ACTIVE via the sandbox-skips-Razorpay path.
+    # The refund_to_promoter side-effect in the respond handler is
+    # idempotent per the assignment-already-resolved gate, so a
+    # second-tap after a successful cancel is a no-op (404).
     ("WAITLISTED", "CANCELLED"):  frozenset({FARMER}),
+    ("ACTIVE", "CANCELLED"):      frozenset({FARMER}),
 
     # Voluntary unsubscribe (SELF subs only — see is_self_unsubscribable).
     # 2026-06-22 — split from CANCELLED into its own terminal so the
