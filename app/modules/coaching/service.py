@@ -883,6 +883,52 @@ async def get_coaching_student_for_user(
     )).scalar_one_or_none()
 
 
+async def guard_coaching_assignment_target(
+    db: AsyncSession,
+    *,
+    farmer_user_id: str,
+    promoter_user_id: str,
+) -> None:
+    """Refuse to send a promoter advisory-assignment request to any
+    user that is a coaching student, unless the sender is the student
+    themselves acting in a cross-role capacity.
+
+    Mirror of `guard_coaching_order_recipient` for the
+    `/promoter/assignments/initiate` path. The sibling
+    `guard_coaching_workspace_onboarding` already blocks the OUTBOUND
+    direction (student's workspace can't onboard real strangers'
+    phones); this guard blocks the INBOUND direction (real external
+    promoter can't reach a coaching student).
+
+    Anchor 2026-10-14: a real dealer at a real client (Kalyan
+    RamaRajya Private) was able to assign a package to a coaching
+    student (GFP Student 4) by typing the student's phone into the
+    promoter-assign flow. The existing outbound guard was no-op
+    because the sender's workspace is real, not coaching — the
+    bidirectional isolation story only had the outbound half
+    implemented.
+
+    No-op for real farmers (`get_coaching_student_for_user` returns
+    None); for coaching students, refuses any promoter_user_id that
+    isn't their own user_id.
+    """
+    student = await get_coaching_student_for_user(db, farmer_user_id)
+    if student is None:
+        return
+    if promoter_user_id != farmer_user_id:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "coaching_external_assignment_forbidden",
+                "message": (
+                    "Advisory assignments to a coaching student can only "
+                    "come from the student themselves acting in a dealer "
+                    "or facilitator role. Use your own registered phone."
+                ),
+            },
+        )
+
+
 async def guard_coaching_order_recipient(
     db: AsyncSession,
     farmer_user_id: str,

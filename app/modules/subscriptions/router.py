@@ -2381,7 +2381,10 @@ async def initiate_assignment(
         farmer-respond path calls `refund_to_promoter` (see B2 wiring).
     """
     from app.modules.auth.service import get_user_by_phone
-    from app.modules.coaching.service import guard_coaching_workspace_onboarding
+    from app.modules.coaching.service import (
+        guard_coaching_workspace_onboarding,
+        guard_coaching_assignment_target,
+    )
     from app.services.promoter_pool import (
         consume_for_assignment, get_promoter_balance,
     )
@@ -2414,6 +2417,21 @@ async def initiate_assignment(
     await guard_coaching_workspace_onboarding(
         db, effective_client_id, target_phone=request.farmer_phone,
     )
+
+    # Coaching Sandbox — INBOUND direction (2026-10-14). The guard
+    # above blocks a coaching student's workspace from onboarding
+    # strangers; this one blocks a real external promoter from
+    # reaching a coaching student. Resolve the target by phone first;
+    # no-op when the phone maps to no user yet (new farmer) or to a
+    # real (non-coaching) user. See `guard_coaching_assignment_target`
+    # for the full rationale.
+    _target_user = await get_user_by_phone(db, request.farmer_phone)
+    if _target_user is not None:
+        await guard_coaching_assignment_target(
+            db,
+            farmer_user_id=_target_user.id,
+            promoter_user_id=current_user.id,
+        )
 
     # 2026-08-10 — stepdown-request block. Once a promoter requests to
     # step down, they can't take on NEW farmers even before the CA
@@ -2978,11 +2996,12 @@ async def promoter_farmer_lookup(
         get_coaching_student_for_user, normalise_phone,
     )
 
-    # Coaching Sandbox — a coaching student wearing the Facilitator-
-    # Promoter hat may only look up their own approved phone.
-    # Prevents real farmer identities (name, id, state, district)
-    # leaking into the coaching PWA. Self-lookup falls through so
-    # the student can practise assigning packages to themselves.
+    # Coaching Sandbox — OUTBOUND. A coaching student wearing the
+    # Facilitator-Promoter hat may only look up their own approved
+    # phone. Prevents real farmer identities (name, id, state,
+    # district) leaking into the coaching PWA. Self-lookup falls
+    # through so the student can practise assigning packages to
+    # themselves.
     coaching_student = await get_coaching_student_for_user(db, current_user.id)
     if coaching_student is not None:
         if normalise_phone(phone) != normalise_phone(coaching_student.approved_phone):
@@ -2994,6 +3013,23 @@ async def promoter_farmer_lookup(
     farmer = await get_user_by_phone(db, phone)
     if not farmer:
         raise HTTPException(status_code=404, detail="No farmer found with this phone number. They must register in the RootsTalk app first.")
+
+    # Coaching Sandbox — INBOUND (2026-10-14 audit). A real external
+    # promoter cannot look up a coaching student's name/state/district
+    # by typing the student's phone. Return the same 404 the "no such
+    # user" branch returns so the real promoter can't even distinguish
+    # "phone unregistered" from "phone belongs to coaching student".
+    # Self-lookup already passed the outbound branch above and reached
+    # the `farmer` object — the check below is a no-op for that path
+    # because farmer.id == current_user.id when the student types their
+    # own phone.
+    farmer_student = await get_coaching_student_for_user(db, farmer.id)
+    if farmer_student is not None and farmer.id != current_user.id:
+        raise HTTPException(
+            status_code=404,
+            detail="No farmer found with this phone number. They must register in the RootsTalk app first.",
+        )
+
     return {
         "id": farmer.id,
         "name": farmer.name,

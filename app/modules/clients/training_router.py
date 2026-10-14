@@ -680,6 +680,20 @@ async def invite_farmer_to_training(
             },
         )
 
+    # Coaching Sandbox — INBOUND isolation (2026-10-14 audit, companion
+    # to the fix in subscriptions/router.py::initiate_assignment).
+    # A real promoter cannot route a training invite to a coaching
+    # student. Same semantic as guard_coaching_assignment_target —
+    # the training invite creates a PromoterAssignment with the exact
+    # same shape as the real promoter-assign flow, so the same
+    # isolation applies here.
+    from app.modules.coaching.service import guard_coaching_assignment_target
+    await guard_coaching_assignment_target(
+        db,
+        farmer_user_id=farmer.id,
+        promoter_user_id=current_user.id,
+    )
+
     # Package must belong to the PARENT (training children borrow
     # the parent's Package catalogue — see Commit C).
     from app.modules.advisory.models import Package
