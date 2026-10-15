@@ -65,6 +65,7 @@ from app.modules.translations.router import router as translations_router
 from app.modules.coaching.router import router as coaching_router
 from app.modules.ledger.router import router as ledger_router
 from app.modules.credit.router import router as credit_router
+from app.modules.soil_nutrient.router import router as soil_nutrient_router
 
 # 2026-06-28 — Subscription soft-delete read-path filter. Installs a
 # session-level SQLAlchemy listener that appends
@@ -112,6 +113,7 @@ app.include_router(translations_router)
 app.include_router(coaching_router)
 app.include_router(ledger_router)
 app.include_router(credit_router)
+app.include_router(soil_nutrient_router)
 
 
 @app.get("/health")

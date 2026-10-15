@@ -222,6 +222,30 @@ class Client(Base):
     is_coaching: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="false", default=False,
     )
+    # 2026-10-15 — Soil Nutrient Management module (Decisions A-P in
+    # project_soil_nutrient_module_design.md). When True, this Client's
+    # CA/SE/CM see the module's authoring surfaces: Portal → Products,
+    # Portal → Normal Ranges, Package → Override Normal Range tab, and
+    # (future) the Mock facility. SA toggles this flag in the SA Portal.
+    # Enforcement: cannot be enabled on is_coaching=True or
+    # is_training=True Clients (coaching/training sandboxes don't carry
+    # live nutrition personalisation). SA-portal UI greys the checkbox
+    # out for sandbox clients.
+    soil_nutrient_module_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false", default=False,
+    )
+    # 2026-10-15 — Soil Testing Lab capability (Decision K). When True,
+    # this Client runs its own soil testing lab (typically a vertically-
+    # integrated fertilizer manufacturer with a lab arm). Unlocks the
+    # LAB_TECHNICIAN role within the Client's user hierarchy and the
+    # lab-portal screens for same-Client farmer-subscription data
+    # entry. Independent labs (no Client relationship) use the farmer-
+    # captured-image path (Decisions I/J) instead. Flag is toggle-able
+    # post-onboarding — a Client may acquire or divest a lab mid-tenure.
+    # Enforcement: cannot be enabled on is_coaching=True Clients.
+    has_soil_testing_lab: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false", default=False,
+    )
     parent_session_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("coaching_sessions.id", ondelete="RESTRICT"),
         nullable=True,

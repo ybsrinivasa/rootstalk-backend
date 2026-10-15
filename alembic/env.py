@@ -43,6 +43,12 @@ from app.modules.farmpundit.models import (
 from app.modules.diagnosis.models import DiagnosisSession  # noqa: F401
 from app.modules.translations.models import ContentTranslation  # noqa: F401
 from app.modules.ledger.models import DealerManualSale, DealerFarmerNote  # noqa: F401
+from app.modules.soil_nutrient.models import (  # noqa: F401
+    PlatformSoilParameter, ProductCategory, ProductCategoryField,
+    PresetSoilProfile, FallbackProduct, FallbackProductCropAssignment,
+    ClientProduct, ClientProductCropAssignment,
+    ClientNormalRange, PackageNormalRangeOverride,
+)
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.database_url_sync)
