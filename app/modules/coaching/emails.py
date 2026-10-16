@@ -15,6 +15,43 @@ from app.modules.clients.service import _send_email
 logger = logging.getLogger(__name__)
 
 
+def _send_email_with_pdf_attachments(
+    to: str, subject: str, html: str, plain: str,
+    attachments: list[tuple[bytes, str]],
+) -> bool:
+    """Multiple-PDF variant of _send_email_with_pdf_attachment.
+    attachments is a list of (bytes, filename) tuples."""
+    if not settings.email_smtp_user or not settings.email_smtp_pass:
+        logger.error(
+            "PDF email to %s skipped: EMAIL_SMTP_USER / _PASS not configured. "
+            "Subject was: %s", to, subject,
+        )
+        return False
+    try:
+        msg = MIMEMultipart("mixed")
+        msg["Subject"] = subject
+        msg["From"] = settings.email_from or settings.email_smtp_user
+        msg["To"] = to
+        body = MIMEMultipart("alternative")
+        body.attach(MIMEText(plain, "plain"))
+        body.attach(MIMEText(html, "html"))
+        msg.attach(body)
+        for pdf_bytes, pdf_filename in attachments:
+            att = MIMEApplication(pdf_bytes, _subtype="pdf")
+            att.add_header(
+                "Content-Disposition", "attachment", filename=pdf_filename,
+            )
+            msg.attach(att)
+        with smtplib.SMTP(settings.email_smtp_host, settings.email_smtp_port) as s:
+            s.ehlo(); s.starttls()
+            s.login(settings.email_smtp_user, settings.email_smtp_pass)
+            s.sendmail(msg["From"], to, msg.as_string())
+        return True
+    except Exception as e:
+        logger.error(f"PDF email send failed to {to}: {e}")
+        return False
+
+
 def _send_email_with_pdf_attachment(
     to: str, subject: str, html: str, plain: str,
     pdf_bytes: bytes, pdf_filename: str,
@@ -64,6 +101,8 @@ def send_certificate_email(
     pdf_bytes: bytes,
     pdf_filename: str,
     verification_url: str,
+    snapshot_pdf_bytes: bytes | None = None,
+    snapshot_pdf_filename: str | None = None,
 ) -> bool:
     """Emails the freshly-generated certificate PDF to the student.
     Body mentions grade + coach + reference client + verification URL
@@ -105,8 +144,11 @@ RootsTalk — Neytiri Eywafarm Agritech"""
     <p style="color:#999;font-size:11px;margin-top:24px">RootsTalk — Neytiri Eywafarm Agritech</p>
   </div>
 </body>"""
-    return _send_email_with_pdf_attachment(
-        to_email, subject, html, plain, pdf_bytes, pdf_filename,
+    attachments: list[tuple[bytes, str]] = [(pdf_bytes, pdf_filename)]
+    if snapshot_pdf_bytes and snapshot_pdf_filename:
+        attachments.append((snapshot_pdf_bytes, snapshot_pdf_filename))
+    return _send_email_with_pdf_attachments(
+        to_email, subject, html, plain, attachments,
     )
 
 

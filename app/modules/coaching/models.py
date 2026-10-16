@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import (
-    String, DateTime, ForeignKey, Index, JSON, UniqueConstraint,
+    String, Text, DateTime, ForeignKey, Index, JSON, UniqueConstraint,
     CheckConstraint, text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -354,6 +354,14 @@ class CoachingStudent(Base):
     # coaching context — the usual exclusion is relaxed for
     # is_coaching=true workspaces.
     assigned_pwa_roles: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+
+    # 2026-10-16 — Workspace snapshot PDF generated at certification
+    # time (hybrid-access design). Independent of future Cosh drift,
+    # preserving the student's authored content as a point-in-time
+    # record. S3 URL; null until the certification generates it.
+    workspace_snapshot_pdf_url: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+    )
 
     certified_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True,
