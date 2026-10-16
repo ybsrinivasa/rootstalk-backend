@@ -42,6 +42,7 @@ async def _sweep_expired_sessions(db: AsyncSession) -> int:
     )).scalars().all()
 
     closed = 0
+    closed_sessions: list[CoachingSession] = []
     for session in sessions:
         if session.auto_close_due(now=now):
             session.status = CoachingSessionStatus.CLOSED_AUTO.value
@@ -49,13 +50,77 @@ async def _sweep_expired_sessions(db: AsyncSession) -> int:
             # closed_by_user_id intentionally left NULL — the audit
             # trail shows the transition wasn't user-driven.
             closed += 1
+            closed_sessions.append(session)
             logger.info(
                 "Coaching session %s auto-closed (started_at=%s)",
                 session.id, session.started_at,
             )
     if closed:
         await db.commit()
+        # Grace-start emails per student (2026-10-16, hybrid access).
+        # Best-effort: don't let email failures roll back the close.
+        for session in closed_sessions:
+            try:
+                await _dispatch_grace_start_emails(db, session)
+            except Exception as e:
+                logger.warning(
+                    "grace-start email dispatch failed for session %s: %s",
+                    session.id, e,
+                )
     return closed
+
+
+async def _dispatch_grace_start_emails(
+    db: AsyncSession, session: CoachingSession,
+) -> None:
+    """Send the grace-start email to each student on an auto-closed
+    session. Mirrors the dispatcher in `service.close_session` for the
+    manual-close path. Kept here to avoid a cross-module tangle; the
+    two call-sites are the only places sessions transition out of
+    ACTIVE."""
+    from app.config import settings
+    from app.modules.clients.models import Client
+    from app.modules.coaching.emails import send_grace_start_email
+    from app.modules.coaching.models import (
+        CoachingStudent, GRACE_DURATION_DAYS,
+    )
+    from app.modules.platform.models import User
+
+    students = (await db.execute(
+        select(CoachingStudent, User, Client)
+        .join(User, User.id == CoachingStudent.user_id)
+        .join(Client, Client.parent_session_id == session.id)
+        .where(CoachingStudent.session_id == session.id)
+    )).all()
+    ref_client_name = (await db.execute(
+        select(Client.full_name).where(
+            Client.id == session.reference_client_id,
+        )
+    )).scalar_one_or_none() or "RootsTalk"
+    coach_user = (await db.execute(
+        select(User).where(User.id == session.coach_user_id)
+    )).scalar_one_or_none()
+    coach_name = (
+        (coach_user.name if coach_user else None)
+        or (coach_user.email if coach_user else None)
+        or "rootsTALK Coach"
+    )
+    portal_root = (
+        settings.frontend_base_url.rstrip("/")
+        if settings.frontend_base_url else "https://rootstalk.in"
+    )
+    for cs, user_row, workspace in students:
+        if not user_row.email:
+            continue
+        portal_url = f"{portal_root}/portal/{workspace.short_name}"
+        send_grace_start_email(
+            to_email=user_row.email,
+            student_name=user_row.name or "Coaching Student",
+            coach_name=coach_name,
+            reference_client_name=ref_client_name,
+            portal_url=portal_url,
+            grace_days=GRACE_DURATION_DAYS,
+        )
 
 
 async def _run_sweep() -> int:

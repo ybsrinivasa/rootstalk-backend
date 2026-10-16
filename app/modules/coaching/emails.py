@@ -208,6 +208,94 @@ RootsTalk — Neytiri Eywafarm Agritech"""
     return _send_email(to_email, subject, html, plain)
 
 
+def send_feedback_request_email(
+    to_email: str,
+    student_name: str,
+    feedback_url: str,
+    is_reminder: bool = False,
+) -> bool:
+    """2026-10-16 — Fires when the coach clicks 'Capture Feedback' on a
+    student card (and again as a +48h reminder if the student hasn't
+    submitted yet). The one-click `feedback_url` is tied to a secret
+    token on the student's Moment2Feedback row.
+
+    Framing (locked with user 2026-10-16):
+      - No duration estimate (students construe '5 minutes' as pressure).
+      - Explicit privacy reassurance: coach can't read before cert.
+    """
+    reminder_prefix = "Reminder: " if is_reminder else ""
+    subject = f"{reminder_prefix}Share your experience of the Coaching Program"
+    plain = f"""Hi {student_name},
+
+You've just completed your coaching session. Before your certificate is issued, we'd love to hear your experience of the Coaching Program.
+
+Take your time — there's no rush. Your honest feedback would be highly valued and will help us build RootsTalk better.
+
+Your coach cannot read your feedback until after your certificate is issued, so please speak freely.
+
+Open the feedback form: {feedback_url}
+
+RootsTalk — Neytiri Eywafarm Agritech"""
+    html = f"""
+<body style="font-family:sans-serif;padding:32px">
+  <h2 style="color:#1A5C2A">Share your experience of the Coaching Program</h2>
+  <p>Hi {student_name},</p>
+  <p>You've just completed your coaching session. Before your certificate is issued, we'd love to hear your experience of the Coaching Program.</p>
+  <p style="background:#ECFDF5;border:1px solid #A7F3D0;padding:12px;border-radius:6px">
+    Take your time — there's no rush. Your honest feedback would be highly valued and will help us build RootsTalk better.
+  </p>
+  <p style="color:#555">Your coach cannot read your feedback until after your certificate is issued, so please speak freely.</p>
+  <p style="margin-top:24px">
+    <a href="{feedback_url}" style="background:#1A5C2A;color:white;padding:12px 24px;text-decoration:none;border-radius:6px;display:inline-block">
+      Open the feedback form
+    </a>
+  </p>
+</body>"""
+    return _send_email(to_email, subject, html, plain)
+
+
+def send_grace_start_email(
+    to_email: str,
+    student_name: str,
+    coach_name: str,
+    reference_client_name: str,
+    portal_url: str,
+    grace_days: int,
+) -> bool:
+    """2026-10-16 — Fires once per student at session close (hybrid-access
+    design). Explains that the coaching session has ended and the
+    student retains full access to practise for the next {grace_days}
+    days; after grace they'll be able to review their workspace in a
+    read-only portal archive forever."""
+    subject = "Your rootsTALK coaching session has ended"
+    plain = f"""Hi {student_name},
+
+Your coaching session with {coach_name} (context: {reference_client_name}) has ended.
+
+You have {grace_days} days of continued full access from today — log in and keep practising with the materials you authored.
+
+After the {grace_days}-day window, your workspace stays available as a read-only archive at the portal, so you can always look back at your work.
+
+Your certificate will arrive separately from your coach.
+
+Portal: {portal_url}
+
+RootsTalk — Neytiri Eywafarm Agritech"""
+    html = f"""
+<body style="font-family:sans-serif;padding:32px">
+  <h2 style="color:#1A5C2A">Your rootsTALK coaching session has ended</h2>
+  <p>Hi {student_name},</p>
+  <p>Your coaching session with <strong>{coach_name}</strong> (context: <strong>{reference_client_name}</strong>) has ended.</p>
+  <p style="background:#ECFDF5;border:1px solid #A7F3D0;padding:12px;border-radius:6px">
+    You have <strong>{grace_days} days of continued full access</strong> from today — log in and keep practising with the materials you authored.
+  </p>
+  <p>After the {grace_days}-day window, your workspace stays available as a <strong>read-only archive</strong> at the portal, so you can always look back at your work.</p>
+  <p style="color:#555">Your certificate will arrive separately from your coach.</p>
+  <p>Portal: <a href="{portal_url}">{portal_url}</a></p>
+</body>"""
+    return _send_email(to_email, subject, html, plain)
+
+
 def send_session_started_email(
     to_email: str,
     student_name: str,

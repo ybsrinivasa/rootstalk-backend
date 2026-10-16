@@ -70,6 +70,36 @@ class CoachingGrade(str, enum.Enum):
     EXCELLENT = "EXCELLENT"
 
 
+class CoachingSessionAccessState(str, enum.Enum):
+    """Access state for a coaching session, derived at runtime from
+    its status + closed_at timestamp. Not a persisted column — the
+    auth layer computes this on each login + request so the state
+    advances with the clock without needing a cron sweep.
+
+    Lifecycle (hybrid access model, settled 2026-10-15):
+
+    NOT_YET_STARTED: session is DRAFT. Student can't log in yet.
+    ACTIVE: session is ACTIVE. Student has full writeable access.
+    GRACE: session is CLOSED_* AND we're within 30 days of closed_at.
+      Student retains full writeable access to practise what they
+      learned. Portal + PWA both allowed.
+    ARCHIVED: session is CLOSED_* AND 30+ days past closed_at.
+      Portal login allowed but mints a read-only token
+      (student_readonly=True claim); PWA login refused with a clear
+      "visit the portal archive" message.
+
+    The grace cutoff is `closed_at + GRACE_DURATION_DAYS` at the
+    moment of the check. A token minted during GRACE naturally
+    expires its writeable window when the next request lands past
+    the grace cutoff — the dependency-layer check in get_current_user
+    enforces the hard-cut.
+    """
+    NOT_YET_STARTED = "NOT_YET_STARTED"
+    ACTIVE = "ACTIVE"
+    GRACE = "GRACE"
+    ARCHIVED = "ARCHIVED"
+
+
 class CoachingInviteStatus(str, enum.Enum):
     """Invite lifecycle: INVITED (coach created, email sent) →
     SUBMITTED (student filled the form) → APPROVED (coach approved,
@@ -102,6 +132,11 @@ INVITE_EXPIRY_DAYS = 14
 
 # Auto-close window after a session moves to ACTIVE.
 SESSION_DURATION_DAYS = 30
+
+# Hybrid-access grace window after a session closes (2026-10-15).
+# Student keeps full writeable access for this many days; after the
+# window they transition to ARCHIVED (portal read-only, PWA refused).
+GRACE_DURATION_DAYS = 30
 
 # Coaching Sandbox — subscription units auto-granted to a student's
 # workspace at approval time (2026-09-03). Lets the student practise
@@ -180,6 +215,34 @@ class CoachingSession(Base):
         if self.started_at is None:
             return False
         return (now or utcnow()) >= self.started_at + timedelta(days=SESSION_DURATION_DAYS)
+
+    def access_state(
+        self, now: Optional[datetime] = None,
+    ) -> "CoachingSessionAccessState":
+        """Return the current access state (NOT_YET_STARTED / ACTIVE
+        / GRACE / ARCHIVED). Pure function of (status, closed_at,
+        now). See CoachingSessionAccessState for the lifecycle."""
+        if self.status == CoachingSessionStatus.DRAFT.value:
+            return CoachingSessionAccessState.NOT_YET_STARTED
+        if self.status == CoachingSessionStatus.ACTIVE.value:
+            return CoachingSessionAccessState.ACTIVE
+        # CLOSED_MANUAL / CLOSED_AUTO
+        if self.closed_at is None:
+            # Defensive — shouldn't happen (DB CHECK invariant), but
+            # treat a missing timestamp as ARCHIVED rather than
+            # giving an unbounded free pass.
+            return CoachingSessionAccessState.ARCHIVED
+        now_ = now or utcnow()
+        if now_ < self.closed_at + timedelta(days=GRACE_DURATION_DAYS):
+            return CoachingSessionAccessState.GRACE
+        return CoachingSessionAccessState.ARCHIVED
+
+    def grace_ends_at(self) -> Optional[datetime]:
+        """When grace will end (closed_at + GRACE_DURATION_DAYS).
+        None for sessions that haven't closed."""
+        if self.closed_at is None:
+            return None
+        return self.closed_at + timedelta(days=GRACE_DURATION_DAYS)
 
 
 class CoachingStudentInvite(Base):
@@ -335,3 +398,95 @@ class CoachingStudent(Base):
 
     def is_certified(self) -> bool:
         return self.certified_at is not None
+
+
+# ── Student feedback (2026-10-16, settled with user) ──────────────────────
+
+class CoachingStudentMoment1Response(Base):
+    """Moment 1 — Expectations captured as part of the student's
+    onboarding form (and updateable during ACTIVE coaching).
+
+    One row per student. `answers_json` holds the student's text
+    answers keyed by question identifier. Question identifiers are
+    frontend-defined; the backend treats answers as opaque.
+
+    All questions are optional (the student can submit the onboarding
+    form without filling any) — per design 2026-10-16: "people can
+    come without any expectation!"
+    """
+    __tablename__ = "coaching_student_moment1_responses"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    student_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("coaching_students.id", ondelete="CASCADE"),
+        nullable=False, unique=True,
+    )
+    answers_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False,
+    )
+
+
+class CoachingStudentMoment2Feedback(Base):
+    """Moment 2 — Feedback captured post-session via a coach-triggered
+    one-click email flow.
+
+    Lifecycle:
+      - Coach clicks "Capture Feedback" → row created with
+        requested_at + feedback_token (unique UUID for email auth) +
+        content_json=NULL (not yet submitted).
+      - System sends email with /f/{feedback_token} link.
+      - Student submits → content_json populated, submitted_at stamped.
+      - After cert issued, coach can view content via post-cert
+        endpoint. Neytiri (SA+CM) sees aggregated feed.
+
+    reminder_sent_at + coach_nudge_sent_at track the 48h/96h cadence:
+      - 48h past requested_at + still submitted_at IS NULL →
+        auto-reminder email, stamp reminder_sent_at.
+      - 96h past requested_at + still NULL → tag coach dashboard,
+        stamp coach_nudge_sent_at.
+
+    Certification gate: `/coaching/sessions/{sid}/students/{stid}/certify`
+    refuses with `moment2_feedback_pending` when submitted_at IS NULL.
+    """
+    __tablename__ = "coaching_student_moment2_feedbacks"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    student_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("coaching_students.id", ondelete="CASCADE"),
+        nullable=False, unique=True,
+    )
+    # One-click email auth token. Secret, random, unique. Short URL
+    # exposure is intentional — leak-containment relies on expiry at
+    # submit time (token is single-use post-submit) + unique random.
+    feedback_token: Mapped[str] = mapped_column(
+        String(64), nullable=False, unique=True,
+    )
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow,
+    )
+    requested_by_coach_user_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    submitted_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    content_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    reminder_sent_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    coach_nudge_sent_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False,
+    )
