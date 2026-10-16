@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import HTTPException
+import io
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -36,7 +37,9 @@ from app.modules.coaching.emails import (
 from app.modules.coaching.models import (
     COACHING_STARTER_POOL_UNITS,
     CoachingInviteStatus, CoachingSession, CoachingSessionStatus,
-    CoachingStudent, CoachingStudentInvite, INVITE_EXPIRY_DAYS,
+    CoachingStudent, CoachingStudentInvite,
+    CoachingStudentMoment1Response,
+    INVITE_EXPIRY_DAYS,
     CoachingSessionAccessState,
     OPEN_SESSION_STATUSES, SESSION_DURATION_DAYS, new_invite_token,
     new_uuid, utcnow,
@@ -183,9 +186,13 @@ async def guard_otp_request_for_coaching_phone(
     if row is None:
         return
     _cs, session = row
-    if session.status == CoachingSessionStatus.ACTIVE.value:
+    state = session.access_state()
+    if state in (
+        CoachingSessionAccessState.ACTIVE,
+        CoachingSessionAccessState.GRACE,
+    ):
         return
-    if session.status == CoachingSessionStatus.DRAFT.value:
+    if state == CoachingSessionAccessState.NOT_YET_STARTED:
         raise HTTPException(
             status_code=403,
             detail={
@@ -197,13 +204,14 @@ async def guard_otp_request_for_coaching_phone(
                 ),
             },
         )
+    # ARCHIVED — PWA refuses with a clear redirect to the portal archive.
     raise HTTPException(
         status_code=403,
         detail={
-            "code": "coaching_session_closed",
+            "code": "coaching_session_archived",
             "message": (
-                "This phone is registered for a coaching session that has "
-                "ended. If you need access, contact your coach."
+                "Your coaching session is archived. Visit the portal "
+                "to review your workspace."
             ),
         },
     )
@@ -687,6 +695,18 @@ async def approve_invite(
         assigned_pwa_roles=[],
     )
     db.add(coaching_student)
+    await db.flush()
+
+    # 2026-10-16 — Carry Moment 1 answers from the onboarding form
+    # into a persistable row that the student can later edit via
+    # /coaching/moment1. If they didn't fill any, we still write an
+    # empty row so the student has a stable home to update later.
+    moment1_from_form = (invite.submitted_form or {}).get("moment1") or {}
+    db.add(CoachingStudentMoment1Response(
+        id=new_uuid(),
+        student_id=coaching_student.id,
+        answers_json=moment1_from_form,
+    ))
 
     # Coaching Sandbox — seed the workspace's SubscriptionPool with
     # COACHING_STARTER_POOL_UNITS units so the student can practise
@@ -1323,12 +1343,22 @@ async def submit_student_form(
             msg = "This invite is no longer active."
         raise HTTPException(status_code=409, detail=msg)
 
+    # moment1_answers: strip empty strings so we don't carry blank
+    # key-value pairs into the Moment 2 mirror. Keys with any
+    # non-empty value are kept verbatim.
+    raw_m1 = form.get("moment1_answers") or {}
+    moment1_clean = {
+        k: str(v).strip()
+        for k, v in raw_m1.items()
+        if isinstance(v, (str, int, float)) and str(v).strip()
+    }
     invite.submitted_form = {
         "name": (form.get("name") or "").strip(),
         "year_of_birth": form.get("year_of_birth"),
         "address": (form.get("address") or "").strip(),
         "organization": (form.get("organization") or "").strip(),
         "phone": (form.get("phone") or "").strip(),
+        "moment1": moment1_clean,
     }
     invite.status = CoachingInviteStatus.SUBMITTED.value
     invite.submitted_at = utcnow()
@@ -1562,6 +1592,72 @@ async def generate_certificate(
         )
 
     student.certificate_generated_at = utcnow()
+
+    # 2026-10-16 — Workspace snapshot PDF (hybrid-access design).
+    # Lists the Packages the student authored in their workspace with
+    # per-Package timeline/practice counts. Best-effort: a snapshot
+    # failure doesn't block the certificate.
+    snapshot_bytes: bytes | None = None
+    snapshot_filename = f"rootsTALK-workspace-snapshot-{student.certificate_number}.pdf"
+    try:
+        from app.modules.advisory.models import (
+            Package, Timeline, Practice,
+        )
+        from app.modules.coaching.workspace_snapshot import (
+            render_workspace_snapshot_pdf,
+        )
+        workspace = (await db.execute(
+            select(Client).where(Client.id == student.workspace_client_id)
+        )).scalar_one()
+        pkg_rows = (await db.execute(
+            select(Package).where(Package.client_id == workspace.id)
+        )).scalars().all()
+        packages_summary: list[tuple[str, int, int]] = []
+        for pkg in pkg_rows:
+            tl_count = (await db.execute(
+                select(func.count(Timeline.id)).where(
+                    Timeline.package_id == pkg.id,
+                )
+            )).scalar() or 0
+            prac_count = (await db.execute(
+                select(func.count(Practice.id))
+                .join(Timeline, Timeline.id == Practice.timeline_id)
+                .where(Timeline.package_id == pkg.id)
+            )).scalar() or 0
+            packages_summary.append((pkg.name, tl_count, prac_count))
+
+        snapshot_bytes = render_workspace_snapshot_pdf(
+            student_name=student_user.name or "Coaching Student",
+            workspace_name=workspace.full_name or workspace.short_name,
+            reference_client_name=ref_client.full_name,
+            coach_name=coach.name or coach.email or "rootsTALK Coach",
+            session_started_at=session.started_at,
+            session_closed_at=session.closed_at,
+            packages=packages_summary,
+        )
+
+        # Upload the snapshot to S3 alongside the certificate.
+        try:
+            from fastapi import UploadFile
+            upload_file = UploadFile(
+                filename=snapshot_filename,
+                file=io.BytesIO(snapshot_bytes),
+            )
+            upload_file.headers = {"content-type": "application/pdf"}  # type: ignore[attr-defined]
+            s3_result = await upload_to_s3(upload_file, folder="coaching-snapshots")
+            student.workspace_snapshot_pdf_url = s3_result.get("url")
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Snapshot S3 upload failed for student %s: %s", student.id, e,
+            )
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(
+            "Workspace snapshot generation failed for student %s: %s",
+            student.id, e,
+        )
+
     await db.commit()
     await db.refresh(student)
 
@@ -1577,6 +1673,8 @@ async def generate_certificate(
             pdf_bytes=pdf_bytes,
             pdf_filename=pdf_filename,
             verification_url=verification_url,
+            snapshot_pdf_bytes=snapshot_bytes,
+            snapshot_pdf_filename=snapshot_filename if snapshot_bytes else None,
         )
     return student
 

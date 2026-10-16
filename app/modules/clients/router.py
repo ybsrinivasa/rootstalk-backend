@@ -987,6 +987,31 @@ async def toggle_client_status(
 
 # ── Client Portal Login ────────────────────────────────────────────────────────
 
+async def _resolve_coaching_access(
+    client: Client, db: AsyncSession,
+) -> dict:
+    """Resolve the GRACE / ARCHIVED banner data for the Client Portal.
+    Empty dict for real (non-coaching) workspaces so the frontend
+    hides the banner."""
+    if not client.is_coaching or not client.parent_session_id:
+        return {}
+    from app.modules.coaching.models import (
+        CoachingSession, CoachingSessionAccessState,
+    )
+    session = await db.get(CoachingSession, client.parent_session_id)
+    if session is None:
+        return {}
+    state = session.access_state()
+    grace_ends_at = session.grace_ends_at()
+    return {
+        "coaching_access": {
+            "state": state.value,
+            "closed_at": session.closed_at.isoformat() if session.closed_at else None,
+            "grace_ends_at": grace_ends_at.isoformat() if grace_ends_at else None,
+        },
+    }
+
+
 @router.get("/portal/{short_name}/branding")
 async def get_portal_branding(short_name: str, db: AsyncSession = Depends(get_db)):
     """Public endpoint — returns branding + the client-level payment
@@ -1021,6 +1046,11 @@ async def get_portal_branding(short_name: str, db: AsyncSession = Depends(get_db
         # loaded candidate list.
         "is_manufacturer": bool(client.is_manufacturer),
         "cosh_manufacturer_id": client.cosh_manufacturer_id,
+        # 2026-10-16 — Coaching workspace access state (hybrid-access
+        # model). For is_coaching=true workspaces the frontend reads
+        # this to render the GRACE / ARCHIVED banner. Absent for real
+        # (non-coaching) clients so the frontend hides the banner.
+        **(await _resolve_coaching_access(client, db)),
     }
 
 

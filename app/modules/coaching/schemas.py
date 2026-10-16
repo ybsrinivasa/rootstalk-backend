@@ -193,12 +193,19 @@ class InviteContextResponse(BaseModel):
 class StudentRegistrationForm(BaseModel):
     """Body for POST /coaching/join/{token}/submit — the student's
     self-registration form. All fields required by design; the coach
-    needs each of these to make the enrolment decision."""
+    needs each of these to make the enrolment decision.
+
+    2026-10-16 — moment1_answers is an optional dict of imagination-
+    oriented questions. Stored on the invite's submitted_form.moment1,
+    and transferred to a CoachingStudentMoment1Response row at
+    approval time (student can keep editing via /coaching/moment1
+    during ACTIVE)."""
     name: str = Field(min_length=2, max_length=255)
     year_of_birth: int = Field(ge=1930, le=2015)
     address: str = Field(min_length=5, max_length=1000)
     organization: str = Field(min_length=2, max_length=255)
     phone: str = Field(min_length=10, max_length=20)
+    moment1_answers: dict = Field(default_factory=dict)
 
 
 class SubmitInviteResponse(BaseModel):
