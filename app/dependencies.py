@@ -85,23 +85,68 @@ async def get_current_user(
         request.state.coach_view_by = payload.get("coach_view_by")
         return user
 
+    # 2026-10-16 — Hybrid access, student_readonly path. ARCHIVED
+    # students log into the portal with a token carrying
+    # `student_readonly=True`. Same enforcement as coach_view:
+    # non-safe HTTP methods refused. Skips the coaching-session-ended
+    # force-logout check below — the student IS allowed in, just
+    # read-only.
+    is_student_readonly = bool(payload.get("student_readonly"))
+    if is_student_readonly:
+        if request.method not in ("GET", "HEAD", "OPTIONS"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "code": "student_readonly",
+                    "message": (
+                        "Your coaching workspace is in archive mode. "
+                        "You can review your work but can't make changes."
+                    ),
+                },
+            )
+        request.state.student_readonly = True
+        return user
+
     # 2026-09-12 — Coaching Sandbox: force-logout if the caller is a
-    # coaching student whose session isn't ACTIVE. Login-time guards
-    # (`guard_coaching_student_login`) already refuse fresh logins on
-    # non-ACTIVE sessions, but that leaves an already-authenticated
+    # coaching student whose session has moved beyond writeable states.
+    # Login-time guards (`guard_coaching_student_login`) already refuse
+    # fresh logins on bad states, but that leaves an already-authenticated
     # student able to keep making requests with an existing JWT until
-    # it expires (30-day TTL). This check applies to every
-    # authenticated request; one extra DB round-trip only for users
-    # that actually have a CoachingStudent row (rare + small
-    # population). Non-coaching users pass through unchanged.
+    # it expires. This check applies to every authenticated request;
+    # one extra DB round-trip only for users that actually have a
+    # CoachingStudent row. Non-coaching users pass through unchanged.
+    #
+    # 2026-10-16 — Hybrid access: ACTIVE + GRACE are both writeable
+    # states, so the force-logout fires only on NOT_YET_STARTED or
+    # ARCHIVED. ARCHIVED students must re-login through the portal to
+    # mint a read-only token (handled above); this ensures a writeable
+    # JWT minted during GRACE stops working the moment grace ends.
     from app.modules.coaching.service import (
         get_coaching_student_for_user,
     )
-    from app.modules.coaching.models import CoachingSession, CoachingSessionStatus
+    from app.modules.coaching.models import (
+        CoachingSession, CoachingSessionAccessState,
+    )
     coaching_student = await get_coaching_student_for_user(db, user.id)
     if coaching_student is not None:
         session = await db.get(CoachingSession, coaching_student.session_id)
-        if session is None or session.status != CoachingSessionStatus.ACTIVE.value:
+        if session is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={
+                    "code": "coaching_session_ended",
+                    "message": (
+                        "Your coaching session has ended. Sign in again "
+                        "with your real phone if you'd like to keep using "
+                        "RootsTalk."
+                    ),
+                },
+            )
+        access_state = session.access_state()
+        if access_state not in (
+            CoachingSessionAccessState.ACTIVE,
+            CoachingSessionAccessState.GRACE,
+        ):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail={

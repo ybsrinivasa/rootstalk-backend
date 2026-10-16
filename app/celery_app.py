@@ -48,6 +48,7 @@ celery_app = Celery(
         "app.tasks.training_expiry",
         "app.tasks.promoter_stepdown_expiry",
         "app.tasks.coaching_expiry",
+        "app.tasks.coaching_feedback_reminders",
         "app.tasks.credit_reminders",
     ],
 )
@@ -168,6 +169,14 @@ celery_app.conf.beat_schedule = {
     "coaching-expiry-check": {
         "task": "app.tasks.coaching_expiry.sweep_expired_coaching_sessions",
         "schedule": crontab(minute=20),
+    },
+    # Coaching student feedback (2026-10-16): hourly scan of pending
+    # Moment2 feedback rows. +48h sends student a reminder email;
+    # +96h stamps coach_nudge_sent_at (frontend reads to show the
+    # "reach out personally" nudge on the student card).
+    "coaching-feedback-reminders": {
+        "task": "app.tasks.coaching_feedback_reminders.sweep_feedback_reminders",
+        "schedule": crontab(minute=25),
     },
     # CMS v1.1 (2026-09-14): daily dealer digest at 14:30 UTC = 20:00
     # IST — end of the working day, when dealers are most likely to

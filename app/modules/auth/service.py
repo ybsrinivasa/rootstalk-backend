@@ -82,6 +82,42 @@ def create_coach_view_token(
     return jwt.encode(payload, settings.secret_key, algorithm=settings.algorithm)
 
 
+def create_student_readonly_token(
+    user: User,
+    *,
+    client_id: Optional[str] = None,
+    client_short_name: Optional[str] = None,
+) -> str:
+    """Mint a portal token for a coaching student whose session is
+    ARCHIVED (hybrid-access, settled 2026-10-15).
+
+    Shape mirrors a normal portal token (sub + roles + client_id +
+    client_short_name) with one extra claim: `student_readonly=True`.
+    get_current_user refuses any non-safe HTTP method on tokens
+    carrying this claim (same mechanism as coach_view), so the student
+    can log into their archive and read everything but write nothing.
+
+    Also bypasses the coaching-session-ended force-logout: the
+    student IS allowed in by design, just read-only.
+
+    No jti rotation — the archive is a long-running state and we
+    don't want to invalidate a sibling device the student might use
+    to re-visit their archive from another browser.
+    """
+    active_roles = [r.role_type.value for r in user.roles if r.status == StatusEnum.ACTIVE]
+    payload = {
+        "sub": user.id,
+        "roles": active_roles,
+        "student_readonly": True,
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=settings.access_token_expire_minutes),
+    }
+    if client_id:
+        payload["client_id"] = client_id
+    if client_short_name:
+        payload["client_short_name"] = client_short_name
+    return jwt.encode(payload, settings.secret_key, algorithm=settings.algorithm)
+
+
 def decode_token(token: str) -> Optional[dict]:
     try:
         return jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])

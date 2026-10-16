@@ -37,6 +37,7 @@ from app.modules.coaching.models import (
     COACHING_STARTER_POOL_UNITS,
     CoachingInviteStatus, CoachingSession, CoachingSessionStatus,
     CoachingStudent, CoachingStudentInvite, INVITE_EXPIRY_DAYS,
+    CoachingSessionAccessState,
     OPEN_SESSION_STATUSES, SESSION_DURATION_DAYS, new_invite_token,
     new_uuid, utcnow,
 )
@@ -45,24 +46,37 @@ from app.modules.platform.models import RoleType, StatusEnum, User
 
 # ── Login / OTP gates for coaching students ──────────────────────────────
 
+# Login channels — passed to guard_coaching_student_login so it can
+# apply the right rule for each surface. See 2026-10-15 hybrid-access
+# design: PORTAL permits ARCHIVED (read-only); PWA refuses ARCHIVED.
+LOGIN_CHANNEL_PORTAL = "PORTAL"
+LOGIN_CHANNEL_PWA = "PWA"
+
+
 async def guard_coaching_student_login(
     db: AsyncSession, user_id: str,
-) -> None:
-    """Refuse login (portal or PWA) if this user is a coaching student
-    whose session isn't ACTIVE. Session lifecycle for the student:
+    channel: str = LOGIN_CHANNEL_PORTAL,
+) -> str:
+    """Decide what access a coaching student is allowed on login.
 
-      - Coach approves → CoachingStudent created + session still DRAFT →
-        student MUST NOT be able to log in yet (coach hasn't clicked
-        Start; wait for the session-started email).
-      - Coach clicks Start → session ACTIVE → login allowed.
-      - Coach clicks Close (or 30-day auto-close) → session CLOSED →
-        student loses login access; coach reviews their workspace
-        read-only for certification.
+    Returns the access state (NOT_YET_STARTED / ACTIVE / GRACE /
+    ARCHIVED) when the login is permitted, so the caller can decide
+    whether to mint a writeable or a read-only token. Raises 403 when
+    the login is refused.
 
-    Non-coaching users pass through unchanged. Same 403 for both
-    "session not started" and "session closed" — students already
-    know the state from the emails they've received, and the
-    generic message avoids leaking session mechanics to non-students.
+    Lifecycle for the student (hybrid-access settled 2026-10-15):
+      - DRAFT:    refuse 403 coaching_session_not_started
+      - ACTIVE:   permit, caller mints a writeable token
+      - GRACE:    permit, caller mints a writeable token (practice
+                  access retained for 30 days post-close)
+      - ARCHIVED (channel=PORTAL): permit, caller mints a
+                  student_readonly token (archive viewing only)
+      - ARCHIVED (channel=PWA): refuse 403 coaching_session_archived
+                  with a clear redirect to the portal archive
+
+    Non-coaching users pass through unchanged (returns "ACTIVE" as
+    a safe default — they're not students, so the state value isn't
+    consulted downstream).
     """
     row = (await db.execute(
         select(CoachingStudent, CoachingSession)
@@ -70,11 +84,12 @@ async def guard_coaching_student_login(
         .where(CoachingStudent.user_id == user_id)
     )).first()
     if row is None:
-        return  # not a coaching student
+        return CoachingSessionAccessState.ACTIVE.value  # not a coaching student
     _cs, session = row
-    if session.status == CoachingSessionStatus.ACTIVE.value:
-        return
-    if session.status == CoachingSessionStatus.DRAFT.value:
+
+    state = session.access_state()
+
+    if state == CoachingSessionAccessState.NOT_YET_STARTED:
         raise HTTPException(
             status_code=403,
             detail={
@@ -85,31 +100,44 @@ async def guard_coaching_student_login(
                 ),
             },
         )
-    # CLOSED_MANUAL / CLOSED_AUTO
-    raise HTTPException(
-        status_code=403,
-        detail={
-            "code": "coaching_session_closed",
-            "message": (
-                "Your coaching session has ended. If you need access, "
-                "contact your coach."
-            ),
-        },
-    )
+    if state == CoachingSessionAccessState.ACTIVE:
+        return state.value
+    if state == CoachingSessionAccessState.GRACE:
+        return state.value
+    # ARCHIVED
+    if channel == LOGIN_CHANNEL_PWA:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "coaching_session_archived",
+                "message": (
+                    "Your coaching session is archived. Visit the portal "
+                    "to review your workspace."
+                ),
+            },
+        )
+    return state.value
 
 
 async def is_active_coaching_temp_phone(
     db: AsyncSession, phone: str,
 ) -> bool:
     """Return True iff `phone` is a `+913…` coaching temp phone that
-    belongs to a CoachingStudent whose session is ACTIVE.
+    belongs to a CoachingStudent whose session is in ACTIVE or GRACE
+    state (i.e. the student retains full writeable access).
+
+    2026-10-15 — hybrid access: widened from ACTIVE-only to include
+    GRACE so students can keep logging into the PWA during the 30-day
+    grace window after their session closes. ARCHIVED students have
+    their PWA login refused upstream (in guard_coaching_student_login
+    with channel=PWA), so no OTP needs to be issued for them.
 
     Drives two behaviours in the OTP request path:
       1. Skip SMS entirely (real carriers can't route +913 numbers).
       2. Surface the OTP in the response body so the PWA can auto-fill
-         / display it in-app for the student. This is safe on prod
-         because the gate is precise — only fires for a phone that
-         matches an active coaching student.
+         / display it in-app for the student. Safe because the gate
+         is precise — only fires for a phone matching an in-session
+         or in-grace coaching student.
     """
     if not phone or not phone.startswith("+913"):
         return False
@@ -125,7 +153,11 @@ async def is_active_coaching_temp_phone(
     if row is None:
         return False
     _cs, session = row
-    return session.status == CoachingSessionStatus.ACTIVE.value
+    state = session.access_state()
+    return state in (
+        CoachingSessionAccessState.ACTIVE,
+        CoachingSessionAccessState.GRACE,
+    )
 
 
 async def guard_otp_request_for_coaching_phone(
@@ -353,7 +385,11 @@ async def close_session(
 ) -> CoachingSession:
     """ACTIVE → CLOSED_MANUAL (or CLOSED_AUTO via the celery task).
     Coaching workspaces stay in place (RESTRICT FK) so the coach can
-    still review student work for certification post-close."""
+    still review student work for certification post-close.
+
+    2026-10-16 — Fires a one-off grace-start email to each student
+    explaining the 30-day continued-access window + eventual read-only
+    archive. Email failure is non-fatal (close still succeeds)."""
     if session.status != CoachingSessionStatus.ACTIVE.value:
         raise HTTPException(
             status_code=409,
@@ -370,6 +406,54 @@ async def close_session(
     session.closed_by_user_id = closed_by.id if closed_by else None
     await db.commit()
     await db.refresh(session)
+
+    # Grace-start emails (best-effort — close has already committed).
+    try:
+        from app.modules.coaching.emails import send_grace_start_email
+        from app.modules.coaching.models import GRACE_DURATION_DAYS
+        from app.config import settings
+
+        students = (await db.execute(
+            select(CoachingStudent, User, Client)
+            .join(User, User.id == CoachingStudent.user_id)
+            .join(Client, Client.parent_session_id == session.id)
+            .where(CoachingStudent.session_id == session.id)
+        )).all()
+        ref_client_name = (await db.execute(
+            select(Client.full_name).where(
+                Client.id == session.reference_client_id,
+            )
+        )).scalar_one_or_none() or "RootsTalk"
+        coach_user = (await db.execute(
+            select(User).where(User.id == session.coach_user_id)
+        )).scalar_one_or_none()
+        coach_name = (
+            (coach_user.name if coach_user else None)
+            or (coach_user.email if coach_user else None)
+            or "rootsTALK Coach"
+        )
+        portal_root = (
+            settings.frontend_base_url.rstrip("/")
+            if settings.frontend_base_url else "https://rootstalk.in"
+        )
+        for cs, user_row, workspace in students:
+            if not user_row.email:
+                continue
+            portal_url = f"{portal_root}/portal/{workspace.short_name}"
+            send_grace_start_email(
+                to_email=user_row.email,
+                student_name=user_row.name or "Coaching Student",
+                coach_name=coach_name,
+                reference_client_name=ref_client_name,
+                portal_url=portal_url,
+                grace_days=GRACE_DURATION_DAYS,
+            )
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(
+            f"grace-start email dispatch failed for session {session.id}: {e}"
+        )
+
     return session
 
 
@@ -1337,6 +1421,31 @@ async def set_certification(
                 detail={
                     "code": "grade_required",
                     "message": "Grade must be one of SATISFACTORY, GOOD, or EXCELLENT.",
+                },
+            )
+        # 2026-10-16 — Moment 2 feedback is mandatory before issuing
+        # a certificate (student feedback design, settled with user).
+        # The coach must have clicked "Capture Feedback" + the student
+        # must have submitted the form before this gate opens. See
+        # project_coaching_student_feedback_design_2026_10_16.md.
+        from app.modules.coaching.models import CoachingStudentMoment2Feedback
+        feedback = (await db.execute(
+            select(CoachingStudentMoment2Feedback).where(
+                CoachingStudentMoment2Feedback.student_id == student.id,
+            )
+        )).scalar_one_or_none()
+        if feedback is None or feedback.submitted_at is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "moment2_feedback_pending",
+                    "message": (
+                        "The student's feedback is required before "
+                        "issuing the certificate. Click 'Capture "
+                        "Feedback' on the student card first; the "
+                        "certificate button will open once the "
+                        "feedback is submitted."
+                    ),
                 },
             )
         student.certified_at = utcnow()

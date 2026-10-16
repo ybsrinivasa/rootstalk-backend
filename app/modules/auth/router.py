@@ -82,33 +82,46 @@ async def _check_client_user(db: AsyncSession, user: User, short_name: str) -> C
         raise HTTPException(status_code=401, detail="This email is not registered with this company")
     # 2026-09-01 — Coaching Sandbox lockout: if this workspace is a
     # coaching workspace whose session has CLOSED, refuse login for
-    # every user (student + every SE/FM/RM the student invited).
+    # every non-student user (every SE/FM/RM the student invited).
     # Without this gate, a Subject Expert the student added would
     # still be able to log in after the coach closed the session and
     # continue authoring in an unsupervised "zombie" workspace.
-    # Student's own login is already blocked by
-    # guard_coaching_student_login; this covers every other
-    # ClientUser in the same workspace.
+    #
+    # 2026-10-16 — hybrid access: the STUDENT themselves is now
+    # allowed through to their own workspace even after the session
+    # closes. guard_coaching_student_login (called after this guard)
+    # decides whether that access is writeable (GRACE) or read-only
+    # (ARCHIVED → student_readonly token).
     if client.is_coaching and client.parent_session_id:
         from app.modules.coaching.models import (
-            CoachingSession, OPEN_SESSION_STATUSES,
+            CoachingSession, CoachingStudent, OPEN_SESSION_STATUSES,
         )
         session_status = (await db.execute(
             select(CoachingSession.status)
             .where(CoachingSession.id == client.parent_session_id)
         )).scalar_one_or_none()
         if session_status and session_status not in {s.value for s in OPEN_SESSION_STATUSES}:
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "code": "coaching_workspace_closed",
-                    "message": (
-                        "This coaching workspace has been closed by the "
-                        "coach. If you need continued access, please "
-                        "contact your coach."
-                    ),
-                },
-            )
+            # Is this user the coaching student that owns this
+            # workspace? If so, let them pass — the per-state access
+            # decision happens in guard_coaching_student_login.
+            is_the_student = (await db.execute(
+                select(CoachingStudent.id).where(
+                    CoachingStudent.session_id == client.parent_session_id,
+                    CoachingStudent.user_id == user.id,
+                )
+            )).scalar_one_or_none() is not None
+            if not is_the_student:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "coaching_workspace_closed",
+                        "message": (
+                            "This coaching workspace has been closed by the "
+                            "coach. If you need continued access, please "
+                            "contact your coach."
+                        ),
+                    },
+                )
     return client
 
 
@@ -177,8 +190,12 @@ async def verify_otp(request: PhoneOtpVerify, db: AsyncSession = Depends(get_db)
     # applied here as belt-and-braces in case the OTP was requested
     # while the session was ACTIVE and consumed after it closed
     # (rare, but possible with a 30-second OTP + a 30-day session).
-    from app.modules.coaching.service import guard_coaching_student_login
-    await guard_coaching_student_login(db, user.id)
+    # 2026-10-16 — PWA channel: ARCHIVED students get refused outright
+    # (no PWA access post-grace; direct them to the portal archive).
+    from app.modules.coaching.service import (
+        guard_coaching_student_login, LOGIN_CHANNEL_PWA,
+    )
+    await guard_coaching_student_login(db, user.id, channel=LOGIN_CHANNEL_PWA)
     await start_new_session(db, user)
     return TokenResponse(access_token=_build_token(user))
 
@@ -196,11 +213,28 @@ async def admin_login(request: AdminLoginRequest, db: AsyncSession = Depends(get
     client: Client | None = None
     if request.client_short_name:
         client = await _check_client_user(db, user, request.client_short_name)
-    # Coaching Sandbox guard — student portal logins refused pre-ACTIVE
-    # and post-CLOSED. Coach + non-student portal users pass through.
-    from app.modules.coaching.service import guard_coaching_student_login
-    await guard_coaching_student_login(db, user.id)
+    # Coaching Sandbox guard — portal channel. Pre-ACTIVE refused;
+    # ACTIVE + GRACE return writeable; ARCHIVED returns the state
+    # value so we mint a read-only token below (hybrid-access,
+    # 2026-10-16).
+    from app.modules.coaching.service import (
+        guard_coaching_student_login, LOGIN_CHANNEL_PORTAL,
+    )
+    from app.modules.coaching.models import CoachingSessionAccessState
+    access_state = await guard_coaching_student_login(
+        db, user.id, channel=LOGIN_CHANNEL_PORTAL,
+    )
     await start_new_session(db, user)
+
+    if access_state == CoachingSessionAccessState.ARCHIVED.value:
+        from app.modules.auth.service import create_student_readonly_token
+        token = create_student_readonly_token(
+            user,
+            client_id=client.id if client else None,
+            client_short_name=client.short_name if client else None,
+        )
+        return TokenResponse(access_token=token)
+
     return TokenResponse(access_token=_build_token(
         user,
         client_id=client.id if client else None,
@@ -284,12 +318,27 @@ async def verify_email_otp(data: dict, db: AsyncSession = Depends(get_db)):
     client: Client | None = None
     if client_short_name and otp.purpose == "LOGIN":
         client = await _check_client_user(db, user, client_short_name)
-    # Coaching Sandbox guard — student portal-OTP logins refused
-    # pre-ACTIVE / post-CLOSED, same rule as password login above.
-    from app.modules.coaching.service import guard_coaching_student_login
-    await guard_coaching_student_login(db, user.id)
+    # Coaching Sandbox guard — portal-OTP channel. Same hybrid-access
+    # rules as /admin/login above (2026-10-16).
+    from app.modules.coaching.service import (
+        guard_coaching_student_login, LOGIN_CHANNEL_PORTAL,
+    )
+    from app.modules.coaching.models import CoachingSessionAccessState
+    access_state = await guard_coaching_student_login(
+        db, user.id, channel=LOGIN_CHANNEL_PORTAL,
+    )
     await db.commit()
     await start_new_session(db, user)
+
+    if access_state == CoachingSessionAccessState.ARCHIVED.value:
+        from app.modules.auth.service import create_student_readonly_token
+        token = create_student_readonly_token(
+            user,
+            client_id=client.id if client else None,
+            client_short_name=client.short_name if client else None,
+        )
+        return TokenResponse(access_token=token)
+
     return TokenResponse(access_token=_build_token(
         user,
         client_id=client.id if client else None,
