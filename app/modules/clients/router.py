@@ -1021,6 +1021,13 @@ async def get_portal_branding(short_name: str, db: AsyncSession = Depends(get_db
         # loaded candidate list.
         "is_manufacturer": bool(client.is_manufacturer),
         "cosh_manufacturer_id": client.cosh_manufacturer_id,
+        # 2026-10-16 — Soil Nutrient module flags. CA portal sidebar
+        # hides /soil-nutrient/* entries when False. SA toggles the
+        # flags from the SA Portal Client-detail panel; cached
+        # CPClient on localStorage auto-refreshes on next layout mount
+        # (see (portal)/layout.tsx refresh effect).
+        "soil_nutrient_module_enabled": bool(client.soil_nutrient_module_enabled),
+        "has_soil_testing_lab": bool(client.has_soil_testing_lab),
     }
 
 
