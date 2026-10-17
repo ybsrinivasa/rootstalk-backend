@@ -943,6 +943,120 @@ async def list_cosh_input_manufacturers(
     return out
 
 
+@router.get("/admin/clients/{client_id}/manufacturers")
+async def list_client_cosh_manufacturers(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """2026-10-17 (Phase 6a / Decision U) — list the Cosh Manufacturers
+    this Client is linked to for the Soil Nutrient module. Returns
+    `[{cosh_id, name}]` — same shape as `/admin/cosh/manufacturers`,
+    enriched with the manufacturer display name from Cosh.
+
+    Independent of `clients.cosh_manufacturer_id` (single value used
+    by QR Product Authentication). This endpoint reads the M:N table.
+    """
+    _require_sa(current_user)
+    from app.modules.clients.models import ClientCoshManufacturer
+    from app.modules.sync.models import CoshCoreItem
+
+    linked = (await db.execute(
+        select(ClientCoshManufacturer.cosh_manufacturer_id)
+        .where(ClientCoshManufacturer.client_id == client_id)
+    )).scalars().all()
+    if not linked:
+        return []
+    rows = (await db.execute(
+        select(CoshCoreItem.cosh_id, CoshCoreItem.translations).where(
+            CoshCoreItem.core_type == "input_manufacturers",
+            CoshCoreItem.cosh_id.in_(linked),
+        )
+    )).all()
+    name_by_id: dict[str, str] = {}
+    for cosh_id, translations in rows:
+        name = None
+        if isinstance(translations, dict):
+            name = translations.get("en") or next(
+                (v for v in translations.values() if v), None,
+            )
+        name_by_id[cosh_id] = name or cosh_id
+    out = [
+        {"cosh_id": cid, "name": name_by_id.get(cid, cid)}
+        for cid in linked
+    ]
+    out.sort(key=lambda r: (r["name"] or "").lower())
+    return out
+
+
+@router.put("/admin/clients/{client_id}/manufacturers")
+async def replace_client_cosh_manufacturers(
+    client_id: str,
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """2026-10-17 (Phase 6a / Decision U) — replace the full set of
+    linked Cosh Manufacturers for this Client. Payload: `{"cosh_ids":
+    [...]}`. Replace-all semantics: existing rows deleted, new rows
+    inserted. Idempotent on repeat.
+
+    Does NOT touch `clients.cosh_manufacturer_id` (QR flow owns that
+    single column independently). SA may consider syncing one entry
+    from the multi-select back into the QR column via the Client edit
+    modal if they want both to agree, but that's an explicit action,
+    not an automatic one.
+    """
+    _require_sa(current_user)
+    cosh_ids = data.get("cosh_ids") or []
+    if not isinstance(cosh_ids, list):
+        raise HTTPException(status_code=422, detail="cosh_ids must be a list")
+
+    client = (await db.execute(
+        select(Client).where(Client.id == client_id)
+    )).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    from app.modules.clients.models import ClientCoshManufacturer
+    # Validate every cosh_id against Cosh master so we don't accept
+    # typos / stale IDs.
+    if cosh_ids:
+        from app.modules.sync.models import CoshCoreItem
+        valid = (await db.execute(
+            select(CoshCoreItem.cosh_id).where(
+                CoshCoreItem.core_type == "input_manufacturers",
+                CoshCoreItem.status == "active",
+                CoshCoreItem.cosh_id.in_(cosh_ids),
+            )
+        )).scalars().all()
+        valid_set = set(valid)
+        invalid = [c for c in cosh_ids if c not in valid_set]
+        if invalid:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "invalid_manufacturer_ids",
+                    "message": f"Unknown Cosh manufacturer IDs: {invalid}",
+                },
+            )
+
+    # Replace-all: delete existing, insert new.
+    await db.execute(
+        ClientCoshManufacturer.__table__.delete().where(
+            ClientCoshManufacturer.client_id == client_id,
+        )
+    )
+    for cid in cosh_ids:
+        db.add(ClientCoshManufacturer(
+            client_id=client_id,
+            cosh_manufacturer_id=cid,
+            created_by=current_user.id,
+        ))
+    await db.commit()
+    return {"client_id": client_id, "cosh_ids": cosh_ids}
+
+
 @router.put("/admin/clients/{client_id}/status", response_model=ClientOut)
 async def toggle_client_status(
     client_id: str,

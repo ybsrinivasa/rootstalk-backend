@@ -292,6 +292,49 @@ class ClientOrganisationType(Base):
     client: Mapped["Client"] = relationship("Client", back_populates="organisation_types")
 
 
+class ClientCoshManufacturer(Base):
+    """2026-10-17 — Client's linked Cosh Manufacturers (M:N) for the Soil
+    Nutrient module per Decision U.
+
+    A Client can be identified with multiple Cosh Manufacturers (e.g., a
+    group operating multiple brand entities under different Cosh
+    manufacturer rows). This drives the Soil Nutrient module's product
+    picker — the Client Portal product selector filters Cosh fertilizer
+    products to those made by the Client's linked Manufacturers.
+
+    Independent of `clients.cosh_manufacturer_id` (single value, added
+    2026-07-05 for QR Product Authentication). The QR flow stays on the
+    single column; the Soil Nutrient module uses this M:N table. The
+    two can coexist indefinitely; a backfill at migration time populates
+    this table with each Client's existing single-column value so
+    nothing breaks.
+    """
+    __tablename__ = "client_cosh_manufacturers"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    client_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("clients.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    cosh_manufacturer_id: Mapped[str] = mapped_column(
+        String(200), nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False,
+    )
+    created_by: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "client_id", "cosh_manufacturer_id",
+            name="uq_client_cosh_manufacturer",
+        ),
+    )
+
+
 class ClientUser(Base):
     __tablename__ = "client_users"
 
