@@ -1,6 +1,7 @@
 import uuid
 import enum
 from datetime import datetime, timezone, date
+from typing import Optional
 from sqlalchemy import (
     String, Text, Boolean, Integer, DateTime, Date, ForeignKey,
     Enum as SAEnum, UniqueConstraint, Index, CheckConstraint,
@@ -140,6 +141,17 @@ class Package(Base):
     # whose content this row was published from. NULL otherwise.
     source_version_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("packages.id"), nullable=True,
+    )
+
+    # Decision W (2026-10-17) — Soil Range Template this Package is
+    # classified against. NULL = no template picked; bounds-based
+    # classification doesn't fire for this Package (Package overrides
+    # may still carry bounds + Decision V adjustments independently).
+    # ondelete=SET NULL — deleting a template deactivates its bindings
+    # without cascading to the Packages themselves.
+    soil_range_template_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("soil_range_templates.id", ondelete="SET NULL"),
+        nullable=True,
     )
 
     locations: Mapped[list["PackageLocation"]] = relationship("PackageLocation", back_populates="package")

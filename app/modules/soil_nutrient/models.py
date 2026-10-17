@@ -293,31 +293,72 @@ class ClientProductCropAssignment(Base):
     )
 
 
-class ClientNormalRange(Base):
-    """Decision N — crop-level default Normal Range for one parameter.
+class SoilRangeTemplate(Base):
+    """Decision W (2026-10-17) — client-level, geography-based Soil
+    Range Template library row.
 
-    The baseline the Soil Nutrient engine classifies a farmer's measured
-    value against when no Package-level override exists for that
-    parameter. Authored by CA/SE/CM-EDIT in the Client Portal
-    (Portal → Normal Ranges), one row per (client, crop, parameter).
+    Walks back Decision N's crop-level scope. Soil property norms
+    (pH, EC, OC, free CaCO3, base N/P/K levels) are governed by
+    geography — parent material, climate, drainage — not by crop.
+    One Dharwad-red template serves Mango, Pomegranate, and Grape
+    Packages equally. SE picks a template on each Package; Package-
+    level overrides (PackageNormalRangeOverride) handle rare
+    exceptions and the Decision V % adjustments.
 
-    Partial authoring is allowed — a parameter without a row for
-    this (client, crop) is simply NOT classified at engine time
-    (no error, no guess). Matches real behaviour where not every lab
-    reports every nutrient.
-
-    Resolution order at classification time: Package override (if
-    present per `PackageNormalRangeOverride`) → this crop default →
-    not classified.
+    Name is unique per Client — "Dharwad red", "Belgaum black cotton",
+    "Udupi coastal" — one Client's naming has no bearing on another's.
     """
-    __tablename__ = "client_normal_ranges"
+    __tablename__ = "soil_range_templates"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     client_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("clients.id", ondelete="CASCADE"),
         nullable=False,
     )
-    crop_cosh_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
+    created_by: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow,
+    )
+
+    rows: Mapped[list["SoilRangeTemplateRow"]] = relationship(
+        "SoilRangeTemplateRow", back_populates="template",
+        cascade="all, delete-orphan",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "client_id", "name",
+            name="uq_soil_range_template_client_name",
+        ),
+    )
+
+
+class SoilRangeTemplateRow(Base):
+    """Decision W — one parameter's operator + Low + High on a template.
+
+    Partial authoring is fine: a parameter without a row simply isn't
+    classified by the engine for Packages that use this template.
+    Matches real behaviour where not every lab reports every nutrient.
+
+    No `low_pct_adjustment` / `high_pct_adjustment` here — those are
+    crop-sensitive and live on `PackageNormalRangeOverride` so each
+    Package's SE can tune the shift for the Package's crop.
+    """
+    __tablename__ = "soil_range_template_rows"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    template_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("soil_range_templates.id", ondelete="CASCADE"),
+        nullable=False,
+    )
     parameter_id: Mapped[str] = mapped_column(
         String(36),
         ForeignKey("platform_soil_parameters.id", ondelete="RESTRICT"),
@@ -329,18 +370,6 @@ class ClientNormalRange(Base):
     )
     low_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     high_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    # Decision V — classification → target adjustment. Operator-gated
-    # at the service layer: low_pct meaningful for RANGE/LOWER_BOUND,
-    # high_pct meaningful for RANGE/UPPER_BOUND. 0.0 = no adjustment.
-    low_pct_adjustment: Mapped[float] = mapped_column(
-        Float, nullable=False, default=0.0, server_default="0",
-    )
-    high_pct_adjustment: Mapped[float] = mapped_column(
-        Float, nullable=False, default=0.0, server_default="0",
-    )
-    created_by: Mapped[Optional[str]] = mapped_column(
-        String(36), ForeignKey("users.id"), nullable=True,
-    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow,
     )
@@ -348,26 +377,34 @@ class ClientNormalRange(Base):
         DateTime(timezone=True), default=utcnow, onupdate=utcnow,
     )
 
+    template: Mapped["SoilRangeTemplate"] = relationship(
+        "SoilRangeTemplate", back_populates="rows",
+    )
+
     __table_args__ = (
         UniqueConstraint(
-            "client_id", "crop_cosh_id", "parameter_id",
-            name="uq_client_crop_parameter_range",
+            "template_id", "parameter_id",
+            name="uq_soil_range_template_parameter",
         ),
     )
 
 
 class PackageNormalRangeOverride(Base):
-    """Decision N — sparse per-Package override for one parameter.
+    """Decision W (2026-10-17, updated) — sparse per-Package row.
 
-    When a specific Package's region or crop subtype needs tighter
-    thresholds than the Client's crop-level default, CA/SE/CM-EDIT
-    adds an override inside the Package editor (Package →
-    'Override Normal Range' tab). Only parameters that genuinely need
-    overriding carry a row; unaddressed parameters inherit the crop
-    default.
+    Two things ride on this row (both optional per column, not per row):
+      1. Bounds override — operator / low_value / high_value. When
+         populated, overrides the matching parameter in the Package's
+         chosen SoilRangeTemplate. Leave operator null to inherit.
+      2. Decision V % adjustments — low_pct_adjustment /
+         high_pct_adjustment. First-class Package data (NOT an
+         "override" of anything on the template — templates carry no
+         adjustments). Default 0.0.
 
-    Resolution order at classification time: this override (if
-    present) → crop default via `ClientNormalRange` → not classified.
+    Resolution order at classification time: template row from
+    `packages.soil_range_template_id` → this row's bounds (if the
+    operator column is populated) → not classified. Adjustments
+    always come from this row (or default 0 when no row exists).
     """
     __tablename__ = "package_normal_range_overrides"
 
@@ -381,15 +418,18 @@ class PackageNormalRangeOverride(Base):
         ForeignKey("platform_soil_parameters.id", ondelete="RESTRICT"),
         nullable=False,
     )
-    operator: Mapped[NormalRangeOperator] = mapped_column(
+    # Decision W — operator + bounds now nullable. NULL operator means
+    # "inherit bounds from template"; non-NULL means "override template
+    # bounds with this row's low/high". low_pct_adjustment /
+    # high_pct_adjustment are first-class Package data (not an override
+    # of anything on the template) and always carry a value — default
+    # 0.0 when the Client hasn't configured one.
+    operator: Mapped[Optional[NormalRangeOperator]] = mapped_column(
         SAEnum(NormalRangeOperator, native_enum=False, length=20),
-        nullable=False,
+        nullable=True,
     )
     low_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     high_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    # Decision V — classification → target adjustment. Operator-gated
-    # at the service layer: low_pct meaningful for RANGE/LOWER_BOUND,
-    # high_pct meaningful for RANGE/UPPER_BOUND. 0.0 = no adjustment.
     low_pct_adjustment: Mapped[float] = mapped_column(
         Float, nullable=False, default=0.0, server_default="0",
     )

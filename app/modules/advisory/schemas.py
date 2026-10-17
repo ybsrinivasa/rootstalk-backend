@@ -16,6 +16,9 @@ class PackageCreate(BaseModel):
     # Editable post-create via PackageUpdate.
     start_date_label_cosh_id: str
     description: Optional[str] = None
+    # Decision W (2026-10-17) — Soil Range Template this Package is
+    # classified against. Optional at create time (SE may add later).
+    soil_range_template_id: Optional[str] = None
 
 
 class PackageUpdate(BaseModel):
@@ -28,6 +31,9 @@ class PackageUpdate(BaseModel):
     # discard a draft); DRAFT → ACTIVE blocked here — must go through
     # the publish endpoint so lineage migration runs correctly.
     status: Optional[str] = None
+    # Decision W — change or clear the Soil Range Template binding.
+    # Omit the key to leave unchanged; send null to clear (set NULL).
+    soil_range_template_id: Optional[str] = None
 
 
 class PackageLocationIn(BaseModel):
@@ -89,6 +95,11 @@ class PackageOut(BaseModel):
     # whether status changed.
     cascade_inactivated_reason: Optional[str] = None
     last_cascade_at: Optional[datetime] = None
+    # Decision W — the Soil Range Template this Package classifies
+    # soil values against. NULL means no template picked yet (the Mock
+    # / engine won't do bounds-based classification for this Package
+    # until one is assigned).
+    soil_range_template_id: Optional[str] = None
 
     class Config:
         from_attributes = True

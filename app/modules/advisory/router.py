@@ -1270,6 +1270,20 @@ async def create_package(
         crop_cosh_id=request.crop_cosh_id, name=request.name,
     )
 
+    # Decision W — if a Soil Range Template was supplied, it must
+    # belong to the same client (and be ACTIVE at pick time).
+    if request.soil_range_template_id:
+        from app.modules.soil_nutrient.models import SoilRangeTemplate
+        tpl = await db.get(SoilRangeTemplate, request.soil_range_template_id)
+        if tpl is None or tpl.client_id != client_id:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "invalid_soil_range_template",
+                    "message": "Soil Range Template not found for this client.",
+                },
+            )
+
     pkg = Package(
         client_id=client_id,
         crop_cosh_id=request.crop_cosh_id,
@@ -1278,6 +1292,7 @@ async def create_package(
         duration_days=duration,
         start_date_label_cosh_id=request.start_date_label_cosh_id,
         description=request.description,
+        soil_range_template_id=request.soil_range_template_id,
         created_by=current_user.id,
         status=PackageStatus.DRAFT,
     )
@@ -1394,6 +1409,19 @@ async def update_package(
             crop_cosh_id=pkg.crop_cosh_id, name=new_name,
             exclude_package_id=pkg.id,
         )
+
+    # Decision W — validate Soil Range Template binding if being set.
+    if update_data.get("soil_range_template_id"):
+        from app.modules.soil_nutrient.models import SoilRangeTemplate
+        tpl = await db.get(SoilRangeTemplate, update_data["soil_range_template_id"])
+        if tpl is None or tpl.client_id != client_id:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "invalid_soil_range_template",
+                    "message": "Soil Range Template not found for this client.",
+                },
+            )
 
     description_changed = "description" in update_data
     for field, value in update_data.items():

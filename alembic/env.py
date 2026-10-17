@@ -47,7 +47,7 @@ from app.modules.soil_nutrient.models import (  # noqa: F401
     PlatformSoilParameter,
     PresetSoilProfile, FallbackProduct, FallbackProductCropAssignment,
     ClientProduct, ClientProductCropAssignment,
-    ClientNormalRange, PackageNormalRangeOverride,
+    SoilRangeTemplate, SoilRangeTemplateRow, PackageNormalRangeOverride,
 )
 
 config = context.config

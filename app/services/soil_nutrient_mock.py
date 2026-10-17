@@ -22,8 +22,9 @@ from sqlalchemy.orm import selectinload
 from app.modules.advisory.models import Package
 from app.modules.clients.models import Client, ClientCrop
 from app.modules.soil_nutrient.models import (
-    ClientNormalRange, ClientProduct, FallbackProduct,
+    ClientProduct, FallbackProduct,
     PackageNormalRangeOverride, PlatformSoilParameter, PresetSoilProfile,
+    SoilRangeTemplate, SoilRangeTemplateRow,
 )
 from app.services.npk_candidates import load_fertiliser_candidates
 from app.services.soil_nutrient_engine import (
@@ -121,42 +122,68 @@ async def run_mock(
             detail="Supply either preset_id or soil_values",
         )
 
-    # ── 4. Effective ranges = Package override > crop default ──
-    crop_ranges = (await db.execute(
-        select(ClientNormalRange).where(
-            ClientNormalRange.client_id == client_id,
-            ClientNormalRange.crop_cosh_id == crop_cosh_id,
-        )
-    )).scalars().all()
+    # ── 4. Effective ranges (Decision W resolution) ──
+    # Start with template bounds (if the Package has a template picked
+    # AND the template is still ACTIVE). Overlay Package overrides on
+    # top: operator=None rows inherit template bounds but still carry
+    # Decision V adjustments; non-None operator rows replace bounds.
+    ranges_by_param: dict[str, EffectiveRange] = {}
+
+    if package.soil_range_template_id:
+        tpl = (await db.execute(
+            select(SoilRangeTemplate).options(
+                selectinload(SoilRangeTemplate.rows),
+            ).where(SoilRangeTemplate.id == package.soil_range_template_id)
+        )).scalar_one_or_none()
+        if tpl and tpl.status == "ACTIVE":
+            for r in tpl.rows:
+                p = param_by_id.get(r.parameter_id)
+                if p is None:
+                    continue
+                ranges_by_param[r.parameter_id] = EffectiveRange(
+                    parameter_id=r.parameter_id, parameter_name=p.name,
+                    operator=NormalRangeOperator(r.operator.value),
+                    low_value=r.low_value, high_value=r.high_value,
+                    low_pct_adjustment=0.0,
+                    high_pct_adjustment=0.0,
+                    source="template",
+                )
+
     pkg_overrides = (await db.execute(
         select(PackageNormalRangeOverride).where(
             PackageNormalRangeOverride.package_id == package_id,
         )
     )).scalars().all()
-    ranges_by_param: dict[str, EffectiveRange] = {}
-    for r in crop_ranges:
-        p = param_by_id.get(r.parameter_id)
-        if p is None:
-            continue
-        ranges_by_param[r.parameter_id] = EffectiveRange(
-            parameter_id=r.parameter_id, parameter_name=p.name,
-            operator=NormalRangeOperator(r.operator.value),
-            low_value=r.low_value, high_value=r.high_value,
-            low_pct_adjustment=r.low_pct_adjustment,
-            high_pct_adjustment=r.high_pct_adjustment,
-            source="crop",
-        )
     for r in pkg_overrides:
         p = param_by_id.get(r.parameter_id)
         if p is None:
             continue
+        existing = ranges_by_param.get(r.parameter_id)
+        # Resolve the effective operator + bounds. operator=None means
+        # inherit from template; non-None means the override replaces
+        # the template's bounds for this parameter.
+        if r.operator is None:
+            if existing is None:
+                # No template bounds AND no override bounds — this row
+                # carries only adjustments but we have no classification
+                # shape to apply them to. Skip; nothing to classify.
+                continue
+            eff_operator = existing.operator
+            eff_low = existing.low_value
+            eff_high = existing.high_value
+            source = "package-adj"  # adjustments only, bounds inherited
+        else:
+            eff_operator = NormalRangeOperator(r.operator.value)
+            eff_low = r.low_value
+            eff_high = r.high_value
+            source = "package"
         ranges_by_param[r.parameter_id] = EffectiveRange(
             parameter_id=r.parameter_id, parameter_name=p.name,
-            operator=NormalRangeOperator(r.operator.value),
-            low_value=r.low_value, high_value=r.high_value,
+            operator=eff_operator,
+            low_value=eff_low, high_value=eff_high,
             low_pct_adjustment=r.low_pct_adjustment,
             high_pct_adjustment=r.high_pct_adjustment,
-            source="package",
+            source=source,
         )
     ranges = list(ranges_by_param.values())
 

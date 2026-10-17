@@ -27,22 +27,28 @@ from app.modules.clients.models import (
 )
 from app.modules.advisory.models import Package
 from app.modules.soil_nutrient.models import (
-    ClientNormalRange, ClientProduct, ClientProductCropAssignment,
+    ClientProduct, ClientProductCropAssignment,
     FallbackProduct, FallbackProductCropAssignment,
     NormalRangeOperator, PackageNormalRangeOverride,
     PlatformSoilParameter, PresetSoilProfile,
+    SoilRangeTemplate, SoilRangeTemplateRow,
 )
 from app.modules.soil_nutrient.schemas import (
-    ClientNormalRangeOut, ClientProductCreate, ClientProductOut,
+    ClientProductCreate, ClientProductOut,
     ClientProductUpdate, ClientSoilNutrientStatusOut,
     CoshFertilizerCandidateOut, CoshFertilizerConcentrationOut,
     DecisionReportOut,
     FallbackProductCreate, FallbackProductOut, FallbackProductUpdate,
-    MockRunRequest, NormalRangeBulkUpsert, NormalRangeIn,
+    MockRunRequest,
+    PackageNormalRangeOverrideBulkUpsert,
+    PackageNormalRangeOverrideIn,
     PackageNormalRangeOverrideOut,
     PresetSoilProfileCreate, PresetSoilProfileOut, PresetSoilProfileUpdate,
     SoilNutrientModuleToggle, SoilParameterCreate,
     SoilParameterOut, SoilParameterUpdate, SoilTestingLabToggle,
+    SoilRangeTemplateCreate, SoilRangeTemplateOut,
+    SoilRangeTemplateRowIn, SoilRangeTemplateRowsBulkUpsert,
+    SoilRangeTemplateUpdate,
 )
 from app.services.npk_candidates import load_fertiliser_candidates
 from app.services.soil_nutrient_cosh_filters import (
@@ -844,14 +850,11 @@ async def list_client_portal_soil_parameters(
     return result.scalars().all()
 
 
-# ── Normal Ranges (Decision N) ─────────────────────────────────────────────
+# ── Soil Range Templates (Decision W) ──────────────────────────────────────
 
-def _validate_normal_range_row(row: NormalRangeIn) -> None:
-    """Enforce operator-specific required-fields invariant.
-
-    Called at upsert time; raises 400 with a clear message when a
-    row's operator doesn't match the populated low/high values.
-    """
+def _validate_template_row(row: SoilRangeTemplateRowIn) -> None:
+    """Enforce operator-specific required-fields invariant on template
+    rows. Templates carry bounds only (no adjustments)."""
     if row.operator == NormalRangeOperator.RANGE:
         if row.low_value is None or row.high_value is None:
             raise HTTPException(
@@ -886,7 +889,39 @@ def _validate_normal_range_row(row: NormalRangeIn) -> None:
                 detail=f"LOWER_BOUND operator must not carry high_value (parameter {row.parameter_id}).",
             )
 
-    # Decision V — operator-gated % adjustments.
+
+def _validate_package_override_row(
+    row: PackageNormalRangeOverrideIn,
+) -> None:
+    """Validate a Package override row — bounds AND adjustments.
+
+    Rules:
+      - If operator is set, run the same per-operator low/high
+        invariants as template rows.
+      - If operator is None, low/high must also be None (can't have
+        a bound without declaring the operator shape).
+      - Decision V adjustments gated by operator when operator is set.
+        When operator is None we take the Package template's shape at
+        engine time and gate there; the row itself just carries the
+        two floats as supplied.
+    """
+    if row.operator is None:
+        if row.low_value is not None or row.high_value is not None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"operator=None means inherit from template; low_value / high_value must also be None (parameter {row.parameter_id}).",
+            )
+        return  # No per-operator adjustment gating in inherit-mode.
+
+    # Bounds validation (same as template rows).
+    _validate_template_row(SoilRangeTemplateRowIn(
+        parameter_id=row.parameter_id,
+        operator=row.operator,
+        low_value=row.low_value,
+        high_value=row.high_value,
+    ))
+
+    # Decision V — operator-gated % adjustments when operator is set.
     if row.operator == NormalRangeOperator.UPPER_BOUND and row.low_pct_adjustment != 0.0:
         raise HTTPException(
             status_code=400,
@@ -900,113 +935,209 @@ def _validate_normal_range_row(row: NormalRangeIn) -> None:
 
 
 @router.get(
-    "/client/{client_id}/soil-nutrient/normal-ranges",
-    response_model=list[ClientNormalRangeOut],
+    "/client/{client_id}/soil-nutrient/templates",
+    response_model=list[SoilRangeTemplateOut],
 )
-async def list_client_normal_ranges(
+async def list_soil_range_templates(
     client_id: str,
-    crop_cosh_id: str,
+    include_inactive: bool = False,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """List this client's crop-level Normal Range defaults.
-
-    Returns only parameters the client has actually authored for
-    this crop. Parameters with no row = engine doesn't classify them.
-    """
+    """List this client's Soil Range Templates with their rows."""
     await _assert_can_edit_client_soil_nutrient(db, current_user.id, client_id)
-    result = await db.execute(
-        select(ClientNormalRange).where(
-            ClientNormalRange.client_id == client_id,
-            ClientNormalRange.crop_cosh_id == crop_cosh_id,
-        )
-    )
+    q = select(SoilRangeTemplate).options(
+        selectinload(SoilRangeTemplate.rows),
+    ).where(
+        SoilRangeTemplate.client_id == client_id,
+    ).order_by(SoilRangeTemplate.name)
+    if not include_inactive:
+        q = q.where(SoilRangeTemplate.status == "ACTIVE")
+    result = await db.execute(q)
     return result.scalars().all()
 
 
-@router.put(
-    "/client/{client_id}/soil-nutrient/normal-ranges",
-    response_model=list[ClientNormalRangeOut],
+@router.post(
+    "/client/{client_id}/soil-nutrient/templates",
+    response_model=SoilRangeTemplateOut,
+    status_code=201,
 )
-async def bulk_upsert_client_normal_ranges(
+async def create_soil_range_template(
     client_id: str,
-    crop_cosh_id: str,
-    data: NormalRangeBulkUpsert,
+    data: SoilRangeTemplateCreate,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Bulk upsert the crop-level Normal Range defaults.
-
-    One Save at the top of the Normal Ranges page writes every row.
-    Rows passed in get upserted; parameters NOT in the payload are
-    left unchanged (not deleted) — if the Client wants to clear a
-    parameter, they use the DELETE endpoint for that parameter.
-    """
+    """Create a new template. Name unique per Client."""
     await _assert_can_edit_client_soil_nutrient(db, current_user.id, client_id)
+    existing = (await db.execute(
+        select(SoilRangeTemplate).where(
+            SoilRangeTemplate.client_id == client_id,
+            SoilRangeTemplate.name == data.name,
+        )
+    )).scalar_one_or_none()
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Template '{data.name}' already exists",
+        )
+    row = SoilRangeTemplate(
+        client_id=client_id,
+        name=data.name,
+        description=data.description,
+        created_by=current_user.id,
+    )
+    db.add(row)
+    await db.commit()
+    reloaded = (await db.execute(
+        select(SoilRangeTemplate).options(
+            selectinload(SoilRangeTemplate.rows),
+        ).where(SoilRangeTemplate.id == row.id)
+    )).scalar_one()
+    return reloaded
+
+
+@router.patch(
+    "/client/{client_id}/soil-nutrient/templates/{template_id}",
+    response_model=SoilRangeTemplateOut,
+)
+async def update_soil_range_template(
+    client_id: str,
+    template_id: str,
+    data: SoilRangeTemplateUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Edit template metadata (name / description / status). Row-level
+    edits go through the bulk-upsert endpoint below."""
+    await _assert_can_edit_client_soil_nutrient(db, current_user.id, client_id)
+    row = (await db.execute(
+        select(SoilRangeTemplate).options(
+            selectinload(SoilRangeTemplate.rows),
+        ).where(
+            SoilRangeTemplate.id == template_id,
+            SoilRangeTemplate.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Template not found")
+    updates = data.model_dump(exclude_unset=True)
+    for key, value in updates.items():
+        setattr(row, key, value)
+    await db.commit()
+    reloaded = (await db.execute(
+        select(SoilRangeTemplate).options(
+            selectinload(SoilRangeTemplate.rows),
+        ).where(SoilRangeTemplate.id == template_id)
+    )).scalar_one()
+    return reloaded
+
+
+@router.delete(
+    "/client/{client_id}/soil-nutrient/templates/{template_id}",
+    response_model=SoilRangeTemplateOut,
+)
+async def deactivate_soil_range_template(
+    client_id: str,
+    template_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Soft delete — status → INACTIVE. Packages pointing at this
+    template keep the FK (classification silently stops working for
+    them, surfaced in the Mock's Section 6 warnings)."""
+    await _assert_can_edit_client_soil_nutrient(db, current_user.id, client_id)
+    row = (await db.execute(
+        select(SoilRangeTemplate).where(
+            SoilRangeTemplate.id == template_id,
+            SoilRangeTemplate.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Template not found")
+    row.status = "INACTIVE"
+    await db.commit()
+    reloaded = (await db.execute(
+        select(SoilRangeTemplate).options(
+            selectinload(SoilRangeTemplate.rows),
+        ).where(SoilRangeTemplate.id == template_id)
+    )).scalar_one()
+    return reloaded
+
+
+@router.put(
+    "/client/{client_id}/soil-nutrient/templates/{template_id}/rows",
+    response_model=SoilRangeTemplateOut,
+)
+async def bulk_upsert_template_rows(
+    client_id: str,
+    template_id: str,
+    data: SoilRangeTemplateRowsBulkUpsert,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Bulk upsert the per-parameter bounds for one template. Rows
+    not in the payload are left unchanged; use the per-row DELETE
+    below to clear a parameter."""
+    await _assert_can_edit_client_soil_nutrient(db, current_user.id, client_id)
+    tpl = (await db.execute(
+        select(SoilRangeTemplate).options(
+            selectinload(SoilRangeTemplate.rows),
+        ).where(
+            SoilRangeTemplate.id == template_id,
+            SoilRangeTemplate.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if tpl is None:
+        raise HTTPException(status_code=404, detail="Template not found")
 
     for row in data.rows:
-        _validate_normal_range_row(row)
+        _validate_template_row(row)
 
-    # Load existing rows for upsert
-    existing = (await db.execute(
-        select(ClientNormalRange).where(
-            ClientNormalRange.client_id == client_id,
-            ClientNormalRange.crop_cosh_id == crop_cosh_id,
-        )
-    )).scalars().all()
-    by_param = {r.parameter_id: r for r in existing}
-
+    by_param = {r.parameter_id: r for r in tpl.rows}
     for row in data.rows:
         if row.parameter_id in by_param:
             r = by_param[row.parameter_id]
             r.operator = row.operator
             r.low_value = row.low_value
             r.high_value = row.high_value
-            r.low_pct_adjustment = row.low_pct_adjustment
-            r.high_pct_adjustment = row.high_pct_adjustment
         else:
-            new_row = ClientNormalRange(
-                client_id=client_id,
-                crop_cosh_id=crop_cosh_id,
+            db.add(SoilRangeTemplateRow(
+                template_id=template_id,
                 parameter_id=row.parameter_id,
                 operator=row.operator,
                 low_value=row.low_value,
                 high_value=row.high_value,
-                low_pct_adjustment=row.low_pct_adjustment,
-                high_pct_adjustment=row.high_pct_adjustment,
-                created_by=current_user.id,
-            )
-            db.add(new_row)
-
+            ))
     await db.commit()
-    result = await db.execute(
-        select(ClientNormalRange).where(
-            ClientNormalRange.client_id == client_id,
-            ClientNormalRange.crop_cosh_id == crop_cosh_id,
-        )
-    )
-    return result.scalars().all()
+    reloaded = (await db.execute(
+        select(SoilRangeTemplate).options(
+            selectinload(SoilRangeTemplate.rows),
+        ).where(SoilRangeTemplate.id == template_id)
+    )).scalar_one()
+    return reloaded
 
 
 @router.delete(
-    "/client/{client_id}/soil-nutrient/normal-ranges/{parameter_id}",
+    "/client/{client_id}/soil-nutrient/templates/{template_id}/rows/{parameter_id}",
     status_code=204,
 )
-async def delete_client_normal_range(
+async def delete_template_row(
     client_id: str,
+    template_id: str,
     parameter_id: str,
-    crop_cosh_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Clear a per-crop range for one parameter (engine stops
-    classifying that parameter for this crop)."""
+    """Clear one parameter from a template."""
     await _assert_can_edit_client_soil_nutrient(db, current_user.id, client_id)
+    tpl = await db.get(SoilRangeTemplate, template_id)
+    if tpl is None or tpl.client_id != client_id:
+        raise HTTPException(status_code=404, detail="Template not found")
     row = (await db.execute(
-        select(ClientNormalRange).where(
-            ClientNormalRange.client_id == client_id,
-            ClientNormalRange.crop_cosh_id == crop_cosh_id,
-            ClientNormalRange.parameter_id == parameter_id,
+        select(SoilRangeTemplateRow).where(
+            SoilRangeTemplateRow.template_id == template_id,
+            SoilRangeTemplateRow.parameter_id == parameter_id,
         )
     )).scalar_one_or_none()
     if row:
@@ -1015,7 +1146,7 @@ async def delete_client_normal_range(
     return None
 
 
-# ── Package-level Normal Range overrides (Decision N two-tier) ────────────
+# ── Package-level overrides (Decision W — same table, reshaped) ───────────
 
 async def _assert_package_belongs_to_client(
     db: AsyncSession, package_id: str, client_id: str,
@@ -1044,8 +1175,9 @@ async def list_package_normal_range_overrides(
     current_user: User = Depends(get_current_user),
 ):
     """List overrides for one Package. Sparse — only parameters with
-    overrides have rows. The authoring UI merges with crop defaults
-    to show the effective range per parameter."""
+    overrides have rows. The authoring UI merges with the Package's
+    chosen template to show the effective range + adjustment per
+    parameter."""
     await _assert_can_edit_client_soil_nutrient(db, current_user.id, client_id)
     await _assert_package_belongs_to_client(db, package_id, client_id)
     result = await db.execute(
@@ -1063,18 +1195,19 @@ async def list_package_normal_range_overrides(
 async def bulk_upsert_package_overrides(
     client_id: str,
     package_id: str,
-    data: NormalRangeBulkUpsert,
+    data: PackageNormalRangeOverrideBulkUpsert,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Bulk upsert Package-level overrides. Same semantics as the
-    crop-level endpoint — rows not in the payload are left alone;
+    """Bulk upsert Package-level override rows. Each row can carry
+    any combination of bounds (operator + low/high) and adjustments
+    (low_pct / high_pct). Rows not in the payload are left alone;
     use DELETE to clear."""
     await _assert_can_edit_client_soil_nutrient(db, current_user.id, client_id)
     await _assert_package_belongs_to_client(db, package_id, client_id)
 
     for row in data.rows:
-        _validate_normal_range_row(row)
+        _validate_package_override_row(row)
 
     existing = (await db.execute(
         select(PackageNormalRangeOverride).where(
@@ -1124,8 +1257,8 @@ async def delete_package_normal_range_override(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Clear one override — the parameter falls back to the crop
-    default for this Package."""
+    """Clear one override — the parameter falls back to the Package's
+    template bounds (and 0% adjustments)."""
     await _assert_can_edit_client_soil_nutrient(db, current_user.id, client_id)
     await _assert_package_belongs_to_client(db, package_id, client_id)
     row = (await db.execute(

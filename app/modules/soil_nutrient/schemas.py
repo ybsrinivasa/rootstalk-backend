@@ -193,50 +193,98 @@ class ClientProductOut(BaseModel):
 
 # ── Normal Ranges (Decision N) ──────────────────────────────────────────────
 
-class NormalRangeIn(BaseModel):
-    """Input shape for both crop-level defaults and Package overrides.
+# ── Soil Range Templates (Decision W — client-level library) ───────────────
+
+class SoilRangeTemplateRowIn(BaseModel):
+    """One parameter's bounds inside a Template.
 
     Validation rules (enforced in router):
       - RANGE: both low_value and high_value required, low <= high.
       - UPPER_BOUND: only high_value required (low_value must be None).
       - LOWER_BOUND: only low_value required (high_value must be None).
 
-    Decision V — per-parameter % adjustment:
-      - RANGE: both low_pct_adjustment and high_pct_adjustment valid.
-      - UPPER_BOUND: only high_pct_adjustment meaningful; low must be 0.
-      - LOWER_BOUND: only low_pct_adjustment meaningful; high must be 0.
-      Defaults to 0.0 so existing clients that haven't authored
-      adjustments yet keep their current (unadjusted) behaviour.
+    Decision V % adjustments do NOT live here — they are crop-sensitive
+    and travel with the Package (see PackageNormalRangeOverrideIn).
     """
     parameter_id: str
     operator: NormalRangeOperator
+    low_value: Optional[float] = None
+    high_value: Optional[float] = None
+
+
+class SoilRangeTemplateRowOut(BaseModel):
+    id: str
+    parameter_id: str
+    operator: NormalRangeOperator
+    low_value: Optional[float]
+    high_value: Optional[float]
+
+    class Config:
+        from_attributes = True
+
+
+class SoilRangeTemplateCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    description: Optional[str] = None
+
+
+class SoilRangeTemplateUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=200)
+    description: Optional[str] = None
+    status: Optional[str] = Field(None, pattern="^(ACTIVE|INACTIVE)$")
+
+
+class SoilRangeTemplateOut(BaseModel):
+    id: str
+    client_id: str
+    name: str
+    description: Optional[str]
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    rows: list[SoilRangeTemplateRowOut] = []
+
+    class Config:
+        from_attributes = True
+
+
+class SoilRangeTemplateRowsBulkUpsert(BaseModel):
+    """Bulk upsert all rows for one template — a single Save on the
+    template editor writes every edited row."""
+    rows: list[SoilRangeTemplateRowIn]
+
+
+# ── Package Normal Range Overrides (Decision W — reshaped) ─────────────────
+
+class PackageNormalRangeOverrideIn(BaseModel):
+    """Package-level row that carries any combination of a bounds-
+    override (operator + low/high) and Decision V adjustments
+    (low_pct / high_pct).
+
+    - operator=None → inherit bounds from the Package's template row.
+    - operator set → override template bounds with this row's low/high
+      (subject to the same per-operator validation as template rows).
+    - low_pct / high_pct → always applied; default 0.0 means no shift.
+
+    Operator-gated adjustment validity (same as before):
+      UPPER_BOUND → low_pct must be 0 (no Low classification).
+      LOWER_BOUND → high_pct must be 0 (no High classification).
+      When operator is None, we don't enforce the gating (the template
+      shape governs; the UI shows only the applicable adjustment).
+    """
+    parameter_id: str
+    operator: Optional[NormalRangeOperator] = None
     low_value: Optional[float] = None
     high_value: Optional[float] = None
     low_pct_adjustment: float = 0.0
     high_pct_adjustment: float = 0.0
 
 
-class ClientNormalRangeOut(BaseModel):
-    id: str
-    client_id: str
-    crop_cosh_id: str
-    parameter_id: str
-    operator: NormalRangeOperator
-    low_value: Optional[float]
-    high_value: Optional[float]
-    low_pct_adjustment: float
-    high_pct_adjustment: float
-    updated_at: datetime
-
-    class Config:
-        from_attributes = True
-
-
 class PackageNormalRangeOverrideOut(BaseModel):
     id: str
     package_id: str
     parameter_id: str
-    operator: NormalRangeOperator
+    operator: Optional[NormalRangeOperator]
     low_value: Optional[float]
     high_value: Optional[float]
     low_pct_adjustment: float
@@ -247,10 +295,10 @@ class PackageNormalRangeOverrideOut(BaseModel):
         from_attributes = True
 
 
-class NormalRangeBulkUpsert(BaseModel):
-    """Bulk upsert payload — a single Save at the top of the Normal
-    Ranges page writes every edited row in one call."""
-    rows: list[NormalRangeIn]
+class PackageNormalRangeOverrideBulkUpsert(BaseModel):
+    """Bulk upsert payload — a single Save on the Package override
+    section writes every edited row in one call."""
+    rows: list[PackageNormalRangeOverrideIn]
 
 
 # ── Mock engine (Phase 7) ──────────────────────────────────────────────────
