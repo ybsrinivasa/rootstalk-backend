@@ -48,6 +48,9 @@ from app.modules.soil_nutrient.schemas import (
     SoilParameterOut, SoilParameterUpdate, SoilTestingLabToggle,
 )
 from app.services.npk_candidates import load_fertiliser_candidates
+from app.services.soil_nutrient_cosh_filters import (
+    common_names_for_client_manufacturers,
+)
 
 
 router = APIRouter(tags=["Soil Nutrient"])
@@ -765,6 +768,74 @@ def _apply_client_crop_assignments(
     ]
 
 
+async def _client_candidates_by_cosh_id(
+    db: AsyncSession,
+) -> dict[str, CoshFertilizerCandidateOut]:
+    """Pre-hydrate the full Cosh fertilizer catalogue keyed by cosh_id.
+    Used by Client Product list hydration + create-time validation."""
+    candidates, _ = await load_fertiliser_candidates(db, fertigation=False)
+    return {
+        c.cosh_id: CoshFertilizerCandidateOut(
+            cosh_id=c.cosh_id,
+            name=c.name,
+            concentration=CoshFertilizerConcentrationOut(
+                n=c.concentration.n,
+                p=c.concentration.p,
+                k=c.concentration.k,
+            ),
+            water_soluble=c.water_soluble,
+        )
+        for c in candidates
+    }
+
+
+def _hydrate_client_product(
+    row: ClientProduct,
+    by_cosh_id: dict[str, CoshFertilizerCandidateOut],
+) -> ClientProductOut:
+    return ClientProductOut(
+        id=row.id,
+        client_id=row.client_id,
+        cosh_product_id=row.cosh_product_id,
+        status=row.status,
+        notes=row.notes,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+        crop_assignments=[
+            {"id": a.id, "crop_cosh_id": a.crop_cosh_id, "status": a.status}
+            for a in row.crop_assignments
+        ],
+        cosh=by_cosh_id.get(row.cosh_product_id),
+    )
+
+
+@router.get(
+    "/client/{client_id}/soil-nutrient/cosh-fertilizers",
+    response_model=list[CoshFertilizerCandidateOut],
+)
+async def list_client_cosh_fertilizers(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Decision U picker feed — Cosh fertilizers manufactured by this
+    Client's linked Manufacturers (via `client_cosh_manufacturers`).
+
+    When the Client has no linked Manufacturers yet, returns an empty
+    list — the frontend surfaces an inline hint pointing to the SA
+    Portal Client edit modal where the link is set up.
+    """
+    await _assert_can_edit_client_soil_nutrient(db, current_user.id, client_id)
+    allowed_cns = await common_names_for_client_manufacturers(db, client_id)
+    if allowed_cns is None or not allowed_cns:
+        return []
+    by_cosh_id = await _client_candidates_by_cosh_id(db)
+    return sorted(
+        (c for cid, c in by_cosh_id.items() if cid in allowed_cns),
+        key=lambda c: c.name.lower(),
+    )
+
+
 @router.get(
     "/client/{client_id}/soil-nutrient/products",
     response_model=list[ClientProductOut],
@@ -772,35 +843,30 @@ def _apply_client_crop_assignments(
 async def list_client_products(
     client_id: str,
     include_inactive: bool = False,
-    category_id: str | None = None,
     crop_cosh_id: str | None = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """List this client's Global Product List.
-
-    Filter by `category_id` for Tab 1 view, by `crop_cosh_id` for
-    Tab 2 view, or both.
-    """
+    """List this client's Global Product List — pointer rows hydrated
+    with Cosh data. Filter by `crop_cosh_id` for the Per-Crop tab view."""
     await _assert_can_edit_client_soil_nutrient(db, current_user.id, client_id)
     q = select(ClientProduct).options(
         selectinload(ClientProduct.crop_assignments),
     ).where(
         ClientProduct.client_id == client_id,
-    ).order_by(ClientProduct.display_name)
+    ).order_by(ClientProduct.created_at.desc())
     if not include_inactive:
         q = q.where(ClientProduct.status == "ACTIVE")
-    if category_id:
-        q = q.where(ClientProduct.category_id == category_id)
     result = await db.execute(q)
-    products = result.scalars().all()
+    rows = result.scalars().all()
     if crop_cosh_id:
-        products = [
-            p for p in products
+        rows = [
+            r for r in rows
             if any(a.crop_cosh_id == crop_cosh_id and a.status == "ACTIVE"
-                   for a in p.crop_assignments)
+                   for a in r.crop_assignments)
         ]
-    return products
+    by_cosh_id = await _client_candidates_by_cosh_id(db)
+    return [_hydrate_client_product(r, by_cosh_id) for r in rows]
 
 
 @router.post(
@@ -815,30 +881,55 @@ async def create_client_product(
     current_user: User = Depends(get_current_user),
 ):
     await _assert_can_edit_client_soil_nutrient(db, current_user.id, client_id)
-    category = await db.get(ProductCategory, data.category_id)
-    if not category:
-        raise HTTPException(status_code=400, detail="Category not found")
+
+    # Validate the cosh_product_id against the manufacturer-filtered
+    # set — Clients can only add products made by their linked
+    # Manufacturers (Decision U).
+    allowed_cns = await common_names_for_client_manufacturers(db, client_id)
+    if allowed_cns is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "no_linked_manufacturers",
+                "message": (
+                    "This Client isn't linked to any Cosh Manufacturers. "
+                    "Ask the Super Admin to link your Manufacturer(s) from "
+                    "the Company edit modal before adding products."
+                ),
+            },
+        )
+    if data.cosh_product_id not in allowed_cns:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "cosh_product_id is not made by this Client's linked "
+                "Manufacturer(s)"
+            ),
+        )
+
+    by_cosh_id = await _client_candidates_by_cosh_id(db)
+    if data.cosh_product_id not in by_cosh_id:
+        raise HTTPException(
+            status_code=400,
+            detail="cosh_product_id is not a known Cosh fertilizer",
+        )
+
+    existing = (await db.execute(
+        select(ClientProduct).where(
+            ClientProduct.client_id == client_id,
+            ClientProduct.cosh_product_id == data.cosh_product_id,
+        )
+    )).scalar_one_or_none()
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail="This Cosh product is already in this Client's Global List",
+        )
 
     row = ClientProduct(
         client_id=client_id,
-        category_id=data.category_id,
-        display_name=data.display_name,
-        manufacturer=data.manufacturer,
-        grade=data.grade,
-        formulation=data.formulation,
-        n_pct=data.n_pct,
-        p2o5_pct=data.p2o5_pct,
-        k2o_pct=data.k2o_pct,
-        ca_pct=data.ca_pct,
-        mg_pct=data.mg_pct,
-        s_pct=data.s_pct,
-        zn_pct=data.zn_pct,
-        fe_pct=data.fe_pct,
-        mn_pct=data.mn_pct,
-        cu_pct=data.cu_pct,
-        b_pct=data.b_pct,
-        application_methods=data.application_methods,
-        data_json=data.data_json,
+        cosh_product_id=data.cosh_product_id,
+        notes=data.notes,
         created_by=current_user.id,
     )
     db.add(row)
@@ -850,7 +941,7 @@ async def create_client_product(
             selectinload(ClientProduct.crop_assignments),
         ).where(ClientProduct.id == row.id)
     )).scalar_one()
-    return reloaded
+    return _hydrate_client_product(reloaded, by_cosh_id)
 
 
 @router.patch(
@@ -876,11 +967,6 @@ async def update_client_product(
     if not row:
         raise HTTPException(status_code=404, detail="Product not found")
 
-    if data.category_id is not None:
-        category = await db.get(ProductCategory, data.category_id)
-        if not category:
-            raise HTTPException(status_code=400, detail="Category not found")
-
     updates = data.model_dump(exclude_unset=True, exclude={"crop_cosh_ids"})
     for key, value in updates.items():
         setattr(row, key, value)
@@ -894,7 +980,8 @@ async def update_client_product(
             selectinload(ClientProduct.crop_assignments),
         ).where(ClientProduct.id == product_id)
     )).scalar_one()
-    return reloaded
+    by_cosh_id = await _client_candidates_by_cosh_id(db)
+    return _hydrate_client_product(reloaded, by_cosh_id)
 
 
 @router.delete(
@@ -927,7 +1014,8 @@ async def discontinue_client_product(
             selectinload(ClientProduct.crop_assignments),
         ).where(ClientProduct.id == product_id)
     )).scalar_one()
-    return reloaded
+    by_cosh_id = await _client_candidates_by_cosh_id(db)
+    return _hydrate_client_product(reloaded, by_cosh_id)
 
 
 @router.get(

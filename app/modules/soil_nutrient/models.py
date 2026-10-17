@@ -290,17 +290,21 @@ class FallbackProductCropAssignment(Base):
 
 
 class ClientProduct(Base):
-    """Decision L — Client's Global Product List (Tier 1 of 3-tier
-    recommendation hierarchy).
+    """Decision U (2026-10-17) — Client's Global Product List (Tier 1)
+    as a pointer table over Cosh products.
 
-    Per-Client product catalogue, authored by CA/SE/CM-EDIT in the
-    Client Portal. The Soil Nutrient engine's Tier 1 candidate loader
-    pulls from these first; only when Tier 1 can't deliver does it
-    fall through to Tier 2 (FallbackProduct) or Tier 3 (pure dosage).
+    Walk-back of Decision L's original native-authoring clause,
+    triggered by the agronomist SME review 2026-10-16 and settled
+    with Decision U. The Client Portal picker is filtered server-side
+    to common_names made by the Client's linked Manufacturers (via
+    `client_cosh_manufacturers`) — turning a 10,000-row Cosh catalogue
+    into a 40-row list of "my own brands". Nutrient %, formulation,
+    manufacturer, brand all resolved from Cosh at read time via
+    `load_fertiliser_candidates()` (shared with Dealer npk-select).
 
-    Schema deliberately mirrors FallbackProduct so the engine's
-    candidate-loader can produce a uniform Candidate shape regardless
-    of source. The only semantic difference is the `client_id` scope.
+    Status values match the walked-forward Decision L semantics:
+    ACTIVE | DISCONTINUED (DISCONTINUED keeps the row for historical
+    references while excluding it from future personalisation runs).
     """
     __tablename__ = "client_products"
 
@@ -309,31 +313,12 @@ class ClientProduct(Base):
         String(36), ForeignKey("clients.id", ondelete="CASCADE"),
         nullable=False,
     )
-    category_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("product_categories.id", ondelete="RESTRICT"),
-        nullable=False,
-    )
-    display_name: Mapped[str] = mapped_column(String(500), nullable=False)
-    manufacturer: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
-    grade: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    formulation: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    n_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    p2o5_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    k2o_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    ca_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    mg_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    s_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    zn_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    fe_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    mn_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    cu_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    b_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    application_methods: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
-    data_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
-    # Status values match Decision L: ACTIVE | DISCONTINUED (used
-    # when the Client stops stocking the product but keeps the row
-    # for historical references).
+    # Pointer into Cosh's common_names_of_inputs Core. UNIQUE per
+    # client — a given Cosh product is in or out of a Client's Global
+    # List, never duplicated.
+    cosh_product_id: Mapped[str] = mapped_column(String(200), nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_by: Mapped[Optional[str]] = mapped_column(
         String(36), ForeignKey("users.id"), nullable=True,
     )
@@ -344,11 +329,17 @@ class ClientProduct(Base):
         DateTime(timezone=True), default=utcnow, onupdate=utcnow,
     )
 
-    category: Mapped["ProductCategory"] = relationship("ProductCategory")
     crop_assignments: Mapped[list["ClientProductCropAssignment"]] = relationship(
         "ClientProductCropAssignment",
         back_populates="product",
         cascade="all, delete-orphan",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "client_id", "cosh_product_id",
+            name="uq_client_product_cosh",
+        ),
     )
 
 

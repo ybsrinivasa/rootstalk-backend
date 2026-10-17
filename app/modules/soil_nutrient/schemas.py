@@ -212,49 +212,19 @@ class FallbackProductOut(BaseModel):
         from_attributes = True
 
 
-# ── Client Products (Decision L) ────────────────────────────────────────────
+# ── Client Products (Decision U — pointer over Cosh) ────────────────────────
 
 class ClientProductCreate(BaseModel):
-    category_id: str
-    display_name: str = Field(..., min_length=1, max_length=500)
-    manufacturer: Optional[str] = Field(None, max_length=500)
-    grade: Optional[str] = Field(None, max_length=100)
-    formulation: Optional[str] = Field(None, max_length=100)
-    n_pct: Optional[float] = None
-    p2o5_pct: Optional[float] = None
-    k2o_pct: Optional[float] = None
-    ca_pct: Optional[float] = None
-    mg_pct: Optional[float] = None
-    s_pct: Optional[float] = None
-    zn_pct: Optional[float] = None
-    fe_pct: Optional[float] = None
-    mn_pct: Optional[float] = None
-    cu_pct: Optional[float] = None
-    b_pct: Optional[float] = None
-    application_methods: Optional[list[str]] = None
-    data_json: Optional[dict] = None
+    """Pointer-shape create. Caller passes a Cosh product id; the
+    server verifies it exists in the Client's manufacturer-filtered
+    candidate set before insert."""
+    cosh_product_id: str = Field(..., min_length=1, max_length=200)
+    notes: Optional[str] = None
     crop_cosh_ids: Optional[list[str]] = None
 
 
 class ClientProductUpdate(BaseModel):
-    category_id: Optional[str] = None
-    display_name: Optional[str] = Field(None, min_length=1, max_length=500)
-    manufacturer: Optional[str] = Field(None, max_length=500)
-    grade: Optional[str] = Field(None, max_length=100)
-    formulation: Optional[str] = Field(None, max_length=100)
-    n_pct: Optional[float] = None
-    p2o5_pct: Optional[float] = None
-    k2o_pct: Optional[float] = None
-    ca_pct: Optional[float] = None
-    mg_pct: Optional[float] = None
-    s_pct: Optional[float] = None
-    zn_pct: Optional[float] = None
-    fe_pct: Optional[float] = None
-    mn_pct: Optional[float] = None
-    cu_pct: Optional[float] = None
-    b_pct: Optional[float] = None
-    application_methods: Optional[list[str]] = None
-    data_json: Optional[dict] = None
+    notes: Optional[str] = None
     status: Optional[str] = Field(None, pattern="^(ACTIVE|DISCONTINUED)$")
     crop_cosh_ids: Optional[list[str]] = None
 
@@ -269,30 +239,19 @@ class ClientProductCropAssignmentOut(BaseModel):
 
 
 class ClientProductOut(BaseModel):
+    """Hydrated view — pointer row joined with its Cosh resolution.
+    `cosh` is `None` only in the unlikely case that the referenced
+    Cosh product has been removed since we linked it (surface a
+    warning in the UI)."""
     id: str
     client_id: str
-    category_id: str
-    display_name: str
-    manufacturer: Optional[str]
-    grade: Optional[str]
-    formulation: Optional[str]
-    n_pct: Optional[float]
-    p2o5_pct: Optional[float]
-    k2o_pct: Optional[float]
-    ca_pct: Optional[float]
-    mg_pct: Optional[float]
-    s_pct: Optional[float]
-    zn_pct: Optional[float]
-    fe_pct: Optional[float]
-    mn_pct: Optional[float]
-    cu_pct: Optional[float]
-    b_pct: Optional[float]
-    application_methods: Optional[list[str]]
-    data_json: Optional[dict]
+    cosh_product_id: str
     status: str
+    notes: Optional[str]
     created_at: datetime
     updated_at: datetime
     crop_assignments: list[ClientProductCropAssignmentOut] = []
+    cosh: Optional[CoshFertilizerCandidateOut] = None
 
     class Config:
         from_attributes = True
