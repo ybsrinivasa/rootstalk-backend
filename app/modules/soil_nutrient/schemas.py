@@ -200,11 +200,20 @@ class NormalRangeIn(BaseModel):
       - RANGE: both low_value and high_value required, low <= high.
       - UPPER_BOUND: only high_value required (low_value must be None).
       - LOWER_BOUND: only low_value required (high_value must be None).
+
+    Decision V — per-parameter % adjustment:
+      - RANGE: both low_pct_adjustment and high_pct_adjustment valid.
+      - UPPER_BOUND: only high_pct_adjustment meaningful; low must be 0.
+      - LOWER_BOUND: only low_pct_adjustment meaningful; high must be 0.
+      Defaults to 0.0 so existing clients that haven't authored
+      adjustments yet keep their current (unadjusted) behaviour.
     """
     parameter_id: str
     operator: NormalRangeOperator
     low_value: Optional[float] = None
     high_value: Optional[float] = None
+    low_pct_adjustment: float = 0.0
+    high_pct_adjustment: float = 0.0
 
 
 class ClientNormalRangeOut(BaseModel):
@@ -215,6 +224,8 @@ class ClientNormalRangeOut(BaseModel):
     operator: NormalRangeOperator
     low_value: Optional[float]
     high_value: Optional[float]
+    low_pct_adjustment: float
+    high_pct_adjustment: float
     updated_at: datetime
 
     class Config:
@@ -228,6 +239,8 @@ class PackageNormalRangeOverrideOut(BaseModel):
     operator: NormalRangeOperator
     low_value: Optional[float]
     high_value: Optional[float]
+    low_pct_adjustment: float
+    high_pct_adjustment: float
     updated_at: datetime
 
     class Config:
@@ -238,6 +251,36 @@ class NormalRangeBulkUpsert(BaseModel):
     """Bulk upsert payload — a single Save at the top of the Normal
     Ranges page writes every edited row in one call."""
     rows: list[NormalRangeIn]
+
+
+# ── Mock engine (Phase 7) ──────────────────────────────────────────────────
+
+class MockRunRequest(BaseModel):
+    """Body for POST /client/{client_id}/soil-nutrient/mock/run.
+
+    One of `preset_id` or `soil_values` must be supplied:
+      - preset_id → load values_json from PresetSoilProfile
+      - soil_values → explicit per-parameter floats (keyed by parameter_id)
+    """
+    package_id: str
+    preset_id: Optional[str] = None
+    # Keyed by platform_soil_parameters.id (NOT name — keeps the UI
+    # resilient to display-name changes).
+    soil_values: Optional[dict[str, float]] = None
+
+
+class DecisionReportSectionOut(BaseModel):
+    heading: str
+    body_md: str
+
+
+class DecisionReportOut(BaseModel):
+    is_mock: bool
+    generated_at: datetime
+    client_id: str
+    package_id: str
+    crop_cosh_id: str
+    sections: list[DecisionReportSectionOut]
 
 
 # ── Client flag toggles (Phase 1 — SA Portal only) ─────────────────────────

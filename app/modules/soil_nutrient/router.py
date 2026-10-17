@@ -36,8 +36,9 @@ from app.modules.soil_nutrient.schemas import (
     ClientNormalRangeOut, ClientProductCreate, ClientProductOut,
     ClientProductUpdate, ClientSoilNutrientStatusOut,
     CoshFertilizerCandidateOut, CoshFertilizerConcentrationOut,
+    DecisionReportOut,
     FallbackProductCreate, FallbackProductOut, FallbackProductUpdate,
-    NormalRangeBulkUpsert, NormalRangeIn,
+    MockRunRequest, NormalRangeBulkUpsert, NormalRangeIn,
     PackageNormalRangeOverrideOut,
     PresetSoilProfileCreate, PresetSoilProfileOut, PresetSoilProfileUpdate,
     SoilNutrientModuleToggle, SoilParameterCreate,
@@ -47,6 +48,7 @@ from app.services.npk_candidates import load_fertiliser_candidates
 from app.services.soil_nutrient_cosh_filters import (
     common_names_for_client_manufacturers,
 )
+from app.services.soil_nutrient_mock import report_to_dict, run_mock
 
 
 router = APIRouter(tags=["Soil Nutrient"])
@@ -884,6 +886,18 @@ def _validate_normal_range_row(row: NormalRangeIn) -> None:
                 detail=f"LOWER_BOUND operator must not carry high_value (parameter {row.parameter_id}).",
             )
 
+    # Decision V — operator-gated % adjustments.
+    if row.operator == NormalRangeOperator.UPPER_BOUND and row.low_pct_adjustment != 0.0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"UPPER_BOUND operator has no Low classification; low_pct_adjustment must be 0 (parameter {row.parameter_id}).",
+        )
+    if row.operator == NormalRangeOperator.LOWER_BOUND and row.high_pct_adjustment != 0.0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"LOWER_BOUND operator has no High classification; high_pct_adjustment must be 0 (parameter {row.parameter_id}).",
+        )
+
 
 @router.get(
     "/client/{client_id}/soil-nutrient/normal-ranges",
@@ -948,6 +962,8 @@ async def bulk_upsert_client_normal_ranges(
             r.operator = row.operator
             r.low_value = row.low_value
             r.high_value = row.high_value
+            r.low_pct_adjustment = row.low_pct_adjustment
+            r.high_pct_adjustment = row.high_pct_adjustment
         else:
             new_row = ClientNormalRange(
                 client_id=client_id,
@@ -956,6 +972,8 @@ async def bulk_upsert_client_normal_ranges(
                 operator=row.operator,
                 low_value=row.low_value,
                 high_value=row.high_value,
+                low_pct_adjustment=row.low_pct_adjustment,
+                high_pct_adjustment=row.high_pct_adjustment,
                 created_by=current_user.id,
             )
             db.add(new_row)
@@ -1071,6 +1089,8 @@ async def bulk_upsert_package_overrides(
             r.operator = row.operator
             r.low_value = row.low_value
             r.high_value = row.high_value
+            r.low_pct_adjustment = row.low_pct_adjustment
+            r.high_pct_adjustment = row.high_pct_adjustment
         else:
             new_row = PackageNormalRangeOverride(
                 package_id=package_id,
@@ -1078,6 +1098,8 @@ async def bulk_upsert_package_overrides(
                 operator=row.operator,
                 low_value=row.low_value,
                 high_value=row.high_value,
+                low_pct_adjustment=row.low_pct_adjustment,
+                high_pct_adjustment=row.high_pct_adjustment,
                 created_by=current_user.id,
             )
             db.add(new_row)
@@ -1230,3 +1252,121 @@ async def toggle_soil_testing_lab(
         soil_nutrient_module_enabled=client.soil_nutrient_module_enabled,
         has_soil_testing_lab=client.has_soil_testing_lab,
     )
+
+
+# ── Mock engine (Phase 7) ──────────────────────────────────────────────────
+
+@router.post(
+    "/client/{client_id}/soil-nutrient/mock/run",
+    response_model=DecisionReportOut,
+)
+async def run_mock_engine_client_portal(
+    client_id: str,
+    data: MockRunRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Client Portal Mock run — produces the six-section Decision Report
+    (Decision T) for a hypothetical soil state against one of the
+    Client's Packages. Does NOT touch subscriptions, overlay rows, or
+    notifications — that's the Real engine's job (Decisions R + S).
+    """
+    await _assert_can_edit_client_soil_nutrient(db, current_user.id, client_id)
+    report = await run_mock(
+        db,
+        client_id=client_id,
+        package_id=data.package_id,
+        preset_id=data.preset_id,
+        soil_values_input=data.soil_values,
+    )
+    return report_to_dict(report)
+
+
+@router.post(
+    "/sa/clients/{client_id}/soil-nutrient/mock/run",
+    response_model=DecisionReportOut,
+)
+async def run_mock_engine_sa_portal(
+    client_id: str,
+    data: MockRunRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SA Portal Mock run — same engine, SA-side auth gate. SA + any
+    active CM can mock-run against any Client (Decision S aggregation).
+    """
+    _require_sa_or_cm(current_user)
+    report = await run_mock(
+        db,
+        client_id=client_id,
+        package_id=data.package_id,
+        preset_id=data.preset_id,
+        soil_values_input=data.soil_values,
+    )
+    return report_to_dict(report)
+
+
+@router.get(
+    "/client/{client_id}/soil-nutrient/preset-profiles",
+    response_model=list[PresetSoilProfileOut],
+)
+async def list_client_portal_preset_profiles(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Mirror of the SA preset-profiles endpoint for the Client Portal
+    Mock form. Presets are platform-seeded so Clients just read the
+    ACTIVE list — no per-Client authoring."""
+    await _assert_can_edit_client_soil_nutrient(db, current_user.id, client_id)
+    result = await db.execute(
+        select(PresetSoilProfile).where(
+            PresetSoilProfile.status == "ACTIVE",
+        ).order_by(PresetSoilProfile.display_order)
+    )
+    return result.scalars().all()
+
+
+@router.get(
+    "/sa/clients/{client_id}/soil-nutrient/packages",
+    response_model=list[dict],
+)
+async def list_sa_client_packages_for_mock(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SA Portal Mock form helper — lists this Client's Packages so SA/CM
+    can pick one to Mock-run against. Shape matches what the Client
+    Portal's /cca/packages endpoint returns (plus crop name denorm),
+    so the UI can use the same type for both portals.
+
+    Separate endpoint instead of reusing /client/{client_id}/cca/packages
+    because that gate is CA/SE/CM-with-assignment; the Mock allows any
+    active CM to simulate against any Client (Decision S aggregation).
+    """
+    _require_sa_or_cm(current_user)
+    pkgs = (await db.execute(
+        select(Package).where(Package.client_id == client_id)
+        .order_by(Package.updated_at.desc().nullslast(), Package.created_at.desc())
+    )).scalars().all()
+
+    # Denormalise crop names from client_crops so the UI doesn't need
+    # a second fetch.
+    from app.modules.clients.models import ClientCrop
+    crops = (await db.execute(
+        select(ClientCrop).where(ClientCrop.client_id == client_id)
+    )).scalars().all()
+    crop_name_by_id = {c.crop_cosh_id: c.crop_name_en for c in crops}
+
+    out = []
+    for p in pkgs:
+        out.append({
+            "id": p.id,
+            "name": p.name,
+            "crop_cosh_id": p.crop_cosh_id,
+            "crop_name_en": crop_name_by_id.get(p.crop_cosh_id) or p.crop_cosh_id,
+            "status": p.status.value if hasattr(p.status, "value") else str(p.status),
+            "version": p.version,
+        })
+    return out

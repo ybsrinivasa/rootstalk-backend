@@ -329,6 +329,15 @@ class ClientNormalRange(Base):
     )
     low_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     high_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # Decision V — classification → target adjustment. Operator-gated
+    # at the service layer: low_pct meaningful for RANGE/LOWER_BOUND,
+    # high_pct meaningful for RANGE/UPPER_BOUND. 0.0 = no adjustment.
+    low_pct_adjustment: Mapped[float] = mapped_column(
+        Float, nullable=False, default=0.0, server_default="0",
+    )
+    high_pct_adjustment: Mapped[float] = mapped_column(
+        Float, nullable=False, default=0.0, server_default="0",
+    )
     created_by: Mapped[Optional[str]] = mapped_column(
         String(36), ForeignKey("users.id"), nullable=True,
     )
@@ -378,6 +387,15 @@ class PackageNormalRangeOverride(Base):
     )
     low_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     high_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # Decision V — classification → target adjustment. Operator-gated
+    # at the service layer: low_pct meaningful for RANGE/LOWER_BOUND,
+    # high_pct meaningful for RANGE/UPPER_BOUND. 0.0 = no adjustment.
+    low_pct_adjustment: Mapped[float] = mapped_column(
+        Float, nullable=False, default=0.0, server_default="0",
+    )
+    high_pct_adjustment: Mapped[float] = mapped_column(
+        Float, nullable=False, default=0.0, server_default="0",
+    )
     created_by: Mapped[Optional[str]] = mapped_column(
         String(36), ForeignKey("users.id"), nullable=True,
     )
