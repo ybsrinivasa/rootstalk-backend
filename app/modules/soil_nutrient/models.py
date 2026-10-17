@@ -50,24 +50,6 @@ class CategoryGroup(str, enum.Enum):
     RATIO = "RATIO"
 
 
-class ProductCategoryScope(str, enum.Enum):
-    """Decision L — scope of a product category.
-
-    GLOBAL: platform-seeded, shared across all Clients. All v1 categories.
-    CLIENT: Client-added (v2+); CLIENT-scoped. Not used in v1.
-    """
-    GLOBAL = "GLOBAL"
-    CLIENT = "CLIENT"
-
-
-class ProductFieldType(str, enum.Enum):
-    """Decision L — product category field types."""
-    TEXT = "TEXT"
-    NUMBER = "NUMBER"
-    ENUM = "ENUM"
-    MULTI_SELECT = "MULTI_SELECT"
-
-
 class NormalRangeOperator(str, enum.Enum):
     """Decision N — one of three operator shapes for a Normal Range row.
 
@@ -125,80 +107,6 @@ class PlatformSoilParameter(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow,
-    )
-
-
-class ProductCategory(Base):
-    """Decision L — platform-seeded product category list.
-
-    v1 seeds two GLOBAL categories: Direct Soil Application, Water Solubles.
-    Categorized by application method, not product type — micronutrients
-    fold into one of the two based on how they're applied; soil amendments
-    (gypsum, lime) go in Direct Soil Application. Each category drives
-    the field schema (ProductCategoryField) that both the Client Global
-    Product List and the Fallback Catalogue use for product authoring.
-    """
-    __tablename__ = "product_categories"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
-    name: Mapped[str] = mapped_column(String(200), nullable=False, unique=True)
-    scope: Mapped[ProductCategoryScope] = mapped_column(
-        SAEnum(ProductCategoryScope, native_enum=False, length=20),
-        default=ProductCategoryScope.GLOBAL,
-    )
-    display_order: Mapped[int] = mapped_column(Integer, default=0)
-    status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow,
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, onupdate=utcnow,
-    )
-
-    fields: Mapped[list["ProductCategoryField"]] = relationship(
-        "ProductCategoryField", back_populates="category",
-        order_by="ProductCategoryField.display_order",
-    )
-
-
-class ProductCategoryField(Base):
-    """Decision L — per-category field schema.
-
-    Each row is one input field a product of this category must or may
-    carry. The authoring UI renders fields dynamically from this
-    schema; the storage layer uses hybrid columns (hot fields like N%
-    as columns on client_products / fallback_products, everything
-    else in a data_json blob) — field_key is the join key on both
-    sides.
-    """
-    __tablename__ = "product_category_fields"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
-    category_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("product_categories.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    field_key: Mapped[str] = mapped_column(String(100), nullable=False)
-    field_label: Mapped[str] = mapped_column(String(200), nullable=False)
-    field_type: Mapped[ProductFieldType] = mapped_column(
-        SAEnum(ProductFieldType, native_enum=False, length=20), nullable=False,
-    )
-    required: Mapped[bool] = mapped_column(Boolean, default=False)
-    unit: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
-    # For ENUM / MULTI_SELECT: {"options": ["prilled", "granule", ...]}
-    enum_values_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
-    display_order: Mapped[int] = mapped_column(Integer, default=0)
-    status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow,
-    )
-
-    category: Mapped["ProductCategory"] = relationship(
-        "ProductCategory", back_populates="fields",
-    )
-
-    __table_args__ = (
-        UniqueConstraint("category_id", "field_key", name="uq_category_field_key"),
     )
 
 

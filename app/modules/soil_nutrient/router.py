@@ -31,7 +31,6 @@ from app.modules.soil_nutrient.models import (
     FallbackProduct, FallbackProductCropAssignment,
     NormalRangeOperator, PackageNormalRangeOverride,
     PlatformSoilParameter, PresetSoilProfile,
-    ProductCategory, ProductCategoryField,
 )
 from app.modules.soil_nutrient.schemas import (
     ClientNormalRangeOut, ClientProductCreate, ClientProductOut,
@@ -41,9 +40,6 @@ from app.modules.soil_nutrient.schemas import (
     NormalRangeBulkUpsert, NormalRangeIn,
     PackageNormalRangeOverrideOut,
     PresetSoilProfileCreate, PresetSoilProfileOut, PresetSoilProfileUpdate,
-    ProductCategoryCreate, ProductCategoryFieldCreate,
-    ProductCategoryFieldOut, ProductCategoryFieldUpdate,
-    ProductCategoryOut, ProductCategoryUpdate,
     SoilNutrientModuleToggle, SoilParameterCreate,
     SoilParameterOut, SoilParameterUpdate, SoilTestingLabToggle,
 )
@@ -193,199 +189,6 @@ async def deactivate_soil_parameter(
     return row
 
 
-# ── Product Categories CRUD (Decision L) ───────────────────────────────────
-
-@router.get(
-    "/sa/soil-nutrient/product-categories",
-    response_model=list[ProductCategoryOut],
-)
-async def list_product_categories(
-    include_inactive: bool = False,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    _require_sa_or_cm(current_user)
-    q = select(ProductCategory).options(
-        selectinload(ProductCategory.fields),
-    ).order_by(ProductCategory.display_order)
-    if not include_inactive:
-        q = q.where(ProductCategory.status == "ACTIVE")
-    result = await db.execute(q)
-    return result.scalars().all()
-
-
-@router.post(
-    "/sa/soil-nutrient/product-categories",
-    response_model=ProductCategoryOut,
-    status_code=201,
-)
-async def create_product_category(
-    data: ProductCategoryCreate,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    _require_sa_or_cm(current_user)
-    existing = (await db.execute(
-        select(ProductCategory).where(ProductCategory.name == data.name)
-    )).scalar_one_or_none()
-    if existing:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Product category '{data.name}' already exists",
-        )
-    row = ProductCategory(
-        name=data.name,
-        scope=data.scope,
-        display_order=data.display_order,
-    )
-    db.add(row)
-    await db.commit()
-    await db.refresh(row)
-    # Reload with fields relationship for consistent response shape
-    reloaded = (await db.execute(
-        select(ProductCategory).options(
-            selectinload(ProductCategory.fields),
-        ).where(ProductCategory.id == row.id)
-    )).scalar_one()
-    return reloaded
-
-
-@router.patch(
-    "/sa/soil-nutrient/product-categories/{category_id}",
-    response_model=ProductCategoryOut,
-)
-async def update_product_category(
-    category_id: str,
-    data: ProductCategoryUpdate,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    _require_sa_or_cm(current_user)
-    row = await db.get(ProductCategory, category_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Category not found")
-    updates = data.model_dump(exclude_unset=True)
-    for key, value in updates.items():
-        setattr(row, key, value)
-    await db.commit()
-    reloaded = (await db.execute(
-        select(ProductCategory).options(
-            selectinload(ProductCategory.fields),
-        ).where(ProductCategory.id == row.id)
-    )).scalar_one()
-    return reloaded
-
-
-@router.delete(
-    "/sa/soil-nutrient/product-categories/{category_id}",
-    response_model=ProductCategoryOut,
-)
-async def deactivate_product_category(
-    category_id: str,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """Soft delete — flips status to INACTIVE. Hard delete would
-    orphan Client products and Fallback products referencing this
-    category (land in Phase 2+)."""
-    _require_sa_or_cm(current_user)
-    row = await db.get(ProductCategory, category_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Category not found")
-    row.status = "INACTIVE"
-    await db.commit()
-    reloaded = (await db.execute(
-        select(ProductCategory).options(
-            selectinload(ProductCategory.fields),
-        ).where(ProductCategory.id == row.id)
-    )).scalar_one()
-    return reloaded
-
-
-# ── Product Category Fields CRUD (Decision L) ──────────────────────────────
-
-@router.post(
-    "/sa/soil-nutrient/product-categories/{category_id}/fields",
-    response_model=ProductCategoryFieldOut,
-    status_code=201,
-)
-async def add_product_category_field(
-    category_id: str,
-    data: ProductCategoryFieldCreate,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    _require_sa_or_cm(current_user)
-    category = await db.get(ProductCategory, category_id)
-    if not category:
-        raise HTTPException(status_code=404, detail="Category not found")
-    # field_key uniqueness within category
-    existing = (await db.execute(
-        select(ProductCategoryField).where(
-            ProductCategoryField.category_id == category_id,
-            ProductCategoryField.field_key == data.field_key,
-        )
-    )).scalar_one_or_none()
-    if existing:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Field '{data.field_key}' already exists in this category",
-        )
-    row = ProductCategoryField(
-        category_id=category_id,
-        field_key=data.field_key,
-        field_label=data.field_label,
-        field_type=data.field_type,
-        required=data.required,
-        unit=data.unit,
-        enum_values_json=data.enum_values_json,
-        display_order=data.display_order,
-    )
-    db.add(row)
-    await db.commit()
-    await db.refresh(row)
-    return row
-
-
-@router.patch(
-    "/sa/soil-nutrient/product-category-fields/{field_id}",
-    response_model=ProductCategoryFieldOut,
-)
-async def update_product_category_field(
-    field_id: str,
-    data: ProductCategoryFieldUpdate,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    _require_sa_or_cm(current_user)
-    row = await db.get(ProductCategoryField, field_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Field not found")
-    updates = data.model_dump(exclude_unset=True)
-    for key, value in updates.items():
-        setattr(row, key, value)
-    await db.commit()
-    await db.refresh(row)
-    return row
-
-
-@router.delete(
-    "/sa/soil-nutrient/product-category-fields/{field_id}",
-    response_model=ProductCategoryFieldOut,
-)
-async def deactivate_product_category_field(
-    field_id: str,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    _require_sa_or_cm(current_user)
-    row = await db.get(ProductCategoryField, field_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Field not found")
-    row.status = "INACTIVE"
-    await db.commit()
-    await db.refresh(row)
-    return row
 
 
 # ── Preset Soil Profiles CRUD (Decision P + MQ5-B) ─────────────────────────
@@ -1036,29 +839,6 @@ async def list_client_portal_soil_parameters(
             PlatformSoilParameter.status == "ACTIVE",
         ).order_by(PlatformSoilParameter.display_order)
     )
-    return result.scalars().all()
-
-
-@router.get(
-    "/client/{client_id}/soil-nutrient/product-categories",
-    response_model=list[ProductCategoryOut],
-)
-async def list_client_portal_product_categories(
-    client_id: str,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """Mirror of /sa/soil-nutrient/product-categories for Client Portal.
-    Client Portal consumes these to render the authoring form fields
-    (field schema is platform-wide per Decision L3).
-    """
-    await _assert_can_edit_client_soil_nutrient(db, current_user.id, client_id)
-    q = select(ProductCategory).options(
-        selectinload(ProductCategory.fields),
-    ).where(
-        ProductCategory.status == "ACTIVE",
-    ).order_by(ProductCategory.display_order)
-    result = await db.execute(q)
     return result.scalars().all()
 
 

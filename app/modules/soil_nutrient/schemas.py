@@ -9,8 +9,7 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 from app.modules.soil_nutrient.models import (
-    CategoryGroup, NormalRangeOperator, ProductCategoryScope,
-    ProductFieldType,
+    CategoryGroup, NormalRangeOperator,
 )
 
 
@@ -46,71 +45,6 @@ class SoilParameterOut(BaseModel):
     status: str
     created_at: datetime
     updated_at: datetime
-
-    class Config:
-        from_attributes = True
-
-
-# ── Product Categories + Fields (Decision L) ────────────────────────────────
-
-class ProductCategoryFieldCreate(BaseModel):
-    field_key: str = Field(..., min_length=1, max_length=100)
-    field_label: str = Field(..., min_length=1, max_length=200)
-    field_type: ProductFieldType
-    required: bool = False
-    unit: Optional[str] = Field(None, max_length=40)
-    enum_values_json: Optional[dict] = None
-    display_order: int = 0
-
-
-class ProductCategoryFieldUpdate(BaseModel):
-    field_key: Optional[str] = Field(None, min_length=1, max_length=100)
-    field_label: Optional[str] = Field(None, min_length=1, max_length=200)
-    field_type: Optional[ProductFieldType] = None
-    required: Optional[bool] = None
-    unit: Optional[str] = Field(None, max_length=40)
-    enum_values_json: Optional[dict] = None
-    display_order: Optional[int] = None
-    status: Optional[str] = Field(None, pattern="^(ACTIVE|INACTIVE)$")
-
-
-class ProductCategoryFieldOut(BaseModel):
-    id: str
-    category_id: str
-    field_key: str
-    field_label: str
-    field_type: ProductFieldType
-    required: bool
-    unit: Optional[str]
-    enum_values_json: Optional[dict]
-    display_order: int
-    status: str
-
-    class Config:
-        from_attributes = True
-
-
-class ProductCategoryCreate(BaseModel):
-    name: str = Field(..., min_length=1, max_length=200)
-    scope: ProductCategoryScope = ProductCategoryScope.GLOBAL
-    display_order: int = 0
-
-
-class ProductCategoryUpdate(BaseModel):
-    name: Optional[str] = Field(None, min_length=1, max_length=200)
-    display_order: Optional[int] = None
-    status: Optional[str] = Field(None, pattern="^(ACTIVE|INACTIVE)$")
-
-
-class ProductCategoryOut(BaseModel):
-    id: str
-    name: str
-    scope: ProductCategoryScope
-    display_order: int
-    status: str
-    created_at: datetime
-    updated_at: datetime
-    fields: list[ProductCategoryFieldOut] = []
 
     class Config:
         from_attributes = True
