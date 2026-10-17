@@ -203,56 +203,35 @@ class ProductCategoryField(Base):
 
 
 class FallbackProduct(Base):
-    """Decision M — Fallback Catalogue (Tier 2 of the 3-tier recommendation
-    hierarchy).
+    """Decision U (2026-10-17) — Fallback Catalogue (Tier 2) as a pointer
+    table over Cosh products.
 
-    Industry-wide known products — authored and maintained by SA/CM in
-    the SA Portal, NOT Cosh-sourced (Decision M reverses Decision D's
-    original "Cosh-sourced" clause). Consumed by all soil-nutrient-
-    enabled Clients when their own Tier 1 Global Product List can't
-    deliver the soil-adjusted nutrient target.
+    Walk-back of the original Decision M "NOT Cosh-sourced" clause,
+    triggered by agronomist SME review 2026-10-16. The old native
+    authoring surface (shipped Phase 2, with its own N%/P%/K%
+    columns) is replaced with this pointer-table shape so Fallback
+    products automatically inherit Cosh-side infrastructure: Brand
+    linkage, Dealer Volume Calculations (BL-06 + npk-ranking), QR
+    Product Authentication.
+
+    SA/CM curates a subset of Cosh fertilizer products by adding
+    rows here, each pointing at a `common_names_of_inputs` cosh_id.
+    Nutrient %, formulation, manufacturer, brand all resolved from
+    Cosh at read time via `load_fertiliser_candidates()` (shared with
+    the Dealer npk-select pipeline).
 
     Priority at engine time: Tier 1 (Client Products) always wins;
     Fallback is engine-of-last-resort before Tier 3 (pure dosage).
-
-    Hybrid storage: hot fields that the engine queries constantly
-    (N%, P%, K%, formulation) live as proper columns on this row;
-    rarer secondary/micro percentages + metadata live in `data_json`.
-    `category_id` ties the row to one Product Category whose
-    `product_category_fields` schema drives the authoring UI.
     """
     __tablename__ = "fallback_products"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
-    category_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("product_categories.id", ondelete="RESTRICT"),
-        nullable=False,
-    )
-    display_name: Mapped[str] = mapped_column(String(500), nullable=False)
-    manufacturer: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
-    grade: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    formulation: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    # Hot nutrient-content columns — queried by the engine every
-    # personalisation run. Nullable because not every product carries
-    # every nutrient.
-    n_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    p2o5_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    k2o_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    ca_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    mg_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    s_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    zn_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    fe_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    mn_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    cu_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    b_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    # application_methods: multi-select enum string list, e.g.
-    # ["basal", "top-dress"] for Direct Soil Application category.
-    application_methods: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
-    # Catch-all for rarer or future fields keyed by field_key from the
-    # category's schema. Keeps rare metadata out of SELECT * weight.
-    data_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    # Pointer into Cosh's common_names_of_inputs Core. Must be unique —
+    # a given Cosh product is in or out of the Fallback catalogue;
+    # it can't appear twice.
+    cosh_product_id: Mapped[str] = mapped_column(String(200), nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_by: Mapped[Optional[str]] = mapped_column(
         String(36), ForeignKey("users.id"), nullable=True,
     )
@@ -263,16 +242,19 @@ class FallbackProduct(Base):
         DateTime(timezone=True), default=utcnow, onupdate=utcnow,
     )
 
-    category: Mapped["ProductCategory"] = relationship("ProductCategory")
     crop_assignments: Mapped[list["FallbackProductCropAssignment"]] = relationship(
         "FallbackProductCropAssignment",
         back_populates="product",
         cascade="all, delete-orphan",
     )
 
+    __table_args__ = (
+        UniqueConstraint("cosh_product_id", name="uq_fallback_cosh_product"),
+    )
+
 
 class FallbackProductCropAssignment(Base):
-    """Decision M — per-crop scoping for a Fallback product.
+    """Decision M (unchanged by U) — per-crop scoping for a Fallback product.
 
     No crop_assignments rows for a product → the product is available
     for personalisation on any crop (universal). At least one row →

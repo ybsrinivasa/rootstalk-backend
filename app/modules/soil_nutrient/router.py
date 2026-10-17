@@ -36,6 +36,7 @@ from app.modules.soil_nutrient.models import (
 from app.modules.soil_nutrient.schemas import (
     ClientNormalRangeOut, ClientProductCreate, ClientProductOut,
     ClientProductUpdate, ClientSoilNutrientStatusOut,
+    CoshFertilizerCandidateOut, CoshFertilizerConcentrationOut,
     FallbackProductCreate, FallbackProductOut, FallbackProductUpdate,
     NormalRangeBulkUpsert, NormalRangeIn,
     PackageNormalRangeOverrideOut,
@@ -46,6 +47,7 @@ from app.modules.soil_nutrient.schemas import (
     SoilNutrientModuleToggle, SoilParameterCreate,
     SoilParameterOut, SoilParameterUpdate, SoilTestingLabToggle,
 )
+from app.services.npk_candidates import load_fertiliser_candidates
 
 
 router = APIRouter(tags=["Soil Nutrient"])
@@ -492,27 +494,88 @@ def _apply_crop_assignments(
     product.crop_assignments = new_rows
 
 
+async def _candidates_by_cosh_id(
+    db: AsyncSession,
+) -> dict[str, CoshFertilizerCandidateOut]:
+    """Load the fertilizer catalogue from Cosh once and key it by cosh_id.
+
+    Shared with the Dealer NPK-select pipeline (`load_fertiliser_
+    candidates`), so Fallback inherits every row Cosh considers valid
+    (fertigation=False includes both soil + fertigation products since
+    we accept non-water-soluble too). Phase 6b uses this to hydrate
+    the picker + list, and to validate pointer-create input.
+    """
+    candidates, _ = await load_fertiliser_candidates(db, fertigation=False)
+    return {
+        c.cosh_id: CoshFertilizerCandidateOut(
+            cosh_id=c.cosh_id,
+            name=c.name,
+            concentration=CoshFertilizerConcentrationOut(
+                n=c.concentration.n,
+                p=c.concentration.p,
+                k=c.concentration.k,
+            ),
+            water_soluble=c.water_soluble,
+        )
+        for c in candidates
+    }
+
+
+def _hydrate_fallback(
+    row: FallbackProduct,
+    by_cosh_id: dict[str, CoshFertilizerCandidateOut],
+) -> FallbackProductOut:
+    return FallbackProductOut(
+        id=row.id,
+        cosh_product_id=row.cosh_product_id,
+        status=row.status,
+        notes=row.notes,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+        crop_assignments=[
+            {"id": a.id, "crop_cosh_id": a.crop_cosh_id, "status": a.status}
+            for a in row.crop_assignments
+        ],
+        cosh=by_cosh_id.get(row.cosh_product_id),
+    )
+
+
+@router.get(
+    "/sa/soil-nutrient/cosh-fertilizers",
+    response_model=list[CoshFertilizerCandidateOut],
+)
+async def list_cosh_fertilizers(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Picker feed — the full Cosh fertilizer catalogue the SA chooses
+    from when adding to the Fallback list. Shared Cosh query layer
+    with Dealer NPK-select (`load_fertiliser_candidates`)."""
+    _require_sa_or_cm(current_user)
+    by_cosh_id = await _candidates_by_cosh_id(db)
+    return sorted(by_cosh_id.values(), key=lambda c: c.name.lower())
+
+
 @router.get(
     "/sa/soil-nutrient/fallback-products",
     response_model=list[FallbackProductOut],
 )
 async def list_fallback_products(
     include_inactive: bool = False,
-    category_id: str | None = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """List Fallback products. Filter by category optional."""
+    """List Fallback products — pointer rows hydrated with Cosh data."""
     _require_sa_or_cm(current_user)
     q = select(FallbackProduct).options(
         selectinload(FallbackProduct.crop_assignments),
-    ).order_by(FallbackProduct.display_name)
+    ).order_by(FallbackProduct.created_at.desc())
     if not include_inactive:
         q = q.where(FallbackProduct.status == "ACTIVE")
-    if category_id:
-        q = q.where(FallbackProduct.category_id == category_id)
     result = await db.execute(q)
-    return result.scalars().all()
+    rows = result.scalars().all()
+    by_cosh_id = await _candidates_by_cosh_id(db)
+    return [_hydrate_fallback(r, by_cosh_id) for r in rows]
 
 
 @router.post(
@@ -526,29 +589,27 @@ async def create_fallback_product(
     current_user: User = Depends(get_current_user),
 ):
     _require_sa_or_cm(current_user)
-    category = await db.get(ProductCategory, data.category_id)
-    if not category:
-        raise HTTPException(status_code=400, detail="Category not found")
+    by_cosh_id = await _candidates_by_cosh_id(db)
+    if data.cosh_product_id not in by_cosh_id:
+        raise HTTPException(
+            status_code=400,
+            detail="cosh_product_id is not a known Cosh fertilizer",
+        )
+
+    existing = (await db.execute(
+        select(FallbackProduct).where(
+            FallbackProduct.cosh_product_id == data.cosh_product_id,
+        )
+    )).scalar_one_or_none()
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail="This Cosh product is already in the Fallback catalogue",
+        )
 
     row = FallbackProduct(
-        category_id=data.category_id,
-        display_name=data.display_name,
-        manufacturer=data.manufacturer,
-        grade=data.grade,
-        formulation=data.formulation,
-        n_pct=data.n_pct,
-        p2o5_pct=data.p2o5_pct,
-        k2o_pct=data.k2o_pct,
-        ca_pct=data.ca_pct,
-        mg_pct=data.mg_pct,
-        s_pct=data.s_pct,
-        zn_pct=data.zn_pct,
-        fe_pct=data.fe_pct,
-        mn_pct=data.mn_pct,
-        cu_pct=data.cu_pct,
-        b_pct=data.b_pct,
-        application_methods=data.application_methods,
-        data_json=data.data_json,
+        cosh_product_id=data.cosh_product_id,
+        notes=data.notes,
         created_by=current_user.id,
     )
     db.add(row)
@@ -560,7 +621,7 @@ async def create_fallback_product(
             selectinload(FallbackProduct.crop_assignments),
         ).where(FallbackProduct.id == row.id)
     )).scalar_one()
-    return reloaded
+    return _hydrate_fallback(reloaded, by_cosh_id)
 
 
 @router.patch(
@@ -582,11 +643,6 @@ async def update_fallback_product(
     if not row:
         raise HTTPException(status_code=404, detail="Product not found")
 
-    if data.category_id is not None:
-        category = await db.get(ProductCategory, data.category_id)
-        if not category:
-            raise HTTPException(status_code=400, detail="Category not found")
-
     updates = data.model_dump(exclude_unset=True, exclude={"crop_cosh_ids"})
     for key, value in updates.items():
         setattr(row, key, value)
@@ -600,7 +656,8 @@ async def update_fallback_product(
             selectinload(FallbackProduct.crop_assignments),
         ).where(FallbackProduct.id == product_id)
     )).scalar_one()
-    return reloaded
+    by_cosh_id = await _candidates_by_cosh_id(db)
+    return _hydrate_fallback(reloaded, by_cosh_id)
 
 
 @router.delete(
@@ -625,7 +682,8 @@ async def deactivate_fallback_product(
             selectinload(FallbackProduct.crop_assignments),
         ).where(FallbackProduct.id == product_id)
     )).scalar_one()
-    return reloaded
+    by_cosh_id = await _candidates_by_cosh_id(db)
+    return _hydrate_fallback(reloaded, by_cosh_id)
 
 
 # ── Client Portal — Client Products CRUD (Decision L) ──────────────────────
