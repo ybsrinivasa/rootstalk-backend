@@ -28,7 +28,12 @@ import sqlalchemy as sa
 
 
 revision: str = 'e6a7b4c13f29'
-down_revision: Union[str, Sequence[str], None] = 'd5d3f574e218'
+# Decision: on prod-safe-2026-10-18 the soil-nutrient migration chain
+# (d1a0f574e215…d5d3f574e218…k3h8c6e29j5a) is intentionally skipped.
+# This migration touches only coaching-specific tables (no soil
+# dependency) so we chain directly off the prod head c8b4d7f2e691.
+# On main (soil shipped), down_revision stays as d5d3f574e218.
+down_revision: Union[str, Sequence[str], None] = 'c8b4d7f2e691'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
