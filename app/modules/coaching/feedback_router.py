@@ -206,6 +206,55 @@ async def put_moment1(
     return Moment1AnswersOut(answers=row.answers_json or {}, updated_at=row.updated_at)
 
 
+# ── Moment 1 — Coach-side read ─────────────────────────────────────────────
+
+@router.get(
+    "/coaching/sessions/{session_id}/students/{student_id}/moment1",
+    response_model=Moment1AnswersOut,
+)
+async def coach_view_moment1(
+    session_id: str,
+    student_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Coach-side read of a student's Moment 1 answers (expectations).
+
+    Unlike Moment 2 content — which is held back until the certificate
+    is issued to keep certification pressure out of feedback — Moment 1
+    is visible to the coach throughout. The coach tailors their coaching
+    better when they can see what the student came in hoping for.
+
+    Permission: coach of this session (or SA/CM).
+    Returns `answers={}` + `updated_at=None` when the student skipped
+    or hasn't started Moment 1 yet (same empty shape as the student's
+    own GET)."""
+    await _require_coach_or_sa(current_user)
+    session = await coaching_service.require_session_owner(
+        db, session_id, current_user,
+    )
+    student = (await db.execute(
+        select(CoachingStudent).where(
+            CoachingStudent.id == student_id,
+            CoachingStudent.session_id == session.id,
+        )
+    )).scalar_one_or_none()
+    if student is None:
+        raise HTTPException(status_code=404, detail="Student not found")
+
+    row = (await db.execute(
+        select(CoachingStudentMoment1Response).where(
+            CoachingStudentMoment1Response.student_id == student.id,
+        )
+    )).scalar_one_or_none()
+    if row is None:
+        return Moment1AnswersOut(answers={}, updated_at=None)
+    return Moment1AnswersOut(
+        answers=row.answers_json or {},
+        updated_at=row.updated_at,
+    )
+
+
 # ── Moment 2 — Coach triggers capture ──────────────────────────────────────
 
 @router.post(
