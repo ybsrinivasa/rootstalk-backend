@@ -852,41 +852,48 @@ async def list_client_portal_soil_parameters(
 
 # ── Soil Range Templates (Decision W) ──────────────────────────────────────
 
-def _validate_template_row(row: SoilRangeTemplateRowIn) -> None:
+def _validate_template_row(
+    row: SoilRangeTemplateRowIn,
+    param_name: str | None = None,
+) -> None:
     """Enforce operator-specific required-fields invariant on template
-    rows. Templates carry bounds only (no adjustments)."""
+    rows. Templates carry bounds only (no adjustments). `param_name`
+    is the display name of the parameter — included in error messages
+    so users don't see raw UUIDs. Falls back to the UUID when the
+    caller didn't look up a name."""
+    label = param_name or f"parameter {row.parameter_id}"
     if row.operator == NormalRangeOperator.RANGE:
         if row.low_value is None or row.high_value is None:
             raise HTTPException(
                 status_code=400,
-                detail=f"RANGE operator requires both low_value and high_value (parameter {row.parameter_id}).",
+                detail=f"{label}: RANGE operator requires both Low and High values.",
             )
         if row.low_value > row.high_value:
             raise HTTPException(
                 status_code=400,
-                detail=f"RANGE operator requires low_value <= high_value (parameter {row.parameter_id}).",
+                detail=f"{label}: Low must be less than or equal to High.",
             )
     elif row.operator == NormalRangeOperator.UPPER_BOUND:
         if row.high_value is None:
             raise HTTPException(
                 status_code=400,
-                detail=f"UPPER_BOUND operator requires high_value (parameter {row.parameter_id}).",
+                detail=f"{label}: operator \"< x\" requires a High value.",
             )
         if row.low_value is not None:
             raise HTTPException(
                 status_code=400,
-                detail=f"UPPER_BOUND operator must not carry low_value (parameter {row.parameter_id}).",
+                detail=f"{label}: operator \"< x\" doesn't take a Low value — clear it before saving.",
             )
     elif row.operator == NormalRangeOperator.LOWER_BOUND:
         if row.low_value is None:
             raise HTTPException(
                 status_code=400,
-                detail=f"LOWER_BOUND operator requires low_value (parameter {row.parameter_id}).",
+                detail=f"{label}: operator \"> x\" requires a Low value.",
             )
         if row.high_value is not None:
             raise HTTPException(
                 status_code=400,
-                detail=f"LOWER_BOUND operator must not carry high_value (parameter {row.parameter_id}).",
+                detail=f"{label}: operator \"> x\" doesn't take a High value — clear it before saving.",
             )
 
 
@@ -902,8 +909,12 @@ _NON_DOSABLE_CATEGORY_GROUPS = {"BASE", "OTHER", "RATIO"}
 def _validate_package_override_row(
     row: PackageNormalRangeOverrideIn,
     param_category_group: str | None = None,
+    param_name: str | None = None,
 ) -> None:
     """Validate a Package override row — bounds AND adjustments.
+
+    `param_name` is the display name of the parameter — included in
+    error messages so users don't see raw UUIDs.
 
     Rules:
       - If operator is set, run the same per-operator low/high
@@ -916,11 +927,10 @@ def _validate_package_override_row(
         two floats as supplied.
       - Decision V-amend: for BASE / OTHER / RATIO parameters,
         low_pct_adjustment + high_pct_adjustment must both be 0 —
-        these parameters aren't dosable. `param_category_group` is
-        the enum value from PlatformSoilParameter.category_group.
-        None means "caller didn't look up the category group"; we
-        skip the check in that case rather than silently allow.
+        these parameters aren't dosable.
     """
+    label = param_name or f"parameter {row.parameter_id}"
+
     # Decision V-amend: dosability check runs first — simpler failure
     # mode and clearest message when the parameter isn't dosable.
     if (
@@ -930,10 +940,8 @@ def _validate_package_override_row(
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Parameter {row.parameter_id} is in CategoryGroup "
-                f"{param_category_group} (not dosable via a fertilizer "
-                f"product); low_pct_adjustment and high_pct_adjustment "
-                f"must both be 0."
+                f"{label} isn't a dosable parameter — Low Adj % and "
+                f"High Adj % must both be 0."
             ),
         )
 
@@ -941,28 +949,35 @@ def _validate_package_override_row(
         if row.low_value is not None or row.high_value is not None:
             raise HTTPException(
                 status_code=400,
-                detail=f"operator=None means inherit from template; low_value / high_value must also be None (parameter {row.parameter_id}).",
+                detail=(
+                    f"{label}: inheriting the template's operator means "
+                    f"Low and High must also be left blank."
+                ),
             )
         return  # No per-operator adjustment gating in inherit-mode.
 
-    # Bounds validation (same as template rows).
-    _validate_template_row(SoilRangeTemplateRowIn(
-        parameter_id=row.parameter_id,
-        operator=row.operator,
-        low_value=row.low_value,
-        high_value=row.high_value,
-    ))
+    # Bounds validation (same as template rows). Pass the name through
+    # so the inner validator's error messages also use the name.
+    _validate_template_row(
+        SoilRangeTemplateRowIn(
+            parameter_id=row.parameter_id,
+            operator=row.operator,
+            low_value=row.low_value,
+            high_value=row.high_value,
+        ),
+        param_name=param_name,
+    )
 
     # Decision V — operator-gated % adjustments when operator is set.
     if row.operator == NormalRangeOperator.UPPER_BOUND and row.low_pct_adjustment != 0.0:
         raise HTTPException(
             status_code=400,
-            detail=f"UPPER_BOUND operator has no Low classification; low_pct_adjustment must be 0 (parameter {row.parameter_id}).",
+            detail=f"{label}: operator \"< x\" has no Low classification — Low Adj % must be 0.",
         )
     if row.operator == NormalRangeOperator.LOWER_BOUND and row.high_pct_adjustment != 0.0:
         raise HTTPException(
             status_code=400,
-            detail=f"LOWER_BOUND operator has no High classification; high_pct_adjustment must be 0 (parameter {row.parameter_id}).",
+            detail=f"{label}: operator \"> x\" has no High classification — High Adj % must be 0.",
         )
 
 
@@ -1123,8 +1138,19 @@ async def bulk_upsert_template_rows(
     if tpl is None:
         raise HTTPException(status_code=404, detail="Template not found")
 
+    # Pre-load parameter names so validator errors surface the human
+    # name instead of the UUID.
+    param_ids = [row.parameter_id for row in data.rows]
+    name_by_param: dict[str, str] = {}
+    if param_ids:
+        rows_p = (await db.execute(
+            select(PlatformSoilParameter.id, PlatformSoilParameter.name)
+            .where(PlatformSoilParameter.id.in_(param_ids))
+        )).all()
+        name_by_param = {pid: name for pid, name in rows_p}
+
     for row in data.rows:
-        _validate_template_row(row)
+        _validate_template_row(row, param_name=name_by_param.get(row.parameter_id))
 
     by_param = {r.parameter_id: r for r in tpl.rows}
     for row in data.rows:
@@ -1238,23 +1264,31 @@ async def bulk_upsert_package_overrides(
     await _assert_can_edit_client_soil_nutrient(db, current_user.id, client_id)
     await _assert_package_belongs_to_client(db, package_id, client_id)
 
-    # Decision V-amend: load category_group for every parameter the
-    # payload touches, so the validator can reject adjustments on
-    # non-dosable parameters (BASE / OTHER / RATIO).
+    # Decision V-amend: load category_group AND name for every
+    # parameter the payload touches, so the validator can (a) reject
+    # adjustments on non-dosable parameters (BASE / OTHER / RATIO)
+    # and (b) surface the parameter's human name in errors instead
+    # of the raw UUID.
     param_ids = [row.parameter_id for row in data.rows]
     category_by_param: dict[str, str] = {}
+    name_by_param: dict[str, str] = {}
     if param_ids:
         rows = (await db.execute(
-            select(PlatformSoilParameter.id, PlatformSoilParameter.category_group)
-            .where(PlatformSoilParameter.id.in_(param_ids))
+            select(
+                PlatformSoilParameter.id,
+                PlatformSoilParameter.category_group,
+                PlatformSoilParameter.name,
+            ).where(PlatformSoilParameter.id.in_(param_ids))
         )).all()
-        for pid, cg in rows:
+        for pid, cg, nm in rows:
             category_by_param[pid] = cg.value if hasattr(cg, "value") else str(cg)
+            name_by_param[pid] = nm
 
     for row in data.rows:
         _validate_package_override_row(
             row,
             param_category_group=category_by_param.get(row.parameter_id),
+            param_name=name_by_param.get(row.parameter_id),
         )
 
     existing = (await db.execute(
