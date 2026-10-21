@@ -890,8 +890,18 @@ def _validate_template_row(row: SoilRangeTemplateRowIn) -> None:
             )
 
 
+# Decision V-amend (2026-10-21) — CategoryGroup values that are NOT
+# dosable via a fertilizer product. Low/High adjustments make no
+# engine sense here (you can't "shift pH target by 20%") so they're
+# rejected server-side and hidden in the UI. The classification itself
+# (operator + Low + High) stays valid — these parameters still appear
+# in Mock Section 2 (Soil Interpretation).
+_NON_DOSABLE_CATEGORY_GROUPS = {"BASE", "OTHER", "RATIO"}
+
+
 def _validate_package_override_row(
     row: PackageNormalRangeOverrideIn,
+    param_category_group: str | None = None,
 ) -> None:
     """Validate a Package override row — bounds AND adjustments.
 
@@ -904,7 +914,29 @@ def _validate_package_override_row(
         When operator is None we take the Package template's shape at
         engine time and gate there; the row itself just carries the
         two floats as supplied.
+      - Decision V-amend: for BASE / OTHER / RATIO parameters,
+        low_pct_adjustment + high_pct_adjustment must both be 0 —
+        these parameters aren't dosable. `param_category_group` is
+        the enum value from PlatformSoilParameter.category_group.
+        None means "caller didn't look up the category group"; we
+        skip the check in that case rather than silently allow.
     """
+    # Decision V-amend: dosability check runs first — simpler failure
+    # mode and clearest message when the parameter isn't dosable.
+    if (
+        param_category_group in _NON_DOSABLE_CATEGORY_GROUPS
+        and (row.low_pct_adjustment != 0.0 or row.high_pct_adjustment != 0.0)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Parameter {row.parameter_id} is in CategoryGroup "
+                f"{param_category_group} (not dosable via a fertilizer "
+                f"product); low_pct_adjustment and high_pct_adjustment "
+                f"must both be 0."
+            ),
+        )
+
     if row.operator is None:
         if row.low_value is not None or row.high_value is not None:
             raise HTTPException(
@@ -1206,8 +1238,24 @@ async def bulk_upsert_package_overrides(
     await _assert_can_edit_client_soil_nutrient(db, current_user.id, client_id)
     await _assert_package_belongs_to_client(db, package_id, client_id)
 
+    # Decision V-amend: load category_group for every parameter the
+    # payload touches, so the validator can reject adjustments on
+    # non-dosable parameters (BASE / OTHER / RATIO).
+    param_ids = [row.parameter_id for row in data.rows]
+    category_by_param: dict[str, str] = {}
+    if param_ids:
+        rows = (await db.execute(
+            select(PlatformSoilParameter.id, PlatformSoilParameter.category_group)
+            .where(PlatformSoilParameter.id.in_(param_ids))
+        )).all()
+        for pid, cg in rows:
+            category_by_param[pid] = cg.value if hasattr(cg, "value") else str(cg)
+
     for row in data.rows:
-        _validate_package_override_row(row)
+        _validate_package_override_row(
+            row,
+            param_category_group=category_by_param.get(row.parameter_id),
+        )
 
     existing = (await db.execute(
         select(PackageNormalRangeOverride).where(
