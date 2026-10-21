@@ -268,10 +268,18 @@ def compute_target_adjustments(
 # micros, pH) classifies and surfaces in the Report but doesn't drive
 # NPK candidate ranking in v1 — Decision C's complex-rule-type covers
 # those in a later phase.
+#
+# Names must match the seed data in
+# alembic/versions/d2a0f574e215_soil_nutrient_phase1_seed.py exactly —
+# the Indian soil-health-card vocabulary uses "Phosphorous" (with the
+# extra 'o') and "Potash" (not Potassium). Prior values here were
+# generic chemistry names and produced false negatives — P and K rows
+# were skipped from candidate ranking and incorrectly counted as
+# "non-NPK" in Section 6 warnings.
 _PARAM_NAME_TO_NUTRIENT = {
     "Available Nitrogen": "N",
-    "Available Phosphorus": "P",
-    "Available Potassium": "K",
+    "Available Phosphorous": "P",
+    "Available Potash": "K",
 }
 
 
