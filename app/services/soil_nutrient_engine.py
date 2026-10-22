@@ -134,6 +134,67 @@ class RankedCandidates:
     tier3: list[CandidateProduct]
 
 
+# ── Phase 8 shapes (2026-10-22) ───────────────────────────────────────────
+# The engine extends from "which products rank highest" to a Package-aware
+# action plan: baseline per nutrient → delta from Decision V % → Tier 0
+# proportional distribution over existing Practices → gap-case Instruction
+# for Low nutrients the Package has no Practice for.
+
+@dataclass(frozen=True)
+class PracticeNutrientContribution:
+    """One Practice's authored contribution to one or more nutrients, in
+    kg of elemental nutrient per acre. Caller does all the parsing +
+    unit conversion (NPK_DOSAGES → read elements; PRODUCTS → multiply
+    DOSAGE × Cosh concentration; foliar g/L × 200 / 1000 → kg/acre)."""
+    practice_id: str
+    timeline_id: str
+    timeline_name: str
+    timeline_from_days: int   # anchor-day; for first-future detection
+    l2_type: str
+    display_label: str        # for Mock rendering, e.g. "Urea 9 kg/acre @ DAS 38–42"
+    is_acknowledged: bool     # Decision H past-ack skip; Mock sets False
+    contributions: dict[str, float]  # nutrient_letter → kg/acre
+
+
+@dataclass(frozen=True)
+class BaselineComputation:
+    """Package-level baseline per nutrient (sum across all Practice
+    contributions). `per_nutrient` keys are the 11 letters covered by
+    `_PARAM_NAME_TO_NUTRIENT_FULL`."""
+    per_nutrient: dict[str, float]
+
+
+@dataclass(frozen=True)
+class Tier0Adjustment:
+    """A single Practice's proposed modification for one nutrient.
+
+    `scaled_kg_per_acre` is what the Decision V math says the new dose
+    should be. `applied_kg_per_acre` is what the engine will actually
+    use — equals scaled unless the Practice is past-acknowledged, in
+    which case it equals original (Decision H: no retroactive edits,
+    no redistribution of missed share to future Practices)."""
+    practice_id: str
+    timeline_name: str
+    nutrient: str
+    original_kg_per_acre: float
+    scaled_kg_per_acre: float
+    applied_kg_per_acre: float
+    skipped_reason: Optional[str]  # "past-acknowledged" when frozen
+
+
+@dataclass(frozen=True)
+class GapInstruction:
+    """A brand-new INSTRUCTION Practice to insert on the first-future
+    Timeline, for Low-classified nutrients the Package carries no
+    Practice for. Only fires for LOW; HIGH gap cases are skipped
+    (no Practice = no over-application risk)."""
+    nutrient: str       # letter: "Mg" / "Zn" etc.
+    nutrient_name: str  # full name for the message: "Magnesium"
+    message: str        # the agronomist-signed-off templated text
+    place_on_timeline_id: Optional[str]
+    place_on_timeline_name: Optional[str]
+
+
 @dataclass(frozen=True)
 class DecisionReportSection:
     heading: str
@@ -281,6 +342,181 @@ _PARAM_NAME_TO_NUTRIENT = {
     "Available Phosphorous": "P",
     "Available Potash": "K",
 }
+
+
+# ── Phase 8 maps (2026-10-22) ─────────────────────────────────────────────
+# Full 11-nutrient map used by Phase 8's baseline + Tier 0 + gap-case
+# Instruction logic. Separate from _PARAM_NAME_TO_NUTRIENT above (which
+# stays NPK-only because rank_candidates can only key off the n/p/k
+# fields on CandidateProduct — secondary/micro concentrations aren't
+# in the Cosh fert_nutrient_concentration Connect yet).
+_PARAM_NAME_TO_NUTRIENT_FULL = {
+    "Available Nitrogen":   "N",
+    "Available Phosphorous": "P",
+    "Available Potash":     "K",
+    "Available Calcium":    "Ca",
+    "Available Magnesium":  "Mg",
+    "Available Sulphur":    "S",
+    "Available Zinc":       "Zn",
+    "Available Iron":       "Fe",
+    "Available Manganese":  "Mn",
+    "Available Copper":     "Cu",
+    "Available Boron":      "B",
+}
+
+_NUTRIENT_LETTER_TO_NAME = {
+    "N":  "Nitrogen",
+    "P":  "Phosphorus",
+    "K":  "Potassium",
+    "Ca": "Calcium",
+    "Mg": "Magnesium",
+    "S":  "Sulphur",
+    "Zn": "Zinc",
+    "Fe": "Iron",
+    "Mn": "Manganese",
+    "Cu": "Copper",
+    "B":  "Boron",
+}
+
+# Agronomist-signed-off messages (2026-10-22). Each describes the
+# visible symptoms, then routes the farmer through the Diagnosis
+# feature with a confirm-before-act gate so false signals don't force
+# an unnecessary application.
+_GAP_INSTRUCTION_MESSAGES = {
+    "N":  "The soil report suggests Nitrogen may be insufficient. Watch for pale yellow older leaves, stunted growth, or thin stems. If you notice these symptoms, open the Diagnosis feature. If it confirms the deficiency, follow the recommended plan.",
+    "P":  "The soil report suggests Phosphorus may be insufficient. Watch for purplish or dark-green older leaves, poor root development, or delayed flowering. If you notice these symptoms, open the Diagnosis feature. If it confirms the deficiency, follow the recommended plan.",
+    "K":  "The soil report suggests Potassium may be insufficient. Watch for scorched or browning leaf edges on older leaves, weak stems, or lodging. If you notice these symptoms, open the Diagnosis feature. If it confirms the deficiency, follow the recommended plan.",
+    "Ca": "The soil report suggests Calcium may be insufficient. Watch for distorted young leaves, blossom-end rot on fruits, or hollow stems. If you notice these symptoms, open the Diagnosis feature. If it confirms the deficiency, follow the recommended plan.",
+    "Mg": "The soil report suggests Magnesium may be insufficient. Watch for interveinal yellowing on older leaves (the leaf veins stay green). If you notice these symptoms, open the Diagnosis feature. If it confirms the deficiency, follow the recommended plan.",
+    "S":  "The soil report suggests Sulphur may be insufficient. Watch for pale young leaves (unlike Nitrogen, where older leaves pale first). If you notice these symptoms, open the Diagnosis feature. If it confirms the deficiency, follow the recommended plan.",
+    "Zn": "The soil report suggests Zinc may be insufficient. Watch for small leaves, shortened internodes, or bronzing on young leaves. If you notice these symptoms, open the Diagnosis feature. If it confirms the deficiency, follow the recommended plan.",
+    "Fe": "The soil report suggests Iron may be insufficient. Watch for interveinal yellowing on young leaves (opposite of Magnesium — young leaves first). If you notice these symptoms, open the Diagnosis feature. If it confirms the deficiency, follow the recommended plan.",
+    "Mn": "The soil report suggests Manganese may be insufficient. Watch for yellowing between veins on young-to-middle leaves, often with brown speckling. If you notice these symptoms, open the Diagnosis feature. If it confirms the deficiency, follow the recommended plan.",
+    "Cu": "The soil report suggests Copper may be insufficient. Watch for wilting, curling, or dieback of young leaves and shoot tips. If you notice these symptoms, open the Diagnosis feature. If it confirms the deficiency, follow the recommended plan.",
+    "B":  "The soil report suggests Boron may be insufficient. Watch for hollow or cracked stems, death of growing points, or poor flower/fruit set. If you notice these symptoms, open the Diagnosis feature. If it confirms the deficiency, follow the recommended plan.",
+}
+
+
+def compute_baseline_per_nutrient(
+    contributions: list[PracticeNutrientContribution],
+) -> BaselineComputation:
+    """Sum each Practice's nutrient contributions into Package-level
+    baselines. Returns kg of elemental nutrient per acre, keyed by
+    the nutrient letter (N / P / K / Ca / Mg / S / Zn / Fe / Mn /
+    Cu / B).
+
+    Agronomist-confirmed (2026-10-22): summing per-nutrient
+    contributions across all Practices equals the SE's prescribed
+    total for the crop.
+    """
+    totals: dict[str, float] = {}
+    for c in contributions:
+        for nut, amount in c.contributions.items():
+            if amount == 0.0:
+                continue
+            totals[nut] = totals.get(nut, 0.0) + amount
+    return BaselineComputation(per_nutrient=totals)
+
+
+def compute_tier0_plan(
+    contributions: list[PracticeNutrientContribution],
+    baseline: BaselineComputation,
+    adjustments: list[TargetAdjustment],
+) -> list[Tier0Adjustment]:
+    """For each actionable Decision V adjustment, distribute the
+    delta proportionally across all baseline Practices that carry
+    that nutrient. Past-acknowledged Practices are skipped and their
+    share is NOT redistributed (Decision H — over-application harms
+    the crop + soil, so the farmer loses that share for this season).
+
+    Agronomist-confirmed worked example (2026-10-22):
+      Baseline 10 kg Basal + 5 kg Top-dress N = 15 kg total
+      Low N +20% → delta 3 kg → proportional +2 Basal, +1 Top-dress
+      Final: Basal 12, Top-dress 6. If Basal already applied:
+      Basal frozen at 10, Top-dress stays at 6 (no +2 redistribution).
+    """
+    # Pick actionable adjustments only.
+    adj_by_letter: dict[str, TargetAdjustment] = {}
+    for adj in adjustments:
+        letter = _PARAM_NAME_TO_NUTRIENT_FULL.get(adj.parameter_name)
+        if letter is None:
+            continue
+        if adj.classification not in (Classification.LOW, Classification.HIGH):
+            continue
+        if adj.pct is None or adj.pct == 0.0:
+            continue
+        adj_by_letter[letter] = adj
+
+    out: list[Tier0Adjustment] = []
+    for letter, adj in adj_by_letter.items():
+        baseline_total = baseline.per_nutrient.get(letter, 0.0)
+        if baseline_total == 0.0:
+            # Gap case — handled by compute_gap_instructions, not Tier 0.
+            continue
+        # Decision V: the % lands on the summed baseline.
+        delta_total = baseline_total * ((adj.pct or 0.0) / 100.0)
+        for c in contributions:
+            share = c.contributions.get(letter, 0.0)
+            if share == 0.0:
+                continue
+            # Proportional slice.
+            per_practice_delta = delta_total * (share / baseline_total)
+            scaled = share + per_practice_delta
+            if c.is_acknowledged:
+                applied = share
+                skipped = "past-acknowledged"
+            else:
+                applied = scaled
+                skipped = None
+            out.append(Tier0Adjustment(
+                practice_id=c.practice_id,
+                timeline_name=c.timeline_name,
+                nutrient=letter,
+                original_kg_per_acre=share,
+                scaled_kg_per_acre=scaled,
+                applied_kg_per_acre=applied,
+                skipped_reason=skipped,
+            ))
+    return out
+
+
+def compute_gap_instructions(
+    adjustments: list[TargetAdjustment],
+    baseline: BaselineComputation,
+    first_future_timeline_id: Optional[str],
+    first_future_timeline_name: Optional[str],
+) -> list[GapInstruction]:
+    """For each nutrient classified LOW with zero baseline (no
+    Practice in the Package carries it), emit a GapInstruction with
+    the agronomist's nutrient-specific message. One Instruction per
+    deficient nutrient. HIGH gap cases are skipped (no Practice =
+    no over-application risk).
+
+    `first_future_timeline_id` + name come from the caller — the
+    earliest Timeline whose from_days > the soil-report-submission
+    DAS. The engine positions the Instruction here so the farmer
+    sees it on their next advisory cycle. May be None if the
+    Package has no future Timelines (surface a warning in Section 6)."""
+    out: list[GapInstruction] = []
+    for adj in adjustments:
+        letter = _PARAM_NAME_TO_NUTRIENT_FULL.get(adj.parameter_name)
+        if letter is None:
+            continue
+        if adj.classification != Classification.LOW:
+            continue
+        if baseline.per_nutrient.get(letter, 0.0) != 0.0:
+            continue
+        message = _GAP_INSTRUCTION_MESSAGES.get(letter)
+        if message is None:
+            continue
+        out.append(GapInstruction(
+            nutrient=letter,
+            nutrient_name=_NUTRIENT_LETTER_TO_NAME.get(letter, letter),
+            message=message,
+            place_on_timeline_id=first_future_timeline_id,
+            place_on_timeline_name=first_future_timeline_name,
+        ))
+    return out
 
 
 def rank_candidates(
