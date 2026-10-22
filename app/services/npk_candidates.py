@@ -195,11 +195,20 @@ async def load_fertiliser_candidates(
             continue
         acc[cn_id][letter] = pct
 
-    # Fertigation gate (spec §5.1). Only common names with at least one
-    # approved trade name in `npk_fertigation_products` survive.
-    fertigation_pool: Optional[set[str]] = None
-    if fertigation:
-        fertigation_pool = await load_fertigation_approved_common_name_ids(db)
+    # Fertigation-approved pool — ALWAYS computed, not just when the
+    # caller is filtering. Two consumers care about this pool:
+    #   1. The `fertigation=True` gate (drops non-fertigation-approved
+    #      candidates from the output).
+    #   2. The `water_soluble` flag on each returned Candidate — which
+    #      downstream surfaces (Mock Section 4 Product Reference, SA
+    #      Portal Fallback Catalogue picker chip, Dealer npk-select PWA
+    #      chip) render as "· water-soluble" / badge.
+    # Previously the pool was computed only when `fertigation=True`,
+    # and `water_soluble` defaulted to True for every candidate when
+    # the caller passed `fertigation=False` — producing "water-soluble"
+    # labels on every single row across all consumers. Caught 2026-10-22
+    # during Mock walkthrough on Sunflower_Fertilizer P1.
+    fertigation_pool = await load_fertigation_approved_common_name_ids(db)
 
     candidates: list[Candidate] = []
     skipped_common_names = 0
@@ -212,7 +221,7 @@ async def load_fertiliser_candidates(
         if cn_core is None:
             skipped_common_names += 1
             continue
-        if fertigation_pool is not None and cn_id not in fertigation_pool:
+        if fertigation and cn_id not in fertigation_pool:
             # Not a Cosh gap — intentional water-soluble filter. Don't
             # count toward skipped (the diagnostic is about missing data,
             # not about the spec's filter).
@@ -223,11 +232,10 @@ async def load_fertiliser_candidates(
             concentration=Concentration(
                 n=vals["N"], p=vals["P"], k=vals["K"],
             ),
-            # water_soluble is now a derived attribute on Candidate that
-            # mirrors the filter we just applied. Kept for downstream
-            # surfaces (e.g. PWA chip) until the broader brand-side
-            # water-soluble flag arrives.
-            water_soluble=fertigation_pool is None or cn_id in fertigation_pool,
+            # Accurate per-candidate flag — reflects whether this
+            # common_name has at least one fertigation-approved trade
+            # name registered in Cosh.
+            water_soluble=cn_id in fertigation_pool,
         ))
 
     return candidates, skipped + skipped_common_names
