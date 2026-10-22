@@ -426,6 +426,13 @@ async def _parse_package_contributions(
         contrib: dict[str, float] = {}
         display_label = f"{pr.l2_type}"
 
+        # APPLICATION_METHOD is present on both DOSAGES and PRODUCTS
+        # Practices; resolve upfront so both branches can carry it on
+        # the PracticeNutrientContribution for the engine's Product
+        # Reference filter.
+        app_method_cosh = (by_type.get("APPLICATION_METHOD") or Element()).cosh_ref
+        app_method_name = _cosh_name(app_method_cosh)
+
         if pr.l2_type in _NUTRITION_DOSAGE_L2S:
             # Nutrient-quantity Practice — read N/P/K directly.
             n = _parse_float((by_type.get("N_DOSAGE") or Element()).value)
@@ -457,9 +464,7 @@ async def _parse_package_contributions(
             common_name_cosh = (by_type.get("COMMON_NAME") or Element()).cosh_ref
             dosage = _parse_float((by_type.get("DOSAGE") or Element()).value)
             dosage_unit_cosh = (by_type.get("DOSAGE_UNIT") or Element()).cosh_ref
-            app_method_cosh = (by_type.get("APPLICATION_METHOD") or Element()).cosh_ref
             dosage_unit_name = _cosh_name(dosage_unit_cosh)
-            app_method_name = _cosh_name(app_method_cosh)
             product_name = _cosh_name(common_name_cosh)
 
             # Foliar conversion — g/L → kg/acre via the 200 L/acre spray
@@ -508,6 +513,7 @@ async def _parse_package_contributions(
             display_label=display_label,
             is_acknowledged=False,  # Mock mode — no subscription
             contributions=contrib,
+            application_method=app_method_name,
         ))
 
     return contributions, uncomputable, first_future_tl_id, first_future_tl_name

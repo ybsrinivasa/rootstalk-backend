@@ -154,6 +154,13 @@ class PracticeNutrientContribution:
     display_label: str        # for Mock rendering, e.g. "Urea 9 kg/acre @ DAS 38–42"
     is_acknowledged: bool     # Decision H past-ack skip; Mock sets False
     contributions: dict[str, float]  # nutrient_letter → kg/acre
+    # Cosh name of the APPLICATION_METHOD Element on the Practice
+    # (e.g., "Direct Soil Application", "Foliar Spray"). Used by the
+    # Product Reference ranking to filter candidates to the ones the SE
+    # could actually swap in — a foliar Practice must only reference
+    # water-soluble products. Empty string when no APPLICATION_METHOD
+    # was authored.
+    application_method: str = ""
 
 
 @dataclass(frozen=True)
@@ -669,6 +676,41 @@ def _section_rules_applied(
     )
 
 
+def _render_product_reference_tiers(
+    parts: list[str],
+    r: "RankedCandidates",
+    *,
+    filter_label: Optional[str] = None,
+    water_soluble_only: bool = False,
+) -> None:
+    """Render one Tier 1 / 2 / 3 block for a nutrient's Product Reference.
+    When `water_soluble_only=True`, drops non-water-soluble candidates
+    (used for Foliar Practice contexts)."""
+    if filter_label:
+        parts.append(filter_label)
+    for tier_name, tier_rows in (
+        ("Tier 1 — Client's Global Product List", r.tier1),
+        ("Tier 2 — Fallback Catalogue", r.tier2),
+        ("Tier 3 — Pure straights", r.tier3),
+    ):
+        parts.append(f"**{tier_name}**")
+        rows_in_scope = (
+            [c for c in tier_rows if c.water_soluble]
+            if water_soluble_only else list(tier_rows)
+        )
+        if not rows_in_scope:
+            parts.append(
+                "- _No water-soluble candidate available at this tier._"
+                if water_soluble_only
+                else "- _No candidate available at this tier._"
+            )
+            continue
+        for c in rows_in_scope[:5]:
+            conc = {"N": c.n, "P": c.p, "K": c.k}[r.nutrient]
+            extra = " · water-soluble" if c.water_soluble else ""
+            parts.append(f"- {c.name} — {r.nutrient}: {_fmt_num(conc)}{extra}")
+
+
 def _section_personalised_plan(
     rankings: list[RankedCandidates],
     contributions: list[PracticeNutrientContribution],
@@ -757,26 +799,43 @@ def _section_personalised_plan(
             parts.append("")
 
     # ── Candidate ranking (informational / reference) ──
+    # Filtered per nutrient by the APPLICATION_METHOD(s) the SE
+    # authored on their Package's Practices for that nutrient — so a
+    # Foliar Practice only sees water-soluble swap candidates, matching
+    # the agronomist's "focus on the SE's authored baseline" principle
+    # (2026-10-22).
     if rankings:
+        app_methods_by_nutrient: dict[str, set[str]] = {}
+        for c in contributions:
+            if not c.application_method:
+                continue
+            for nut in c.contributions:
+                app_methods_by_nutrient.setdefault(nut, set()).add(c.application_method)
+
         parts.append("### Product reference — ranked candidates\n")
-        parts.append("_Informational: if the SE wants to swap a product, these are the ranked options by nutrient concentration. The Tier 0 plan above already handles scaling of existing Practices._\n")
+        parts.append("_Informational: if the SE wants to swap a product, these are the ranked options by nutrient concentration. Candidates are filtered by the application method on the SE's authored Practice(s) for each nutrient._\n")
         for r in rankings:
             label = {"N": "Nitrogen (N)", "P": "Phosphorus (P₂O₅)",
                      "K": "Potassium (K₂O)"}[r.nutrient]
             parts.append(f"#### {label}")
-            for tier_name, tier_rows in (
-                ("Tier 1 — Client's Global Product List", r.tier1),
-                ("Tier 2 — Fallback Catalogue", r.tier2),
-                ("Tier 3 — Pure straights", r.tier3),
-            ):
-                parts.append(f"**{tier_name}**")
-                if not tier_rows:
-                    parts.append("- _No candidate available at this tier._")
-                    continue
-                for c in tier_rows[:5]:
-                    conc = {"N": c.n, "P": c.p, "K": c.k}[r.nutrient]
-                    extra = " · water-soluble" if c.water_soluble else ""
-                    parts.append(f"- {c.name} — {r.nutrient}: {_fmt_num(conc)}{extra}")
+            methods = sorted(app_methods_by_nutrient.get(r.nutrient, set()))
+            if not methods:
+                # No Package Practice carries this nutrient (gap case) —
+                # show all candidates unfiltered; SE will decide method
+                # when authoring any new Practice.
+                _render_product_reference_tiers(parts, r, filter_label=None)
+            else:
+                for method in methods:
+                    is_foliar = "foliar" in method.lower()
+                    filter_label = (
+                        f"**For {method} (water-soluble only)**"
+                        if is_foliar
+                        else f"**For {method}**"
+                    )
+                    _render_product_reference_tiers(
+                        parts, r, filter_label=filter_label,
+                        water_soluble_only=is_foliar,
+                    )
 
     return DecisionReportSection(
         heading="Personalised Plan",
