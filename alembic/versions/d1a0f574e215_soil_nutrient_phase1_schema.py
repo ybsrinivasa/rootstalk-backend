@@ -38,7 +38,13 @@ import sqlalchemy as sa
 
 
 revision: str = 'd1a0f574e215'
-down_revision: Union[str, Sequence[str], None] = 'c8b4d7f2e691'
+# prod-safe-soil-2026-10-22: re-root the soil chain so it chains OFF
+# the current prod coaching tip (e7b8c592d104, workspace snapshot url)
+# instead of the pre-coaching c8b4d7f2e691. This lets `alembic upgrade
+# head` apply the full soil chain forward on prod, which currently has
+# e7b8c592d104 as its alembic_version. On main the original value
+# c8b4d7f2e691 stays; this edit is prod-safe-soil-only.
+down_revision: Union[str, Sequence[str], None] = 'e7b8c592d104'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

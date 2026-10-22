@@ -25,7 +25,11 @@ import sqlalchemy as sa
 
 
 revision: str = 'f8c3b9174e05'
-down_revision: Union[str, Sequence[str], None] = 'e7b8c592d104'
+# prod-safe-soil-2026-10-22: chain Phase 6a onto soil Phase 4
+# (d5d3f574e218) now that soil Phases 1–4 are re-rooted off the
+# current prod coaching tip. On main the original value
+# e7b8c592d104 stays; this edit is prod-safe-soil-only.
+down_revision: Union[str, Sequence[str], None] = 'd5d3f574e218'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

@@ -28,7 +28,13 @@ import sqlalchemy as sa
 
 
 revision: str = 'e6a7b4c13f29'
-down_revision: Union[str, Sequence[str], None] = 'd5d3f574e218'
+# prod-safe-soil-2026-10-22: this migration shipped to prod on
+# prod-safe-2026-10-18 with down_revision=c8b4d7f2e691 (soil skipped).
+# To keep the actual applied history consistent and let the soil
+# chain apply forward from the current prod head, we re-root the
+# soil chain OFF this branch (see d1a0f574e215.down_revision below).
+# e6a7b4c13f29 therefore matches its prod-applied ancestor.
+down_revision: Union[str, Sequence[str], None] = 'c8b4d7f2e691'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
