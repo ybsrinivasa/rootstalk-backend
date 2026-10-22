@@ -671,31 +671,113 @@ def _section_rules_applied(
 
 def _section_personalised_plan(
     rankings: list[RankedCandidates],
+    contributions: list[PracticeNutrientContribution],
+    baseline: BaselineComputation,
+    adjustments: list[TargetAdjustment],
+    tier0_plan: list[Tier0Adjustment],
+    gap_instructions: list[GapInstruction],
 ) -> DecisionReportSection:
+    """Section 4 rewritten for Phase 8: baseline + target table →
+    Tier 0 proposed Practice modifications → gap-case Instructions
+    → candidate-ranking reference (now informational, not primary)."""
     header = "## 4. Personalised Plan\n\n"
-    if not rankings:
-        return DecisionReportSection(
-            heading="Personalised Plan",
-            body_md=header + "_No NPK adjustment required for this soil._",
-        )
-    parts = []
-    for r in rankings:
-        label = {"N": "Nitrogen (N)", "P": "Phosphorus (P₂O₅)",
-                 "K": "Potassium (K₂O)"}[r.nutrient]
-        parts.append(f"### {label}\n")
-        for tier_name, tier_rows in (
-            ("Tier 1 — Client's Global Product List", r.tier1),
-            ("Tier 2 — Fallback Catalogue", r.tier2),
-            ("Tier 3 — Pure straights", r.tier3),
-        ):
-            parts.append(f"**{tier_name}**")
-            if not tier_rows:
-                parts.append("- _No candidate available at this tier._")
-                continue
-            for c in tier_rows[:5]:  # top 5 per tier
-                conc = {"N": c.n, "P": c.p, "K": c.k}[r.nutrient]
-                extra = " · water-soluble" if c.water_soluble else ""
-                parts.append(f"- {c.name} — {r.nutrient}: {_fmt_num(conc)}{extra}")
+    parts: list[str] = []
+
+    # ── Baseline + Target table ──
+    adj_by_letter: dict[str, TargetAdjustment] = {}
+    for adj in adjustments:
+        letter = _PARAM_NAME_TO_NUTRIENT_FULL.get(adj.parameter_name)
+        if letter and adj.classification in (Classification.LOW, Classification.HIGH):
+            adj_by_letter[letter] = adj
+
+    nutrients_in_scope = sorted(
+        set(baseline.per_nutrient.keys()) | set(adj_by_letter.keys()),
+        key=lambda letter: list(_NUTRIENT_LETTER_TO_NAME.keys()).index(letter)
+            if letter in _NUTRIENT_LETTER_TO_NAME else 999,
+    )
+    if nutrients_in_scope:
+        parts.append("### Baseline + Target\n")
+        parts.append("| Nutrient | Baseline (kg/acre) | Shift | Target (kg/acre) | Delta |")
+        parts.append("|---|---:|---:|---:|---:|")
+        for letter in nutrients_in_scope:
+            name = _NUTRIENT_LETTER_TO_NAME.get(letter, letter)
+            base = baseline.per_nutrient.get(letter, 0.0)
+            adj = adj_by_letter.get(letter)
+            if adj is None or adj.pct is None or adj.pct == 0.0:
+                shift_txt = "—"
+                target = base
+                delta = 0.0
+            else:
+                shift_txt = f"{'+' if adj.pct > 0 else ''}{adj.pct:g}%"
+                target = base * (1 + adj.pct / 100.0)
+                delta = target - base
+            parts.append(
+                f"| {name} | {_fmt_num(base)} | {shift_txt} | "
+                f"{_fmt_num(target)} | {('+' if delta > 0 else '') + _fmt_num(delta)} |"
+            )
+        parts.append("")
+
+    # ── Tier 0 — Scaling existing Practices ──
+    if tier0_plan:
+        parts.append("### Tier 0 — Scaling existing Practices\n")
+        # Group by nutrient for readability.
+        by_nutrient: dict[str, list[Tier0Adjustment]] = {}
+        for t in tier0_plan:
+            by_nutrient.setdefault(t.nutrient, []).append(t)
+        contrib_label_by_id = {c.practice_id: (c.display_label, c.timeline_name)
+                               for c in contributions}
+        for letter in [l for l in _NUTRIENT_LETTER_TO_NAME if l in by_nutrient]:
+            items = by_nutrient[letter]
+            name = _NUTRIENT_LETTER_TO_NAME.get(letter, letter)
+            parts.append(f"**{name} ({letter})**")
+            for t in items:
+                label, tl_name = contrib_label_by_id.get(
+                    t.practice_id, (t.practice_id, t.timeline_name))
+                arrow = f"{_fmt_num(t.original_kg_per_acre)} → {_fmt_num(t.applied_kg_per_acre)} kg/acre"
+                if t.skipped_reason == "past-acknowledged":
+                    note = f" _(frozen — already applied; scaled target would have been {_fmt_num(t.scaled_kg_per_acre)})_"
+                else:
+                    pct_change = ((t.applied_kg_per_acre - t.original_kg_per_acre) / t.original_kg_per_acre * 100
+                                  if t.original_kg_per_acre else 0.0)
+                    note = f" (**{'+' if pct_change >= 0 else ''}{pct_change:.1f}%**)"
+                parts.append(f"- [{tl_name}] {label}: {letter} {arrow}{note}")
+            parts.append("")
+    else:
+        parts.append("_No Tier 0 adjustments — either no nutrient needs scaling, or no existing Practice carries the deficient nutrient (see Instructions below)._\n")
+
+    # ── Gap-case Instructions ──
+    if gap_instructions:
+        parts.append("### New Instructions — nutrients without an existing Practice\n")
+        for g in gap_instructions:
+            where = (f"**first-future Timeline: {g.place_on_timeline_name}**"
+                     if g.place_on_timeline_name
+                     else "**no future Timeline available — see Section 6**")
+            parts.append(f"**{g.nutrient_name} ({g.nutrient})** → {where}")
+            parts.append(f"> {g.message}")
+            parts.append("")
+
+    # ── Candidate ranking (informational / reference) ──
+    if rankings:
+        parts.append("### Product reference — ranked candidates\n")
+        parts.append("_Informational: if the SE wants to swap a product, these are the ranked options by nutrient concentration. The Tier 0 plan above already handles scaling of existing Practices._\n")
+        for r in rankings:
+            label = {"N": "Nitrogen (N)", "P": "Phosphorus (P₂O₅)",
+                     "K": "Potassium (K₂O)"}[r.nutrient]
+            parts.append(f"#### {label}")
+            for tier_name, tier_rows in (
+                ("Tier 1 — Client's Global Product List", r.tier1),
+                ("Tier 2 — Fallback Catalogue", r.tier2),
+                ("Tier 3 — Pure straights", r.tier3),
+            ):
+                parts.append(f"**{tier_name}**")
+                if not tier_rows:
+                    parts.append("- _No candidate available at this tier._")
+                    continue
+                for c in tier_rows[:5]:
+                    conc = {"N": c.n, "P": c.p, "K": c.k}[r.nutrient]
+                    extra = " · water-soluble" if c.water_soluble else ""
+                    parts.append(f"- {c.name} — {r.nutrient}: {_fmt_num(conc)}{extra}")
+
     return DecisionReportSection(
         heading="Personalised Plan",
         body_md=header + "\n".join(parts),
@@ -722,6 +804,8 @@ def _section_warnings(
     classifications: list[ClassificationResult],
     adjustments: list[TargetAdjustment],
     rankings: list[RankedCandidates],
+    uncomputable_contributions: Optional[list[str]] = None,
+    gap_instructions: Optional[list[GapInstruction]] = None,
 ) -> DecisionReportSection:
     header = "## 6. Warnings & Metadata\n\n"
     lines = []
@@ -764,6 +848,32 @@ def _section_warnings(
             f"v1 engine shows the classification only — product ranking "
             f"for secondaries/micros lands with Decision C in a later phase."
         )
+    # Phase 8 — non-NPK Practices whose nutrient contributions couldn't
+    # be computed because Cosh's fert_nutrient_concentration Connect
+    # only covers N/P/K today. Surfaces every such Practice so the SE
+    # knows the baseline is incomplete for those nutrients.
+    if uncomputable_contributions:
+        lines.append(
+            f"- ℹ️ {len(uncomputable_contributions)} Practice(s) carry a "
+            f"non-NPK product whose nutrient contribution isn't in Cosh's "
+            f"concentration data yet, so they're excluded from the baseline. "
+            f"({'; '.join(uncomputable_contributions)}) "
+            f"Expand Cosh's `fert_nutrient_concentration` Connect to cover "
+            f"these commons, or author them into the Fallback Catalogue."
+        )
+    # Phase 8 — gap-case Instructions with no future Timeline to place on
+    # (Package has no Timeline after today's DAS). Surface so the SE
+    # knows to add a late-season Timeline or the Instructions silently
+    # drop.
+    if gap_instructions:
+        orphan_gaps = [g for g in gap_instructions
+                       if g.place_on_timeline_id is None]
+        if orphan_gaps:
+            lines.append(
+                f"- ⚠️ {len(orphan_gaps)} gap-case Instruction(s) couldn't be "
+                f"placed on any Timeline (no future Timelines exist on this "
+                f"Package): {', '.join(g.nutrient_name for g in orphan_gaps)}."
+            )
     if not lines:
         lines.append("- No warnings.")
     lines.append("")
@@ -790,8 +900,22 @@ def build_decision_report(
     classifications: list[ClassificationResult],
     adjustments: list[TargetAdjustment],
     rankings: list[RankedCandidates],
+    contributions: Optional[list[PracticeNutrientContribution]] = None,
+    baseline: Optional[BaselineComputation] = None,
+    tier0_plan: Optional[list[Tier0Adjustment]] = None,
+    gap_instructions: Optional[list[GapInstruction]] = None,
+    uncomputable_contributions: Optional[list[str]] = None,
 ) -> DecisionReport:
-    """Assemble the six-section Decision Report per Decision T."""
+    """Assemble the six-section Decision Report per Decision T.
+
+    Phase 8 extras (optional for backward compat; caller passes None for
+    the old-shape output): `contributions` (per-Practice nutrient
+    contributions), `baseline` (per-nutrient totals), `tier0_plan` (the
+    proposed proportional-scaling of existing Practices), and
+    `gap_instructions` (new INSTRUCTION Practices for Low nutrients with
+    no baseline). `uncomputable_contributions` is a list of human-
+    readable labels for Practices whose nutrient contribution couldn't
+    be computed (Cosh data gap)."""
     generated_at = datetime.now(timezone.utc)
     sections = [
         _section_summary(
@@ -801,12 +925,21 @@ def build_decision_report(
         ),
         _section_soil_interpretation(classifications),
         _section_rules_applied(adjustments),
-        _section_personalised_plan(rankings),
+        _section_personalised_plan(
+            rankings=rankings,
+            contributions=contributions or [],
+            baseline=baseline or BaselineComputation(per_nutrient={}),
+            adjustments=adjustments,
+            tier0_plan=tier0_plan or [],
+            gap_instructions=gap_instructions or [],
+        ),
         _section_advisory_text(),
         _section_warnings(
             is_mock=is_mock, generated_at=generated_at,
             classifications=classifications, adjustments=adjustments,
             rankings=rankings,
+            uncomputable_contributions=uncomputable_contributions,
+            gap_instructions=gap_instructions,
         ),
     ]
     return DecisionReport(
