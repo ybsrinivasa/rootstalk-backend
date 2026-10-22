@@ -33,7 +33,8 @@ from app.services.soil_nutrient_engine import (
     NormalRangeOperator, PracticeNutrientContribution, SoilValue,
     Tier0Adjustment,
     build_decision_report, classify_soil_values, compute_baseline_per_nutrient,
-    compute_gap_instructions, compute_target_adjustments, compute_tier0_plan,
+    compute_gap_instructions, compute_recommended_practices,
+    compute_target_adjustments, compute_tier0_plan,
     rank_candidates,
 )
 
@@ -294,6 +295,7 @@ async def run_mock(
     gap_instructions = compute_gap_instructions(
         adjustments, baseline, first_future_tl_id, first_future_tl_name,
     )
+    recommended_practices = compute_recommended_practices(contributions, tier0_plan)
 
     return build_decision_report(
         is_mock=True,
@@ -311,6 +313,7 @@ async def run_mock(
         baseline=baseline,
         tier0_plan=tier0_plan,
         gap_instructions=gap_instructions,
+        recommended_practices=recommended_practices,
         uncomputable_contributions=uncomputable,
     )
 
@@ -504,6 +507,18 @@ async def _parse_package_contributions(
                 f"{product_name} {_fmt(dosage)} {dosage_unit_name}{tail}".strip()
             )
 
+        # Baseline product shape — only PRODUCT L2 Practices carry a
+        # discrete product_name + product_dosage. DOSAGE L2 Practices
+        # scale by elemental numbers only; the engine's Recommended
+        # Practices renderer handles the two shapes separately.
+        rp_product_name = ""
+        rp_product_dosage = 0.0
+        rp_product_dosage_unit = ""
+        if pr.l2_type in _NUTRITION_PRODUCT_L2S:
+            rp_product_name = product_name
+            rp_product_dosage = dosage
+            rp_product_dosage_unit = dosage_unit_name
+
         contributions.append(PracticeNutrientContribution(
             practice_id=pr.id,
             timeline_id=pr.timeline_id,
@@ -514,6 +529,9 @@ async def _parse_package_contributions(
             is_acknowledged=False,  # Mock mode — no subscription
             contributions=contrib,
             application_method=app_method_name,
+            product_name=rp_product_name,
+            product_dosage=rp_product_dosage,
+            product_dosage_unit=rp_product_dosage_unit,
         ))
 
     return contributions, uncomputable, first_future_tl_id, first_future_tl_name

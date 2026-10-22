@@ -161,6 +161,16 @@ class PracticeNutrientContribution:
     # water-soluble products. Empty string when no APPLICATION_METHOD
     # was authored.
     application_method: str = ""
+    # Baseline product shape — populated only for PRODUCT L2 Practices
+    # (CHEMICAL_FERTILIZER_PRODUCTS, CHEMICAL_FERTILIZER_FERTIGATION_PRODUCTS).
+    # Lets Phase 8c reconstruct a Practice-shaped recommendation by
+    # scaling the product dosage, not just the elemental math. For
+    # foliar g/L Practices, `product_dosage` holds the ORIGINAL g/L
+    # value (not the derived kg/acre) so the recommendation renders
+    # in the farmer-facing unit the SE authored.
+    product_name: str = ""
+    product_dosage: float = 0.0
+    product_dosage_unit: str = ""
 
 
 @dataclass(frozen=True)
@@ -200,6 +210,25 @@ class GapInstruction:
     message: str        # the agronomist-signed-off templated text
     place_on_timeline_id: Optional[str]
     place_on_timeline_name: Optional[str]
+
+
+@dataclass(frozen=True)
+class RecommendedPractice:
+    """One Package Practice re-emitted in the SE's authored shape,
+    with per-nutrient quantities scaled per the Decision V %. Phase 8c.
+
+    One `PracticeNutrientContribution` → one `RecommendedPractice`.
+    `display_label` is already farmer-ready; the renderer groups by
+    Timeline.
+    """
+    source_practice_id: str
+    timeline_name: str
+    timeline_from_days: int
+    l2_type: str
+    application_method: str
+    is_frozen: bool              # past-ack: shape emitted unchanged
+    display_label: str
+    note: Optional[str] = None   # e.g., "frozen — past acknowledgement"
 
 
 @dataclass(frozen=True)
@@ -526,6 +555,122 @@ def compute_gap_instructions(
     return out
 
 
+# Rounding — farmer-friendly precision per unit. Agronomist can tune later.
+def _round_kg(v: float) -> float:
+    return round(v)
+
+def _round_gl(v: float) -> float:
+    return round(v, 1)
+
+def _round_product_kg(v: float) -> float:
+    # Nearest 0.5 kg for product dosages (easier to measure in the field).
+    return round(v * 2) / 2
+
+
+def compute_recommended_practices(
+    contributions: list[PracticeNutrientContribution],
+    tier0_plan: list[Tier0Adjustment],
+) -> list[RecommendedPractice]:
+    """Materialise the Tier 0 abstract deltas into actual Practice-shaped
+    recommendations that mirror the SE's authored baseline — same L2
+    type, same APPLICATION_METHOD, same Timeline, same product, with
+    numbers scaled per the Decision V % (Phase 8c).
+
+    DOSAGE L2:  per-nutrient numbers scaled directly from Tier 0.
+    PRODUCT L2: product quantity scaled by the dominant-nutrient ratio
+                (new_elemental / old_elemental). Foliar g/L stays in
+                g/L (the SE's authored unit); the Tier 0 math already
+                lives in kg/acre-equivalent.
+    Past-ack frozen: shape emitted unchanged, flagged with a note.
+    """
+    # Index Tier 0 applied values: (practice_id, nutrient) → applied kg/acre.
+    applied_by_key: dict[tuple[str, str], float] = {}
+    frozen_practices: set[str] = set()
+    for t in tier0_plan:
+        applied_by_key[(t.practice_id, t.nutrient)] = t.applied_kg_per_acre
+        if t.skipped_reason == "past-acknowledged":
+            frozen_practices.add(t.practice_id)
+
+    out: list[RecommendedPractice] = []
+    for c in contributions:
+        if not c.contributions:
+            continue
+
+        is_frozen = c.is_acknowledged or c.practice_id in frozen_practices
+        note = "frozen — already applied" if is_frozen else None
+
+        # New per-nutrient values: Tier 0 applied if adjusted, else original.
+        new_per_nut: dict[str, float] = {}
+        for nut, original in c.contributions.items():
+            new_per_nut[nut] = applied_by_key.get(
+                (c.practice_id, nut), original
+            )
+
+        method_tail = f" · {c.application_method}" if c.application_method else ""
+
+        if c.l2_type in ("CHEMICAL_FERTILIZERS_NPK_DOSAGES", "FERTIGATION_NPK_DOSAGES"):
+            # Nutrient-quantity Practice — the Decision V scaled values
+            # ARE the recommendation. Preserve the N/P/K layout.
+            label_prefix = (
+                "Fertigation nutrient dosages"
+                if c.l2_type == "FERTIGATION_NPK_DOSAGES"
+                else "Nutrient dosages"
+            )
+            pieces: list[str] = []
+            for letter in ("N", "P", "K"):
+                v = new_per_nut.get(letter, 0.0)
+                if v == 0.0 and c.contributions.get(letter, 0.0) == 0.0:
+                    continue
+                pieces.append(f"{letter} {_fmt_num(_round_kg(v))}")
+            body = f"{label_prefix} ({', '.join(pieces)} kg/acre)" if pieces else label_prefix
+            display = f"{body}{method_tail}"
+
+        else:
+            # PRODUCT L2 — scale the product dosage by the dominant
+            # nutrient's ratio. "Dominant" = the one with the largest
+            # original elemental contribution.
+            dominant = max(
+                c.contributions.items(),
+                key=lambda kv: kv[1],
+                default=(None, 0.0),
+            )
+            dominant_nut, original_kg = dominant
+            if (
+                not c.product_name
+                or c.product_dosage == 0.0
+                or dominant_nut is None
+                or original_kg == 0.0
+            ):
+                # Can't reconstruct a scaled product dosage; fall back
+                # to the SE's original authored label.
+                display = (
+                    f"{c.product_name or c.display_label} "
+                    f"{_fmt_num(c.product_dosage)} {c.product_dosage_unit}"
+                    f"{method_tail}"
+                ).strip()
+            else:
+                scale = new_per_nut.get(dominant_nut, original_kg) / original_kg
+                scaled_dosage = c.product_dosage * scale
+                unit = c.product_dosage_unit or ""
+                if "g/l" in unit.lower():
+                    dosage_txt = _fmt_num(_round_gl(scaled_dosage))
+                else:
+                    dosage_txt = _fmt_num(_round_product_kg(scaled_dosage))
+                display = f"{c.product_name} {dosage_txt} {unit}{method_tail}".strip()
+
+        out.append(RecommendedPractice(
+            source_practice_id=c.practice_id,
+            timeline_name=c.timeline_name,
+            timeline_from_days=c.timeline_from_days,
+            l2_type=c.l2_type,
+            application_method=c.application_method,
+            is_frozen=is_frozen,
+            display_label=display,
+            note=note,
+        ))
+    return out
+
+
 def rank_candidates(
     adjustments: list[TargetAdjustment],
     candidates: list[CandidateProduct],
@@ -718,6 +863,7 @@ def _section_personalised_plan(
     adjustments: list[TargetAdjustment],
     tier0_plan: list[Tier0Adjustment],
     gap_instructions: list[GapInstruction],
+    recommended_practices: Optional[list[RecommendedPractice]] = None,
 ) -> DecisionReportSection:
     """Section 4 rewritten for Phase 8: baseline + target table →
     Tier 0 proposed Practice modifications → gap-case Instructions
@@ -786,6 +932,29 @@ def _section_personalised_plan(
             parts.append("")
     else:
         parts.append("_No Tier 0 adjustments — either no nutrient needs scaling, or no existing Practice carries the deficient nutrient (see Instructions below)._\n")
+
+    # ── Recommended Practices — the Tier 0 math reassembled into the ──
+    # SE's authored Practice shape (same L2, same APPLICATION_METHOD,
+    # same Timeline, same product) with scaled quantities. This is what
+    # the farmer sees as the actual recommendation; the Tier 0 block
+    # above is the scaling trace behind it.
+    if recommended_practices:
+        parts.append("### Recommended Practices\n")
+        parts.append(
+            "_Based on the SE's authored baseline, scaled to meet the "
+            "per-nutrient targets above. Shape, product, Timeline, and "
+            "application method mirror the original Practice._\n"
+        )
+        # Group by Timeline (earliest first).
+        by_tl: dict[tuple[int, str], list[RecommendedPractice]] = {}
+        for rp in recommended_practices:
+            by_tl.setdefault((rp.timeline_from_days, rp.timeline_name), []).append(rp)
+        for (_, tl_name) in sorted(by_tl.keys()):
+            parts.append(f"**{tl_name}**")
+            for rp in by_tl[(_, tl_name)]:
+                note_tail = f" _({rp.note})_" if rp.note else ""
+                parts.append(f"- {rp.display_label}{note_tail}")
+            parts.append("")
 
     # ── Gap-case Instructions ──
     if gap_instructions:
@@ -963,6 +1132,7 @@ def build_decision_report(
     baseline: Optional[BaselineComputation] = None,
     tier0_plan: Optional[list[Tier0Adjustment]] = None,
     gap_instructions: Optional[list[GapInstruction]] = None,
+    recommended_practices: Optional[list[RecommendedPractice]] = None,
     uncomputable_contributions: Optional[list[str]] = None,
 ) -> DecisionReport:
     """Assemble the six-section Decision Report per Decision T.
@@ -991,6 +1161,7 @@ def build_decision_report(
             adjustments=adjustments,
             tier0_plan=tier0_plan or [],
             gap_instructions=gap_instructions or [],
+            recommended_practices=recommended_practices or [],
         ),
         _section_advisory_text(),
         _section_warnings(
