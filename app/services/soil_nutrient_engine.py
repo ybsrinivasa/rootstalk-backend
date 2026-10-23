@@ -388,15 +388,21 @@ _PARAM_NAME_TO_NUTRIENT = {
     "Available Nitrogen":    "N",
     "Available Phosphorous": "P",
     "Available Potash":      "K",
-    # Phase 8d (2026-10-23) — secondaries. Candidate ranking lights up
-    # for Ca/Mg/S the moment Cosh carries their concentrations.
-    # Products with Ca/Mg/S=0 simply fall out of the per-nutrient
-    # has_nut() filter and contribute nothing. Micros are intentionally
-    # NOT here yet (foliar-first, chelation, antagonisms — agronomist
-    # review needed before enabling candidate ranking for them).
+    # Phase 8d (2026-10-23) — secondaries.
     "Available Calcium":     "Ca",
     "Available Magnesium":   "Mg",
     "Available Sulphur":     "S",
+    # Phase 8e (2026-10-23) — micros. Agronomist-settled: foliar-first
+    # delivery, chelated form preferred (ranking boost in rank_candidates),
+    # full gram-scale precision (no g/plant or g/L rounding — SE
+    # authors e.g. 0.5 g/plant and that must survive the engine round-
+    # trip). Antagonism warnings (High P → Zn, High K → Mg, etc.) + tank-
+    # mixing warnings surfaced as separate Section 2 / Section 4 blocks.
+    "Available Zinc":        "Zn",
+    "Available Iron":        "Fe",
+    "Available Manganese":   "Mn",
+    "Available Copper":      "Cu",
+    "Available Boron":       "B",
 }
 
 
@@ -573,16 +579,20 @@ def compute_gap_instructions(
     return out
 
 
-# Rounding — farmer-friendly precision per unit. Agronomist can tune later.
+# Rounding — farmer-friendly precision per unit. Agronomist-settled
+# 2026-10-23: NO rounding at gram scale (g/plant, g/L, g/acre). SE may
+# legitimately author 0.5 g/plant; rounding to 1 g would be a terrible
+# mistake. Only kg-scale quantities get rounded (0.5 kg for products,
+# whole kg for DOSAGE N/P/K layouts).
 def _round_kg(v: float) -> float:
     return round(v)
-
-def _round_gl(v: float) -> float:
-    return round(v, 1)
 
 def _round_product_kg(v: float) -> float:
     # Nearest 0.5 kg for product dosages (easier to measure in the field).
     return round(v * 2) / 2
+
+def _no_round(v: float) -> float:
+    return v
 
 
 def compute_recommended_practices(
@@ -670,10 +680,15 @@ def compute_recommended_practices(
                 scale = new_per_nut.get(dominant_nut, original_kg) / original_kg
                 scaled_dosage = c.product_dosage * scale
                 unit = c.product_dosage_unit or ""
-                if "g/l" in unit.lower():
-                    dosage_txt = _fmt_num(_round_gl(scaled_dosage))
-                else:
-                    dosage_txt = _fmt_num(_round_product_kg(scaled_dosage))
+                unit_l = unit.lower()
+                # Gram-scale dosages carry full precision (agronomist 2026-10-23).
+                is_gram_scale = ("g/plant" in unit_l or "g/l" in unit_l
+                                 or "g/acre" in unit_l)
+                dosage_txt = (
+                    _fmt_num(_no_round(scaled_dosage))
+                    if is_gram_scale
+                    else _fmt_num(_round_product_kg(scaled_dosage))
+                )
                 display = f"{c.product_name} {dosage_txt} {unit}{method_tail}".strip()
 
         out.append(RecommendedPractice(
@@ -696,6 +711,21 @@ _NUTRIENT_LETTER_TO_ATTR = {
     "Ca": "ca", "Mg": "mg", "S":  "s",
     "Zn": "zn", "Fe": "fe", "Mn": "mn", "Cu": "cu", "B": "b",
 }
+
+# Micros for which chelated form is agronomically preferred (plant-
+# availability advantage). Boron is intentionally NOT in this set —
+# standard sodium borate / boric acid formulations are fine, and
+# chelated boron isn't a standard product. Settled 2026-10-23.
+_CHELATED_PREFERRED_MICROS = {"Zn", "Fe", "Mn", "Cu"}
+
+# Common-name substrings that mark a candidate as chelated. Any match
+# (case-insensitive) qualifies the candidate for the chelated boost.
+_CHELATION_MARKERS = ("chelat", "edta", "eddha", "dtpa", "lignosulph")
+
+
+def _is_chelated(candidate_name: str) -> bool:
+    n = candidate_name.lower()
+    return any(m in n for m in _CHELATION_MARKERS)
 
 
 def rank_candidates(
@@ -734,10 +764,23 @@ def rank_candidates(
         def conc(c: CandidateProduct, _attr: str = attr) -> float:
             return getattr(c, _attr)
 
+        # Chelated preference for micros where chelation is agronomically
+        # relevant (Zn/Fe/Mn/Cu — not B). Chelated candidates sort above
+        # inorganic within the same tier; within the chelated group, by
+        # concentration; within the non-chelated group, by concentration.
+        prefer_chelated = nut in _CHELATED_PREFERRED_MICROS
+
+        def sort_key(c: CandidateProduct, _conc=conc) -> tuple[int, float]:
+            # Negate concentration so sorted(reverse=True) → high conc first,
+            # and higher chelated-rank also comes first.
+            if prefer_chelated:
+                return (1 if _is_chelated(c.name) else 0, _conc(c))
+            return (0, _conc(c))
+
         in_scope = [c for c in candidates if conc(c) > 0]
-        tier1 = sorted((c for c in in_scope if c.tier == 1), key=conc, reverse=True)
-        tier2 = sorted((c for c in in_scope if c.tier == 2), key=conc, reverse=True)
-        tier3 = sorted((c for c in in_scope if c.tier == 3), key=conc, reverse=True)
+        tier1 = sorted((c for c in in_scope if c.tier == 1), key=sort_key, reverse=True)
+        tier2 = sorted((c for c in in_scope if c.tier == 2), key=sort_key, reverse=True)
+        tier3 = sorted((c for c in in_scope if c.tier == 3), key=sort_key, reverse=True)
         out.append(RankedCandidates(
             nutrient=nut, tier1=tier1, tier2=tier2, tier3=tier3,
         ))
@@ -812,10 +855,170 @@ def _section_soil_interpretation(
             f"| {_classification_label(c.classification)} "
             f"| {c.range_source or '—'} |"
         )
+    body = "\n".join(rows)
+
+    # ── Antagonism warnings (Phase 8e, 2026-10-23) ──
+    # When nutrient A is High (or an existing imbalance), nutrient B's
+    # uptake may be suppressed even if B's own classification is Optimum.
+    # First-pass rule list — agronomist reviews + tunes.
+    antagonism = _compute_antagonism_warnings(classifications)
+    if antagonism:
+        body += "\n\n### Nutrient Interaction Warnings\n\n"
+        body += ("_Soil-level nutrient imbalances that may suppress uptake "
+                 "of other nutrients, even when their own classification is "
+                 "Optimum. Monitor the crop for the symptoms noted below._\n\n")
+        for line in antagonism:
+            body += f"- {line}\n"
+
     return DecisionReportSection(
         heading="Soil Interpretation",
-        body_md=header + "\n".join(rows),
+        body_md=header + body,
     )
+
+
+# Agronomist-settled rule list (2026-10-23) — first pass; agronomist
+# will refine texts + add/remove pairs as needed. Each entry is:
+#   (antagonist_letter, antagonist_class, suppressed_letter, warning_text)
+# "antagonist_class" is the classification of the antagonist nutrient
+# that triggers the warning (currently all HIGH except Boron self-check).
+_ANTAGONISM_RULES: list[tuple[str, "Classification", str, str]] = []
+
+
+def _init_antagonism_rules() -> None:
+    """Deferred init so Classification enum is bound at call time."""
+    global _ANTAGONISM_RULES
+    if _ANTAGONISM_RULES:
+        return
+    _ANTAGONISM_RULES = [
+        ("P",  Classification.HIGH, "Zn",
+         "**High Phosphorus may suppress Zinc uptake.** Watch for Zn-deficiency "
+         "symptoms (small leaves, shortened internodes, bronzing on young growth) "
+         "even if the Zinc classification is Optimum."),
+        ("K",  Classification.HIGH, "Mg",
+         "**High Potassium may suppress Magnesium uptake.** Watch for Mg-deficiency "
+         "symptoms (interveinal chlorosis on older leaves)."),
+        ("Ca", Classification.HIGH, "Mg",
+         "**High Calcium may suppress Magnesium uptake.** Watch for Mg-deficiency "
+         "symptoms (interveinal chlorosis on older leaves)."),
+        ("Zn", Classification.HIGH, "Fe",
+         "**High Zinc may suppress Iron uptake.** Watch for Fe-deficiency "
+         "symptoms (interveinal chlorosis on young leaves with green veins)."),
+        ("Fe", Classification.HIGH, "Mn",
+         "**High Iron may suppress Manganese uptake.** Watch for Mn-deficiency "
+         "symptoms (interveinal chlorosis with distinctly green veins)."),
+        ("Mn", Classification.HIGH, "Fe",
+         "**High Manganese may suppress Iron uptake** (reciprocal of Fe→Mn). "
+         "Watch for Fe-deficiency symptoms on young leaves."),
+        ("Cu", Classification.HIGH, "Zn",
+         "**High Copper may suppress Zinc uptake.** Watch for Zn-deficiency "
+         "symptoms on young growth."),
+        ("Cu", Classification.HIGH, "Fe",
+         "**High Copper may also suppress Iron uptake.** Watch for chlorosis "
+         "on young leaves."),
+        ("B",  Classification.HIGH, "B",
+         "**Boron is already High — risk of Boron toxicity.** Boron has a narrow "
+         "sufficiency range. Avoid additional B application; monitor leaves "
+         "for marginal scorch / tip die-back."),
+    ]
+
+
+def _compute_antagonism_warnings(
+    classifications: list[ClassificationResult],
+) -> list[str]:
+    _init_antagonism_rules()
+    class_by_letter: dict[str, Classification] = {}
+    for c in classifications:
+        letter = _PARAM_NAME_TO_NUTRIENT_FULL.get(c.parameter_name)
+        if letter:
+            class_by_letter[letter] = c.classification
+    out: list[str] = []
+    for antagonist, antag_class, _suppressed, text in _ANTAGONISM_RULES:
+        if class_by_letter.get(antagonist) == antag_class:
+            out.append(text)
+    return out
+
+
+# Tank-mixing incompatibility rules (Phase 8e, 2026-10-23). First-pass
+# agronomist-reviewable list. Each rule looks at pairs of Recommended
+# Practices placed on the same Timeline and matches on (nutrient_a,
+# nutrient_b) carried by distinct products, OR on specific product-name
+# patterns where chemistry demands it.
+_MIXING_PAIR_RULES: list[tuple[str, str, str]] = [
+    # (nutrient_a_letter, nutrient_b_letter, warning_text)
+    ("Ca", "S",
+     "**Calcium + Sulphur in the same application can precipitate as "
+     "gypsum**, reducing nutrient availability. Apply on different days "
+     "or use different Timelines."),
+    ("Ca", "P",
+     "**Calcium + Phosphorus in the same application can precipitate as "
+     "calcium phosphate**, locking up both nutrients. Apply on different "
+     "days or use different Timelines."),
+    ("Mg", "P",
+     "**Magnesium + Phosphorus at high rates may precipitate.** Monitor "
+     "crop response if applying together."),
+]
+
+# Product-name-specific incompatibilities — fire when both patterns are
+# present in the same Timeline, regardless of elemental overlap.
+_MIXING_PRODUCT_RULES: list[tuple[str, str, str]] = [
+    # (pattern_a_lower, pattern_b_lower, warning_text)
+    ("mop",   "ca",
+     "**Potassium chloride (MOP) + Calcium can precipitate.** Use "
+     "potassium sulphate (SOP) instead if Calcium is being applied in "
+     "the same Timeline."),
+    ("eddha", "p",
+     "**EDDHA Iron chelate loses stability in high-phosphate conditions.** "
+     "Separate the applications."),
+]
+
+
+def _compute_mixing_warnings(
+    recommended_practices: list[RecommendedPractice],
+    contributions: list[PracticeNutrientContribution],
+) -> list[str]:
+    # Group contributions by (practice_id, timeline_name) so we can look
+    # up the nutrient set carried by each Recommended Practice.
+    nut_by_pid: dict[str, set[str]] = {}
+    for c in contributions:
+        if c.practice_id not in nut_by_pid:
+            nut_by_pid[c.practice_id] = set()
+        nut_by_pid[c.practice_id].update(c.contributions.keys())
+
+    # Group Recommended Practices by Timeline — mixing concerns only
+    # apply when two products are applied together.
+    by_tl: dict[str, list[RecommendedPractice]] = {}
+    for rp in recommended_practices:
+        by_tl.setdefault(rp.timeline_name, []).append(rp)
+
+    warnings_seen: set[str] = set()  # dedupe identical warning texts
+    out: list[str] = []
+    for tl_name, rps in by_tl.items():
+        if len(rps) < 2:
+            continue
+        for i, rp_a in enumerate(rps):
+            for rp_b in rps[i + 1:]:
+                nuts_a = nut_by_pid.get(rp_a.source_practice_id, set())
+                nuts_b = nut_by_pid.get(rp_b.source_practice_id, set())
+                # Pair rules — check both directions since the pair is
+                # order-agnostic.
+                for (nut_a, nut_b, text) in _MIXING_PAIR_RULES:
+                    if (nut_a in nuts_a and nut_b in nuts_b) or \
+                       (nut_a in nuts_b and nut_b in nuts_a):
+                        line = f"[{tl_name}] {text}"
+                        if line not in warnings_seen:
+                            out.append(line)
+                            warnings_seen.add(line)
+                # Product-name rules.
+                name_a = rp_a.display_label.lower()
+                name_b = rp_b.display_label.lower()
+                for (pat_a, pat_b, text) in _MIXING_PRODUCT_RULES:
+                    if (pat_a in name_a and pat_b in name_b) or \
+                       (pat_a in name_b and pat_b in name_a):
+                        line = f"[{tl_name}] {text}"
+                        if line not in warnings_seen:
+                            out.append(line)
+                            warnings_seen.add(line)
+    return out
 
 
 def _section_rules_applied(
@@ -979,6 +1182,23 @@ def _section_personalised_plan(
             for rp in by_tl[(_, tl_name)]:
                 note_tail = f" _({rp.note})_" if rp.note else ""
                 parts.append(f"- {rp.display_label}{note_tail}")
+            parts.append("")
+
+    # ── Mixing (tank-incompatibility) warnings (Phase 8e, 2026-10-23) ──
+    # When Recommended Practices place two incompatible products in the
+    # same Timeline, warn — chemical precipitation or antagonism can
+    # waste the application. First-pass rule list; agronomist refines.
+    if recommended_practices:
+        mix_warnings = _compute_mixing_warnings(recommended_practices, contributions)
+        if mix_warnings:
+            parts.append("### Application Compatibility Warnings\n")
+            parts.append(
+                "_Recommended Practices that may be incompatible when applied "
+                "at the same time. Separate the applications across days or "
+                "choose alternative products._\n"
+            )
+            for line in mix_warnings:
+                parts.append(f"- {line}")
             parts.append("")
 
     # ── Gap-case Instructions ──
