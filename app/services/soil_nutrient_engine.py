@@ -343,9 +343,16 @@ def compute_target_adjustments(
 ) -> list[TargetAdjustment]:
     """Apply Decision V's % adjustment per classification.
 
-    - LOW → low_pct_adjustment (typically positive — raise the target)
-    - HIGH → high_pct_adjustment (typically negative — lower it)
-    - OPTIMUM → pct = 0.0 (included in output so UI can show "no shift")
+    Agronomist-settled semantic (2026-10-23): the pct columns on the
+    Normal Range row store a MAGNITUDE (SE authors a positive number
+    like 15 for 15%). The engine supplies the sign based on
+    classification: Low → +pct (raise target), High → -pct (reduce
+    target). This makes "give more when low, give less when high"
+    the uniform rule across N/P/K + Ca/Mg/S + Zn/Fe/Mn/Cu/B.
+
+    - LOW → +low_pct_adjustment    (raise target)
+    - HIGH → -high_pct_adjustment  (reduce target)
+    - OPTIMUM → pct = 0.0 (included so the UI can show "no shift")
     - NOT_CLASSIFIED / NO_MEASUREMENT → pct = None (nothing to apply)
     """
     ranges_by_id = {r.parameter_id: r for r in ranges}
@@ -354,9 +361,16 @@ def compute_target_adjustments(
         r = ranges_by_id.get(c.parameter_id)
         pct: Optional[float]
         if c.classification == Classification.LOW:
-            pct = r.low_pct_adjustment if r else None
+            mag = r.low_pct_adjustment if r else None
+            # Direction is positive for Low; defensively abs() so an
+            # SE-authored negative value doesn't accidentally reduce.
+            pct = abs(mag) if mag is not None else None
         elif c.classification == Classification.HIGH:
-            pct = r.high_pct_adjustment if r else None
+            mag = r.high_pct_adjustment if r else None
+            # Direction is negative for High (reduce target). Same
+            # defensive abs() so sign is always correct regardless of
+            # how the SE authored.
+            pct = -abs(mag) if mag is not None else None
         elif c.classification == Classification.OPTIMUM:
             pct = 0.0
         else:
@@ -1317,14 +1331,25 @@ def _section_warnings(
     actionable_adjs = [a for a in adjustments
                        if a.classification in (Classification.LOW, Classification.HIGH)
                        and a.pct is not None and a.pct != 0.0]
+    # "No candidate" is only a real gap for LOW classifications — the
+    # engine needs a product to RAISE the nutrient. For HIGH, the
+    # action is to REDUCE the baseline; if no Package Practice carries
+    # the nutrient (baseline=0), there's nothing to reduce — not a
+    # problem, and no candidate is needed.
+    low_letters = {_PARAM_NAME_TO_NUTRIENT.get(a.parameter_name)
+                   for a in actionable_adjs
+                   if a.classification == Classification.LOW}
+    low_letters.discard(None)
     tiers_without_candidates = []
     for r in rankings:
+        if r.nutrient not in low_letters:
+            continue
         if not r.tier1 and not r.tier2 and not r.tier3:
             tiers_without_candidates.append(r.nutrient)
     if tiers_without_candidates:
         lines.append(
             f"- ⚠️ Nutrient(s) {', '.join(tiers_without_candidates)} needed "
-            f"an adjustment but no fertilizer candidate carried them."
+            f"a raise but no fertilizer candidate carried them."
         )
     # Non-NPK actionable adjustments — flagged as "informational only"
     # since v1 ranking is NPK-only.
