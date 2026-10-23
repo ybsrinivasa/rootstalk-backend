@@ -245,15 +245,16 @@ async def run_mock(
                 and fb.cosh_product_id in cosh_by_id:
             tier2_cosh_ids.add(fb.cosh_product_id)
 
-    # Tier 3 — pure straights. v1 heuristic: top N-concentration,
-    # top P-concentration, top K-concentration from the Cosh catalogue
-    # that aren't already in Tier 1 or 2. Captures urea / DAP / MOP
-    # naturally without a hand-coded list.
+    # Tier 3 — pure straights. v1 heuristic: top-concentration product
+    # per nutrient from the Cosh catalogue that isn't already in Tier
+    # 1 or 2. Captures urea / DAP / MOP naturally without a hand-coded
+    # list. Iterating all 11 attribute keys so Ca/Mg/S + Zn/Fe/Mn/Cu/B
+    # also seed Tier 3 the moment Cosh carries their concentrations.
     tier3_cosh_ids: set[str] = set()
     remaining = [c for c in cosh_candidates
                  if c.cosh_id not in tier1_cosh_ids
                  and c.cosh_id not in tier2_cosh_ids]
-    for key in ("n", "p", "k"):
+    for key in ("n", "p", "k", "ca", "mg", "s", "zn", "fe", "mn", "cu", "b"):
         ranked = sorted(remaining,
                         key=lambda c: getattr(c.concentration, key),
                         reverse=True)
@@ -266,6 +267,9 @@ async def run_mock(
         return CandidateProduct(
             cosh_id=cosh_id, name=c.name,
             n=c.concentration.n, p=c.concentration.p, k=c.concentration.k,
+            ca=c.concentration.ca, mg=c.concentration.mg, s=c.concentration.s,
+            zn=c.concentration.zn, fe=c.concentration.fe, mn=c.concentration.mn,
+            cu=c.concentration.cu, b=c.concentration.b,
             water_soluble=c.water_soluble, tier=tier,
         )
     candidates: list[CandidateProduct] = []
@@ -495,12 +499,19 @@ async def _parse_package_contributions(
                 # list is the signal.
                 continue
 
-            if cosh_candidate.concentration.n:
-                contrib["N"] = kg_product_per_acre * cosh_candidate.concentration.n / 100.0
-            if cosh_candidate.concentration.p:
-                contrib["P"] = kg_product_per_acre * cosh_candidate.concentration.p / 100.0
-            if cosh_candidate.concentration.k:
-                contrib["K"] = kg_product_per_acre * cosh_candidate.concentration.k / 100.0
+            # All 11 nutrients — any carried by this product contributes
+            # proportionally. Secondaries (Ca/Mg/S) + micros (Zn/Fe/Mn/Cu/B)
+            # light up automatically the moment Cosh carries their
+            # concentrations for this common_name (per Decision U, 2026-10-17).
+            for letter, attr in (
+                ("N", "n"), ("P", "p"), ("K", "k"),
+                ("Ca", "ca"), ("Mg", "mg"), ("S", "s"),
+                ("Zn", "zn"), ("Fe", "fe"), ("Mn", "mn"),
+                ("Cu", "cu"), ("B", "b"),
+            ):
+                pct = getattr(cosh_candidate.concentration, attr)
+                if pct:
+                    contrib[letter] = kg_product_per_acre * pct / 100.0
 
             tail = f" via {app_method_name}" if app_method_name else ""
             display_label = (

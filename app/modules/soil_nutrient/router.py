@@ -325,9 +325,10 @@ async def _candidates_by_cosh_id(
             cosh_id=c.cosh_id,
             name=c.name,
             concentration=CoshFertilizerConcentrationOut(
-                n=c.concentration.n,
-                p=c.concentration.p,
-                k=c.concentration.k,
+                n=c.concentration.n,   p=c.concentration.p,   k=c.concentration.k,
+                ca=c.concentration.ca, mg=c.concentration.mg, s=c.concentration.s,
+                zn=c.concentration.zn, fe=c.concentration.fe, mn=c.concentration.mn,
+                cu=c.concentration.cu, b=c.concentration.b,
             ),
             water_soluble=c.water_soluble,
         )
@@ -590,9 +591,10 @@ async def _client_candidates_by_cosh_id(
             cosh_id=c.cosh_id,
             name=c.name,
             concentration=CoshFertilizerConcentrationOut(
-                n=c.concentration.n,
-                p=c.concentration.p,
-                k=c.concentration.k,
+                n=c.concentration.n,   p=c.concentration.p,   k=c.concentration.k,
+                ca=c.concentration.ca, mg=c.concentration.mg, s=c.concentration.s,
+                zn=c.concentration.zn, fe=c.concentration.fe, mn=c.concentration.mn,
+                cu=c.concentration.cu, b=c.concentration.b,
             ),
             water_soluble=c.water_soluble,
         )

@@ -112,11 +112,21 @@ class FallbackProductCropAssignmentOut(BaseModel):
 
 
 class CoshFertilizerConcentrationOut(BaseModel):
-    """Mirror of `app.services.npk_candidates.Concentration` — grams of
-    N / P2O5 / K2O per kg of product (as modelled by Cosh)."""
-    n: float
-    p: float
-    k: float
+    """Mirror of `app.services.npk_ranking.Concentration` — elemental
+    nutrient % per 100g of product (as modelled by Cosh). Secondaries
+    (Ca/Mg/S) + micros (Zn/Fe/Mn/Cu/B) default to 0.0 until Neytiri
+    expands the Cosh fert_nutrients Core (Decision U, 2026-10-17)."""
+    n: float = 0.0
+    p: float = 0.0
+    k: float = 0.0
+    ca: float = 0.0
+    mg: float = 0.0
+    s: float = 0.0
+    zn: float = 0.0
+    fe: float = 0.0
+    mn: float = 0.0
+    cu: float = 0.0
+    b: float = 0.0
 
 
 class CoshFertilizerCandidateOut(BaseModel):

@@ -76,14 +76,25 @@ class EffectiveRange:
 class CandidateProduct:
     """A fertilizer the engine can recommend. Tier is set by the
     router when converting ClientProduct / FallbackProduct / pure
-    straight into this shape."""
+    straight into this shape. Elemental % per 100g product; NPK are
+    required (positional), secondaries (Ca/Mg/S) + micros
+    (Zn/Fe/Mn/Cu/B) default to 0.0 until Cosh carries them per
+    product."""
     cosh_id: str
     name: str
-    n: float      # grams N per kg product
-    p: float      # grams P2O5 per kg product
-    k: float      # grams K2O per kg product
+    n: float      # % N
+    p: float      # % P (elemental convention per Soil Nutrient v1 — see rank_candidates)
+    k: float      # % K
     water_soluble: bool
     tier: int     # 1 = Client, 2 = Fallback, 3 = pure straight
+    ca: float = 0.0
+    mg: float = 0.0
+    s: float = 0.0
+    zn: float = 0.0
+    fe: float = 0.0
+    mn: float = 0.0
+    cu: float = 0.0
+    b: float = 0.0
 
 
 # ── Output shapes ─────────────────────────────────────────────────────────
@@ -374,18 +385,25 @@ def compute_target_adjustments(
 # were skipped from candidate ranking and incorrectly counted as
 # "non-NPK" in Section 6 warnings.
 _PARAM_NAME_TO_NUTRIENT = {
-    "Available Nitrogen": "N",
+    "Available Nitrogen":    "N",
     "Available Phosphorous": "P",
-    "Available Potash": "K",
+    "Available Potash":      "K",
+    # Phase 8d (2026-10-23) — secondaries. Candidate ranking lights up
+    # for Ca/Mg/S the moment Cosh carries their concentrations.
+    # Products with Ca/Mg/S=0 simply fall out of the per-nutrient
+    # has_nut() filter and contribute nothing. Micros are intentionally
+    # NOT here yet (foliar-first, chelation, antagonisms — agronomist
+    # review needed before enabling candidate ranking for them).
+    "Available Calcium":     "Ca",
+    "Available Magnesium":   "Mg",
+    "Available Sulphur":     "S",
 }
 
 
 # ── Phase 8 maps (2026-10-22) ─────────────────────────────────────────────
 # Full 11-nutrient map used by Phase 8's baseline + Tier 0 + gap-case
-# Instruction logic. Separate from _PARAM_NAME_TO_NUTRIENT above (which
-# stays NPK-only because rank_candidates can only key off the n/p/k
-# fields on CandidateProduct — secondary/micro concentrations aren't
-# in the Cosh fert_nutrient_concentration Connect yet).
+# Instruction logic. _PARAM_NAME_TO_NUTRIENT above now covers N/P/K/Ca/Mg/S
+# (Phase 8d, 2026-10-23); micros stay out until agronomist signs off.
 _PARAM_NAME_TO_NUTRIENT_FULL = {
     "Available Nitrogen":   "N",
     "Available Phosphorous": "P",
@@ -671,24 +689,33 @@ def compute_recommended_practices(
     return out
 
 
+# Letter → CandidateProduct attribute name. Lowercase of the letter in
+# every case; "s" (Sulphur) is unambiguous as a dataclass field name.
+_NUTRIENT_LETTER_TO_ATTR = {
+    "N":  "n",  "P":  "p",  "K":  "k",
+    "Ca": "ca", "Mg": "mg", "S":  "s",
+    "Zn": "zn", "Fe": "fe", "Mn": "mn", "Cu": "cu", "B": "b",
+}
+
+
 def rank_candidates(
     adjustments: list[TargetAdjustment],
     candidates: list[CandidateProduct],
 ) -> list[RankedCandidates]:
-    """For each primary NPK nutrient whose target was shifted (either
-    direction), rank available candidates by tier then concentration.
+    """For each nutrient whose target was shifted (either direction),
+    rank available candidates by tier then concentration.
 
-    v1 scoping: only N/P/K drive candidate ranking. OPTIMUM parameters
-    produce no ranking entry (nothing to recommend). NOT_CLASSIFIED /
-    NO_MEASUREMENT also produce no entry (we can't recommend without
-    a signal).
+    v1 → v2 scoping: N/P/K/Ca/Mg/S drive candidate ranking today
+    (Phase 8d, 2026-10-23). Micros (Zn/Fe/Mn/Cu/B) are intentionally
+    excluded from `_PARAM_NAME_TO_NUTRIENT` pending agronomist review
+    on foliar-first + chelation + antagonism handling. OPTIMUM /
+    NOT_CLASSIFIED / NO_MEASUREMENT produce no entry.
 
     Within each tier the sort key is the nutrient concentration
     descending — the engine prefers the most efficient delivery for a
     given shift (fewer kg of product to meet the same gram target).
-    Tier 3 (pure straights) is seeded by the router from well-known
-    Cosh commons (urea / DAP / MOP) — this function just orders what
-    it's given.
+    Tier 3 (pure straights) is seeded by the router/Mock from well-
+    known Cosh commons; this function just orders what it's given.
     """
     out: list[RankedCandidates] = []
     for adj in adjustments:
@@ -700,17 +727,14 @@ def rank_candidates(
         if adj.pct is None or adj.pct == 0.0:
             continue
 
-        def has_nut(c: CandidateProduct) -> bool:
-            return (
-                (nut == "N" and c.n > 0)
-                or (nut == "P" and c.p > 0)
-                or (nut == "K" and c.k > 0)
-            )
+        attr = _NUTRIENT_LETTER_TO_ATTR.get(nut)
+        if attr is None:
+            continue
 
-        def conc(c: CandidateProduct) -> float:
-            return {"N": c.n, "P": c.p, "K": c.k}[nut]
+        def conc(c: CandidateProduct, _attr: str = attr) -> float:
+            return getattr(c, _attr)
 
-        in_scope = [c for c in candidates if has_nut(c)]
+        in_scope = [c for c in candidates if conc(c) > 0]
         tier1 = sorted((c for c in in_scope if c.tier == 1), key=conc, reverse=True)
         tier2 = sorted((c for c in in_scope if c.tier == 2), key=conc, reverse=True)
         tier3 = sorted((c for c in in_scope if c.tier == 3), key=conc, reverse=True)
@@ -851,7 +875,8 @@ def _render_product_reference_tiers(
             )
             continue
         for c in rows_in_scope[:5]:
-            conc = {"N": c.n, "P": c.p, "K": c.k}[r.nutrient]
+            attr = _NUTRIENT_LETTER_TO_ATTR.get(r.nutrient)
+            conc = getattr(c, attr) if attr else 0.0
             extra = " · water-soluble" if c.water_soluble else ""
             parts.append(f"- {c.name} — {r.nutrient}: {_fmt_num(conc)}{extra}")
 
@@ -983,9 +1008,25 @@ def _section_personalised_plan(
 
         parts.append("### Product reference — ranked candidates\n")
         parts.append("_Informational: if the SE wants to swap a product, these are the ranked options by nutrient concentration. Candidates are filtered by the application method on the SE's authored Practice(s) for each nutrient._\n")
+        # Labels: NPK keep industry oxide convention (P₂O₅ / K₂O);
+        # secondaries use elemental form matching the soil-test
+        # parameter names ("Available Calcium" → Calcium (Ca)) for
+        # consistency with Section 2. Agronomist can tune later.
+        _NUTRIENT_HEADING = {
+            "N":  "Nitrogen (N)",
+            "P":  "Phosphorus (P₂O₅)",
+            "K":  "Potassium (K₂O)",
+            "Ca": "Calcium (Ca)",
+            "Mg": "Magnesium (Mg)",
+            "S":  "Sulphur (S)",
+            "Zn": "Zinc (Zn)",
+            "Fe": "Iron (Fe)",
+            "Mn": "Manganese (Mn)",
+            "Cu": "Copper (Cu)",
+            "B":  "Boron (B)",
+        }
         for r in rankings:
-            label = {"N": "Nitrogen (N)", "P": "Phosphorus (P₂O₅)",
-                     "K": "Potassium (K₂O)"}[r.nutrient]
+            label = _NUTRIENT_HEADING.get(r.nutrient, r.nutrient)
             parts.append(f"#### {label}")
             methods = sorted(app_methods_by_nutrient.get(r.nutrient, set()))
             if not methods:

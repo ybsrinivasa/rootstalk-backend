@@ -29,14 +29,27 @@ FertiliserClass = Literal["STRAIGHT_N", "STRAIGHT_P", "STRAIGHT_K", "MIXED"]
 
 @dataclass(frozen=True)
 class Concentration:
-    """N / P / K per 100 units of product. Example: Urea 46:0:0 →
-    Concentration(46, 0, 0). All values clamped non-negative."""
-    n: float
-    p: float
-    k: float
+    """Elemental nutrient % per 100 units of product. Example: Urea
+    46:0:0 → Concentration(n=46). Secondaries (Ca/Mg/S) and micros
+    (Zn/Fe/Mn/Cu/B) default to 0.0 so Dealer-flow NPK matching stays
+    unaffected; Soil Nutrient v2 reads them when Cosh carries the
+    data. All values clamped non-negative.
+    """
+    n: float = 0.0
+    p: float = 0.0
+    k: float = 0.0
+    ca: float = 0.0
+    mg: float = 0.0
+    s: float = 0.0
+    zn: float = 0.0
+    fe: float = 0.0
+    mn: float = 0.0
+    cu: float = 0.0
+    b: float = 0.0
 
     def __post_init__(self) -> None:
-        for label, v in (("n", self.n), ("p", self.p), ("k", self.k)):
+        for label in ("n", "p", "k", "ca", "mg", "s", "zn", "fe", "mn", "cu", "b"):
+            v = getattr(self, label)
             if v < 0:
                 raise ValueError(f"{label} percentage must be >= 0, got {v}")
 

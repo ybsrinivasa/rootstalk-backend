@@ -54,13 +54,28 @@ from app.services.npk_ranking import Candidate, Concentration
 
 
 # Cosh ships nutrient identities as English translations on the
-# fert_nutrients Core. Map them to NPK letter codes so the rest of
-# the algorithm stays terse.
+# fert_nutrients Core. Map them to letter codes so the rest of the
+# algorithm stays terse. NPK are the only three Cosh carries today;
+# secondaries (Ca/Mg/S) and micros (Zn/Fe/Mn/Cu/B) are listed here so
+# the moment Neytiri expands the fert_nutrients Core (per Decision U,
+# 2026-10-17) their concentration rows flow straight into Candidate
+# without a code change. Rows for a letter not in this map are skipped.
 _NUTRIENT_NAME_TO_LETTER = {
     "Nitrogen":   "N",
     "Phosphorus": "P",
     "Potassium":  "K",
+    "Calcium":    "Ca",
+    "Magnesium":  "Mg",
+    "Sulphur":    "S",
+    "Sulfur":     "S",   # US spelling; Cosh may carry either
+    "Zinc":       "Zn",
+    "Iron":       "Fe",
+    "Manganese":  "Mn",
+    "Copper":     "Cu",
+    "Boron":      "B",
 }
+
+_ALL_LETTERS = ("N", "P", "K", "Ca", "Mg", "S", "Zn", "Fe", "Mn", "Cu", "B")
 
 
 async def load_fertigation_approved_common_name_ids(
@@ -153,8 +168,11 @@ async def load_fertiliser_candidates(
     )).scalars().all()
     cores_by_id = {c.cosh_id: c for c in core_rows}
 
-    # accumulator: common_name_cosh_id → {"N": pct, "P": pct, "K": pct}
-    acc: dict[str, dict[str, float]] = defaultdict(lambda: {"N": 0.0, "P": 0.0, "K": 0.0})
+    # accumulator: common_name_cosh_id → {letter: pct} for all 11 nutrients.
+    # Any letter Cosh doesn't carry for a given common_name stays 0.0.
+    acc: dict[str, dict[str, float]] = defaultdict(
+        lambda: {letter: 0.0 for letter in _ALL_LETTERS}
+    )
     common_name_seen: set[str] = set()
     skipped = 0
 
@@ -214,7 +232,10 @@ async def load_fertiliser_candidates(
     skipped_common_names = 0
     for cn_id in common_name_seen:
         vals = acc.get(cn_id)
-        if not vals or (vals["N"] == 0 and vals["P"] == 0 and vals["K"] == 0):
+        if not vals or not any(vals[letter] > 0 for letter in _ALL_LETTERS):
+            # Common_name has no concentration data for ANY of the 11
+            # tracked nutrients — not a usable candidate for any
+            # Soil Nutrient recommendation.
             skipped_common_names += 1
             continue
         cn_core = cores_by_id.get(cn_id)
@@ -230,7 +251,10 @@ async def load_fertiliser_candidates(
         candidates.append(Candidate(
             cosh_id=cn_id, name=name,
             concentration=Concentration(
-                n=vals["N"], p=vals["P"], k=vals["K"],
+                n=vals["N"],   p=vals["P"],   k=vals["K"],
+                ca=vals["Ca"], mg=vals["Mg"], s=vals["S"],
+                zn=vals["Zn"], fe=vals["Fe"], mn=vals["Mn"],
+                cu=vals["Cu"], b=vals["B"],
             ),
             # Accurate per-candidate flag — reflects whether this
             # common_name has at least one fertigation-approved trade
