@@ -1227,59 +1227,95 @@ def _section_personalised_plan(
             parts.append("")
 
     # ── Candidate ranking (informational / reference) ──
-    # Filtered per nutrient by the APPLICATION_METHOD(s) the SE
-    # authored on their Package's Practices for that nutrient — so a
-    # Foliar Practice only sees water-soluble swap candidates, matching
-    # the agronomist's "focus on the SE's authored baseline" principle
-    # (2026-10-22).
+    # Phase 8g (2026-10-26): per-nutrient scoping of the Product
+    # Reference block. Tiers only make sense when the SE's authoring
+    # intent is at the product level. For a Practice authored as a
+    # DOSAGE (CHEMICAL_FERTILIZERS_NPK_DOSAGES / FERTIGATION_NPK_
+    # DOSAGES), the SE has deliberately said "I don't care which
+    # product — just deliver this many kg of elemental nutrient"; the
+    # Dosage IS the recommendation. Showing ranked swap candidates
+    # contradicts that intent and clutters the Report.
+    #
+    # Rule per nutrient:
+    #   - At least one PRODUCT L2 Practice carries it → show (swap use case)
+    #   - Only DOSAGE L2 Practice(s) carry it → skip (dosage IS the plan)
+    #   - No Practice carries it (gap case) → show (farmer picks product)
+    #
+    # Filter per shown nutrient by the APPLICATION_METHOD(s) the SE
+    # authored on PRODUCT Practices for that nutrient — a Foliar
+    # Practice only sees water-soluble swap candidates. Settled
+    # 2026-10-22.
+    _DOSAGE_L2S = {"CHEMICAL_FERTILIZERS_NPK_DOSAGES", "FERTIGATION_NPK_DOSAGES"}
+    _PRODUCT_L2S = {"CHEMICAL_FERTILIZER_PRODUCTS",
+                    "CHEMICAL_FERTILIZER_FERTIGATION_PRODUCTS"}
+
     if rankings:
+        # Per nutrient: carried by any PRODUCT L2 Practice at all?
+        product_carriers: dict[str, bool] = {}
         app_methods_by_nutrient: dict[str, set[str]] = {}
         for c in contributions:
-            if not c.application_method:
-                continue
+            is_product = c.l2_type in _PRODUCT_L2S
             for nut in c.contributions:
-                app_methods_by_nutrient.setdefault(nut, set()).add(c.application_method)
+                if is_product:
+                    product_carriers[nut] = True
+                    if c.application_method:
+                        app_methods_by_nutrient.setdefault(nut, set()).add(
+                            c.application_method)
 
-        parts.append("### Product reference — ranked candidates\n")
-        parts.append("_Informational: if the SE wants to swap a product, these are the ranked options by nutrient concentration. Candidates are filtered by the application method on the SE's authored Practice(s) for each nutrient._\n")
-        # Labels: NPK keep industry oxide convention (P₂O₅ / K₂O);
-        # secondaries use elemental form matching the soil-test
-        # parameter names ("Available Calcium" → Calcium (Ca)) for
-        # consistency with Section 2. Agronomist can tune later.
-        _NUTRIENT_HEADING = {
-            "N":  "Nitrogen (N)",
-            "P":  "Phosphorus (P₂O₅)",
-            "K":  "Potassium (K₂O)",
-            "Ca": "Calcium (Ca)",
-            "Mg": "Magnesium (Mg)",
-            "S":  "Sulphur (S)",
-            "Zn": "Zinc (Zn)",
-            "Fe": "Iron (Fe)",
-            "Mn": "Manganese (Mn)",
-            "Cu": "Copper (Cu)",
-            "B":  "Boron (B)",
-        }
-        for r in rankings:
-            label = _NUTRIENT_HEADING.get(r.nutrient, r.nutrient)
-            parts.append(f"#### {label}")
-            methods = sorted(app_methods_by_nutrient.get(r.nutrient, set()))
-            if not methods:
-                # No Package Practice carries this nutrient (gap case) —
-                # show all candidates unfiltered; SE will decide method
-                # when authoring any new Practice.
-                _render_product_reference_tiers(parts, r, filter_label=None)
-            else:
-                for method in methods:
-                    is_foliar = "foliar" in method.lower()
-                    filter_label = (
-                        f"**For {method} (water-soluble only)**"
-                        if is_foliar
-                        else f"**For {method}**"
-                    )
-                    _render_product_reference_tiers(
-                        parts, r, filter_label=filter_label,
-                        water_soluble_only=is_foliar,
-                    )
+        # Keep only rankings for nutrients where a Product Reference is
+        # agronomically meaningful — either (a) a PRODUCT L2 Practice
+        # already carries them (swap case) OR (b) no Practice carries
+        # them at all (gap case; the farmer will need to pick something).
+        nutrient_has_any_carrier: dict[str, bool] = {}
+        for c in contributions:
+            for nut in c.contributions:
+                nutrient_has_any_carrier[nut] = True
+        shown_rankings = [
+            r for r in rankings
+            if product_carriers.get(r.nutrient, False)
+            or not nutrient_has_any_carrier.get(r.nutrient, False)
+        ]
+
+        if shown_rankings:
+            parts.append("### Product reference — ranked candidates\n")
+            parts.append("_Informational: if the SE wants to swap a product, these are the ranked options by nutrient concentration. Candidates are filtered by the application method on the SE's authored Practice(s) for each nutrient._\n")
+            # Labels: NPK keep industry oxide convention (P₂O₅ / K₂O);
+            # secondaries use elemental form matching the soil-test
+            # parameter names ("Available Calcium" → Calcium (Ca)) for
+            # consistency with Section 2. Agronomist can tune later.
+            _NUTRIENT_HEADING = {
+                "N":  "Nitrogen (N)",
+                "P":  "Phosphorus (P₂O₅)",
+                "K":  "Potassium (K₂O)",
+                "Ca": "Calcium (Ca)",
+                "Mg": "Magnesium (Mg)",
+                "S":  "Sulphur (S)",
+                "Zn": "Zinc (Zn)",
+                "Fe": "Iron (Fe)",
+                "Mn": "Manganese (Mn)",
+                "Cu": "Copper (Cu)",
+                "B":  "Boron (B)",
+            }
+            for r in shown_rankings:
+                label = _NUTRIENT_HEADING.get(r.nutrient, r.nutrient)
+                parts.append(f"#### {label}")
+                methods = sorted(app_methods_by_nutrient.get(r.nutrient, set()))
+                if not methods:
+                    # Gap case — show all candidates unfiltered; SE will
+                    # decide method when authoring any new Practice.
+                    _render_product_reference_tiers(parts, r, filter_label=None)
+                else:
+                    for method in methods:
+                        is_foliar = "foliar" in method.lower()
+                        filter_label = (
+                            f"**For {method} (water-soluble only)**"
+                            if is_foliar
+                            else f"**For {method}**"
+                        )
+                        _render_product_reference_tiers(
+                            parts, r, filter_label=filter_label,
+                            water_soluble_only=is_foliar,
+                        )
 
     return DecisionReportSection(
         heading="Personalised Plan",
