@@ -7093,12 +7093,21 @@ async def pull_global_package(
 async def _deep_copy_package_metadata(
     db: AsyncSession, src_id: str, dst_id: str,
 ) -> None:
-    """Copy locations + authors + package_variables. Used by
-    clone-to-draft and rollback-publish where the destination row
-    must be a fully-formed Local Package (locations/authors are
-    required by the publish-readiness gate). Push/pull deliberately
-    skip this since they originate from Global (no client-scoped
-    metadata to copy)."""
+    """Copy locations + authors + package_variables + Soil Nutrient
+    normal-range overrides. Used by clone-to-draft and rollback-publish
+    where the destination row must be a fully-formed Local Package
+    (locations/authors are required by the publish-readiness gate;
+    normal-range overrides are the SE-authored Decision V % adjustments
+    + Decision W bounds overrides and MUST survive versioning).
+
+    Push/pull from Global deliberately skip this helper since those
+    paths originate from Global (no client-scoped metadata to copy).
+
+    Normal-range override deep-copy added 2026-10-26: without it,
+    every clone-to-draft or rollback-publish lost the SE's authored
+    Low/High Adj % values. SE perception was "my Adj % vanished the
+    moment I edited a Timeline" because editing an ACTIVE Package
+    auto-clones to DRAFT. See git blame for the DB audit."""
     for loc in (await db.execute(
         select(PackageLocation).where(PackageLocation.package_id == src_id)
     )).scalars().all():
@@ -7120,6 +7129,27 @@ async def _deep_copy_package_metadata(
         db.add(PackageVariable(
             package_id=dst_id, parameter_id=pv.parameter_id,
             variable_id=pv.variable_id,
+        ))
+    # Soil Nutrient Normal Range overrides (Decision V % + Decision W
+    # bounds). Imported lazily so this advisory module doesn't take a
+    # hard dependency on the soil_nutrient module at import time
+    # (matches the lazy-import pattern already used at line 1276 /
+    # 1415 for SoilRangeTemplate).
+    from app.modules.soil_nutrient.models import PackageNormalRangeOverride
+    for ov in (await db.execute(
+        select(PackageNormalRangeOverride).where(
+            PackageNormalRangeOverride.package_id == src_id,
+        )
+    )).scalars().all():
+        db.add(PackageNormalRangeOverride(
+            package_id=dst_id,
+            parameter_id=ov.parameter_id,
+            operator=ov.operator,
+            low_value=ov.low_value,
+            high_value=ov.high_value,
+            low_pct_adjustment=ov.low_pct_adjustment,
+            high_pct_adjustment=ov.high_pct_adjustment,
+            created_by=ov.created_by,
         ))
     await db.flush()
 
@@ -7224,6 +7254,12 @@ async def clone_to_draft(
         duration_days=src.duration_days,
         start_date_label_cosh_id=src.start_date_label_cosh_id,
         description=src.description,
+        # Soil Range Template is Client-scoped (Decision W) + travels
+        # with the Local Package through versioning. See 2026-10-26
+        # audit — a missing copy here was half of the "my Adj %
+        # vanished" bug (the other half was the overrides deep-copy
+        # in _deep_copy_package_metadata).
+        soil_range_template_id=src.soil_range_template_id,
         created_by=current_user.id,
         status=PackageStatus.DRAFT,
         created_via=PackageCreatedVia.SE_EDIT_DRAFT,
@@ -7313,6 +7349,9 @@ async def rollback_publish(
         duration_days=src.duration_days,
         start_date_label_cosh_id=src.start_date_label_cosh_id,
         description=src.description,
+        # Soil Range Template travels with the Local Package through
+        # versioning (same reasoning as clone-to-draft above).
+        soil_range_template_id=src.soil_range_template_id,
         created_by=current_user.id,
         status=PackageStatus.ACTIVE,
         version=new_version,
