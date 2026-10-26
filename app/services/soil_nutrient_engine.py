@@ -1227,54 +1227,62 @@ def _section_personalised_plan(
             parts.append("")
 
     # ── Candidate ranking (informational / reference) ──
-    # Phase 8g (2026-10-26): per-nutrient scoping of the Product
-    # Reference block. Tiers only make sense when the SE's authoring
-    # intent is at the product level. For a Practice authored as a
-    # DOSAGE (CHEMICAL_FERTILIZERS_NPK_DOSAGES / FERTIGATION_NPK_
-    # DOSAGES), the SE has deliberately said "I don't care which
-    # product — just deliver this many kg of elemental nutrient"; the
-    # Dosage IS the recommendation. Showing ranked swap candidates
-    # contradicts that intent and clutters the Report.
+    # Phase 8h (2026-10-26): mirror the engine's actual action. Show
+    # the Product Reference block for a nutrient only when the engine
+    # is actually recommending something for that nutrient AND a
+    # product choice is relevant to that recommendation.
     #
-    # Rule per nutrient:
-    #   - At least one PRODUCT L2 Practice carries it → show (swap use case)
-    #   - Only DOSAGE L2 Practice(s) carry it → skip (dosage IS the plan)
-    #   - No Practice carries it (gap case) → show (farmer picks product)
+    # Rule per nutrient (strictly: both must be true for "show"):
+    #   (A) at least one Recommended Practice for the nutrient is a
+    #       PRODUCT L2 type — the SE might swap the product, OR
+    #   (B) a Gap Instruction fires for the nutrient — Low + no
+    #       Package Practice carries it; farmer will need to pick a
+    #       product to introduce.
+    #
+    # What this drops vs Phase 8g:
+    #   - Nutrients served only by DOSAGE Practices (same as 8g —
+    #     dosage IS the plan, no product to swap).
+    #   - High-classified nutrients with baseline=0 (engine takes no
+    #     action — Tier 0 scales 0×anything=0 and gap-case High is
+    #     skipped per the agronomist's 2026-10-22 settle). Previously
+    #     8g treated these as "no Practice carries → gap case → show"
+    #     which cluttered the Report with 3-tiers-all-empty blocks.
     #
     # Filter per shown nutrient by the APPLICATION_METHOD(s) the SE
     # authored on PRODUCT Practices for that nutrient — a Foliar
     # Practice only sees water-soluble swap candidates. Settled
     # 2026-10-22.
-    _DOSAGE_L2S = {"CHEMICAL_FERTILIZERS_NPK_DOSAGES", "FERTIGATION_NPK_DOSAGES"}
     _PRODUCT_L2S = {"CHEMICAL_FERTILIZER_PRODUCTS",
                     "CHEMICAL_FERTILIZER_FERTIGATION_PRODUCTS"}
 
     if rankings:
-        # Per nutrient: carried by any PRODUCT L2 Practice at all?
-        product_carriers: dict[str, bool] = {}
+        # Nutrients where at least one Recommended Practice is a
+        # PRODUCT L2 — anchor for the swap case.
+        source_pid_of_rp = {rp.source_practice_id: rp for rp in (recommended_practices or [])}
+        rp_pid_to_nutrients: dict[str, set[str]] = {}
+        for c in contributions:
+            if c.practice_id in source_pid_of_rp:
+                rp_pid_to_nutrients[c.practice_id] = set(c.contributions.keys())
+        product_rp_nutrients: set[str] = set()
         app_methods_by_nutrient: dict[str, set[str]] = {}
         for c in contributions:
-            is_product = c.l2_type in _PRODUCT_L2S
+            if c.l2_type not in _PRODUCT_L2S:
+                continue
+            if c.practice_id not in source_pid_of_rp:
+                continue
             for nut in c.contributions:
-                if is_product:
-                    product_carriers[nut] = True
-                    if c.application_method:
-                        app_methods_by_nutrient.setdefault(nut, set()).add(
-                            c.application_method)
+                product_rp_nutrients.add(nut)
+                if c.application_method:
+                    app_methods_by_nutrient.setdefault(nut, set()).add(
+                        c.application_method)
 
-        # Keep only rankings for nutrients where a Product Reference is
-        # agronomically meaningful — either (a) a PRODUCT L2 Practice
-        # already carries them (swap case) OR (b) no Practice carries
-        # them at all (gap case; the farmer will need to pick something).
-        nutrient_has_any_carrier: dict[str, bool] = {}
-        for c in contributions:
-            for nut in c.contributions:
-                nutrient_has_any_carrier[nut] = True
-        shown_rankings = [
-            r for r in rankings
-            if product_carriers.get(r.nutrient, False)
-            or not nutrient_has_any_carrier.get(r.nutrient, False)
-        ]
+        # Nutrients where a Gap Instruction fires — the agronomist's
+        # Low-nutrient-with-no-Practice case; farmer needs product options.
+        gap_instruction_nutrients = {g.nutrient for g in (gap_instructions or [])}
+
+        # The union is the "show" set.
+        showable_nutrients = product_rp_nutrients | gap_instruction_nutrients
+        shown_rankings = [r for r in rankings if r.nutrient in showable_nutrients]
 
         if shown_rankings:
             parts.append("### Product reference — ranked candidates\n")
