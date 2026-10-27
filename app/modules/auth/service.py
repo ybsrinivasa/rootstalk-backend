@@ -7,7 +7,7 @@ from typing import Optional
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete, or_
+from sqlalchemy import select, delete, or_, func
 from sqlalchemy.orm import selectinload
 from app.config import settings
 from app.modules.platform.models import User, UserRole, RoleType, StatusEnum
@@ -204,8 +204,18 @@ async def get_user_by_phone(db: AsyncSession, phone: str) -> Optional[User]:
 
 
 async def get_user_by_email(db: AsyncSession, email: str) -> Optional[User]:
+    """Case-insensitive email lookup. Fixes a 2026-10-26 coaching-cohort
+    incident where ~17 students hit 401 Unauthorized on password login
+    because their email on the form (auto-capitalized by mobile keyboard
+    / password manager) didn't exactly match the lowercase email stored
+    on their User row at approval time. Email-OTP endpoints already
+    `.strip().lower()`'d the input, which is why OTP worked but
+    password didn't. Single-point normalization here catches every
+    caller instead of hunting them down one by one."""
     result = await db.execute(
-        select(User).options(selectinload(User.roles)).where(User.email == email)
+        select(User).options(selectinload(User.roles)).where(
+            func.lower(User.email) == (email or "").strip().lower()
+        )
     )
     return result.scalar_one_or_none()
 
