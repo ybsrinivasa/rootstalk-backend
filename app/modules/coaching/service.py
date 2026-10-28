@@ -1836,27 +1836,43 @@ async def load_coaching_context(
     """Return the PWA/portal context for a coaching student user, or
     None if the user isn't one. Used by /auth/me so the PWA can
     render a persistent 'You're in a coaching session — this is
-    practice' banner across every screen.
+    practice' banner across every screen, and by the CP's
+    `canPublishAdvisory` helper to gate the Publish button.
 
-    Only returns context for the current OPEN session — if the
-    student's session has closed and they somehow still hold a
-    valid token, context is None (login gates would already have
-    kicked them out).
+    Returns a context dict for students whose access_state is ACTIVE
+    or GRACE (both have writeable access — the hybrid-access design
+    settled 2026-10-15 widened "can publish" to include GRACE). Returns
+    None for students in NOT_YET_STARTED (login blocked) and ARCHIVED
+    (portal is read-only; publish controls intentionally hidden).
+
+    Fix 2026-10-28: the original query filtered to
+    OPEN_SESSION_STATUSES = {DRAFT, ACTIVE}, which excluded GRACE
+    (CLOSED_MANUAL / CLOSED_AUTO within the 30-day window). Students
+    whose sessions had closed hit the hybrid-access guard on login
+    (which lets them through), but then saw no coaching_context on
+    /auth/me, so the CP Publish gate fell back to "SE role required"
+    and hid the Publish button for all 22 coaching DRAFT packages
+    whose owners happened to be in grace.
     """
-    open_statuses = [s.value for s in OPEN_SESSION_STATUSES]
     row = (await db.execute(
         select(CoachingStudent, CoachingSession, Client, User)
         .join(CoachingSession, CoachingSession.id == CoachingStudent.session_id)
         .join(Client, Client.id == CoachingSession.reference_client_id)
         .join(User, User.id == CoachingSession.coach_user_id)
-        .where(
-            CoachingStudent.user_id == user.id,
-            CoachingSession.status.in_(open_statuses),
-        )
+        .where(CoachingStudent.user_id == user.id)
     )).first()
     if row is None:
         return None
     student, session, ref_client, coach = row
+    # Hybrid-access gate: only ACTIVE + GRACE sessions get a context
+    # (both are writeable). NOT_YET_STARTED is unreachable (login
+    # refuses it); ARCHIVED gets None so the portal stays read-only.
+    access_state = session.access_state()
+    if access_state not in (
+        CoachingSessionAccessState.ACTIVE,
+        CoachingSessionAccessState.GRACE,
+    ):
+        return None
     return {
         "session_id": session.id,
         "session_status": session.status,
