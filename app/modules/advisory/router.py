@@ -1849,24 +1849,51 @@ async def set_package_authors(
         )
 
     if user_ids:
-        valid_se_ids = set((await db.execute(
-            select(ClientUser.user_id).where(
-                ClientUser.client_id == client_id,
-                ClientUser.user_id.in_(user_ids),
-                ClientUser.role == ClientUserRole.SUBJECT_EXPERT,
-                ClientUser.status == StatusEnum.ACTIVE,
-            )
-        )).scalars().all())
-        invalid = sorted(set(user_ids) - valid_se_ids)
+        # Coaching Sandbox — inside an is_coaching workspace, the sole
+        # ClientUser is the student (CA role; CA-exclusivity guards
+        # prevent any other user being added). The spec §4.1 "author
+        # must be SE" rule was written for real clients where the SE
+        # is a distinct human from the CA. For a coaching workspace
+        # there's no separate SE to credit — the student IS both the
+        # CA and the only possible content author. Without this
+        # bypass, every coaching package would be stuck in DRAFT
+        # forever because publish-readiness requires n_authors >= 1
+        # and n_authors stays 0 (no SE exists). Settled 2026-10-28.
+        from app.modules.coaching.service import get_coaching_student_for_workspace
+        is_coaching_workspace = await get_coaching_student_for_workspace(
+            db, client_id,
+        ) is not None
+
+        if is_coaching_workspace:
+            # Accept any ACTIVE ClientUser of this workspace as a valid
+            # author (which in practice is just the student themselves).
+            valid_author_ids = set((await db.execute(
+                select(ClientUser.user_id).where(
+                    ClientUser.client_id == client_id,
+                    ClientUser.user_id.in_(user_ids),
+                    ClientUser.status == StatusEnum.ACTIVE,
+                )
+            )).scalars().all())
+        else:
+            valid_author_ids = set((await db.execute(
+                select(ClientUser.user_id).where(
+                    ClientUser.client_id == client_id,
+                    ClientUser.user_id.in_(user_ids),
+                    ClientUser.role == ClientUserRole.SUBJECT_EXPERT,
+                    ClientUser.status == StatusEnum.ACTIVE,
+                )
+            )).scalars().all())
+        invalid = sorted(set(user_ids) - valid_author_ids)
         if invalid:
             raise HTTPException(
                 status_code=422,
                 detail={
                     "code": "invalid_author",
                     "message": (
-                        "The following user_id(s) are not ACTIVE Subject "
-                        "Experts of this company and cannot be assigned "
-                        "as Package authors."
+                        "The following user_id(s) are not valid authors "
+                        "for this Package — they must be an ACTIVE Subject "
+                        "Expert of this company (or the student themselves "
+                        "for a coaching workspace)."
                     ),
                     "invalid_user_ids": invalid,
                 },
