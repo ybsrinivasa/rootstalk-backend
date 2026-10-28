@@ -320,10 +320,24 @@ async def get_my_reference_client_profile(
     fully-configured profile so the student sees what a real
     Company Profile looks like.
 
-    Auth: caller must be a CoachingStudent in a non-CLOSED session.
-    404 for non-students / closed-session students. Bypasses the
-    tenant guard cleanly (dedicated endpoint, no path param, so
-    the cross_client_forbidden gate doesn't fire).
+    Auth: caller must be a CoachingStudent whose session is in
+    ACTIVE or GRACE access state (hybrid-access, 2026-10-15 — GRACE
+    students retain writeable workspace access for 30 days post-close
+    and must keep seeing this reference profile). 404 for
+    non-students and ARCHIVED students (workspace is read-only post-
+    grace; UI hides the Company Profile tile).
+
+    Fix 2026-10-28: the original query filtered to `status.in_([DRAFT,
+    ACTIVE])` which excluded GRACE (CLOSED_MANUAL / CLOSED_AUTO within
+    the 30-day window). GRACE students landed on the Company Profile
+    page, got a 404 from this endpoint, and saw a brief flicker before
+    the UI rendered the "Could not load profile. Please refresh."
+    error block. Same bug class as the earlier `load_coaching_context`
+    filter — see feedback_grep_every_session_status_filter_when_adding_
+    access_state.md for the audit recipe.
+
+    Bypasses the tenant guard cleanly (dedicated endpoint, no path
+    param, so the cross_client_forbidden gate doesn't fire).
 
     Response shape matches GET /client/{cid}/profile so the existing
     profile page's data model can consume this endpoint by swapping
@@ -332,21 +346,24 @@ async def get_my_reference_client_profile(
     from app.modules.clients.models import (
         Client, ClientOrganisationType,
     )
+    from app.modules.coaching.models import CoachingSessionAccessState
     row = (await db.execute(
         select(CoachingStudent, CoachingSession, Client)
         .join(CoachingSession, CoachingSession.id == CoachingStudent.session_id)
         .join(Client, Client.id == CoachingSession.reference_client_id)
-        .where(
-            CoachingStudent.user_id == current_user.id,
-            CoachingSession.status.in_([
-                CoachingSessionStatus.DRAFT.value,
-                CoachingSessionStatus.ACTIVE.value,
-            ]),
-        )
+        .where(CoachingStudent.user_id == current_user.id)
     )).first()
     if row is None:
-        raise HTTPException(status_code=404, detail="Not a coaching student in an active session")
+        raise HTTPException(status_code=404, detail="Not a coaching student")
     _cs, _sess, ref_client = row
+    if _sess.access_state() not in (
+        CoachingSessionAccessState.ACTIVE,
+        CoachingSessionAccessState.GRACE,
+    ):
+        raise HTTPException(
+            status_code=404,
+            detail="Reference client profile is not available after the coaching grace period ends.",
+        )
     org_types = (await db.execute(
         select(ClientOrganisationType.org_type_cosh_id)
         .where(ClientOrganisationType.client_id == ref_client.id)
