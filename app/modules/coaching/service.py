@@ -803,6 +803,16 @@ def _build_workspace_client(
         ca_name=student_user.name or "Coaching Student",
         ca_phone=student_user.phone or "",
         ca_email=student_user.email or "",
+        # Coaching Sandbox defaults 2026-10-29: every student workspace
+        # starts in Advisory-Only Mode with Nearby Dealers + in-app
+        # ordering enabled (the full v2 experience). Mirrors what a
+        # real client would configure for a modern advisory-only
+        # launch and lets the student practise the full flow out of
+        # the box. SA / coach can flip these later via the normal
+        # client-settings UI.
+        advisory_only_mode=True,
+        dealer_list_enabled=True,
+        in_app_orders_enabled=True,
     )
 
 
