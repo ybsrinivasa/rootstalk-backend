@@ -19,7 +19,16 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.advisory.models import Element, Practice
-from app.services.npk_candidates import load_fertiliser_candidates
+from app.modules.sync.models import CoshConnectRow
+from app.services.cosh_constants import (
+    COSH_COMMON_NAMES_CORE,
+    COSH_TRADENAME_COMMONNAME_CONNECT,
+    COSH_TRADE_NAMES_CORE,
+)
+from app.services.npk_candidates import (
+    load_fertigation_approved_common_name_ids,
+    load_fertiliser_candidates,
+)
 from app.services.npk_ranking import (
     Dose,
     classify_fertiliser,
@@ -60,6 +69,37 @@ def _candidate_to_dict(cand) -> dict:
         "class": cls,
         "water_soluble": cand.water_soluble,
     }
+
+
+async def _common_names_with_chemical_brands(
+    db: AsyncSession, candidate_cosh_ids: set[str],
+) -> set[str]:
+    """Batch: return the subset of candidate common_name cosh_ids that
+    have at least one active trade_name linked via the
+    `tradename_commonname` Cosh Connect. Lets the resolver tag
+    `has_brands=False` on orphan common_names so the PWA can filter
+    them out of the ranked/straights lists (no shop-shelf brand to
+    actually buy).
+
+    Single Cosh scan; O(N) client-side over all tradename_commonname
+    rows (bounded set). Called once per /npk-brands response — cheap.
+    """
+    if not candidate_cosh_ids:
+        return set()
+    rows = (await db.execute(
+        select(CoshConnectRow).where(
+            CoshConnectRow.connect_type == COSH_TRADENAME_COMMONNAME_CONNECT,
+            CoshConnectRow.status == "active",
+        )
+    )).scalars().all()
+    found: set[str] = set()
+    for r in rows:
+        for ep in r.endpoints or []:
+            cid = ep.get("cosh_id")
+            if ep.get("role") == COSH_COMMON_NAMES_CORE and cid in candidate_cosh_ids:
+                found.add(cid)
+                break
+    return found
 
 
 def _val(by_type: dict, element_type: str) -> float:
@@ -123,6 +163,24 @@ async def resolve_npk_options(
     )
     straights.sort(key=lambda c: c.name.lower())
 
+    # has_brands flag — tags each ranked Mixed and enabled Straight
+    # with whether at least one trade name exists in Cosh for it, so
+    # the PWA can filter out shelf-unavailable options (one less
+    # dead-end for the farmer walking through the picker). For
+    # Fertigation NPK, every candidate is in the fertigation pool
+    # BY DEFINITION of having at least one approved trade name
+    # (load_fertiliser_candidates(fertigation=True) returns only
+    # those common_names) — so we can skip the Cosh scan and tag all.
+    all_cosh_ids = {r.candidate.cosh_id for r in ranked} | {
+        c.cosh_id for c in straights
+    }
+    if fertigation:
+        with_brands = all_cosh_ids
+    else:
+        with_brands = await _common_names_with_chemical_brands(
+            db, all_cosh_ids,
+        )
+
     return {
         "is_npk_practice": True,
         "fertigation": fertigation,
@@ -146,6 +204,7 @@ async def resolve_npk_options(
                 },
                 "match_target": r.best.target,
                 "total_delivered": round(r.total_delivered, 2),
+                "has_brands": r.candidate.cosh_id in with_brands,
             }
             for r in ranked
         ],
@@ -159,6 +218,7 @@ async def resolve_npk_options(
                 "kg_product_needed": _round_or_none(
                     straight_kg_for_gap(c.concentration, gap),
                 ),
+                "has_brands": c.cosh_id in with_brands,
             }
             for c in straights
         ],
