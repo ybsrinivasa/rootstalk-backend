@@ -8797,13 +8797,21 @@ async def list_npk_purchases(
         ).order_by(NpkDosagePurchase.created_at)
     )).scalars().all()
 
+    # area_acres kept in the response for backwards compat with the
+    # earlier shape (acre-only subscriptions). scope_text is the
+    # authoritative label the PWA renders — includes "N acres" OR
+    # "N plants" depending on the practice's authoring unit.
     area = (
         float(sub.farm_area_acres)
         if sub.farm_area_acres is not None else None
     )
     out = []
     for r in rows:
-        kg = await compute_apply_kg(db, r)
+        result = await compute_apply_kg(db, r)
+        apply_kg = (round(result["apply_kg"], 2)
+                    if result and result.get("apply_kg") is not None
+                    else None)
+        scope_text = result.get("scope_text") if result else None
         out.append({
             "id": r.id,
             "trade_name_cosh_id": r.trade_name_cosh_id,
@@ -8811,7 +8819,8 @@ async def list_npk_purchases(
             "common_name_cosh_id": r.common_name_cosh_id,
             "product_role": r.product_role,
             "match_target": r.match_target,
-            "apply_kg": round(kg, 2) if kg is not None else None,
+            "apply_kg": apply_kg,
+            "scope_text": scope_text,
             "area_acres": area,
             "created_at": r.created_at,
         })
