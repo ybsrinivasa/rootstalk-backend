@@ -26,6 +26,7 @@ from app.services.npk_ranking import (
     compute_gap_after_mixed,
     enabled_straights as npk_enabled_straights,
     rank_mixed,
+    straight_kg_for_gap,
 )
 
 
@@ -33,6 +34,10 @@ NPK_L2_TYPES = frozenset({
     "CHEMICAL_FERTILIZERS_NPK_DOSAGES",
     "FERTIGATION_NPK_DOSAGES",
 })
+
+
+def _round_or_none(v: Optional[float]) -> Optional[float]:
+    return round(v, 2) if v is not None else None
 
 
 def _candidate_to_dict(cand) -> dict:
@@ -134,7 +139,19 @@ async def resolve_npk_options(
             }
             for r in ranked
         ],
-        "enabled_straights": [_candidate_to_dict(c) for c in straights],
+        "enabled_straights": [
+            {
+                **_candidate_to_dict(c),
+                # kg of this straight needed to close the gap for its
+                # one nutrient (None if the Straight's class doesn't
+                # match any remaining gap — shouldn't happen since
+                # npk_enabled_straights already filters, but defensive).
+                "kg_product_needed": _round_or_none(
+                    straight_kg_for_gap(c.concentration, gap),
+                ),
+            }
+            for c in straights
+        ],
         "gap": {"n": gap.n, "p": gap.p, "k": gap.k},
         "cosh_skipped_count": skipped,
     }
