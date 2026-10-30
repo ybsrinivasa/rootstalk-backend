@@ -8807,7 +8807,13 @@ async def list_npk_purchases(
     )
     out = []
     for r in rows:
-        result = await compute_apply_kg(db, r)
+        # Free-text brands never compute an apply quantity (no
+        # concentration data). compute_apply_kg handles this by
+        # returning None, so the UI just shows the brand + photo.
+        result = (
+            None if r.source == "FARMER_ENTERED"
+            else await compute_apply_kg(db, r)
+        )
         apply_kg = (round(result["apply_kg"], 2)
                     if result and result.get("apply_kg") is not None
                     else None)
@@ -8819,6 +8825,8 @@ async def list_npk_purchases(
             "common_name_cosh_id": r.common_name_cosh_id,
             "product_role": r.product_role,
             "match_target": r.match_target,
+            "source": r.source,
+            "photo_url": r.photo_url,
             "apply_kg": apply_kg,
             "scope_text": scope_text,
             "area_acres": area,
@@ -8903,35 +8911,85 @@ async def create_npk_purchase(
     else:
         match_target = None  # ignore any sent value for Straights
 
+    source = (body.get("source") or "COSH").strip().upper()
+    if source not in {"COSH", "FARMER_ENTERED"}:
+        raise HTTPException(status_code=422, detail="source invalid")
+
     cn_id = (body.get("common_name_cosh_id") or "").strip()
     tn_id = (body.get("trade_name_cosh_id") or "").strip()
     tn_display = (body.get("trade_name_display") or "").strip()
-    if not (cn_id and tn_id and tn_display):
-        raise HTTPException(
-            status_code=422,
-            detail="common_name_cosh_id, trade_name_cosh_id, trade_name_display required",
-        )
+    photo_url = (body.get("photo_url") or "").strip() or None
 
-    existing = (await db.execute(
-        select(NpkDosagePurchase).where(
-            NpkDosagePurchase.practice_id == practice_id,
-            NpkDosagePurchase.farmer_user_id == current_user.id,
-            NpkDosagePurchase.trade_name_cosh_id == tn_id,
+    if source == "COSH":
+        # Catalogued brand picked from the Brands drilldown — all three
+        # Cosh refs required.
+        if not (cn_id and tn_id and tn_display):
+            raise HTTPException(
+                status_code=422,
+                detail="common_name_cosh_id, trade_name_cosh_id, trade_name_display required",
+            )
+        # Idempotent on the brand.
+        existing = (await db.execute(
+            select(NpkDosagePurchase).where(
+                NpkDosagePurchase.practice_id == practice_id,
+                NpkDosagePurchase.farmer_user_id == current_user.id,
+                NpkDosagePurchase.trade_name_cosh_id == tn_id,
+            )
+        )).scalar_one_or_none()
+        if existing is not None:
+            return {"id": existing.id, "duplicate": True}
+        row = NpkDosagePurchase(
+            subscription_id=subscription_id,
+            practice_id=practice_id,
+            farmer_user_id=current_user.id,
+            common_name_cosh_id=cn_id or None,
+            trade_name_cosh_id=tn_id or None,
+            trade_name_display=tn_display[:200],
+            product_role=role,
+            match_target=match_target,
+            source="COSH",
+            photo_url=photo_url,
         )
-    )).scalar_one_or_none()
-    if existing is not None:
-        return {"id": existing.id, "duplicate": True}
+    else:
+        # FARMER_ENTERED — free-text brand not in Cosh. Only
+        # trade_name_display + photo (optional) matter; Cosh refs stay
+        # NULL. Also open a MissingBrandReport so SA can later add the
+        # brand to Cosh (same table the pesticide-side free-text flow
+        # uses; source='FARMER' distinguishes origin).
+        if not tn_display:
+            raise HTTPException(
+                status_code=422,
+                detail="trade_name_display required for FARMER_ENTERED",
+            )
+        row = NpkDosagePurchase(
+            subscription_id=subscription_id,
+            practice_id=practice_id,
+            farmer_user_id=current_user.id,
+            common_name_cosh_id=None,
+            trade_name_cosh_id=None,
+            trade_name_display=tn_display[:200],
+            product_role=role,
+            match_target=match_target,
+            source="FARMER_ENTERED",
+            photo_url=photo_url,
+        )
+        try:
+            from app.modules.orders.models import MissingBrandReport
+            report = MissingBrandReport(
+                dealer_user_id=current_user.id,
+                brand_name_reported=tn_display[:500],
+                photos=[photo_url] if photo_url else [],
+                source="FARMER",
+                l1_type="FERTILIZER",
+                l2_practice=practice.l2_type,
+            )
+            db.add(report)
+        except Exception as _e:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                f"MissingBrandReport (farmer NPK free-text) write failed: {_e}"
+            )
 
-    row = NpkDosagePurchase(
-        subscription_id=subscription_id,
-        practice_id=practice_id,
-        farmer_user_id=current_user.id,
-        common_name_cosh_id=cn_id,
-        trade_name_cosh_id=tn_id,
-        trade_name_display=tn_display[:200],
-        product_role=role,
-        match_target=match_target,
-    )
     db.add(row)
     await db.commit()
     await db.refresh(row)
