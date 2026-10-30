@@ -101,8 +101,33 @@ class MixedRanking:
     kg_product: float
 
 
+def is_npk_fertiliser(c: Concentration) -> bool:
+    """True iff this product carries at least one of N / P / K.
+
+    Phase 8d (2026-10-23) widened `load_fertiliser_candidates` to
+    return products with any-of-11 nutrient > 0 so the Soil Nutrient
+    engine could rank secondaries/micros per nutrient (Gypsum,
+    Zn-EDTA, Borax, etc.). The NPK ranking flow (`rank_mixed`,
+    `enabled_straights`, `straight_kg_for_gap`) only models the
+    three-nutrient space; feeding a pure-secondary product through
+    `classify_fertiliser` below would raise ValueError. Callers in
+    this module gate on this predicate first so non-NPK products are
+    silently skipped from the NPK flow — they still participate in
+    the Soil Nutrient engine's own per-nutrient ranking (which
+    doesn't go through this classifier).
+    """
+    return c.n > 0 or c.p > 0 or c.k > 0
+
+
 def classify_fertiliser(c: Concentration) -> FertiliserClass:
-    """Spec §1.1: Mixed = two or more nutrients; Straight = exactly one."""
+    """Spec §1.1: Mixed = two or more nutrients; Straight = exactly one.
+
+    Precondition: `is_npk_fertiliser(c)` is True. Callers inside this
+    module gate on that first; the ValueError is kept for anything
+    reaching this classifier with all-zero NPK by mistake, so a
+    future caller doesn't silently misclassify a pure-secondary
+    product.
+    """
     bits = (1 if c.n > 0 else 0) + (1 if c.p > 0 else 0) + (1 if c.k > 0 else 0)
     if bits >= 2:
         return "MIXED"
@@ -203,6 +228,8 @@ def rank_mixed(
     """
     out: list[MixedRanking] = []
     for cand in candidates:
+        if not is_npk_fertiliser(cand.concentration):
+            continue
         if classify_fertiliser(cand.concentration) != "MIXED":
             continue
         if water_soluble_only and not cand.water_soluble:
@@ -256,6 +283,8 @@ def enabled_straights(
     }
     out: list[Candidate] = []
     for cand in candidates:
+        if not is_npk_fertiliser(cand.concentration):
+            continue
         cls = classify_fertiliser(cand.concentration)
         if cls == "MIXED":
             continue
@@ -269,7 +298,11 @@ def enabled_straights(
 def straight_kg_for_gap(c: Concentration, gap: Dose) -> Optional[float]:
     """Given a Straight + the remaining gap, how many kg of product
     delivers exactly the gap of its one nutrient? `None` if the
-    Straight's nutrient isn't needed."""
+    Straight's nutrient isn't needed, or if the candidate carries no
+    NPK at all (pure-secondary product reached this helper via a
+    future caller that didn't gate on `is_npk_fertiliser`)."""
+    if not is_npk_fertiliser(c):
+        return None
     cls = classify_fertiliser(c)
     if cls == "STRAIGHT_N" and c.n > 0 and gap.n > 0:
         return 100.0 * gap.n / c.n

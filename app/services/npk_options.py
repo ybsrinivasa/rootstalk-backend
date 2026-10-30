@@ -25,6 +25,7 @@ from app.services.npk_ranking import (
     classify_fertiliser,
     compute_gap_after_mixed,
     enabled_straights as npk_enabled_straights,
+    is_npk_fertiliser,
     rank_mixed,
     straight_kg_for_gap,
 )
@@ -41,13 +42,22 @@ def _round_or_none(v: Optional[float]) -> Optional[float]:
 
 
 def _candidate_to_dict(cand) -> dict:
+    # Defensive: a pure-non-NPK candidate shouldn't reach here (both
+    # rank_mixed and enabled_straights gate on is_npk_fertiliser) but
+    # emit a stable "UNCLASSIFIED" rather than crashing if a future
+    # caller feeds us one.
+    cls = (
+        classify_fertiliser(cand.concentration)
+        if is_npk_fertiliser(cand.concentration)
+        else "UNCLASSIFIED"
+    )
     return {
         "cosh_id": cand.cosh_id,
         "name": cand.name,
         "n": cand.concentration.n,
         "p": cand.concentration.p,
         "k": cand.concentration.k,
-        "class": classify_fertiliser(cand.concentration),
+        "class": cls,
         "water_soluble": cand.water_soluble,
     }
 
