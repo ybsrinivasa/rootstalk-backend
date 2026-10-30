@@ -8594,6 +8594,166 @@ async def get_practice_brands_farmer(
     }
 
 
+@router.get(
+    "/farmer/subscriptions/{subscription_id}"
+    "/practices/{practice_id}/npk-brands",
+)
+async def get_practice_npk_brands_farmer(
+    subscription_id: str,
+    practice_id: str,
+    picked_mixed_cosh_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Farmer-facing NPK brands flow for Advisory-Only Mode. Mirrors
+    the dealer's `/dealer/orders/{oid}/items/{iid}/npk-options` shape
+    for the two NPK dosage L2 types (CHEMICAL_FERTILIZERS_NPK_DOSAGES,
+    FERTIGATION_NPK_DOSAGES) where the SE authored elemental N/P/K
+    numbers rather than a specific product. Delegates to the shared
+    `resolve_npk_options` resolver so dealer and farmer paths can't
+    drift agronomically.
+
+    Call pattern (same as dealer):
+      1. GET without `picked_mixed_cosh_id` → shows ranked Mixed list
+         + full enabled_straights (gap = full dose).
+      2. Farmer taps a Mixed → GET with that cosh_id → straights now
+         show only what's needed for the remaining gap.
+      3. Farmer taps a specific common name on either list → calls
+         `/npk-trade-names` below for branded options.
+
+    Response shape matches the dealer endpoint. `applications_
+    multiplier` is always 1 here — Advisory-Only Mode is per-
+    application viewing, not a procurement total (farmer buys their
+    own volume; no PO is created). Fertigation flag still signals
+    water-soluble filtering to the engine.
+
+    Auth: subscription must belong to current_user; subscription must
+    be in advisory_only_mode. Non-NPK practices return 400.
+    """
+    from app.services.npk_options import NPK_L2_TYPES, resolve_npk_options
+
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    if not sub.advisory_only_mode:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "brands_screen_advisory_only",
+                "message": (
+                    "The NPK Brands screen is only available for "
+                    "advisory-only subscriptions."
+                ),
+            },
+        )
+    practice = (await db.execute(
+        select(Practice).where(Practice.id == practice_id)
+    )).scalar_one_or_none()
+    if practice is None:
+        raise HTTPException(status_code=404, detail="Practice not found")
+    if practice.l2_type not in NPK_L2_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "not_an_npk_practice",
+                "message": "This practice is not an NPK dosage practice.",
+            },
+        )
+    return await resolve_npk_options(
+        db, practice,
+        picked_mixed_cosh_id=picked_mixed_cosh_id,
+        applications_multiplier=1,
+    )
+
+
+@router.get(
+    "/farmer/subscriptions/{subscription_id}"
+    "/practices/{practice_id}/npk-trade-names",
+)
+async def get_practice_npk_trade_names_farmer(
+    subscription_id: str,
+    practice_id: str,
+    common_name_cosh_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Trade names available for a picked NPK common name — farmer
+    view. Mirrors the dealer's `/dealer/orders/{oid}/items/{iid}/
+    npk-trade-names` shape but returns a flat list (farmer has no
+    "my brands" / dealership grouping). Branded options come from
+    the same Cosh walk as the dealer path.
+
+    Auth: subscription must belong to current_user; subscription must
+    be in advisory_only_mode. Non-NPK practices return 400.
+    """
+    from app.services.npk_options import NPK_L2_TYPES
+    from app.services.npk_trade_names import (
+        trade_names_for_chemical_npk,
+        trade_names_for_fertigation_npk,
+    )
+
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    if not sub.advisory_only_mode:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "brands_screen_advisory_only",
+                "message": (
+                    "The NPK Brands screen is only available for "
+                    "advisory-only subscriptions."
+                ),
+            },
+        )
+    practice = (await db.execute(
+        select(Practice).where(Practice.id == practice_id)
+    )).scalar_one_or_none()
+    if practice is None:
+        raise HTTPException(status_code=404, detail="Practice not found")
+    if practice.l2_type not in NPK_L2_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "not_an_npk_practice",
+                "message": "This practice is not an NPK dosage practice.",
+            },
+        )
+
+    fertigation = practice.l2_type == "FERTIGATION_NPK_DOSAGES"
+    lang = current_user.language_code or "en"
+    if fertigation:
+        rows = await trade_names_for_fertigation_npk(
+            db, common_name_cosh_id, lang=lang,
+        )
+    else:
+        rows = await trade_names_for_chemical_npk(
+            db, common_name_cosh_id, lang=lang,
+        )
+    return {
+        "common_name_cosh_id": common_name_cosh_id,
+        "fertigation": fertigation,
+        "trade_names": [
+            {
+                "cosh_id": tn_id,
+                "name": name,
+                "manufacturer_cosh_id": mfr,
+            }
+            for tn_id, name, mfr in rows
+        ],
+    }
+
+
 @router.get("/practices/{practice_id}/brands")
 async def get_practice_brands_author(
     practice_id: str,

@@ -9193,88 +9193,28 @@ async def get_item_npk_options(
             "gap": None, "cosh_skipped_count": 0,
         }
 
+    # 2026-10-30 — Core logic extracted to app/services/npk_options.py
+    # so dealer and farmer paths share one agronomic resolver. Dealer
+    # retains the Fertigation `applications_multiplier` so the PO can
+    # procure for the whole timeline; farmer path passes 1 (no PO).
     elements = (await db.execute(
         select(Element).where(Element.practice_id == practice.id)
     )).scalars().all()
     by_type = {e.element_type: e for e in elements}
 
-    def _val(et: str) -> float:
-        e = by_type.get(et) or by_type.get(et.upper()) or by_type.get(et.lower())
-        if e is None or e.value is None:
-            return 0.0
-        try:
-            return float(e.value)
-        except (TypeError, ValueError):
-            return 0.0
-
-    dose = Dose(n=_val("N_DOSAGE"), p=_val("P_DOSAGE"), k=_val("K_DOSAGE"))
     fertigation = practice.l2_type == "FERTIGATION_NPK_DOSAGES"
-
-    # 2026-07-13 — Real fertigation multiplier (spec §5.2). Replaces
-    # the pre-existing `by_type.get("applications")` lookup that
-    # never matched a real Element (see helper docstring).
     applications_multiplier = 1
     if fertigation:
         applications_multiplier = await _fertigation_multiplier_from_practice(
             db, practice, by_type,
         )
 
-    # Fertigation gate happens in the candidate loader (filters common
-    # names down to those with a trade name in `npk_fertigation_products`).
-    # `rank_mixed`'s `water_soluble_only` is then a no-op for this flow
-    # since every candidate is already approved — but we keep it on for
-    # belt-and-braces if a future loader stops gating.
-    candidates, skipped = await load_fertiliser_candidates(
-        db, fertigation=fertigation,
+    from app.services.npk_options import resolve_npk_options
+    return await resolve_npk_options(
+        db, practice,
+        picked_mixed_cosh_id=picked_mixed_cosh_id,
+        applications_multiplier=applications_multiplier,
     )
-    ranked = rank_mixed(
-        candidates, dose, water_soluble_only=fertigation,
-    )
-    # Resolve the dealer's pick (if any) against the ranked list so the
-    # gap is computed from the SAME MatchOutcome the dealer saw.
-    picked = None
-    if picked_mixed_cosh_id:
-        for r in ranked:
-            if r.candidate.cosh_id == picked_mixed_cosh_id:
-                picked = r
-                break
-
-    gap = compute_gap_after_mixed(dose, picked)
-    straights = npk_enabled_straights(
-        gap, candidates, water_soluble_only=fertigation,
-    )
-    straights.sort(key=lambda c: c.name.lower())  # alphabetical per spec §3.1
-
-    return {
-        "is_npk_practice": True,
-        "fertigation": fertigation,
-        "applications_multiplier": applications_multiplier,
-        "required_dose": {"n": dose.n, "p": dose.p, "k": dose.k},
-        "ranked_mixed": [
-            {
-                "cosh_id": r.candidate.cosh_id,
-                "name": r.candidate.name,
-                "n": r.candidate.concentration.n,
-                "p": r.candidate.concentration.p,
-                "k": r.candidate.concentration.k,
-                # `kg_product` is per-application for the ranking display.
-                # `kg_product_total` is what the dealer actually buys.
-                "kg_product": round(r.kg_product, 2),
-                "kg_product_total": round(r.kg_product * applications_multiplier, 2),
-                "delivered": {
-                    "n": round(r.best.n_delivered, 2),
-                    "p": round(r.best.p_delivered, 2),
-                    "k": round(r.best.k_delivered, 2),
-                },
-                "match_target": r.best.target,
-                "total_delivered": round(r.total_delivered, 2),
-            }
-            for r in ranked
-        ],
-        "enabled_straights": [_candidate_to_dict(c) for c in straights],
-        "gap": {"n": gap.n, "p": gap.p, "k": gap.k},
-        "cosh_skipped_count": skipped,
-    }
 
 
 # ── Dealer: NPK trade-name picker (Batch 30B) ─────────────────────────────────
