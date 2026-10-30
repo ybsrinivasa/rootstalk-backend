@@ -411,13 +411,24 @@ class NpkDosagePurchase(Base):
     farmer_user_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("users.id"), nullable=False,
     )
-    common_name_cosh_id: Mapped[str] = mapped_column(String(36), nullable=False)
-    trade_name_cosh_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    # 2026-10-30 — free-text brand entry (farmer types a brand not in
+    # Cosh): common_name / trade_name cosh_ids are null; the typed
+    # name lives in trade_name_display; source='FARMER_ENTERED';
+    # photo_url carries the uploaded bag label.
+    common_name_cosh_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    trade_name_cosh_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     trade_name_display: Mapped[str] = mapped_column(String(200), nullable=False)
     # 'MIXED' | 'STRAIGHT_N' | 'STRAIGHT_P' | 'STRAIGHT_K'
     product_role: Mapped[str] = mapped_column(String(20), nullable=False)
     # 'N' | 'P' | 'K' — only for MIXED rows; mirrors rank_mixed's match_target.
     match_target: Mapped[str] = mapped_column(String(4), nullable=True)
+    # 'COSH' (catalogued brand picked from the Brands drilldown) |
+    # 'FARMER_ENTERED' (free-text, no Cosh refs, no apply_kg).
+    source: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="COSH", server_default="COSH",
+    )
+    # S3 URL of a bag-label photo, when the farmer uploaded one.
+    photo_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow,
     )
