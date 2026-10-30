@@ -8754,6 +8754,212 @@ async def get_practice_npk_trade_names_farmer(
     }
 
 
+# ── NPK Dosage per-brand purchase records (2026-10-30) ────────────────────
+
+
+_NPK_PURCHASE_ROLES = {"MIXED", "STRAIGHT_N", "STRAIGHT_P", "STRAIGHT_K"}
+_NPK_MATCH_TARGETS = {"N", "P", "K"}
+
+
+@router.get(
+    "/farmer/subscriptions/{subscription_id}"
+    "/practices/{practice_id}/npk-purchases",
+)
+async def list_npk_purchases(
+    subscription_id: str,
+    practice_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List all per-brand purchase records the farmer has made against
+    this NPK Dosage practice, each enriched with the computed kg to
+    apply across their farm area ("Apply ~X kg of [brand] for your N
+    acres"). `apply_kg` is null when any input (farm_area_acres,
+    Cosh concentration, match_target) is unresolvable — PWA renders
+    only the brand line in that case."""
+    from app.modules.subscriptions.models import NpkDosagePurchase
+    from app.services.npk_purchase_qty import compute_apply_kg
+
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    rows = (await db.execute(
+        select(NpkDosagePurchase).where(
+            NpkDosagePurchase.subscription_id == subscription_id,
+            NpkDosagePurchase.practice_id == practice_id,
+            NpkDosagePurchase.farmer_user_id == current_user.id,
+        ).order_by(NpkDosagePurchase.created_at)
+    )).scalars().all()
+
+    area = (
+        float(sub.farm_area_acres)
+        if sub.farm_area_acres is not None else None
+    )
+    out = []
+    for r in rows:
+        kg = await compute_apply_kg(db, r)
+        out.append({
+            "id": r.id,
+            "trade_name_cosh_id": r.trade_name_cosh_id,
+            "trade_name_display": r.trade_name_display,
+            "common_name_cosh_id": r.common_name_cosh_id,
+            "product_role": r.product_role,
+            "match_target": r.match_target,
+            "apply_kg": round(kg, 2) if kg is not None else None,
+            "area_acres": area,
+            "created_at": r.created_at,
+        })
+    return {"purchases": out}
+
+
+@router.post(
+    "/farmer/subscriptions/{subscription_id}"
+    "/practices/{practice_id}/npk-purchases",
+    status_code=201,
+)
+async def create_npk_purchase(
+    subscription_id: str,
+    practice_id: str,
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Record that the farmer has bought a specific brand against this
+    NPK Dosage practice.
+
+    Body shape:
+      {
+        "common_name_cosh_id": "<...>",
+        "trade_name_cosh_id":  "<...>",
+        "trade_name_display":  "<brand name as rendered>",
+        "product_role":        "MIXED" | "STRAIGHT_N" | "STRAIGHT_P" | "STRAIGHT_K",
+        "match_target":        "N" | "P" | "K"   # required when product_role=MIXED
+      }
+
+    Idempotent on (practice_id, farmer_user_id, trade_name_cosh_id)
+    via unique constraint — a duplicate POST returns 409 with the
+    existing row's id so the PWA can tick the brand as already-bought."""
+    from app.modules.subscriptions.models import NpkDosagePurchase
+    from app.services.npk_options import NPK_L2_TYPES
+
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    if not sub.advisory_only_mode:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "advisory_only_only",
+                "message": (
+                    "NPK purchase records are only recorded for "
+                    "advisory-only subscriptions."
+                ),
+            },
+        )
+    practice = (await db.execute(
+        select(Practice).where(Practice.id == practice_id)
+    )).scalar_one_or_none()
+    if practice is None:
+        raise HTTPException(status_code=404, detail="Practice not found")
+    if practice.l2_type not in NPK_L2_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "not_an_npk_practice",
+                "message": "This practice is not an NPK dosage practice.",
+            },
+        )
+
+    role = (body.get("product_role") or "").strip()
+    if role not in _NPK_PURCHASE_ROLES:
+        raise HTTPException(status_code=422, detail="product_role invalid")
+    match_target = (body.get("match_target") or "").strip() or None
+    if role == "MIXED":
+        if match_target not in _NPK_MATCH_TARGETS:
+            raise HTTPException(
+                status_code=422,
+                detail="match_target (N/P/K) required for MIXED role",
+            )
+    else:
+        match_target = None  # ignore any sent value for Straights
+
+    cn_id = (body.get("common_name_cosh_id") or "").strip()
+    tn_id = (body.get("trade_name_cosh_id") or "").strip()
+    tn_display = (body.get("trade_name_display") or "").strip()
+    if not (cn_id and tn_id and tn_display):
+        raise HTTPException(
+            status_code=422,
+            detail="common_name_cosh_id, trade_name_cosh_id, trade_name_display required",
+        )
+
+    existing = (await db.execute(
+        select(NpkDosagePurchase).where(
+            NpkDosagePurchase.practice_id == practice_id,
+            NpkDosagePurchase.farmer_user_id == current_user.id,
+            NpkDosagePurchase.trade_name_cosh_id == tn_id,
+        )
+    )).scalar_one_or_none()
+    if existing is not None:
+        return {"id": existing.id, "duplicate": True}
+
+    row = NpkDosagePurchase(
+        subscription_id=subscription_id,
+        practice_id=practice_id,
+        farmer_user_id=current_user.id,
+        common_name_cosh_id=cn_id,
+        trade_name_cosh_id=tn_id,
+        trade_name_display=tn_display[:200],
+        product_role=role,
+        match_target=match_target,
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return {"id": row.id, "duplicate": False}
+
+
+@router.delete(
+    "/farmer/subscriptions/{subscription_id}"
+    "/practices/{practice_id}/npk-purchases/{purchase_id}",
+    status_code=204,
+)
+async def delete_npk_purchase(
+    subscription_id: str,
+    practice_id: str,
+    purchase_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Farmer removes a brand from their purchase record for this
+    practice (e.g., they changed their mind before actually buying)."""
+    from app.modules.subscriptions.models import NpkDosagePurchase
+
+    row = (await db.execute(
+        select(NpkDosagePurchase).where(
+            NpkDosagePurchase.id == purchase_id,
+            NpkDosagePurchase.practice_id == practice_id,
+            NpkDosagePurchase.subscription_id == subscription_id,
+            NpkDosagePurchase.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Purchase record not found")
+    await db.delete(row)
+    await db.commit()
+    return
+
+
 @router.get("/practices/{practice_id}/brands")
 async def get_practice_brands_author(
     practice_id: str,

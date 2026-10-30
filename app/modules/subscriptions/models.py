@@ -384,3 +384,47 @@ class EnterpriseLicense(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow,
     )
+
+
+class NpkDosagePurchase(Base):
+    """Per-brand purchase record for an NPK Dosage practice (2026-10-30).
+
+    Advisory-Only Mode NPK Dosage practices invite multiple product
+    purchases per practice (Mixed + Straights for the gap). This
+    sibling to the single-brand `purchased_brand_cosh_id` ack holds
+    one row per brand the farmer has confirmed buying for a given
+    practice. Service layer computes "apply ~X kg of [brand] for
+    your N acres" by combining this row + subscription area +
+    Cosh concentration for the common_name.
+    """
+    __tablename__ = "npk_dosage_purchases"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    subscription_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("subscriptions.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    practice_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("practices.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    farmer_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=False,
+    )
+    common_name_cosh_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    trade_name_cosh_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    trade_name_display: Mapped[str] = mapped_column(String(200), nullable=False)
+    # 'MIXED' | 'STRAIGHT_N' | 'STRAIGHT_P' | 'STRAIGHT_K'
+    product_role: Mapped[str] = mapped_column(String(20), nullable=False)
+    # 'N' | 'P' | 'K' — only for MIXED rows; mirrors rank_mixed's match_target.
+    match_target: Mapped[str] = mapped_column(String(4), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "practice_id", "farmer_user_id", "trade_name_cosh_id",
+            name="uq_npk_dosage_purchase_brand_per_practice",
+        ),
+    )
