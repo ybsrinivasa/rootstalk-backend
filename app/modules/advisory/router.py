@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.dependencies import get_current_user
@@ -2240,16 +2240,51 @@ async def delete_client_variable(
                 "code": "min_two_variables",
                 "message": "A CUSTOM Parameter must have at least 2 variables.",
             })
-    in_use = (await db.execute(
-        select(PackageVariable).where(
-            PackageVariable.variable_id == variable_id,
-        ).limit(1)
-    )).scalar_one_or_none()
-    if in_use is not None:
+    # 2026-11-03 — enumerate blocking packages (name + status) instead
+    # of just checking existence. The SE needs to know which signatures
+    # to clear, and whether a listed package is DRAFT (safe to edit),
+    # ACTIVE (changes land on subscribed farmers), or INACTIVE (changes
+    # may affect historical subs that still render from the current
+    # signature — subs store only package_id, not a snapshot of the
+    # signature values, so pulling a variable silently gaps the
+    # farmer's "For Your Situation" screen).
+    blocking = (await db.execute(
+        select(Package.id, Package.name, Package.status)
+        .join(PackageVariable, PackageVariable.package_id == Package.id)
+        .where(PackageVariable.variable_id == variable_id)
+        .distinct()
+    )).all()
+    if blocking:
+        pkgs = [
+            {
+                "id": p.id,
+                "name": p.name,
+                "status": (p.status.value if hasattr(p.status, "value")
+                           else str(p.status)),
+            }
+            for p in blocking
+        ]
         raise HTTPException(status_code=422, detail={
             "code": "variable_in_use",
-            "message": "Variable is in use by one or more Package signatures. Clear those signatures first.",
+            "message": (
+                f"Variable is in use by {len(pkgs)} Package "
+                f"signature{'s' if len(pkgs) != 1 else ''}. "
+                "Clear the signature in each package first."
+            ),
+            "packages": pkgs,
         })
+    # Variable has dependent VariableTranslation rows (one per supported
+    # language, written by the auto-translate Celery task fired at
+    # create). The FK has no ondelete cascade and the ORM relationship
+    # has no cascade either, so `db.delete(var)` without this cleanup
+    # would surface as a FK IntegrityError at commit time → surfaces as
+    # a bare 500 on the client (the first-cohort CM saw "Failed to
+    # delete variable." with no detail, 2026-11-03).
+    await db.execute(
+        delete(VariableTranslation).where(
+            VariableTranslation.variable_id == variable_id,
+        )
+    )
     await db.delete(var)
     await db.commit()
 
