@@ -1919,6 +1919,7 @@ async def set_package_authors(
 @router.get("/client/{client_id}/parameters")
 async def list_parameters(
     client_id: str, crop_cosh_id: str,
+    package_id: str | None = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1938,23 +1939,48 @@ async def list_parameters(
     crop's P-V saw an empty list until SA pre-warmed it (every fresh
     crop on prod was unmirrored). The auto-ensure is idempotent and
     cheap on warm crops; first read per crop pays the ~1s Connect
-    walk + insert."""
+    walk + insert.
+
+    2026-11-03 — `package_id` controls INACTIVE visibility:
+      • omitted (default)  → return ALL (ACTIVE + INACTIVE). The
+        Custom Parameters admin page uses this; the SE needs to see
+        inactive rows to reactivate them.
+      • set to a package id → return ACTIVE parameters PLUS any
+        INACTIVE ones that are already in THIS package's signature
+        (so an earlier assignment is still visible and the SE can
+        clear it). INACTIVE parameters not used by this package
+        are hidden — the ask the first-cohort CM raised was that a
+        deactivated custom parameter kept appearing in new packages
+        because the earlier filterless list returned them all."""
     await _assert_can_view_client_advisory(db, current_user.id, client_id)
     from sqlalchemy import and_, or_
     from app.modules.advisory.models import ParameterSource
     from app.services.cosh_pv_view import ensure_local_parameters_for_crop
     await ensure_local_parameters_for_crop(db, crop_cosh_id)
-    result = await db.execute(
-        select(Parameter).where(
-            Parameter.crop_cosh_id == crop_cosh_id,
-            or_(
-                Parameter.client_id == client_id,
-                and_(
-                    Parameter.client_id == None,  # noqa: E711
-                    Parameter.source == ParameterSource.COSH,
-                ),
+    where_clauses = [
+        Parameter.crop_cosh_id == crop_cosh_id,
+        or_(
+            Parameter.client_id == client_id,
+            and_(
+                Parameter.client_id == None,  # noqa: E711
+                Parameter.source == ParameterSource.COSH,
             ),
-        ).order_by(Parameter.display_order)
+        ),
+    ]
+    if package_id is not None:
+        signature_param_ids = (
+            select(PackageVariable.parameter_id)
+            .where(PackageVariable.package_id == package_id)
+            .scalar_subquery()
+        )
+        where_clauses.append(
+            or_(
+                Parameter.status == "ACTIVE",
+                Parameter.id.in_(signature_param_ids),
+            )
+        )
+    result = await db.execute(
+        select(Parameter).where(*where_clauses).order_by(Parameter.display_order)
     )
     return result.scalars().all()
 
