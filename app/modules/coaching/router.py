@@ -1008,7 +1008,7 @@ async def list_student_portfolios(
         # Include the user's display name for the SA Portal list row.
         user = await db.get(User, p.user_id)
         row = _portfolio_response(p, cvs)
-        row["student_name"] = (user.full_name if user else None) or (
+        row["student_name"] = (user.name if user else None) or (
             user.email if user else None
         )
         row["student_email"] = user.email if user else None
