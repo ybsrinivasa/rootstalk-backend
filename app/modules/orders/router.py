@@ -8262,6 +8262,49 @@ async def update_brand_report(
     return {"id": report_id, "status": report.status}
 
 
+@router.delete("/admin/missing-brand-reports/{report_id}", status_code=204)
+async def delete_brand_report(
+    report_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """2026-11-04 — hard-delete a REJECTED brand report so the SA can
+    prune training/testing noise from the Reviewed list. Guard:
+
+      • Same gate as the review endpoint (SA, or CM with the
+        BRAND_HANDLING privilege).
+      • Only REJECTED rows are deletable. APPROVED rows are historical
+        evidence that a brand entered the Cosh catalogue via SA
+        curation — removing them would obscure that provenance.
+        PENDING / REVIEWED rows still need the SA's judgement and
+        shouldn't be hard-deleted sight-unseen.
+
+    MissingBrandReport has no inbound FK references (`order_item_id`
+    is outbound, nullable), so the delete is a clean row-drop with no
+    cascading side-effects.
+    """
+    from app.modules.advisory.router import _assert_sa_or_privileged_cm
+    await _assert_sa_or_privileged_cm(db, current_user, "BRAND_HANDLING")
+    report = (await db.execute(
+        select(MissingBrandReport).where(MissingBrandReport.id == report_id)
+    )).scalar_one_or_none()
+    if report is None:
+        raise HTTPException(status_code=404, detail="Report not found")
+    if report.status != "REJECTED":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "only_rejected_deletable",
+                "message": (
+                    "Only REJECTED brand reports can be deleted. "
+                    "Reject this one first if you intend to prune it."
+                ),
+            },
+        )
+    await db.delete(report)
+    await db.commit()
+
+
 # ── Dealer Brand Forms — dashboard-launched standalone submissions ──
 
 def _brand_form_to_dict(r: MissingBrandReport) -> dict:
