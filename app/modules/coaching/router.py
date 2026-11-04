@@ -10,16 +10,16 @@ session (unless SA).
 """
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select, update
 
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.modules.coaching import service as coaching_service
 from app.modules.coaching.models import (
     CoachingSession, CoachingSessionStatus, CoachingStudent,
-    CoachingStudentInvite,
+    CoachingStudentInvite, StudentCV, StudentPortfolio,
 )
 from app.modules.coaching.schemas import (
     AssignPwaRolesRequest, CertificatePublicView, CertifiedRecord,
@@ -635,3 +635,417 @@ async def certify_student(
         certified=request.certified, grade=request.grade,
     )
     return await coaching_service.load_session_detail(db, session)
+
+
+# ── Student portfolio (2026-11-04) ────────────────────────────────────────
+#
+# PWA endpoints under /me/portfolio let a CERTIFIED coaching student build
+# up two things:
+#   - Testimonial profile: photo + short video + written testimonial, each
+#     opt-in for marketing use via its own consent flag.
+#   - Hiring profile: a versioned CV + employment status + an opt-in to
+#     share the CV with partner companies.
+#
+# SA Portal endpoints under /coaching/portfolios expose the aggregated
+# view so the SA / coach can collect testimonials and forward CVs.
+#
+# Gate for the student side: at least one CoachingStudent row for this
+# user_id with certified_at IS NOT NULL. Uncertifying a student re-closes
+# the surface without touching their uploaded data.
+
+
+_PORTFOLIO_UPLOAD_SPECS = {
+    # (folder, allowed_types, max_bytes)
+    "photo": ("portfolio-photos", "IMAGE", 10 * 1024 * 1024),
+    "video": ("portfolio-videos", "VIDEO", 100 * 1024 * 1024),
+    "cv":    ("portfolio-cvs",    "PDF",   10 * 1024 * 1024),
+}
+
+
+async def _require_certified_student(
+    db: AsyncSession, user_id: str,
+) -> None:
+    """403 unless the caller has at least one CoachingStudent row where
+    certified_at IS NOT NULL. Portfolio surfaces are earned-after-cert;
+    uncertifying re-closes them without touching uploads."""
+    row = (await db.execute(
+        select(CoachingStudent.id).where(
+            CoachingStudent.user_id == user_id,
+            CoachingStudent.certified_at.isnot(None),
+        ).limit(1)
+    )).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "portfolio_requires_certification",
+                "message": (
+                    "The portfolio surface is available after you've "
+                    "been certified on a coaching session."
+                ),
+            },
+        )
+
+
+async def _get_or_create_portfolio(
+    db: AsyncSession, user_id: str,
+) -> StudentPortfolio:
+    """Lazy singleton — returns the user's portfolio row, inserting a
+    blank one on first access so callers never have to branch on None."""
+    row = (await db.execute(
+        select(StudentPortfolio).where(StudentPortfolio.user_id == user_id)
+    )).scalar_one_or_none()
+    if row is None:
+        row = StudentPortfolio(user_id=user_id)
+        db.add(row)
+        await db.commit()
+        await db.refresh(row)
+    return row
+
+
+def _portfolio_response(
+    portfolio: StudentPortfolio, cvs: list[StudentCV],
+) -> dict:
+    """Shape shared by GET /me/portfolio and GET /coaching/portfolios/
+    {user_id}. Flat so the PWA / SA Portal can bind directly."""
+    return {
+        "user_id": portfolio.user_id,
+        "photo_url": portfolio.photo_url,
+        "video_url": portfolio.video_url,
+        "testimonial_text": portfolio.testimonial_text,
+        "marketing_consent_photo": portfolio.marketing_consent_photo,
+        "marketing_consent_video": portfolio.marketing_consent_video,
+        "marketing_consent_testimonial": portfolio.marketing_consent_testimonial,
+        "is_employed": portfolio.is_employed,
+        "employer_name": portfolio.employer_name,
+        "employed_since": (
+            portfolio.employed_since.isoformat()
+            if portfolio.employed_since else None
+        ),
+        "is_open_to_offers": portfolio.is_open_to_offers,
+        "open_to_offers_notes": portfolio.open_to_offers_notes,
+        "hiring_consent_share_cv": portfolio.hiring_consent_share_cv,
+        "cvs": [
+            {
+                "id": cv.id,
+                "file_url": cv.file_url,
+                "filename": cv.filename,
+                "is_latest": cv.is_latest,
+                "uploaded_at": cv.uploaded_at.isoformat(),
+            }
+            for cv in cvs
+        ],
+        "updated_at": portfolio.updated_at.isoformat(),
+    }
+
+
+async def _load_cvs(db: AsyncSession, user_id: str) -> list[StudentCV]:
+    return (await db.execute(
+        select(StudentCV)
+        .where(StudentCV.user_id == user_id)
+        .order_by(StudentCV.uploaded_at.desc())
+    )).scalars().all()
+
+
+@router.get("/me/portfolio-eligible")
+async def portfolio_eligible(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cheap probe for the PWA Profile page: does this caller have a
+    CoachingStudent row with certified_at IS NOT NULL? Drives the
+    "My Portfolio" tile's visibility without the PWA having to catch
+    403s from the main portfolio endpoint. Returns `{eligible: bool}`."""
+    row = (await db.execute(
+        select(CoachingStudent.id).where(
+            CoachingStudent.user_id == current_user.id,
+            CoachingStudent.certified_at.isnot(None),
+        ).limit(1)
+    )).scalar_one_or_none()
+    return {"eligible": row is not None}
+
+
+@router.get("/me/portfolio")
+async def get_my_portfolio(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return this student's portfolio, creating a blank row on first
+    read. Gated on certification."""
+    await _require_certified_student(db, current_user.id)
+    portfolio = await _get_or_create_portfolio(db, current_user.id)
+    cvs = await _load_cvs(db, current_user.id)
+    return _portfolio_response(portfolio, cvs)
+
+
+@router.put("/me/portfolio/marketing")
+async def update_my_portfolio_marketing(
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Patch the marketing-facing fields: photo/video/testimonial URLs +
+    the three per-asset consent flags. The PWA uploads a file via
+    POST /me/portfolio/upload (which returns a URL), then PUTs the URL
+    here — keeps the upload-vs-state concerns separate."""
+    await _require_certified_student(db, current_user.id)
+    portfolio = await _get_or_create_portfolio(db, current_user.id)
+    for field in (
+        "photo_url", "video_url", "testimonial_text",
+        "marketing_consent_photo", "marketing_consent_video",
+        "marketing_consent_testimonial",
+    ):
+        if field in body:
+            setattr(portfolio, field, body[field])
+    await db.commit()
+    await db.refresh(portfolio)
+    cvs = await _load_cvs(db, current_user.id)
+    return _portfolio_response(portfolio, cvs)
+
+
+@router.put("/me/portfolio/employment")
+async def update_my_portfolio_employment(
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Patch the hiring-facing fields: is_employed + employer_name +
+    employed_since, is_open_to_offers + open_to_offers_notes, and the
+    hiring_consent_share_cv flag. employed-but-looking is legal — both
+    is_employed and is_open_to_offers may be true."""
+    await _require_certified_student(db, current_user.id)
+    portfolio = await _get_or_create_portfolio(db, current_user.id)
+    from datetime import date as _date
+    for field in (
+        "is_employed", "employer_name", "is_open_to_offers",
+        "open_to_offers_notes", "hiring_consent_share_cv",
+    ):
+        if field in body:
+            setattr(portfolio, field, body[field])
+    if "employed_since" in body:
+        val = body["employed_since"]
+        if val is None or val == "":
+            portfolio.employed_since = None
+        else:
+            try:
+                portfolio.employed_since = _date.fromisoformat(val)
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=422,
+                    detail="employed_since must be YYYY-MM-DD.",
+                )
+    await db.commit()
+    await db.refresh(portfolio)
+    cvs = await _load_cvs(db, current_user.id)
+    return _portfolio_response(portfolio, cvs)
+
+
+@router.post("/me/portfolio/upload")
+async def upload_my_portfolio_asset(
+    asset_type: str,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Upload a photo or short video to S3 and return the URL. Caller
+    then PUTs the URL into /me/portfolio/marketing. For CV uploads use
+    POST /me/portfolio/cv instead — that endpoint also records the
+    StudentCV row + flips is_latest."""
+    await _require_certified_student(db, current_user.id)
+    if asset_type not in ("photo", "video"):
+        raise HTTPException(
+            status_code=422,
+            detail="asset_type must be 'photo' or 'video'. For CVs POST to /me/portfolio/cv.",
+        )
+    folder, kind, cap = _PORTFOLIO_UPLOAD_SPECS[asset_type]
+    from app.modules.media.router import (
+        IMAGE_CONTENT_TYPES, VIDEO_CONTENT_TYPES, upload_to_s3,
+    )
+    allowed = IMAGE_CONTENT_TYPES if kind == "IMAGE" else VIDEO_CONTENT_TYPES
+    return await upload_to_s3(
+        file, folder, allowed_types=allowed, max_size_bytes=cap,
+    )
+
+
+@router.post("/me/portfolio/cv", status_code=201)
+async def upload_my_cv(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Upload a new CV PDF. Flips `is_latest=false` on the previous
+    latest row and inserts the new row with `is_latest=true`. The
+    partial unique index enforces at most one latest row per user — a
+    concurrent duplicate insert would bounce at the DB level, so the
+    flip-then-insert sequence is race-safe."""
+    await _require_certified_student(db, current_user.id)
+    folder, _kind, cap = _PORTFOLIO_UPLOAD_SPECS["cv"]
+    from app.modules.media.router import DOCUMENT_CONTENT_TYPES, upload_to_s3
+    result = await upload_to_s3(
+        file, folder,
+        allowed_types=DOCUMENT_CONTENT_TYPES,  # PDF-only
+        max_size_bytes=cap,
+    )
+    await db.execute(
+        update(StudentCV)
+        .where(
+            StudentCV.user_id == current_user.id,
+            StudentCV.is_latest.is_(True),
+        )
+        .values(is_latest=False)
+    )
+    row = StudentCV(
+        user_id=current_user.id,
+        file_url=result["url"],
+        filename=(file.filename or "cv.pdf")[:500],
+        is_latest=True,
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return {
+        "id": row.id,
+        "file_url": row.file_url,
+        "filename": row.filename,
+        "is_latest": row.is_latest,
+        "uploaded_at": row.uploaded_at.isoformat(),
+    }
+
+
+@router.delete("/me/portfolio/cv/{cv_id}", status_code=204)
+async def delete_my_cv(
+    cv_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete one CV version. If it was the latest, the next-most-
+    recent remaining CV is promoted to `is_latest=true` so the SA
+    portal still has a current CV to forward. If no CVs remain, the
+    student's portfolio simply shows an empty CV list — unchanged
+    consent flag stays as the student set it (they may upload a new
+    CV later)."""
+    await _require_certified_student(db, current_user.id)
+    row = (await db.execute(
+        select(StudentCV).where(
+            StudentCV.id == cv_id,
+            StudentCV.user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="CV not found")
+    was_latest = row.is_latest
+    await db.delete(row)
+    await db.flush()
+    if was_latest:
+        next_latest = (await db.execute(
+            select(StudentCV)
+            .where(StudentCV.user_id == current_user.id)
+            .order_by(StudentCV.uploaded_at.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+        if next_latest is not None:
+            next_latest.is_latest = True
+    await db.commit()
+
+
+# ── SA Portal — browse / forward portfolios ──────────────────────────────
+
+
+@router.get("/portfolios")
+async def list_student_portfolios(
+    has_testimonial: Optional[bool] = None,
+    has_cv: Optional[bool] = None,
+    shared_cv_consent: Optional[bool] = None,
+    is_open_to_offers: Optional[bool] = None,
+    is_employed: Optional[bool] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_coach_or_sa),
+):
+    """SA/coach view. Lists certified students with their portfolio +
+    latest CV, filterable so the SA can shortlist (e.g. "all open-to-
+    offers students who have shared their CV")."""
+    # Only students who ever got certified are eligible to have a
+    # portfolio visible here. If a user had multiple cohorts, dedupe
+    # by user_id.
+    cert_user_ids_subq = (
+        select(CoachingStudent.user_id)
+        .where(CoachingStudent.certified_at.isnot(None))
+        .distinct()
+        .scalar_subquery()
+    )
+    q = select(StudentPortfolio).where(
+        StudentPortfolio.user_id.in_(cert_user_ids_subq)
+    )
+    if has_testimonial is True:
+        q = q.where(StudentPortfolio.testimonial_text.isnot(None))
+        q = q.where(StudentPortfolio.testimonial_text != "")
+    elif has_testimonial is False:
+        q = q.where(
+            or_(
+                StudentPortfolio.testimonial_text.is_(None),
+                StudentPortfolio.testimonial_text == "",
+            )
+        )
+    if shared_cv_consent is not None:
+        q = q.where(
+            StudentPortfolio.hiring_consent_share_cv == shared_cv_consent
+        )
+    if is_open_to_offers is not None:
+        q = q.where(
+            StudentPortfolio.is_open_to_offers == is_open_to_offers
+        )
+    if is_employed is not None:
+        q = q.where(StudentPortfolio.is_employed == is_employed)
+    portfolios = (await db.execute(q)).scalars().all()
+    # Optionally also require at least one CV on file.
+    results: list[dict] = []
+    for p in portfolios:
+        cvs = await _load_cvs(db, p.user_id)
+        if has_cv is True and not cvs:
+            continue
+        if has_cv is False and cvs:
+            continue
+        # Include the user's display name for the SA Portal list row.
+        user = await db.get(User, p.user_id)
+        row = _portfolio_response(p, cvs)
+        row["student_name"] = (user.full_name if user else None) or (
+            user.email if user else None
+        )
+        row["student_email"] = user.email if user else None
+        results.append(row)
+    return results
+
+
+@router.get("/portfolios/{user_id}")
+async def get_student_portfolio(
+    user_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_coach_or_sa),
+):
+    """Detailed view of one certified student's portfolio."""
+    # Confirm this user_id was ever certified — avoids leaking a
+    # portfolio built up by someone who was never a student.
+    cert = (await db.execute(
+        select(CoachingStudent.id).where(
+            CoachingStudent.user_id == user_id,
+            CoachingStudent.certified_at.isnot(None),
+        ).limit(1)
+    )).scalar_one_or_none()
+    if cert is None:
+        raise HTTPException(status_code=404, detail="Student not found")
+    portfolio = (await db.execute(
+        select(StudentPortfolio).where(StudentPortfolio.user_id == user_id)
+    )).scalar_one_or_none()
+    if portfolio is None:
+        # Student is certified but has not opened their portfolio yet.
+        # Return an empty-but-valid shape so the SA Portal can render
+        # without branching.
+        portfolio = StudentPortfolio(user_id=user_id)
+    cvs = await _load_cvs(db, user_id)
+    user = await db.get(User, user_id)
+    row = _portfolio_response(portfolio, cvs)
+    row["student_name"] = (user.full_name if user else None) or (
+        user.email if user else None
+    )
+    row["student_email"] = user.email if user else None
+    return row
