@@ -8186,6 +8186,12 @@ async def list_missing_brand_reports(
     """SA / privileged CM: list every brand submission. Response is
     enriched with the dealer's name + phone so the SA can call for
     clarification without a second round-trip.
+
+    2026-11-04 — summary-only shape. The heavy fields (manufacturer,
+    l1/l2 taxonomy, additional_info, photos) move to the detail
+    endpoint so the list stays light as the archive grows. The SA
+    Portal expands individual rows to lazy-fetch detail; see
+    GET /admin/missing-brand-reports/{report_id} below.
     """
     rows = (await db.execute(
         select(MissingBrandReport).order_by(MissingBrandReport.created_at.desc())
@@ -8212,19 +8218,55 @@ async def list_missing_brand_reports(
             # (v2 Checkbox 3 arc). Column has been present + backfilled
             # DEALER for legacy rows since c8b4d7f2e691.
             "source": r.source.value if hasattr(r.source, "value") else r.source,
-            "order_item_id": r.order_item_id,
             "brand_name_reported": r.brand_name_reported,
-            "manufacturer_name": r.manufacturer_name,
-            "l1_type": r.l1_type,
-            "l2_practice": r.l2_practice,
-            "additional_info": r.additional_info,
-            "photos": r.photos or [],
             "status": r.status,
             "cm_notes": r.cm_notes,
             "reviewed_at": r.reviewed_at,
             "created_at": r.created_at,
         })
     return out
+
+
+@router.get("/admin/missing-brand-reports/{report_id}")
+async def get_missing_brand_report(
+    report_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """2026-11-04 — detail fetch, fired by the SA Portal when the user
+    expands a row. Carries the fields the list endpoint drops
+    (manufacturer, l1/l2 taxonomy, additional_info, photos,
+    order_item_id) plus the dealer-name / dealer-phone pair so the
+    detail panel can render standalone without re-reading list state.
+    """
+    from app.modules.advisory.router import _assert_sa_or_privileged_cm
+    await _assert_sa_or_privileged_cm(db, current_user, "BRAND_HANDLING")
+    r = (await db.execute(
+        select(MissingBrandReport).where(MissingBrandReport.id == report_id)
+    )).scalar_one_or_none()
+    if r is None:
+        raise HTTPException(status_code=404, detail="Report not found")
+    u = (await db.execute(
+        select(User).where(User.id == r.dealer_user_id)
+    )).scalar_one_or_none()
+    return {
+        "id": r.id,
+        "dealer_user_id": r.dealer_user_id,
+        "dealer_name": u.name if u else None,
+        "dealer_phone": u.phone if u else None,
+        "source": r.source.value if hasattr(r.source, "value") else r.source,
+        "order_item_id": r.order_item_id,
+        "brand_name_reported": r.brand_name_reported,
+        "manufacturer_name": r.manufacturer_name,
+        "l1_type": r.l1_type,
+        "l2_practice": r.l2_practice,
+        "additional_info": r.additional_info,
+        "photos": r.photos or [],
+        "status": r.status,
+        "cm_notes": r.cm_notes,
+        "reviewed_at": r.reviewed_at,
+        "created_at": r.created_at,
+    }
 
 
 @router.put("/admin/missing-brand-reports/{report_id}")
