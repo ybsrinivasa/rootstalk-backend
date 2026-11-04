@@ -9,8 +9,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import (
-    String, Text, DateTime, ForeignKey, Index, JSON, UniqueConstraint,
-    CheckConstraint, text,
+    String, Text, DateTime, Date, Boolean, ForeignKey, Index, JSON,
+    UniqueConstraint, CheckConstraint, text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -497,4 +497,116 @@ class CoachingStudentMoment2Feedback(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False,
+    )
+
+
+# ── Student portfolio — testimonial + hiring (2026-11-04) ─────────────────
+#
+# Two-surface design. The student assembles a Testimonial profile (photo,
+# short video, written testimonial) that RootsTalk may use for marketing
+# and a Hiring profile (CV versions + employment status) that may be
+# forwarded to partner companies. Each marketing asset has its own
+# consent flag so a student can share their testimonial but not their
+# photo (or vice versa) — mixing consent into a single checkbox would
+# make retroactive opt-outs painful.
+#
+# Keyed by `user_id` (not `coaching_student_id`) because the profile is a
+# property of the person, not of any single cohort — a student going
+# through a second cohort shouldn't have to re-upload their CV. Student
+# PWA access to the portfolio surface requires at least one CoachingStudent
+# row for this user_id with `certified_at IS NOT NULL`; the gate is
+# enforced in the router, not the model, so uncertifying a student
+# re-closes the surface without any data loss.
+#
+# CV upload history is kept in a separate `student_cvs` table — the
+# student can replace their CV any time but older versions remain for
+# audit and for the SA to grab an older one if the latest doesn't fit.
+# `is_latest` keeps the "current" pointer O(1) to query; set to true on
+# insert, flipped to false on prior rows in the same handler.
+
+class StudentPortfolio(Base):
+    __tablename__ = "student_portfolios"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False, unique=True,
+    )
+
+    # Marketing assets (photo + video + written testimonial). Each is
+    # independently opt-in via the three consent flags below; a NULL
+    # URL means nothing uploaded yet.
+    photo_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    video_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    testimonial_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    marketing_consent_photo: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false"),
+    )
+    marketing_consent_video: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false"),
+    )
+    marketing_consent_testimonial: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false"),
+    )
+
+    # Hiring profile — employment status + CV share consent. `is_employed`
+    # and `is_open_to_offers` can both be true (employed-but-looking is
+    # explicitly supported, per user 2026-11-04). `employer_name` and
+    # `employed_since` are only meaningful when `is_employed=true` — but
+    # we don't enforce that as a DB constraint; the UI clears them when
+    # the student toggles off, and stale text on a toggle-off row is
+    # harmless.
+    is_employed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false"),
+    )
+    employer_name: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    employed_since: Mapped[Optional[datetime]] = mapped_column(Date, nullable=True)
+    is_open_to_offers: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false"),
+    )
+    open_to_offers_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    hiring_consent_share_cv: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false"),
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False,
+    )
+
+
+class StudentCV(Base):
+    __tablename__ = "student_cvs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # S3 URL of the uploaded PDF (CV uploads are PDF-only per user
+    # 2026-11-04 — DOCX exporters can "Save as PDF" from Word).
+    file_url: Mapped[str] = mapped_column(Text, nullable=False)
+    # Original filename as uploaded, so the student + SA see a
+    # recognisable name. Not used for storage addressing.
+    filename: Mapped[str] = mapped_column(String(500), nullable=False)
+    # Fast "current CV" lookup. True on exactly one row per user_id;
+    # handlers flip the prior row to false before inserting.
+    is_latest: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false"),
+    )
+
+    uploaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False,
+    )
+
+    __table_args__ = (
+        Index("ix_student_cvs_user_id", "user_id"),
+        Index(
+            "ix_student_cvs_latest_per_user", "user_id",
+            unique=True,
+            postgresql_where="is_latest = true",
+        ),
     )
