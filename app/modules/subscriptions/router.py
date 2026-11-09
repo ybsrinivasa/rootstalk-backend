@@ -1787,6 +1787,10 @@ async def discover_companies(
                 # + flat pricing preview at the payment step.
                 "advisory_only_mode": bool(client.advisory_only_mode),
                 "dealer_list_enabled": bool(client.dealer_list_enabled),
+                # 2026-11-09 — needed by the PWA subscribe payment
+                # picker to decide whether "Ask a facilitator" renders
+                # alongside "Ask a dealer" on Advisory-Only subs.
+                "in_app_orders_enabled": bool(client.in_app_orders_enabled),
                 "subscription_fee_paise": client.subscription_fee_paise,
             })
     return companies
@@ -3428,6 +3432,7 @@ class PaymentDelegateRequest(BaseModel):
 @router.get("/farmer/delegate-lookup")
 async def delegate_lookup(
     phone: str,
+    role: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -3443,6 +3448,15 @@ async def delegate_lookup(
       - 422 `delegate_is_self`     — looked-up user is the caller
       - 422 `target_not_facilitator_or_dealer` — user exists but has
         no ACTIVE FACILITATOR/DEALER ClientPromoter row anywhere
+
+    2026-11-09 — optional `role=DEALER|FACILITATOR` filter. When the
+    PWA opens the picker from the "Ask a dealer" option it passes
+    `role=DEALER` so facilitator-only lookups bounce; from the "Ask a
+    facilitator" option it passes `role=FACILITATOR`. Regular Mode's
+    unified picker omits the param and gets both roles as before.
+    Added for the Advisory-Only Mode opening (dealer_list_enabled →
+    dealer-only; in_app_orders_enabled → both) so a dealer-only sub
+    can't resolve a facilitator via a direct API call.
 
     Side-effect-free; safe to call repeatedly as the farmer types.
     """
@@ -3494,24 +3508,39 @@ async def delegate_lookup(
     # company names alongside the role badges. One row per
     # (client, promoter_type) so the farmer can see e.g. "Facilitator
     # at Acme; Dealer at Beta".
+    # 2026-11-09 — honour the `role` filter when passed so a
+    # dealer-only picker (Advisory-Only + dealer_list_enabled) won't
+    # resolve a facilitator-only user.
+    role_filter = (role or "").strip().upper() or None
+    if role_filter and role_filter not in ("DEALER", "FACILITATOR"):
+        raise HTTPException(
+            status_code=422,
+            detail="role must be DEALER or FACILITATOR when provided.",
+        )
+    allowed_types = (role_filter,) if role_filter else ("FACILITATOR", "DEALER")
     rows = (await db.execute(
         select(ClientPromoter, Client)
         .join(Client, Client.id == ClientPromoter.client_id)
         .where(
             ClientPromoter.user_id == target.id,
-            ClientPromoter.promoter_type.in_(("FACILITATOR", "DEALER")),
+            ClientPromoter.promoter_type.in_(allowed_types),
             ClientPromoter.status == "ACTIVE",
         )
     )).all()
     if not rows:
+        role_word = (
+            "Dealer" if role_filter == "DEALER"
+            else "Facilitator" if role_filter == "FACILITATOR"
+            else "Facilitator or Dealer"
+        )
         raise HTTPException(
             status_code=422,
             detail={
                 "code": "target_not_facilitator_or_dealer",
                 "message": (
-                    "This person isn't registered as a Facilitator or "
-                    "Dealer with any company. Ask them to register "
-                    "via 'Become a Facilitator' or 'Become a Dealer' "
+                    f"This person isn't registered as a {role_word} "
+                    "with any company. Ask them to register via "
+                    f"'Become a {role_word.split(' ')[0]}' "
                     "in their app, then try again."
                 ),
             },
@@ -3545,22 +3574,20 @@ async def delegate_payment(
 ):
     sub = await _get_subscription(db, subscription_id, current_user.id)
 
-    # Advisory-Only Mode (2026-09-16): dealer/facilitator payment
-    # routing is hidden in the PWA; block the backend too so a direct
-    # API call can't sneak a delegate payment onto an advisory-only
-    # sub. Farmer must pay directly via /payment/create-order.
-    if sub.advisory_only_mode:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "advisory_only_no_delegate_payment",
-                "message": (
-                    "This subscription's client is in advisory-only mode. "
-                    "Please pay directly for your subscription — the "
-                    "dealer/facilitator payment channel is disabled."
-                ),
-            },
-        )
+    # Advisory-Only Mode gating (2026-09-16, selectively lifted
+    # 2026-11-09):
+    #   - advisory_only_mode=false → delegate payment always allowed
+    #     (Regular Mode).
+    #   - advisory_only_mode=true  AND in_app_orders_enabled=true →
+    #     allow BOTH DEALER and FACILITATOR delegates.
+    #   - advisory_only_mode=true  AND dealer_list_enabled=true →
+    #     allow DEALER delegate only. FACILITATOR 403s.
+    #   - advisory_only_mode=true  AND neither sub-mode → 403, as
+    #     before. The PWA hides the picker entirely in this case;
+    #     the guard is defense-in-depth against a direct API call.
+    # The target's actual role is checked further down; we stash it
+    # from the `has_role` query and apply the Advisory-Only
+    # restriction after it's known.
 
     # Resolve delegate user — either by explicit ID or by phone number
     resolved_user_id = request.requested_from_user_id
@@ -3612,15 +3639,20 @@ async def delegate_payment(
     # request was delivered. Per user 2026-05-30: a Facilitator
     # onboarding at any company is sufficient (Promoter designation
     # NOT required); same for Dealer.
+    #
+    # 2026-11-09 — capture the DISTINCT role types here so the
+    # Advisory-Only sub-mode check below can refuse FACILITATOR
+    # targets on a dealer-only sub.
     from app.modules.clients.models import ClientPromoter
-    has_role = (await db.execute(
-        select(ClientPromoter.id).where(
+    role_rows = (await db.execute(
+        select(ClientPromoter.promoter_type).where(
             ClientPromoter.user_id == resolved_user_id,
             ClientPromoter.promoter_type.in_(("FACILITATOR", "DEALER")),
             ClientPromoter.status == "ACTIVE",
-        ).limit(1)
-    )).scalar_one_or_none()
-    if has_role is None:
+        )
+    )).scalars().all()
+    target_roles = set(role_rows)
+    if not target_roles:
         raise HTTPException(
             status_code=422,
             detail={
@@ -3633,6 +3665,41 @@ async def delegate_payment(
                 ),
             },
         )
+
+    # Advisory-Only sub-mode gate (selective, see comment above).
+    if sub.advisory_only_mode:
+        if sub.in_app_orders_enabled:
+            # Both DEALER and FACILITATOR delegates allowed — no extra
+            # filter beyond the role presence check above.
+            pass
+        elif sub.dealer_list_enabled:
+            if "DEALER" not in target_roles:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "advisory_only_dealer_only",
+                        "message": (
+                            "In this advisory-only subscription, only a "
+                            "Dealer can be asked to pay. The person you "
+                            "picked isn't registered as a Dealer."
+                        ),
+                    },
+                )
+        else:
+            # Plain advisory-only — no delegate channel. Same 403 as
+            # before the 2026-11-09 selective lift; the picker is
+            # hidden in the PWA and this guards against direct calls.
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "advisory_only_no_delegate_payment",
+                    "message": (
+                        "This subscription's client is in advisory-only mode. "
+                        "Please pay directly for your subscription — the "
+                        "dealer/facilitator payment channel is disabled."
+                    ),
+                },
+            )
 
     # Guard: only one PENDING request per subscription at a time. If
     # the farmer already has one outstanding, they must cancel it
@@ -3783,20 +3850,12 @@ async def create_payment_share_link(
 
     sub = await _get_subscription(db, subscription_id, current_user.id)
 
-    # Advisory-Only Mode (2026-09-16): share-link payment routing is
-    # hidden in the PWA; block the backend too so a direct API call
-    # can't sneak a share-link onto an advisory-only sub.
-    if sub.advisory_only_mode:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "advisory_only_no_share_link",
-                "message": (
-                    "This subscription's client is in advisory-only mode. "
-                    "Share-link payments are disabled — please pay directly."
-                ),
-            },
-        )
+    # 2026-11-09 — share-link payments are now allowed on Advisory-Only
+    # subs. The earlier blanket block (2026-09-16) was lifted after the
+    # user confirmed: share-link is self-contained (no dealer /
+    # facilitator record needed, just a Razorpay payment link URL),
+    # which maps cleanly onto Advisory-Only Mode's "farmer pays, maybe
+    # with help from someone else" intent.
 
     existing_pending = (await db.execute(
         select(SubscriptionPaymentRequest).where(
