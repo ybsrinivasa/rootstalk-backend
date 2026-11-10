@@ -4537,6 +4537,187 @@ async def get_subscription_inputs(
     return {"due_now": due_now, "all": rows}
 
 
+# ── Call Log (Phase 4, 2026-11-10) ────────────────────────────────────────────
+
+
+async def _assert_rm_for_call_logging(
+    db: AsyncSession, user: User, client_id: str,
+) -> None:
+    """Narrow gate for POST /call-log. CA can VIEW the log but cannot
+    LOG — per spec §5.5 ("CA can view the call log — read only"). This
+    reflects RootsTalk's single-role-at-a-client model: logging a call
+    is an RM action; a CA who also handles support should hold the RM
+    role on a separate login per user direction 2026-11-10.
+
+    Allowed:
+      - SA (admin / testing).
+      - CLIENT_RM at this client.
+      - CM-EDIT at this client (CM inherits every in-client role per
+        project convention).
+
+    Rejected (403 call_log_rm_role_required):
+      - CA, SUBJECT_EXPERT, FIELD_MANAGER, REPORT_USER, PRODUCT_MANAGER,
+        anyone not enrolled. The CA case is called out in the error
+        message because that's the most surprising reject.
+    """
+    if bool(settings.sa_email) and user.email == settings.sa_email:
+        return
+    role_row = (await db.execute(
+        select(ClientUser.role).where(
+            ClientUser.client_id == client_id,
+            ClientUser.user_id == user.id,
+            ClientUser.status == StatusEnum.ACTIVE,
+            ClientUser.role == ClientUserRole.CLIENT_RM,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if role_row is not None:
+        return
+    cm_edit = (await db.execute(
+        select(CMClientAssignment.id).where(
+            CMClientAssignment.cm_user_id == user.id,
+            CMClientAssignment.client_id == client_id,
+            CMClientAssignment.status == StatusEnum.ACTIVE,
+            CMClientAssignment.rights == CMRights.EDIT,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if cm_edit is not None:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "code": "call_log_rm_role_required",
+            "message": (
+                "Only the Relationship Manager role can log calls. "
+                "CA roles can view the log but not add entries — ask "
+                "an RM to log on your behalf, or hold the RM role on "
+                "a separate account."
+            ),
+        },
+    )
+
+
+class CallLogCreate(BaseModel):
+    call_type: str                     # OUTBOUND | INBOUND
+    call_at: Optional[str] = None      # ISO datetime; defaults to now()
+
+
+@router.get("/client/{client_id}/farmer-support/farmers/{farmer_user_id}/call-log")
+async def list_farmer_call_log(
+    client_id: str,
+    farmer_user_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Chronological list of calls (most recent first) for one farmer.
+    Returns every entry with the logging RM's name resolved so the
+    panel renders standalone."""
+    from app.modules.clients.models import FarmerCallLog
+    await _assert_ca_or_rm(db, current_user, client_id)
+    await _assert_farmer_belongs_to_client(db, client_id, farmer_user_id)
+    rows = (await db.execute(
+        select(FarmerCallLog)
+        .where(
+            FarmerCallLog.client_id == client_id,
+            FarmerCallLog.farmer_user_id == farmer_user_id,
+        )
+        .order_by(FarmerCallLog.call_at.desc())
+    )).scalars().all()
+
+    # Bulk-resolve logger names.
+    logger_ids = {r.logged_by_user_id for r in rows}
+    name_by_id: dict[str, str | None] = {}
+    if logger_ids:
+        user_rows = (await db.execute(
+            select(User.id, User.name).where(User.id.in_(logger_ids))
+        )).all()
+        name_by_id = {uid: nm for uid, nm in user_rows}
+
+    out = []
+    outbound = 0
+    inbound = 0
+    for r in rows:
+        ct = r.call_type.value if hasattr(r.call_type, "value") else r.call_type
+        if ct == "OUTBOUND":
+            outbound += 1
+        elif ct == "INBOUND":
+            inbound += 1
+        out.append({
+            "id": r.id,
+            "call_type": ct,
+            "call_at": r.call_at.isoformat() if r.call_at else None,
+            "logged_by_user_id": r.logged_by_user_id,
+            "logged_by_name": name_by_id.get(r.logged_by_user_id),
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        })
+    return {
+        "total": len(rows),
+        "outbound_count": outbound,
+        "inbound_count": inbound,
+        "rows": out,
+    }
+
+
+@router.post(
+    "/client/{client_id}/farmer-support/farmers/{farmer_user_id}/call-log",
+    status_code=201,
+)
+async def create_farmer_call_log(
+    client_id: str,
+    farmer_user_id: str,
+    body: CallLogCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """RM-only. Permanent entry — no edit or delete endpoint exists.
+    `logged_by_user_id` is always the authenticated caller's id; the
+    body cannot override it (the auto-fill is the whole provenance
+    guarantee per spec §5.3)."""
+    from app.modules.clients.models import CallType, FarmerCallLog
+    from datetime import datetime, timezone
+    await _assert_rm_for_call_logging(db, current_user, client_id)
+    await _assert_farmer_belongs_to_client(db, client_id, farmer_user_id)
+
+    ct_raw = (body.call_type or "").strip().upper()
+    if ct_raw not in ("OUTBOUND", "INBOUND"):
+        raise HTTPException(
+            status_code=422,
+            detail="call_type must be OUTBOUND or INBOUND.",
+        )
+    if body.call_at:
+        try:
+            # Accept both naive and tz-aware ISO strings; normalise to UTC.
+            parsed = datetime.fromisoformat(body.call_at.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            call_at = parsed
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail="call_at must be a valid ISO datetime string.",
+            )
+    else:
+        call_at = datetime.now(timezone.utc)
+
+    row = FarmerCallLog(
+        client_id=client_id,
+        farmer_user_id=farmer_user_id,
+        call_type=CallType(ct_raw),
+        call_at=call_at,
+        logged_by_user_id=current_user.id,
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return {
+        "id": row.id,
+        "call_type": ct_raw,
+        "call_at": row.call_at.isoformat(),
+        "logged_by_user_id": row.logged_by_user_id,
+        "logged_by_name": current_user.name,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SA: CM Client Assignments
 # ═══════════════════════════════════════════════════════════════════════════════

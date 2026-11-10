@@ -541,3 +541,60 @@ class ClientPromoter(Base):
     )
 
     __table_args__ = (UniqueConstraint("client_id", "user_id", "promoter_type"),)
+
+
+# ── Farmer Call Log (2026-11-10) ──────────────────────────────────────────────
+#
+# Per-farmer phone-contact record, manually logged by the CLIENT_RM from the
+# Farmer Support 360° view. Design: Farmer Support doc §5.
+#
+# Decided design (and locked):
+#   - Permanent. No edit, no delete. The whole point is a reliable contact
+#     history across RM handoffs — mutability would undermine that.
+#   - Fields: call_type (OUTBOUND / INBOUND), call_at (date + time), the
+#     RM who logged (auto-filled). Nothing else — no notes, no duration,
+#     no outcome, no category. User's framing: "keep it so lightweight it
+#     actually gets used."
+#   - An RM may log a call on a colleague's behalf; the logger is ALWAYS
+#     the logged-in RM, no delegation field. Teams that need that
+#     distinction negotiate it in their own notes.
+#   - Scoped per-farmer. No company-wide call log view in v1.
+
+class CallType(str, enum.Enum):
+    OUTBOUND = "OUTBOUND"
+    INBOUND = "INBOUND"
+
+
+class FarmerCallLog(Base):
+    __tablename__ = "farmer_call_logs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    client_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("clients.id", ondelete="CASCADE"), nullable=False,
+    )
+    farmer_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False,
+    )
+    call_type: Mapped[CallType] = mapped_column(
+        SAEnum(CallType, name="call_type_enum"), nullable=False,
+    )
+    # Combined date + time of the call. Defaults to utcnow() at write time
+    # when the RM doesn't override; override is allowed for retrospective
+    # entries (per spec §5.3 — "RM can change if logging a call
+    # retrospectively").
+    call_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+    logged_by_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False,
+    )
+
+    __table_args__ = (
+        # Reads are always (client, farmer) filtered + ordered by call_at
+        # desc for the 360° panel.
+        Index("ix_farmer_call_logs_client_farmer_call_at",
+              "client_id", "farmer_user_id", "call_at"),
+    )
