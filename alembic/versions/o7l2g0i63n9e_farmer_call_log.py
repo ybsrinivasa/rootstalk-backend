@@ -32,8 +32,25 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    call_type = sa.Enum('OUTBOUND', 'INBOUND', name='call_type_enum')
-    call_type.create(op.get_bind(), checkfirst=True)
+    # Create the enum defensively — a half-run of this migration on
+    # staging 2026-11-10 left the enum created but the table missing;
+    # SQLAlchemy's `checkfirst=True` on the Enum does not always
+    # suppress CREATE TYPE in alembic contexts. Wrap in DO/EXCEPTION
+    # so re-running is a no-op if the enum already exists.
+    op.execute("""
+    DO $$ BEGIN
+        CREATE TYPE call_type_enum AS ENUM ('OUTBOUND', 'INBOUND');
+    EXCEPTION
+        WHEN duplicate_object THEN null;
+    END $$;
+    """)
+
+    # Tell SQLAlchemy NOT to attempt CREATE TYPE again inside
+    # create_table (we already did it above, or it already existed).
+    from sqlalchemy.dialects import postgresql
+    call_type = postgresql.ENUM(
+        'OUTBOUND', 'INBOUND', name='call_type_enum', create_type=False,
+    )
 
     op.create_table(
         'farmer_call_logs',
@@ -74,4 +91,4 @@ def downgrade() -> None:
         table_name='farmer_call_logs',
     )
     op.drop_table('farmer_call_logs')
-    sa.Enum(name='call_type_enum').drop(op.get_bind(), checkfirst=True)
+    op.execute("DROP TYPE IF EXISTS call_type_enum")
