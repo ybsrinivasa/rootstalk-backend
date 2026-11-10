@@ -3264,6 +3264,10 @@ def _base_alert_row(sub, user, enrich: dict) -> dict:
     return {
         "subscription_id": sub.id,
         "subscription_ref": sub.reference_number,
+        # 2026-11-10 — Added farmer_user_id so the CA Portal Farmer
+        # Support list can hard-match alert rows to farmer rows by id
+        # instead of the (name + phone) soft key Phase 2 shipped with.
+        "farmer_user_id": user.id,
         "farmer_name": user.name,
         "farmer_phone": user.phone,
         "state_cosh_id": user.state_cosh_id,
@@ -3979,6 +3983,558 @@ async def get_no_active_subscription(
         }
         for sub, user in picked
     ]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Farmer Support 360° (Phase 3, 2026-11-10) — per-farmer read endpoints
+# for a client's RM to open any farmer and see everything.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+async def _assert_farmer_belongs_to_client(
+    db: AsyncSession, client_id: str, farmer_user_id: str,
+) -> None:
+    """Prevent enumeration via guessed user_ids — the RM can only
+    open farmers who actually subscribe with this client. Raises 404
+    (not 403) so the response is indistinguishable from "user doesn't
+    exist at all" — standard anti-enumeration shape."""
+    from app.modules.subscriptions.models import Subscription
+    row = (await db.execute(
+        select(Subscription.id)
+        .where(
+            Subscription.client_id == client_id,
+            Subscription.farmer_user_id == farmer_user_id,
+        )
+        .limit(1)
+    )).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Farmer not found")
+
+
+def _timeline_window(tl, crop_start: "date") -> tuple["date | None", "date | None"]:
+    """Compute (window_start, window_end) for a Timeline against a
+    crop_start_date. Mirrors the /overdue-inputs + /missed-inputs
+    pattern; returns (None, None) when the window can't be resolved
+    (unsupported from_type or wrap-around CALENDAR)."""
+    from datetime import date as _date, timedelta
+    from_type = tl.from_type.value if hasattr(tl.from_type, "value") else str(tl.from_type)
+    if from_type == "DAS":
+        return (crop_start + timedelta(days=int(tl.from_value)),
+                crop_start + timedelta(days=int(tl.to_value)))
+    if from_type == "DBS":
+        return (crop_start - timedelta(days=int(tl.to_value)),
+                crop_start - timedelta(days=int(tl.from_value)))
+    if from_type == "CALENDAR":
+        if tl.from_value is not None and tl.to_value is not None \
+                and int(tl.from_value) <= int(tl.to_value):
+            year_start = _date(crop_start.year, 1, 1)
+            return (year_start + timedelta(days=int(tl.from_value) - 1),
+                    year_start + timedelta(days=int(tl.to_value) - 1))
+    return (None, None)
+
+
+@router.get("/client/{client_id}/farmer-support/farmers/{farmer_user_id}")
+async def get_farmer_support_profile(
+    client_id: str,
+    farmer_user_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Farmer header for the 360° view — persistent across all tabs.
+    Lightweight; name / phone / location / registered crops
+    (deduped)."""
+    from app.modules.subscriptions.models import Subscription
+    from app.modules.advisory.models import Package
+    await _assert_ca_or_rm(db, current_user, client_id)
+    await _assert_farmer_belongs_to_client(db, client_id, farmer_user_id)
+    user = await db.get(User, farmer_user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="Farmer not found")
+    # Crops registered by this farmer with this client — one per
+    # Package.crop_cosh_id across all their subs.
+    crop_rows = (await db.execute(
+        select(Package.crop_cosh_id)
+        .join(Subscription, Subscription.package_id == Package.id)
+        .where(
+            Subscription.client_id == client_id,
+            Subscription.farmer_user_id == farmer_user_id,
+            Package.crop_cosh_id.isnot(None),
+        )
+        .distinct()
+    )).scalars().all()
+    lang = current_user.language_code or "en"
+    from app.services.i18n_cosh import resolve_names_by_cosh_id
+    cosh_ids = {c for c in crop_rows if c}
+    if user.state_cosh_id:
+        cosh_ids.add(user.state_cosh_id)
+    if user.district_cosh_id:
+        cosh_ids.add(user.district_cosh_id)
+    if user.sub_district_cosh_id:
+        cosh_ids.add(user.sub_district_cosh_id)
+    names = await resolve_names_by_cosh_id(db, cosh_ids, lang) if cosh_ids else {}
+    return {
+        "user_id": user.id,
+        "name": user.name,
+        "phone": user.phone,
+        "state_cosh_id": user.state_cosh_id,
+        "state_name": names.get(user.state_cosh_id) if user.state_cosh_id else None,
+        "district_cosh_id": user.district_cosh_id,
+        "district_name": names.get(user.district_cosh_id) if user.district_cosh_id else None,
+        "sub_district_cosh_id": user.sub_district_cosh_id,
+        "sub_district_name": names.get(user.sub_district_cosh_id) if user.sub_district_cosh_id else None,
+        "crops": [
+            {"crop_cosh_id": c, "crop_name": names.get(c)}
+            for c in crop_rows
+        ],
+    }
+
+
+@router.get("/client/{client_id}/farmer-support/farmers/{farmer_user_id}/subscriptions")
+async def list_farmer_subscriptions(
+    client_id: str,
+    farmer_user_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """All subscriptions this farmer has with this client — active
+    first, past in reverse-chrono. One row per subscription with the
+    display fields for the 360° Subscription Summary tab bar."""
+    from app.modules.subscriptions.models import (
+        PromoterAssignment, Subscription, SubscriptionStatus,
+    )
+    from app.modules.advisory.models import Package
+    await _assert_ca_or_rm(db, current_user, client_id)
+    await _assert_farmer_belongs_to_client(db, client_id, farmer_user_id)
+
+    rows = (await db.execute(
+        select(Subscription, Package)
+        .join(Package, Package.id == Subscription.package_id)
+        .where(
+            Subscription.client_id == client_id,
+            Subscription.farmer_user_id == farmer_user_id,
+        )
+    )).all()
+    if not rows:
+        return []
+
+    # Promoter name per subscription — one query then map.
+    sub_ids = [s.id for s, _ in rows]
+    pa_rows = (await db.execute(
+        select(PromoterAssignment.subscription_id, User.name)
+        .join(User, User.id == PromoterAssignment.promoter_user_id)
+        .where(PromoterAssignment.subscription_id.in_(sub_ids))
+    )).all()
+    promoter_name_by_sub: dict[str, str | None] = {}
+    for sid, pname in pa_rows:
+        promoter_name_by_sub.setdefault(sid, pname)
+
+    # Crop name resolution.
+    lang = current_user.language_code or "en"
+    from app.services.i18n_cosh import resolve_names_by_cosh_id
+    crop_ids = {pkg.crop_cosh_id for _, pkg in rows if pkg.crop_cosh_id}
+    name_by_id = await resolve_names_by_cosh_id(db, crop_ids, lang) if crop_ids else {}
+
+    out = []
+    for sub, pkg in rows:
+        out.append({
+            "subscription_id": sub.id,
+            "status": sub.status.value if hasattr(sub.status, "value") else sub.status,
+            "is_active": sub.status == SubscriptionStatus.ACTIVE,
+            "package_id": pkg.id,
+            "package_name": pkg.name,
+            "crop_cosh_id": pkg.crop_cosh_id,
+            "crop_name": name_by_id.get(pkg.crop_cosh_id) if pkg.crop_cosh_id else None,
+            "crop_start_date": sub.crop_start_date.isoformat() if sub.crop_start_date else None,
+            "created_at": sub.created_at.isoformat() if sub.created_at else None,
+            "promoter_name": promoter_name_by_sub.get(sub.id),
+            "farm_area_acres": (
+                float(sub.farm_area_acres) if sub.farm_area_acres else None
+            ),
+            "number_of_plants": (
+                int(sub.number_of_plants) if sub.number_of_plants else None
+            ),
+        })
+    # Active first, then by crop_start_date desc (nulls last), then
+    # created_at desc as tie-breaker.
+    out.sort(key=lambda r: (
+        0 if r["is_active"] else 1,
+        -(int(r["crop_start_date"].replace("-", "")) if r["crop_start_date"] else 0),
+        -(int(r["created_at"].replace("-", "").split("T")[0]) if r["created_at"] else 0),
+    ))
+    return out
+
+
+@router.get("/client/{client_id}/farmer-support/farmers/{farmer_user_id}/subscriptions/{subscription_id}/practices")
+async def get_subscription_practice_timeline(
+    client_id: str,
+    farmer_user_id: str,
+    subscription_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Practice timeline for one subscription — past (with status),
+    current, upcoming. Read-only; the RM never acts on these.
+
+    Status derivation per practice:
+      - 'Completed' if PracticeAcknowledgement.marked_at is set
+      - 'Skipped'   if PracticeAcknowledgement.hidden_at is set
+      - 'Missed'    if window has passed and no ack
+      - 'Current'   if today is within the window
+      - 'Upcoming'  otherwise (window in future)
+
+    For Phase 3 v1 we return a flat list sorted by timeline window
+    start date; the UI buckets them into past/current/upcoming.
+    """
+    from app.modules.subscriptions.models import Subscription
+    from app.modules.advisory.models import (
+        PracticeAcknowledgement, Timeline, Practice,
+    )
+    from datetime import date
+    await _assert_ca_or_rm(db, current_user, client_id)
+    await _assert_farmer_belongs_to_client(db, client_id, farmer_user_id)
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.client_id == client_id,
+            Subscription.farmer_user_id == farmer_user_id,
+        )
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    today = date.today()
+    crop_start = None
+    if sub.crop_start_date:
+        crop_start = (
+            sub.crop_start_date.date()
+            if hasattr(sub.crop_start_date, "date") else sub.crop_start_date
+        )
+
+    tls = (await db.execute(
+        select(Timeline).where(Timeline.package_id == sub.package_id)
+    )).scalars().all()
+    tl_ids = [tl.id for tl in tls]
+    practices = (await db.execute(
+        select(Practice).where(Practice.timeline_id.in_(tl_ids))
+    )).scalars().all() if tl_ids else []
+    acks = (await db.execute(
+        select(PracticeAcknowledgement).where(
+            PracticeAcknowledgement.subscription_id == subscription_id,
+        )
+    )).scalars().all()
+    ack_by_key: dict[tuple[str, str], object] = {}
+    for a in acks:
+        ack_by_key[(a.practice_id, a.timeline_lineage_id)] = a
+
+    tl_by_id = {tl.id: tl for tl in tls}
+    out = []
+    for p in practices:
+        tl = tl_by_id.get(p.timeline_id)
+        if tl is None or crop_start is None:
+            continue
+        win_start, win_end = _timeline_window(tl, crop_start)
+        ack = ack_by_key.get((p.id, tl.lineage_id))
+        if ack and ack.marked_at:
+            status = "COMPLETED"
+        elif ack and ack.hidden_at:
+            status = "SKIPPED"
+        elif win_end is not None and today > win_end:
+            status = "MISSED"
+        elif win_start is not None and win_end is not None and win_start <= today <= win_end:
+            status = "CURRENT"
+        else:
+            status = "UPCOMING"
+        out.append({
+            "practice_id": p.id,
+            "practice_name": p.name,
+            "l0_type": (p.l0_type.value if hasattr(p.l0_type, "value") else p.l0_type),
+            "l1_type": p.l1_type,
+            "l2_type": p.l2_type,
+            "timeline_id": tl.id,
+            "timeline_name": tl.name,
+            "window_start": win_start.isoformat() if win_start else None,
+            "window_end": win_end.isoformat() if win_end else None,
+            "status": status,
+            "marked_at": ack.marked_at.isoformat() if ack and ack.marked_at else None,
+            "hidden_at": ack.hidden_at.isoformat() if ack and ack.hidden_at else None,
+        })
+    # Sort by window_start asc so past → current → upcoming reads
+    # naturally. Timelines without a resolved window land first (deal
+    # with the garbage).
+    out.sort(key=lambda r: (r["window_start"] or ""))
+    return out
+
+
+@router.get("/client/{client_id}/farmer-support/farmers/{farmer_user_id}/subscriptions/{subscription_id}/diagnoses")
+async def get_subscription_diagnoses(
+    client_id: str,
+    farmer_user_id: str,
+    subscription_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Pest diagnoses the farmer raised under this subscription.
+    Only returns DIAGNOSED sessions (ACTIVE = in-flight, ABORTED =
+    user bailed; neither is useful for the RM's follow-up)."""
+    from app.modules.subscriptions.models import Subscription
+    from app.modules.diagnosis.models import DiagnosisSession
+    await _assert_ca_or_rm(db, current_user, client_id)
+    await _assert_farmer_belongs_to_client(db, client_id, farmer_user_id)
+    sub = (await db.execute(
+        select(Subscription.id).where(
+            Subscription.id == subscription_id,
+            Subscription.client_id == client_id,
+            Subscription.farmer_user_id == farmer_user_id,
+        )
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    rows = (await db.execute(
+        select(DiagnosisSession)
+        .where(
+            DiagnosisSession.subscription_id == subscription_id,
+            DiagnosisSession.status == "DIAGNOSED",
+        )
+        .order_by(DiagnosisSession.created_at.desc())
+    )).scalars().all()
+    lang = current_user.language_code or "en"
+    from app.services.i18n_cosh import resolve_names_by_cosh_id
+    cosh_ids = set()
+    for r in rows:
+        if getattr(r, "diagnosed_problem_cosh_id", None):
+            cosh_ids.add(r.diagnosed_problem_cosh_id)
+        if getattr(r, "initial_plant_part_cosh_id", None):
+            cosh_ids.add(r.initial_plant_part_cosh_id)
+    names = await resolve_names_by_cosh_id(db, cosh_ids, lang) if cosh_ids else {}
+    return [
+        {
+            "session_id": r.id,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "diagnosed_problem_cosh_id": getattr(r, "diagnosed_problem_cosh_id", None),
+            "diagnosed_problem_name": names.get(getattr(r, "diagnosed_problem_cosh_id", None)),
+            "plant_part_cosh_id": getattr(r, "initial_plant_part_cosh_id", None),
+            "plant_part_name": names.get(getattr(r, "initial_plant_part_cosh_id", None)),
+            "status": r.status,
+        }
+        for r in rows
+    ]
+
+
+@router.get("/client/{client_id}/farmer-support/farmers/{farmer_user_id}/subscriptions/{subscription_id}/queries")
+async def get_subscription_queries(
+    client_id: str,
+    farmer_user_id: str,
+    subscription_id: str,
+    sla_hours: int = 48,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Expert queries the farmer raised under this subscription.
+    Each row carries the derived ui_status (Answered / Pending /
+    Overdue) so the front-end doesn't have to re-apply the SLA logic."""
+    from app.modules.subscriptions.models import Subscription
+    from app.modules.farmpundit.models import (
+        FarmPunditProfile, Query as FarmerQuery, QueryResponse, QueryStatus,
+    )
+    from datetime import datetime, timedelta, timezone
+    await _assert_ca_or_rm(db, current_user, client_id)
+    await _assert_farmer_belongs_to_client(db, client_id, farmer_user_id)
+    sub = (await db.execute(
+        select(Subscription.id).where(
+            Subscription.id == subscription_id,
+            Subscription.client_id == client_id,
+            Subscription.farmer_user_id == farmer_user_id,
+        )
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    sla_cutoff = datetime.now(timezone.utc) - timedelta(hours=max(1, sla_hours))
+    rows = (await db.execute(
+        select(FarmerQuery)
+        .where(FarmerQuery.subscription_id == subscription_id)
+        .order_by(FarmerQuery.created_at.desc())
+    )).scalars().all()
+
+    # Pre-fetch responses + pundit names in bulk.
+    query_ids = [q.id for q in rows]
+    response_by_q: dict[str, QueryResponse] = {}
+    pundit_name_by_profile: dict[str, str | None] = {}
+    if query_ids:
+        resp_rows = (await db.execute(
+            select(QueryResponse).where(QueryResponse.query_id.in_(query_ids))
+        )).scalars().all()
+        for r in resp_rows:
+            response_by_q[r.query_id] = r
+        profile_ids = {q.current_holder_id for q in rows if q.current_holder_id}
+        if profile_ids:
+            pundit_rows = (await db.execute(
+                select(FarmPunditProfile.id, User.name)
+                .join(User, User.id == FarmPunditProfile.user_id)
+                .where(FarmPunditProfile.id.in_(profile_ids))
+            )).all()
+            pundit_name_by_profile = {pid: nm for pid, nm in pundit_rows}
+
+    def derive_ui_status(q: FarmerQuery) -> str:
+        if q.status == QueryStatus.RESPONDED:
+            return "ANSWERED"
+        if q.status in (QueryStatus.REJECTED, QueryStatus.EXPIRED):
+            return "CLOSED"
+        # NEW / FORWARDED / RETURNED — pending or overdue
+        if q.created_at and q.created_at <= sla_cutoff:
+            return "OVERDUE"
+        return "PENDING"
+
+    out = []
+    for q in rows:
+        resp = response_by_q.get(q.id)
+        out.append({
+            "query_id": q.id,
+            "title": q.title,
+            "severity": q.severity,
+            "status": q.status.value if hasattr(q.status, "value") else q.status,
+            "ui_status": derive_ui_status(q),
+            "created_at": q.created_at.isoformat() if q.created_at else None,
+            "assigned_to": pundit_name_by_profile.get(q.current_holder_id) if q.current_holder_id else None,
+            "response_text": resp.text if resp else None,
+            "response_at": resp.created_at.isoformat() if resp and resp.created_at else None,
+            "sla_hours": sla_hours,
+        })
+    return out
+
+
+@router.get("/client/{client_id}/farmer-support/farmers/{farmer_user_id}/subscriptions/{subscription_id}/inputs")
+async def get_subscription_inputs(
+    client_id: str,
+    farmer_user_id: str,
+    subscription_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Input tracking for one subscription. Each input-type practice
+    (l0_type = 'INPUT') gets a row with one of six statuses:
+
+      PURCHASED    — PracticeAcknowledgement.purchased_at is set
+      ORDERED      — an uncancelled OrderItem exists for this timeline
+      DUE_NOW      — today within window, no order, no purchase
+      UPCOMING     — today before window, starts within 7 days
+      MISSED       — today past window end, no order, no purchase
+      NOT_REQUIRED — PracticeAcknowledgement.hidden_at is set
+
+    Response groups 'due_now' separately so the UI can render its
+    highlighted priority panel without re-filtering."""
+    from app.modules.subscriptions.models import Subscription
+    from app.modules.advisory.models import (
+        PracticeAcknowledgement, Timeline, Practice,
+    )
+    from app.modules.orders.models import Order, OrderItem, OrderStatus
+    from datetime import date, timedelta
+    await _assert_ca_or_rm(db, current_user, client_id)
+    await _assert_farmer_belongs_to_client(db, client_id, farmer_user_id)
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.client_id == client_id,
+            Subscription.farmer_user_id == farmer_user_id,
+        )
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    today = date.today()
+    crop_start = None
+    if sub.crop_start_date:
+        crop_start = (
+            sub.crop_start_date.date()
+            if hasattr(sub.crop_start_date, "date") else sub.crop_start_date
+        )
+
+    # Pull only INPUT practices.
+    tls = (await db.execute(
+        select(Timeline).where(Timeline.package_id == sub.package_id)
+    )).scalars().all()
+    tl_ids = [tl.id for tl in tls]
+    practices = (await db.execute(
+        select(Practice).where(
+            Practice.timeline_id.in_(tl_ids),
+            Practice.l0_type == "INPUT",
+        )
+    )).scalars().all() if tl_ids else []
+    if not practices:
+        return {"due_now": [], "all": []}
+
+    acks = (await db.execute(
+        select(PracticeAcknowledgement).where(
+            PracticeAcknowledgement.subscription_id == subscription_id,
+        )
+    )).scalars().all()
+    ack_by_key: dict[tuple[str, str], object] = {}
+    for a in acks:
+        ack_by_key[(a.practice_id, a.timeline_lineage_id)] = a
+
+    # Active (non-cancelled) order items by timeline.
+    order_tl_ids = (await db.execute(
+        select(OrderItem.timeline_id)
+        .join(Order, Order.id == OrderItem.order_id)
+        .where(
+            Order.subscription_id == subscription_id,
+            Order.status != OrderStatus.CANCELLED,
+        )
+        .distinct()
+    )).scalars().all()
+    active_order_tls = set(order_tl_ids)
+
+    tl_by_id = {tl.id: tl for tl in tls}
+    rows: list[dict] = []
+    for p in practices:
+        tl = tl_by_id.get(p.timeline_id)
+        if tl is None:
+            continue
+        win_start, win_end = (None, None) if crop_start is None \
+            else _timeline_window(tl, crop_start)
+        ack = ack_by_key.get((p.id, tl.lineage_id))
+        has_order = tl.id in active_order_tls
+
+        if ack and ack.purchased_at:
+            status = "PURCHASED"
+        elif ack and ack.hidden_at:
+            status = "NOT_REQUIRED"
+        elif has_order:
+            status = "ORDERED"
+        elif win_start is not None and win_end is not None:
+            if today > win_end:
+                status = "MISSED"
+            elif win_start <= today <= win_end:
+                status = "DUE_NOW"
+            elif today < win_start and (win_start - today).days <= 7:
+                status = "UPCOMING"
+            else:
+                status = "UPCOMING"  # further-future; UI may hide
+        else:
+            status = "UPCOMING"  # unresolved window
+
+        rows.append({
+            "practice_id": p.id,
+            "practice_name": p.name,
+            "l1_type": p.l1_type,
+            "l2_type": p.l2_type,
+            "timeline_id": tl.id,
+            "timeline_name": tl.name,
+            "window_start": win_start.isoformat() if win_start else None,
+            "window_end": win_end.isoformat() if win_end else None,
+            "status": status,
+            "purchased_at": ack.purchased_at.isoformat() if ack and ack.purchased_at else None,
+            "purchased_brand_text": (
+                ack.purchased_brand_text if ack and getattr(ack, "purchased_brand_text", None) else None
+            ),
+            "purchased_brand_cosh_id": (
+                ack.purchased_brand_cosh_id if ack and getattr(ack, "purchased_brand_cosh_id", None) else None
+            ),
+        })
+    # Sort by window_start so the input list mirrors the practice
+    # timeline ordering.
+    rows.sort(key=lambda r: (r["window_start"] or ""))
+    due_now = [r for r in rows if r["status"] == "DUE_NOW"]
+    return {"due_now": due_now, "all": rows}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
