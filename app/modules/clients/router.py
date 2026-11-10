@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from pydantic import BaseModel
 from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.config import settings
@@ -3453,6 +3453,532 @@ async def get_overdue_inputs(
             break  # One entry per subscription — first overdue tl wins
 
     return overdue
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Farmer Support View (2026-11-10) — RM-facing CRM-style farmer list +
+# three new alert endpoints. Design in
+# `~/Downloads/RootsTalk_ClientPortal_FarmerSupport.docx`.
+#
+# Core principle: read and remind. The CLIENT_RM role gets rich visibility
+# across every farmer in this client but can NEVER mutate farmer state —
+# that boundary is held by the farmer-ownership checks on every
+# `/farmer/*` mutation endpoint (verified 2026-11-10 audit; e.g.
+# `_upsert_practice_ack` at subscriptions/router.py:5774, orders POST at
+# orders/router.py:234, queries POST at farmpundit/router.py:854 all
+# gate on `current_user.id == farmer_user_id`).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+async def _assert_ca_or_rm(
+    db: AsyncSession, user: User, client_id: str,
+) -> None:
+    """Role gate on every /client/{cid}/farmer-support/* endpoint.
+
+    Allowed:
+      - SA (global email match).
+      - CA of this client.
+      - CLIENT_RM of this client (the Relationship Manager role, the
+        primary audience for Farmer Support).
+      - CM with EDIT rights on this client (project convention — CM
+        inherits every in-client role).
+
+    Rejected (403 farmer_support_role_required):
+      - SUBJECT_EXPERT, FIELD_MANAGER, REPORT_USER, PRODUCT_MANAGER,
+        anyone not enrolled on this client. Farmer Support is a
+        deliberate scope cut — the doc (Section 2) restricts it to
+        RM + CA. SE/FM can hold the RM role too; they just need it
+        explicitly assigned.
+    """
+    if bool(settings.sa_email) and user.email == settings.sa_email:
+        return
+    role_row = (await db.execute(
+        select(ClientUser.role).where(
+            ClientUser.client_id == client_id,
+            ClientUser.user_id == user.id,
+            ClientUser.status == StatusEnum.ACTIVE,
+            ClientUser.role.in_([
+                ClientUserRole.CA, ClientUserRole.CLIENT_RM,
+            ]),
+        ).limit(1)
+    )).scalar_one_or_none()
+    if role_row is not None:
+        return
+    cm_edit = (await db.execute(
+        select(CMClientAssignment.id).where(
+            CMClientAssignment.cm_user_id == user.id,
+            CMClientAssignment.client_id == client_id,
+            CMClientAssignment.status == StatusEnum.ACTIVE,
+            CMClientAssignment.rights == CMRights.EDIT,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if cm_edit is not None:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "code": "farmer_support_role_required",
+            "message": (
+                "Farmer Support is restricted to Customer Admin and "
+                "Relationship Manager roles. Ask your CA to assign the "
+                "RM role to your account at this client."
+            ),
+        },
+    )
+
+
+@router.get("/client/{client_id}/farmer-support/farmers")
+async def list_farmer_support_farmers(
+    client_id: str,
+    # Location cascade (user-side fields)
+    state_cosh_id: Optional[str] = None,
+    district_cosh_id: Optional[str] = None,
+    sub_district_cosh_id: Optional[str] = None,
+    # Subscription-side filters
+    promoter_user_id: Optional[str] = None,
+    crop_cosh_id: Optional[str] = None,
+    subscription_status: Optional[str] = None,  # ACTIVE | COMPLETED | NOT_STARTED
+    start_date_from: Optional[str] = None,       # ISO date
+    start_date_to: Optional[str] = None,         # ISO date
+    # Subscription origin — self-subscribed vs promoter-assigned
+    origin: Optional[str] = None,                # SELF | PROMOTER
+    # Search (farmer name OR phone, partial)
+    search: Optional[str] = None,
+    # Sort + pagination
+    sort_by: str = "name",                       # name | start_date | district
+    sort_dir: str = "asc",                       # asc | desc
+    page: int = 1,
+    page_size: int = 25,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Paginated farmer list for Farmer Support (CLIENT_RM + CA).
+
+    One row per farmer (deduped). Each row carries the farmer's
+    identity, location, their current / most-recent subscription
+    summary (crop, status, start date, promoter name), and a
+    pre-computed 'active_subscription_count'. Alert signals are NOT
+    computed here — the UI calls the per-type alert endpoints
+    separately and surfaces them as tiles / badges.
+
+    Design principle (2026-11-10): keep this endpoint cheap +
+    predictable; richer per-farmer data lives behind `GET
+    /client/{cid}/farmer-support/farmers/{uid}` (Phase 3). Cap
+    page_size at 100 to defend against runaway queries; the UI
+    default is 25 per the user's 2026-11-10 call.
+    """
+    from app.modules.subscriptions.models import (
+        PromoterAssignment, Subscription, SubscriptionStatus,
+    )
+    await _assert_ca_or_rm(db, current_user, client_id)
+    if page < 1:
+        page = 1
+    if page_size < 1:
+        page_size = 25
+    if page_size > 100:
+        page_size = 100
+    sort_by = (sort_by or "name").strip().lower()
+    sort_dir = (sort_dir or "asc").strip().lower()
+    if sort_by not in ("name", "start_date", "district"):
+        raise HTTPException(status_code=422, detail="sort_by must be name|start_date|district.")
+    if sort_dir not in ("asc", "desc"):
+        raise HTTPException(status_code=422, detail="sort_dir must be asc|desc.")
+
+    # Base: every subscription for this client + its farmer. We dedupe
+    # by farmer below so a farmer with multiple subs appears once.
+    q = (
+        select(Subscription, User)
+        .join(User, User.id == Subscription.farmer_user_id)
+        .where(Subscription.client_id == client_id)
+    )
+    if state_cosh_id:
+        q = q.where(User.state_cosh_id == state_cosh_id)
+    if district_cosh_id:
+        q = q.where(User.district_cosh_id == district_cosh_id)
+    if sub_district_cosh_id:
+        q = q.where(User.sub_district_cosh_id == sub_district_cosh_id)
+    if crop_cosh_id:
+        # crop lives on Package; join lazily to keep the common case
+        # (no crop filter) cheap.
+        from app.modules.advisory.models import Package
+        q = q.join(Package, Package.id == Subscription.package_id).where(
+            Package.crop_cosh_id == crop_cosh_id
+        )
+    if subscription_status:
+        status_upper = subscription_status.strip().upper()
+        if status_upper == "NOT_STARTED":
+            q = q.where(
+                Subscription.status == SubscriptionStatus.ACTIVE,
+                Subscription.crop_start_date.is_(None),
+            )
+        elif status_upper in ("ACTIVE", "COMPLETED"):
+            q = q.where(Subscription.status == SubscriptionStatus(status_upper))
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail="subscription_status must be ACTIVE|COMPLETED|NOT_STARTED.",
+            )
+    if start_date_from:
+        from datetime import date as _date
+        try:
+            d_from = _date.fromisoformat(start_date_from)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="start_date_from must be YYYY-MM-DD.")
+        q = q.where(Subscription.crop_start_date >= d_from)
+    if start_date_to:
+        from datetime import date as _date
+        try:
+            d_to = _date.fromisoformat(start_date_to)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="start_date_to must be YYYY-MM-DD.")
+        q = q.where(Subscription.crop_start_date <= d_to)
+    if promoter_user_id:
+        # Promoter is stored on PromoterAssignment, not directly on
+        # Subscription. Filter via EXISTS so the dedupe still works.
+        q = q.where(
+            select(PromoterAssignment.id).where(
+                PromoterAssignment.subscription_id == Subscription.id,
+                PromoterAssignment.promoter_user_id == promoter_user_id,
+            ).exists()
+        )
+    if origin:
+        origin_upper = origin.strip().upper()
+        has_promoter = select(PromoterAssignment.id).where(
+            PromoterAssignment.subscription_id == Subscription.id,
+        ).exists()
+        if origin_upper == "SELF":
+            q = q.where(~has_promoter)
+        elif origin_upper == "PROMOTER":
+            q = q.where(has_promoter)
+        else:
+            raise HTTPException(
+                status_code=422, detail="origin must be SELF|PROMOTER.",
+            )
+    if search:
+        needle = f"%{search.strip()}%"
+        q = q.where(or_(User.name.ilike(needle), User.phone.ilike(needle)))
+
+    rows = (await db.execute(q)).all()
+
+    # Dedupe by farmer_user_id, keeping the most-recent subscription
+    # as the representative row (so start_date sort surfaces the
+    # latest crop start, matching the design doc's "Latest Start Date"
+    # column).
+    by_farmer: dict[str, tuple] = {}
+    for sub, user in rows:
+        existing = by_farmer.get(user.id)
+        if existing is None:
+            by_farmer[user.id] = (sub, user)
+            continue
+        prev_sub, _ = existing
+        prev_start = prev_sub.crop_start_date
+        cur_start = sub.crop_start_date
+        # Prefer the subscription with the later crop_start_date; fall
+        # back to created_at when start_date is NULL on either side.
+        if cur_start and (prev_start is None or cur_start > prev_start):
+            by_farmer[user.id] = (sub, user)
+        elif cur_start is None and prev_start is None:
+            if sub.created_at and prev_sub.created_at and sub.created_at > prev_sub.created_at:
+                by_farmer[user.id] = (sub, user)
+
+    # Second pass: active-subscription count per farmer (visible on
+    # the list row). Separate lightweight query to avoid inflating the
+    # join above with aggregate grouping.
+    farmer_ids = list(by_farmer.keys())
+    active_counts: dict[str, int] = {}
+    if farmer_ids:
+        from sqlalchemy import func as _func
+        count_rows = (await db.execute(
+            select(
+                Subscription.farmer_user_id,
+                _func.count(Subscription.id),
+            )
+            .where(
+                Subscription.client_id == client_id,
+                Subscription.farmer_user_id.in_(farmer_ids),
+                Subscription.status == SubscriptionStatus.ACTIVE,
+            )
+            .group_by(Subscription.farmer_user_id)
+        )).all()
+        active_counts = {fid: int(cnt) for fid, cnt in count_rows}
+
+    # Promoter name resolution — one lookup for the set of promoter
+    # user_ids appearing on the representative subs.
+    promoter_name_by_sub: dict[str, str | None] = {}
+    sub_ids_for_promoter = [s.id for s, _ in by_farmer.values()]
+    if sub_ids_for_promoter:
+        pa_rows = (await db.execute(
+            select(PromoterAssignment.subscription_id, User.name)
+            .join(User, User.id == PromoterAssignment.promoter_user_id)
+            .where(PromoterAssignment.subscription_id.in_(sub_ids_for_promoter))
+        )).all()
+        for sid, pname in pa_rows:
+            promoter_name_by_sub.setdefault(sid, pname)
+
+    # Build row objects
+    out_rows: list[dict] = []
+    for sub, user in by_farmer.values():
+        out_rows.append({
+            "user_id": user.id,
+            "name": user.name,
+            "phone": user.phone,
+            "state_cosh_id": user.state_cosh_id,
+            "district_cosh_id": user.district_cosh_id,
+            "sub_district_cosh_id": user.sub_district_cosh_id,
+            "latest_subscription_id": sub.id,
+            "latest_subscription_status": (
+                sub.status.value if hasattr(sub.status, "value") else sub.status
+            ),
+            "latest_crop_start_date": (
+                sub.crop_start_date.isoformat() if sub.crop_start_date else None
+            ),
+            "active_subscription_count": active_counts.get(user.id, 0),
+            "promoter_name": promoter_name_by_sub.get(sub.id),
+        })
+
+    # Sort in Python — dataset size is bounded by the farmer-per-
+    # client count, which is small enough that in-memory sort beats
+    # pushing another ORDER BY through the dedupe.
+    def sort_key(r: dict):
+        if sort_by == "name":
+            return (r["name"] or "").lower()
+        if sort_by == "start_date":
+            # NULL start dates land at the end regardless of sort_dir —
+            # the SA's intent on sorting by date is usually to see
+            # cohorts, and NULL-at-end keeps them from polluting both
+            # extremes.
+            return r["latest_crop_start_date"] or ""
+        if sort_by == "district":
+            return (r["district_cosh_id"] or "")
+        return (r["name"] or "").lower()
+    out_rows.sort(key=sort_key, reverse=(sort_dir == "desc"))
+
+    total = len(out_rows)
+    start = (page - 1) * page_size
+    end = start + page_size
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "rows": out_rows[start:end],
+    }
+
+
+@router.get("/client/{client_id}/alerts/missed-inputs")
+async def get_missed_inputs(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Farmers whose input practice window has FULLY passed with no
+    order and no purchase recorded. Distinct from overdue-inputs
+    (where the window is still open today).
+
+    v1 definition: `today > timeline.to_date` for a timeline on an
+    ACTIVE subscription, with no order_item on that timeline AND no
+    PracticeAcknowledgement.purchased_at for any practice in that
+    timeline. Tightening pass in Phase 3 may add per-practice
+    granularity; this is the aggregate signal the tile needs.
+    """
+    from app.modules.farmpundit.router import _assert_portal_member
+    from app.modules.subscriptions.models import Subscription, SubscriptionStatus
+    from app.modules.orders.models import OrderItem
+    from app.modules.advisory.models import (
+        PracticeAcknowledgement, Timeline,
+    )
+    from datetime import date, timedelta
+    await _assert_portal_member(db, current_user.id, client_id)
+
+    today = date.today()
+    result = await db.execute(
+        select(Subscription, User)
+        .join(User, User.id == Subscription.farmer_user_id)
+        .where(
+            Subscription.client_id == client_id,
+            Subscription.status == SubscriptionStatus.ACTIVE,
+            Subscription.crop_start_date != None,  # noqa: E711
+        )
+    )
+    rows = result.all()
+    subs = [s for s, _u in rows]
+    users = [u for _s, u in rows]
+    lang = current_user.language_code or "en"
+    enrich = await _bulk_resolve_enrichment(db, subs, users, lang)
+
+    missed = []
+    for sub, user in rows:
+        crop_start = (
+            sub.crop_start_date.date()
+            if hasattr(sub.crop_start_date, "date") else sub.crop_start_date
+        )
+        tls = (await db.execute(
+            select(Timeline).where(Timeline.package_id == sub.package_id)
+        )).scalars().all()
+        for tl in tls:
+            from_type = tl.from_type.value if hasattr(tl.from_type, "value") else str(tl.from_type)
+            win_end: date | None = None
+            if from_type == "DAS":
+                win_end = crop_start + timedelta(days=int(tl.to_value))
+            elif from_type == "DBS":
+                win_end = crop_start - timedelta(days=int(tl.from_value))
+            elif from_type == "CALENDAR":
+                if tl.from_value is not None and tl.to_value is not None \
+                        and int(tl.from_value) <= int(tl.to_value):
+                    year_start = date(crop_start.year, 1, 1)
+                    win_end = year_start + timedelta(days=int(tl.to_value) - 1)
+            if win_end is None or today <= win_end:
+                continue
+            # Window has fully passed. Confirm no active order AND no
+            # purchase_ack on any practice in this timeline.
+            had_order = (await db.execute(
+                select(OrderItem.id).where(OrderItem.timeline_id == tl.id).limit(1)
+            )).scalar_one_or_none()
+            if had_order:
+                continue
+            had_purchase = (await db.execute(
+                select(PracticeAcknowledgement.id)
+                .where(
+                    PracticeAcknowledgement.subscription_id == sub.id,
+                    PracticeAcknowledgement.timeline_lineage_id == tl.lineage_id,
+                    PracticeAcknowledgement.purchased_at.isnot(None),
+                )
+                .limit(1)
+            )).scalar_one_or_none()
+            if had_purchase:
+                continue
+            missed.append({
+                **_base_alert_row(sub, user, enrich),
+                "timeline_name": tl.name,
+                "window_end": win_end.isoformat(),
+            })
+            break  # One entry per subscription — first missed wins
+    return missed
+
+
+@router.get("/client/{client_id}/alerts/overdue-expert-queries")
+async def get_overdue_expert_queries(
+    client_id: str,
+    sla_hours: int = 48,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Farmers with expert queries past SLA (default 48h) that haven't
+    reached a terminal status (RESPONDED, REJECTED, EXPIRED). Tuneable
+    via `sla_hours` query param so the SA can sweep for either
+    strictly-overdue or nearing-overdue cases."""
+    from app.modules.farmpundit.router import _assert_portal_member
+    from app.modules.farmpundit.models import Query as FarmerQuery, QueryStatus
+    from app.modules.subscriptions.models import Subscription
+    from datetime import datetime, timedelta, timezone
+    await _assert_portal_member(db, current_user.id, client_id)
+
+    sla_cutoff = datetime.now(timezone.utc) - timedelta(hours=max(1, sla_hours))
+
+    rows = (await db.execute(
+        select(FarmerQuery, Subscription, User)
+        .join(Subscription, Subscription.id == FarmerQuery.subscription_id)
+        .join(User, User.id == FarmerQuery.farmer_user_id)
+        .where(
+            FarmerQuery.client_id == client_id,
+            FarmerQuery.status.notin_([
+                QueryStatus.RESPONDED,
+                QueryStatus.REJECTED,
+                QueryStatus.EXPIRED,
+            ]),
+            FarmerQuery.created_at <= sla_cutoff,
+        )
+        .order_by(FarmerQuery.created_at.asc())
+    )).all()
+    subs = [s for _q, s, _u in rows]
+    users = [u for _q, _s, u in rows]
+    lang = current_user.language_code or "en"
+    enrich = await _bulk_resolve_enrichment(db, subs, users, lang)
+
+    out = []
+    for q, sub, user in rows:
+        out.append({
+            **_base_alert_row(sub, user, enrich),
+            "query_id": q.id,
+            "query_title": q.title,
+            "query_status": (q.status.value if hasattr(q.status, "value") else q.status),
+            "query_created_at": q.created_at.isoformat() if q.created_at else None,
+            "sla_hours": sla_hours,
+        })
+    return out
+
+
+@router.get("/client/{client_id}/alerts/no-active-subscription")
+async def get_no_active_subscription(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Farmers who have EVER subscribed with this client but have no
+    ACTIVE subscription right now. Proactive-outreach signal: the
+    farmer finished a prior crop, time to invite them back for the
+    next season."""
+    from app.modules.farmpundit.router import _assert_portal_member
+    from app.modules.subscriptions.models import Subscription, SubscriptionStatus
+    await _assert_portal_member(db, current_user.id, client_id)
+
+    # All farmer_user_ids who ever subscribed with this client.
+    ever_rows = (await db.execute(
+        select(Subscription.farmer_user_id)
+        .where(Subscription.client_id == client_id)
+        .distinct()
+    )).scalars().all()
+    if not ever_rows:
+        return []
+
+    # Those who have at least one ACTIVE subscription right now.
+    active_rows = (await db.execute(
+        select(Subscription.farmer_user_id)
+        .where(
+            Subscription.client_id == client_id,
+            Subscription.status == SubscriptionStatus.ACTIVE,
+        )
+        .distinct()
+    )).scalars().all()
+    active_ids = set(active_rows)
+    inactive_ids = [fid for fid in ever_rows if fid not in active_ids]
+    if not inactive_ids:
+        return []
+
+    # Pull the most-recent (any-status) subscription per farmer for
+    # context on the alert row (what was their last crop / when did
+    # it finish).
+    last_rows = (await db.execute(
+        select(Subscription, User)
+        .join(User, User.id == Subscription.farmer_user_id)
+        .where(
+            Subscription.client_id == client_id,
+            Subscription.farmer_user_id.in_(inactive_ids),
+        )
+        .order_by(Subscription.created_at.desc())
+    )).all()
+    seen: set[str] = set()
+    picked: list[tuple] = []
+    for sub, user in last_rows:
+        if user.id in seen:
+            continue
+        seen.add(user.id)
+        picked.append((sub, user))
+    subs = [s for s, _ in picked]
+    users = [u for _, u in picked]
+    lang = current_user.language_code or "en"
+    enrich = await _bulk_resolve_enrichment(db, subs, users, lang)
+    return [
+        {
+            **_base_alert_row(sub, user, enrich),
+            "last_subscription_status": (
+                sub.status.value if hasattr(sub.status, "value") else sub.status
+            ),
+            "last_subscription_created_at": (
+                sub.created_at.isoformat() if sub.created_at else None
+            ),
+        }
+        for sub, user in picked
+    ]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
