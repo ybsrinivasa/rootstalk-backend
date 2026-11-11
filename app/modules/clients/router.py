@@ -3719,6 +3719,22 @@ async def list_farmer_support_farmers(
         for sid, pname in pa_rows:
             promoter_name_by_sub.setdefault(sid, pname)
 
+    # 2026-11-11 — resolve state/district names once per page so the
+    # UI's filter dropdowns can show readable labels instead of
+    # truncated cosh_ids (first live RM report: "the dropdowns show
+    # 3b9f56d0… not 'Karnataka'"). Skipping sub_district here since
+    # the list UI doesn't render sub-district as a filter option.
+    cosh_ids_to_resolve: set[str] = set()
+    for sub, user in by_farmer.values():
+        if user.state_cosh_id: cosh_ids_to_resolve.add(user.state_cosh_id)
+        if user.district_cosh_id: cosh_ids_to_resolve.add(user.district_cosh_id)
+    lang = current_user.language_code or "en"
+    from app.services.i18n_cosh import resolve_names_by_cosh_id
+    name_by_cosh_id = (
+        await resolve_names_by_cosh_id(db, cosh_ids_to_resolve, lang)
+        if cosh_ids_to_resolve else {}
+    )
+
     # Build row objects
     out_rows: list[dict] = []
     for sub, user in by_farmer.values():
@@ -3727,14 +3743,21 @@ async def list_farmer_support_farmers(
             "name": user.name,
             "phone": user.phone,
             "state_cosh_id": user.state_cosh_id,
+            "state_name": name_by_cosh_id.get(user.state_cosh_id) if user.state_cosh_id else None,
             "district_cosh_id": user.district_cosh_id,
+            "district_name": name_by_cosh_id.get(user.district_cosh_id) if user.district_cosh_id else None,
             "sub_district_cosh_id": user.sub_district_cosh_id,
             "latest_subscription_id": sub.id,
             "latest_subscription_status": (
                 sub.status.value if hasattr(sub.status, "value") else sub.status
             ),
+            # Normalise datetime → date-only ISO so the CP sort / badge
+            # UI doesn't see mixed shapes (2026-11-11 fix — some
+            # Subscription rows store this as datetime, others as date).
             "latest_crop_start_date": (
-                sub.crop_start_date.isoformat() if sub.crop_start_date else None
+                sub.crop_start_date.date().isoformat()
+                if hasattr(sub.crop_start_date, "date")
+                else (sub.crop_start_date.isoformat() if sub.crop_start_date else None)
             ),
             "active_subscription_count": active_counts.get(user.id, 0),
             "promoter_name": promoter_name_by_sub.get(sub.id),
@@ -4134,6 +4157,20 @@ async def list_farmer_subscriptions(
     crop_ids = {pkg.crop_cosh_id for _, pkg in rows if pkg.crop_cosh_id}
     name_by_id = await resolve_names_by_cosh_id(db, crop_ids, lang) if crop_ids else {}
 
+    # 2026-11-11 — Subscription.crop_start_date is stored as a
+    # datetime on some rows, date on others (legacy inconsistency).
+    # Normalise to date-only ISO at serialisation time so the API
+    # shape is predictable and the sort key below never has to parse
+    # a full datetime string. Earlier crash (`ValueError: invalid
+    # literal for int() with base 10: '20260928T00:00:00+00:00'`) was
+    # exactly this.
+    def _date_iso(v) -> str | None:
+        if v is None:
+            return None
+        if hasattr(v, "date"):
+            return v.date().isoformat()
+        return v.isoformat()
+
     out = []
     for sub, pkg in rows:
         out.append({
@@ -4144,7 +4181,7 @@ async def list_farmer_subscriptions(
             "package_name": pkg.name,
             "crop_cosh_id": pkg.crop_cosh_id,
             "crop_name": name_by_id.get(pkg.crop_cosh_id) if pkg.crop_cosh_id else None,
-            "crop_start_date": sub.crop_start_date.isoformat() if sub.crop_start_date else None,
+            "crop_start_date": _date_iso(sub.crop_start_date),
             "created_at": sub.created_at.isoformat() if sub.created_at else None,
             "promoter_name": promoter_name_by_sub.get(sub.id),
             "farm_area_acres": (
@@ -4155,7 +4192,9 @@ async def list_farmer_subscriptions(
             ),
         })
     # Active first, then by crop_start_date desc (nulls last), then
-    # created_at desc as tie-breaker.
+    # created_at desc as tie-breaker. crop_start_date is always
+    # YYYY-MM-DD after normalisation; created_at is full ISO so split
+    # off the date portion before int-parsing.
     out.sort(key=lambda r: (
         0 if r["is_active"] else 1,
         -(int(r["crop_start_date"].replace("-", "")) if r["crop_start_date"] else 0),
