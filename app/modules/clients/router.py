@@ -4323,8 +4323,16 @@ async def get_subscription_diagnoses(
     current_user: User = Depends(get_current_user),
 ):
     """Pest diagnoses the farmer raised under this subscription.
-    Only returns DIAGNOSED sessions (ACTIVE = in-flight, ABORTED =
-    user bailed; neither is useful for the RM's follow-up)."""
+
+    2026-11-11 — widened the status filter: now returns both
+    DIAGNOSED (farmer matched a Cosh problem — recommendations
+    flowed) AND OUTSIDE_LIST (farmer completed the flow but the
+    problem wasn't in the catalog — farmer was pointed at the
+    expert path). The OUTSIDE_LIST signal is the RM's clearest
+    "farmer has a problem we couldn't help with" cue. Still
+    hiding ACTIVE (in-flight, incomplete) and ABORTED (user
+    bailed mid-flow) — those are noise for the RM's follow-up.
+    """
     from app.modules.subscriptions.models import Subscription
     from app.modules.diagnosis.models import DiagnosisSession
     await _assert_ca_or_rm(db, current_user, client_id)
@@ -4343,7 +4351,7 @@ async def get_subscription_diagnoses(
         select(DiagnosisSession)
         .where(
             DiagnosisSession.subscription_id == subscription_id,
-            DiagnosisSession.status == "DIAGNOSED",
+            DiagnosisSession.status.in_(["DIAGNOSED", "OUTSIDE_LIST"]),
         )
         .order_by(DiagnosisSession.created_at.desc())
     )).scalars().all()
