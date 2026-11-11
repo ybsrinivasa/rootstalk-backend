@@ -4140,22 +4140,111 @@ async def list_farmer_subscriptions(
     if not rows:
         return []
 
-    # Promoter name per subscription — one query then map.
+    # Promoter name + user_id per subscription — one query then map.
+    # Keeping user_id too (2026-11-12) so we can resolve Promoter-Pundit
+    # status for each sub's assigned promoter below.
     sub_ids = [s.id for s, _ in rows]
     pa_rows = (await db.execute(
-        select(PromoterAssignment.subscription_id, User.name)
+        select(
+            PromoterAssignment.subscription_id,
+            PromoterAssignment.promoter_user_id,
+            User.name,
+        )
         .join(User, User.id == PromoterAssignment.promoter_user_id)
         .where(PromoterAssignment.subscription_id.in_(sub_ids))
     )).all()
     promoter_name_by_sub: dict[str, str | None] = {}
-    for sid, pname in pa_rows:
+    promoter_user_id_by_sub: dict[str, str | None] = {}
+    for sid, puid, pname in pa_rows:
         promoter_name_by_sub.setdefault(sid, pname)
+        promoter_user_id_by_sub.setdefault(sid, puid)
 
     # Crop name resolution.
     lang = current_user.language_code or "en"
     from app.services.i18n_cosh import resolve_names_by_cosh_id
     crop_ids = {pkg.crop_cosh_id for _, pkg in rows if pkg.crop_cosh_id}
     name_by_id = await resolve_names_by_cosh_id(db, crop_ids, lang) if crop_ids else {}
+
+    # 2026-11-12 — per-sub activity counts for the tab badges + alert-
+    # receiver / promoter-pundit resolution for the "Who follows up"
+    # strip. All lookups are batched (one query each for N subs).
+    from app.modules.diagnosis.models import DiagnosisSession
+    from app.modules.farmpundit.models import Query as FarmerQuery
+    from sqlalchemy import func as _func
+
+    # Count of DIAGNOSED + OUTSIDE_LIST diagnosis sessions per sub.
+    # Mirrors the filter on get_subscription_diagnoses so badge count
+    # matches what the RM will see in the detail panel.
+    diag_count_rows = (await db.execute(
+        select(DiagnosisSession.subscription_id, _func.count(DiagnosisSession.id))
+        .where(
+            DiagnosisSession.subscription_id.in_(sub_ids),
+            DiagnosisSession.status.in_(["DIAGNOSED", "OUTSIDE_LIST"]),
+        )
+        .group_by(DiagnosisSession.subscription_id)
+    )).all()
+    diag_count_by_sub = {sid: cnt for sid, cnt in diag_count_rows}
+
+    # Count of UNANSWERED queries per sub (NEW/FORWARDED/RETURNED).
+    # Terminal statuses (RESPONDED/REJECTED/EXPIRED) are excluded —
+    # the badge's purpose is to flag queues that need follow-up.
+    query_count_rows = (await db.execute(
+        select(FarmerQuery.subscription_id, _func.count(FarmerQuery.id))
+        .where(
+            FarmerQuery.subscription_id.in_(sub_ids),
+            FarmerQuery.status.in_(["NEW", "FORWARDED", "RETURNED"]),
+        )
+        .group_by(FarmerQuery.subscription_id)
+    )).all()
+    query_count_by_sub = {sid: cnt for sid, cnt in query_count_rows}
+
+    # Alert receiver = Subscription.extra_alert_user_id → User (the
+    # FK that drives alert delivery, per the model comment). Falls
+    # back to the subscription's primary promoter when no extra_alert
+    # recipient is set — that's who gets alerts in the default case.
+    alert_user_ids: set[str] = set()
+    for sub, _pkg in rows:
+        if sub.extra_alert_user_id:
+            alert_user_ids.add(sub.extra_alert_user_id)
+        elif sub.promoter_user_id:
+            alert_user_ids.add(sub.promoter_user_id)
+        else:
+            # Fall back to PromoterAssignment-resolved promoter.
+            pa_puid = promoter_user_id_by_sub.get(sub.id)
+            if pa_puid:
+                alert_user_ids.add(pa_puid)
+    alert_users_by_id: dict[str, User] = {}
+    if alert_user_ids:
+        au_rows = (await db.execute(
+            select(User).where(User.id.in_(alert_user_ids))
+        )).scalars().all()
+        alert_users_by_id = {u.id: u for u in au_rows}
+
+    # Promoter-Pundit resolution: for each sub's promoter_user_id,
+    # check the ClientPromoter row at this client. If
+    # is_promoter_pundit=True AND status=ACTIVE, they're the PP.
+    candidate_pp_ids = {
+        promoter_user_id_by_sub.get(sub.id) or sub.promoter_user_id
+        for sub, _pkg in rows
+    }
+    candidate_pp_ids.discard(None)
+    pp_user_ids_set: set[str] = set()
+    if candidate_pp_ids:
+        pp_rows = (await db.execute(
+            select(ClientPromoter.user_id).where(
+                ClientPromoter.client_id == client_id,
+                ClientPromoter.user_id.in_(candidate_pp_ids),
+                ClientPromoter.status == StatusEnum.ACTIVE,
+                ClientPromoter.is_promoter_pundit.is_(True),
+            )
+        )).scalars().all()
+        pp_user_ids_set = set(pp_rows)
+    pp_users_by_id: dict[str, User] = {}
+    if pp_user_ids_set:
+        pp_user_rows = (await db.execute(
+            select(User).where(User.id.in_(pp_user_ids_set))
+        )).scalars().all()
+        pp_users_by_id = {u.id: u for u in pp_user_rows}
 
     # 2026-11-11 — Subscription.crop_start_date is stored as a
     # datetime on some rows, date on others (legacy inconsistency).
@@ -4173,6 +4262,37 @@ async def list_farmer_subscriptions(
 
     out = []
     for sub, pkg in rows:
+        # Resolve alert receiver for this sub (extra_alert_user_id →
+        # promoter_user_id → PromoterAssignment-resolved, same order
+        # as the alert_user_ids collection above).
+        alert_uid = (
+            sub.extra_alert_user_id
+            or sub.promoter_user_id
+            or promoter_user_id_by_sub.get(sub.id)
+        )
+        alert_receiver = None
+        if alert_uid and alert_uid in alert_users_by_id:
+            au = alert_users_by_id[alert_uid]
+            alert_receiver = {
+                "user_id": au.id,
+                "name": au.name,
+                "phone": au.phone,
+                "gps_lat": float(au.gps_lat) if au.gps_lat is not None else None,
+                "gps_lng": float(au.gps_lng) if au.gps_lng is not None else None,
+            }
+
+        # Resolve Promoter-Pundit (if the sub's promoter holds that
+        # role at this client).
+        pp = None
+        pp_candidate = promoter_user_id_by_sub.get(sub.id) or sub.promoter_user_id
+        if pp_candidate and pp_candidate in pp_users_by_id:
+            ppu = pp_users_by_id[pp_candidate]
+            pp = {
+                "user_id": ppu.id,
+                "name": ppu.name,
+                "phone": ppu.phone,
+            }
+
         out.append({
             "subscription_id": sub.id,
             "status": sub.status.value if hasattr(sub.status, "value") else sub.status,
@@ -4190,6 +4310,11 @@ async def list_farmer_subscriptions(
             "number_of_plants": (
                 int(sub.number_of_plants) if sub.number_of_plants else None
             ),
+            # 2026-11-12 — tab-badge counts + follow-up contacts.
+            "diagnoses_count": int(diag_count_by_sub.get(sub.id, 0)),
+            "unanswered_queries_count": int(query_count_by_sub.get(sub.id, 0)),
+            "alert_receiver": alert_receiver,
+            "promoter_pundit": pp,
         })
     # Active first, then by crop_start_date desc (nulls last), then
     # created_at desc as tie-breaker. crop_start_date is always
