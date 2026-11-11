@@ -4264,6 +4264,14 @@ async def get_subscription_practice_timeline(
     for a in acks:
         ack_by_key[(a.practice_id, a.timeline_lineage_id)] = a
 
+    # 2026-11-11 — Practice has no `name` column; the user-facing
+    # practice name is derived from l2_type via the Cosh-translated
+    # map in subscriptions/router.py. Reuse that helper so the name
+    # matches what farmers see in the PWA advisory view.
+    from app.modules.subscriptions.router import _l2_name_loc_map
+    lang = current_user.language_code or "en"
+    l2_name_loc = await _l2_name_loc_map(db, lang)
+
     tl_by_id = {tl.id: tl for tl in tls}
     out = []
     for p in practices:
@@ -4284,7 +4292,10 @@ async def get_subscription_practice_timeline(
             status = "UPCOMING"
         out.append({
             "practice_id": p.id,
-            "practice_name": p.name,
+            # Localised L2 name, falling back to the enum value so the
+            # UI never shows a blank name even if a Cosh mapping is
+            # missing for a legacy practice type.
+            "practice_name": l2_name_loc.get(p.l2_type) or p.l2_type,
             "l0_type": (p.l0_type.value if hasattr(p.l0_type, "value") else p.l0_type),
             "l1_type": p.l1_type,
             "l2_type": p.l2_type,
@@ -4522,6 +4533,13 @@ async def get_subscription_inputs(
     )).scalars().all()
     active_order_tls = set(order_tl_ids)
 
+    # 2026-11-11 — same Cosh-resolution pattern as the practices
+    # endpoint; Practice has no `name` column, use l2_type via
+    # _l2_name_loc_map.
+    from app.modules.subscriptions.router import _l2_name_loc_map
+    lang = current_user.language_code or "en"
+    l2_name_loc = await _l2_name_loc_map(db, lang)
+
     tl_by_id = {tl.id: tl for tl in tls}
     rows: list[dict] = []
     for p in practices:
@@ -4553,7 +4571,7 @@ async def get_subscription_inputs(
 
         rows.append({
             "practice_id": p.id,
-            "practice_name": p.name,
+            "practice_name": l2_name_loc.get(p.l2_type) or p.l2_type,
             "l1_type": p.l1_type,
             "l2_type": p.l2_type,
             "timeline_id": tl.id,
