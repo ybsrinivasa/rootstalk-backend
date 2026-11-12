@@ -4727,6 +4727,172 @@ async def get_subscription_inputs(
     return {"due_now": due_now, "all": rows}
 
 
+@router.get(
+    "/client/{client_id}/farmer-support/farmers/{farmer_user_id}"
+    "/subscriptions/{subscription_id}/nearby-facilitators"
+)
+async def get_subscription_nearby_facilitators(
+    client_id: str,
+    farmer_user_id: str,
+    subscription_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """RM-facing variant of the PWA's nearby-facilitators endpoint.
+
+    Returns the farmer's own GPS pin + every ONBOARDED facilitator at
+    this subscription's effective client (training subs resolve to the
+    parent client), each with distance from the farmer and a `role`
+    tag so the CP map can colour-code pins (ALERT_RECEIVER, PROMOTER,
+    PROMOTER_PUNDIT, FACILITATOR). All data is read-only — the RM
+    uses this to see whether the active alert receiver is actually the
+    closest/right person, not to re-assign anyone.
+    """
+    from app.modules.subscriptions.models import (
+        Subscription, PromoterAssignment, AssignmentStatus,
+    )
+    from app.modules.subscriptions.router import _haversine_sub
+    from app.services.training import resolve_package_client_id
+
+    await _assert_ca_or_rm(db, current_user, client_id)
+    await _assert_farmer_belongs_to_client(db, client_id, farmer_user_id)
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.client_id == client_id,
+            Subscription.farmer_user_id == farmer_user_id,
+        )
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    farmer = (await db.execute(
+        select(User).where(User.id == farmer_user_id)
+    )).scalar_one_or_none()
+    if farmer is None or farmer.gps_lat is None or farmer.gps_lng is None:
+        # Map can't anchor without a farmer coord — surface the gap
+        # so the CP can render an explanatory empty state instead of
+        # a confusing world-centred map.
+        return {
+            "farmer": {
+                "user_id": farmer_user_id,
+                "name": farmer.name if farmer else None,
+                "phone": farmer.phone if farmer else None,
+                "gps_lat": None,
+                "gps_lng": None,
+            },
+            "facilitators": [],
+            "reason": "farmer_gps_missing" if farmer else "farmer_not_found",
+        }
+
+    farmer_lat = float(farmer.gps_lat)
+    farmer_lng = float(farmer.gps_lng)
+
+    # Resolve who the alert_receiver is for this sub so the role tag
+    # lines up with the "Who follows up" strip (same fallback chain
+    # as list_farmer_subscriptions).
+    pa_row = (await db.execute(
+        select(PromoterAssignment.promoter_user_id).where(
+            PromoterAssignment.subscription_id == subscription_id,
+            PromoterAssignment.status == AssignmentStatus.ACTIVE,
+        ).order_by(PromoterAssignment.assigned_at.desc()).limit(1)
+    )).scalar_one_or_none()
+    alert_user_id = (
+        sub.extra_alert_user_id or sub.promoter_user_id or pa_row
+    )
+    promoter_user_id = sub.promoter_user_id or pa_row
+
+    # Facilitator pool = ACTIVE FACILITATOR ClientPromoter rows at
+    # the effective (training-aware) client.
+    effective_client_id = await resolve_package_client_id(db, sub.client_id)
+    cp_rows = (await db.execute(
+        select(ClientPromoter.user_id, ClientPromoter.is_promoter_pundit).where(
+            ClientPromoter.client_id == effective_client_id,
+            ClientPromoter.promoter_type == "FACILITATOR",
+            ClientPromoter.status == StatusEnum.ACTIVE,
+        )
+    )).all()
+    pundit_flag_by_uid = {uid: bool(pp) for uid, pp in cp_rows}
+    fac_uids = set(pundit_flag_by_uid.keys())
+
+    # Always include the alert_receiver + promoter even if they
+    # weren't onboarded as FACILITATOR (e.g. a DEALER-pinned
+    # promoter) — the RM needs to see them on the map regardless.
+    for extra in (alert_user_id, promoter_user_id):
+        if extra:
+            fac_uids.add(extra)
+
+    if not fac_uids:
+        return {
+            "farmer": {
+                "user_id": farmer.id,
+                "name": farmer.name,
+                "phone": farmer.phone,
+                "gps_lat": farmer_lat,
+                "gps_lng": farmer_lng,
+            },
+            "facilitators": [],
+            "reason": None,
+        }
+
+    fac_users = (await db.execute(
+        select(User).where(User.id.in_(fac_uids))
+    )).scalars().all()
+
+    out = []
+    for u in fac_users:
+        gps_ok = u.gps_lat is not None and u.gps_lng is not None
+        dist = (
+            round(_haversine_sub(
+                farmer_lat, farmer_lng,
+                float(u.gps_lat), float(u.gps_lng),
+            ), 1)
+            if gps_ok else None
+        )
+        # Role precedence: a single pin carries the highest-signal
+        # label (alert-receiver > promoter-pundit > promoter > plain).
+        if u.id == alert_user_id:
+            role = "ALERT_RECEIVER"
+        elif pundit_flag_by_uid.get(u.id):
+            role = "PROMOTER_PUNDIT"
+        elif u.id == promoter_user_id:
+            role = "PROMOTER"
+        else:
+            role = "FACILITATOR"
+        out.append({
+            "user_id": u.id,
+            "name": u.name,
+            "phone": u.phone,
+            "gps_lat": float(u.gps_lat) if gps_ok else None,
+            "gps_lng": float(u.gps_lng) if gps_ok else None,
+            "distance_km": dist,
+            "role": role,
+            "is_alert_receiver": u.id == alert_user_id,
+            "is_promoter": u.id == promoter_user_id,
+            "is_promoter_pundit": pundit_flag_by_uid.get(u.id, False),
+        })
+
+    # Sort: alert receiver first (so the RM's primary follow-up
+    # contact is always visible even on a crowded map), then by
+    # distance; GPS-less facilitators sink to the bottom.
+    out.sort(key=lambda r: (
+        0 if r["is_alert_receiver"] else 1,
+        r["distance_km"] if r["distance_km"] is not None else 1e9,
+    ))
+
+    return {
+        "farmer": {
+            "user_id": farmer.id,
+            "name": farmer.name,
+            "phone": farmer.phone,
+            "gps_lat": farmer_lat,
+            "gps_lng": farmer_lng,
+        },
+        "facilitators": out,
+        "reason": None,
+    }
+
+
 # ── Call Log (Phase 4, 2026-11-10) ────────────────────────────────────────────
 
 
