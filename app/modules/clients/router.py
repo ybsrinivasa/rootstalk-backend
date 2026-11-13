@@ -3809,7 +3809,7 @@ async def get_missed_inputs(
     """
     from app.modules.farmpundit.router import _assert_portal_member
     from app.modules.subscriptions.models import Subscription, SubscriptionStatus
-    from app.modules.orders.models import OrderItem
+    from app.modules.orders.models import Order, OrderItem, OrderStatus
     from app.modules.advisory.models import (
         PracticeAcknowledgement, Timeline,
     )
@@ -3857,8 +3857,27 @@ async def get_missed_inputs(
                 continue
             # Window has fully passed. Confirm no active order AND no
             # purchase_ack on any practice in this timeline.
+            # 2026-11-13 — tightened:
+            #   (a) scope to THIS subscription (OrderItem.timeline_id
+            #       is shared across farmers when they subscribe to
+            #       the same package; without the Order.subscription_id
+            #       filter, any farmer's order on the shared timeline
+            #       suppressed everyone else's missed-input alert).
+            #   (b) filter CANCELLED + EXPIRED Orders so a farmer
+            #       whose order was cancelled still surfaces as missed
+            #       (they genuinely missed the input).
+            #   (c) filter archived OrderItems so Orders V2 lineage
+            #       husks (REROUTED items) don't suppress real misses.
             had_order = (await db.execute(
-                select(OrderItem.id).where(OrderItem.timeline_id == tl.id).limit(1)
+                select(OrderItem.id)
+                .join(Order, Order.id == OrderItem.order_id)
+                .where(
+                    Order.subscription_id == sub.id,
+                    Order.status.notin_([OrderStatus.CANCELLED, OrderStatus.EXPIRED]),
+                    OrderItem.timeline_id == tl.id,
+                    OrderItem.archived_at.is_(None),
+                )
+                .limit(1)
             )).scalar_one_or_none()
             if had_order:
                 continue
