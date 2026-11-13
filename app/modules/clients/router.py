@@ -4597,21 +4597,42 @@ async def get_subscription_inputs(
     """Input tracking for one subscription. Each input-type practice
     (l0_type = 'INPUT') gets a row with one of six statuses:
 
-      PURCHASED    — PracticeAcknowledgement.purchased_at is set
+      PURCHASED    — any of:
+                     (a) PracticeAcknowledgement.purchased_at is set
+                         (farmer tapped "I've purchased this" in PWA)
+                     (b) an OrderItem on this timeline reached
+                         status=APPROVED with final_confirmed_at set
+                         (farmer accepted dealer's final offer in-app)
+                     Surfaces `picked_up_at` when the corresponding
+                     PackingList has `farmer_received_at` set
+                     (physical pickup confirmed).
       ORDERED      — an uncancelled OrderItem exists for this timeline
+                     but hasn't reached APPROVED+final_confirmed yet
       DUE_NOW      — today within window, no order, no purchase
       UPCOMING     — today before window, starts within 7 days
       MISSED       — today past window end, no order, no purchase
       NOT_REQUIRED — PracticeAcknowledgement.hidden_at is set
 
     Response groups 'due_now' separately so the UI can render its
-    highlighted priority panel without re-filtering."""
+    highlighted priority panel without re-filtering.
+
+    2026-11-13 fix: previously `has_order → ORDERED` was terminal in
+    the no-ack path, so an item stayed ORDERED even after the farmer
+    picked it up via the in-app order flow (no code writes
+    PracticeAcknowledgement.purchased_at as a side effect of order
+    completion). Now any APPROVED+final-confirmed OrderItem flips the
+    row to PURCHASED, and `picked_up_at` carries the actual pickup
+    date when a PackingList farmer_received_at exists.
+    """
     from app.modules.subscriptions.models import Subscription
     from app.modules.advisory.models import (
         PracticeAcknowledgement, Timeline, Practice,
     )
-    from app.modules.orders.models import Order, OrderItem, OrderStatus
+    from app.modules.orders.models import (
+        Order, OrderItem, OrderStatus, OrderItemStatus, PackingList,
+    )
     from datetime import date, timedelta
+    from sqlalchemy import func as _func
     await _assert_ca_or_rm(db, current_user, client_id)
     await _assert_farmer_belongs_to_client(db, client_id, farmer_user_id)
     sub = (await db.execute(
@@ -4654,17 +4675,63 @@ async def get_subscription_inputs(
     for a in acks:
         ack_by_key[(a.practice_id, a.timeline_lineage_id)] = a
 
-    # Active (non-cancelled) order items by timeline.
-    order_tl_ids = (await db.execute(
-        select(OrderItem.timeline_id)
+    # Pull all non-cancelled OrderItems once; derive the three
+    # timeline-level booleans we need (active / approved / picked-up)
+    # + a best `picked_up_at` per timeline. Batched so the per-practice
+    # loop below stays O(n) in practice count, not per-row round-trips.
+    oi_rows = (await db.execute(
+        select(
+            OrderItem.timeline_id,
+            OrderItem.status,
+            OrderItem.final_confirmed_at,
+            OrderItem.order_id,
+        )
         .join(Order, Order.id == OrderItem.order_id)
         .where(
             Order.subscription_id == subscription_id,
-            Order.status != OrderStatus.CANCELLED,
+            Order.status.notin_([OrderStatus.CANCELLED, OrderStatus.EXPIRED]),
+            OrderItem.archived_at.is_(None),
         )
-        .distinct()
-    )).scalars().all()
-    active_order_tls = set(order_tl_ids)
+    )).all()
+    active_order_tls: set[str] = set()
+    approved_tls: set[str] = set()
+    order_ids_for_approved: set[str] = set()
+    for tl_id, item_status, final_at, order_id in oi_rows:
+        active_order_tls.add(tl_id)
+        if item_status == OrderItemStatus.APPROVED and final_at is not None:
+            approved_tls.add(tl_id)
+            order_ids_for_approved.add(order_id)
+
+    # For each approved-containing order, map order_id → earliest
+    # packing-list `farmer_received_at` (the authoritative "farmer has
+    # physically received the goods" marker). Multiple PL rows per
+    # order are possible (per-batch pickup); the earliest "farmer has
+    # it in hand" wins for the per-timeline pickup date.
+    pickup_by_order: dict[str, object] = {}
+    if order_ids_for_approved:
+        pl_rows = (await db.execute(
+            select(PackingList.order_id, PackingList.farmer_received_at)
+            .where(
+                PackingList.order_id.in_(order_ids_for_approved),
+                PackingList.farmer_received_at.isnot(None),
+            )
+        )).all()
+        for oid, rec_at in pl_rows:
+            existing = pickup_by_order.get(oid)
+            if existing is None or (rec_at and rec_at < existing):
+                pickup_by_order[oid] = rec_at
+    # Collapse back to per-timeline: earliest pickup across any
+    # approved OrderItem on that timeline wins.
+    picked_up_by_tl: dict[str, object] = {}
+    for tl_id, item_status, _final, order_id in oi_rows:
+        if item_status != OrderItemStatus.APPROVED:
+            continue
+        rec_at = pickup_by_order.get(order_id)
+        if rec_at is None:
+            continue
+        existing = picked_up_by_tl.get(tl_id)
+        if existing is None or rec_at < existing:
+            picked_up_by_tl[tl_id] = rec_at
 
     # 2026-11-11 — same Cosh-resolution pattern as the practices
     # endpoint; Practice has no `name` column, use l2_type via
@@ -4683,9 +4750,21 @@ async def get_subscription_inputs(
             else _timeline_window(tl, crop_start)
         ack = ack_by_key.get((p.id, tl.lineage_id))
         has_order = tl.id in active_order_tls
+        has_approved = tl.id in approved_tls
+        picked_up_at = picked_up_by_tl.get(tl.id)
 
+        # purchased_via tells the UI which signal fired so it can
+        # label accordingly: "ack" (farmer tapped buy) /
+        # "order_pickup" (full in-app pickup) / "order_approved"
+        # (farmer accepted final offer but PackingList pickup not yet
+        # recorded — still counts as purchased for RM purposes).
+        purchased_via: str | None = None
         if ack and ack.purchased_at:
             status = "PURCHASED"
+            purchased_via = "ack"
+        elif has_approved:
+            status = "PURCHASED"
+            purchased_via = "order_pickup" if picked_up_at else "order_approved"
         elif ack and ack.hidden_at:
             status = "NOT_REQUIRED"
         elif has_order:
@@ -4712,7 +4791,9 @@ async def get_subscription_inputs(
             "window_start": win_start.isoformat() if win_start else None,
             "window_end": win_end.isoformat() if win_end else None,
             "status": status,
+            "purchased_via": purchased_via,
             "purchased_at": ack.purchased_at.isoformat() if ack and ack.purchased_at else None,
+            "picked_up_at": picked_up_at.isoformat() if picked_up_at else None,
             "purchased_brand_text": (
                 ack.purchased_brand_text if ack and getattr(ack, "purchased_brand_text", None) else None
             ),
