@@ -4309,19 +4309,28 @@ async def list_farmer_subscriptions(
         )).scalars().all()
         alert_users_by_id = {u.id: u for u in au_rows}
 
-    # Promoter-Pundit resolution: for each sub's promoter_user_id,
-    # check BOTH P-P paths at this client (post b8e4a72f3019 migration):
+    # Promoter-Pundit resolution: for each sub, pick the pinned
+    # override (`extra_promoter_pundit_user_id`, 2026-11-14) when set,
+    # else fall back to the sub's promoter. Then validate the chosen
+    # candidate against BOTH P-P paths at this client (post
+    # b8e4a72f3019 migration):
     #   Path 1: ClientPromoter.is_promoter_pundit = TRUE (phantom
     #           pundit path).
     #   Path 2: ClientFarmPundit.role = PROMOTER_PUNDIT (FarmPundit-
     #           profile-backed designation).
-    # 2026-11-14 pt3 — Path 2 was missed previously; this surface
-    # now matches the Nearby Contacts panel's resolution.
-    candidate_pp_ids = {
-        promoter_user_id_by_sub.get(sub.id) or sub.promoter_user_id
-        for sub, _pkg in rows
-    }
-    candidate_pp_ids.discard(None)
+    # Matches the backend query-routing priority (pinned beats derived)
+    # so the strip display agrees with what the farmer's queries
+    # actually route to.
+    candidate_pp_by_sub: dict[str, str] = {}
+    for sub, _pkg in rows:
+        cand = (
+            sub.extra_promoter_pundit_user_id
+            or promoter_user_id_by_sub.get(sub.id)
+            or sub.promoter_user_id
+        )
+        if cand:
+            candidate_pp_by_sub[sub.id] = cand
+    candidate_pp_ids = set(candidate_pp_by_sub.values())
     pp_user_ids_set: set[str] = set()
     if candidate_pp_ids:
         pp_rows_p1 = (await db.execute(
@@ -4434,10 +4443,14 @@ async def list_farmer_subscriptions(
                 "gps_lng": float(au.gps_lng) if au.gps_lng is not None else None,
             }
 
-        # Resolve Promoter-Pundit (if the sub's promoter holds that
-        # role at this client).
+        # Resolve Promoter-Pundit — prefer the RM-pinned override
+        # (`extra_promoter_pundit_user_id`), then fall back to the
+        # sub's promoter if they hold that role. Matches the query-
+        # routing priority so this display and the actual routing
+        # decision agree. candidate_pp_by_sub is pre-computed above
+        # with the same preference order.
         pp = None
-        pp_candidate = promoter_user_id_by_sub.get(sub.id) or sub.promoter_user_id
+        pp_candidate = candidate_pp_by_sub.get(sub.id)
         if pp_candidate and pp_candidate in pp_users_by_id:
             ppu = pp_users_by_id[pp_candidate]
             pp = {
@@ -5545,6 +5558,168 @@ async def set_subscription_alert_receiver(
     return {
         "subscription_id": sub.id,
         "alert_receiver_user_id": new_user_id,
+        "changed": True,
+    }
+
+
+# ── Promoter-Pundit reassignment (v2 mutation #2, 2026-11-14) ─────────────────
+#
+# Lets the RM pin a specific designated Promoter-Pundit to a
+# subscription. Writes `Subscription.extra_promoter_pundit_user_id`
+# — a new column added in migration q9n4i2k85p1g. The BL-12a query-
+# routing service (`services/bl12_query_routing.py`) now prefers
+# this pin over the derived P-P (the sub's promoter if they're
+# also a P-P) but still ranks BELOW the farmer's explicit
+# preference so farmer agency stays authoritative.
+#
+# Validation: new user_id must be a designated P-P at this sub's
+# effective client — EITHER via Path 1 (ClientPromoter.
+# is_promoter_pundit=True) OR Path 2 (ClientFarmPundit.role =
+# PROMOTER_PUNDIT). Mirrors the Nearby Contacts panel's union so
+# the UI's P-P chip set equals the valid-assignment set.
+
+
+class PromoterPunditChangeBody(BaseModel):
+    user_id: Optional[str] = None  # None = clear the pin
+
+
+@router.put(
+    "/client/{client_id}/farmer-support/farmers/{farmer_user_id}"
+    "/subscriptions/{subscription_id}/promoter-pundit"
+)
+async def set_subscription_promoter_pundit(
+    client_id: str,
+    farmer_user_id: str,
+    subscription_id: str,
+    body: PromoterPunditChangeBody,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Assign (or clear) the pinned Promoter-Pundit on a subscription.
+
+    Audit row written for every change. Best-effort farmer SMS
+    notification fires post-commit — the farmer should know when
+    the person who answers their queries is being changed on their
+    behalf (same transparency rationale as the alert-receiver
+    endpoint).
+    """
+    from app.modules.subscriptions.models import Subscription
+    from app.modules.farmpundit.models import ClientFarmPundit, FarmPunditProfile
+    from app.modules.clients.models import SubscriptionPromoterPunditChange
+    from app.services.training import resolve_package_client_id
+    from app.services.sms_service import send_sms
+
+    await _assert_ca_or_rm(db, current_user, client_id)
+    await _assert_rm_for_alert_receiver_change(db, current_user, client_id)
+    await _assert_farmer_belongs_to_client(db, client_id, farmer_user_id)
+
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.client_id == client_id,
+            Subscription.farmer_user_id == farmer_user_id,
+        )
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    new_user_id = body.user_id.strip() if body.user_id else None
+    if new_user_id == "":
+        new_user_id = None
+
+    # Validate: new_user_id must be a designated P-P at this client
+    # via either path. Union matches the Nearby Contacts resolution
+    # so the UI's "Promoter-Pundit" chip set equals the valid set.
+    new_user: Optional[User] = None
+    if new_user_id is not None:
+        effective_client_id = await resolve_package_client_id(db, sub.client_id)
+        is_pp_p1 = (await db.execute(
+            select(ClientPromoter.id).where(
+                ClientPromoter.client_id == effective_client_id,
+                ClientPromoter.user_id == new_user_id,
+                ClientPromoter.status == StatusEnum.ACTIVE,
+                ClientPromoter.is_promoter_pundit.is_(True),
+            ).limit(1)
+        )).scalar_one_or_none()
+        is_pp_p2 = None
+        if is_pp_p1 is None:
+            is_pp_p2 = (await db.execute(
+                select(ClientFarmPundit.id)
+                .join(FarmPunditProfile, FarmPunditProfile.id == ClientFarmPundit.pundit_id)
+                .where(
+                    ClientFarmPundit.client_id == effective_client_id,
+                    ClientFarmPundit.status == "ACTIVE",
+                    ClientFarmPundit.role == "PROMOTER_PUNDIT",
+                    FarmPunditProfile.user_id == new_user_id,
+                ).limit(1)
+            )).scalar_one_or_none()
+        if is_pp_p1 is None and is_pp_p2 is None:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "promoter_pundit_not_designated",
+                    "message": (
+                        "The chosen user is not a designated Promoter-"
+                        "Pundit at this client. Only users marked P-P "
+                        "(via Promoter UI or FarmPundit profile) are "
+                        "eligible to be pinned."
+                    ),
+                },
+            )
+        new_user = (await db.execute(
+            select(User).where(User.id == new_user_id)
+        )).scalar_one_or_none()
+        if new_user is None:
+            raise HTTPException(
+                status_code=422, detail="New Promoter-Pundit user not found.",
+            )
+
+    old_user_id = sub.extra_promoter_pundit_user_id
+    if old_user_id == new_user_id:
+        return {
+            "subscription_id": sub.id,
+            "promoter_pundit_user_id": new_user_id,
+            "changed": False,
+        }
+
+    sub.extra_promoter_pundit_user_id = new_user_id
+
+    db.add(SubscriptionPromoterPunditChange(
+        subscription_id=sub.id,
+        old_user_id=old_user_id,
+        new_user_id=new_user_id,
+        changed_by_user_id=current_user.id,
+        source="FARMER_SUPPORT_RM",
+    ))
+    await db.commit()
+
+    # Notify farmer (best-effort). The P-P change affects who
+    # receives their expert queries — meaningful enough to surface
+    # to the farmer, same as alert-receiver changes.
+    farmer = (await db.execute(
+        select(User).where(User.id == farmer_user_id)
+    )).scalar_one_or_none()
+    if farmer and farmer.phone:
+        if new_user_id and new_user:
+            body_text = (
+                f"RootsTalk: Your support team has updated the Promoter-"
+                f"Pundit who answers your expert queries. New contact: "
+                f"{new_user.name or '—'} ({new_user.phone or '—'})."
+            )
+        else:
+            body_text = (
+                "RootsTalk: Your support team has cleared the pinned "
+                "Promoter-Pundit on your crop — new queries will route "
+                "via the default rules again."
+            )
+        try:
+            await send_sms(farmer.phone, body_text)
+        except Exception:
+            pass
+
+    return {
+        "subscription_id": sub.id,
+        "promoter_pundit_user_id": new_user_id,
         "changed": True,
     }
 

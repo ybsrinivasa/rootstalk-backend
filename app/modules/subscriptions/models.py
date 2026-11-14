@@ -116,6 +116,19 @@ class Subscription(Base):
     alerts_extra_disabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False,
     )
+    # 2026-11-14 — RM-pinned Promoter-Pundit override. When set, the
+    # BL-12a query-routing service prefers this user over the
+    # Priority-2 "derived P-P" (the sub's promoter if they're a P-P).
+    # Still ranks BELOW the farmer's explicit preference (P1) to keep
+    # the farmer's choice authoritative. Set via the RM's Farmer
+    # Support Nearby-Contacts panel; auto-NULLed if the referenced
+    # user is deleted. Writes are audited in
+    # `subscription_promoter_pundit_changes`.
+    extra_promoter_pundit_user_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     subscription_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     lapsed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     # 2026-09-16 — Advisory-Only Mode snapshot columns. Captured from
