@@ -3812,29 +3812,53 @@ async def _get_next_pundit_for_query(
     )).scalar_one_or_none()
     farmer_preferred = pref.pundit_id if pref else None
 
-    # Priority 2: Promoter-Pundit (from promoter_assignments)
-    from app.modules.subscriptions.models import PromoterAssignment
-    assignment = (await db.execute(
-        select(PromoterAssignment).where(
-            PromoterAssignment.subscription_id == subscription_id,
-            PromoterAssignment.status == "ACTIVE",
-        ).order_by(PromoterAssignment.assigned_at.desc()).limit(1)
+    # Priority 2: Promoter-Pundit. Prefer the RM-pinned override
+    # (`Subscription.extra_promoter_pundit_user_id`, 2026-11-14) when
+    # set and that user is still a designated P-P at this client. Fall
+    # back to the derived P-P (the sub's promoter if they're a P-P) —
+    # this was the whole mechanism pre-2026-11-14.
+    from app.modules.subscriptions.models import PromoterAssignment, Subscription
+    sub_row = (await db.execute(
+        select(Subscription.extra_promoter_pundit_user_id)
+        .where(Subscription.id == subscription_id)
     )).scalar_one_or_none()
+    pinned_user_id = sub_row
 
     promoter_pundit_id = None
-    if assignment:
-        # Check if promoter is also a Promoter-Pundit for this client
-        promoter_user = (await db.execute(
-            select(FarmPunditProfile).where(FarmPunditProfile.user_id == assignment.promoter_user_id)
+    if pinned_user_id:
+        pinned_profile = (await db.execute(
+            select(FarmPunditProfile).where(FarmPunditProfile.user_id == pinned_user_id)
         )).scalar_one_or_none()
-        if promoter_user:
+        if pinned_profile:
             pp_slot = next(
                 (e for e in experts
-                 if e.pundit_id == promoter_user.id and e.role == "PROMOTER_PUNDIT"),
+                 if e.pundit_id == pinned_profile.id and e.role == "PROMOTER_PUNDIT"),
                 None,
             )
             if pp_slot:
-                promoter_pundit_id = promoter_user.id
+                promoter_pundit_id = pinned_profile.id
+
+    # Fall back to the derived P-P (assigning promoter who is also a
+    # P-P at this client) if the RM pin didn't resolve.
+    if promoter_pundit_id is None:
+        assignment = (await db.execute(
+            select(PromoterAssignment).where(
+                PromoterAssignment.subscription_id == subscription_id,
+                PromoterAssignment.status == "ACTIVE",
+            ).order_by(PromoterAssignment.assigned_at.desc()).limit(1)
+        )).scalar_one_or_none()
+        if assignment:
+            promoter_user = (await db.execute(
+                select(FarmPunditProfile).where(FarmPunditProfile.user_id == assignment.promoter_user_id)
+            )).scalar_one_or_none()
+            if promoter_user:
+                pp_slot = next(
+                    (e for e in experts
+                     if e.pundit_id == promoter_user.id and e.role == "PROMOTER_PUNDIT"),
+                    None,
+                )
+                if pp_slot:
+                    promoter_pundit_id = promoter_user.id
 
     # Last received pundit (for round-robin)
     last_remark = (await db.execute(

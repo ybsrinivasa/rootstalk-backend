@@ -642,3 +642,45 @@ class SubscriptionAlertReceiverChange(Base):
         Index("ix_sarc_sub_changed_at",
               "subscription_id", "changed_at"),
     )
+
+
+class SubscriptionPromoterPunditChange(Base):
+    """Permanent audit trail for every change to a subscription's
+    RM-pinned Promoter-Pundit. Append-only (no edit, no delete) —
+    mirrors SubscriptionAlertReceiverChange + farmer_call_logs.
+
+    Writes fire from both the RM-side endpoint (source =
+    FARMER_SUPPORT_RM) and should one day fire from any farmer-side
+    path too — currently the farmer cannot pin a P-P directly, so
+    all rows are FARMER_SUPPORT_RM.
+    """
+    __tablename__ = "subscription_promoter_pundit_changes"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    subscription_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("subscriptions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    old_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    new_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    changed_by_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    changed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False,
+    )
+    source: Mapped[str] = mapped_column(
+        String(40), default="FARMER_SUPPORT_RM", nullable=False,
+    )
+
+    __table_args__ = (
+        Index("ix_sppc_sub_changed_at",
+              "subscription_id", "changed_at"),
+    )
