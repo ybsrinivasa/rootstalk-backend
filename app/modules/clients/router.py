@@ -4310,8 +4310,13 @@ async def list_farmer_subscriptions(
         alert_users_by_id = {u.id: u for u in au_rows}
 
     # Promoter-Pundit resolution: for each sub's promoter_user_id,
-    # check the ClientPromoter row at this client. If
-    # is_promoter_pundit=True AND status=ACTIVE, they're the PP.
+    # check BOTH P-P paths at this client (post b8e4a72f3019 migration):
+    #   Path 1: ClientPromoter.is_promoter_pundit = TRUE (phantom
+    #           pundit path).
+    #   Path 2: ClientFarmPundit.role = PROMOTER_PUNDIT (FarmPundit-
+    #           profile-backed designation).
+    # 2026-11-14 pt3 — Path 2 was missed previously; this surface
+    # now matches the Nearby Contacts panel's resolution.
     candidate_pp_ids = {
         promoter_user_id_by_sub.get(sub.id) or sub.promoter_user_id
         for sub, _pkg in rows
@@ -4319,7 +4324,7 @@ async def list_farmer_subscriptions(
     candidate_pp_ids.discard(None)
     pp_user_ids_set: set[str] = set()
     if candidate_pp_ids:
-        pp_rows = (await db.execute(
+        pp_rows_p1 = (await db.execute(
             select(ClientPromoter.user_id).where(
                 ClientPromoter.client_id == client_id,
                 ClientPromoter.user_id.in_(candidate_pp_ids),
@@ -4327,7 +4332,21 @@ async def list_farmer_subscriptions(
                 ClientPromoter.is_promoter_pundit.is_(True),
             )
         )).scalars().all()
-        pp_user_ids_set = set(pp_rows)
+        pp_user_ids_set.update(pp_rows_p1)
+        from app.modules.farmpundit.models import (
+            ClientFarmPundit, FarmPunditProfile,
+        )
+        pp_rows_p2 = (await db.execute(
+            select(FarmPunditProfile.user_id)
+            .join(ClientFarmPundit, ClientFarmPundit.pundit_id == FarmPunditProfile.id)
+            .where(
+                ClientFarmPundit.client_id == client_id,
+                ClientFarmPundit.status == "ACTIVE",
+                ClientFarmPundit.role == "PROMOTER_PUNDIT",
+                FarmPunditProfile.user_id.in_(candidate_pp_ids),
+            )
+        )).scalars().all()
+        pp_user_ids_set.update(pp_rows_p2)
     pp_users_by_id: dict[str, User] = {}
     if pp_user_ids_set:
         pp_user_rows = (await db.execute(
