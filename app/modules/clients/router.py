@@ -5173,7 +5173,31 @@ async def get_subscription_nearby_contacts(
             ClientPromoter.status == StatusEnum.ACTIVE,
         )
     )).all()
-    if not cp_rows:
+
+    # 2026-11-14 pt3 — Promoter-Pundit designations live on TWO rows
+    # in the current schema (post b8e4a72f3019 migration):
+    #   Path 1: ClientPromoter.is_promoter_pundit = TRUE (the "phantom
+    #           pundit" path — a Promoter who was elevated to P-P via
+    #           the Promoter UI without a FarmPundit profile).
+    #   Path 2: ClientFarmPundit.role = PROMOTER_PUNDIT (the real path
+    #           — a user who registered as a FarmPundit and then got
+    #           designated as the company's P-P).
+    # Pre-2026-06-23 these were unified via a single is_promoter_pundit
+    # flag on ClientFarmPundit; the migration split them. Querying
+    # only Path 1 missed Path-2 P-Ps entirely (first live example:
+    # KhazaKhan PP at KRP). Load both + union by user_id.
+    from app.modules.farmpundit.models import ClientFarmPundit, FarmPunditProfile
+    pp_via_pundit_uids = set((await db.execute(
+        select(FarmPunditProfile.user_id)
+        .join(ClientFarmPundit, ClientFarmPundit.pundit_id == FarmPunditProfile.id)
+        .where(
+            ClientFarmPundit.client_id == effective_client_id,
+            ClientFarmPundit.status == "ACTIVE",
+            ClientFarmPundit.role == "PROMOTER_PUNDIT",
+        )
+    )).scalars().all())
+
+    if not cp_rows and not pp_via_pundit_uids:
         return {"farmer_has_gps": farmer_lat is not None, "contacts": []}
 
     # Per-user metadata — a user can hold MULTIPLE ClientPromoter rows
@@ -5198,6 +5222,23 @@ async def get_subscription_nearby_contacts(
                 existing["is_promoter"] = True
             if bool(is_pp):
                 existing["is_promoter_pundit"] = True
+
+    # Merge Path-2 P-Ps. If they're already in cp_meta_by_uid (i.e.
+    # they also have a ClientPromoter row), just flip the P-P flag
+    # on their existing entry. Otherwise add a new entry with empty
+    # promoter_types so the RM still sees them as a nearby contact
+    # with the Promoter-Pundit chip — useful for P-P-only pundits
+    # the RM may want to call for query support.
+    for uid in pp_via_pundit_uids:
+        existing = cp_meta_by_uid.get(uid)
+        if existing is None:
+            cp_meta_by_uid[uid] = {
+                "promoter_types": set(),
+                "is_promoter": False,
+                "is_promoter_pundit": True,
+            }
+        else:
+            existing["is_promoter_pundit"] = True
 
     user_ids = list(cp_meta_by_uid.keys())
     users = (await db.execute(
