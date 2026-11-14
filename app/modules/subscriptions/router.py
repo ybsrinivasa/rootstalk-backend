@@ -4411,16 +4411,37 @@ async def set_alert_preferences(
     """
     from app.modules.platform.models import UserRole, RoleType, StatusEnum
     from app.tasks.alerts import supersede_alerts_for_removed_recipients
+    from app.modules.clients.models import SubscriptionAlertReceiverChange
 
     sub = await _get_subscription(db, subscription_id, current_user.id)
     disabled = bool(data.get("disabled"))
     phone_raw = (data.get("extra_phone") or "").strip()
+
+    # 2026-11-14 pt5 — audit-trail parity. The RM-side endpoint
+    # already writes SubscriptionAlertReceiverChange rows for every
+    # change; close the gap on the farmer's path too so the history
+    # is complete across both actors. source='FARMER_PWA' lets later
+    # readers distinguish RM-initiated changes from farmer-initiated
+    # ones. No row written when the value doesn't actually change.
+    old_user_id = sub.extra_alert_user_id
+
+    def _audit_if_changed(new_user_id: Optional[str]) -> None:
+        if old_user_id == new_user_id:
+            return
+        db.add(SubscriptionAlertReceiverChange(
+            subscription_id=sub.id,
+            old_user_id=old_user_id,
+            new_user_id=new_user_id,
+            changed_by_user_id=current_user.id,
+            source="FARMER_PWA",
+        ))
 
     if disabled:
         sub.alerts_extra_disabled = True
         sub.extra_alert_user_id = None
         sub.extra_alert_phone = None
         sub.extra_alert_name = None
+        _audit_if_changed(None)
         await db.commit()
         # 2026-09-18 — self-heal stale SENT alerts for recipients no
         # longer in the resolved set (promoter fallback, previous
@@ -4436,6 +4457,7 @@ async def set_alert_preferences(
         sub.extra_alert_user_id = None
         sub.extra_alert_phone = None
         sub.extra_alert_name = None
+        _audit_if_changed(None)
         await db.commit()
         await supersede_alerts_for_removed_recipients(db, sub.id)
         await db.commit()
@@ -4483,6 +4505,7 @@ async def set_alert_preferences(
     sub.extra_alert_user_id = target.id
     sub.extra_alert_phone = target.phone
     sub.extra_alert_name = target.name
+    _audit_if_changed(target.id)
     await db.commit()
     await supersede_alerts_for_removed_recipients(db, sub.id)
     await db.commit()
