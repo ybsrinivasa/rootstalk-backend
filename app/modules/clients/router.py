@@ -5094,6 +5094,312 @@ async def get_subscription_nearby_facilitators(
     }
 
 
+# ── Practice recommendation detail (v1, 2026-11-14) ───────────────────────────
+#
+# RM-facing recommendation payload for one practice on one subscription.
+# The field-implementation model is that the RM runs a weekly phone
+# call with the farmer and must be able to say exactly what the farmer
+# sees in-app (brand, dose, method, timing). Without this detail the
+# RM is stuck at the practice *name* level ("apply a chemical pesticide")
+# and the farmer loses confidence in the call.
+#
+# Scope v1:
+#   - Chemical practices (Fertiliser / Pesticide / Organic): reuses
+#     `get_brand_options` (same helper the farmer /brands endpoint
+#     uses) with the farmer's user_id so grouping matches the farmer
+#     view.
+#   - NPK Dosages (Chemical + Fertigation): reuses `resolve_npk_options`
+#     with applications_multiplier=1 (same as farmer PWA).
+#   - All practice types: elements (farmer-visible only; media URLs
+#     stripped to counts), ack state, AND/OR sibling legs + their ack
+#     state, and package-signature chips so the RM sees why THIS
+#     variant was picked for this farmer.
+#
+# Deferred to v2:
+#   - Cultural practices extra detail (elements already surface for
+#     these in v1; a v2 might add irrigation/pruning extras).
+#   - Diagnostics-driven recommendations (already surface on the
+#     diagnosis card — cross-link rather than duplicate).
+#   - Seed variety recommendations (separate subscribe-time flow).
+
+_FARMER_HIDDEN_ELEMENT_TYPES = frozenset({
+    # Mirror of FARMER_HIDDEN_ELEMENT_TYPES in
+    # rootstalk-pwa/app/advisory/[subscriptionId]/page.tsx:254.
+    # Showing RM-side what farmer sees means hiding the same elements.
+    "COMMON_NAME", "BRAND_NAME", "MANUFACTURER",
+    "FORMULATION", "FORMULATION_AI_CONC", "AI_CONCENTRATION",
+    "N_DOSAGE", "P_DOSAGE", "K_DOSAGE", "UNIT",
+    "FERTIGATION_INTERVAL", "IRRIGATION_INTERVAL", "REPEAT_INTERVAL",
+    "NUMBER_OF_APPLICATIONS",
+})
+_MEDIA_ELEMENT_TYPES = frozenset({"MEDIA_IMAGE", "MEDIA_AUDIO", "MEDIA_HYPERLINK"})
+_CHEMICAL_L1_TYPES_FOR_BRANDS = frozenset({
+    "CHEMICAL_FERTILIZERS", "CHEMICAL_PESTICIDES", "CHEMICAL_HERBICIDES",
+    "ORGANIC_FERTILIZERS", "ORGANIC_PESTICIDES",
+})
+
+
+@router.get(
+    "/client/{client_id}/farmer-support/farmers/{farmer_user_id}"
+    "/subscriptions/{subscription_id}/practices/{practice_id}/recommendation"
+)
+async def get_practice_recommendation(
+    client_id: str,
+    farmer_user_id: str,
+    subscription_id: str,
+    practice_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Full recommendation detail for one practice as the farmer sees
+    it. Powers the expand-per-row panel on Practice Timeline + Input
+    Tracking in the 360° view.
+    """
+    from app.modules.subscriptions.models import Subscription
+    from app.modules.advisory.models import (
+        Practice, PracticeAcknowledgement, Timeline, Element,
+        PackageVariable, Parameter, Variable, Relation,
+    )
+    from app.modules.subscriptions.router import _l2_name_loc_map
+    # `_timeline_window` is a module-level helper in THIS file
+    # (clients/router.py:~4056); no import needed.
+    from app.services.bl07_brand_options import get_brand_options
+    from app.services.npk_options import resolve_npk_options, NPK_L2_TYPES
+    from datetime import date
+
+    await _assert_ca_or_rm(db, current_user, client_id)
+    await _assert_farmer_belongs_to_client(db, client_id, farmer_user_id)
+
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.client_id == client_id,
+            Subscription.farmer_user_id == farmer_user_id,
+        )
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    practice = (await db.execute(
+        select(Practice).where(Practice.id == practice_id)
+    )).scalar_one_or_none()
+    if practice is None:
+        raise HTTPException(status_code=404, detail="Practice not found")
+    timeline = (await db.execute(
+        select(Timeline).where(Timeline.id == practice.timeline_id)
+    )).scalar_one_or_none()
+    if timeline is None or timeline.package_id != sub.package_id:
+        # Prevent a Practice from another package from being peeked
+        # through this subscription — the Practice must actually be
+        # one the farmer sees under this sub.
+        raise HTTPException(status_code=404, detail="Practice not on this subscription")
+
+    lang = current_user.language_code or "en"
+    l2_name_loc = await _l2_name_loc_map(db, lang)
+
+    # Elements: filter farmer-hidden + media, count media separately.
+    all_elements = (await db.execute(
+        select(Element).where(Element.practice_id == practice_id)
+    )).scalars().all()
+    media_counts = {"photos": 0, "audios": 0, "hyperlinks": 0}
+    visible_elements: list[dict] = []
+    for el in all_elements:
+        et = el.element_type
+        if et == "MEDIA_IMAGE":
+            media_counts["photos"] += 1
+            continue
+        if et == "MEDIA_AUDIO":
+            media_counts["audios"] += 1
+            continue
+        if et == "MEDIA_HYPERLINK":
+            media_counts["hyperlinks"] += 1
+            continue
+        if et in _FARMER_HIDDEN_ELEMENT_TYPES:
+            continue
+        visible_elements.append({
+            "element_type": et,
+            "value": el.value,
+            "cosh_ref": el.cosh_ref,
+            "unit_cosh_id": el.unit_cosh_id,
+        })
+
+    # Occurrence date for ack lookup — mirrors the farmer flow in
+    # `_today_advisory_for_user` (today for frequency practices with
+    # frequency_days >= 2, else the timeline's from_d derived from
+    # crop_start_date).
+    today = date.today()
+    crop_start = (
+        sub.crop_start_date.date() if hasattr(sub.crop_start_date, "date")
+        else sub.crop_start_date
+    )
+    win_start, win_end = (None, None)
+    if crop_start is not None:
+        win_start, win_end = _timeline_window(timeline, crop_start)
+    if practice.frequency_days and practice.frequency_days >= 2:
+        occurrence_date = today
+    else:
+        occurrence_date = win_start or today
+
+    ack = (await db.execute(
+        select(PracticeAcknowledgement).where(
+            PracticeAcknowledgement.subscription_id == subscription_id,
+            PracticeAcknowledgement.practice_id == practice_id,
+            PracticeAcknowledgement.timeline_lineage_id == timeline.lineage_id,
+        )
+    )).scalars().first()
+    ack_payload = {
+        "marked_at": ack.marked_at.isoformat() if ack and ack.marked_at else None,
+        "purchased_at": ack.purchased_at.isoformat() if ack and ack.purchased_at else None,
+        "hidden_at": ack.hidden_at.isoformat() if ack and ack.hidden_at else None,
+        "purchased_brand_cosh_id": (
+            ack.purchased_brand_cosh_id if ack and getattr(ack, "purchased_brand_cosh_id", None) else None
+        ),
+        "purchased_brand_text": (
+            ack.purchased_brand_text if ack and getattr(ack, "purchased_brand_text", None) else None
+        ),
+    }
+
+    # AND/OR sibling legs. relation_id groups practices into one
+    # relation; each sibling is its own leg with its own ack row. The
+    # RM needs to know which legs the farmer has already done + which
+    # are still pending for the ongoing conversation.
+    relation_payload = None
+    if practice.relation_id:
+        rel = (await db.execute(
+            select(Relation).where(Relation.id == practice.relation_id)
+        )).scalar_one_or_none()
+        sibling_rows = (await db.execute(
+            select(Practice).where(
+                Practice.relation_id == practice.relation_id,
+                Practice.timeline_id == practice.timeline_id,
+            )
+        )).scalars().all()
+        sibling_pids = [p.id for p in sibling_rows]
+        sibling_acks: dict[str, PracticeAcknowledgement] = {}
+        if sibling_pids:
+            sa_rows = (await db.execute(
+                select(PracticeAcknowledgement).where(
+                    PracticeAcknowledgement.subscription_id == subscription_id,
+                    PracticeAcknowledgement.timeline_lineage_id == timeline.lineage_id,
+                    PracticeAcknowledgement.practice_id.in_(sibling_pids),
+                )
+            )).scalars().all()
+            for a in sa_rows:
+                sibling_acks[a.practice_id] = a
+        siblings_out = []
+        for sp in sibling_rows:
+            sa = sibling_acks.get(sp.id)
+            siblings_out.append({
+                "practice_id": sp.id,
+                "l2_type": sp.l2_type,
+                "l2_name": l2_name_loc.get(sp.l2_type) or sp.l2_type,
+                "relation_role": sp.relation_role,
+                "is_self": sp.id == practice_id,
+                "ack_marked_at": sa.marked_at.isoformat() if sa and sa.marked_at else None,
+                "ack_purchased_at": sa.purchased_at.isoformat() if sa and sa.purchased_at else None,
+                "ack_hidden_at": sa.hidden_at.isoformat() if sa and sa.hidden_at else None,
+            })
+        # Sort by relation_role so the RM sees legs in the same order
+        # the farmer sees them in the PWA (deterministic by Part/Option/
+        # Position string tokens the PWA also sorts on).
+        siblings_out.sort(key=lambda s: s["relation_role"] or "")
+        relation_payload = {
+            "relation_id": practice.relation_id,
+            "relation_type": (
+                rel.relation_type.value if rel and hasattr(rel.relation_type, "value")
+                else (rel.relation_type if rel else None)
+            ),
+            "siblings": siblings_out,
+        }
+
+    # Chemical brand candidates — reuses the shared brand-options
+    # helper with the FARMER's user_id so dealer-relationship grouping
+    # matches what the farmer sees (My dealer / Other), not the RM's.
+    brand_candidates = None
+    if practice.l1_type in _CHEMICAL_L1_TYPES_FOR_BRANDS and practice.l2_type not in NPK_L2_TYPES:
+        try:
+            br = await get_brand_options(db, practice_id, farmer_user_id, lang=lang)
+            if br.is_locked:
+                brand_candidates = {
+                    "is_locked": True,
+                    "locked_brand_name": br.locked_brand_name,
+                    "brands": (
+                        [{"name": br.locked_brand_name, "manufacturer": None, "cosh_id": None}]
+                        if br.locked_brand_name else []
+                    ),
+                }
+            else:
+                flat = []
+                for grp in (br.group_recommended, br.group_my, br.group_other):
+                    for opt in (grp or []):
+                        flat.append({
+                            "cosh_id": opt.cosh_id,
+                            "name": opt.name,
+                            "manufacturer": opt.manufacturer,
+                        })
+                flat.sort(key=lambda b: (b["name"] or "").lower())
+                brand_candidates = {"is_locked": False, "brands": flat}
+        except Exception:
+            # Defensive: brand resolution has several Cosh-side paths
+            # and we don't want a bad data row to crash the whole
+            # panel — surface an empty list instead.
+            brand_candidates = {"is_locked": False, "brands": [], "error": "brand_resolution_failed"}
+
+    # NPK recommendation — ranked Mixed + enabled Straights.
+    npk_payload = None
+    if practice.l2_type in NPK_L2_TYPES:
+        try:
+            npk_payload = await resolve_npk_options(
+                db, practice, applications_multiplier=1,
+            )
+        except Exception:
+            npk_payload = {"error": "npk_resolution_failed"}
+
+    # Signature chips — show the RM which parameter/variable pairs
+    # the farmer answered so the RM understands why this specific
+    # recommendation variant exists.
+    pv_rows = (await db.execute(
+        select(PackageVariable, Parameter, Variable)
+        .join(Parameter, Parameter.id == PackageVariable.parameter_id)
+        .join(Variable, Variable.id == PackageVariable.variable_id)
+        .where(PackageVariable.package_id == sub.package_id)
+    )).all()
+    signature_chips = [
+        {
+            "parameter_name": param.name,
+            "variable_name": var.name,
+        }
+        for _pv, param, var in pv_rows
+    ]
+    signature_chips.sort(key=lambda c: (c["parameter_name"] or "").lower())
+
+    return {
+        "practice": {
+            "practice_id": practice.id,
+            "l0_type": (
+                practice.l0_type.value if hasattr(practice.l0_type, "value")
+                else practice.l0_type
+            ),
+            "l1_type": practice.l1_type,
+            "l2_type": practice.l2_type,
+            "l2_name": l2_name_loc.get(practice.l2_type) or practice.l2_type,
+            "timeline_name": timeline.name,
+            "occurrence_date": occurrence_date.isoformat() if occurrence_date else None,
+            "window_start": win_start.isoformat() if win_start else None,
+            "window_end": win_end.isoformat() if win_end else None,
+            "frequency_days": practice.frequency_days,
+            "is_brand_locked": practice.is_brand_locked,
+        },
+        "elements": visible_elements,
+        "media_counts": media_counts,
+        "ack": ack_payload,
+        "relation": relation_payload,
+        "brand_candidates": brand_candidates,
+        "npk_recommendation": npk_payload,
+        "signature_chips": signature_chips,
+    }
+
+
 # ── Call Log (Phase 4, 2026-11-10) ────────────────────────────────────────────
 
 
