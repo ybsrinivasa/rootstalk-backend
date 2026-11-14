@@ -5122,15 +5122,25 @@ async def get_subscription_nearby_facilitators(
 #     diagnosis card — cross-link rather than duplicate).
 #   - Seed variety recommendations (separate subscribe-time flow).
 
-_FARMER_HIDDEN_ELEMENT_TYPES = frozenset({
-    # Mirror of FARMER_HIDDEN_ELEMENT_TYPES in
-    # rootstalk-pwa/app/advisory/[subscriptionId]/page.tsx:254.
-    # Showing RM-side what farmer sees means hiding the same elements.
-    "COMMON_NAME", "BRAND_NAME", "MANUFACTURER",
-    "FORMULATION", "FORMULATION_AI_CONC", "AI_CONCENTRATION",
+# 2026-11-14 UX fix after KK's staging walk-through: the RM needs the
+# full recommended-product identity (Common Name + Trade Name + Mfr +
+# Formulation + AI concentration) because that's the SPECIFIC thing
+# they tell the farmer on the call ("you should pick up X by Y"). We
+# surface these as a dedicated `recommended_product` block instead of
+# mixing them into the generic elements list. Only the NPK engine-math
+# + cadence scheduling tokens stay hidden — those are SE-facing and
+# repeating them to the farmer adds no value.
+_RM_HIDDEN_ELEMENT_TYPES = frozenset({
+    # NPK engine inputs — ranked Mixed/Straights section already shows
+    # what the farmer sees post-resolution, so the raw inputs add noise.
     "N_DOSAGE", "P_DOSAGE", "K_DOSAGE", "UNIT",
+    # Cadence tokens — farmer's today-advisory view hides these; the
+    # frequency_days field on `practice` carries the signal for the RM.
     "FERTIGATION_INTERVAL", "IRRIGATION_INTERVAL", "REPEAT_INTERVAL",
     "NUMBER_OF_APPLICATIONS",
+    # Pulled out into `recommended_product` block below.
+    "COMMON_NAME", "BRAND_NAME", "MANUFACTURER",
+    "FORMULATION", "FORMULATION_AI_CONC", "AI_CONCENTRATION",
 })
 _MEDIA_ELEMENT_TYPES = frozenset({"MEDIA_IMAGE", "MEDIA_AUDIO", "MEDIA_HYPERLINK"})
 _CHEMICAL_L1_TYPES_FOR_BRANDS = frozenset({
@@ -5160,11 +5170,15 @@ async def get_practice_recommendation(
         Practice, PracticeAcknowledgement, Timeline, Element,
         PackageVariable, Parameter, Variable, Relation,
     )
-    from app.modules.subscriptions.router import _l2_name_loc_map
+    from app.modules.subscriptions.router import (
+        _l2_name_loc_map, _resolve_practice_chemistry,
+    )
     # `_timeline_window` is a module-level helper in THIS file
     # (clients/router.py:~4056); no import needed.
     from app.services.bl07_brand_options import get_brand_options
     from app.services.npk_options import resolve_npk_options, NPK_L2_TYPES
+    from app.services.i18n_cosh import resolve_names_by_cosh_id, pick_translation
+    from app.modules.orders.models import BrandLookupCache
     from datetime import date
 
     await _assert_ca_or_rm(db, current_user, client_id)
@@ -5197,10 +5211,28 @@ async def get_practice_recommendation(
     lang = current_user.language_code or "en"
     l2_name_loc = await _l2_name_loc_map(db, lang)
 
-    # Elements: filter farmer-hidden + media, count media separately.
+    # Elements: pass 1 — collect cosh_refs + unit_cosh_ids, then batch-
+    # resolve them to human-readable names via the Cosh registry so the
+    # RM panel doesn't surface raw UUIDs (KK staging feedback 2026-11-14).
     all_elements = (await db.execute(
         select(Element).where(Element.practice_id == practice_id)
     )).scalars().all()
+    cosh_ids_to_resolve: set[str] = set()
+    for el in all_elements:
+        if el.cosh_ref:
+            cosh_ids_to_resolve.add(el.cosh_ref)
+        if el.unit_cosh_id:
+            cosh_ids_to_resolve.add(el.unit_cosh_id)
+    cosh_name_by_id: dict[str, str] = {}
+    if cosh_ids_to_resolve:
+        cosh_name_by_id = await resolve_names_by_cosh_id(
+            db, cosh_ids_to_resolve, lang,
+        )
+
+    # Pass 2 — build the visible-elements list with resolved display
+    # strings, count media separately. Any element whose value is a
+    # UUID we can't resolve falls back to the raw string so a bad row
+    # at least surfaces rather than being silently blank.
     media_counts = {"photos": 0, "audios": 0, "hyperlinks": 0}
     visible_elements: list[dict] = []
     for el in all_elements:
@@ -5214,14 +5246,72 @@ async def get_practice_recommendation(
         if et == "MEDIA_HYPERLINK":
             media_counts["hyperlinks"] += 1
             continue
-        if et in _FARMER_HIDDEN_ELEMENT_TYPES:
+        if et in _RM_HIDDEN_ELEMENT_TYPES:
             continue
+        display_value: str | None = None
+        if el.value and el.value.strip():
+            display_value = el.value.strip()
+        elif el.cosh_ref:
+            display_value = cosh_name_by_id.get(el.cosh_ref) or el.cosh_ref
+        unit_display: str | None = None
+        if el.unit_cosh_id:
+            unit_display = cosh_name_by_id.get(el.unit_cosh_id) or el.unit_cosh_id
         visible_elements.append({
             "element_type": et,
-            "value": el.value,
-            "cosh_ref": el.cosh_ref,
-            "unit_cosh_id": el.unit_cosh_id,
+            "value": display_value,
+            "unit": unit_display,
         })
+
+    # Recommended product block — the SPECIFIC thing the RM tells the
+    # farmer to buy. Combines _resolve_practice_chemistry (Common Name
+    # / Formulation / AI concentration) with a BrandLookupCache lookup
+    # for the BRAND_NAME element (same pattern as the farmer /brands
+    # endpoint at subscriptions/router.py:~8515).
+    chemistry = await _resolve_practice_chemistry(db, practice_id, lang)
+    brand_el = next(
+        (e for e in all_elements if (e.element_type or "").upper() == "BRAND_NAME"),
+        None,
+    )
+    recommended_trade_name: str | None = None
+    recommended_manufacturer_name: str | None = None
+    if brand_el and brand_el.cosh_ref:
+        row = (await db.execute(
+            select(
+                BrandLookupCache.trade_name,
+                BrandLookupCache.trade_name_translations,
+                BrandLookupCache.manufacturer_name,
+                BrandLookupCache.manufacturer_translations,
+            ).where(BrandLookupCache.trade_name_cosh_id == brand_el.cosh_ref)
+        )).first()
+        if row:
+            tn_en, tn_tr, mfr_en, mfr_tr = row
+            if tn_en:
+                recommended_trade_name = pick_translation(tn_tr or {}, lang, tn_en)
+            if mfr_en:
+                recommended_manufacturer_name = pick_translation(mfr_tr or {}, lang, mfr_en)
+    # MANUFACTURER element — sometimes the SE sets a stand-alone Mfr
+    # even without a Brand pin. Fall back to that when BRAND_NAME
+    # didn't give us a manufacturer.
+    if recommended_manufacturer_name is None:
+        mfr_el = next(
+            (e for e in all_elements if (e.element_type or "").upper() == "MANUFACTURER"),
+            None,
+        )
+        if mfr_el:
+            if mfr_el.value and mfr_el.value.strip():
+                recommended_manufacturer_name = mfr_el.value.strip()
+            elif mfr_el.cosh_ref:
+                recommended_manufacturer_name = cosh_name_by_id.get(mfr_el.cosh_ref) or mfr_el.cosh_ref
+    recommended_product = {
+        "common_name": chemistry.get("practice_common_name"),
+        "trade_name": recommended_trade_name,
+        "manufacturer": recommended_manufacturer_name,
+        "formulation": chemistry.get("practice_formulation_display"),
+        "ai_concentration": chemistry.get("practice_ai_display"),
+        # True when the SE ticked "lock this brand" — farmer cannot
+        # substitute; RM should repeat the exact brand name on the call.
+        "is_brand_locked": bool(practice.is_brand_locked),
+    }
 
     # Occurrence date for ack lookup — mirrors the farmer flow in
     # `_today_advisory_for_user` (today for frequency practices with
@@ -5390,6 +5480,7 @@ async def get_practice_recommendation(
             "frequency_days": practice.frequency_days,
             "is_brand_locked": practice.is_brand_locked,
         },
+        "recommended_product": recommended_product,
         "elements": visible_elements,
         "media_counts": media_counts,
         "ack": ack_payload,
