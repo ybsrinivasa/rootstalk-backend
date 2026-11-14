@@ -5166,6 +5166,7 @@ async def get_subscription_nearby_contacts(
         select(
             ClientPromoter.user_id,
             ClientPromoter.promoter_type,
+            ClientPromoter.is_promoter,
             ClientPromoter.is_promoter_pundit,
         ).where(
             ClientPromoter.client_id == effective_client_id,
@@ -5175,22 +5176,27 @@ async def get_subscription_nearby_contacts(
     if not cp_rows:
         return {"farmer_has_gps": farmer_lat is not None, "contacts": []}
 
+    # Per-user metadata — a user can hold MULTIPLE ClientPromoter rows
+    # at the same client (one as DEALER + one as FACILITATOR), and
+    # user's mental model requires that both roles surface
+    # simultaneously in the row (chips) + both contribute to filter
+    # counts. So we collect a SET of promoter_types per user rather
+    # than keeping only the "most-privileged" one.
     cp_meta_by_uid: dict[str, dict] = {}
-    for uid, ptype, pp in cp_rows:
-        # When the same user holds multiple promoter rows (rare but
-        # possible — e.g. DEALER + FACILITATOR at the same client),
-        # keep the most-privileged one so a single row is still
-        # tagged with the Promoter-Pundit flag when set.
+    for uid, ptype, is_prom, is_pp in cp_rows:
+        ptype_str = ptype.value if hasattr(ptype, "value") else ptype
         existing = cp_meta_by_uid.get(uid)
         if existing is None:
             cp_meta_by_uid[uid] = {
-                "promoter_type": (
-                    ptype.value if hasattr(ptype, "value") else ptype
-                ),
-                "is_promoter_pundit": bool(pp),
+                "promoter_types": {ptype_str},
+                "is_promoter": bool(is_prom),
+                "is_promoter_pundit": bool(is_pp),
             }
         else:
-            if bool(pp) and not existing["is_promoter_pundit"]:
+            existing["promoter_types"].add(ptype_str)
+            if bool(is_prom):
+                existing["is_promoter"] = True
+            if bool(is_pp):
                 existing["is_promoter_pundit"] = True
 
     user_ids = list(cp_meta_by_uid.keys())
@@ -5223,7 +5229,12 @@ async def get_subscription_nearby_contacts(
             "user_id": u.id,
             "name": u.name,
             "phone": u.phone,
-            "promoter_type": meta["promoter_type"],
+            # 2026-11-14 pt2 — a user can wear multiple hats (DEALER +
+            # FACILITATOR). Return the set so the CP can show both
+            # chips + count the user under both filters. Sorted for a
+            # stable render order.
+            "promoter_types": sorted(meta["promoter_types"]),
+            "is_promoter": meta["is_promoter"],
             "is_promoter_pundit": meta["is_promoter_pundit"],
             "distance_km": dist,
             "gps_lat": float(u.gps_lat) if gps_ok else None,
