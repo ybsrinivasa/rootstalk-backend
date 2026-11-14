@@ -5113,6 +5113,141 @@ async def get_subscription_nearby_facilitators(
     }
 
 
+@router.get(
+    "/client/{client_id}/farmer-support/farmers/{farmer_user_id}"
+    "/subscriptions/{subscription_id}/nearby-contacts"
+)
+async def get_subscription_nearby_contacts(
+    client_id: str,
+    farmer_user_id: str,
+    subscription_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List all ACTIVE ClientPromoter contacts (facilitators, dealers,
+    company-designated promoters) at this subscription's effective
+    client, with distance from the farmer + resolved address + phones.
+
+    Supports the RM's "who's around" scan BEFORE considering any
+    assignment changes (which are a separate v2 mutation surface).
+    Returns one list, each entry tagged by `promoter_type` so the CP
+    can group or filter client-side. Sorted by distance ascending;
+    GPS-less contacts sink to the end but still return (they're still
+    valid phone contacts).
+    """
+    from app.modules.subscriptions.models import Subscription
+    from app.modules.subscriptions.router import _haversine_sub
+    from app.services.training import resolve_package_client_id
+    from app.services.i18n_cosh import resolve_names_by_cosh_id
+
+    await _assert_ca_or_rm(db, current_user, client_id)
+    await _assert_farmer_belongs_to_client(db, client_id, farmer_user_id)
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.client_id == client_id,
+            Subscription.farmer_user_id == farmer_user_id,
+        )
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    farmer = (await db.execute(
+        select(User).where(User.id == farmer_user_id)
+    )).scalar_one_or_none()
+    farmer_lat = float(farmer.gps_lat) if farmer and farmer.gps_lat is not None else None
+    farmer_lng = float(farmer.gps_lng) if farmer and farmer.gps_lng is not None else None
+
+    # ACTIVE ClientPromoter rows at the effective (training-aware)
+    # client, including ALL promoter_types so the RM sees the full
+    # roster, not just facilitators.
+    effective_client_id = await resolve_package_client_id(db, sub.client_id)
+    cp_rows = (await db.execute(
+        select(
+            ClientPromoter.user_id,
+            ClientPromoter.promoter_type,
+            ClientPromoter.is_promoter_pundit,
+        ).where(
+            ClientPromoter.client_id == effective_client_id,
+            ClientPromoter.status == StatusEnum.ACTIVE,
+        )
+    )).all()
+    if not cp_rows:
+        return {"farmer_has_gps": farmer_lat is not None, "contacts": []}
+
+    cp_meta_by_uid: dict[str, dict] = {}
+    for uid, ptype, pp in cp_rows:
+        # When the same user holds multiple promoter rows (rare but
+        # possible — e.g. DEALER + FACILITATOR at the same client),
+        # keep the most-privileged one so a single row is still
+        # tagged with the Promoter-Pundit flag when set.
+        existing = cp_meta_by_uid.get(uid)
+        if existing is None:
+            cp_meta_by_uid[uid] = {
+                "promoter_type": (
+                    ptype.value if hasattr(ptype, "value") else ptype
+                ),
+                "is_promoter_pundit": bool(pp),
+            }
+        else:
+            if bool(pp) and not existing["is_promoter_pundit"]:
+                existing["is_promoter_pundit"] = True
+
+    user_ids = list(cp_meta_by_uid.keys())
+    users = (await db.execute(
+        select(User).where(User.id.in_(user_ids))
+    )).scalars().all()
+
+    # Batch-resolve location cosh_ids to names once.
+    loc_cosh_ids: set[str] = set()
+    for u in users:
+        for v in (u.state_cosh_id, u.district_cosh_id, u.sub_district_cosh_id):
+            if v:
+                loc_cosh_ids.add(v)
+    lang = current_user.language_code or "en"
+    loc_names = await resolve_names_by_cosh_id(db, loc_cosh_ids, lang) if loc_cosh_ids else {}
+
+    out = []
+    for u in users:
+        meta = cp_meta_by_uid.get(u.id)
+        if meta is None:
+            continue
+        gps_ok = u.gps_lat is not None and u.gps_lng is not None
+        dist = None
+        if gps_ok and farmer_lat is not None and farmer_lng is not None:
+            dist = round(_haversine_sub(
+                farmer_lat, farmer_lng,
+                float(u.gps_lat), float(u.gps_lng),
+            ), 1)
+        out.append({
+            "user_id": u.id,
+            "name": u.name,
+            "phone": u.phone,
+            "promoter_type": meta["promoter_type"],
+            "is_promoter_pundit": meta["is_promoter_pundit"],
+            "distance_km": dist,
+            "gps_lat": float(u.gps_lat) if gps_ok else None,
+            "gps_lng": float(u.gps_lng) if gps_ok else None,
+            "address_line": u.address_line,
+            "state_name": loc_names.get(u.state_cosh_id) if u.state_cosh_id else None,
+            "district_name": loc_names.get(u.district_cosh_id) if u.district_cosh_id else None,
+            "sub_district_name": (
+                loc_names.get(u.sub_district_cosh_id) if u.sub_district_cosh_id else None
+            ),
+        })
+
+    # Sort by distance ascending, GPS-less to the end.
+    out.sort(key=lambda r: (
+        0 if r["distance_km"] is not None else 1,
+        r["distance_km"] if r["distance_km"] is not None else 0,
+    ))
+
+    return {
+        "farmer_has_gps": farmer_lat is not None,
+        "contacts": out,
+    }
+
+
 # ── Practice recommendation detail (v1, 2026-11-14) ───────────────────────────
 #
 # RM-facing recommendation payload for one practice on one subscription.
