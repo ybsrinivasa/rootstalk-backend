@@ -5319,6 +5319,236 @@ async def get_subscription_nearby_contacts(
     }
 
 
+# ── Alert receiver reassignment (v2 mutation #1, 2026-11-14) ──────────────────
+#
+# Crosses the "read and remind" line that the earlier Farmer Support
+# work held. The farmer was told at subscribe time "{client}'s support
+# team may follow up with you about this advisory" — this surface lets
+# the client-side (RM) actually change WHO on the support team gets
+# alerted about the farmer's crop. Defensible because:
+#   (1) Subscription.extra_alert_user_id is already overrideable (the
+#       farmer can set it themselves via existing flows);
+#   (2) alert_receiver is a delivery route, not content mutation —
+#       the content the receiver sees is unchanged;
+#   (3) we keep a permanent audit trail
+#       (SubscriptionAlertReceiverChange rows) AND notify the farmer
+#       via SMS + FCM (best-effort) so the change isn't invisible to them.
+# Future v2 mutations (Promoter-Pundit assignment, Promoter reassignment)
+# are bigger design conversations — do NOT quietly extend this same
+# endpoint to cover them.
+
+
+async def _assert_rm_for_alert_receiver_change(
+    db: AsyncSession, user: User, client_id: str,
+) -> None:
+    """RM-only mutation gate. CA can view the current receiver +
+    nearby contacts list but cannot change the routing (same
+    asymmetry as the call log — mutating the farmer's alert path
+    is an RM action; CA + RM on one email is not the pattern).
+    """
+    if bool(settings.sa_email) and user.email == settings.sa_email:
+        return
+    role_row = (await db.execute(
+        select(ClientUser.role).where(
+            ClientUser.client_id == client_id,
+            ClientUser.user_id == user.id,
+            ClientUser.status == StatusEnum.ACTIVE,
+            ClientUser.role == ClientUserRole.CLIENT_RM,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if role_row is not None:
+        return
+    cm_edit = (await db.execute(
+        select(CMClientAssignment.id).where(
+            CMClientAssignment.cm_user_id == user.id,
+            CMClientAssignment.client_id == client_id,
+            CMClientAssignment.status == StatusEnum.ACTIVE,
+            CMClientAssignment.rights == CMRights.EDIT,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if cm_edit is not None:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "code": "alert_receiver_change_rm_role_required",
+            "message": (
+                "Only the Relationship Manager role can change the "
+                "Alert Receiver. CA roles can view the current receiver "
+                "but not re-assign — hold the RM role on a separate "
+                "account if you need to mutate farmer routing."
+            ),
+        },
+    )
+
+
+class AlertReceiverChangeBody(BaseModel):
+    # None = clear the override (restore the sub's fallback chain).
+    user_id: Optional[str] = None
+
+
+@router.put(
+    "/client/{client_id}/farmer-support/farmers/{farmer_user_id}"
+    "/subscriptions/{subscription_id}/alert-receiver"
+)
+async def set_subscription_alert_receiver(
+    client_id: str,
+    farmer_user_id: str,
+    subscription_id: str,
+    body: AlertReceiverChangeBody,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Assign (or clear) the Alert Receiver override on a subscription.
+
+    Validation: the new user_id, when non-null, must be an ACTIVE
+    ClientPromoter at this sub's effective client, OR a Promoter-
+    Pundit via the FarmPundit path. Any other user_id is rejected
+    with 422 — prevents the RM from routing alerts to arbitrary
+    strangers. Writes `Subscription.extra_alert_user_id` and clears
+    the denormalised `extra_alert_phone` + `extra_alert_name` so
+    read-sites keep deriving from User (no name/phone drift later).
+
+    Records a permanent SubscriptionAlertReceiverChange row for every
+    successful change (append-only). Best-effort fires:
+      - SMS to the farmer via Draft4SMS
+      - FCM push to the farmer's app (if fcm_token set)
+    Both are best-effort and logged — the mutation itself succeeds
+    even if both delivery channels fail (the audit row is the source
+    of truth for what happened).
+    """
+    from app.modules.subscriptions.models import Subscription
+    from app.modules.farmpundit.models import ClientFarmPundit, FarmPunditProfile
+    from app.modules.clients.models import SubscriptionAlertReceiverChange
+    from app.services.training import resolve_package_client_id
+    from app.services.sms_service import send_sms
+
+    await _assert_ca_or_rm(db, current_user, client_id)
+    await _assert_rm_for_alert_receiver_change(db, current_user, client_id)
+    await _assert_farmer_belongs_to_client(db, client_id, farmer_user_id)
+
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.client_id == client_id,
+            Subscription.farmer_user_id == farmer_user_id,
+        )
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    new_user_id = body.user_id.strip() if body.user_id else None
+    if new_user_id == "":
+        new_user_id = None
+
+    # Validate the new receiver, if set. Must be ACTIVE in either of
+    # the two "onboarded contact" paths at this client. Mirrors the
+    # nearby-contacts endpoint's Path 1 + Path 2 union so the valid
+    # set equals the UI-visible set.
+    new_user: Optional[User] = None
+    if new_user_id is not None:
+        effective_client_id = await resolve_package_client_id(db, sub.client_id)
+        is_promoter_row = (await db.execute(
+            select(ClientPromoter.id).where(
+                ClientPromoter.client_id == effective_client_id,
+                ClientPromoter.user_id == new_user_id,
+                ClientPromoter.status == StatusEnum.ACTIVE,
+            ).limit(1)
+        )).scalar_one_or_none()
+        is_pp_row = None
+        if is_promoter_row is None:
+            is_pp_row = (await db.execute(
+                select(ClientFarmPundit.id)
+                .join(FarmPunditProfile, FarmPunditProfile.id == ClientFarmPundit.pundit_id)
+                .where(
+                    ClientFarmPundit.client_id == effective_client_id,
+                    ClientFarmPundit.status == "ACTIVE",
+                    ClientFarmPundit.role == "PROMOTER_PUNDIT",
+                    FarmPunditProfile.user_id == new_user_id,
+                ).limit(1)
+            )).scalar_one_or_none()
+        if is_promoter_row is None and is_pp_row is None:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "alert_receiver_not_onboarded",
+                    "message": (
+                        "The chosen user is not an active onboarded "
+                        "contact at this client — they must be a "
+                        "Facilitator / Dealer / Promoter / Promoter-"
+                        "Pundit to be eligible as an Alert Receiver."
+                    ),
+                },
+            )
+        new_user = (await db.execute(
+            select(User).where(User.id == new_user_id)
+        )).scalar_one_or_none()
+        if new_user is None:
+            raise HTTPException(
+                status_code=422, detail="New alert receiver user not found.",
+            )
+
+    old_user_id = sub.extra_alert_user_id
+    if old_user_id == new_user_id:
+        # No-op reassignment — skip the audit + notification work.
+        return {
+            "subscription_id": sub.id,
+            "alert_receiver_user_id": new_user_id,
+            "changed": False,
+        }
+
+    # Mutate: set extra_alert_user_id + clear denormalised fields so
+    # the read-side always derives name/phone from User.
+    sub.extra_alert_user_id = new_user_id
+    sub.extra_alert_phone = None
+    sub.extra_alert_name = None
+
+    # Audit row — write BEFORE the SMS/FCM so a DB failure rolls back
+    # the whole change (post-commit notifications are a separate concern).
+    db.add(SubscriptionAlertReceiverChange(
+        subscription_id=sub.id,
+        old_user_id=old_user_id,
+        new_user_id=new_user_id,
+        changed_by_user_id=current_user.id,
+        source="FARMER_SUPPORT_RM",
+    ))
+    await db.commit()
+
+    # Notify the farmer — best-effort. Both channels run independently
+    # and never block the mutation success response. Draft4SMS may
+    # silently drop non-template messages under DLT; FCM is more
+    # reliable for app-using farmers. The audit row is authoritative
+    # regardless of delivery outcome.
+    farmer = (await db.execute(
+        select(User).where(User.id == farmer_user_id)
+    )).scalar_one_or_none()
+    if farmer and farmer.phone:
+        if new_user_id and new_user:
+            body_text = (
+                f"RootsTalk: Your support team has updated the person "
+                f"who gets alerts for your crop. New contact: "
+                f"{new_user.name or '—'} ({new_user.phone or '—'})."
+            )
+        else:
+            body_text = (
+                "RootsTalk: Your support team has cleared the extra "
+                "Alert Receiver on your crop — alerts will go to the "
+                "default contact (your Promoter)."
+            )
+        try:
+            await send_sms(farmer.phone, body_text)
+        except Exception:
+            # Logged inside send_sms. Don't surface to the RM; the
+            # audit row already captures the intent.
+            pass
+
+    return {
+        "subscription_id": sub.id,
+        "alert_receiver_user_id": new_user_id,
+        "changed": True,
+    }
+
+
 # ── Practice recommendation detail (v1, 2026-11-14) ───────────────────────────
 #
 # RM-facing recommendation payload for one practice on one subscription.
