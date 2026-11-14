@@ -9,7 +9,7 @@ from app.database import get_db
 from app.config import settings
 from app.dependencies import get_current_user
 from app.modules.platform.models import User, StatusEnum, RoleType, UserRole
-from app.modules.subscriptions.models import Subscription, SubscriptionStatus
+from app.modules.subscriptions.models import Subscription, SubscriptionStatus, SubscriptionType
 from app.modules.clients.models import (
     Client, ClientOrganisationType, ClientUser, ClientUserRole,
     ClientLocation, ClientCrop, ClientStatus, ClientPromoter,
@@ -4463,6 +4463,13 @@ async def list_farmer_subscriptions(
             "subscription_id": sub.id,
             "status": sub.status.value if hasattr(sub.status, "value") else sub.status,
             "is_active": sub.status == SubscriptionStatus.ACTIVE,
+            # 2026-11-14 pt7 — expose subscription_type so the CP can
+            # gate the Follow-up Promoter radio column to SELF subs
+            # only (current v3 scope).
+            "subscription_type": (
+                sub.subscription_type.value if hasattr(sub.subscription_type, "value")
+                else sub.subscription_type
+            ),
             "package_id": pkg.id,
             "package_name": pkg.name,
             "crop_cosh_id": pkg.crop_cosh_id,
@@ -4481,6 +4488,24 @@ async def list_farmer_subscriptions(
             "unanswered_queries_count": int(query_count_by_sub.get(sub.id, 0)),
             "alert_receiver": alert_receiver,
             "promoter_pundit": pp,
+            # 2026-11-14 pt7 — Follow-up Promoter (v3 mutation). Only
+            # populated for SELF subs with a promoter_user_id set —
+            # i.e. the RM has delegated a facilitator-promoter. For
+            # ASSIGNED subs, the promoter is the signup promoter, not
+            # a follow-up delegation; this field stays null there.
+            "followup_promoter": (
+                {
+                    "user_id": alert_users_by_id[sub.promoter_user_id].id,
+                    "name": alert_users_by_id[sub.promoter_user_id].name,
+                    "phone": alert_users_by_id[sub.promoter_user_id].phone,
+                }
+                if (
+                    sub.subscription_type == SubscriptionType.SELF
+                    and sub.promoter_user_id
+                    and sub.promoter_user_id in alert_users_by_id
+                )
+                else None
+            ),
             # 2026-11-14 — carry filter match per-sub so the CP can
             # highlight the matching tabs + pre-select first match.
             "matches_filter": (
@@ -5720,6 +5745,206 @@ async def set_subscription_promoter_pundit(
     return {
         "subscription_id": sub.id,
         "promoter_pundit_user_id": new_user_id,
+        "changed": True,
+    }
+
+
+# ── Follow-up Promoter assignment (v2 mutation #3, 2026-11-14) ────────────────
+#
+# For SELF-subscribed subs ONLY (subscription_type == SELF). Lets the
+# RM delegate a facilitator as the sub's follow-up promoter —
+# enabling field-team follow-up for farmers who signed themselves up
+# with no promoter. Semantic:
+#   - Before: Subscription.promoter_user_id was NULL for SELF subs.
+#   - After the mutation: that column carries the RM-delegated
+#     facilitator; the fact "this was SELF-signup" is preserved by
+#     subscription_type staying SELF. Every read site that already
+#     resolves promoter from that column (alert fallback chain,
+#     BL-12a routing, "Who follows up" strip, promoter's My Farmers
+#     dashboard) picks it up automatically — no schema change on
+#     subscriptions.
+#
+# Restricted to **facilitator-promoters** (promoter_type == FACILITATOR
+# AND is_promoter == TRUE at the effective client). Dealer-promoters
+# are intentionally excluded — dealers are commerce-primary; this
+# mutation is about field-extension follow-up.
+#
+# Lifecycle:
+#   - Assign: write Subscription.promoter_user_id + create one
+#     PromoterAssignment row (status=ACTIVE, type=FACILITATOR).
+#     Supersede any pre-existing ACTIVE PromoterAssignment (shouldn't
+#     exist for SELF but defend) by flipping its status to
+#     REVOKED_BY_RM.
+#   - Clear: set Subscription.promoter_user_id=None + flip the
+#     ACTIVE PromoterAssignment to REVOKED_BY_RM.
+#   - Reassign: same as Clear then Assign.
+#
+# Notify farmer by best-effort SMS. Audit row to
+# subscription_followup_promoter_changes.
+
+
+class FollowupPromoterChangeBody(BaseModel):
+    user_id: Optional[str] = None  # None = clear
+
+
+@router.put(
+    "/client/{client_id}/farmer-support/farmers/{farmer_user_id}"
+    "/subscriptions/{subscription_id}/followup-promoter"
+)
+async def set_subscription_followup_promoter(
+    client_id: str,
+    farmer_user_id: str,
+    subscription_id: str,
+    body: FollowupPromoterChangeBody,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Assign (or clear) the Follow-up Promoter on a SELF subscription."""
+    from app.modules.subscriptions.models import (
+        Subscription, SubscriptionType, PromoterAssignment,
+        PromoterType, AssignmentStatus,
+    )
+    from app.modules.clients.models import SubscriptionFollowupPromoterChange
+    from app.services.training import resolve_package_client_id
+    from app.services.sms_service import send_sms
+
+    await _assert_ca_or_rm(db, current_user, client_id)
+    await _assert_rm_for_alert_receiver_change(db, current_user, client_id)
+    await _assert_farmer_belongs_to_client(db, client_id, farmer_user_id)
+
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.client_id == client_id,
+            Subscription.farmer_user_id == farmer_user_id,
+        )
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    if sub.subscription_type != SubscriptionType.SELF:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "followup_promoter_self_subs_only",
+                "message": (
+                    "Follow-up Promoter assignment is available only for "
+                    "SELF-subscribed subscriptions in v1. This sub was "
+                    "promoter-assigned at signup."
+                ),
+            },
+        )
+
+    new_user_id = body.user_id.strip() if body.user_id else None
+    if new_user_id == "":
+        new_user_id = None
+
+    # Validate: new user must be a facilitator-promoter at this client
+    # (promoter_type=FACILITATOR + is_promoter=True, ACTIVE row).
+    # Narrower than the alert-receiver / P-P mutations by design —
+    # dealers are commerce-primary and deliberately excluded.
+    new_user: Optional[User] = None
+    if new_user_id is not None:
+        effective_client_id = await resolve_package_client_id(db, sub.client_id)
+        is_fac_promoter = (await db.execute(
+            select(ClientPromoter.id).where(
+                ClientPromoter.client_id == effective_client_id,
+                ClientPromoter.user_id == new_user_id,
+                ClientPromoter.status == StatusEnum.ACTIVE,
+                ClientPromoter.promoter_type == "FACILITATOR",
+                ClientPromoter.is_promoter.is_(True),
+            ).limit(1)
+        )).scalar_one_or_none()
+        if is_fac_promoter is None:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "followup_promoter_must_be_facilitator_promoter",
+                    "message": (
+                        "The chosen user is not an active Facilitator-"
+                        "Promoter at this client. Only field-side "
+                        "facilitators flagged as Promoters are eligible "
+                        "for Follow-up Promoter assignment."
+                    ),
+                },
+            )
+        new_user = (await db.execute(
+            select(User).where(User.id == new_user_id)
+        )).scalar_one_or_none()
+        if new_user is None:
+            raise HTTPException(
+                status_code=422, detail="New Follow-up Promoter user not found.",
+            )
+
+    old_user_id = sub.promoter_user_id
+    if old_user_id == new_user_id:
+        return {
+            "subscription_id": sub.id,
+            "followup_promoter_user_id": new_user_id,
+            "changed": False,
+        }
+
+    # Supersede any existing ACTIVE PromoterAssignment on this sub.
+    # SELF subs normally have none, but defend against half-migrated
+    # or edge-case rows. Flip to REVOKED_BY_RM so the audit trail
+    # on the assignments table itself records the end of effect.
+    existing_assignments = (await db.execute(
+        select(PromoterAssignment).where(
+            PromoterAssignment.subscription_id == sub.id,
+            PromoterAssignment.status == AssignmentStatus.ACTIVE,
+        )
+    )).scalars().all()
+    for a in existing_assignments:
+        a.status = AssignmentStatus.REVOKED_BY_RM
+
+    # Assign-case: write the new promoter + create a fresh
+    # PromoterAssignment row with status=ACTIVE (no PENDING_FARMER_
+    # APPROVAL step — RM authority supersedes; farmer is notified
+    # via SMS below).
+    sub.promoter_user_id = new_user_id
+    if new_user_id:
+        db.add(PromoterAssignment(
+            subscription_id=sub.id,
+            promoter_user_id=new_user_id,
+            promoter_type=PromoterType.FACILITATOR,
+            status=AssignmentStatus.ACTIVE,
+        ))
+
+    # Audit row.
+    db.add(SubscriptionFollowupPromoterChange(
+        subscription_id=sub.id,
+        old_user_id=old_user_id,
+        new_user_id=new_user_id,
+        changed_by_user_id=current_user.id,
+        source="FARMER_SUPPORT_RM",
+    ))
+    await db.commit()
+
+    # Notify farmer best-effort.
+    farmer = (await db.execute(
+        select(User).where(User.id == farmer_user_id)
+    )).scalar_one_or_none()
+    if farmer and farmer.phone:
+        if new_user_id and new_user:
+            body_text = (
+                f"RootsTalk: Your support team has assigned "
+                f"{new_user.name or '—'} ({new_user.phone or '—'}) as "
+                f"your follow-up promoter. They'll help you with your "
+                f"crop advisory going forward."
+            )
+        else:
+            body_text = (
+                "RootsTalk: Your support team has removed the follow-up "
+                "promoter on your crop. Your Relationship Manager "
+                "remains your primary contact."
+            )
+        try:
+            await send_sms(farmer.phone, body_text)
+        except Exception:
+            pass
+
+    return {
+        "subscription_id": sub.id,
+        "followup_promoter_user_id": new_user_id,
         "changed": True,
     }
 

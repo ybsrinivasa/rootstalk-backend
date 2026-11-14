@@ -45,6 +45,13 @@ class AssignmentStatus(str, enum.Enum):
     EXPIRED = "EXPIRED"
     # F-P B2 — F-P withdraws their own PENDING_FARMER_APPROVAL.
     CANCELLED_BY_PROMOTER = "CANCELLED_BY_PROMOTER"
+    # 2026-11-14 — RM revoked / superseded the assignment via the
+    # Farmer Support Follow-up Promoter mutation. Keeps the row for
+    # audit continuity while flipping it out of the ACTIVE set so
+    # queries that expect at most one ACTIVE per sub stay correct.
+    # DB column is String(30), not PG enum, so adding this value
+    # requires no schema migration.
+    REVOKED_BY_RM = "REVOKED_BY_RM"
 
 
 class AlertType(str, enum.Enum):

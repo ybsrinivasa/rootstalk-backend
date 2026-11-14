@@ -684,3 +684,44 @@ class SubscriptionPromoterPunditChange(Base):
         Index("ix_sppc_sub_changed_at",
               "subscription_id", "changed_at"),
     )
+
+
+class SubscriptionFollowupPromoterChange(Base):
+    """Permanent audit trail for every RM-initiated change to a
+    SELF-subscribed subscription's Follow-up Promoter. Append-only
+    — same shape as SubscriptionAlertReceiverChange and
+    SubscriptionPromoterPunditChange. source always
+    'FARMER_SUPPORT_RM' for now (no farmer-side path for this
+    assignment — farmer can self-subscribe but cannot delegate to
+    a facilitator; that's the RM's prerogative).
+    """
+    __tablename__ = "subscription_followup_promoter_changes"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    subscription_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("subscriptions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    old_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    new_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    changed_by_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    changed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False,
+    )
+    source: Mapped[str] = mapped_column(
+        String(40), default="FARMER_SUPPORT_RM", nullable=False,
+    )
+
+    __table_args__ = (
+        Index("ix_sfpc_sub_changed_at",
+              "subscription_id", "changed_at"),
+    )
