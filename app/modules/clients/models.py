@@ -598,3 +598,47 @@ class FarmerCallLog(Base):
         Index("ix_farmer_call_logs_client_farmer_call_at",
               "client_id", "farmer_user_id", "call_at"),
     )
+
+
+class SubscriptionAlertReceiverChange(Base):
+    """Permanent audit trail for every RM-initiated change to a
+    subscription's alert receiver. Mirrors the farmer_call_logs
+    design — append-only, no edit, no delete. Powers the "who
+    changed the alert routing and when" question that the farmer,
+    the SA, or a successor RM might ask weeks later.
+    """
+    __tablename__ = "subscription_alert_receiver_changes"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    subscription_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("subscriptions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # NULL = at write time the fallback chain was resolving to a
+    # default (sub's promoter, PromoterAssignment-resolved). NOT a
+    # soft-delete marker — a cleared NULL is a real value.
+    old_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    new_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    changed_by_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    changed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False,
+    )
+    # Leaves room for future paths (mobile RM, bulk ops) without a
+    # column migration.
+    source: Mapped[str] = mapped_column(
+        String(40), default="FARMER_SUPPORT_RM", nullable=False,
+    )
+
+    __table_args__ = (
+        Index("ix_sarc_sub_changed_at",
+              "subscription_id", "changed_at"),
+    )
