@@ -4148,6 +4148,13 @@ async def list_farmer_subscriptions(
     start_date_from: Optional[str] = None,       # ISO date
     start_date_to: Optional[str] = None,         # ISO date
     origin: Optional[str] = None,                # SELF | PROMOTER
+    # 2026-11-14 (p.m. revision) — also accept direct subscription-id
+    # highlights, so alert tiles (Missing Start Date / Overdue Input /
+    # Missed Input / Overdue Expert Query / No Active Subscription)
+    # can forward the exact sub rows that triggered the alert. Each
+    # alert endpoint already surfaces `subscription_id` per row; the
+    # CP aggregates per farmer and passes a CSV.
+    highlight_subscription_ids: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -4200,9 +4207,15 @@ async def list_farmer_subscriptions(
         except ValueError:
             raise HTTPException(status_code=422, detail="start_date_to must be YYYY-MM-DD.")
 
+    highlight_sids: set[str] = set()
+    if highlight_subscription_ids:
+        highlight_sids = {
+            s.strip() for s in highlight_subscription_ids.split(",") if s.strip()
+        }
+
     filter_active = any([
         promoter_user_id, crop_cosh_id, status_upper,
-        d_from, d_to, origin_upper,
+        d_from, d_to, origin_upper, highlight_sids,
     ])
 
     rows = (await db.execute(
@@ -4348,6 +4361,12 @@ async def list_farmer_subscriptions(
         )
 
     def _sub_matches_filter(sub, pkg) -> bool:
+        # highlight_subscription_ids wins outright when present — the
+        # CP uses it to echo an alert-tile selection, which is a
+        # per-sub signal; it should not be intersected with the
+        # (broader) sub-side filter semantics.
+        if highlight_sids:
+            return sub.id in highlight_sids
         if crop_cosh_id and pkg.crop_cosh_id != crop_cosh_id:
             return False
         if status_upper == "ACTIVE" and sub.status != SubscriptionStatus.ACTIVE:
