@@ -4135,18 +4135,75 @@ async def get_farmer_support_profile(
 async def list_farmer_subscriptions(
     client_id: str,
     farmer_user_id: str,
+    # 2026-11-14 — mirror the sub-side filters from
+    # `list_farmer_support_farmers` so the CP can carry filter context
+    # from the list page into the 360° view. Each returned sub gets a
+    # `matches_filter` boolean when ANY of these are set; null when no
+    # filter is active (CP skips highlighting). Filter semantics are
+    # kept IDENTICAL to the list endpoint so "3 of 8 matching" reads
+    # true to what the RM saw.
+    promoter_user_id: Optional[str] = None,
+    crop_cosh_id: Optional[str] = None,
+    subscription_status: Optional[str] = None,  # ACTIVE | COMPLETED | NOT_STARTED
+    start_date_from: Optional[str] = None,       # ISO date
+    start_date_to: Optional[str] = None,         # ISO date
+    origin: Optional[str] = None,                # SELF | PROMOTER
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """All subscriptions this farmer has with this client — active
     first, past in reverse-chrono. One row per subscription with the
-    display fields for the 360° Subscription Summary tab bar."""
+    display fields for the 360° Subscription Summary tab bar.
+
+    When any filter param is passed, each row carries
+    `matches_filter: bool` reflecting whether that sub meets the list-
+    page criteria (CP uses this to highlight the matching tabs + pre-
+    select the first match). When no filter param is passed,
+    `matches_filter` is null and the CP falls back to active-first.
+    """
     from app.modules.subscriptions.models import (
         PromoterAssignment, Subscription, SubscriptionStatus,
     )
     from app.modules.advisory.models import Package
     await _assert_ca_or_rm(db, current_user, client_id)
     await _assert_farmer_belongs_to_client(db, client_id, farmer_user_id)
+
+    # Validate filter inputs up-front so a bad one can't silently
+    # degrade to "no match" on every row.
+    status_upper: Optional[str] = None
+    if subscription_status:
+        status_upper = subscription_status.strip().upper()
+        if status_upper not in ("ACTIVE", "COMPLETED", "NOT_STARTED"):
+            raise HTTPException(
+                status_code=422,
+                detail="subscription_status must be ACTIVE|COMPLETED|NOT_STARTED.",
+            )
+    origin_upper: Optional[str] = None
+    if origin:
+        origin_upper = origin.strip().upper()
+        if origin_upper not in ("SELF", "PROMOTER"):
+            raise HTTPException(
+                status_code=422, detail="origin must be SELF|PROMOTER.",
+            )
+    d_from = None
+    d_to = None
+    if start_date_from:
+        from datetime import date as _date
+        try:
+            d_from = _date.fromisoformat(start_date_from)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="start_date_from must be YYYY-MM-DD.")
+    if start_date_to:
+        from datetime import date as _date
+        try:
+            d_to = _date.fromisoformat(start_date_to)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="start_date_to must be YYYY-MM-DD.")
+
+    filter_active = any([
+        promoter_user_id, crop_cosh_id, status_upper,
+        d_from, d_to, origin_upper,
+    ])
 
     rows = (await db.execute(
         select(Subscription, Package)
@@ -4279,6 +4336,45 @@ async def list_farmer_subscriptions(
             return v.date().isoformat()
         return v.isoformat()
 
+    # 2026-11-14 — per-sub filter-match computation. Only runs when a
+    # filter param is active; otherwise rows get `matches_filter: None`
+    # and the CP defaults to active-first selection as before.
+    def _crop_start_date_or_none(sub):
+        if not sub.crop_start_date:
+            return None
+        return (
+            sub.crop_start_date.date()
+            if hasattr(sub.crop_start_date, "date") else sub.crop_start_date
+        )
+
+    def _sub_matches_filter(sub, pkg) -> bool:
+        if crop_cosh_id and pkg.crop_cosh_id != crop_cosh_id:
+            return False
+        if status_upper == "ACTIVE" and sub.status != SubscriptionStatus.ACTIVE:
+            return False
+        if status_upper == "COMPLETED" and sub.status != SubscriptionStatus.COMPLETED:
+            return False
+        if status_upper == "NOT_STARTED":
+            if sub.status != SubscriptionStatus.ACTIVE or sub.crop_start_date is not None:
+                return False
+        csd = _crop_start_date_or_none(sub)
+        if d_from and (csd is None or csd < d_from):
+            return False
+        if d_to and (csd is None or csd > d_to):
+            return False
+        if promoter_user_id:
+            # True iff ANY PromoterAssignment on this sub matches.
+            assigned = promoter_user_id_by_sub.get(sub.id)
+            if assigned != promoter_user_id:
+                return False
+        if origin_upper == "SELF":
+            if promoter_user_id_by_sub.get(sub.id) is not None:
+                return False
+        if origin_upper == "PROMOTER":
+            if promoter_user_id_by_sub.get(sub.id) is None:
+                return False
+        return True
+
     out = []
     for sub, pkg in rows:
         # Resolve alert receiver for this sub (extra_alert_user_id →
@@ -4334,6 +4430,11 @@ async def list_farmer_subscriptions(
             "unanswered_queries_count": int(query_count_by_sub.get(sub.id, 0)),
             "alert_receiver": alert_receiver,
             "promoter_pundit": pp,
+            # 2026-11-14 — carry filter match per-sub so the CP can
+            # highlight the matching tabs + pre-select first match.
+            "matches_filter": (
+                _sub_matches_filter(sub, pkg) if filter_active else None
+            ),
         })
     # Active first, then by crop_start_date desc (nulls last), then
     # created_at desc as tie-breaker. crop_start_date is always
