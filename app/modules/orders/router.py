@@ -11282,6 +11282,18 @@ async def _promoted_farmers(db, promoter_user_id: str, lang: str = "en"):
         )).scalars().all()
         pkg_by_id = {p.id: p for p in prows}
 
+    # 2026-11-15 — surface is_training per sub so the promoter's
+    # /promoted-farmers list can render a "Remove Training crop"
+    # button on training rows only.
+    from app.modules.clients.models import Client as _Client
+    client_ids = {s.client_id for s in sub_rows}
+    is_training_by_client: dict[str, bool] = {}
+    if client_ids:
+        crows = (await db.execute(
+            select(_Client.id, _Client.is_training).where(_Client.id.in_(client_ids))
+        )).all()
+        is_training_by_client = {cid: bool(it) for cid, it in crows}
+
     crop_cosh_ids = {p.crop_cosh_id for p in pkg_by_id.values() if p.crop_cosh_id}
     crop_name_by_cosh_id: dict[str, str] = {}
     if crop_cosh_ids:
@@ -11325,6 +11337,10 @@ async def _promoted_farmers(db, promoter_user_id: str, lang: str = "en"):
             "area_unit": sub.area_unit,
             "number_of_plants": sub.number_of_plants,
             "planting_year": sub.planting_year,
+            # 2026-11-15 — Training Sandbox marker. Promoter's PWA
+            # list uses this to show a "Remove Training crop" button
+            # on these rows; non-training rows don't get the button.
+            "is_training": is_training_by_client.get(sub.client_id, False),
         })
     return out
 
