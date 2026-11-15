@@ -56,7 +56,10 @@ def _resolve_input_alert_lead_days(sub) -> int:
         return 0
     return int(val)
 from app.services.fcm_service import send_fcm
-from app.services.sms_service import send_sms
+# 2026-11-15 — send_sms import removed; BL-09 alerts are FCM-only
+# now that we've confirmed non-OTP SMS bodies get silently dropped
+# at the operator leg (no DLT registration). If SMS fallback comes
+# back later (after DLT registration), re-import here.
 
 logger = logging.getLogger(__name__)
 
@@ -444,18 +447,22 @@ async def _send_to_recipient(
     db, sub_id: str, alert_type: AlertType, recipient: AlertRecipientSpec,
     user: User, sms_body: str, fcm_title: str, fcm_body: str,
 ) -> None:
-    """Fan out one alert to one recipient via every channel they
-    accept. SMS fires if user.phone is set; FCM push fires if
-    user.fcm_token is set; both run independently of each other.
+    """Fan out one alert to one recipient via FCM push.
     The Alert row is written unconditionally so the audit trail
     captures every intended notification regardless of delivery
     channel availability.
+
+    2026-11-15 — SMS send removed. The non-OTP SMS bodies used by
+    BL-09 alerts are not DLT-registered → Draft4SMS returned
+    "submitted successfully" but operators silently dropped every
+    message. Confirmed via comparison test (OTP template delivered,
+    alert-body template did not, same numbers). Design per user call
+    2026-11-15: daily alerts go via FCM push only; SMS reserved for
+    OTP + the missed-call reply (both independently DLT-registered).
+    sms_body parameter kept in the signature for now to avoid
+    rippling through a dozen call sites — it's just unused, and a
+    later cleanup can drop it along with the formatter imports.
     """
-    if user.phone:
-        try:
-            await send_sms(user.phone, sms_body)
-        except Exception as e:
-            logger.error(f"SMS send failed to {user.phone}: {e}")
     if user.fcm_token:
         # 2026-10-03 — Tap-through target. Farmers get their crop
         # advisory for this subscription (the START_DATE / INPUT
