@@ -896,6 +896,213 @@ def _normalise_phone(phone: str) -> str:
     return "+91" + digits[-10:]
 
 
+# ── Training: per-sub remove (2026-11-15) ─────────────────────────────────────
+#
+# Soft-removes a single Training subscription. Both endpoints share the
+# same `_soft_remove_training_sub` helper so the cleanup semantics are
+# identical regardless of actor; only the auth gate + the resulting
+# PromoterAssignment status differ (REMOVED_BY_PROMOTER vs
+# REMOVED_BY_FARMER).
+#
+# Scoped to Training subs only — the Subscription's client must be a
+# training sandbox (Client.is_training=True). Regular subs use the
+# existing unsubscribe (farmer SELF) / assignment-withdraw (promoter
+# PENDING) flows — this endpoint intentionally refuses them so a stray
+# DELETE can't cascade a real farmer's data.
+#
+# Mechanism: Subscription.deleted_at=now() + deleted_by_user_id=actor.
+# The session-level soft-delete listener (soft_delete.py) auto-filters
+# the row from every subsequent read; dependent orders/queries/acks
+# inherit the hide via their subscription_id joins. Row is recoverable
+# via execution_options(include_deleted=True) if needed. Full hard-
+# cascade still happens at training-session end (training_expiry.py).
+
+
+async def _soft_remove_training_sub(
+    db: AsyncSession,
+    sub,  # Subscription
+    actor_user: User,
+    assignment_end_status: str,
+) -> None:
+    """Shared soft-remove. Caller MUST have already verified:
+      - sub.client is a training sandbox (is_training=True)
+      - actor is authorised for this sub (farmer owns it, OR promoter
+        assigned it)
+      - sub is not already deleted
+    Sets deleted_at + deleted_by_user_id on Subscription, flips any
+    ACTIVE PromoterAssignment to the actor-appropriate REMOVED_*
+    status. Commits.
+    """
+    from datetime import datetime, timezone
+    from app.modules.subscriptions.models import (
+        PromoterAssignment, AssignmentStatus,
+    )
+
+    now = datetime.now(timezone.utc)
+    sub.deleted_at = now
+    sub.deleted_by_user_id = actor_user.id
+
+    # Supersede any still-live PromoterAssignment on this sub so the
+    # row is visibly closed on the assignment table too (helps later
+    # audit queries that ask "why did this training sub disappear?").
+    pa_rows = (await db.execute(
+        select(PromoterAssignment).where(
+            PromoterAssignment.subscription_id == sub.id,
+            PromoterAssignment.status.in_([
+                AssignmentStatus.ACTIVE,
+                AssignmentStatus.PENDING_FARMER_APPROVAL,
+            ]),
+        )
+    )).scalars().all()
+    for pa in pa_rows:
+        pa.status = assignment_end_status
+
+    await db.commit()
+
+
+def _looks_like_promoter_assignment(pa) -> bool:
+    return pa is not None
+
+
+@router.delete(
+    "/promoter/training-subscriptions/{subscription_id}",
+    status_code=204,
+)
+async def remove_training_subscription_as_promoter(
+    subscription_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Promoter removes a training sub they assigned. Typically used
+    to clear the demo slot so the same farmer can be moved to a
+    real crop next. Scoped strictly to:
+      - Sub must exist + its client must be a training sandbox.
+      - Caller must be the promoter who created the active
+        PromoterAssignment for this sub (not just any promoter at
+        the parent).
+      - Sub must not already be soft-deleted.
+    Soft-remove via Subscription.deleted_at (session listener hides
+    it + its dependents on every subsequent read).
+    """
+    from app.modules.subscriptions.models import (
+        Subscription, PromoterAssignment, AssignmentStatus,
+    )
+
+    sub = (await db.execute(
+        select(Subscription).where(Subscription.id == subscription_id)
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    if sub.deleted_at is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "already_removed",
+                    "message": "Subscription has already been removed."},
+        )
+
+    # Must be a training sub.
+    client = (await db.execute(
+        select(Client).where(Client.id == sub.client_id)
+    )).scalar_one_or_none()
+    if client is None or not client.is_training:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "not_a_training_subscription",
+                "message": (
+                    "This endpoint removes Training sandbox "
+                    "subscriptions only. Use the regular "
+                    "assignment-withdraw / unsubscribe flows for "
+                    "non-training subs."
+                ),
+            },
+        )
+
+    # Caller must be the promoter who created the active
+    # PromoterAssignment for this sub.
+    pa = (await db.execute(
+        select(PromoterAssignment).where(
+            PromoterAssignment.subscription_id == sub.id,
+            PromoterAssignment.promoter_user_id == current_user.id,
+            PromoterAssignment.status.in_([
+                AssignmentStatus.ACTIVE,
+                AssignmentStatus.PENDING_FARMER_APPROVAL,
+            ]),
+        ).order_by(PromoterAssignment.assigned_at.desc()).limit(1)
+    )).scalar_one_or_none()
+    if pa is None:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "not_assigning_promoter",
+                "message": (
+                    "Only the promoter who assigned this Training "
+                    "subscription can remove it."
+                ),
+            },
+        )
+
+    await _soft_remove_training_sub(
+        db, sub, current_user, AssignmentStatus.REMOVED_BY_PROMOTER,
+    )
+    return None
+
+
+@router.delete(
+    "/farmer/training-subscriptions/{subscription_id}",
+    status_code=204,
+)
+async def remove_training_subscription_as_farmer(
+    subscription_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Farmer removes their own Training sub. Reached via the widened
+    Unsubscribe affordance on the My Subscriptions page (training
+    ASSIGNED subs show the button; regular ASSIGNED subs do not).
+    """
+    from app.modules.subscriptions.models import (
+        Subscription, AssignmentStatus,
+    )
+
+    sub = (await db.execute(
+        select(Subscription).where(
+            Subscription.id == subscription_id,
+            Subscription.farmer_user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    if sub.deleted_at is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "already_removed",
+                    "message": "Subscription has already been removed."},
+        )
+
+    client = (await db.execute(
+        select(Client).where(Client.id == sub.client_id)
+    )).scalar_one_or_none()
+    if client is None or not client.is_training:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "not_a_training_subscription",
+                "message": (
+                    "This endpoint removes Training sandbox "
+                    "subscriptions only. For regular subscriptions, "
+                    "use the Unsubscribe flow on SELF subs or ask "
+                    "your company to cancel assigned subs."
+                ),
+            },
+        )
+
+    await _soft_remove_training_sub(
+        db, sub, current_user, AssignmentStatus.REMOVED_BY_FARMER,
+    )
+    return None
+
+
 # ── Training Expert ─────────────────────────────────────────────────────
 
 @router.post("/client/{client_id}/training/expert")

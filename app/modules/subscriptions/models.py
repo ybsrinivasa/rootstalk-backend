@@ -52,6 +52,19 @@ class AssignmentStatus(str, enum.Enum):
     # DB column is String(30), not PG enum, so adding this value
     # requires no schema migration.
     REVOKED_BY_RM = "REVOKED_BY_RM"
+    # 2026-11-15 — Training Sandbox per-sub removal. Different from
+    # CANCELLED_BY_PROMOTER (which is used for withdrawing a still-
+    # PENDING_FARMER_APPROVAL assignment + refunding the kitty).
+    # These two flag an assignment whose Subscription has been soft-
+    # removed via the Training per-sub remove flow:
+    #   REMOVED_BY_PROMOTER — promoter removed this training sub to
+    #     clear the slot (typically to assign a real crop next).
+    #   REMOVED_BY_FARMER — farmer removed this training sub via the
+    #     widened Unsubscribe affordance.
+    # Pair cleanly with Subscription.deleted_at + deleted_by_user_id
+    # so audits can reconstruct the full who/why.
+    REMOVED_BY_PROMOTER = "REMOVED_BY_PROMOTER"
+    REMOVED_BY_FARMER = "REMOVED_BY_FARMER"
 
 
 class AlertType(str, enum.Enum):
