@@ -5459,7 +5459,6 @@ async def set_subscription_alert_receiver(
     from app.modules.farmpundit.models import ClientFarmPundit, FarmPunditProfile
     from app.modules.clients.models import SubscriptionAlertReceiverChange
     from app.services.training import resolve_package_client_id
-    from app.services.sms_service import send_sms
 
     await _assert_ca_or_rm(db, current_user, client_id)
     await _assert_rm_for_alert_receiver_change(db, current_user, client_id)
@@ -5552,33 +5551,14 @@ async def set_subscription_alert_receiver(
     ))
     await db.commit()
 
-    # Notify the farmer — best-effort. Both channels run independently
-    # and never block the mutation success response. Draft4SMS may
-    # silently drop non-template messages under DLT; FCM is more
-    # reliable for app-using farmers. The audit row is authoritative
-    # regardless of delivery outcome.
-    farmer = (await db.execute(
-        select(User).where(User.id == farmer_user_id)
-    )).scalar_one_or_none()
-    if farmer and farmer.phone:
-        if new_user_id and new_user:
-            body_text = (
-                f"RootsTalk: Your support team has updated the person "
-                f"who gets alerts for your crop. New contact: "
-                f"{new_user.name or '—'} ({new_user.phone or '—'})."
-            )
-        else:
-            body_text = (
-                "RootsTalk: Your support team has cleared the extra "
-                "Alert Receiver on your crop — alerts will go to the "
-                "default contact (your Promoter)."
-            )
-        try:
-            await send_sms(farmer.phone, body_text)
-        except Exception:
-            # Logged inside send_sms. Don't surface to the RM; the
-            # audit row already captures the intent.
-            pass
+    # 2026-11-15 — Removed the farmer SMS-notify call that was here.
+    # Diagnostic test (OTP template delivered, alert-body template
+    # did not) confirmed non-OTP SMS bodies lack DLT registration and
+    # are silently dropped by operators. Draft4SMS returns "submitted
+    # successfully" but the farmer never receives anything. The audit
+    # trail (subscription_alert_receiver_changes) is authoritative.
+    # If a farmer notification channel is wanted here later, wire FCM
+    # push (farmer.fcm_token) — not SMS — per 2026-11-15 design call.
 
     return {
         "subscription_id": sub.id,
@@ -5632,7 +5612,6 @@ async def set_subscription_promoter_pundit(
     from app.modules.farmpundit.models import ClientFarmPundit, FarmPunditProfile
     from app.modules.clients.models import SubscriptionPromoterPunditChange
     from app.services.training import resolve_package_client_id
-    from app.services.sms_service import send_sms
 
     await _assert_ca_or_rm(db, current_user, client_id)
     await _assert_rm_for_alert_receiver_change(db, current_user, client_id)
@@ -5718,29 +5697,10 @@ async def set_subscription_promoter_pundit(
     ))
     await db.commit()
 
-    # Notify farmer (best-effort). The P-P change affects who
-    # receives their expert queries — meaningful enough to surface
-    # to the farmer, same as alert-receiver changes.
-    farmer = (await db.execute(
-        select(User).where(User.id == farmer_user_id)
-    )).scalar_one_or_none()
-    if farmer and farmer.phone:
-        if new_user_id and new_user:
-            body_text = (
-                f"RootsTalk: Your support team has updated the Promoter-"
-                f"Pundit who answers your expert queries. New contact: "
-                f"{new_user.name or '—'} ({new_user.phone or '—'})."
-            )
-        else:
-            body_text = (
-                "RootsTalk: Your support team has cleared the pinned "
-                "Promoter-Pundit on your crop — new queries will route "
-                "via the default rules again."
-            )
-        try:
-            await send_sms(farmer.phone, body_text)
-        except Exception:
-            pass
+    # 2026-11-15 — Removed the farmer SMS-notify call that was here;
+    # see Alert Receiver endpoint for the full context (non-OTP SMS
+    # bodies aren't DLT-registered → silently dropped). Audit row
+    # (subscription_promoter_pundit_changes) is authoritative.
 
     return {
         "subscription_id": sub.id,
@@ -5806,7 +5766,6 @@ async def set_subscription_followup_promoter(
     )
     from app.modules.clients.models import SubscriptionFollowupPromoterChange
     from app.services.training import resolve_package_client_id
-    from app.services.sms_service import send_sms
 
     await _assert_ca_or_rm(db, current_user, client_id)
     await _assert_rm_for_alert_receiver_change(db, current_user, client_id)
@@ -5919,28 +5878,9 @@ async def set_subscription_followup_promoter(
     ))
     await db.commit()
 
-    # Notify farmer best-effort.
-    farmer = (await db.execute(
-        select(User).where(User.id == farmer_user_id)
-    )).scalar_one_or_none()
-    if farmer and farmer.phone:
-        if new_user_id and new_user:
-            body_text = (
-                f"RootsTalk: Your support team has assigned "
-                f"{new_user.name or '—'} ({new_user.phone or '—'}) as "
-                f"your follow-up promoter. They'll help you with your "
-                f"crop advisory going forward."
-            )
-        else:
-            body_text = (
-                "RootsTalk: Your support team has removed the follow-up "
-                "promoter on your crop. Your Relationship Manager "
-                "remains your primary contact."
-            )
-        try:
-            await send_sms(farmer.phone, body_text)
-        except Exception:
-            pass
+    # 2026-11-15 — Removed the farmer SMS-notify call that was here;
+    # see Alert Receiver endpoint for context. Audit row
+    # (subscription_followup_promoter_changes) is authoritative.
 
     return {
         "subscription_id": sub.id,
