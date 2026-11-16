@@ -109,6 +109,11 @@ def upgrade() -> None:
     )
 
     # ── 5) Drop the two training-session columns ─────────────────────
+    # The `v_real_clients` view does SELECT *, which pins the schema;
+    # Postgres refuses to drop columns referenced by it. Rebuild the
+    # view around the drop so it picks up the new column list.
+    bind.execute(sa.text("DROP VIEW IF EXISTS v_real_clients"))
+
     # Model columns remain in SQLAlchemy drift via `create_all` on some
     # envs, so keep the drop idempotent.
     for col in ("training_status", "training_ends_at"):
@@ -118,6 +123,12 @@ def upgrade() -> None:
         """)).first()
         if exists:
             op.drop_column("clients", col)
+
+    bind.execute(sa.text(
+        "CREATE VIEW v_real_clients AS "
+        "SELECT * FROM clients "
+        "WHERE is_training = false AND is_coaching = false"
+    ))
 
     # ── 6) Recreate partial unique index — one training child per
     #    parent, regardless of lifecycle state. A closed session has
