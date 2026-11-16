@@ -4553,6 +4553,29 @@ async def get_alert_preferences(
             "disabled": True,
         }
 
+    # 2026-11-16 — Prefer the authoritative `extra_alert_user_id` over
+    # the denormalised phone/name snapshot. Both the RM's Farmer
+    # Support mutation (`clients/router.py::set_subscription_alert_receiver`,
+    # 2026-11-14) and the farmer's own POST write `extra_alert_user_id`;
+    # only the farmer-side POST additionally stamps the denorm fields.
+    # Reading from the user_id side keeps the PWA chip in sync across
+    # both actors. Deleted-user grace falls back to the stale denorm
+    # snapshot so the farmer at least sees *something* until they pick
+    # again.
+    if sub.extra_alert_user_id:
+        recipient = (await db.execute(
+            select(User).where(User.id == sub.extra_alert_user_id)
+        )).scalar_one_or_none()
+        if recipient and recipient.phone:
+            return {
+                "extra_phone": recipient.phone,
+                "extra_name": recipient.name,
+                "source": "override",
+                "disabled": False,
+            }
+        # User row is gone (deleted-user grace) — fall through to the
+        # denorm snapshot, then to auto_promoter / none below.
+
     if sub.extra_alert_phone:
         return {
             "extra_phone": sub.extra_alert_phone,
@@ -9518,29 +9541,26 @@ async def get_expert_setting(
                     }
 
     # 2) Promoter-Pundit (active promoter who is also marked as Promoter-Pundit on this client)
+    #
+    # 2026-11-16 — Honour the RM-pinned override
+    # (`Subscription.extra_promoter_pundit_user_id`, Farmer Support
+    # mutation 2026-11-14) with the same priority as the BL-12a
+    # routing service (`farmpundit/router.py::route_query`). Without
+    # this the PWA chip shows the derived P-P while routing goes to
+    # the pinned user — UI truth and routing truth get out of sync.
+    # Pin is only considered if the pinned user is (still) a
+    # designated P-P at this client via the FarmPundit profile.
     promoter_pundit = None
     try:
-        assignment = (await db.execute(
-            select(PromoterAssignment).where(
-                PromoterAssignment.subscription_id == subscription_id,
-                PromoterAssignment.status == AssignmentStatus.ACTIVE,
-            )
-        )).scalar_one_or_none()
-        if assignment:
-            cp = (await db.execute(
-                select(ClientPromoter).where(
-                    ClientPromoter.user_id == assignment.promoter_user_id,
-                    ClientPromoter.client_id == sub.client_id,
-                )
-            )).scalar_one_or_none()
-            # Also find their FarmPundit profile and the ClientFarmPundit (role=PROMOTER_PUNDIT designation)
-            promoter_user = (await db.execute(
-                select(User).where(User.id == assignment.promoter_user_id)
+        pinned_user_id = sub.extra_promoter_pundit_user_id
+        if pinned_user_id:
+            pinned_user = (await db.execute(
+                select(User).where(User.id == pinned_user_id)
             )).scalar_one_or_none()
             pp_profile = None
-            if promoter_user:
+            if pinned_user:
                 pp_profile = (await db.execute(
-                    select(FarmPunditProfile).where(FarmPunditProfile.user_id == promoter_user.id)
+                    select(FarmPunditProfile).where(FarmPunditProfile.user_id == pinned_user.id)
                 )).scalar_one_or_none()
             cfp = None
             if pp_profile:
@@ -9552,12 +9572,53 @@ async def get_expert_setting(
                         ClientFarmPundit.status == "ACTIVE",
                     )
                 )).scalar_one_or_none()
-            if cp and cfp and pp_profile and promoter_user:
+            if pinned_user and pp_profile and cfp:
                 promoter_pundit = {
                     "pundit_id": pp_profile.id,
-                    "name": promoter_user.name,
-                    "phone": promoter_user.phone,
+                    "name": pinned_user.name,
+                    "phone": pinned_user.phone,
                 }
+
+        # Fall back to the derived P-P (ACTIVE assignment's promoter
+        # who is also a designated P-P at this client).
+        if promoter_pundit is None:
+            assignment = (await db.execute(
+                select(PromoterAssignment).where(
+                    PromoterAssignment.subscription_id == subscription_id,
+                    PromoterAssignment.status == AssignmentStatus.ACTIVE,
+                )
+            )).scalar_one_or_none()
+            if assignment:
+                cp = (await db.execute(
+                    select(ClientPromoter).where(
+                        ClientPromoter.user_id == assignment.promoter_user_id,
+                        ClientPromoter.client_id == sub.client_id,
+                    )
+                )).scalar_one_or_none()
+                promoter_user = (await db.execute(
+                    select(User).where(User.id == assignment.promoter_user_id)
+                )).scalar_one_or_none()
+                pp_profile = None
+                if promoter_user:
+                    pp_profile = (await db.execute(
+                        select(FarmPunditProfile).where(FarmPunditProfile.user_id == promoter_user.id)
+                    )).scalar_one_or_none()
+                cfp = None
+                if pp_profile:
+                    cfp = (await db.execute(
+                        select(ClientFarmPundit).where(
+                            ClientFarmPundit.client_id == sub.client_id,
+                            ClientFarmPundit.pundit_id == pp_profile.id,
+                            ClientFarmPundit.role == "PROMOTER_PUNDIT",
+                            ClientFarmPundit.status == "ACTIVE",
+                        )
+                    )).scalar_one_or_none()
+                if cp and cfp and pp_profile and promoter_user:
+                    promoter_pundit = {
+                        "pundit_id": pp_profile.id,
+                        "name": promoter_user.name,
+                        "phone": promoter_user.phone,
+                    }
     except Exception:
         promoter_pundit = None
 
