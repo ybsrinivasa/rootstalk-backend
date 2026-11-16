@@ -1,30 +1,28 @@
 """Training Sandbox — hourly expiry sweep.
 
-Commit F of the 2026-07-24 build plan. Two transitions:
+2026-11-16 — Rewritten from session-level to per-crop. The 12-day
+clock no longer lives on the training Client (Client.training_ends_at
++ training_status were dropped in migration t2q7l5n18s4j). Each
+training Subscription carries its own `auto_remove_at` stamped at
+farmer-acceptance time (farmer_responded_at + 12d).
 
-1. ACTIVE → WINDING_DOWN when `training_ends_at` <= now:
-   push everyone involved (CA of parent client + every farmer with
-   a training subscription) with a "[Training] Session ended — 24
-   hours to wrap up" FCM. In-flight orders/queries can still
-   complete their next hop; no new writes are blocked (deferred to
-   post-V1 per user "wait and see" 2026-07-24).
+The sweep now:
+  - Picks every training Subscription whose `auto_remove_at` has
+    passed and that hasn't already been soft-removed.
+  - Calls the shared `_soft_remove_training_sub` helper (same code
+    path as the Promoter / Farmer Remove-training-crop buttons) with
+    AssignmentStatus.AUTO_REMOVED as the end-status.
 
-2. WINDING_DOWN → hard-cascade-delete when `training_ends_at + 24h`
-   <= now: push each farmer one last time with "[Training]
-   Practice complete", then delete the entire descendant graph in
-   FK-dependency order (QueryResponseMedia → QueryResponse →
-   QueryRemark → Query, PromoterAssignment, OrderItemEvent →
-   OrderItem → Order, SubscriptionPaymentRequest →
-   FarmerSubscriptionHistory → Subscription, ClientPromoter,
-   ClientLocation, ClientCrop, Client itself).
+The session-level hard cascade (`_cascade_delete_training_child`)
+still exists — it's what runs when a CA hits Close Session. No session
+timer, no WINDING_DOWN state, no 24h grace, no auto-close of the
+session itself (CA Start/Close is now the only session-level lever).
 
-Runs hourly per celery beat schedule (see app/celery_app.py — beat
-entry lands in the same commit).
+Runs hourly per celery beat schedule (see app/celery_app.py).
 """
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import Iterable
+from datetime import datetime, timezone
 
 from sqlalchemy import delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,7 +31,6 @@ from app.celery_app import celery_app
 from app.database import AsyncSessionLocal
 from app.modules.clients.models import (
     Client, ClientCrop, ClientLocation, ClientPromoter, ClientUser,
-    ClientUserRole,
 )
 from app.modules.farmpundit.models import (
     Query, QueryRemark, QueryResponse,
@@ -41,7 +38,7 @@ from app.modules.farmpundit.models import (
 from app.modules.orders.models import (
     Order, OrderItem, OrderItemEvent,
 )
-from app.modules.platform.models import StatusEnum, User
+from app.modules.platform.models import User
 from app.modules.subscriptions.models import (
     FarmerSubscriptionHistory, PromoterAssignment, Subscription,
     SubscriptionPaymentRequest,
@@ -56,98 +53,44 @@ from app.services.fcm_service import send_fcm
 logger = logging.getLogger(__name__)
 
 
-TRAINING_WIND_DOWN_HOURS = 24
+# ── Per-crop auto-remove push ─────────────────────────────────────────────────
 
-
-# ── FCM helpers ───────────────────────────────────────────────────────────────
-
-async def _push_training_ending(db: AsyncSession, child: Client) -> None:
-    """Fired at ACTIVE → WINDING_DOWN transition. Recipients: CA of
-    the parent client + every farmer with a training subscription."""
-    ends_at_str = (
-        child.training_ends_at.strftime("%d %b %H:%M UTC")
-        if child.training_ends_at else "shortly"
-    )
-    title = "[Training] Session ended"
+async def _push_training_crop_auto_removed(
+    db: AsyncSession, sub: Subscription,
+) -> None:
+    """Fired when the hourly sweep auto-removes a training sub. One
+    push to the farmer + one to the assigning promoter."""
+    title = "[Training] Crop auto-removed"
     body = (
-        f"The training session for {child.display_name or child.full_name} "
-        f"is winding down. In-flight orders and queries have 24 hours to "
-        f"complete; after that the sandbox will be cleared."
+        "A training crop on your account has been auto-removed after "
+        "the 12-day practice window. Ask your promoter to re-assign it "
+        "any time."
     )
-    # CA of the parent — they're the one who started the session.
-    ca_rows = (await db.execute(
-        select(User)
-        .join(ClientUser, ClientUser.user_id == User.id)
-        .where(
-            ClientUser.client_id == child.parent_client_id,
-            ClientUser.role == ClientUserRole.CA,
-            ClientUser.status == StatusEnum.ACTIVE,
-        )
+    recipient_ids: set[str] = {sub.farmer_user_id}
+    pa = (await db.execute(
+        select(PromoterAssignment.promoter_user_id).where(
+            PromoterAssignment.subscription_id == sub.id,
+        ).order_by(PromoterAssignment.assigned_at.desc()).limit(1)
+    )).scalar_one_or_none()
+    if pa:
+        recipient_ids.add(pa)
+    users = (await db.execute(
+        select(User).where(User.id.in_(recipient_ids))
     )).scalars().all()
-    # Farmers with subs under the training child.
-    farmer_rows = (await db.execute(
-        select(User)
-        .join(Subscription, Subscription.farmer_user_id == User.id)
-        .where(Subscription.client_id == child.id)
-        .distinct()
-    )).scalars().all()
-    for u in list(ca_rows) + list(farmer_rows):
+    for u in users:
         if not u or not u.fcm_token:
             continue
         try:
             await send_fcm(
                 token=u.fcm_token, title=title, body=body,
                 data={
-                    "type": "TRAINING_WINDING_DOWN",
-                    "training_client_id": child.id,
-                    "parent_client_id": child.parent_client_id,
+                    "type": "TRAINING_CROP_AUTO_REMOVED",
+                    "subscription_id": sub.id,
                     "click_action": "/",
                 },
             )
         except Exception as exc:
-            logger.error(f"FCM push failed for training-ending u={u.id}: {exc}")
-
-
-async def _push_training_complete(
-    db: AsyncSession, child: Client, farmer_ids: Iterable[str],
-) -> None:
-    """Fired at DELETE-cascade time — one final push to every farmer
-    whose training sub is about to vanish, and to the CA."""
-    title = "[Training] Practice complete"
-    body = (
-        f"The {child.display_name or child.full_name} sandbox has been "
-        f"cleared. Any practice subscriptions have been removed."
-    )
-    recipient_ids = set(farmer_ids)
-    ca_rows = (await db.execute(
-        select(User.id)
-        .join(ClientUser, ClientUser.user_id == User.id)
-        .where(
-            ClientUser.client_id == child.parent_client_id,
-            ClientUser.role == ClientUserRole.CA,
-            ClientUser.status == StatusEnum.ACTIVE,
-        )
-    )).scalars().all()
-    recipient_ids.update(ca_rows)
-    if not recipient_ids:
-        return
-    users = (await db.execute(
-        select(User).where(User.id.in_(recipient_ids))
-    )).scalars().all()
-    for u in users:
-        if not u.fcm_token:
-            continue
-        try:
-            await send_fcm(
-                token=u.fcm_token, title=title, body=body,
-                data={
-                    "type": "TRAINING_COMPLETE",
-                    "parent_client_id": child.parent_client_id,
-                    "click_action": "/",
-                },
-            )
-        except Exception as exc:
-            logger.error(f"FCM push failed for training-complete u={u.id}: {exc}")
+            logger.error(f"FCM push failed for training-crop-auto-removed u={u.id}: {exc}")
 
 
 # ── Cascade delete ────────────────────────────────────────────────────────────
@@ -194,10 +137,21 @@ async def _cascade_delete_training_child(
     )).scalars().all()
 
     # SeedOrderFull sits directly under Client (seed_mgmt module).
+    # 2026-11-16 — Expanded the collection to also pick up rows whose
+    # `subscription_id` points to a training sub but whose `client_id`
+    # points to the PARENT client. Seen on staging: farmer seed orders
+    # recorded during training against the parent's client_id instead
+    # of the training child's — the original client_id-only filter
+    # missed those and the Subscription DELETE below blew up with
+    # `seed_orders_full_subscription_id_fkey` FK violation. Both FKs
+    # need clearing before the Subscription delete can land.
     try:
         from app.modules.seed_mgmt.models import SeedOrderFull
+        _conditions = [SeedOrderFull.client_id == cid]
+        if sub_ids:
+            _conditions.append(SeedOrderFull.subscription_id.in_(sub_ids))
         seed_full_ids = (await db.execute(
-            select(SeedOrderFull.id).where(SeedOrderFull.client_id == cid)
+            select(SeedOrderFull.id).where(or_(*_conditions))
         )).scalars().all()
     except ImportError:
         SeedOrderFull = None  # type: ignore
@@ -550,51 +504,70 @@ async def _cascade_delete_training_child(
 
 # ── The sweep ─────────────────────────────────────────────────────────────────
 
-async def _run_sweep_with_session(db: AsyncSession, now=None) -> tuple[int, int]:
-    """Inner sweep — split out so integration tests can inject the
-    testcontainer session and assert on the rows the task commits."""
+async def _run_sweep_with_session(db: AsyncSession, now=None) -> int:
+    """Inner sweep — per-training-sub soft-delete. Split out so
+    integration tests can inject the testcontainer session and assert
+    on the rows the task commits.
+
+    Each sub is removed in its own commit (via `_soft_remove_training_sub`)
+    so a single failing row doesn't strand the rest of the batch — the
+    session-level all-or-nothing of the old session-sweep was exactly
+    the bug that stranded four staging clients on 2026-11-16.
+    """
+    from app.modules.clients.training_router import _soft_remove_training_sub
+    from app.modules.subscriptions.models import AssignmentStatus
+
     now = now or datetime.now(timezone.utc)
 
-    # 1) ACTIVE → WINDING_DOWN when the 12-day clock has passed.
-    to_wind = (await db.execute(
-        select(Client).where(
+    # One join per sweep. is_training filter keeps the index-hit cheap;
+    # the deleted_at IS NULL filter is already covered by the partial
+    # index on subscriptions.auto_remove_at.
+    rows = (await db.execute(
+        select(Subscription)
+        .join(Client, Client.id == Subscription.client_id)
+        .where(
+            Subscription.auto_remove_at.is_not(None),
+            Subscription.auto_remove_at <= now,
+            Subscription.deleted_at.is_(None),
             Client.is_training == True,  # noqa: E712
-            Client.training_status == "ACTIVE",
-            Client.training_ends_at <= now,
         )
     )).scalars().all()
-    for child in to_wind:
-        child.training_status = "WINDING_DOWN"
-        await _push_training_ending(db, child)
 
-    # 2) WINDING_DOWN → DELETE when the 24h grace has also passed.
-    cutoff = now - timedelta(hours=TRAINING_WIND_DOWN_HOURS)
-    to_delete = (await db.execute(
-        select(Client).where(
-            Client.is_training == True,  # noqa: E712
-            Client.training_status == "WINDING_DOWN",
-            Client.training_ends_at <= cutoff,
-        )
-    )).scalars().all()
-    for child in to_delete:
-        farmer_ids = (await db.execute(
-            select(Subscription.farmer_user_id)
-            .where(Subscription.client_id == child.id)
-            .distinct()
-        )).scalars().all()
-        await _push_training_complete(db, child, farmer_ids)
-        await _cascade_delete_training_child(db, child)
+    removed = 0
+    for sub in rows:
+        try:
+            # Farmer-attributed soft-remove would be misleading (the
+            # farmer didn't initiate). Pass a synthetic system actor —
+            # the deleted_by_user_id FK is SET NULL on actor delete so
+            # passing None through needs a wrapper. Use the sub's own
+            # farmer_user_id as the audit anchor; the AUTO_REMOVED
+            # PromoterAssignment status makes the "sweep-did-this"
+            # provenance unambiguous without an extra column.
+            farmer_row = (await db.execute(
+                select(User).where(User.id == sub.farmer_user_id)
+            )).scalar_one_or_none()
+            if farmer_row is None:
+                logger.warning(
+                    f"Training sweep: sub {sub.id} has no farmer row, skipping"
+                )
+                continue
+            await _soft_remove_training_sub(
+                db, sub, farmer_row, AssignmentStatus.AUTO_REMOVED,
+            )
+            await _push_training_crop_auto_removed(db, sub)
+            removed += 1
+        except Exception as exc:
+            logger.error(
+                f"Training sweep: soft-remove failed for sub {sub.id}: {exc}"
+            )
+            await db.rollback()
 
-    if to_wind or to_delete:
-        await db.commit()
-        logger.info(
-            f"Training expiry sweep: wound {len(to_wind)}, "
-            f"cascade-deleted {len(to_delete)}"
-        )
-    return len(to_wind), len(to_delete)
+    if removed:
+        logger.info(f"Training expiry sweep: auto-removed {removed} subs")
+    return removed
 
 
-async def _run() -> tuple[int, int]:
+async def _run() -> int:
     async with AsyncSessionLocal() as db:
         return await _run_sweep_with_session(db)
 

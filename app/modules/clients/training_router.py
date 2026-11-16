@@ -48,14 +48,12 @@ from app.modules.platform.models import StatusEnum, User
 router = APIRouter(tags=["Training Sandbox"])
 
 
-# Session length. 12 days per user 2026-07-24; extending is
-# deliberate — CA has to explicitly start a fresh session, they
-# can't drift the clock.
-TRAINING_SESSION_DAYS = 12
-# After training_ends_at, the child sits in WINDING_DOWN for this
-# window so in-flight orders/queries can complete. The expiry
-# sweep (Commit F) hard-deletes anything still standing after this.
-TRAINING_WIND_DOWN_HOURS = 24
+# 2026-11-16 — Session length moved from the Client (session) level
+# to per-training-crop (Subscription.auto_remove_at). The CA now
+# controls Start/Close with no session timer; each training crop
+# auto-removes 12 days after the farmer accepts it. Constants that
+# used to live here (TRAINING_SESSION_DAYS, TRAINING_WIND_DOWN_HOURS)
+# are gone.
 
 
 # ── Role gates ────────────────────────────────────────────────────────────────
@@ -172,15 +170,14 @@ async def _load_parent_client(db: AsyncSession, client_id: str) -> Client:
 
 
 async def _current_training_child(db: AsyncSession, parent_id: str) -> Client | None:
-    """The one training child that's still 'live' — either ACTIVE or
-    WINDING_DOWN. Cleaned-up children are hard-deleted, so a NULL
-    result means the parent has no session in flight and can start
-    a fresh one."""
+    """The parent's live training child, if any. 2026-11-16 — session
+    lifecycle is now binary: the child row exists while the session is
+    ACTIVE; CA's Close cascade-deletes it. NULL return = parent has no
+    session in flight and can start a fresh one."""
     return (await db.execute(
         select(Client).where(
             Client.parent_client_id == parent_id,
             Client.is_training == True,  # noqa: E712
-            Client.training_status.in_(["ACTIVE", "WINDING_DOWN"]),
         ).limit(1)
     )).scalar_one_or_none()
 
@@ -206,8 +203,9 @@ def _serialise_training(child: Client) -> dict:
         "primary_colour": child.primary_colour,
         "logo_url": child.logo_url,
         "training_started_at": child.training_started_at,
-        "training_ends_at": child.training_ends_at,
-        "training_status": child.training_status,
+        # 2026-11-16 — Session is binary now: if the child row exists,
+        # it's open. The `training_ends_at` + `training_status` fields
+        # were dropped (migration t2q7l5n18s4j).
         "training_expert_user_id": child.training_expert_user_id,
         "training_dealer_user_id": child.training_dealer_user_id,
     }
@@ -298,15 +296,18 @@ async def start_training_session(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """CA starts a fresh 12-day training session under this client.
+    """CA starts a fresh training session under this client.
+
+    2026-11-16 — No session-level timer. The session runs until the CA
+    explicitly closes it; each training crop auto-removes 12 days
+    after the farmer accepts the promoter's invite.
 
     Refusals (409):
     - `training_of_training_forbidden` — caller passed a training id.
     - `parent_client_not_active` — parent isn't ACTIVE.
-    - `training_session_already_active` — there's already an
-      ACTIVE/WINDING_DOWN child. The DB partial unique index would
-      raise IntegrityError otherwise; we check first for a clean
-      error message.
+    - `training_session_already_active` — there's already a child.
+      The DB partial unique index would raise IntegrityError otherwise;
+      we check first for a clean error message.
     """
     await _assert_ca(db, current_user, client_id)
     parent = await _load_parent_client(db, client_id)
@@ -319,20 +320,13 @@ async def start_training_session(
                 "code": "training_session_already_active",
                 "message": (
                     "A training session is already in progress for this "
-                    "client. End it first, or wait for it to finish, "
-                    "before starting a new one."
+                    "client. Close it first before starting a new one."
                 ),
                 "current_training_id": existing.id,
-                "training_status": existing.training_status,
-                "training_ends_at": (
-                    existing.training_ends_at.isoformat()
-                    if existing.training_ends_at else None
-                ),
             },
         )
 
     now = datetime.now(timezone.utc)
-    ends_at = now + timedelta(days=TRAINING_SESSION_DAYS)
 
     # display_name: parent's display + " · Training" so the CA and
     # every downstream PWA immediately reads it as a training tile.
@@ -370,15 +364,15 @@ async def start_training_session(
         hidden_from_discovery=True,
         # ACTIVE so downstream endpoints that already filter on
         # status treat the training child as live (Package lookups,
-        # etc.). The training_status field is the training-specific
-        # lifecycle marker.
+        # etc.).
         status=ClientStatus.ACTIVE,
-        # Training-lifecycle fields.
+        # Training-lifecycle fields. 2026-11-16 — No training_ends_at
+        # or training_status: the Client row's existence IS the
+        # session's "ACTIVE" state. CA Close deletes the row; per-crop
+        # timers live on Subscription.auto_remove_at.
         is_training=True,
         parent_client_id=parent.id,
         training_started_at=now,
-        training_ends_at=ends_at,
-        training_status="ACTIVE",
     )
     db.add(child)
     try:
@@ -434,26 +428,19 @@ async def end_training_session(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """CA force-ends the active session — hard close.
+    """CA closes the active session — hard cascade.
 
-    2026-07-25 — Switched from soft-close (WINDING_DOWN + 24h grace)
-    to hard-close per user's team feedback. Soft-close was creating
-    confusion because the `uq_one_active_training_per_parent` DB
-    index covers both ACTIVE and WINDING_DOWN rows, so a CA who
-    ended a session couldn't start a fresh one for ~25h until the
-    hourly sweep cascade-deleted the winding row. Hard-close runs
-    the same cascade helper synchronously so `POST /training/start`
-    is unblocked within seconds of tap.
+    Every subscription, order, query, promoter assignment and any
+    other row under the training child is cleared immediately; the
+    training-child Client row itself is also deleted, so the parent
+    can start a fresh session right after.
 
-    In-flight orders / queries / subscriptions under the training
-    session vanish mid-transaction. That's the deliberate tradeoff
-    the team accepted — training data is throwaway, and the visual
-    friction of soft-close outweighed the value of the 24h grace.
-
-    The 12-day auto-expiry (`app/tasks/training_expiry.py`) still
-    routes ACTIVE → WINDING_DOWN → 24h grace → cascade. Only the
-    user-initiated end path is now synchronous; farmers + promoters
-    keep the grace window when the session times out naturally.
+    2026-11-16 — Session no longer has an auto-close timer. The hourly
+    sweep (`app/tasks/training_expiry.py`) now soft-removes individual
+    training crops on their per-crop 12d clock; the session itself
+    only closes via this endpoint. In-flight orders / queries vanish
+    mid-transaction — the deliberate tradeoff the team accepted since
+    training data is throwaway.
 
     404 if there's no active training session for this client.
     """
@@ -490,18 +477,16 @@ async def list_available_training_clients(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Every ACTIVE training session where the caller has an ACTIVE
+    """Every open training session where the caller has an ACTIVE
     ClientPromoter binding on the PARENT client. Used by the dealer
     / facilitator PWA to render the "Training Session" tile (only
     when this returns non-empty) and to populate the picker on the
     invite-farmer form.
 
     F-P sees at most one training session (they're locked to a
-    single parent per §11.2); D-P may see several.
-
-    WINDING_DOWN sessions are excluded — the invite endpoint
-    refuses them anyway (Commit G training_not_active), so no
-    point showing them in the picker.
+    single parent per §11.2); D-P may see several. 2026-11-16 — No
+    lifecycle-status filter needed: if the training-child row still
+    exists, the session is open (CA Close hard-cascades the row).
     """
     parent_ids = (await db.execute(
         select(ClientPromoter.client_id).where(
@@ -515,7 +500,6 @@ async def list_available_training_clients(
     rows = (await db.execute(
         select(Client, Client.parent_client_id).where(
             Client.is_training == True,  # noqa: E712
-            Client.training_status == "ACTIVE",
             Client.parent_client_id.in_(list(set(parent_ids))),
         )
     )).all()
@@ -614,9 +598,6 @@ async def invite_farmer_to_training(
     Refusals:
     - training_client_not_found  (404) — id doesn't resolve.
     - not_a_training_client      (409) — id is a real client.
-    - training_not_active        (409) — training is WINDING_DOWN
-      or the row's state is invalid. New invites blocked once the
-      12-day clock has passed; in-flight subs can still complete.
     - farmer_not_registered      (404) — phone has no User row.
       Farmer must self-register in the PWA first.
     - not_a_promoter_at_parent   (403) — see helper docstring.
@@ -644,18 +625,6 @@ async def invite_farmer_to_training(
             status_code=409,
             detail={"code": "not_a_training_client",
                     "message": "This client is not a training sandbox."},
-        )
-    if child.training_status != "ACTIVE":
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "training_not_active",
-                "message": (
-                    "This training session is no longer accepting new "
-                    "invitations. It has either ended or is winding down."
-                ),
-                "training_status": child.training_status,
-            },
         )
 
     # Caller must be a real promoter at the PARENT.
