@@ -11341,6 +11341,9 @@ async def _promoted_farmers(db, promoter_user_id: str, lang: str = "en"):
             # list uses this to show a "Remove Training crop" button
             # on these rows; non-training rows don't get the button.
             "is_training": is_training_by_client.get(sub.client_id, False),
+            # 2026-11-16 — Per-training-crop auto-remove clock. NULL on
+            # non-training subs. PWA renders a countdown pill when set.
+            "auto_remove_at": sub.auto_remove_at,
         })
     return out
 
@@ -12600,7 +12603,6 @@ async def _assert_active_dealer(db: AsyncSession, user_id: str) -> None:
         select(Client.id).where(
             Client.training_dealer_user_id == user_id,
             Client.is_training == True,  # noqa: E712
-            Client.training_status == "ACTIVE",
         ).limit(1)
     )).scalar_one_or_none()
     if training_slot is not None:

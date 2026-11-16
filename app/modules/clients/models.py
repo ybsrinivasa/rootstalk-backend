@@ -171,15 +171,16 @@ class Client(Base):
     in_app_orders_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=True,
     )
-    # 2026-07-24 — Training Sandbox V1. When True, this Client is a
+    # 2026-07-24 — Training Sandbox. When True, this Client is a
     # shadow training child of `parent_client_id` — created by the CA
-    # via POST /client/{cid}/training/start, lives for 12 days, then
-    # 24h WINDING_DOWN grace, then hard-cascade-deleted by the hourly
-    # `training_expiry` celery task. Everything under a training
-    # client (Subscriptions, Orders, Queries, PromoterAssignments)
-    # inherits the training marker via `client_id` — no per-entity
-    # flag needed. See project_rootstalk_training_sandbox_2026_07_24.md
-    # (once the memory lands) for the full design.
+    # via POST /client/{cid}/training/start. 2026-11-16 — Session no
+    # longer has an auto-close timer; the CA closes the session
+    # explicitly via /training/end (hard cascade). Individual training
+    # crops auto-remove 12d after the farmer accepts (see
+    # Subscription.auto_remove_at + app/tasks/training_expiry.py).
+    # Everything under a training client (Subscriptions, Orders,
+    # Queries, PromoterAssignments) inherits the training marker via
+    # `client_id` — no per-entity flag needed.
     is_training: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="false", default=False,
     )
@@ -189,15 +190,6 @@ class Client(Base):
     )
     training_started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=True,
-    )
-    training_ends_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=True,
-    )
-    # 'ACTIVE' during the 12-day window, 'WINDING_DOWN' for the 24h
-    # grace after training_ends_at (no new writes, in-flight can
-    # complete), then the row is hard-deleted.
-    training_status: Mapped[str] = mapped_column(
-        String(20), nullable=True,
     )
     # Optional session-scoped role assignments — only meaningful when
     # is_training=True. Cleared implicitly when the training-child row

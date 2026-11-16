@@ -145,11 +145,12 @@ celery_app.conf.beat_schedule = {
         "task": "app.tasks.timeline_archive.archive_expired_timeline_items",
         "schedule": crontab(minute=50),
     },
-    # Training Sandbox V1 (2026-07-24, Commit F): hourly sweep with
-    # two transitions — ACTIVE→WINDING_DOWN at training_ends_at, and
-    # WINDING_DOWN→hard-cascade-delete after another 24h grace.
-    # :55 keeps the training sweeps on the same hourly rhythm as
-    # the other :45/:50 house-keeping tasks without colliding.
+    # Training Sandbox (2026-11-16 rewrite): hourly per-training-crop
+    # soft-remove sweep. Each training Subscription carries its own
+    # `auto_remove_at` stamped at farmer acceptance (farmer_responded_at
+    # + 12d). Session-level timer was removed — CA Start/Close is now
+    # the only session lever. :55 keeps the sweep on the same hourly
+    # rhythm as the other :45/:50 house-keeping tasks.
     "training-expiry-check": {
         "task": "app.tasks.training_expiry.sweep_training_expiry",
         "schedule": crontab(minute=55),

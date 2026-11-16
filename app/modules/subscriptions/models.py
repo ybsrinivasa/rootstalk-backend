@@ -65,6 +65,13 @@ class AssignmentStatus(str, enum.Enum):
     # so audits can reconstruct the full who/why.
     REMOVED_BY_PROMOTER = "REMOVED_BY_PROMOTER"
     REMOVED_BY_FARMER = "REMOVED_BY_FARMER"
+    # 2026-11-16 — Training Sandbox per-sub auto-expiry. The 12-day
+    # clock moved from the Training session (Client.training_ends_at,
+    # dropped in migration t2q7l5n18s4j) to per-crop
+    # (Subscription.auto_remove_at, stamped at farmer acceptance).
+    # When the hourly sweep soft-removes a training sub whose clock
+    # has run out, the paired PromoterAssignment flips to this.
+    AUTO_REMOVED = "AUTO_REMOVED"
 
 
 class AlertType(str, enum.Enum):
@@ -199,6 +206,14 @@ class Subscription(Base):
     )
     deleted_by_user_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True,
+    )
+    # 2026-11-16 — Training Sandbox per-crop auto-expiry. NULL for every
+    # non-training sub; for training subs, stamped at farmer acceptance
+    # as PromoterAssignment.farmer_responded_at + 12 days. The hourly
+    # `sweep_training_expiry` task soft-removes rows whose clock has
+    # expired via `_soft_remove_training_sub(..., AUTO_REMOVED)`.
+    auto_remove_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

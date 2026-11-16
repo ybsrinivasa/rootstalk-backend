@@ -3337,7 +3337,18 @@ async def respond_to_assignment(
         # initiate. Just unblocking advisory delivery via the
         # assignment flip above. subscription_date + reference_number
         # were stamped at initiate time, so nothing to do here.
-        pass
+        # 2026-11-16 — If the sub is under a Training sandbox, stamp
+        # the per-crop auto-remove clock (12d from acceptance). The
+        # hourly `sweep_training_expiry` task soft-removes it when
+        # the clock expires, unless the farmer or promoter removes
+        # it earlier via the explicit Remove buttons.
+        from app.modules.clients.models import Client as _Client
+        _is_training = (await db.execute(
+            select(_Client.is_training).where(_Client.id == sub.client_id)
+        )).scalar()
+        if bool(_is_training):
+            from datetime import timedelta as _td
+            sub.auto_remove_at = now + _td(days=12)
     else:
         # Reject — transition Sub ACTIVE → CANCELLED via BL11. The
         # transition table allows this for the FARMER role.
@@ -5130,6 +5141,12 @@ async def my_subscriptions(
             "client_primary_colour": client.get("client_primary_colour"),
             "client_short_name": client.get("client_short_name"),
             "client_is_training": client.get("client_is_training", False),
+            # 2026-11-16 — Per-training-crop auto-remove clock. NULL on
+            # non-training subs; set on training subs at farmer-accept
+            # time (farmer_responded_at + 12d). PWA renders a
+            # "Training crop auto-removes in N days" countdown on
+            # training rows whose clock is still in the future.
+            "auto_remove_at": s.auto_remove_at,
             # Drives the Ask Expert button + Diagnose-IDK gateway gate
             # on the PWA. False → no PRIMARY pundit is available to
             # receive a query at this client.
