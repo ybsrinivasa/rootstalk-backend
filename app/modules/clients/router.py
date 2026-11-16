@@ -3574,7 +3574,7 @@ async def list_farmer_support_farmers(
     default is 25 per the user's 2026-11-10 call.
     """
     from app.modules.subscriptions.models import (
-        PromoterAssignment, Subscription, SubscriptionStatus,
+        PromoterAssignment, Subscription, SubscriptionStatus, SubscriptionType,
     )
     await _assert_ca_or_rm(db, current_user, client_id)
     if page < 1:
@@ -3649,13 +3649,18 @@ async def list_farmer_support_farmers(
         )
     if origin:
         origin_upper = origin.strip().upper()
-        has_promoter = select(PromoterAssignment.id).where(
-            PromoterAssignment.subscription_id == Subscription.id,
-        ).exists()
+        # 2026-11-16 Bundle B fix — origin is SIGN-UP origin, not
+        # "has any PromoterAssignment attached". The two drifted
+        # apart on 2026-11-14 when the Follow-up Promoter mutation
+        # started creating ACTIVE PromoterAssignment rows on SELF
+        # subs; the old EXISTS check surfaced those SELF subs under
+        # "PROMOTER-assigned only" (reported from staging with the
+        # KKFARMER screenshot). Read subscription_type directly —
+        # that column is set at sub creation and never mutated.
         if origin_upper == "SELF":
-            q = q.where(~has_promoter)
+            q = q.where(Subscription.subscription_type == SubscriptionType.SELF)
         elif origin_upper == "PROMOTER":
-            q = q.where(has_promoter)
+            q = q.where(Subscription.subscription_type == SubscriptionType.ASSIGNED)
         else:
             raise HTTPException(
                 status_code=422, detail="origin must be SELF|PROMOTER.",
@@ -3743,13 +3748,16 @@ async def list_farmer_support_farmers(
                 ).exists()
             )
         if origin:
-            has_promoter = select(PromoterAssignment.id).where(
-                PromoterAssignment.subscription_id == Subscription.id,
-            ).exists()
+            # See base query — origin is sign-up origin
+            # (subscription_type) not EXISTS(PromoterAssignment).
             if origin_upper == "SELF":
-                count_q = count_q.where(~has_promoter)
+                count_q = count_q.where(
+                    Subscription.subscription_type == SubscriptionType.SELF
+                )
             elif origin_upper == "PROMOTER":
-                count_q = count_q.where(has_promoter)
+                count_q = count_q.where(
+                    Subscription.subscription_type == SubscriptionType.ASSIGNED
+                )
         count_rows = (await db.execute(count_q)).all()
         matching_counts = {fid: int(cnt) for fid, cnt in count_rows}
 
@@ -4216,7 +4224,7 @@ async def list_farmer_subscriptions(
     `matches_filter` is null and the CP falls back to active-first.
     """
     from app.modules.subscriptions.models import (
-        PromoterAssignment, Subscription, SubscriptionStatus,
+        PromoterAssignment, Subscription, SubscriptionStatus, SubscriptionType,
     )
     from app.modules.advisory.models import Package
     await _assert_ca_or_rm(db, current_user, client_id)
@@ -4461,11 +4469,17 @@ async def list_farmer_subscriptions(
             assigned = promoter_user_id_by_sub.get(sub.id)
             if assigned != promoter_user_id:
                 return False
+        # 2026-11-16 Bundle B fix — origin is sign-up origin
+        # (subscription_type), not "has any attached promoter". The
+        # Follow-up Promoter mutation (2026-11-14) attaches a
+        # facilitator to SELF subs via PromoterAssignment, so the
+        # old EXISTS-based check surfaced those under PROMOTER-origin
+        # incorrectly. Read subscription_type directly.
         if origin_upper == "SELF":
-            if promoter_user_id_by_sub.get(sub.id) is not None:
+            if sub.subscription_type != SubscriptionType.SELF:
                 return False
         if origin_upper == "PROMOTER":
-            if promoter_user_id_by_sub.get(sub.id) is None:
+            if sub.subscription_type != SubscriptionType.ASSIGNED:
                 return False
         return True
 
