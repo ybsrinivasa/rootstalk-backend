@@ -5628,6 +5628,31 @@ async def set_subscription_alert_receiver(
     # If a farmer notification channel is wanted here later, wire FCM
     # push (farmer.fcm_token) — not SMS — per 2026-11-15 design call.
 
+    # 2026-11-16 — Sync-fire alerts so a mid-stream receiver change
+    # doesn't wait for the 11:30 IST daily beat. Covers two scenarios
+    # user reported: (a) farmer self-subs → no one got the START_DATE
+    # alert → RM assigns a receiver and that receiver needs to know
+    # the farmer has an outstanding start-date entry; (b) old
+    # receiver got the alert but farmer still hasn't entered the
+    # start date → RM reassigns to a new person → new person needs
+    # the START_DATE alert too. Per-recipient idempotency in
+    # `_alert_sent_today` keeps anyone who already has today's row
+    # from being re-notified. INPUT alerts for this sub also get
+    # fired by the same helper for the new receiver (useful mid-
+    # season handoffs — e.g. a day-0 practice window the receiver
+    # would otherwise discover only tomorrow). Non-fatal: alert
+    # fire failures are logged and don't fail the mutation.
+    if new_user_id is not None:
+        try:
+            from app.tasks.alerts import send_alerts_now_for_subscription
+            await send_alerts_now_for_subscription(db, sub.id)
+            await db.commit()
+        except Exception as _exc:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                f"Post-receiver-change alert fire failed for sub {sub.id}: {_exc}"
+            )
+
     return {
         "subscription_id": sub.id,
         "alert_receiver_user_id": new_user_id,
