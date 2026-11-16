@@ -580,6 +580,16 @@ class FarmerCallLog(Base):
     logged_by_user_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False,
     )
+    # 2026-11-16 (Bundle B) — Per-sub attribution. NULL for calls
+    # logged pre-Bundle-B (farmer-level only) and for calls the RM
+    # explicitly logged without picking a sub. The sub-detail page's
+    # "Log a call" button stamps this with the sub being viewed; the
+    # per-farmer call log UI continues to show every row regardless.
+    subscription_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("subscriptions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False,
     )

@@ -3561,7 +3561,9 @@ async def list_farmer_support_farmers(
     One row per farmer (deduped). Each row carries the farmer's
     identity, location, their current / most-recent subscription
     summary (crop, status, start date, promoter name), and a
-    pre-computed 'active_subscription_count'. Alert signals are NOT
+    pre-computed 'matching_subscription_count' (respects the same
+    sub-level filters as the list query — see Bundle B 2026-11-16).
+    Alert signals are NOT
     computed here — the UI calls the per-type alert endpoints
     separately and surfaces them as tiles / badges.
 
@@ -3685,14 +3687,19 @@ async def list_farmer_support_farmers(
             if sub.created_at and prev_sub.created_at and sub.created_at > prev_sub.created_at:
                 by_farmer[user.id] = (sub, user)
 
-    # Second pass: active-subscription count per farmer (visible on
-    # the list row). Separate lightweight query to avoid inflating the
-    # join above with aggregate grouping.
+    # Second pass: matching-subscription count per farmer (visible on
+    # the collapsed list row — "N subs match" chip). 2026-11-16 (Bundle
+    # B) — was `active_subscription_count` which ignored every sub-
+    # level filter (origin / crop / status / date / promoter) and so
+    # showed "3 active" when only 1 matched the current filter. The
+    # new count respects the SAME sub-level predicates applied in the
+    # farmer query above, so the chip always agrees with the inline
+    # sub list the RM sees on expand.
+    from sqlalchemy import func as _func
     farmer_ids = list(by_farmer.keys())
-    active_counts: dict[str, int] = {}
+    matching_counts: dict[str, int] = {}
     if farmer_ids:
-        from sqlalchemy import func as _func
-        count_rows = (await db.execute(
+        count_q = (
             select(
                 Subscription.farmer_user_id,
                 _func.count(Subscription.id),
@@ -3700,11 +3707,51 @@ async def list_farmer_support_farmers(
             .where(
                 Subscription.client_id == client_id,
                 Subscription.farmer_user_id.in_(farmer_ids),
-                Subscription.status == SubscriptionStatus.ACTIVE,
             )
             .group_by(Subscription.farmer_user_id)
-        )).all()
-        active_counts = {fid: int(cnt) for fid, cnt in count_rows}
+        )
+        if state_cosh_id or district_cosh_id or sub_district_cosh_id:
+            # Farmer-side filters don't affect the count (already
+            # scoped by farmer_ids), but we still need to rejoin User
+            # when a crop filter is applied. Skip the join unless
+            # required — avoids an unnecessary row explosion.
+            pass
+        if crop_cosh_id:
+            from app.modules.advisory.models import Package as _P
+            count_q = count_q.join(_P, _P.id == Subscription.package_id).where(
+                _P.crop_cosh_id == crop_cosh_id
+            )
+        if subscription_status:
+            if status_upper == "NOT_STARTED":
+                count_q = count_q.where(
+                    Subscription.status == SubscriptionStatus.ACTIVE,
+                    Subscription.crop_start_date.is_(None),
+                )
+            elif status_upper in ("ACTIVE", "COMPLETED"):
+                count_q = count_q.where(
+                    Subscription.status == SubscriptionStatus(status_upper)
+                )
+        if start_date_from:
+            count_q = count_q.where(Subscription.crop_start_date >= d_from)
+        if start_date_to:
+            count_q = count_q.where(Subscription.crop_start_date <= d_to)
+        if promoter_user_id:
+            count_q = count_q.where(
+                select(PromoterAssignment.id).where(
+                    PromoterAssignment.subscription_id == Subscription.id,
+                    PromoterAssignment.promoter_user_id == promoter_user_id,
+                ).exists()
+            )
+        if origin:
+            has_promoter = select(PromoterAssignment.id).where(
+                PromoterAssignment.subscription_id == Subscription.id,
+            ).exists()
+            if origin_upper == "SELF":
+                count_q = count_q.where(~has_promoter)
+            elif origin_upper == "PROMOTER":
+                count_q = count_q.where(has_promoter)
+        count_rows = (await db.execute(count_q)).all()
+        matching_counts = {fid: int(cnt) for fid, cnt in count_rows}
 
     # Promoter name resolution — one lookup for the set of promoter
     # user_ids appearing on the representative subs.
@@ -3759,7 +3806,7 @@ async def list_farmer_support_farmers(
                 if hasattr(sub.crop_start_date, "date")
                 else (sub.crop_start_date.isoformat() if sub.crop_start_date else None)
             ),
-            "active_subscription_count": active_counts.get(user.id, 0),
+            "matching_subscription_count": matching_counts.get(user.id, 0),
             "promoter_name": promoter_name_by_sub.get(sub.id),
         })
 
@@ -4477,6 +4524,13 @@ async def list_farmer_subscriptions(
             "crop_start_date": _date_iso(sub.crop_start_date),
             "created_at": sub.created_at.isoformat() if sub.created_at else None,
             "promoter_name": promoter_name_by_sub.get(sub.id),
+            # 2026-11-16 (Bundle B) — Training Sandbox per-crop
+            # auto-remove clock. NULL on non-training subs; set at
+            # farmer-accept on training subs. CP surfaces an amber
+            # "auto-removes in N days" chip on the sub row.
+            "auto_remove_at": (
+                sub.auto_remove_at.isoformat() if sub.auto_remove_at else None
+            ),
             "farm_area_acres": (
                 float(sub.farm_area_acres) if sub.farm_area_acres else None
             ),
@@ -6348,6 +6402,10 @@ async def _assert_rm_for_call_logging(
 class CallLogCreate(BaseModel):
     call_type: str                     # OUTBOUND | INBOUND
     call_at: Optional[str] = None      # ISO datetime; defaults to now()
+    # 2026-11-16 (Bundle B) — Optional per-sub attribution. When
+    # provided, must belong to this farmer+client (422 otherwise).
+    # The sub-detail page always sends it; other call sites may omit.
+    subscription_id: Optional[str] = None
 
 
 @router.get("/client/{client_id}/farmer-support/farmers/{farmer_user_id}/call-log")
@@ -6358,8 +6416,12 @@ async def list_farmer_call_log(
     current_user: User = Depends(get_current_user),
 ):
     """Chronological list of calls (most recent first) for one farmer.
-    Returns every entry with the logging RM's name resolved so the
-    panel renders standalone."""
+
+    2026-11-16 (Bundle B) — always returns the farmer's FULL history
+    (no server-side sub filter) and emits `subscription_id` on each
+    row. The sub-detail page shows all entries so pre-Bundle-B rows
+    (which carry no sub id) remain visible everywhere; the UI can
+    style sub-matching rows differently if it wants to."""
     from app.modules.clients.models import FarmerCallLog
     await _assert_ca_or_rm(db, current_user, client_id)
     await _assert_farmer_belongs_to_client(db, client_id, farmer_user_id)
@@ -6396,6 +6458,7 @@ async def list_farmer_call_log(
             "call_at": r.call_at.isoformat() if r.call_at else None,
             "logged_by_user_id": r.logged_by_user_id,
             "logged_by_name": name_by_id.get(r.logged_by_user_id),
+            "subscription_id": r.subscription_id,
             "created_at": r.created_at.isoformat() if r.created_at else None,
         })
     return {
@@ -6447,12 +6510,39 @@ async def create_farmer_call_log(
     else:
         call_at = datetime.now(timezone.utc)
 
+    # 2026-11-16 (Bundle B) — validate subscription_id if provided:
+    # the sub must exist, belong to this farmer, AND to this client
+    # (anti-URL-forgery). Without the farmer+client gates the RM
+    # could stamp a call against any sub by id.
+    subscription_id: Optional[str] = (body.subscription_id or "").strip() or None
+    if subscription_id is not None:
+        from app.modules.subscriptions.models import Subscription
+        owned = (await db.execute(
+            select(Subscription.id).where(
+                Subscription.id == subscription_id,
+                Subscription.client_id == client_id,
+                Subscription.farmer_user_id == farmer_user_id,
+            ).limit(1)
+        )).scalar_one_or_none()
+        if owned is None:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "subscription_not_in_scope",
+                    "message": (
+                        "The subscription_id does not belong to this "
+                        "farmer at this client."
+                    ),
+                },
+            )
+
     row = FarmerCallLog(
         client_id=client_id,
         farmer_user_id=farmer_user_id,
         call_type=CallType(ct_raw),
         call_at=call_at,
         logged_by_user_id=current_user.id,
+        subscription_id=subscription_id,
     )
     db.add(row)
     await db.commit()
@@ -6463,6 +6553,7 @@ async def create_farmer_call_log(
         "call_at": row.call_at.isoformat(),
         "logged_by_user_id": row.logged_by_user_id,
         "logged_by_name": current_user.name,
+        "subscription_id": row.subscription_id,
         "created_at": row.created_at.isoformat() if row.created_at else None,
     }
 
