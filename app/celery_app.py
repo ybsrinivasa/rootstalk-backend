@@ -50,6 +50,7 @@ celery_app = Celery(
         "app.tasks.coaching_expiry",
         "app.tasks.coaching_feedback_reminders",
         "app.tasks.credit_reminders",
+        "app.tasks.pundit_exclusivity_expiry",
     ],
 )
 
@@ -162,6 +163,15 @@ celery_app.conf.beat_schedule = {
     "promoter-stepdown-expiry-check": {
         "task": "app.tasks.promoter_stepdown_expiry.sweep_stepdown_requests",
         "schedule": crontab(minute=40),
+    },
+    # Pundit Exclusivity (2026-11-17): hourly auto-approve of
+    # Pundit end-requests past the 7-day window so a ghosted CA
+    # can't lock the Pundit in indefinitely. Mirrors the promoter-
+    # stepdown pattern. :35 lands between stepdown and training
+    # sweeps to spread the minute load.
+    "pundit-exclusivity-expiry-check": {
+        "task": "app.tasks.pundit_exclusivity_expiry.auto_approve_end_requests",
+        "schedule": crontab(minute=35),
     },
     # Coaching Sandbox (2026-09-01): hourly sweep that flips ACTIVE
     # coaching sessions past 30 days from started_at to CLOSED_AUTO.

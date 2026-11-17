@@ -654,6 +654,37 @@ async def accept_invitation(
     current_user: User = Depends(get_current_user),
 ):
     inv = await _get_invitation(db, invitation_id)
+
+    # 2026-11-17 — Pundit Exclusivity gate. If this Pundit already has
+    # an ACTIVE exclusivity agreement with a DIFFERENT client, refuse
+    # new ClientFarmPundit creation at the inviting client. Existing
+    # relationships are frozen in place; new onboardings are blocked.
+    # Pundit must end the exclusivity agreement first (via /request-end
+    # and wait for CA approval or the 7-day auto-approve) before
+    # accepting other clients' invitations.
+    from app.modules.farmpundit.models import (
+        PunditExclusivityAgreement, PunditExclusivityStatus,
+    )
+    active_excl = (await db.execute(
+        select(PunditExclusivityAgreement).where(
+            PunditExclusivityAgreement.pundit_profile_id == inv.pundit_id,
+            PunditExclusivityAgreement.status == PunditExclusivityStatus.ACTIVE,
+        )
+    )).scalar_one_or_none()
+    if active_excl is not None and active_excl.client_id != inv.client_id:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "pundit_exclusively_committed",
+                "message": (
+                    "You're currently exclusive with another client. "
+                    "End that agreement first before accepting another "
+                    "company's invitation."
+                ),
+                "exclusive_with_client_id": active_excl.client_id,
+            },
+        )
+
     inv.status = "ACCEPTED"
 
     sequence = await _next_round_robin_sequence(db, inv.client_id)
@@ -2126,6 +2157,19 @@ async def search_pundits(
     """
     await _assert_portal_member(db, current_user.id, client_id)
 
+    # 2026-11-17 — Pundit Exclusivity filter. Exclude any Pundit who
+    # has an ACTIVE exclusivity agreement with a DIFFERENT client so
+    # a CA at client B can't even see Pundits locked to client A.
+    # Partial index `uq_pundit_exclusivity_one_active` keeps this
+    # subquery tiny. Deferred import avoids a circular dependency.
+    from app.modules.farmpundit.models import (
+        PunditExclusivityAgreement, PunditExclusivityStatus,
+    )
+    _exclusive_elsewhere = select(PunditExclusivityAgreement.pundit_profile_id).where(
+        PunditExclusivityAgreement.status == PunditExclusivityStatus.ACTIVE,
+        PunditExclusivityAgreement.client_id != client_id,
+    )
+
     if phone:
         # Independent quick-lookup path. Every other filter is ignored.
         phone_user_ids = {
@@ -2140,10 +2184,14 @@ async def search_pundits(
                 select(FarmPunditProfile).where(
                     FarmPunditProfile.declaration_accepted == True,  # noqa: E712
                     FarmPunditProfile.user_id.in_(phone_user_ids),
+                    FarmPunditProfile.id.notin_(_exclusive_elsewhere),
                 )
             )).scalars().all()
     else:
-        q = select(FarmPunditProfile).where(FarmPunditProfile.declaration_accepted == True)  # noqa: E712
+        q = select(FarmPunditProfile).where(
+            FarmPunditProfile.declaration_accepted == True,  # noqa: E712
+            FarmPunditProfile.id.notin_(_exclusive_elsewhere),
+        )
         if education_cosh_id:
             q = q.where(FarmPunditProfile.education_cosh_id == education_cosh_id)
         if experience_cosh_id:
@@ -4024,3 +4072,534 @@ async def _trigger_qa_for_query(
         # "Please check with the farmer" and the volume estimate skips.
         affected_plants_count=query.affected_plants_count,
     ))
+
+
+# ── Pundit Exclusivity (2026-11-17) ──────────────────────────────────────────
+#
+# Six endpoints implementing the CA↔Pundit exclusivity opt-in flow.
+# See `PunditExclusivityAgreement` model docstring for the status
+# transitions + why. Scope rules settled with user 2026-11-17:
+#   - PRIMARY + PANEL eligible; PROMOTER_PUNDIT excluded (already
+#     one-client-locked by its own design)
+#   - Freeze semantics on accept — existing ClientFarmPundit rows at
+#     other clients stay ACTIVE + searchable within those clients;
+#     only CA-portal search / new-onboarding is filtered
+#   - Single-client exclusivity enforced by partial unique index
+#   - Pundit-end-request has a 7-day auto-approve escape valve so a
+#     ghosted CA can't lock the Pundit in indefinitely
+
+from app.modules.farmpundit.models import (  # noqa: E402
+    PunditExclusivityAgreement, PunditExclusivityStatus,
+)
+
+PUNDIT_END_REQUEST_AUTO_APPROVE_DAYS = 7
+
+
+async def _assert_pundit_self(
+    db: AsyncSession, user_id: str,
+) -> "FarmPunditProfile":
+    """Return the FarmPunditProfile for the authenticated user, 403
+    otherwise. Pundit-side endpoints that don't take a client_id use
+    this instead of _assert_portal_member."""
+    profile = (await db.execute(
+        select(FarmPunditProfile).where(FarmPunditProfile.user_id == user_id)
+    )).scalar_one_or_none()
+    if profile is None:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "pundit_profile_required",
+                "message": (
+                    "Only registered FarmPundits can access the "
+                    "exclusivity endpoints."
+                ),
+            },
+        )
+    return profile
+
+
+def _serialise_agreement(a: PunditExclusivityAgreement) -> dict:
+    return {
+        "id": a.id,
+        "pundit_profile_id": a.pundit_profile_id,
+        "client_id": a.client_id,
+        "status": a.status,
+        "requested_at": a.requested_at.isoformat() if a.requested_at else None,
+        "responded_at": a.responded_at.isoformat() if a.responded_at else None,
+        "ended_at": a.ended_at.isoformat() if a.ended_at else None,
+        "requested_by_user_id": a.requested_by_user_id,
+        "responded_by_user_id": a.responded_by_user_id,
+        "ended_by_user_id": a.ended_by_user_id,
+        "end_reason": a.end_reason,
+        "pundit_end_requested_at": (
+            a.pundit_end_requested_at.isoformat()
+            if a.pundit_end_requested_at else None
+        ),
+    }
+
+
+# 1 — CA fires exclusivity request on a Pundit at this client.
+@router.post(
+    "/client/{client_id}/pundits/{cp_id}/request-exclusivity",
+    status_code=201,
+)
+async def request_exclusivity(
+    client_id: str,
+    cp_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Create a PENDING_PUNDIT_APPROVAL exclusivity request on behalf
+    of this client's CA. Pundit decides via their PWA.
+
+    Refusals:
+    - 404 `pundit_not_at_client` — cp_id doesn't resolve at this client.
+    - 422 `pundit_role_ineligible` — Promoter-Pundits are already
+      one-client-locked; only PRIMARY/PANEL eligible.
+    - 409 `pundit_already_exclusive_elsewhere` — Pundit has an ACTIVE
+      agreement with a different client already (single-exclusivity).
+    - 409 `pundit_already_exclusive_with_us` — same client already has
+      an ACTIVE agreement.
+    - 409 `request_already_pending` — a PENDING request from THIS
+      client already exists.
+    """
+    await _assert_portal_member(db, current_user.id, client_id)
+    cp = (await db.execute(
+        select(ClientFarmPundit).where(
+            ClientFarmPundit.id == cp_id,
+            ClientFarmPundit.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if cp is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "pundit_not_at_client",
+                "message": "That Pundit isn't onboarded at this client.",
+            },
+        )
+    if cp.role == PunditRole.PROMOTER_PUNDIT:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "pundit_role_ineligible",
+                "message": (
+                    "Promoter-Pundits are already one-client-locked "
+                    "by role. Exclusivity is for Primary and Panel "
+                    "Experts only."
+                ),
+            },
+        )
+    # Any ACTIVE agreement anywhere?
+    active_elsewhere = (await db.execute(
+        select(PunditExclusivityAgreement).where(
+            PunditExclusivityAgreement.pundit_profile_id == cp.pundit_id,
+            PunditExclusivityAgreement.status == PunditExclusivityStatus.ACTIVE,
+        )
+    )).scalar_one_or_none()
+    if active_elsewhere is not None:
+        if active_elsewhere.client_id == client_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "pundit_already_exclusive_with_us",
+                    "message": (
+                        "This Pundit is already exclusive with your "
+                        "client. End the existing agreement first to "
+                        "start a new one."
+                    ),
+                    "agreement_id": active_elsewhere.id,
+                },
+            )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "pundit_already_exclusive_elsewhere",
+                "message": (
+                    "This Pundit is currently exclusive with another "
+                    "client. They can only hold one exclusivity "
+                    "agreement at a time."
+                ),
+            },
+        )
+    # Any PENDING request from this client already?
+    existing_pending = (await db.execute(
+        select(PunditExclusivityAgreement).where(
+            PunditExclusivityAgreement.pundit_profile_id == cp.pundit_id,
+            PunditExclusivityAgreement.client_id == client_id,
+            PunditExclusivityAgreement.status
+                == PunditExclusivityStatus.PENDING_PUNDIT_APPROVAL,
+        )
+    )).scalar_one_or_none()
+    if existing_pending is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "request_already_pending",
+                "message": (
+                    "An exclusivity request is already pending with "
+                    "this Pundit. Wait for their response or withdraw "
+                    "the existing request."
+                ),
+                "agreement_id": existing_pending.id,
+            },
+        )
+
+    now = datetime.now(timezone.utc)
+    ag = PunditExclusivityAgreement(
+        pundit_profile_id=cp.pundit_id,
+        client_id=client_id,
+        status=PunditExclusivityStatus.PENDING_PUNDIT_APPROVAL,
+        requested_at=now,
+        requested_by_user_id=current_user.id,
+    )
+    db.add(ag)
+    await db.commit()
+    await db.refresh(ag)
+    return _serialise_agreement(ag)
+
+
+# 2 — Pundit lists their exclusivity requests (pending + current ACTIVE).
+@router.get("/pundit/me/exclusivity-requests")
+async def list_my_exclusivity_requests(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return every PENDING + ACTIVE exclusivity-agreement row for this
+    Pundit. PWA home-screen uses this to render the "Exclusivity
+    request from X" card AND the "Current exclusivity" status chip.
+    Terminal (DECLINED / ENDED_*) rows are excluded — they're audit
+    history, not actionable."""
+    profile = await _assert_pundit_self(db, current_user.id)
+    rows = (await db.execute(
+        select(PunditExclusivityAgreement).where(
+            PunditExclusivityAgreement.pundit_profile_id == profile.id,
+            PunditExclusivityAgreement.status.in_([
+                PunditExclusivityStatus.PENDING_PUNDIT_APPROVAL,
+                PunditExclusivityStatus.ACTIVE,
+            ]),
+        ).order_by(PunditExclusivityAgreement.requested_at.desc())
+    )).scalars().all()
+
+    # Resolve client names for display.
+    from app.modules.clients.models import Client as _Client
+    client_ids = {r.client_id for r in rows}
+    name_by_id: dict[str, str | None] = {}
+    if client_ids:
+        crows = (await db.execute(
+            select(_Client.id, _Client.display_name, _Client.full_name)
+            .where(_Client.id.in_(client_ids))
+        )).all()
+        name_by_id = {
+            cid: (disp or full) for cid, disp, full in crows
+        }
+
+    out = []
+    for r in rows:
+        payload = _serialise_agreement(r)
+        payload["client_name"] = name_by_id.get(r.client_id)
+        out.append(payload)
+    return out
+
+
+# 3 — Pundit accepts or declines a PENDING request.
+class ExclusivityRespondBody(BaseModel):
+    accept: bool
+    reason: Optional[str] = None  # optional on decline; ignored on accept
+
+
+@router.post("/pundit/me/exclusivity-requests/{agreement_id}/respond")
+async def respond_to_exclusivity_request(
+    agreement_id: str,
+    body: ExclusivityRespondBody,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Accept → status flips ACTIVE; Decline → DECLINED_BY_PUNDIT.
+
+    Refusals:
+    - 404 `agreement_not_found` — id doesn't resolve or doesn't belong
+      to this Pundit.
+    - 422 `agreement_not_pending` — already resolved; idempotent refusal.
+    - 409 `pundit_already_exclusive_elsewhere` — someone else's
+      agreement went ACTIVE between the request-time check + now (race
+      against the partial unique index).
+    """
+    profile = await _assert_pundit_self(db, current_user.id)
+    ag = (await db.execute(
+        select(PunditExclusivityAgreement).where(
+            PunditExclusivityAgreement.id == agreement_id,
+            PunditExclusivityAgreement.pundit_profile_id == profile.id,
+        )
+    )).scalar_one_or_none()
+    if ag is None:
+        raise HTTPException(
+            status_code=404, detail={"code": "agreement_not_found"},
+        )
+    if ag.status != PunditExclusivityStatus.PENDING_PUNDIT_APPROVAL:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "agreement_not_pending",
+                "message": (
+                    f"This request is already {ag.status}. You can "
+                    f"only respond to PENDING requests."
+                ),
+            },
+        )
+
+    now = datetime.now(timezone.utc)
+    ag.responded_at = now
+    ag.responded_by_user_id = current_user.id
+    if body.accept:
+        # Defensive race check — the partial unique index is the
+        # ultimate enforcer, but we want a friendly 409 instead of an
+        # IntegrityError leak.
+        active_elsewhere = (await db.execute(
+            select(PunditExclusivityAgreement).where(
+                PunditExclusivityAgreement.pundit_profile_id == profile.id,
+                PunditExclusivityAgreement.status
+                    == PunditExclusivityStatus.ACTIVE,
+            )
+        )).scalar_one_or_none()
+        if active_elsewhere is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "pundit_already_exclusive_elsewhere",
+                    "message": (
+                        "You already have an active exclusivity "
+                        "agreement with another client. Only one "
+                        "exclusivity is permitted at a time."
+                    ),
+                },
+            )
+        ag.status = PunditExclusivityStatus.ACTIVE
+    else:
+        ag.status = PunditExclusivityStatus.DECLINED_BY_PUNDIT
+        if body.reason:
+            ag.end_reason = body.reason.strip()[:1000]
+
+    await db.commit()
+    await db.refresh(ag)
+    return _serialise_agreement(ag)
+
+
+# 4 — CA ends an ACTIVE agreement unilaterally.
+class ExclusivityEndBody(BaseModel):
+    reason: Optional[str] = None
+
+
+@router.delete("/client/{client_id}/pundit-exclusivities/{agreement_id}")
+async def end_exclusivity_as_ca(
+    client_id: str,
+    agreement_id: str,
+    body: ExclusivityEndBody,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Client releases the Pundit from exclusivity. Status → ENDED_BY_CLIENT.
+
+    Also usable to withdraw a PENDING request (never-accepted → ended
+    with the same reason code for audit cleanliness).
+    """
+    await _assert_portal_member(db, current_user.id, client_id)
+    ag = (await db.execute(
+        select(PunditExclusivityAgreement).where(
+            PunditExclusivityAgreement.id == agreement_id,
+            PunditExclusivityAgreement.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if ag is None:
+        raise HTTPException(
+            status_code=404, detail={"code": "agreement_not_found"},
+        )
+    if ag.status not in (
+        PunditExclusivityStatus.ACTIVE,
+        PunditExclusivityStatus.PENDING_PUNDIT_APPROVAL,
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "agreement_not_endable",
+                "message": (
+                    f"This agreement is {ag.status}. Only ACTIVE or "
+                    f"PENDING agreements can be ended."
+                ),
+            },
+        )
+    now = datetime.now(timezone.utc)
+    ag.ended_at = now
+    ag.ended_by_user_id = current_user.id
+    ag.status = PunditExclusivityStatus.ENDED_BY_CLIENT
+    if body.reason:
+        ag.end_reason = body.reason.strip()[:1000]
+    await db.commit()
+    await db.refresh(ag)
+    return _serialise_agreement(ag)
+
+
+# 5 — Pundit asks CA to let them out of an ACTIVE agreement.
+@router.post("/pundit/me/exclusivity/{agreement_id}/request-end")
+async def request_end_as_pundit(
+    agreement_id: str,
+    body: ExclusivityEndBody,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Pundit writes `pundit_end_requested_at`. CA has 7 days to
+    approve via /approve-end-request; the daily celery task auto-
+    approves after that so the Pundit isn't stuck indefinitely.
+
+    Refusals:
+    - 404 `agreement_not_found` — id doesn't resolve for this Pundit.
+    - 422 `agreement_not_active` — only ACTIVE agreements accept
+      end-requests.
+    - 409 `end_already_requested` — this Pundit already sent an
+      end-request; wait for the CA or the auto-approve window.
+    """
+    profile = await _assert_pundit_self(db, current_user.id)
+    ag = (await db.execute(
+        select(PunditExclusivityAgreement).where(
+            PunditExclusivityAgreement.id == agreement_id,
+            PunditExclusivityAgreement.pundit_profile_id == profile.id,
+        )
+    )).scalar_one_or_none()
+    if ag is None:
+        raise HTTPException(
+            status_code=404, detail={"code": "agreement_not_found"},
+        )
+    if ag.status != PunditExclusivityStatus.ACTIVE:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "agreement_not_active",
+                "message": "Only an ACTIVE agreement can be ended.",
+            },
+        )
+    if ag.pundit_end_requested_at is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "end_already_requested",
+                "message": (
+                    "You've already requested to end this agreement. "
+                    "The client has 7 days from that request to respond; "
+                    "after that your exclusivity auto-ends."
+                ),
+                "pundit_end_requested_at": ag.pundit_end_requested_at.isoformat(),
+            },
+        )
+    ag.pundit_end_requested_at = datetime.now(timezone.utc)
+    if body.reason:
+        ag.end_reason = body.reason.strip()[:1000]
+    await db.commit()
+    await db.refresh(ag)
+    return _serialise_agreement(ag)
+
+
+# 6 — CA approves a Pundit's end-request.
+@router.post(
+    "/client/{client_id}/pundit-exclusivities/{agreement_id}/approve-end-request"
+)
+async def approve_end_request_as_ca(
+    client_id: str,
+    agreement_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Approve a pending Pundit end-request → status flips to
+    ENDED_BY_PUNDIT_REQUEST."""
+    await _assert_portal_member(db, current_user.id, client_id)
+    ag = (await db.execute(
+        select(PunditExclusivityAgreement).where(
+            PunditExclusivityAgreement.id == agreement_id,
+            PunditExclusivityAgreement.client_id == client_id,
+        )
+    )).scalar_one_or_none()
+    if ag is None:
+        raise HTTPException(
+            status_code=404, detail={"code": "agreement_not_found"},
+        )
+    if ag.status != PunditExclusivityStatus.ACTIVE:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "agreement_not_active",
+                "message": "Only an ACTIVE agreement can be ended.",
+            },
+        )
+    if ag.pundit_end_requested_at is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "no_end_request_pending",
+                "message": (
+                    "There is no end-request from the Pundit on this "
+                    "agreement. Use DELETE /pundit-exclusivities/{id} "
+                    "to end it unilaterally instead."
+                ),
+            },
+        )
+    now = datetime.now(timezone.utc)
+    ag.ended_at = now
+    ag.ended_by_user_id = current_user.id
+    ag.status = PunditExclusivityStatus.ENDED_BY_PUNDIT_REQUEST
+    await db.commit()
+    await db.refresh(ag)
+    return _serialise_agreement(ag)
+
+
+# 7 — CA lists all exclusivity agreements for this client (admin view).
+@router.get("/client/{client_id}/pundit-exclusivities")
+async def list_client_exclusivities(
+    client_id: str,
+    include_terminal: bool = False,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Returns the client's PENDING + ACTIVE exclusivity rows by
+    default. `include_terminal=true` returns DECLINED + ENDED_* too
+    (audit history view). Pundit names resolved via FarmPunditProfile
+    → User."""
+    await _assert_portal_member(db, current_user.id, client_id)
+    q = select(PunditExclusivityAgreement).where(
+        PunditExclusivityAgreement.client_id == client_id,
+    )
+    if not include_terminal:
+        q = q.where(PunditExclusivityAgreement.status.in_([
+            PunditExclusivityStatus.PENDING_PUNDIT_APPROVAL,
+            PunditExclusivityStatus.ACTIVE,
+        ]))
+    rows = (await db.execute(
+        q.order_by(PunditExclusivityAgreement.requested_at.desc())
+    )).scalars().all()
+
+    if not rows:
+        return []
+
+    # Pundit names.
+    profile_ids = {r.pundit_profile_id for r in rows}
+    name_by_profile: dict[str, dict] = {}
+    if profile_ids:
+        prows = (await db.execute(
+            select(FarmPunditProfile, User)
+            .join(User, User.id == FarmPunditProfile.user_id)
+            .where(FarmPunditProfile.id.in_(profile_ids))
+        )).all()
+        for profile, user in prows:
+            name_by_profile[profile.id] = {
+                "name": user.name, "phone": user.phone,
+            }
+
+    out = []
+    for r in rows:
+        payload = _serialise_agreement(r)
+        payload["pundit_name"] = (
+            name_by_profile.get(r.pundit_profile_id, {}).get("name")
+        )
+        payload["pundit_phone"] = (
+            name_by_profile.get(r.pundit_profile_id, {}).get("phone")
+        )
+        out.append(payload)
+    return out
