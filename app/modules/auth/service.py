@@ -191,9 +191,19 @@ async def start_new_session(db: AsyncSession, user: User) -> str:
 # ── User lookups ───────────────────────────────────────────────────────────────
 
 async def get_user_by_phone(db: AsyncSession, phone: str) -> Optional[User]:
-    """Find user by phone. Excludes accounts whose 30-day grace period has fully expired
-    (so a re-used phone after full deletion looks 'not found' and creates a fresh user)."""
-    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+    """Find user by phone. Excludes accounts whose grace deletion
+    period has fully expired (so a re-used phone after full deletion
+    looks 'not found' and creates a fresh user).
+
+    2026-11-17 — Grace window is now configurable via
+    `settings.account_deletion_grace_days` (default 30; staging sets
+    it to 0 so a deleted account is immediately unreachable and the
+    same phone can register a fresh account same-session)."""
+    from app.config import settings as _settings
+    cutoff = (
+        datetime.now(timezone.utc)
+        - timedelta(days=_settings.account_deletion_grace_days)
+    )
     result = await db.execute(
         select(User).options(selectinload(User.roles)).where(
             User.phone == phone,

@@ -456,7 +456,15 @@ async def confirm_delete_account(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Verify OTP and soft-delete the account. Active subscriptions cancelled. Data retained 30 days."""
+    """Verify OTP and soft-delete the account. Active subscriptions
+    cancelled. Data retained for `settings.account_deletion_grace_days`
+    (default 30 in production; 0 in staging). On staging the row is
+    anonymised synchronously in the same request — the farmer's phone
+    is immediately available to register a fresh account, matching
+    the post-grace prod behaviour but without the 30-day wait."""
+    from app.config import settings as _settings
+    from app.modules.subscriptions.models import Subscription, SubscriptionStatus
+
     otp_code = (data.get("otp_code") or "").strip()
     if not otp_code:
         raise HTTPException(status_code=422, detail="OTP required")
@@ -467,13 +475,16 @@ async def confirm_delete_account(
     if not valid:
         raise HTTPException(status_code=401, detail="Invalid or expired OTP")
 
-    # Soft delete: mark deleted_at — actual anonymisation happens after 30 days
-    # via the daily Celery task. Within 30 days, signing in restores the account.
-    from app.modules.subscriptions.models import Subscription, SubscriptionStatus
-
+    # Soft delete: mark deleted_at. On prod (grace > 0) the row stays
+    # restorable by signing in within the window; the daily task
+    # anonymises after grace. On staging (grace == 0) we scrub
+    # synchronously below so the full "post-grace" state is testable
+    # in one session.
+    grace_days = _settings.account_deletion_grace_days
     current_user.deleted_at = datetime.now(timezone.utc)
 
-    # Cancel active subscriptions immediately
+    # Cancel active subscriptions immediately — same intent in both
+    # modes ("stop my advisory NOW").
     subs = (await db.execute(
         select(Subscription).where(
             Subscription.farmer_user_id == current_user.id,
@@ -483,11 +494,27 @@ async def confirm_delete_account(
     for sub in subs:
         sub.status = SubscriptionStatus.CANCELLED
 
-    # Invalidate current session — any open device gets logged out
+    # Invalidate current session — any open device gets logged out.
     current_user.current_session_id = None
 
+    # 2026-11-17 — Staging-only synchronous anonymise. Uses the same
+    # scrub shape as the daily task so prod and staging converge on
+    # identical post-grace state. Guarded by grace_days == 0 so prod
+    # paths are literally unchanged.
+    if grace_days == 0:
+        from app.tasks.account_deletion import anonymise_user_row
+        anonymise_user_row(current_user)
+
     await db.commit()
-    return {"detail": "Account scheduled for deletion. You can restore it by signing in within 30 days."}
+
+    if grace_days == 0:
+        msg = "Account deleted immediately. Your phone is now free to register a fresh account."
+    else:
+        msg = (
+            f"Account scheduled for deletion. You can restore it by signing in "
+            f"within {grace_days} days."
+        )
+    return {"detail": msg}
 
 
 # ── Self-claim a PWA ecosystem role ────────────────────────────────────────────
