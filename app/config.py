@@ -104,6 +104,16 @@ class Settings(BaseSettings):
     sa_email: str
     sa_password: str
 
+    # Account deletion grace window (days). Production defaults to 30
+    # — the farmer has that long to change their mind and get their
+    # account restored by signing back in with the same phone number.
+    # Staging sets this to 0 via ACCOUNT_DELETION_GRACE_DAYS=0 so a
+    # tester can walk through the full "deleted then start fresh"
+    # flow in one session instead of waiting a month. With grace=0,
+    # the delete endpoint anonymises synchronously and the farmer's
+    # phone is immediately available for a new registration.
+    account_deletion_grace_days: int = 30
+
     # CORS
     allowed_origins: str = "http://localhost:3000"
 
