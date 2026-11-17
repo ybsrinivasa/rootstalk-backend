@@ -740,6 +740,12 @@ async def invite_farmer_to_training(
         client_id=training_client_id,
         package_id=request.package_id,
         promoter_user_id=current_user.id,
+        # 2026-11-17 — Same immutable-signup pattern as the real
+        # /promoter/assignments/initiate flow. Training subs get
+        # cascade-deleted on session close so attribution matters
+        # less here, but keeping shape parity avoids bugs if the
+        # follow-up mutation is ever exercised on a training sub.
+        signup_promoter_user_id=current_user.id,
         subscription_type=SubscriptionType.ASSIGNED,
         status=SubscriptionStatus.ACTIVE,
         subscription_date=now,

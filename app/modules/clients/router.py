@@ -4303,6 +4303,21 @@ async def list_farmer_subscriptions(
         promoter_name_by_sub.setdefault(sid, pname)
         promoter_user_id_by_sub.setdefault(sid, puid)
 
+    # 2026-11-17 — Immutable signup attribution. Independent of the
+    # ACTIVE PromoterAssignment lookup above (which tracks the current
+    # effective promoter — follow-up for ASSIGNED subs where the
+    # original has left). The signup attribution is read straight from
+    # Subscription.signup_promoter_user_id → User.name batched below.
+    signup_puids: set[str] = {
+        s.signup_promoter_user_id for s, _ in rows if s.signup_promoter_user_id
+    }
+    signup_name_by_uid: dict[str, str | None] = {}
+    if signup_puids:
+        sg_rows = (await db.execute(
+            select(User.id, User.name).where(User.id.in_(signup_puids))
+        )).all()
+        signup_name_by_uid = {uid: nm for uid, nm in sg_rows}
+
     # Crop name resolution.
     lang = current_user.language_code or "en"
     from app.services.i18n_cosh import resolve_names_by_cosh_id
@@ -4538,6 +4553,17 @@ async def list_farmer_subscriptions(
             "crop_start_date": _date_iso(sub.crop_start_date),
             "created_at": sub.created_at.isoformat() if sub.created_at else None,
             "promoter_name": promoter_name_by_sub.get(sub.id),
+            # 2026-11-17 — Immutable signup attribution. Equal to
+            # promoter_name on untouched ASSIGNED subs; diverges once
+            # the RM reassigns via Follow-up Promoter (so the CP can
+            # label "Signup: X" alongside "Follow-up: Y"). NULL on
+            # SELF subs (no signup promoter) and on backfilled rows
+            # where the original user no longer exists.
+            "signup_promoter_user_id": sub.signup_promoter_user_id,
+            "signup_promoter_name": (
+                signup_name_by_uid.get(sub.signup_promoter_user_id)
+                if sub.signup_promoter_user_id else None
+            ),
             # 2026-11-16 (Bundle B) — Training Sandbox per-crop
             # auto-remove clock. NULL on non-training subs; set at
             # farmer-accept on training subs. CP surfaces an amber
@@ -4556,11 +4582,14 @@ async def list_farmer_subscriptions(
             "unanswered_queries_count": int(query_count_by_sub.get(sub.id, 0)),
             "alert_receiver": alert_receiver,
             "promoter_pundit": pp,
-            # 2026-11-14 pt7 — Follow-up Promoter (v3 mutation). Only
-            # populated for SELF subs with a promoter_user_id set —
-            # i.e. the RM has delegated a facilitator-promoter. For
-            # ASSIGNED subs, the promoter is the signup promoter, not
-            # a follow-up delegation; this field stays null there.
+            # 2026-11-14 pt7 — Follow-up Promoter (v3 mutation).
+            # 2026-11-17 — widened from SELF-only to ASSIGNED too.
+            # Populated when an RM follow-up has actually happened:
+            #   - SELF: any non-null promoter_user_id is a follow-up
+            #     (SELF subs start with promoter_user_id = NULL).
+            #   - ASSIGNED: populated only when promoter_user_id has
+            #     diverged from signup_promoter_user_id (i.e. an
+            #     actual reassignment, not the untouched signup).
             "followup_promoter": (
                 {
                     "user_id": alert_users_by_id[sub.promoter_user_id].id,
@@ -4568,9 +4597,12 @@ async def list_farmer_subscriptions(
                     "phone": alert_users_by_id[sub.promoter_user_id].phone,
                 }
                 if (
-                    sub.subscription_type == SubscriptionType.SELF
-                    and sub.promoter_user_id
+                    sub.promoter_user_id
                     and sub.promoter_user_id in alert_users_by_id
+                    and (
+                        sub.subscription_type == SubscriptionType.SELF
+                        or sub.promoter_user_id != sub.signup_promoter_user_id
+                    )
                 )
                 else None
             ),
@@ -5873,52 +5905,79 @@ async def set_subscription_followup_promoter(
     )).scalar_one_or_none()
     if sub is None:
         raise HTTPException(status_code=404, detail="Subscription not found")
-    if sub.subscription_type != SubscriptionType.SELF:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "code": "followup_promoter_self_subs_only",
-                "message": (
-                    "Follow-up Promoter assignment is available only for "
-                    "SELF-subscribed subscriptions in v1. This sub was "
-                    "promoter-assigned at signup."
-                ),
-            },
-        )
+
+    # 2026-11-17 — Follow-up Promoter widened from SELF-only to both
+    # SELF + ASSIGNED subs. ASSIGNED case lets the RM redirect field
+    # support when the signup promoter has left the organisation;
+    # Subscription.signup_promoter_user_id (set at create) preserves
+    # the original attribution, so the follow-up overwrite of
+    # promoter_user_id doesn't lose "who signed this farmer up?".
 
     new_user_id = body.user_id.strip() if body.user_id else None
     if new_user_id == "":
         new_user_id = None
 
-    # Validate: new user must be a facilitator-promoter at this client
-    # (promoter_type=FACILITATOR + is_promoter=True, ACTIVE row).
-    # Narrower than the alert-receiver / P-P mutations by design —
-    # dealers are commerce-primary and deliberately excluded.
+    # Validate: eligibility depends on signup type.
+    # - SELF subs: Facilitator-Promoter only (v3 scope, unchanged).
+    # - ASSIGNED subs (new 2026-11-17): Facilitator OR Dealer. On an
+    #   ASSIGNED sub the farmer already had a commerce-adjacent
+    #   relationship with the original (dealer or facilitator); the
+    #   follow-up should be allowed to preserve either role's
+    #   continuity, so a departed Dealer can be replaced by another
+    #   Dealer (and the farmer keeps ordering through the follow-up).
     new_user: Optional[User] = None
+    new_promoter_type: Optional[str] = None
     if new_user_id is not None:
         effective_client_id = await resolve_package_client_id(db, sub.client_id)
-        is_fac_promoter = (await db.execute(
-            select(ClientPromoter.id).where(
+        if sub.subscription_type == SubscriptionType.SELF:
+            eligible_types = ["FACILITATOR"]
+        else:
+            eligible_types = ["FACILITATOR", "DEALER"]
+        cp_row = (await db.execute(
+            select(ClientPromoter).where(
                 ClientPromoter.client_id == effective_client_id,
                 ClientPromoter.user_id == new_user_id,
                 ClientPromoter.status == StatusEnum.ACTIVE,
-                ClientPromoter.promoter_type == "FACILITATOR",
+                ClientPromoter.promoter_type.in_(eligible_types),
                 ClientPromoter.is_promoter.is_(True),
+            ).order_by(
+                # Prefer the type matching the sub's existing
+                # subscription_type context when the user holds both
+                # roles — a sub originally handled by a facilitator
+                # should follow-up with the facilitator binding even
+                # if the user is also a dealer at this client.
+                ClientPromoter.promoter_type.desc(),
             ).limit(1)
         )).scalar_one_or_none()
-        if is_fac_promoter is None:
+        if cp_row is None:
+            if sub.subscription_type == SubscriptionType.SELF:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "followup_promoter_must_be_facilitator_promoter",
+                        "message": (
+                            "The chosen user is not an active Facilitator-"
+                            "Promoter at this client. SELF subscriptions only "
+                            "allow facilitator follow-ups."
+                        ),
+                    },
+                )
             raise HTTPException(
                 status_code=422,
                 detail={
-                    "code": "followup_promoter_must_be_facilitator_promoter",
+                    "code": "followup_promoter_must_be_active_promoter",
                     "message": (
-                        "The chosen user is not an active Facilitator-"
-                        "Promoter at this client. Only field-side "
-                        "facilitators flagged as Promoters are eligible "
-                        "for Follow-up Promoter assignment."
+                        "The chosen user is not an active Facilitator- or "
+                        "Dealer-Promoter at this client. Only active "
+                        "promoters (either role) can take over as Follow-up "
+                        "on a promoter-assigned subscription."
                     ),
                 },
             )
+        new_promoter_type = (
+            cp_row.promoter_type.value if hasattr(cp_row.promoter_type, "value")
+            else str(cp_row.promoter_type)
+        )
         new_user = (await db.execute(
             select(User).where(User.id == new_user_id)
         )).scalar_one_or_none()
@@ -5951,13 +6010,20 @@ async def set_subscription_followup_promoter(
     # Assign-case: write the new promoter + create a fresh
     # PromoterAssignment row with status=ACTIVE (no PENDING_FARMER_
     # APPROVAL step — RM authority supersedes; farmer is notified
-    # via SMS below).
+    # via SMS below). promoter_type is resolved from the chosen
+    # user's ClientPromoter row above (FACILITATOR or DEALER) so
+    # that the assignment row carries true-to-life type info —
+    # downstream order flows + role gates depend on it.
     sub.promoter_user_id = new_user_id
     if new_user_id:
+        _pt = (
+            PromoterType.DEALER if new_promoter_type == "DEALER"
+            else PromoterType.FACILITATOR
+        )
         db.add(PromoterAssignment(
             subscription_id=sub.id,
             promoter_user_id=new_user_id,
-            promoter_type=PromoterType.FACILITATOR,
+            promoter_type=_pt,
             status=AssignmentStatus.ACTIVE,
         ))
 
