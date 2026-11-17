@@ -94,6 +94,18 @@ class Subscription(Base):
     client_id: Mapped[str] = mapped_column(String(36), ForeignKey("clients.id"), nullable=False)
     package_id: Mapped[str] = mapped_column(String(36), ForeignKey("packages.id"), nullable=False)
     promoter_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
+    # 2026-11-17 — Immutable signup attribution. Snapshotted at
+    # Subscription create (ASSIGNED subs → copied from promoter_user_id;
+    # SELF subs → NULL). The RM's Follow-up Promoter mutation writes to
+    # promoter_user_id (current effective); signup_promoter_user_id
+    # stays as the audit anchor so "who signed this farmer up?" stays
+    # answerable even after departures. See migration v4s9n7p30u6l +
+    # note on Follow-up Promoter widened to ASSIGNED subs.
+    signup_promoter_user_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     subscription_type: Mapped[SubscriptionType] = mapped_column(String(20), nullable=False)
     status: Mapped[SubscriptionStatus] = mapped_column(String(20), default=SubscriptionStatus.WAITLISTED)
     # Area-wise crop context. Used by volume calcs that multiply

@@ -2531,6 +2531,11 @@ async def initiate_assignment(
         client_id=effective_client_id,
         package_id=request.package_id,
         promoter_user_id=current_user.id,
+        # 2026-11-17 — Immutable signup attribution for ASSIGNED subs.
+        # Copies promoter_user_id at create time; stays as the audit
+        # anchor even if the Follow-up Promoter mutation later
+        # rewrites promoter_user_id (e.g. when the original leaves).
+        signup_promoter_user_id=current_user.id,
         subscription_type=SubscriptionType.ASSIGNED,
         status=SubscriptionStatus.ACTIVE,
         subscription_date=now,
