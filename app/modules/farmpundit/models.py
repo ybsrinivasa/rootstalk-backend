@@ -397,3 +397,84 @@ class QueryTranslation(Base):
             name="uq_query_translations_entity_target",
         ),
     )
+
+
+# ── Pundit Exclusivity (2026-11-17) ──────────────────────────────────────────
+#
+# Lets a Client's CA request that a Primary/Panel Pundit serve them
+# exclusively. Pundit accepts or declines via their PWA. Once ACTIVE,
+# every other CA Portal's pundit-search filters this Pundit out
+# (freeze semantics — existing ClientFarmPundit rows at other clients
+# continue serving their farmers; new onboardings get refused).
+#
+# Status flow:
+#   PENDING_PUNDIT_APPROVAL → ACTIVE | DECLINED_BY_PUNDIT
+#   ACTIVE                  → ENDED_BY_CLIENT | ENDED_BY_PUNDIT_REQUEST
+#
+# Pundit can request end; CA has 7 days to approve (celery task auto-
+# approves after that so the Pundit isn't stuck indefinitely). CA can
+# unilaterally end at any time. Enforced "single-client exclusivity"
+# via the partial unique index `uq_pundit_exclusivity_one_active`.
+
+class PunditExclusivityStatus:
+    PENDING_PUNDIT_APPROVAL = "PENDING_PUNDIT_APPROVAL"
+    ACTIVE = "ACTIVE"
+    DECLINED_BY_PUNDIT = "DECLINED_BY_PUNDIT"
+    ENDED_BY_CLIENT = "ENDED_BY_CLIENT"
+    ENDED_BY_PUNDIT_REQUEST = "ENDED_BY_PUNDIT_REQUEST"
+
+
+class PunditExclusivityAgreement(Base):
+    __tablename__ = "pundit_exclusivity_agreements"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4()),
+    )
+    pundit_profile_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("farm_pundit_profiles.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    client_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("clients.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(String(40), nullable=False)
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    responded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    ended_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    requested_by_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    responded_by_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    ended_by_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    end_reason: Mapped[str] = mapped_column(Text, nullable=True)
+    # Pundit sets this when they request to be released from the
+    # agreement. CA has 7 days to approve (celery task auto-approves
+    # after that → status flips to ENDED_BY_PUNDIT_REQUEST).
+    pundit_end_requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
