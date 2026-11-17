@@ -27,9 +27,20 @@ def anonymise_user_row(user: User) -> None:
     Query, FarmerCallLog, PromoterAssignment, etc.) stay valid and
     just resolve to "Deleted User" in joins. Idempotent — running
     on an already-anonymised row is a no-op (phone would already be
-    the scrambled form, name would already be "Deleted User")."""
+    the scrambled form, name would already be "Deleted User").
+
+    2026-11-17 — Scrambled phone format shortened from
+    `deleted_<16hex>` (24 chars) → `del_<10hex>` (14 chars) to fit
+    in User.phone's String(15) column. The original 24-char pattern
+    was a latent bug in the daily task since account-deletion
+    shipped — every prod anonymisation would have StringDataRight-
+    TruncationError'd on first attempt. Surfaced today when the
+    staging synchronous-anonymise path (grace=0) hit it on every
+    delete. 40 bits of entropy from 10 hex chars = 1-in-a-trillion
+    collision per million deleted users, plenty for anonymisation
+    purposes."""
     user.name = "Deleted User"
-    user.phone = f"deleted_{secrets.token_hex(8)}"
+    user.phone = f"del_{secrets.token_hex(5)}"
     user.email = None
     user.gps_lat = None
     user.gps_lng = None

@@ -440,12 +440,24 @@ async def request_delete_otp(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Send OTP to farmer's phone to confirm account deletion."""
+    """Send OTP to farmer's phone to confirm account deletion.
+
+    2026-11-17 — dev_otp surfacing on this endpoint is decoupled
+    from the global `SURFACE_DEV_OTP` flag. On any non-production
+    environment the delete-OTP always surfaces in the response so
+    testers can walk the delete flow even when login/password OTP
+    surfacing is off (useful while the delete-OTP SMS template
+    works through DLT registration + Draft4SMS approval). The
+    hard production gate (`environment == "production"`) still
+    applies — prod cannot leak this code regardless of any flag.
+    Safe surface: this endpoint requires an authenticated JWT,
+    so even on staging the code only reaches the authenticated
+    caller — not a public login surface."""
     if not current_user.phone:
         raise HTTPException(status_code=422, detail="No phone number on this account")
     otp_code = await create_phone_otp(db, current_user.phone)
     response = {"detail": "OTP sent to your phone"}
-    if _surface_dev_otp():
+    if settings.environment != "production":
         response["dev_otp"] = otp_code
     return response
 
