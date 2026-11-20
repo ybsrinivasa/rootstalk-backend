@@ -158,6 +158,17 @@ class Client(Base):
     input_alert_lead_days: Mapped[int] = mapped_column(
         Integer, nullable=True,
     )
+    # 2026-11-20 — Per-client query-expiry SLA override. NULL means
+    # fall back to the global default QUERY_EXPIRE_DAYS=2. Bounded
+    # 1..14 at the API layer. Set via PUT /client/{cid}/settings/query-
+    # expiry (CA / CM-EDIT / SA gated). Only affects NEW queries
+    # created after the change — existing in-flight queries keep the
+    # `expires_at` stamped at create time (no retroactive timer
+    # changes, no surprise re-opening of expired queries). See
+    # app/modules/farmpundit/router.py::_compute_query_expiry.
+    query_expire_days: Mapped[int] = mapped_column(
+        Integer, nullable=True,
+    )
     # v2 (2026-09-22) — Checkbox 3 "Enable in-app ordering". When True
     # AND advisory_only_mode=True, farmers on this client get the Order
     # button + Orders tile back (Regular Mode-style order flow) while
