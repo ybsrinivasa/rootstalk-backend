@@ -94,7 +94,14 @@ async def _holder_role(
 # per user direction 2026-05-27 — submitted on Day 0, expert has all
 # of Day 1 + Day 2 to respond, expires at end of Day 2 (IST). The
 # calculation lives in `_compute_query_expiry`.
+#
+# 2026-11-20 — Per-client override: a CA can configure
+# `Client.query_expire_days` via /setup → Query SLA (bounded 1..14).
+# NULL on the client row = use this default. See migration
+# x6u3p9r52w8n and the GET/PUT endpoints below.
 QUERY_EXPIRE_DAYS = 2
+QUERY_EXPIRE_DAYS_MIN = 1
+QUERY_EXPIRE_DAYS_MAX = 14
 
 # Per-(farmer, client) free quota. The 7th and later queries cost
 # `settings.query_amount_paise` (₹20 prod, ₹1 testing via .env). Single
@@ -114,16 +121,27 @@ from datetime import time as _dtime
 _IST = timezone(timedelta(hours=5, minutes=30))
 
 
-def _compute_query_expiry(now_utc: datetime) -> datetime:
-    """end-of-Day-2 (IST) for a query submitted at `now_utc`.
+def _compute_query_expiry(now_utc: datetime, client_days: int | None = None) -> datetime:
+    """end-of-Day-N (IST) for a query submitted at `now_utc`, where
+    N is the client's per-tenant SLA override (1..14) or the global
+    default `QUERY_EXPIRE_DAYS` when `client_days` is None/invalid.
 
     Day 0 = the IST calendar day of submission; the expert has Day 1
-    and Day 2 to respond; expires at the last second of Day 2.
+    through Day N to respond; expires at the last second of Day N.
     Stored as UTC.
+
+    2026-11-20 — Added `client_days` param. Callers that pass the
+    client row (or its query_expire_days column) get the tenant-
+    specific window; callers that don't fall back silently to the
+    global default — same behaviour as pre-2026-11-20.
     """
+    if client_days is not None and QUERY_EXPIRE_DAYS_MIN <= client_days <= QUERY_EXPIRE_DAYS_MAX:
+        days = client_days
+    else:
+        days = QUERY_EXPIRE_DAYS
     ist_today = now_utc.astimezone(_IST).date()
     ist_expiry = datetime.combine(
-        ist_today + timedelta(days=QUERY_EXPIRE_DAYS),
+        ist_today + timedelta(days=days),
         _dtime(23, 59, 59),
         tzinfo=_IST,
     )
@@ -1014,7 +1032,14 @@ async def submit_query(
             )
 
     now_utc = datetime.now(timezone.utc)
-    expires_at = _compute_query_expiry(now_utc)
+    # 2026-11-20 — Pass the client's per-tenant SLA override so the
+    # expires_at reflects the CA's chosen window. NULL on the client
+    # row falls back silently to the global QUERY_EXPIRE_DAYS default.
+    from app.modules.clients.models import Client as _Client
+    _client_days = (await db.execute(
+        select(_Client.query_expire_days).where(_Client.id == request.client_id)
+    )).scalar_one_or_none()
+    expires_at = _compute_query_expiry(now_utc, _client_days)
 
     query = Query(
         farmer_user_id=current_user.id,

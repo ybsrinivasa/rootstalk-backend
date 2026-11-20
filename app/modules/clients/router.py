@@ -7513,3 +7513,96 @@ async def bulk_soft_delete_subscriptions(
         "deleted_at": now.isoformat(),
         "reason": request.reason,
     }
+
+
+# ── Query SLA — per-client query-expiry window (2026-11-20) ─────────────────
+#
+# CA-configurable number of days (1..14) that the client's experts
+# have to respond to a farmer query before it auto-expires. NULL on
+# the client row = fall back to the global default (2) in
+# `app/modules/farmpundit/router.py::QUERY_EXPIRE_DAYS`.
+#
+# Only affects NEW queries created after the change — existing in-
+# flight queries keep the `expires_at` stamped at create time. See
+# migration x6u3p9r52w8n and `_compute_query_expiry`'s client_days
+# param.
+
+QUERY_SLA_DEFAULT_DAYS = 2
+QUERY_SLA_MIN_DAYS = 1
+QUERY_SLA_MAX_DAYS = 14
+
+
+class QuerySlaBody(BaseModel):
+    # None = reset to the global default. Int = 1..14 bounded at the
+    # endpoint; out-of-range → 422.
+    days: Optional[int] = None
+
+
+@router.get("/client/{client_id}/settings/query-expiry")
+async def get_query_sla(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return the client's current query-expiry SLA setting + the
+    global default + the allowed range so the CP can render the
+    form without hardcoding values.
+    """
+    from app.modules.farmpundit.router import _assert_portal_member
+    await _assert_portal_member(db, current_user.id, client_id)
+    client = (await db.execute(
+        select(Client).where(Client.id == client_id)
+    )).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status_code=404, detail="Client not found")
+    return {
+        "days": client.query_expire_days,
+        "default_days": QUERY_SLA_DEFAULT_DAYS,
+        "min_days": QUERY_SLA_MIN_DAYS,
+        "max_days": QUERY_SLA_MAX_DAYS,
+    }
+
+
+@router.put("/client/{client_id}/settings/query-expiry")
+async def set_query_sla(
+    client_id: str,
+    body: QuerySlaBody,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Update the client's query-expiry SLA. CA / CM-EDIT / SA only
+    (same gate as the cleanup endpoints). days=null resets to the
+    global default. days=int must be 1..14.
+    """
+    await _assert_ca_admin_or_cm_for_client(db, current_user.id, client_id)
+    if body.days is not None:
+        if not isinstance(body.days, int):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "days_not_int", "message": "days must be an integer."},
+            )
+        if body.days < QUERY_SLA_MIN_DAYS or body.days > QUERY_SLA_MAX_DAYS:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "days_out_of_range",
+                    "message": (
+                        f"days must be between {QUERY_SLA_MIN_DAYS} and "
+                        f"{QUERY_SLA_MAX_DAYS} (inclusive). "
+                        f"Send null to reset to the default of {QUERY_SLA_DEFAULT_DAYS}."
+                    ),
+                },
+            )
+    client = (await db.execute(
+        select(Client).where(Client.id == client_id)
+    )).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status_code=404, detail="Client not found")
+    client.query_expire_days = body.days
+    await db.commit()
+    return {
+        "days": client.query_expire_days,
+        "default_days": QUERY_SLA_DEFAULT_DAYS,
+        "min_days": QUERY_SLA_MIN_DAYS,
+        "max_days": QUERY_SLA_MAX_DAYS,
+    }
