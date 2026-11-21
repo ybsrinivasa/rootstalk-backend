@@ -599,3 +599,116 @@ async def sa_reports_summary(
         "current": current,
         "prior": prior,
     }
+
+
+# ── CSV download audit viewer (2026-11-21) ──────────────────────────────────
+#
+# Reads the generic `report_csv_downloads` table populated by every CP
+# CSV export. SA-only. Any future audited report (farmer activity,
+# orders, promoters, etc.) just calls `record_csv_download(... report_
+# name="...")` and shows up here automatically — no new endpoint per
+# report.
+
+@router.get("/admin/sa/reports/csv-downloads")
+async def list_csv_downloads(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    client_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    report_name: Optional[str] = None,
+    period_from: Optional[datetime] = None,
+    period_to: Optional[datetime] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Paginated list of CSV download audit rows. SA-only.
+
+    Response shape: `{rows, total, page, page_size, report_names,
+    client_options}` — the last two are tiny lists so the SA viewer
+    can render filter dropdowns without a second round-trip.
+    """
+    _require_sa(current_user)
+
+    from app.modules.reports.models import ReportCsvDownload
+    stmt = select(ReportCsvDownload)
+    if client_id:
+        stmt = stmt.where(ReportCsvDownload.client_id == client_id)
+    if user_id:
+        stmt = stmt.where(ReportCsvDownload.user_id == user_id)
+    if report_name:
+        stmt = stmt.where(ReportCsvDownload.report_name == report_name)
+    if period_from is not None:
+        stmt = stmt.where(ReportCsvDownload.downloaded_at >= period_from)
+    if period_to is not None:
+        stmt = stmt.where(ReportCsvDownload.downloaded_at < period_to)
+
+    total = int((await db.execute(
+        stmt.with_only_columns(func.count(ReportCsvDownload.id))
+    )).scalar_one())
+
+    stmt = (
+        stmt.order_by(ReportCsvDownload.downloaded_at.desc())
+        .limit(page_size)
+        .offset((page - 1) * page_size)
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+
+    # Hydrate user + client names in bulk. SET NULL on the FKs means
+    # a row could carry a dangling id after a user/client delete; the
+    # fallback renders the raw id so the audit trail stays readable.
+    uids = {r.user_id for r in rows if r.user_id}
+    cids = {r.client_id for r in rows if r.client_id}
+    user_names: dict[str, dict[str, str]] = {}
+    if uids:
+        urows = (await db.execute(
+            select(User.id, User.name, User.email, User.phone)
+            .where(User.id.in_(uids))
+        )).all()
+        user_names = {
+            uid: {"name": name or "", "email": email or "", "phone": phone or ""}
+            for uid, name, email, phone in urows
+        }
+    client_names: dict[str, str] = {}
+    if cids:
+        crows = (await db.execute(
+            select(Client.id, Client.display_name).where(Client.id.in_(cids))
+        )).all()
+        client_names = {cid: name or "" for cid, name in crows}
+
+    shaped = [
+        {
+            "id": r.id,
+            "downloaded_at": r.downloaded_at.isoformat() if r.downloaded_at else None,
+            "report_name": r.report_name,
+            "row_count": r.row_count,
+            "filters_json": r.filters_json or {},
+            "ip_address": r.ip_address,
+            "user_agent": r.user_agent,
+            "user": {
+                "id": r.user_id,
+                **(user_names.get(r.user_id) or {"name": "", "email": "", "phone": ""}),
+            } if r.user_id else None,
+            "client": {
+                "id": r.client_id,
+                "display_name": client_names.get(r.client_id, r.client_id or ""),
+            } if r.client_id else None,
+        }
+        for r in rows
+    ]
+
+    # Report-name options for the filter dropdown. Cheap distinct over
+    # the full table; grows at most ~1 new value per distinct report
+    # type added to the platform.
+    report_names = sorted(
+        n for (n,) in (await db.execute(
+            select(distinct(ReportCsvDownload.report_name))
+        )).all() if n
+    )
+
+    return {
+        "rows": shaped,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "report_names": report_names,
+    }
