@@ -349,6 +349,17 @@ async def _complete_trade_names_for_l2(
 
 # ── Per-L2 lookups ─────────────────────────────────────────────────────────
 
+# 2026-11-21 — Fertilizer L2s that should carry nutrient concentration
+# (N-P-K + secondaries + micros) alongside the Common Name option. All
+# other L2s omit the `concentrations` field entirely. NPK Dosages L2s
+# are excluded here — they have their own NPK flow (practitioner
+# specifies dosages directly, no brand picker).
+_L2_WITH_FERT_CONCENTRATIONS = frozenset({
+    "CHEMICAL_FERTILIZER_PRODUCTS",
+    "CHEMICAL_FERTILIZER_FERTIGATION_PRODUCTS",
+})
+
+
 async def list_common_names_for_l2(
     db: AsyncSession, l2_type: str,
 ) -> list[dict]:
@@ -381,9 +392,63 @@ async def list_common_names_for_l2(
             if cn and tn and tn in complete_tns:
                 cn_with_complete_tn.add(cn)
         common_name_ids &= cn_with_complete_tn
-    return await _resolve_names(
+    base = await _resolve_names(
         db, core_type=COSH_COMMON_NAMES_CORE, cosh_ids=common_name_ids,
     )
+    if l2_type in _L2_WITH_FERT_CONCENTRATIONS and base:
+        concentrations = await _load_fert_concentrations(
+            db, {b["cosh_id"] for b in base},
+        )
+        for b in base:
+            c = concentrations.get(b["cosh_id"])
+            if c:
+                # Only attach when Cosh has data — frontends can then
+                # distinguish "no data yet" from the composition itself.
+                b["concentrations"] = c
+    return base
+
+
+async def _load_fert_concentrations(
+    db: AsyncSession, common_name_ids: set[str],
+) -> dict[str, dict[str, float]]:
+    """Bulk-load nutrient concentrations for the given fertilizer
+    common names from the `fert_nutrient_concentration` Connect.
+
+    Returns `{common_name_cosh_id: {letter: pct}}` where letter is one
+    of N / P / K / Ca / Mg / S / Zn / Fe / Mn / Cu / B. Missing letters
+    for a given common name are simply absent (not zero) — the caller
+    can distinguish "Cosh has no data" from "data says 0%".
+
+    Delegates to the same loader the NPK ranker uses so there's one
+    source of truth for parsing the Connect's 4-endpoint shape.
+    """
+    if not common_name_ids:
+        return {}
+    from app.services.npk_candidates import load_fertiliser_candidates
+    candidates, _skipped = await load_fertiliser_candidates(
+        db, fertigation=False,
+    )
+    out: dict[str, dict[str, float]] = {}
+    # Concentration stores lowercase attrs (n/p/k/ca/...); the public
+    # payload uses capitalised letters (N/P/K/Ca/...) because that's
+    # how agronomists read them. Pair them explicitly.
+    _LETTER_ATTR = [
+        ("N", "n"), ("P", "p"), ("K", "k"),
+        ("Ca", "ca"), ("Mg", "mg"), ("S", "s"),
+        ("Zn", "zn"), ("Fe", "fe"), ("Mn", "mn"), ("Cu", "cu"), ("B", "b"),
+    ]
+    for c in candidates:
+        if c.cosh_id not in common_name_ids:
+            continue
+        pretty: dict[str, float] = {}
+        conc = c.concentration
+        for display, attr in _LETTER_ATTR:
+            val = getattr(conc, attr, 0.0) or 0.0
+            if val:
+                pretty[display] = float(val)
+        if pretty:
+            out[c.cosh_id] = pretty
+    return out
 
 
 async def list_application_methods_for_l2(
