@@ -4324,18 +4324,21 @@ async def _hydrate_remarks_chain(
 async def _hydrate_media_urls(
     db: AsyncSession, query_ids: list[str],
 ) -> dict[str, list[str]]:
-    """Per-query list of media URLs (ordered by created_at). Empty
-    list when no media. Used by the CSV exporter."""
+    """Per-query list of media URLs. QueryMedia carries no
+    `created_at`, so order by `id` (UUIDv4 primary key) for a
+    deterministic-but-not-time-ordered sequence per query. The CSV
+    shows up to 5 URLs with no stated order promise. Empty list when
+    no media."""
     if not query_ids:
         return {}
     from app.modules.farmpundit.models import QueryMedia  # local import — avoid top-level cycle
     stmt = (
-        select(QueryMedia.query_id, QueryMedia.url, QueryMedia.created_at)
+        select(QueryMedia.query_id, QueryMedia.url)
         .where(QueryMedia.query_id.in_(query_ids))
-        .order_by(QueryMedia.query_id, QueryMedia.created_at)
+        .order_by(QueryMedia.query_id, QueryMedia.id)
     )
     out: dict[str, list[str]] = {}
-    for qid, url, _ in (await db.execute(stmt)).all():
+    for qid, url in (await db.execute(stmt)).all():
         out.setdefault(qid, []).append(url)
     return out
 
