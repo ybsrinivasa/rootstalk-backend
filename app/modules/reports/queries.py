@@ -212,6 +212,16 @@ class ReportFilters:
         # consumes these; other subject areas ignore them.
         "severity",
         "pundit_id",
+        # 2026-11-21 — Phase 4 extension. Multi-select pundit for the
+        # Queries list + CSV endpoints. When populated, takes priority
+        # over `pundit_id`; empty/None falls back to single `pundit_id`
+        # or no pundit filter at all.
+        "pundit_ids",
+        # 2026-11-21 — Response-time bucket for the Responded list.
+        # Values: "UNDER_1D" (< 86400s), "UNDER_2D" (< 172800s), "OVER_2D".
+        # Only consumed by `queries_list_rows`; the dashboard metrics
+        # ignore it.
+        "response_time_bucket",
     )
 
     def __init__(
@@ -226,6 +236,8 @@ class ReportFilters:
         promoter_user_id: Optional[str] = None,
         severity: Optional[str] = None,
         pundit_id: Optional[str] = None,
+        pundit_ids: Optional[list[str]] = None,
+        response_time_bucket: Optional[str] = None,
     ) -> None:
         self.period_from = period_from
         self.period_to = period_to
@@ -237,6 +249,8 @@ class ReportFilters:
         self.promoter_user_id = promoter_user_id
         self.severity = severity
         self.pundit_id = pundit_id
+        self.pundit_ids = pundit_ids
+        self.response_time_bucket = response_time_bucket
 
 
 # ── Subscriptions subject area ────────────────────────────────────────────────
@@ -3800,7 +3814,16 @@ def _apply_query_filters(stmt: Select, filters: ReportFilters) -> Select:
             stmt = stmt.where(User.district_cosh_id == filters.district_cosh_id)
     if filters.severity:
         stmt = stmt.where(Query.severity == filters.severity)
-    if filters.pundit_id:
+    # 2026-11-21 — Multi-select pundit takes priority when present; the
+    # single-id path stays for existing callers (hero metrics).
+    if filters.pundit_ids:
+        stmt = stmt.where(
+            select(QueryRemark.id).where(
+                QueryRemark.query_id == Query.id,
+                QueryRemark.pundit_id.in_(filters.pundit_ids),
+            ).exists()
+        )
+    elif filters.pundit_id:
         stmt = stmt.where(
             select(QueryRemark.id).where(
                 QueryRemark.query_id == Query.id,
@@ -4171,3 +4194,238 @@ async def pundit_scorecard(
         merged.values(),
         key=lambda r: -(r["direct"] + r["forwarded_in"]),
     )
+
+
+# ── Queries list + CSV rows (2026-11-21) ─────────────────────────────────────
+#
+# Row-per-Query output for the drill-in panel at CP /reports/queries
+# (Open / Expired / Responded tabs) and the CA CSV export. Returns a
+# flat list of dicts; the router shapes it for JSON vs CSV.
+#
+# Status bucket mapping:
+#   OPEN       → QueryStatus.NEW, FORWARDED, RETURNED
+#   EXPIRED    → QueryStatus.EXPIRED
+#   RESPONDED  → QueryStatus.RESPONDED, REJECTED
+#
+# Period filter semantics per bucket (settled 2026-11-21):
+#   OPEN       — period IGNORED (open queries live max 14 days by design;
+#                any period filter would mostly hide the overdue-most rows)
+#   EXPIRED    — period applies to `created_at` (query submission date);
+#                sort by created_at desc
+#   RESPONDED  — period applies to `created_at`; sort by response time
+#                (QueryResponse.created_at) desc
+#
+# Response-time bucket is only honoured for RESPONDED and only filters
+# out rows whose age at response falls outside the chosen bucket.
+
+_STATUS_BUCKET_VALUES = {
+    "OPEN": [QueryStatus.NEW, QueryStatus.FORWARDED, QueryStatus.RETURNED],
+    "EXPIRED": [QueryStatus.EXPIRED],
+    "RESPONDED": [QueryStatus.RESPONDED, QueryStatus.REJECTED],
+}
+
+
+def _status_bucket_filter(stmt: Select, status_bucket: str) -> Select:
+    values = _STATUS_BUCKET_VALUES.get(status_bucket.upper())
+    if not values:
+        raise ValueError(f"Unknown status bucket '{status_bucket}'")
+    return stmt.where(Query.status.in_(values))
+
+
+def _ignore_period_for_bucket(filters: ReportFilters, status_bucket: str) -> ReportFilters:
+    """Open queries cap at 14 days — ignore any period filter the
+    caller passed so the list doesn't silently hide overdue rows."""
+    if status_bucket.upper() == "OPEN" and (
+        filters.period_from is not None or filters.period_to is not None
+    ):
+        return ReportFilters(
+            period_from=None, period_to=None,
+            crop_cosh_id=filters.crop_cosh_id,
+            state_cosh_id=filters.state_cosh_id,
+            district_cosh_id=filters.district_cosh_id,
+            package_id=filters.package_id,
+            dealer_user_id=filters.dealer_user_id,
+            promoter_user_id=filters.promoter_user_id,
+            severity=filters.severity,
+            pundit_id=filters.pundit_id,
+            pundit_ids=filters.pundit_ids,
+            response_time_bucket=filters.response_time_bucket,
+        )
+    return filters
+
+
+def _mask_phone(phone: Optional[str]) -> str:
+    """Mask every digit except the last 4. Preserves country-code
+    prefix. Empty / short values returned as-is (<=4 chars → full)."""
+    if not phone:
+        return ""
+    if len(phone) <= 4:
+        return phone
+    return "•" * (len(phone) - 4) + phone[-4:]
+
+
+def _response_time_bucket(seconds: Optional[float]) -> Optional[str]:
+    if seconds is None:
+        return None
+    if seconds < 86400:
+        return "UNDER_1D"
+    if seconds < 172800:
+        return "UNDER_2D"
+    return "OVER_2D"
+
+
+async def _hydrate_pundit_names(
+    db: AsyncSession, pundit_ids: list[str],
+) -> dict[str, str]:
+    """Resolve FarmPunditProfile.id → User.name via the one-to-one
+    profile→user link."""
+    if not pundit_ids:
+        return {}
+    stmt = (
+        select(FarmPunditProfile.id, User.name)
+        .join(User, User.id == FarmPunditProfile.user_id)
+        .where(FarmPunditProfile.id.in_(pundit_ids))
+    )
+    return {pid: name for pid, name in (await db.execute(stmt)).all()}
+
+
+async def _hydrate_remarks_chain(
+    db: AsyncSession, query_ids: list[str],
+) -> dict[str, list[dict]]:
+    """Return remarks per query as ordered lists of
+    {action, pundit_name, remark, created_at}. Used by the CSV
+    exporter; the JSON list endpoint sends them on expand only."""
+    if not query_ids:
+        return {}
+    stmt = (
+        select(
+            QueryRemark.query_id,
+            QueryRemark.action,
+            QueryRemark.remark,
+            QueryRemark.created_at,
+            User.name,
+        )
+        .outerjoin(FarmPunditProfile, FarmPunditProfile.id == QueryRemark.pundit_id)
+        .outerjoin(User, User.id == FarmPunditProfile.user_id)
+        .where(QueryRemark.query_id.in_(query_ids))
+        .order_by(QueryRemark.query_id, QueryRemark.created_at)
+    )
+    out: dict[str, list[dict]] = {}
+    for query_id, action, remark, created_at, name in (await db.execute(stmt)).all():
+        out.setdefault(query_id, []).append({
+            "action": action,
+            "pundit_name": name,
+            "remark": remark,
+            "created_at": created_at,
+        })
+    return out
+
+
+async def _hydrate_media_urls(
+    db: AsyncSession, query_ids: list[str],
+) -> dict[str, list[str]]:
+    """Per-query list of media URLs (ordered by created_at). Empty
+    list when no media. Used by the CSV exporter."""
+    if not query_ids:
+        return {}
+    from app.modules.farmpundit.models import QueryMedia  # local import — avoid top-level cycle
+    stmt = (
+        select(QueryMedia.query_id, QueryMedia.url, QueryMedia.created_at)
+        .where(QueryMedia.query_id.in_(query_ids))
+        .order_by(QueryMedia.query_id, QueryMedia.created_at)
+    )
+    out: dict[str, list[str]] = {}
+    for qid, url, _ in (await db.execute(stmt)).all():
+        out.setdefault(qid, []).append(url)
+    return out
+
+
+@timed_query("queries_list_total")
+async def queries_list_total(
+    db: AsyncSession, client_id: str, filters: ReportFilters, status_bucket: str,
+) -> int:
+    """Row count for the status bucket under the current filters.
+    Used by the list endpoint for pagination."""
+    filters = _ignore_period_for_bucket(filters, status_bucket)
+    stmt = _apply_query_filters(_query_scope(client_id), filters)
+    stmt = _status_bucket_filter(stmt, status_bucket)
+    stmt = stmt.with_only_columns(func.count(Query.id))
+    return int((await db.execute(stmt)).scalar_one())
+
+
+@timed_query("queries_list_rows")
+async def queries_list_rows(
+    db: AsyncSession, client_id: str, filters: ReportFilters,
+    status_bucket: str,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> list[dict]:
+    """Row-per-query list for the status bucket under the current
+    filters. Each row carries display columns + enough timestamps
+    for the CP to format age / response time.
+
+    `limit` / `offset` for pagination; omit both for the "all rows"
+    CSV path (exporter applies its own hard cap).
+    """
+    filters = _ignore_period_for_bucket(filters, status_bucket)
+    stmt = _apply_query_filters(_query_scope(client_id), filters)
+    stmt = _status_bucket_filter(stmt, status_bucket)
+
+    # Join everything we need in one go so the N+1 trap doesn't bite
+    # on a 500-row CSV export. Response joins LEFT so we get null-
+    # tolerant columns for the OPEN / EXPIRED buckets.
+    stmt = (
+        stmt
+        .join(User, User.id == Query.farmer_user_id)
+        .outerjoin(QueryResponse, QueryResponse.query_id == Query.id)
+        .outerjoin(
+            FarmPunditProfile,
+            FarmPunditProfile.id == Query.current_holder_id,
+        )
+        .with_only_columns(
+            Query.id,
+            Query.title,
+            Query.description,
+            Query.severity,
+            Query.status,
+            Query.created_at,
+            Query.expires_at,
+            Query.crop_cosh_id,
+            User.id.label("farmer_user_id"),
+            User.name.label("farmer_name"),
+            User.phone.label("farmer_phone"),
+            User.state_cosh_id,
+            User.district_cosh_id,
+            Query.current_holder_id,
+            QueryResponse.created_at.label("responded_at"),
+        )
+    )
+
+    bucket_up = status_bucket.upper()
+    if bucket_up == "OPEN":
+        stmt = stmt.order_by(Query.created_at.asc())
+    elif bucket_up == "EXPIRED":
+        stmt = stmt.order_by(Query.created_at.desc())
+    else:  # RESPONDED
+        # Response-time bucket filters apply here, pre-order.
+        if filters.response_time_bucket:
+            response_age = func.extract(
+                "epoch", QueryResponse.created_at - Query.created_at,
+            )
+            bucket_val = filters.response_time_bucket.upper()
+            if bucket_val == "UNDER_1D":
+                stmt = stmt.where(response_age < 86400)
+            elif bucket_val == "UNDER_2D":
+                stmt = stmt.where(response_age < 172800)
+            elif bucket_val == "OVER_2D":
+                stmt = stmt.where(response_age >= 172800)
+            # Unknown values are ignored silently (stay-permissive).
+        stmt = stmt.order_by(QueryResponse.created_at.desc())
+
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    if offset is not None:
+        stmt = stmt.offset(offset)
+
+    rows = (await db.execute(stmt)).mappings().all()
+    return [dict(r) for r in rows]

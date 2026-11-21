@@ -25,9 +25,9 @@ import io
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -1276,7 +1276,9 @@ async def queries_report(
     state_cosh_id: Optional[str] = None,
     district_cosh_id: Optional[str] = None,
     severity: Optional[str] = None,
-    pundit_id: Optional[str] = None,
+    # 2026-11-21 — Multi-select. Backward-compatible: a single
+    # `?pundit_id=X` still resolves to [X]. Empty list = no filter.
+    pundit_id: list[str] = Query(default_factory=list),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1300,8 +1302,12 @@ async def queries_report(
         period_from, period_to,
         crop_cosh_id, state_cosh_id, district_cosh_id,
         None,  # package_id — not used in queries area
-        severity=severity, pundit_id=pundit_id,
+        severity=severity,
+        pundit_id=None,
     )
+    # Honour the multi-select pundit via the new `pundit_ids` slot;
+    # _apply_query_filters prefers it over single `pundit_id`.
+    filters.pundit_ids = list(pundit_id) or None
 
     metric_up = metric.upper()
     if metric_up not in _QUERY_METRICS:
@@ -1357,7 +1363,8 @@ async def queries_pundit_scorecard(
     state_cosh_id: Optional[str] = None,
     district_cosh_id: Optional[str] = None,
     severity: Optional[str] = None,
-    pundit_id: Optional[str] = None,
+    # 2026-11-21 — Multi-select; same shape as /reports/queries.
+    pundit_id: list[str] = Query(default_factory=list),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1381,8 +1388,10 @@ async def queries_pundit_scorecard(
         period_from, period_to,
         crop_cosh_id, state_cosh_id, district_cosh_id,
         None,
-        severity=severity, pundit_id=pundit_id,
+        severity=severity,
+        pundit_id=None,
     )
+    filters.pundit_ids = list(pundit_id) or None
     rows = await queries.pundit_scorecard(db, cid, filters)
     if not rows:
         return {"rows": [], "pooled": None}
@@ -1556,3 +1565,285 @@ async def queries_filter_options(
 
 
 QUERY_SEVERITIES_ORDERED = ["CRITICAL", "HIGH", "MODERATE", "LOW"]
+
+
+# ── Queries drill-in list + CSV export (2026-11-21) ──────────────────────────
+#
+# Per-tab list rendered at CP /reports/queries under the hero scorecard.
+# Three status buckets (Open / Expired / Responded) each with their own
+# sort + period rules — see docstrings on `queries.queries_list_rows`.
+# Pundit chip is multi-select here (repeated query-param); the dashboard
+# endpoints keep their single-select `pundit_id`.
+#
+# CSV export is CA-only (same gate as subscriptions_csv / orders_csv);
+# triggers `record_csv_download` for the SA Portal audit viewer.
+
+_QUERY_LIST_PAGE_DEFAULT = 25
+_QUERY_LIST_PAGE_MAX = 100
+# Hard cap on CSV row count. Protects the SMTP-style memory profile +
+# gives the audit log a predictable "largest-possible-export" bound.
+# If a legit need exceeds this, the CA's next move is to narrow filters
+# — much saner than streaming 50k rows into Excel.
+_QUERY_CSV_HARD_CAP = 5000
+
+
+def _query_status_bucket_param(status: str) -> str:
+    up = (status or "").upper()
+    if up not in ("OPEN", "EXPIRED", "RESPONDED"):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "unknown_status_bucket",
+                "message": f"Unknown status bucket '{status}'. Expected OPEN | EXPIRED | RESPONDED.",
+            },
+        )
+    return up
+
+
+@router.get("/client/{cid}/reports/queries/list")
+async def queries_list(
+    cid: str,
+    status: str = Query(..., description="OPEN | EXPIRED | RESPONDED"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(_QUERY_LIST_PAGE_DEFAULT, ge=1, le=_QUERY_LIST_PAGE_MAX),
+    period_from: Optional[datetime] = None,
+    period_to: Optional[datetime] = None,
+    crop_cosh_id: Optional[str] = None,
+    state_cosh_id: Optional[str] = None,
+    district_cosh_id: Optional[str] = None,
+    pundit_id: list[str] = Query(default_factory=list),
+    response_time_bucket: Optional[str] = Query(
+        None, description="Responded-only filter: UNDER_1D | UNDER_2D | OVER_2D",
+    ),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Row-per-query drill-in list. Report Users + CA may read; the
+    CSV sibling is CA-only.
+
+    Pagination: 1-indexed `page` + `page_size` (default 25, max 100).
+    Response also returns `total` so the CP can render page N of M.
+
+    Columns on each row:
+      id · created_at · expires_at · responded_at (nullable) · status
+      · severity · title · description · crop_cosh_id · district (resolved)
+      · farmer_user_id · farmer_name · farmer_phone_masked
+      · current_holder_id · current_holder_name
+      · response_seconds (nullable) · response_bucket (nullable)
+      · media_count
+
+    The `description` field is sent in full; the CP decides how much
+    to preview and when to expand.
+    """
+    await _assert_client_report_reader(db, current_user, cid)
+    _assert_subject_enabled(cid, "queries")
+    status_up = _query_status_bucket_param(status)
+
+    filters = queries.ReportFilters(
+        period_from=period_from, period_to=period_to,
+        crop_cosh_id=crop_cosh_id,
+        state_cosh_id=state_cosh_id,
+        district_cosh_id=district_cosh_id,
+        pundit_ids=list(pundit_id) or None,
+        response_time_bucket=response_time_bucket,
+    )
+
+    offset = (page - 1) * page_size
+    total = await queries.queries_list_total(db, cid, filters, status_up)
+    rows = await queries.queries_list_rows(
+        db, cid, filters, status_up,
+        limit=page_size, offset=offset,
+    )
+
+    # Hydrate pundit names + district names + media counts in bulk so
+    # a 25-row page doesn't fire 75 round-trips.
+    pundit_ids_seen = [r["current_holder_id"] for r in rows if r["current_holder_id"]]
+    pundit_names = await queries._hydrate_pundit_names(db, pundit_ids_seen)
+
+    cosh_ids_seen: list[str] = []
+    for r in rows:
+        for k in ("crop_cosh_id", "district_cosh_id", "state_cosh_id"):
+            v = r.get(k)
+            if v:
+                cosh_ids_seen.append(v)
+    cosh_names = await _cosh_names(db, cosh_ids_seen) if cosh_ids_seen else {}
+
+    query_ids_seen = [r["id"] for r in rows]
+    from app.modules.farmpundit.models import QueryMedia  # local — avoid cycle
+    media_counts: dict[str, int] = {}
+    if query_ids_seen:
+        mc_stmt = (
+            select(QueryMedia.query_id, func.count(QueryMedia.id))
+            .where(QueryMedia.query_id.in_(query_ids_seen))
+            .group_by(QueryMedia.query_id)
+        )
+        media_counts = {
+            qid: int(cnt) for qid, cnt in (await db.execute(mc_stmt)).all()
+        }
+
+    shaped = []
+    for r in rows:
+        responded_at = r.get("responded_at")
+        response_seconds: Optional[float] = None
+        if responded_at is not None:
+            response_seconds = (responded_at - r["created_at"]).total_seconds()
+        shaped.append({
+            "id": r["id"],
+            "created_at": _format_dt(r["created_at"]),
+            "expires_at": _format_dt(r["expires_at"]),
+            "responded_at": _format_dt(responded_at) if responded_at else None,
+            "status": str(r["status"]),
+            "severity": r["severity"],
+            "title": r["title"],
+            "description": r["description"] or "",
+            "crop_cosh_id": r["crop_cosh_id"] or "",
+            "crop_name": cosh_names.get(r["crop_cosh_id"] or "", r["crop_cosh_id"] or ""),
+            "district_cosh_id": r["district_cosh_id"] or "",
+            "district_name": cosh_names.get(r["district_cosh_id"] or "", r["district_cosh_id"] or ""),
+            "state_cosh_id": r["state_cosh_id"] or "",
+            "state_name": cosh_names.get(r["state_cosh_id"] or "", r["state_cosh_id"] or ""),
+            "farmer_user_id": r["farmer_user_id"],
+            "farmer_name": r["farmer_name"] or "",
+            "farmer_phone_masked": queries._mask_phone(r["farmer_phone"]),
+            "current_holder_id": r["current_holder_id"],
+            "current_holder_name": pundit_names.get(r["current_holder_id"] or "", ""),
+            "response_seconds": response_seconds,
+            "response_bucket": queries._response_time_bucket(response_seconds),
+            "media_count": media_counts.get(r["id"], 0),
+        })
+
+    return {
+        "rows": shaped,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "status": status_up,
+    }
+
+
+@router.get("/client/{cid}/reports/queries/export.csv")
+async def queries_csv(
+    cid: str,
+    status: str = Query(..., description="OPEN | EXPIRED | RESPONDED"),
+    period_from: Optional[datetime] = None,
+    period_to: Optional[datetime] = None,
+    crop_cosh_id: Optional[str] = None,
+    state_cosh_id: Optional[str] = None,
+    district_cosh_id: Optional[str] = None,
+    pundit_id: list[str] = Query(default_factory=list),
+    response_time_bucket: Optional[str] = None,
+    request: Request = None,  # noqa — FastAPI injects when declared
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CA-only CSV export of the Queries list. Respects the same
+    filters as `/queries/list`; applies NO pagination but caps at
+    `_QUERY_CSV_HARD_CAP` rows to keep memory + audit bounds sane.
+
+    Side effect: writes one row to `report_csv_downloads` so the SA
+    Portal audit viewer can show who exported what and when. The
+    audit write is non-fatal — a hiccup there doesn't block the
+    download.
+    """
+    await _assert_ca_for_export(db, current_user, cid)
+    _assert_subject_enabled(cid, "queries")
+    status_up = _query_status_bucket_param(status)
+
+    filters = queries.ReportFilters(
+        period_from=period_from, period_to=period_to,
+        crop_cosh_id=crop_cosh_id,
+        state_cosh_id=state_cosh_id,
+        district_cosh_id=district_cosh_id,
+        pundit_ids=list(pundit_id) or None,
+        response_time_bucket=response_time_bucket,
+    )
+    rows = await queries.queries_list_rows(
+        db, cid, filters, status_up, limit=_QUERY_CSV_HARD_CAP, offset=0,
+    )
+
+    pundit_ids_seen = [r["current_holder_id"] for r in rows if r["current_holder_id"]]
+    pundit_names = await queries._hydrate_pundit_names(db, pundit_ids_seen)
+
+    cosh_ids_seen: list[str] = []
+    for r in rows:
+        for k in ("crop_cosh_id", "district_cosh_id", "state_cosh_id"):
+            v = r.get(k)
+            if v:
+                cosh_ids_seen.append(v)
+    cosh_names = await _cosh_names(db, cosh_ids_seen) if cosh_ids_seen else {}
+
+    query_ids_seen = [r["id"] for r in rows]
+    remarks_chain = await queries._hydrate_remarks_chain(db, query_ids_seen)
+    media_urls = await queries._hydrate_media_urls(db, query_ids_seen)
+
+    header = [
+        "Submitted", "Status", "Farmer Name", "Farmer Phone (masked)",
+        "Crop", "State", "District",
+        "Query Title", "Query Text",
+        "Current Holder (Pundit)",
+        "Expires At", "Responded At", "Response Seconds", "Response Bucket",
+        "Remarks Chain",
+        "Media URL 1", "Media URL 2", "Media URL 3", "Media URL 4", "Media URL 5",
+    ]
+    body = []
+    for r in rows:
+        responded_at = r.get("responded_at")
+        response_seconds: Optional[float] = None
+        if responded_at is not None:
+            response_seconds = (responded_at - r["created_at"]).total_seconds()
+        chain_lines = []
+        for entry in remarks_chain.get(r["id"], []):
+            who = entry["pundit_name"] or "—"
+            action = entry["action"] or ""
+            txt = (entry["remark"] or "").strip()
+            when = _format_dt(entry["created_at"])
+            chain_lines.append(f"[{when}] {who} · {action}: {txt}")
+        media = media_urls.get(r["id"], [])
+        media_cells = [media[i] if i < len(media) else "" for i in range(5)]
+        body.append([
+            _format_dt(r["created_at"]),
+            str(r["status"]),
+            r["farmer_name"] or "",
+            _excel_text(queries._mask_phone(r["farmer_phone"])),
+            cosh_names.get(r["crop_cosh_id"] or "", r["crop_cosh_id"] or ""),
+            cosh_names.get(r["state_cosh_id"] or "", r["state_cosh_id"] or ""),
+            cosh_names.get(r["district_cosh_id"] or "", r["district_cosh_id"] or ""),
+            r["title"] or "",
+            r["description"] or "",
+            pundit_names.get(r["current_holder_id"] or "", ""),
+            _format_dt(r["expires_at"]),
+            _format_dt(responded_at) if responded_at else "",
+            f"{response_seconds:.0f}" if response_seconds is not None else "",
+            queries._response_time_bucket(response_seconds) or "",
+            "\n---\n".join(chain_lines),
+            *media_cells,
+        ])
+
+    resp = _stream_csv(header, body)
+    resp.headers["Content-Disposition"] = (
+        f'attachment; filename="{_csv_filename(cid, f"queries-{status_up.lower()}")}"'
+    )
+
+    # Audit — fire after the response body is built but before we
+    # return it, because `record_csv_download` is non-fatal + commits
+    # on its own session scope.
+    from app.modules.reports.audit import record_csv_download
+    await record_csv_download(
+        db,
+        user=current_user,
+        report_name=f"queries_{status_up.lower()}",
+        client_id=cid,
+        filters={
+            "status": status_up,
+            "period_from": period_from.isoformat() if period_from else None,
+            "period_to": period_to.isoformat() if period_to else None,
+            "crop_cosh_id": crop_cosh_id,
+            "state_cosh_id": state_cosh_id,
+            "district_cosh_id": district_cosh_id,
+            "pundit_ids": list(pundit_id) or None,
+            "response_time_bucket": response_time_bucket,
+        },
+        row_count=len(rows),
+        request=request,
+    )
+    return resp
