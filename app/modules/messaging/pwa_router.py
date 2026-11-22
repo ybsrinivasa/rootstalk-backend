@@ -9,6 +9,13 @@ Response rules (spec §3.4 / §6.4):
 - Expiry past = can still view but not submit.
 - Test recipients (is_test=True) see the campaign like anyone else;
   their response IS stored but excluded from CA analytics.
+
+Intentional feature-flag omission (2026-11-22 audit confirmation):
+No endpoint here checks `client_has_feature(..., "messaging")`. This
+is deliberate per spec §2 — when a paid feature expires, in-flight
+campaigns and their response surfaces continue to work ("the
+delivery promise was made at send time"). Only the compose side
+is gated. Don't "fix" this.
 """
 from __future__ import annotations
 
@@ -261,16 +268,41 @@ async def mark_opened(
 ):
     """Stamp opened_at the first time the recipient opens the message.
     Idempotent — repeat calls are no-ops. Also bumps the campaign-level
-    opened_count on the first stamp only."""
+    opened_count on the first stamp only.
+
+    Concurrency-safe (2026-11-22 audit): the opened_at flip is done
+    via a conditional UPDATE with `opened_at IS NULL` in the WHERE
+    clause + `RETURNING id`. Two concurrent POSTs from the same user
+    (e.g. double-tap on a slow network) result in exactly one row
+    update — the other UPDATE touches zero rows. Only the "winner"
+    bumps the campaign counter.
+    """
     recipient, _camp = await _get_own_recipient(db, current_user.id, campaign_id)
     if recipient.opened_at is not None:
         return {"ok": True, "already": True}
     now = datetime.now(timezone.utc)
-    recipient.opened_at = now
-    # Bump campaign counter only for non-test opens.
+
+    from sqlalchemy import update as _update
+    result = await db.execute(
+        _update(CampaignRecipient)
+        .where(
+            CampaignRecipient.id == recipient.id,
+            CampaignRecipient.opened_at.is_(None),
+        )
+        .values(opened_at=now)
+        .returning(CampaignRecipient.id)
+    )
+    won = result.scalar_one_or_none() is not None
+    if not won:
+        # Another concurrent call stamped first. Treat as already-opened.
+        await db.commit()
+        return {"ok": True, "already": True}
+
+    # Bump campaign counter only for non-test opens, only when we
+    # won the stamp race.
     if not recipient.is_test:
         await db.execute(
-            update(Campaign)
+            _update(Campaign)
             .where(Campaign.id == campaign_id)
             .values(opened_count=Campaign.opened_count + 1)
         )

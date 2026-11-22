@@ -62,6 +62,22 @@ async def _run() -> dict:
 
         for camp in due:
             try:
+                # Re-check status after re-fetch to close the race with
+                # a CA clicking Cancel between our SELECT and UPDATE
+                # (2026-11-22 audit finding). If the status flipped to
+                # CANCELLED or anything non-SCHEDULED mid-flight, skip.
+                fresh = (await db.execute(
+                    select(Campaign).where(Campaign.id == camp.id)
+                )).scalar_one_or_none()
+                if fresh is None or fresh.status != CampaignStatus.SCHEDULED.value:
+                    logger.info(
+                        "campaign_schedule: skip id=%s — status flipped to %s "
+                        "between SELECT and activation",
+                        camp.id, fresh.status if fresh else "deleted",
+                    )
+                    continue
+                camp = fresh
+
                 # The system acts as the sender. We don't have a User
                 # context in a beat task, so audit row records with
                 # sender_user_id = created_by (the CA who scheduled it).
@@ -91,8 +107,15 @@ async def _run() -> dict:
                 camp.sent_at = now
                 camp.recipient_count = snapped
                 camp.updated_at = now
-                if sender is not None:
-                    await _write_send_audit(db, camp, sender, snapped, is_test=False)
+                # Always write the audit row — spec §3.7 says "every
+                # campaign send writes a row". When the creator has
+                # been deleted/anonymised we use a system sentinel
+                # (user object with id=None); _write_send_audit's
+                # sender_user_id column is nullable with SET NULL.
+                audit_sender = sender if sender is not None else User(
+                    id=None, name="(scheduled by deleted user)",
+                )
+                await _write_send_audit(db, camp, audit_sender, snapped, is_test=False)
                 await db.commit()
 
                 from app.tasks.campaign_dispatch import dispatch_campaign

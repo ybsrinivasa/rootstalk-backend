@@ -32,8 +32,8 @@ from app.modules.platform.models import User
 from app.modules.feature_access.models import FEATURE_MESSAGING
 from app.modules.feature_access.service import client_has_feature
 from app.modules.messaging.models import (
-    Campaign, CampaignQuestion, CampaignRecipient, CampaignResponse,
-    CampaignResponseAnswer, CampaignSendAudit,
+    Campaign, CampaignAttachment, CampaignQuestion, CampaignRecipient,
+    CampaignResponse, CampaignResponseAnswer, CampaignSendAudit,
     CampaignStatus, CampaignType, RecipientRole,
     QuestionType, SUBSCRIPTION_STATUS_FILTER_VALUES,
 )
@@ -645,6 +645,26 @@ def _validate_question_shape(q: QuestionIn) -> None:
                     "message": "A choice question can have at most 10 options.",
                 },
             )
+        # 2026-11-22 audit — MULTIPLE_CHOICE answers are stored as
+        # comma-joined strings in CampaignResponseAnswer.value_choice;
+        # the aggregate tally in campaign_analytics splits on comma.
+        # An option label containing a comma would be split into
+        # phantom options and corrupt the tally. Reject at validation
+        # so CAs can't trip the bug. The commas-in-options workaround
+        # is "use a dash or semicolon".
+        for opt in q.choice_options:
+            if "," in opt:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "choice_option_contains_comma",
+                        "message": (
+                            f"Option labels can't contain commas (storage format "
+                            f"ambiguity). Rephrase: '{opt}' — try using a dash "
+                            f"or semicolon instead."
+                        ),
+                    },
+                )
     if q.question_type == QuestionType.NUMBER.value and not q.number_unit:
         raise HTTPException(
             status_code=422,
@@ -1150,12 +1170,20 @@ async def archive_campaign(
     )).scalar_one_or_none()
     if c is None:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    if c.status in (CampaignStatus.ACTIVE.value, CampaignStatus.SCHEDULED.value):
+    if c.status in (
+        CampaignStatus.ACTIVE.value,
+        CampaignStatus.SCHEDULED.value,
+        CampaignStatus.DRAFT.value,
+    ):
         raise HTTPException(
             status_code=422,
             detail={
                 "code": "not_archivable",
-                "message": "Active and scheduled campaigns cannot be archived.",
+                "message": (
+                    "Only terminated campaigns (Expired or Cancelled) can be "
+                    "archived. Drafts should be discarded instead; active and "
+                    "scheduled campaigns must run their course or be cancelled first."
+                ),
             },
         )
     now = datetime.now(timezone.utc)
@@ -1474,7 +1502,7 @@ async def export_responses_csv(
     # mirror the CSV convention set in the Queries report).
     await _assert_ca_admin_or_cm_for_client(db, current_user.id, cid)
     # Feature flag.
-    if not await client_has_feature(db, cid, "messaging"):
+    if not await client_has_feature(db, cid, FEATURE_MESSAGING):
         raise HTTPException(
             status_code=403,
             detail={"code": "feature_not_enabled", "message": "Messaging not enabled."},
@@ -1625,11 +1653,36 @@ async def test_send_by_phone(
             detail={"code": "too_many_phones", "message": "Test-send accepts at most 5 recipients."},
         )
 
-    # Resolve phones → user_ids. Loose match: any user with that phone.
-    # (No role scoping — test-send is a CA ops tool; they may want to
-    # send to their own non-farmer phone.)
+    # Resolve phones → user_ids. Scoped to users who are associated
+    # with THIS client: either a portal member (ClientUser), a
+    # dealer/facilitator (ClientPromoter), or a farmer with a
+    # subscription on this client. Prevents a CA from accidentally —
+    # or deliberately — sending a test to a random user elsewhere
+    # on the platform (2026-11-22 audit finding).
+    from app.modules.clients.models import ClientUser, ClientPromoter
+    from app.modules.subscriptions.models import Subscription
+    from sqlalchemy import or_
     found = (await db.execute(
-        select(User.id, User.phone).where(User.phone.in_(phones))
+        select(User.id, User.phone)
+        .where(
+            User.phone.in_(phones),
+            or_(
+                select(ClientUser.id).where(
+                    ClientUser.client_id == cid,
+                    ClientUser.user_id == User.id,
+                ).exists(),
+                select(ClientPromoter.id).where(
+                    ClientPromoter.client_id == cid,
+                    ClientPromoter.user_id == User.id,
+                    ClientPromoter.status == "ACTIVE",
+                ).exists(),
+                select(Subscription.id).where(
+                    Subscription.client_id == cid,
+                    Subscription.farmer_user_id == User.id,
+                    Subscription.deleted_at.is_(None),
+                ).exists(),
+            ),
+        )
     )).all()
     by_phone = {ph: uid for uid, ph in found}
     resolved_ids = [by_phone[p] for p in phones if p in by_phone]
