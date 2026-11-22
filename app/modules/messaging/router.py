@@ -288,8 +288,12 @@ async def create_draft(
     )).scalar_one_or_none()
     _assert_client_exists(client)
 
-    # Minimum viable draft
-    missing = [k for k in ("name", "campaign_type", "recipient_role", "title", "body")
+    # Minimum viable draft — only the three structural fields are
+    # required at CREATE. title + body are work-in-progress fields
+    # that the composer fills on the Content step; they're validated
+    # non-empty at SEND time (see send_campaign). Lets the Basics
+    # step save the draft before the CA writes a word of content.
+    missing = [k for k in ("name", "campaign_type", "recipient_role")
                if getattr(body, k) is None or (isinstance(getattr(body, k), str) and not getattr(body, k).strip())]
     if missing:
         raise HTTPException(
@@ -309,8 +313,8 @@ async def create_draft(
         campaign_type=body.campaign_type,
         recipient_role=body.recipient_role,
         description=body.description,
-        title=body.title.strip(),
-        body=body.body,
+        title=(body.title or "").strip(),
+        body=body.body or "",
         language_code=body.language_code,
         audience_filters=_normalise_audience_filters(body.audience_filters),
         rating_scale_type=body.rating_scale_type,
@@ -1010,6 +1014,28 @@ async def send_campaign(
             detail={
                 "code": "not_a_draft",
                 "message": f"Only DRAFT campaigns can be sent. Current status: {c.status}.",
+            },
+        )
+
+    # Content check — title + body are optional at CREATE (so the
+    # composer can save-as-you-go from Basics before any content is
+    # typed) but mandatory at SEND. Returns a stable error code so the
+    # composer can flag which field is missing.
+    content_missing = []
+    if not c.title or not c.title.strip():
+        content_missing.append("title")
+    if not c.body or not c.body.strip():
+        content_missing.append("body")
+    if content_missing:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "campaign_content_incomplete",
+                "message": (
+                    f"Fill in the content first: {content_missing}. "
+                    "Go back to the Content step."
+                ),
+                "missing": content_missing,
             },
         )
 
