@@ -48,14 +48,22 @@ async def inbox_list(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Recipient's active inbox. Expired/cancelled/archived campaigns
-    are hidden (per spec: expired = gone from recipient's view).
+    """Recipient's inbox — WhatsApp-style, grouped by organization.
+
+    Returns `{organizations: [...], unread_count}`. Each organization
+    row carries its most-recent-message preview + unread tally so the
+    inbox list page can render one card per client without hitting
+    the per-org endpoint until the user taps in.
+
+    Sort: organizations ordered by most_recent_at DESC (newest
+    activity on top — WhatsApp reshuffle). Within-org ordering
+    happens in the sibling `/pwa/messages/org/{cid}` endpoint.
+
+    Expired/cancelled/archived campaigns are hidden per spec; orgs
+    whose messages are all expired disappear from the inbox.
     """
-    now = datetime.now(timezone.utc)
     rows = (await db.execute(
-        select(
-            CampaignRecipient, Campaign,
-        )
+        select(CampaignRecipient, Campaign)
         .join(Campaign, Campaign.id == CampaignRecipient.campaign_id)
         .where(
             CampaignRecipient.user_id == current_user.id,
@@ -66,29 +74,97 @@ async def inbox_list(
 
     from app.modules.clients.models import Client
     client_ids = {c.client_id for _, c in rows}
-    name_by_cid: dict[str, str] = {}
+    client_meta: dict[str, dict] = {}
     if client_ids:
         crows = (await db.execute(
-            select(Client.id, Client.display_name)
+            select(Client.id, Client.display_name, Client.logo_url)
             .where(Client.id.in_(client_ids))
         )).all()
-        name_by_cid = {cid: (name or "") for cid, name in crows}
+        client_meta = {
+            cid: {"name": name or "", "logo_url": logo}
+            for cid, name, logo in crows
+        }
 
-    items = []
-    unread = 0
+    # Group by client_id. Rows are already ordered newest-first,
+    # so first-seen per client = most recent.
+    orgs: dict[str, dict] = {}
+    unread_total = 0
     for recipient, camp in rows:
         is_unread = recipient.opened_at is None
         if is_unread:
-            unread += 1
+            unread_total += 1
+        bucket = orgs.setdefault(camp.client_id, {
+            "client_id": camp.client_id,
+            "client_name": client_meta.get(camp.client_id, {}).get("name", ""),
+            "client_logo_url": client_meta.get(camp.client_id, {}).get("logo_url"),
+            "unread_count": 0,
+            "message_count": 0,
+            "pending_response_count": 0,
+            "most_recent_at": None,
+            "most_recent_title": None,
+            "most_recent_is_unread": False,
+        })
+        bucket["message_count"] += 1
+        if is_unread:
+            bucket["unread_count"] += 1
+        expects_response = camp.campaign_type != CampaignType.ANNOUNCEMENT.value
+        if expects_response and recipient.responded_at is None:
+            bucket["pending_response_count"] += 1
+        # Because rows are newest-first, the first bucket write wins.
+        if bucket["most_recent_at"] is None:
+            bucket["most_recent_at"] = camp.sent_at.isoformat() if camp.sent_at else None
+            bucket["most_recent_title"] = camp.title
+            bucket["most_recent_is_unread"] = is_unread
+
+    # Order orgs by most_recent_at DESC (WhatsApp reshuffle).
+    organizations = sorted(
+        orgs.values(),
+        key=lambda o: o["most_recent_at"] or "",
+        reverse=True,
+    )
+    return {"organizations": organizations, "unread_count": unread_total}
+
+
+# ── Per-org message thread (WhatsApp-style chat view) ───────────────────
+
+@router.get("/pwa/messages/org/{client_id}")
+async def org_messages(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Active messages from one client, chronological OLDEST → NEWEST.
+    PWA scrolls to the bottom on open (WhatsApp chat view).
+
+    Access: implicit — only returns messages where the current user
+    is a recipient. No separate role/client gate needed.
+    """
+    rows = (await db.execute(
+        select(CampaignRecipient, Campaign)
+        .join(Campaign, Campaign.id == CampaignRecipient.campaign_id)
+        .where(
+            CampaignRecipient.user_id == current_user.id,
+            Campaign.client_id == client_id,
+            Campaign.status == CampaignStatus.ACTIVE.value,
+        )
+        .order_by(Campaign.sent_at.asc())  # oldest first — chat order
+    )).all()
+
+    from app.modules.clients.models import Client
+    client = (await db.execute(
+        select(Client).where(Client.id == client_id)
+    )).scalar_one_or_none()
+
+    items = []
+    for recipient, camp in rows:
+        is_unread = recipient.opened_at is None
         expects_response = camp.campaign_type != CampaignType.ANNOUNCEMENT.value
         pending_response = expects_response and recipient.responded_at is None
         items.append({
             "recipient_id": recipient.id,
             "campaign_id": camp.id,
-            "client_id": camp.client_id,
-            "client_name": name_by_cid.get(camp.client_id, ""),
             "title": camp.title,
-            "preview": (camp.body or "")[:120],
+            "preview": (camp.body or "")[:200],
             "campaign_type": camp.campaign_type,
             "sent_at": camp.sent_at.isoformat() if camp.sent_at else None,
             "expires_at": camp.expires_at.isoformat() if camp.expires_at else None,
@@ -97,7 +173,13 @@ async def inbox_list(
             "pending_response": pending_response,
             "is_test": recipient.is_test,
         })
-    return {"items": items, "unread_count": unread}
+
+    return {
+        "client_id": client_id,
+        "client_name": (client.display_name if client else "") or "",
+        "client_logo_url": (client.logo_url if client else None),
+        "items": items,
+    }
 
 
 # ── Badge count (cheap read for the nav icon) ────────────────────────────
@@ -196,6 +278,7 @@ async def message_detail(
     return {
         "campaign": {
             "id": camp.id,
+            "client_id": camp.client_id,
             "title": camp.title,
             "body": camp.body,
             "campaign_type": camp.campaign_type,
