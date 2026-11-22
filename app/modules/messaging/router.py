@@ -1255,3 +1255,377 @@ async def campaign_analytics(
         "feedback_rating_histogram": feedback,
         "questions": question_aggs,
     }
+
+
+# ── Individual response drill-down ──────────────────────────────────────
+
+def _mask_phone(phone: str | None) -> str:
+    """Last-4-only masking — same convention as the Queries report
+    (shipped 2026-11-21). CA has Farmer Support for the full phone."""
+    if not phone:
+        return ""
+    if len(phone) <= 4:
+        return phone
+    return "•" * (len(phone) - 4) + phone[-4:]
+
+
+def _display_answer(
+    answer: CampaignResponseAnswer,
+    question: CampaignQuestion | None,
+) -> str:
+    """Flatten the polymorphic answer columns into one human-readable
+    string. Used by both the JSON drill-down and the CSV export so
+    the two views agree."""
+    if answer.value_text is not None:
+        return str(answer.value_text)
+    if answer.value_number is not None:
+        # Keep ints clean, decimals to 2 places max.
+        n = answer.value_number
+        if n == int(n):
+            return str(int(n))
+        return f"{n:.2f}".rstrip("0").rstrip(".")
+    if answer.value_choice is not None:
+        # MULTIPLE_CHOICE stored comma-joined; render as-is.
+        return str(answer.value_choice)
+    if answer.value_boolean is not None:
+        return "Yes" if answer.value_boolean else "No"
+    if answer.value_date is not None:
+        return answer.value_date.isoformat()
+    if answer.value_media_path is not None:
+        # Media URL sent in a follow-up Phase 2E step; for now surface
+        # the stored path so CAs know a photo was uploaded.
+        return f"[photo: {answer.value_media_path}]"
+    return ""
+
+
+@router.get("/client/{cid}/messaging/campaigns/{campaign_id}/responses")
+async def list_responses(
+    cid: str, campaign_id: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Paginated per-recipient response list for the drill-down table
+    on the campaign-detail page. Excludes test recipients from the
+    count + rows so analytics stays clean."""
+    from sqlalchemy import func
+    await _assert_messaging_access(db, current_user, cid)
+    c = (await db.execute(
+        select(Campaign).where(
+            Campaign.id == campaign_id, Campaign.client_id == cid,
+        )
+    )).scalar_one_or_none()
+    if c is None:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    # Base: responses JOIN recipients to get denorm fields + skip test.
+    total = (await db.execute(
+        select(func.count(CampaignResponse.id))
+        .join(CampaignRecipient, CampaignRecipient.id == CampaignResponse.recipient_id)
+        .where(
+            CampaignResponse.campaign_id == campaign_id,
+            CampaignRecipient.is_test.is_(False),
+        )
+    )).scalar_one()
+
+    offset = (page - 1) * page_size
+    rows = (await db.execute(
+        select(CampaignResponse, CampaignRecipient)
+        .join(CampaignRecipient, CampaignRecipient.id == CampaignResponse.recipient_id)
+        .where(
+            CampaignResponse.campaign_id == campaign_id,
+            CampaignRecipient.is_test.is_(False),
+        )
+        .order_by(CampaignResponse.submitted_at.desc())
+        .offset(offset).limit(page_size)
+    )).all()
+    if not rows:
+        return {
+            "rows": [], "total": total, "page": page, "page_size": page_size,
+        }
+
+    # Hydrate answers in bulk — one query across all displayed responses.
+    response_ids = [r.id for r, _ in rows]
+    ans_rows = (await db.execute(
+        select(CampaignResponseAnswer).where(
+            CampaignResponseAnswer.response_id.in_(response_ids),
+        )
+    )).scalars().all()
+    answers_by_response: dict[str, list[CampaignResponseAnswer]] = {}
+    for a in ans_rows:
+        answers_by_response.setdefault(a.response_id, []).append(a)
+
+    # Hydrate question labels (for display + CSV header).
+    q_rows = (await db.execute(
+        select(CampaignQuestion)
+        .where(CampaignQuestion.campaign_id == campaign_id)
+        .order_by(CampaignQuestion.sort_order)
+    )).scalars().all()
+    q_by_id = {q.id: q for q in q_rows}
+
+    # Hydrate state/district cosh → English for display.
+    from app.modules.sync.models import CoshCoreItem
+    cosh_ids = set()
+    for _, r in rows:
+        if r.recipient_state_cosh_id: cosh_ids.add(r.recipient_state_cosh_id)
+        if r.recipient_district_cosh_id: cosh_ids.add(r.recipient_district_cosh_id)
+    name_by_cosh: dict[str, str] = {}
+    if cosh_ids:
+        cores = (await db.execute(
+            select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
+            .where(CoshCoreItem.cosh_id.in_(cosh_ids))
+        )).all()
+        for cid_, trans in cores:
+            name_by_cosh[cid_] = (trans or {}).get("en") or cid_
+
+    shaped = []
+    for resp, recipient in rows:
+        ans_list = sorted(
+            answers_by_response.get(resp.id, []),
+            key=lambda a: q_by_id.get(a.question_id).sort_order if q_by_id.get(a.question_id) else 0,
+        )
+        shaped.append({
+            "response_id": resp.id,
+            "recipient_name": recipient.recipient_name,
+            "recipient_phone_masked": _mask_phone(recipient.recipient_phone),
+            "recipient_state": name_by_cosh.get(recipient.recipient_state_cosh_id or "", ""),
+            "recipient_district": name_by_cosh.get(recipient.recipient_district_cosh_id or "", ""),
+            "submitted_at": resp.submitted_at.isoformat() if resp.submitted_at else None,
+            "interest_answer": resp.interest_answer,
+            "rating": resp.rating,
+            "answers": [
+                {
+                    "question_id": a.question_id,
+                    "question_label": q_by_id.get(a.question_id).label if q_by_id.get(a.question_id) else "(removed)",
+                    "question_type": q_by_id.get(a.question_id).question_type if q_by_id.get(a.question_id) else None,
+                    "display_value": _display_answer(a, q_by_id.get(a.question_id)),
+                }
+                for a in ans_list
+            ],
+        })
+    return {
+        "rows": shaped, "total": total, "page": page, "page_size": page_size,
+        "questions": [
+            {"id": q.id, "label": q.label, "question_type": q.question_type, "sort_order": q.sort_order}
+            for q in q_rows
+        ],
+    }
+
+
+# ── CSV export (CA-only) ────────────────────────────────────────────────
+
+@router.get("/client/{cid}/messaging/campaigns/{campaign_id}/export.csv")
+async def export_responses_csv(
+    cid: str, campaign_id: str,
+    request: Request = None,  # noqa — FastAPI injects when declared
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CSV export of all responses for this campaign. CA-only (same
+    gate as other CSV exports). Writes a row to `report_csv_downloads`
+    with `report_name="messaging_v1"` so the SA Portal CSV audit
+    viewer (shipped 2026-11-21) surfaces this download alongside
+    every other audited CSV."""
+    from app.modules.clients.router import _assert_ca_admin_or_cm_for_client
+    import csv, io
+    from fastapi.responses import StreamingResponse
+    from datetime import datetime
+
+    # Role: CA / CM-EDIT / SA only (not CLIENT_RM, not REPORT_USER —
+    # mirror the CSV convention set in the Queries report).
+    await _assert_ca_admin_or_cm_for_client(db, current_user.id, cid)
+    # Feature flag.
+    if not await client_has_feature(db, cid, "messaging"):
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "feature_not_enabled", "message": "Messaging not enabled."},
+        )
+
+    c = (await db.execute(
+        select(Campaign).where(
+            Campaign.id == campaign_id, Campaign.client_id == cid,
+        )
+    )).scalar_one_or_none()
+    if c is None:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    # Pull everything (no pagination on export).
+    rows = (await db.execute(
+        select(CampaignResponse, CampaignRecipient)
+        .join(CampaignRecipient, CampaignRecipient.id == CampaignResponse.recipient_id)
+        .where(
+            CampaignResponse.campaign_id == campaign_id,
+            CampaignRecipient.is_test.is_(False),
+        )
+        .order_by(CampaignResponse.submitted_at.desc())
+    )).all()
+
+    q_rows = (await db.execute(
+        select(CampaignQuestion)
+        .where(CampaignQuestion.campaign_id == campaign_id)
+        .order_by(CampaignQuestion.sort_order)
+    )).scalars().all()
+    q_by_id = {q.id: q for q in q_rows}
+
+    ans_by_response: dict[str, dict[str, CampaignResponseAnswer]] = {}
+    if rows:
+        response_ids = [r.id for r, _ in rows]
+        ans_rows = (await db.execute(
+            select(CampaignResponseAnswer).where(
+                CampaignResponseAnswer.response_id.in_(response_ids),
+            )
+        )).scalars().all()
+        for a in ans_rows:
+            ans_by_response.setdefault(a.response_id, {})[a.question_id] = a
+
+    # Hydrate cosh id → name for state/district cols.
+    from app.modules.sync.models import CoshCoreItem
+    cosh_ids = set()
+    for _, r in rows:
+        if r.recipient_state_cosh_id: cosh_ids.add(r.recipient_state_cosh_id)
+        if r.recipient_district_cosh_id: cosh_ids.add(r.recipient_district_cosh_id)
+    name_by_cosh: dict[str, str] = {}
+    if cosh_ids:
+        cores = (await db.execute(
+            select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
+            .where(CoshCoreItem.cosh_id.in_(cosh_ids))
+        )).all()
+        for cid_, trans in cores:
+            name_by_cosh[cid_] = (trans or {}).get("en") or cid_
+
+    # Build CSV in-memory. UTF-8 BOM + Excel sep hint (same conventions
+    # we set in the Queries CSV helper).
+    buf = io.StringIO()
+    buf.write("sep=,\r\n")
+    writer = csv.writer(buf, quoting=csv.QUOTE_ALL)
+    header = [
+        "Recipient Name", "Phone (masked)", "State", "District",
+        "Submitted At",
+    ]
+    if c.campaign_type == CampaignType.INTEREST_CAPTURE.value:
+        header.append("Interest Answer")
+    if c.campaign_type == CampaignType.FEEDBACK.value:
+        header.append("Rating")
+    for q in q_rows:
+        header.append(q.label)
+    writer.writerow(header)
+
+    for resp, recipient in rows:
+        row = [
+            recipient.recipient_name,
+            _mask_phone(recipient.recipient_phone),
+            name_by_cosh.get(recipient.recipient_state_cosh_id or "", ""),
+            name_by_cosh.get(recipient.recipient_district_cosh_id or "", ""),
+            resp.submitted_at.isoformat() if resp.submitted_at else "",
+        ]
+        if c.campaign_type == CampaignType.INTEREST_CAPTURE.value:
+            row.append(resp.interest_answer or "")
+        if c.campaign_type == CampaignType.FEEDBACK.value:
+            row.append(str(resp.rating) if resp.rating is not None else "")
+        for q in q_rows:
+            a = ans_by_response.get(resp.id, {}).get(q.id)
+            row.append(_display_answer(a, q) if a else "")
+        writer.writerow(row)
+
+    body = "﻿" + buf.getvalue()  # UTF-8 BOM prefix
+
+    # Audit row — same append-only table as Queries CSV, so the SA
+    # Portal CSV audit viewer surfaces this download automatically
+    # with `report_name="messaging_v1"`.
+    from app.modules.reports.audit import record_csv_download
+    await record_csv_download(
+        db,
+        user=current_user,
+        report_name="messaging_v1",
+        client_id=cid,
+        filters={
+            "campaign_id": campaign_id,
+            "campaign_name": c.name,
+            "campaign_type": c.campaign_type,
+            "recipient_role": c.recipient_role,
+        },
+        row_count=len(rows),
+        request=request,
+    )
+
+    stamp = datetime.utcnow().strftime("%Y%m%d")
+    filename = f"{cid[:8]}-{c.name[:30].replace(' ', '-')}-{stamp}.csv"
+    resp = StreamingResponse(iter([body]), media_type="text/csv")
+    resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return resp
+
+
+# ── Phone-based test-send (convenience wrapper) ─────────────────────────
+
+class TestSendByPhoneIn(BaseModel):
+    """Resolve each phone number to a user_id, then delegate to the
+    regular send flow with is_test=true + test_user_ids. Keeps CAs
+    from having to look up internal user_ids."""
+    phones: list[str]
+
+
+@router.post("/client/{cid}/messaging/campaigns/{campaign_id}/test-send")
+async def test_send_by_phone(
+    cid: str, campaign_id: str, body: TestSendByPhoneIn,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Test-send to 1-5 recipients identified by phone number.
+    Returns `{resolved: [...], unresolved: [...]}` plus the result of
+    the underlying send."""
+    await _assert_messaging_access(db, current_user, cid)
+    phones = [p.strip() for p in (body.phones or []) if p.strip()]
+    if not phones:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "no_phones", "message": "Enter at least one phone number."},
+        )
+    if len(phones) > 5:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "too_many_phones", "message": "Test-send accepts at most 5 recipients."},
+        )
+
+    # Resolve phones → user_ids. Loose match: any user with that phone.
+    # (No role scoping — test-send is a CA ops tool; they may want to
+    # send to their own non-farmer phone.)
+    found = (await db.execute(
+        select(User.id, User.phone).where(User.phone.in_(phones))
+    )).all()
+    by_phone = {ph: uid for uid, ph in found}
+    resolved_ids = [by_phone[p] for p in phones if p in by_phone]
+    unresolved = [p for p in phones if p not in by_phone]
+    if not resolved_ids:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "no_matching_phones",
+                "message": "None of those phone numbers match a RootsTalk account.",
+                "unresolved": unresolved,
+            },
+        )
+
+    # Delegate to the main send flow.
+    c = (await db.execute(
+        select(Campaign).where(
+            Campaign.id == campaign_id, Campaign.client_id == cid,
+        )
+    )).scalar_one_or_none()
+    if c is None:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    snapped = await _snapshot_recipients(
+        db, c, resolved_ids, is_test=True,
+    )
+    await _write_send_audit(db, c, current_user, snapped, is_test=True)
+    await db.commit()
+    from app.tasks.campaign_dispatch import dispatch_campaign
+    dispatch_campaign.delay(c.id, test_only=True)
+
+    return {
+        "sent": True,
+        "resolved_count": len(resolved_ids),
+        "unresolved": unresolved,
+        "is_test": True,
+    }
