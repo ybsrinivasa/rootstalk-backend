@@ -51,6 +51,7 @@ celery_app = Celery(
         "app.tasks.coaching_feedback_reminders",
         "app.tasks.credit_reminders",
         "app.tasks.pundit_exclusivity_expiry",
+        "app.tasks.feature_access_expiry",
     ],
 )
 
@@ -209,6 +210,16 @@ celery_app.conf.beat_schedule = {
     "credit-farmer-weekly-summary": {
         "task": "app.tasks.credit_reminders.dispatch_farmer_weekly_summary",
         "schedule": crontab(hour=2, minute=30, day_of_week=0),
+    },
+    # Feature Access (2026-11-22): daily audit log sweep at 00:15 UTC
+    # (05:45 IST). Does NOT flip any status — expiry is a derived
+    # computation (access_until < now on the latest row). Logs one
+    # line per feature that silently expired in the last 24h so the
+    # worker journal carries a breadcrumb even when the SA dashboard
+    # isn't being watched. See app/tasks/feature_access_expiry.py.
+    "feature-access-expiry-sweep": {
+        "task": "app.tasks.feature_access_expiry.sweep_expiries",
+        "schedule": crontab(hour=0, minute=15),
     },
 }
 

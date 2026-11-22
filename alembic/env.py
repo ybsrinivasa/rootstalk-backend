@@ -50,6 +50,7 @@ from app.modules.soil_nutrient.models import (  # noqa: F401
     SoilRangeTemplate, SoilRangeTemplateRow, PackageNormalRangeOverride,
 )
 from app.modules.reports.models import ReportCsvDownload  # noqa: F401
+from app.modules.feature_access.models import ClientFeatureAccess  # noqa: F401
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.database_url_sync)
