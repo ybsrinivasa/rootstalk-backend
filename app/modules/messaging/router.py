@@ -20,7 +20,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -994,15 +994,53 @@ async def send_campaign(
         )
 
     now = datetime.now(timezone.utc)
-    # Scheduling deferred — reject future send_at for now.
+
+    # Scheduling path (2026-11-22 Phase 2E) — send_at in the future
+    # flips to SCHEDULED; the campaign_schedule beat task activates
+    # it at the right time. Audience is NOT snapshotted at this
+    # point — snapshot runs at activation so the recipient list
+    # reflects reality at the send moment.
     if body.send_at is not None and body.send_at > now:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "code": "scheduling_not_yet_available",
-                "message": "Scheduled sends are not yet supported. Leave send_at empty to send now.",
-            },
-        )
+        # Reject sends scheduled > 180 days out (matches expiry cap
+        # semantics).
+        from datetime import timedelta as _td
+        if body.send_at > now + _td(days=180):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "send_at_too_far",
+                    "message": "send_at must be at most 180 days from now.",
+                },
+            )
+        # Compute + validate expires_at relative to send_at, not now.
+        scheduled_expires = body.expires_at or (body.send_at + timedelta(days=7))
+        if scheduled_expires < body.send_at + timedelta(days=1):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "expires_too_soon",
+                    "message": "expires_at must be at least 1 day after send_at.",
+                },
+            )
+        if scheduled_expires > body.send_at + timedelta(days=180):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "expires_too_far",
+                    "message": "expires_at must be at most 180 days after send_at.",
+                },
+            )
+        c.status = CampaignStatus.SCHEDULED.value
+        c.scheduled_at = body.send_at
+        c.expires_at = scheduled_expires
+        c.updated_at = now
+        await db.commit()
+        return {
+            "sent": False,
+            "scheduled": True,
+            "scheduled_at": body.send_at.isoformat(),
+            "expires_at": scheduled_expires.isoformat(),
+        }
 
     # Compute expiry — floor at now + 1 day per spec §3.1.
     expires = body.expires_at or (now + timedelta(days=7))
@@ -1628,4 +1666,139 @@ async def test_send_by_phone(
         "resolved_count": len(resolved_ids),
         "unresolved": unresolved,
         "is_test": True,
+    }
+
+
+# ── Attachments (Phase 2E, 2026-11-22) ──────────────────────────────────
+
+# Per spec §3.3 — cap 3 attachments × 10 MB each per campaign.
+# Allow-list: images (JPEG/PNG/WebP/GIF), video (MP4/WebM/QuickTime),
+# PDFs. Audio deliberately out — campaigns aren't voice-note channels.
+MESSAGING_ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024
+MESSAGING_ATTACHMENT_MAX_COUNT = 3
+MESSAGING_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+MESSAGING_VIDEO_TYPES = {"video/mp4", "video/webm", "video/quicktime"}
+MESSAGING_PDF_TYPES = {"application/pdf"}
+MESSAGING_ATTACHMENT_TYPES = (
+    MESSAGING_IMAGE_TYPES | MESSAGING_VIDEO_TYPES | MESSAGING_PDF_TYPES
+)
+
+
+def _kind_for_mime(mime: str) -> str:
+    base = (mime or "").split(";", 1)[0].strip()
+    if base in MESSAGING_IMAGE_TYPES: return "IMAGE"
+    if base in MESSAGING_VIDEO_TYPES: return "VIDEO"
+    if base in MESSAGING_PDF_TYPES:   return "PDF"
+    return "IMAGE"  # unreachable — validator rejects first
+
+
+@router.post("/client/{cid}/messaging/campaigns/{campaign_id}/attachments")
+async def add_attachment(
+    cid: str, campaign_id: str,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Upload + attach a file to a DRAFT campaign. Delegates to the
+    shared /media/upload S3 path (same pattern as logo uploads).
+    Returns the created CampaignAttachment shape."""
+    from app.modules.media.router import upload_to_s3
+
+    await _assert_messaging_access(db, current_user, cid)
+    c = await _get_draft_or_422(db, cid, campaign_id)
+
+    count = len((await db.execute(
+        select(CampaignAttachment.id).where(
+            CampaignAttachment.campaign_id == campaign_id,
+        )
+    )).scalars().all())
+    if count >= MESSAGING_ATTACHMENT_MAX_COUNT:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "too_many_attachments",
+                "message": f"A campaign can have at most {MESSAGING_ATTACHMENT_MAX_COUNT} attachments.",
+            },
+        )
+
+    # upload_to_s3 handles type + size validation.
+    uploaded = await upload_to_s3(
+        file,
+        folder="messaging",
+        allowed_types=MESSAGING_ATTACHMENT_TYPES,
+        max_size_bytes=MESSAGING_ATTACHMENT_MAX_BYTES,
+    )
+
+    base_ct = (file.content_type or "").split(";", 1)[0].strip()
+    row = CampaignAttachment(
+        campaign_id=campaign_id,
+        kind=_kind_for_mime(base_ct),
+        storage_path=uploaded["url"],
+        original_filename=(file.filename or "attachment")[:300],
+        size_bytes=file.size or 0,
+        mime_type=base_ct[:100],
+        sort_order=count,
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return {
+        "id": row.id,
+        "kind": row.kind,
+        "url": row.storage_path,
+        "original_filename": row.original_filename,
+        "mime_type": row.mime_type,
+        "size_bytes": row.size_bytes,
+        "sort_order": row.sort_order,
+    }
+
+
+@router.delete("/client/{cid}/messaging/campaigns/{campaign_id}/attachments/{attachment_id}")
+async def remove_attachment(
+    cid: str, campaign_id: str, attachment_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Remove an attachment from a DRAFT. The S3 object itself is NOT
+    deleted (attachments are small + lifecycle policies on the bucket
+    handle cleanup if ever needed) — this just drops the row."""
+    await _assert_messaging_access(db, current_user, cid)
+    _ = await _get_draft_or_422(db, cid, campaign_id)
+    row = (await db.execute(
+        select(CampaignAttachment).where(
+            CampaignAttachment.id == attachment_id,
+            CampaignAttachment.campaign_id == campaign_id,
+        )
+    )).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    await db.delete(row)
+    await db.commit()
+    return {"deleted": True}
+
+
+@router.get("/client/{cid}/messaging/campaigns/{campaign_id}/attachments")
+async def list_attachments(
+    cid: str, campaign_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List attachments on a campaign (for the composer to show current
+    state). CA-side read — gated like everything else."""
+    await _assert_messaging_access(db, current_user, cid)
+    rows = (await db.execute(
+        select(CampaignAttachment)
+        .where(CampaignAttachment.campaign_id == campaign_id)
+        .order_by(CampaignAttachment.sort_order)
+    )).scalars().all()
+    return {
+        "attachments": [
+            {
+                "id": r.id, "kind": r.kind, "url": r.storage_path,
+                "original_filename": r.original_filename,
+                "mime_type": r.mime_type, "size_bytes": r.size_bytes,
+                "sort_order": r.sort_order,
+            }
+            for r in rows
+        ],
     }
