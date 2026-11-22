@@ -52,6 +52,8 @@ celery_app = Celery(
         "app.tasks.credit_reminders",
         "app.tasks.pundit_exclusivity_expiry",
         "app.tasks.feature_access_expiry",
+        "app.tasks.campaign_dispatch",
+        "app.tasks.campaign_expiry",
     ],
 )
 
@@ -210,6 +212,13 @@ celery_app.conf.beat_schedule = {
     "credit-farmer-weekly-summary": {
         "task": "app.tasks.credit_reminders.dispatch_farmer_weekly_summary",
         "schedule": crontab(hour=2, minute=30, day_of_week=0),
+    },
+    # Messaging (2026-11-22): hourly ACTIVE→EXPIRED sweep of
+    # campaigns past their expires_at. :10 to spread the hourly load
+    # off minute-zero. Idempotent.
+    "campaign-expiry-sweep": {
+        "task": "app.tasks.campaign_expiry.sweep_campaign_expiry",
+        "schedule": crontab(minute=10),
     },
     # Feature Access (2026-11-22): daily audit log sweep at 00:15 UTC
     # (05:45 IST). Does NOT flip any status — expiry is a derived

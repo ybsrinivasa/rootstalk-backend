@@ -1101,6 +1101,48 @@ async def toggle_client_status(
 
 # ── Client Portal Login ────────────────────────────────────────────────────────
 
+async def _resolve_feature_access(
+    client_id: str, db: AsyncSession,
+) -> dict:
+    """Return the Messaging / Touchpoints feature-access state so the
+    CP layout can gate the CAMPAIGNS nav + render the Expiring Soon
+    banner without an extra round-trip.
+
+    Shape:
+      messaging_enabled: bool
+      messaging_expires_at: ISO str | None
+      messaging_days_remaining: int | None
+      touchpoints_enabled: bool
+      touchpoints_expires_at: ISO str | None
+      touchpoints_days_remaining: int | None
+    """
+    from datetime import datetime, timezone
+    from app.modules.feature_access.models import (
+        FEATURE_MESSAGING, FEATURE_TOUCHPOINTS,
+    )
+    from app.modules.feature_access.service import (
+        latest_feature_row, row_is_active,
+    )
+    now = datetime.now(timezone.utc)
+    out: dict = {}
+    for key, feature in (
+        ("messaging", FEATURE_MESSAGING),
+        ("touchpoints", FEATURE_TOUCHPOINTS),
+    ):
+        row = await latest_feature_row(db, client_id, feature)
+        enabled = row is not None and row_is_active(row, now)
+        out[f"{key}_enabled"] = enabled
+        if enabled and row is not None:
+            out[f"{key}_expires_at"] = row.access_until.isoformat()
+            out[f"{key}_days_remaining"] = int(
+                (row.access_until - now).total_seconds() // 86400
+            )
+        else:
+            out[f"{key}_expires_at"] = None
+            out[f"{key}_days_remaining"] = None
+    return out
+
+
 async def _resolve_coaching_access(
     client: Client, db: AsyncSession,
 ) -> dict:
@@ -1167,6 +1209,13 @@ async def get_portal_branding(short_name: str, db: AsyncSession = Depends(get_db
         # (see (portal)/layout.tsx refresh effect).
         "soil_nutrient_module_enabled": bool(client.soil_nutrient_module_enabled),
         "has_soil_testing_lab": bool(client.has_soil_testing_lab),
+        # 2026-11-22 — Feature Access state for paid add-ons (Messaging,
+        # Subscription Touchpoints). CP sidebar hides the CAMPAIGNS
+        # nav when _enabled=False. `_expires_at` powers the "Expiring
+        # Soon" banner shown ≤7 days from access_until. Resolved via
+        # the generic client_feature_access read-side helper so adding
+        # a new paid feature later is a one-line addition.
+        **(await _resolve_feature_access(client.id, db)),
         # 2026-10-16 — Coaching workspace access state (hybrid-access
         # model). For is_coaching=true workspaces the frontend reads
         # this to render the GRACE / ARCHIVED banner. Absent for real
