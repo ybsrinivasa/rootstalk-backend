@@ -54,6 +54,7 @@ celery_app = Celery(
         "app.tasks.feature_access_expiry",
         "app.tasks.campaign_dispatch",
         "app.tasks.campaign_expiry",
+        "app.tasks.campaign_schedule",
     ],
 )
 
@@ -219,6 +220,15 @@ celery_app.conf.beat_schedule = {
     "campaign-expiry-sweep": {
         "task": "app.tasks.campaign_expiry.sweep_campaign_expiry",
         "schedule": crontab(minute=10),
+    },
+    # Messaging (2026-11-22 Phase 2E): every-minute sweep that flips
+    # SCHEDULED → ACTIVE at send_at. Audience is snapshotted at
+    # activation (not at /send time), so a Friday-morning send
+    # captures the Friday-morning recipient set. See
+    # app/tasks/campaign_schedule.py.
+    "campaign-schedule-activate": {
+        "task": "app.tasks.campaign_schedule.activate_scheduled_campaigns",
+        "schedule": crontab(minute="*"),
     },
     # Feature Access (2026-11-22): daily audit log sweep at 00:15 UTC
     # (05:45 IST). Does NOT flip any status — expiry is a derived

@@ -220,8 +220,12 @@ async def message_detail(
                 "original_filename": a.original_filename,
                 "mime_type": a.mime_type,
                 "size_bytes": a.size_bytes,
-                # Signed URL comes in Phase 2D.
-                "url": None,
+                # Public S3 URL — storage_path IS the URL (same pattern
+                # as the rest of RootsTalk's uploads). Phase 2E
+                # (2026-11-22). CAs are told at publish time that
+                # recipients can save/forward; we don't attempt to
+                # enforce ephemerality on the web.
+                "url": a.storage_path,
             }
             for a in attachments
         ],
