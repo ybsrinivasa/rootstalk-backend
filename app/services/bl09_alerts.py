@@ -144,11 +144,21 @@ def find_input_practices_due_today(
     v1.13 (2026-09-18): `lead_days` shifts the earliest-active edge by
     N days (advisory-only pre-window alerts). A practice with authored
     window `[from, to]` is "due" when today ∈ `[from - lead_days, to]`.
-    Implemented as `cca_window_active(meta, day_offset + lead_days,
-    today_date + lead_days)` — makes today "look like" it's N days
-    later to the window check, so day-N-before-open becomes day-open.
-    lead_days=0 (default) is byte-identical to the pre-v1.13
-    behaviour — Regular Mode subs are unaffected.
+
+    2026-11-24 — fix: original v1.13 implementation shifted BOTH edges
+    of the window check by `lead_days`, so an Advisory-Only Mode sub
+    with lead_days=2 fired only during the pre-window and went silent
+    the moment the real window actually opened (window `[14,15]` with
+    lead=2 matched days 12-13 then skipped days 14-15 because shifted
+    offset 16-17 was past the close). Caught on prod SM-26-000002
+    where Vikas received no alert despite 2 INPUT practices showing as
+    due in the CP Farmer Support tracker.
+
+    Current implementation: fire if EITHER the shifted check matches
+    (pre-window via lead) OR the unshifted check matches (real window).
+    Union gives today ∈ `[from - lead_days, to]` as the docstring
+    always promised. lead_days=0 is byte-identical to pre-v1.13
+    (shifted==unshifted → single check path).
     """
     if lead_days < 0:
         lead_days = 0
@@ -164,7 +174,12 @@ def find_input_practices_due_today(
             from_value=tl.from_value,
             to_value=tl.to_value,
         )
-        if cca_window_active(meta, shifted_day_offset, today_date=shifted_today_date):
+        fires = cca_window_active(meta, shifted_day_offset, today_date=shifted_today_date)
+        if not fires and lead_days > 0:
+            # Real window check — picks up today when the window has
+            # actually opened but is past the shifted-close.
+            fires = cca_window_active(meta, day_offset, today_date=today_date)
+        if fires:
             out.extend(tl.input_practice_ids)
     return out
 
