@@ -55,6 +55,11 @@ from app.modules.messaging.models import (  # noqa: F401
     Campaign, CampaignAttachment, CampaignQuestion, CampaignRecipient,
     CampaignResponse, CampaignResponseAnswer, CampaignSendAudit,
 )
+from app.modules.touchpoints.models import (  # noqa: F401
+    Touchpoint, TouchpointAssignment, TouchpointAttachment,
+    TouchpointQuestion, TouchpointRecipient, TouchpointResponse,
+    TouchpointResponseAnswer,
+)
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.database_url_sync)

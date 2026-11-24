@@ -70,6 +70,8 @@ from app.modules.soil_nutrient.router import router as soil_nutrient_router
 from app.modules.feature_access.router import router as feature_access_router
 from app.modules.messaging.router import router as messaging_router
 from app.modules.messaging.pwa_router import router as messaging_pwa_router
+from app.modules.touchpoints.router import router as touchpoints_router
+from app.modules.touchpoints.pwa_router import router as touchpoints_pwa_router
 
 # 2026-06-28 — Subscription soft-delete read-path filter. Installs a
 # session-level SQLAlchemy listener that appends
@@ -122,6 +124,8 @@ app.include_router(soil_nutrient_router)
 app.include_router(feature_access_router)
 app.include_router(messaging_router)
 app.include_router(messaging_pwa_router)
+app.include_router(touchpoints_router)
+app.include_router(touchpoints_pwa_router)
 
 
 @app.get("/health")
