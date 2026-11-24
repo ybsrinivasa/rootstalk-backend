@@ -55,6 +55,8 @@ celery_app = Celery(
         "app.tasks.campaign_dispatch",
         "app.tasks.campaign_expiry",
         "app.tasks.campaign_schedule",
+        "app.tasks.touchpoint_firing",
+        "app.tasks.touchpoint_dispatch",
     ],
 )
 
@@ -229,6 +231,17 @@ celery_app.conf.beat_schedule = {
     "campaign-schedule-activate": {
         "task": "app.tasks.campaign_schedule.activate_scheduled_campaigns",
         "schedule": crontab(minute="*"),
+    },
+    # Subscription Touchpoints (2026-11-24 Phase T-C): daily firing
+    # sweep at 06:00 UTC (11:30 IST) — paired with the BL-09 alerts
+    # tick so farmers get one "morning dose" of new content. Walks
+    # active assignments × active subs, matches milestone crossings
+    # since the last run (non-retroactive gate via assignment.
+    # activated_at), writes touchpoint_recipients + enqueues
+    # touchpoint_dispatch. See app/tasks/touchpoint_firing.py.
+    "touchpoint-firing-daily": {
+        "task": "app.tasks.touchpoint_firing.sweep_touchpoint_firings",
+        "schedule": crontab(hour=6, minute=0),
     },
     # Feature Access (2026-11-22): daily audit log sweep at 00:15 UTC
     # (05:45 IST). Does NOT flip any status — expiry is a derived

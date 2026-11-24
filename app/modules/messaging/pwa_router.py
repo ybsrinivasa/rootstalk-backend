@@ -59,21 +59,69 @@ async def inbox_list(
     activity on top — WhatsApp reshuffle). Within-org ordering
     happens in the sibling `/pwa/messages/org/{cid}` endpoint.
 
-    Expired/cancelled/archived campaigns are hidden per spec; orgs
-    whose messages are all expired disappear from the inbox.
+    UNIFIED (2026-11-24 — Phase T-D): includes both Messaging Module
+    campaigns AND Subscription Touchpoints firings. The farmer sees
+    one card per company regardless of which feature produced the
+    message. Only the message detail view distinguishes them (via
+    the subscription-context tag on touchpoint firings).
     """
-    rows = (await db.execute(
+    now = datetime.now(timezone.utc)
+
+    # ─ Messaging side ─
+    camp_rows = (await db.execute(
         select(CampaignRecipient, Campaign)
         .join(Campaign, Campaign.id == CampaignRecipient.campaign_id)
         .where(
             CampaignRecipient.user_id == current_user.id,
             Campaign.status == CampaignStatus.ACTIVE.value,
         )
-        .order_by(Campaign.sent_at.desc())
     )).all()
 
+    # ─ Touchpoints side ─
+    from app.modules.touchpoints.models import (
+        Touchpoint, TouchpointRecipient, TouchpointStatus,
+    )
+    tp_rows = (await db.execute(
+        select(TouchpointRecipient, Touchpoint)
+        .join(Touchpoint, Touchpoint.id == TouchpointRecipient.touchpoint_id)
+        .where(
+            TouchpointRecipient.user_id == current_user.id,
+            TouchpointRecipient.expires_at > now,
+            Touchpoint.status == TouchpointStatus.ACTIVE.value,
+        )
+    )).all()
+
+    # Normalise each source into a common shape: (client_id, title,
+    # sent_at, is_unread, is_pending_response). Lets the grouping
+    # logic work uniformly regardless of source.
+    normalised: list[dict] = []
+    for recipient, camp in camp_rows:
+        normalised.append({
+            "client_id": camp.client_id,
+            "title": camp.title,
+            "at": camp.sent_at,
+            "is_unread": recipient.opened_at is None,
+            "is_pending_response": (
+                camp.campaign_type != CampaignType.ANNOUNCEMENT.value
+                and recipient.responded_at is None
+            ),
+        })
+    for recipient, tp in tp_rows:
+        from app.modules.touchpoints.models import TouchpointContentType
+        normalised.append({
+            "client_id": tp.client_id,
+            "title": tp.title,
+            "at": recipient.fired_at,
+            "is_unread": recipient.opened_at is None,
+            "is_pending_response": (
+                tp.content_type != TouchpointContentType.ANNOUNCEMENT.value
+                and recipient.responded_at is None
+            ),
+        })
+
+    # Hydrate client metadata in one pass across both sources.
     from app.modules.clients.models import Client
-    client_ids = {c.client_id for _, c in rows}
+    client_ids = {n["client_id"] for n in normalised}
     client_meta: dict[str, dict] = {}
     if client_ids:
         crows = (await db.execute(
@@ -85,18 +133,18 @@ async def inbox_list(
             for cid, name, logo in crows
         }
 
-    # Group by client_id. Rows are already ordered newest-first,
-    # so first-seen per client = most recent.
+    # Sort newest-first so grouping picks the right most_recent_*.
+    normalised.sort(key=lambda n: n["at"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+
     orgs: dict[str, dict] = {}
     unread_total = 0
-    for recipient, camp in rows:
-        is_unread = recipient.opened_at is None
-        if is_unread:
+    for item in normalised:
+        if item["is_unread"]:
             unread_total += 1
-        bucket = orgs.setdefault(camp.client_id, {
-            "client_id": camp.client_id,
-            "client_name": client_meta.get(camp.client_id, {}).get("name", ""),
-            "client_logo_url": client_meta.get(camp.client_id, {}).get("logo_url"),
+        bucket = orgs.setdefault(item["client_id"], {
+            "client_id": item["client_id"],
+            "client_name": client_meta.get(item["client_id"], {}).get("name", ""),
+            "client_logo_url": client_meta.get(item["client_id"], {}).get("logo_url"),
             "unread_count": 0,
             "message_count": 0,
             "pending_response_count": 0,
@@ -105,18 +153,16 @@ async def inbox_list(
             "most_recent_is_unread": False,
         })
         bucket["message_count"] += 1
-        if is_unread:
+        if item["is_unread"]:
             bucket["unread_count"] += 1
-        expects_response = camp.campaign_type != CampaignType.ANNOUNCEMENT.value
-        if expects_response and recipient.responded_at is None:
+        if item["is_pending_response"]:
             bucket["pending_response_count"] += 1
-        # Because rows are newest-first, the first bucket write wins.
+        # First-seen per bucket (normalised is newest-first) = most recent.
         if bucket["most_recent_at"] is None:
-            bucket["most_recent_at"] = camp.sent_at.isoformat() if camp.sent_at else None
-            bucket["most_recent_title"] = camp.title
-            bucket["most_recent_is_unread"] = is_unread
+            bucket["most_recent_at"] = item["at"].isoformat() if item["at"] else None
+            bucket["most_recent_title"] = item["title"]
+            bucket["most_recent_is_unread"] = item["is_unread"]
 
-    # Order orgs by most_recent_at DESC (WhatsApp reshuffle).
     organizations = sorted(
         orgs.values(),
         key=lambda o: o["most_recent_at"] or "",
@@ -138,8 +184,20 @@ async def org_messages(
 
     Access: implicit — only returns messages where the current user
     is a recipient. No separate role/client gate needed.
+
+    UNIFIED (2026-11-24 — Phase T-D): items include both Messaging
+    Module campaigns and Touchpoints firings interleaved
+    chronologically. Each item carries a `source` discriminator
+    ('campaign' | 'touchpoint') so the PWA can route detail-page
+    taps correctly. Touchpoint items also carry a
+    `subscription_context` object (crop_name, timeline_name, fire_at)
+    so bubble previews can show "About your Chilli · End of
+    Vegetative Growth" without an extra fetch.
     """
-    rows = (await db.execute(
+    now = datetime.now(timezone.utc)
+
+    # ─ Messaging side ─
+    camp_rows = (await db.execute(
         select(CampaignRecipient, Campaign)
         .join(Campaign, Campaign.id == CampaignRecipient.campaign_id)
         .where(
@@ -147,32 +205,95 @@ async def org_messages(
             Campaign.client_id == client_id,
             Campaign.status == CampaignStatus.ACTIVE.value,
         )
-        .order_by(Campaign.sent_at.asc())  # oldest first — chat order
     )).all()
+
+    # ─ Touchpoints side ─
+    from app.modules.touchpoints.models import (
+        Touchpoint, TouchpointContentType, TouchpointRecipient,
+        TouchpointStatus,
+    )
+    tp_rows = (await db.execute(
+        select(TouchpointRecipient, Touchpoint)
+        .join(Touchpoint, Touchpoint.id == TouchpointRecipient.touchpoint_id)
+        .where(
+            TouchpointRecipient.user_id == current_user.id,
+            Touchpoint.client_id == client_id,
+            TouchpointRecipient.expires_at > now,
+            Touchpoint.status == TouchpointStatus.ACTIVE.value,
+        )
+    )).all()
+
+    # Resolve crop_cosh_id → crop name for touchpoint items.
+    from app.modules.sync.models import CoshCoreItem
+    crop_ids = {r.crop_cosh_id for r, _ in tp_rows if r.crop_cosh_id}
+    crop_name_by_id: dict[str, str] = {}
+    if crop_ids:
+        cores = (await db.execute(
+            select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
+            .where(CoshCoreItem.cosh_id.in_(crop_ids))
+        )).all()
+        for cid_, trans in cores:
+            crop_name_by_id[cid_] = (trans or {}).get("en") or cid_
 
     from app.modules.clients.models import Client
     client = (await db.execute(
         select(Client).where(Client.id == client_id)
     )).scalar_one_or_none()
 
-    items = []
-    for recipient, camp in rows:
+    items: list[dict] = []
+    for recipient, camp in camp_rows:
         is_unread = recipient.opened_at is None
         expects_response = camp.campaign_type != CampaignType.ANNOUNCEMENT.value
         pending_response = expects_response and recipient.responded_at is None
         items.append({
+            "source": "campaign",
             "recipient_id": recipient.id,
             "campaign_id": camp.id,
+            "detail_key": camp.id,  # URL path param for detail navigation
             "title": camp.title,
             "preview": (camp.body or "")[:200],
-            "campaign_type": camp.campaign_type,
+            "content_type": camp.campaign_type,
+            "at": camp.sent_at,
             "sent_at": camp.sent_at.isoformat() if camp.sent_at else None,
             "expires_at": camp.expires_at.isoformat() if camp.expires_at else None,
             "is_unread": is_unread,
             "expects_response": expects_response,
             "pending_response": pending_response,
             "is_test": recipient.is_test,
+            "subscription_context": None,
         })
+    for recipient, tp in tp_rows:
+        is_unread = recipient.opened_at is None
+        expects_response = tp.content_type != TouchpointContentType.ANNOUNCEMENT.value
+        pending_response = expects_response and recipient.responded_at is None
+        items.append({
+            "source": "touchpoint",
+            "recipient_id": recipient.id,
+            "touchpoint_id": tp.id,
+            "detail_key": recipient.id,  # Touchpoints route by recipient_id
+            "title": tp.title,
+            "preview": (tp.body or "")[:200],
+            "content_type": tp.content_type,
+            "at": recipient.fired_at,
+            "sent_at": recipient.fired_at.isoformat() if recipient.fired_at else None,
+            "expires_at": recipient.expires_at.isoformat() if recipient.expires_at else None,
+            "is_unread": is_unread,
+            "expects_response": expects_response,
+            "pending_response": pending_response,
+            "is_test": False,
+            "subscription_context": {
+                "crop_name": crop_name_by_id.get(recipient.crop_cosh_id or "", ""),
+                "crop_cosh_id": recipient.crop_cosh_id,
+                "timeline_name": recipient.timeline_name,
+                "fire_at": recipient.fire_at,
+            },
+        })
+
+    # Chat order = oldest at top, newest at bottom.
+    items.sort(key=lambda i: i["at"] or datetime.min.replace(tzinfo=timezone.utc))
+    # Strip the sort-only `at` key so the wire response is clean.
+    for i in items:
+        i.pop("at", None)
 
     return {
         "client_id": client_id,
@@ -190,8 +311,8 @@ async def inbox_badge(
     current_user: User = Depends(get_current_user),
 ):
     """Cheap scalar read for the bottom-nav badge. Counts unread
-    ACTIVE campaigns for this recipient."""
-    count = (await db.execute(
+    ACTIVE campaigns + unread (not-yet-expired) touchpoint firings."""
+    camp_count = (await db.execute(
         select(func.count(CampaignRecipient.id))
         .join(Campaign, Campaign.id == CampaignRecipient.campaign_id)
         .where(
@@ -200,7 +321,21 @@ async def inbox_badge(
             Campaign.status == CampaignStatus.ACTIVE.value,
         )
     )).scalar_one()
-    return {"unread_count": int(count or 0)}
+    from app.modules.touchpoints.models import (
+        Touchpoint, TouchpointRecipient, TouchpointStatus,
+    )
+    now = datetime.now(timezone.utc)
+    tp_count = (await db.execute(
+        select(func.count(TouchpointRecipient.id))
+        .join(Touchpoint, Touchpoint.id == TouchpointRecipient.touchpoint_id)
+        .where(
+            TouchpointRecipient.user_id == current_user.id,
+            TouchpointRecipient.opened_at.is_(None),
+            TouchpointRecipient.expires_at > now,
+            Touchpoint.status == TouchpointStatus.ACTIVE.value,
+        )
+    )).scalar_one()
+    return {"unread_count": int(camp_count or 0) + int(tp_count or 0)}
 
 
 # ── Message detail ───────────────────────────────────────────────────────
