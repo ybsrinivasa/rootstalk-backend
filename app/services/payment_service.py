@@ -115,6 +115,7 @@ def verify_payment_signature(razorpay_order_id: str, razorpay_payment_id: str, r
 def create_subscription_payment_link(
     *, payment_request_id: str, farmer_name: str | None,
     expire_in_seconds: int,
+    amount_paise_override: int | None = None,
 ) -> dict:
     """Create a Razorpay Payment Link the farmer can share with
     anyone (e.g., a relative in a city). Returns the link's
@@ -122,7 +123,13 @@ def create_subscription_payment_link(
     'https://rzp.io/i/xxx').
 
     Constraints encoded in the request:
-      • amount = settings.subscription_amount_paise (₹199 prod, ₹1 test)
+      • amount = amount_paise_override OR settings.subscription_amount_paise
+        (₹199 prod default, ₹1 test). The override lets Advisory-Only
+        Mode subs charge the client's per-sub fee (from
+        Subscription.subscription_fee_paise) instead of the platform
+        default — added 2026-11-24 after Mohammad Assim on SMS Grow
+        was overcharged ₹199 via a SHARE_LINK when his sub carries
+        subscription_fee_paise=9900 (₹99).
       • accept_partial=false (no part-pays)
       • expire_by = now + expire_in_seconds (matches our
         SubscriptionPaymentRequest.expires_at so both sides time
@@ -132,8 +139,13 @@ def create_subscription_payment_link(
     """
     import time
     client = _client()
+    amount = (
+        amount_paise_override
+        if amount_paise_override is not None
+        else settings.subscription_amount_paise
+    )
     body = {
-        "amount": settings.subscription_amount_paise,
+        "amount": amount,
         "currency": "INR",
         "accept_partial": False,
         "description": "RootsTalk Subscription",

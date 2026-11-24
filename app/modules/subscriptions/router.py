@@ -3863,6 +3863,7 @@ async def create_payment_share_link(
     via `notes.payment_request_id`.
     """
     from app.services.payment_service import create_subscription_payment_link
+    from app.config import settings
 
     sub = await _get_subscription(db, subscription_id, current_user.id)
 
@@ -3888,12 +3889,22 @@ async def create_payment_share_link(
             },
         )
 
+    # Effective amount per Advisory-Only Mode: when the sub carries
+    # a per-sub subscription_fee_paise (SMS Grow's ₹99, etc.), that
+    # overrides the platform default (₹199). Before 2026-11-24 the
+    # SHARE_LINK path ignored this and always charged ₹199 — real
+    # farmers were overcharged (Mohammad Assim on SM-26-000005 paid
+    # ₹199 via plink_U3xIxDZlWOThe6 before this patch landed).
+    amount_paise = sub.subscription_fee_paise or settings.subscription_amount_paise
+    amount_rupees = amount_paise / 100
+
     expires_at = datetime.now(timezone.utc) + timedelta(hours=PAYMENT_REQUEST_EXPIRY_HOURS)
     pr = SubscriptionPaymentRequest(
         subscription_id=subscription_id,
         farmer_user_id=current_user.id,
         requested_from_user_id=None,
         method="SHARE_LINK",
+        amount=amount_rupees,
         expires_at=expires_at,
     )
     db.add(pr)
@@ -3904,6 +3915,7 @@ async def create_payment_share_link(
             payment_request_id=pr.id,
             farmer_name=current_user.name,
             expire_in_seconds=PAYMENT_REQUEST_EXPIRY_HOURS * 3600,
+            amount_paise_override=amount_paise,
         )
     except Exception as e:
         await db.rollback()
@@ -4620,7 +4632,14 @@ async def dealer_create_payment_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Dealer/Facilitator creates a RazorPay order to pay Rs. 199 for a farmer."""
+    """Dealer/Facilitator creates a RazorPay order to pay for a farmer.
+
+    Amount is ₹199 (platform default) unless the farmer's subscription
+    carries a per-sub `subscription_fee_paise` override (Advisory-Only
+    Mode clients like SMS Grow charge ₹99). Before 2026-11-24 the
+    override was missed on this path — dealers would have been
+    overcharged if they ever paid for an Advisory-Only farmer.
+    """
     from app.services.payment_service import create_subscription_order
     pr = (await db.execute(
         select(SubscriptionPaymentRequest).where(
@@ -4631,7 +4650,13 @@ async def dealer_create_payment_order(
     )).scalar_one_or_none()
     if not pr:
         raise HTTPException(status_code=404, detail="Payment request not found or already handled")
-    order = create_subscription_order(receipt=request_id[:20])
+    sub = (await db.execute(
+        select(Subscription).where(Subscription.id == pr.subscription_id)
+    )).scalar_one()
+    order = create_subscription_order(
+        receipt=request_id[:20],
+        amount_paise_override=sub.subscription_fee_paise,
+    )
     return order
 
 
