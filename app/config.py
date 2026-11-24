@@ -155,6 +155,16 @@ class Settings(BaseSettings):
     # regardless of this flag (see _surface_dev_otp).
     surface_dev_otp: bool = True
 
+    # 2026-11-24 — Per-phone OTP whitelist that bypasses the production
+    # surface-OTP guard. Comma-separated phones in the
+    # OTP_WHITELIST_PHONES env var (e.g. "+919000000001,+919000000002")
+    # get the raw dev_otp in the /auth/request-otp response EVEN on
+    # production, so external testers (Razorpay KYC, QA vendors) can
+    # exercise the login + payment flow without SMS access to the
+    # test number. Keep the list tight — every phone here has its
+    # OTP leaked over an unauthenticated endpoint.
+    otp_whitelist_phones: str = ""
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 

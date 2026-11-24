@@ -45,6 +45,28 @@ def _surface_dev_otp() -> bool:
     return settings.surface_dev_otp
 
 
+def _otp_whitelist_phones() -> set[str]:
+    """Normalised set of phones from settings.otp_whitelist_phones.
+    Comma-separated env var; each entry stripped. Empty when unset."""
+    raw = settings.otp_whitelist_phones or ""
+    return {p.strip() for p in raw.split(",") if p.strip()}
+
+
+def _surface_dev_otp_for_phone(phone: str | None) -> bool:
+    """Extension of `_surface_dev_otp` that also surfaces the OTP on
+    production for specific whitelisted phones.
+
+    2026-11-24 — added for Razorpay prod KYC testing. Their compliance
+    team needed a known OTP to exercise the end-to-end login + payment
+    flow without SMS access to the test phone. Only phones explicitly
+    listed in OTP_WHITELIST_PHONES get the OTP surfaced on prod — every
+    other prod phone follows the SMS-only path per the original guard.
+    """
+    if phone and phone in _otp_whitelist_phones():
+        return True
+    return _surface_dev_otp()
+
+
 async def _check_client_user(db: AsyncSession, user: User, short_name: str) -> Client:
     """When logging in via client portal: verify client is ACTIVE and
     user belongs to it. Returns the Client row so callers can bind
@@ -152,11 +174,11 @@ async def request_otp(request: PhoneOtpRequest, db: AsyncSession = Depends(get_d
         logger.info(f"[COACHING TEMP] OTP for {request.phone}: {otp_code}")
         return {"detail": "OTP sent.", "dev_otp": otp_code, "coaching_temp": True}
 
-    if _surface_dev_otp():
-        logger.info(f"[NON-PROD] OTP for {request.phone}: {otp_code}")
+    if _surface_dev_otp_for_phone(request.phone):
+        logger.info(f"[DEV_OTP_SURFACED] OTP for {request.phone}: {otp_code}")
         # Still attempt SMS if a gateway key is configured — useful
-        # for testing real-phone delivery. Failure is non-fatal in
-        # non-prod since the caller also gets dev_otp.
+        # for testing real-phone delivery. Failure is non-fatal here
+        # since the caller also gets dev_otp.
         if settings.draft_sms_key:
             await send_otp_sms(request.phone, otp_code)
         return {"detail": "OTP sent.", "dev_otp": otp_code}
