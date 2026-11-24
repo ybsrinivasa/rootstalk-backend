@@ -468,19 +468,45 @@ async def request_delete_otp(
     from the global `SURFACE_DEV_OTP` flag. On any non-production
     environment the delete-OTP always surfaces in the response so
     testers can walk the delete flow even when login/password OTP
-    surfacing is off (useful while the delete-OTP SMS template
-    works through DLT registration + Draft4SMS approval). The
-    hard production gate (`environment == "production"`) still
-    applies — prod cannot leak this code regardless of any flag.
-    Safe surface: this endpoint requires an authenticated JWT,
-    so even on staging the code only reaches the authenticated
-    caller — not a public login surface."""
+    surfacing is off. The hard production gate stays — prod never
+    leaks this code regardless of any flag. Safe surface: this
+    endpoint requires an authenticated JWT, so even on staging the
+    code only reaches the authenticated caller — not a public login
+    surface.
+
+    2026-11-24 — DLT-approved SMS delivery wired in via a dedicated
+    `send_delete_account_otp_sms` helper that carries the Delete-
+    Account template (approved as `NEAPL / otp for delete account`).
+    Login OTP uses a DIFFERENT template — mixing the two is unsafe
+    (operators scrub on exact body match). On prod the SMS send is
+    the ONLY delivery channel; a failure raises 503 so the user
+    knows to retry. On non-prod the SMS attempt is best-effort —
+    the caller still gets dev_otp in the response regardless.
+    """
+    from app.services.sms_service import send_delete_account_otp_sms
+
     if not current_user.phone:
         raise HTTPException(status_code=422, detail="No phone number on this account")
     otp_code = await create_phone_otp(db, current_user.phone)
-    response = {"detail": "OTP sent to your phone"}
+
+    sms_sent = await send_delete_account_otp_sms(current_user.phone, otp_code)
+
+    response: dict = {"detail": "OTP sent to your phone"}
     if settings.environment != "production":
+        # Non-prod: always surface dev_otp (regardless of SMS outcome)
+        # so testers can walk the delete flow end-to-end even when
+        # the SMS gateway isn't configured.
         response["dev_otp"] = otp_code
+        return response
+
+    # Prod: SMS is the only channel. Failure = raise 503 so the
+    # farmer knows to retry rather than see a silent success that
+    # never arrives.
+    if not sms_sent:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Failed to send OTP. Please try again.",
+        )
     return response
 
 

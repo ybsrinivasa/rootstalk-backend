@@ -89,3 +89,30 @@ async def send_otp_sms(phone: str, otp_code: str) -> bool:
         f"@{origin} #{otp_code}"
     )
     return await send_sms(phone, message)
+
+
+async def send_delete_account_otp_sms(phone: str, otp_code: str) -> bool:
+    """Send the Delete-Account OTP via Draft4SMS. DISTINCT DLT template
+    from `send_otp_sms` (which is Login OTP) — operators match on
+    exact body, so these must stay in separate functions with their
+    own template strings. Mixing the two risks either (a) silently
+    dropping the delete-OTP at the scrubber, or (b) if we ever changed
+    the login template, breaking deletion too.
+
+    DLT template approved 2026-11-24 under header `NEAPL`, sender
+    `EYFARM`, title `otp for delete account`. Body below MUST stay
+    byte-identical to the registered template — single-character
+    differences fail the match. No WebOTP line (template is single-
+    line); delete flow is triggered from an authenticated page where
+    the user types the 6 digits manually.
+
+    Called from the authenticated `/auth/me/request-delete-otp`
+    endpoint — never public-facing, so no risk of OTP-spam attacks
+    against arbitrary phones. Returns True on success, False on failure.
+    """
+    message = (
+        f"{otp_code} is your OTP for deleting rootsTALK account. "
+        f"Valid for 30 seconds. Do not share. "
+        f"- NEYTIRI EYWAFARM AGRITECH PRIVATE LIMITED"
+    )
+    return await send_sms(phone, message)
