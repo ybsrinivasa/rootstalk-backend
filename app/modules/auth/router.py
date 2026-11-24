@@ -464,24 +464,25 @@ async def request_delete_otp(
 ):
     """Send OTP to farmer's phone to confirm account deletion.
 
-    2026-11-17 — dev_otp surfacing on this endpoint is decoupled
-    from the global `SURFACE_DEV_OTP` flag. On any non-production
-    environment the delete-OTP always surfaces in the response so
-    testers can walk the delete flow even when login/password OTP
-    surfacing is off. The hard production gate stays — prod never
-    leaks this code regardless of any flag. Safe surface: this
-    endpoint requires an authenticated JWT, so even on staging the
-    code only reaches the authenticated caller — not a public login
-    surface.
-
     2026-11-24 — DLT-approved SMS delivery wired in via a dedicated
     `send_delete_account_otp_sms` helper that carries the Delete-
     Account template (approved as `NEAPL / otp for delete account`).
     Login OTP uses a DIFFERENT template — mixing the two is unsafe
-    (operators scrub on exact body match). On prod the SMS send is
-    the ONLY delivery channel; a failure raises 503 so the user
-    knows to retry. On non-prod the SMS attempt is best-effort —
-    the caller still gets dev_otp in the response regardless.
+    (operators scrub on exact body match).
+
+    Dev-OTP surfacing now follows the standard `_surface_dev_otp()`
+    rule (same as Login OTP): on production NEVER surfaces; on non-
+    production respects `settings.surface_dev_otp` (staging has this
+    OFF, so staging also runs SMS-only now that the DLT template is
+    live). The earlier "always-on dedicated branch" (added 2026-11-17
+    while waiting on DLT) was removed 2026-11-24 after a user noticed
+    both the on-screen badge AND the SMS arriving on staging — the
+    badge is redundant now and arguably leaky on a shared screen.
+
+    SMS failure returns 503 on prod so the farmer retries rather than
+    see a silent success. On non-prod the SMS attempt is best-effort
+    (many dev envs have no SMS gateway); `_surface_dev_otp()` returns
+    the code via dev_otp if configured, otherwise nothing.
     """
     from app.services.sms_service import send_delete_account_otp_sms
 
@@ -492,16 +493,13 @@ async def request_delete_otp(
     sms_sent = await send_delete_account_otp_sms(current_user.phone, otp_code)
 
     response: dict = {"detail": "OTP sent to your phone"}
-    if settings.environment != "production":
-        # Non-prod: always surface dev_otp (regardless of SMS outcome)
-        # so testers can walk the delete flow end-to-end even when
-        # the SMS gateway isn't configured.
+    if _surface_dev_otp():
         response["dev_otp"] = otp_code
         return response
 
-    # Prod: SMS is the only channel. Failure = raise 503 so the
-    # farmer knows to retry rather than see a silent success that
-    # never arrives.
+    # Prod (and staging with SURFACE_DEV_OTP=false): SMS is the only
+    # channel. Failure = raise 503 so the farmer knows to retry
+    # rather than see a silent success that never arrives.
     if not sms_sent:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
