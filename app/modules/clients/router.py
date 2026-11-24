@@ -2735,6 +2735,42 @@ async def lookup_user_by_phone(
     return {"exists": False, "name": None}
 
 
+async def _delete_phantom_promoter_pundit_cfp(
+    db: AsyncSession, *, client_id: str, user_id: str,
+) -> None:
+    """Delete the phantom ClientFarmPundit row backing an FM-side
+    is_promoter_pundit flag. Mirror of the inline delete in
+    `fm_toggle_promoter_pundit` (line 2972ff) so paths that flip the
+    flag off cascade to the CFP routing table consistently.
+
+    2026-11-24 — added after Shubha on SMS Grow kept showing as an
+    ACTIVE Promoter-Pundit on the FarmPundits tab even though her
+    ClientPromoter row was INACTIVE + is_promoter_pundit=False. Both
+    deactivate_promoter and revoke_promoter flipped the flag but left
+    the phantom CFP row behind.
+
+    Safe to call when no profile exists or no phantom row exists —
+    both branches are no-ops.
+    """
+    from app.modules.farmpundit.models import (
+        ClientFarmPundit, FarmPunditProfile, PunditRole,
+    )
+    from sqlalchemy import delete as sa_delete
+    profile = (await db.execute(
+        select(FarmPunditProfile).where(FarmPunditProfile.user_id == user_id)
+    )).scalar_one_or_none()
+    if profile is None:
+        return
+    await db.execute(
+        sa_delete(ClientFarmPundit).where(
+            ClientFarmPundit.client_id == client_id,
+            ClientFarmPundit.pundit_id == profile.id,
+            ClientFarmPundit.role == PunditRole.PROMOTER_PUNDIT,
+            ClientFarmPundit.searchable == False,  # noqa: E712
+        )
+    )
+
+
 @router.put("/client/{client_id}/field-manager/promoters/{promoter_id}/deactivate")
 async def deactivate_promoter(
     client_id: str,
@@ -2765,6 +2801,13 @@ async def deactivate_promoter(
     # can no longer route to them, and the flag would silently
     # re-activate on re-onboarding.
     cp.is_promoter_pundit = False
+    # 2026-11-24 — also delete the phantom CFP row so the CA's
+    # FarmPundits > Promoter-Pundits tab stops showing this person.
+    # Shubha at SMS Grow was the trigger — INACTIVE on FM page but
+    # ACTIVE on Promoter-Pundits tab because the CFP row persisted.
+    await _delete_phantom_promoter_pundit_cfp(
+        db, client_id=client_id, user_id=cp.user_id,
+    )
     await db.commit()
     return {"status": "INACTIVE"}
 
@@ -3166,6 +3209,12 @@ async def revoke_promoter(
     # the person as a functional Pundit even though the Promoter role
     # (its prerequisite) is gone.
     cp.is_promoter_pundit = False
+    # 2026-11-24 — cascade to the phantom CFP row (same reason as
+    # deactivate_promoter — the FM-page flag flip has to propagate to
+    # the CA's Promoter-Pundits tab).
+    await _delete_phantom_promoter_pundit_cfp(
+        db, client_id=client_id, user_id=cp.user_id,
+    )
     cp.promoter_request_status = "NONE"
     cp.promoter_request_responded_at = datetime.now(timezone.utc)
     await db.commit()
