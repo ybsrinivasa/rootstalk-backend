@@ -364,6 +364,127 @@ async def list_touchpoints(
     return {"touchpoints": out}
 
 
+# ── Composer picker: Crop → Package → Timeline cascade ─────────────────
+#
+# These static-path routes MUST be registered BEFORE
+# `GET /client/{cid}/touchpoints/{tid}` — otherwise FastAPI's first-
+# match ordering routes GET .../touchpoints/crops into the {tid}
+# handler as tid="crops" and 404s with "Touchpoint not found" (bug
+# caught on staging 2026-11-24 while the Triggers step was loading).
+# Feature-flag probe (/access) sits here for the same reason.
+
+@router.get("/client/{cid}/touchpoints/crops")
+async def list_crops_with_active_packages(
+    cid: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Crops that have ≥1 ACTIVE package under this client.
+    First step of the composer's PoP-assignment cascade."""
+    await _assert_touchpoints_access(db, current_user, cid)
+    crop_ids = (await db.execute(
+        select(Package.crop_cosh_id).where(
+            Package.client_id == cid,
+            Package.status == PackageStatus.ACTIVE.value,
+            Package.crop_cosh_id.isnot(None),
+        ).distinct()
+    )).scalars().all()
+    if not crop_ids:
+        return {"crops": []}
+    from app.modules.sync.models import CoshCoreItem
+    cores = (await db.execute(
+        select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
+        .where(CoshCoreItem.cosh_id.in_(crop_ids))
+    )).all()
+    name_by_id = {cid_: ((trans or {}).get("en") or cid_) for cid_, trans in cores}
+    crops = [
+        {"cosh_id": c, "name": name_by_id.get(c, c)} for c in crop_ids
+    ]
+    crops.sort(key=lambda o: o["name"].casefold())
+    return {"crops": crops}
+
+
+@router.get("/client/{cid}/touchpoints/packages")
+async def list_packages_for_crop(
+    cid: str,
+    crop_cosh_id: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """ACTIVE packages for a given crop under this client.
+    Second step of the composer cascade."""
+    await _assert_touchpoints_access(db, current_user, cid)
+    rows = (await db.execute(
+        select(Package.id, Package.name).where(
+            Package.client_id == cid,
+            Package.status == PackageStatus.ACTIVE.value,
+            Package.crop_cosh_id == crop_cosh_id,
+        ).order_by(Package.name)
+    )).all()
+    return {
+        "packages": [{"id": pid, "name": name or ""} for pid, name in rows],
+    }
+
+
+@router.get("/client/{cid}/touchpoints/timelines")
+async def list_timelines_for_package(
+    cid: str,
+    package_id: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Timelines in a package (ordered by their sort position in
+    the PoP). Third step of the composer cascade."""
+    await _assert_touchpoints_access(db, current_user, cid)
+    pkg = (await db.execute(
+        select(Package.id).where(
+            Package.id == package_id,
+            Package.client_id == cid,
+        )
+    )).scalar_one_or_none()
+    if pkg is None:
+        raise HTTPException(status_code=404, detail="Package not found")
+    # ACTIVE timelines only — INACTIVE timelines are excluded from
+    # farmer advisory (Batch 28 per Timeline.status docstring), so
+    # hosting a touchpoint on an INACTIVE timeline would be a
+    # firing-against-nothing situation. Order by display_order.
+    rows = (await db.execute(
+        select(Timeline.id, Timeline.name)
+        .where(
+            Timeline.package_id == package_id,
+            Timeline.status == "ACTIVE",
+        )
+        .order_by(Timeline.display_order.asc(), Timeline.name.asc())
+    )).all()
+    return {
+        "timelines": [{"id": tid, "name": name or ""} for tid, name in rows],
+    }
+
+
+@router.get("/client/{cid}/touchpoints/access")
+async def touchpoints_access(
+    cid: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Returns {enabled, expires_at, days_remaining} so the CP can
+    decide whether to render the nav + Expiring Soon banner. Does
+    NOT 403 when feature is off — reports state."""
+    from app.modules.clients.router import _assert_ca_or_rm
+    await _assert_ca_or_rm(db, current_user, cid)
+    from app.modules.feature_access.service import latest_feature_row, row_is_active
+    latest = await latest_feature_row(db, cid, FEATURE_TOUCHPOINTS)
+    if latest is None or not row_is_active(latest):
+        return {"enabled": False, "expires_at": None, "days_remaining": None}
+    now = datetime.now(timezone.utc)
+    remaining = int((latest.access_until - now).total_seconds() // 86400)
+    return {
+        "enabled": True,
+        "expires_at": latest.access_until.isoformat(),
+        "days_remaining": remaining,
+    }
+
+
 @router.get("/client/{cid}/touchpoints/{tid}")
 async def get_touchpoint(
     cid: str, tid: str,
@@ -1163,123 +1284,6 @@ async def remove_attachment(
     await db.delete(row)
     await db.commit()
     return {"deleted": True}
-
-
-# ── Composer picker: Crop → Package → Timeline cascade ─────────────────
-
-@router.get("/client/{cid}/touchpoints/crops")
-async def list_crops_with_active_packages(
-    cid: str,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """Crops that have ≥1 ACTIVE package under this client.
-    First step of the composer's PoP-assignment cascade."""
-    await _assert_touchpoints_access(db, current_user, cid)
-    crop_ids = (await db.execute(
-        select(Package.crop_cosh_id).where(
-            Package.client_id == cid,
-            Package.status == PackageStatus.ACTIVE.value,
-            Package.crop_cosh_id.isnot(None),
-        ).distinct()
-    )).scalars().all()
-    if not crop_ids:
-        return {"crops": []}
-    from app.modules.sync.models import CoshCoreItem
-    cores = (await db.execute(
-        select(CoshCoreItem.cosh_id, CoshCoreItem.translations)
-        .where(CoshCoreItem.cosh_id.in_(crop_ids))
-    )).all()
-    name_by_id = {cid_: ((trans or {}).get("en") or cid_) for cid_, trans in cores}
-    crops = [
-        {"cosh_id": c, "name": name_by_id.get(c, c)} for c in crop_ids
-    ]
-    crops.sort(key=lambda o: o["name"].casefold())
-    return {"crops": crops}
-
-
-@router.get("/client/{cid}/touchpoints/packages")
-async def list_packages_for_crop(
-    cid: str,
-    crop_cosh_id: str = Query(...),
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """ACTIVE packages for a given crop under this client.
-    Second step of the composer cascade."""
-    await _assert_touchpoints_access(db, current_user, cid)
-    rows = (await db.execute(
-        select(Package.id, Package.name).where(
-            Package.client_id == cid,
-            Package.status == PackageStatus.ACTIVE.value,
-            Package.crop_cosh_id == crop_cosh_id,
-        ).order_by(Package.name)
-    )).all()
-    return {
-        "packages": [{"id": pid, "name": name or ""} for pid, name in rows],
-    }
-
-
-@router.get("/client/{cid}/touchpoints/timelines")
-async def list_timelines_for_package(
-    cid: str,
-    package_id: str = Query(...),
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """Timelines in a package (ordered by their sort position in
-    the PoP). Third step of the composer cascade."""
-    await _assert_touchpoints_access(db, current_user, cid)
-    # Verify package belongs to this client.
-    pkg = (await db.execute(
-        select(Package.id).where(
-            Package.id == package_id,
-            Package.client_id == cid,
-        )
-    )).scalar_one_or_none()
-    if pkg is None:
-        raise HTTPException(status_code=404, detail="Package not found")
-    # ACTIVE timelines only — INACTIVE timelines are excluded from
-    # farmer advisory (Batch 28 per Timeline.status docstring), so
-    # hosting a touchpoint on an INACTIVE timeline would be a
-    # firing-against-nothing situation. Order by display_order.
-    rows = (await db.execute(
-        select(Timeline.id, Timeline.name)
-        .where(
-            Timeline.package_id == package_id,
-            Timeline.status == "ACTIVE",
-        )
-        .order_by(Timeline.display_order.asc(), Timeline.name.asc())
-    )).all()
-    return {
-        "timelines": [{"id": tid, "name": name or ""} for tid, name in rows],
-    }
-
-
-# ── Feature-flag access probe (mirror of Messaging's) ──────────────────
-
-@router.get("/client/{cid}/touchpoints/access")
-async def touchpoints_access(
-    cid: str,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """Returns {enabled, expires_at, days_remaining} so the CP can
-    decide whether to render the nav + Expiring Soon banner. Does
-    NOT 403 when feature is off — reports state."""
-    from app.modules.clients.router import _assert_ca_or_rm
-    await _assert_ca_or_rm(db, current_user, cid)
-    from app.modules.feature_access.service import latest_feature_row, row_is_active
-    latest = await latest_feature_row(db, cid, FEATURE_TOUCHPOINTS)
-    if latest is None or not row_is_active(latest):
-        return {"enabled": False, "expires_at": None, "days_remaining": None}
-    now = datetime.now(timezone.utc)
-    remaining = int((latest.access_until - now).total_seconds() // 86400)
-    return {
-        "enabled": True,
-        "expires_at": latest.access_until.isoformat(),
-        "days_remaining": remaining,
-    }
 
 
 # ── Analytics ───────────────────────────────────────────────────────────
