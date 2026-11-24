@@ -6768,22 +6768,34 @@ async def _assert_client_user_can_edit(
     db: AsyncSession, user_id: str, client_id: str,
 ) -> None:
     """Authorisation gate for SE-side actions on a Client's local
-    Packages (pull from Global; future clone-to-draft etc).
+    Packages (lineage read, clone-to-draft, pull-from-global).
 
-    Today's eligible roles: any ACTIVE ClientUser whose role can
-    edit advisory content for the client. V1 is permissive — every
-    ClientUser status=ACTIVE qualifies, since onboarding is small
-    and role-level granularity comes in V2 alongside the wider
-    `_require_client_role` audit.
+    Eligible actors:
+      1. Any ACTIVE ClientUser at this client (V1 permissive — every
+         status=ACTIVE qualifies; role-level granularity comes in V2
+         alongside the wider `_require_client_role` audit).
+      2. Any ACTIVE CMClientAssignment at this client with EDIT
+         rights (CM SSO via /admin/cm/clients/{cid}/login-as).
+         Added 2026-11-25 — CMs already hold full CA-equivalent
+         access across every other CP surface via the synthesised
+         CONTENT_MANAGER role + is_cm_for_this_client flag (user
+         rule 2026-05-18: "the CM will have all the privileges
+         inside the Client — that of the CA, Subject Experts, and
+         all other roles"). The historical gate predated CM SSO and
+         silently 403'd CMs on lineage + clone-to-draft; the sibling
+         `_assert_can_view_client_advisory` (line 475) has had the
+         CM branch since Batch K.
 
     Raises 403 with stable code `client_user_required`.
     """
-    from app.modules.clients.models import ClientUser
+    from app.modules.clients.models import (
+        CMClientAssignment, CMRights, ClientUser,
+    )
     from app.modules.platform.models import StatusEnum
 
-    # Existence check, not a single-row constraint. The DB allows
-    # multiple ClientUser rows per (user, client) keyed on role, so
-    # `.first()` is the correct primitive here.
+    # Path 1 — ACTIVE ClientUser (existence check; the DB allows
+    # multiple rows per (user, client) keyed on role, so `.first()`
+    # is the correct primitive here).
     cu = (await db.execute(
         select(ClientUser.id).where(
             ClientUser.user_id == user_id,
@@ -6791,17 +6803,32 @@ async def _assert_client_user_can_edit(
             ClientUser.status == StatusEnum.ACTIVE,
         ).limit(1)
     )).scalar_one_or_none()
-    if cu is None:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "client_user_required",
-                "message": (
-                    "Only an active staff member of this client may "
-                    "pull a new version of a Global Package."
-                ),
-            },
-        )
+    if cu is not None:
+        return
+
+    # Path 2 — ACTIVE CMClientAssignment with EDIT rights. Mirrors
+    # the pattern at _assert_can_view_client_advisory:513-522.
+    cm = (await db.execute(
+        select(CMClientAssignment.id).where(
+            CMClientAssignment.cm_user_id == user_id,
+            CMClientAssignment.client_id == client_id,
+            CMClientAssignment.status == StatusEnum.ACTIVE,
+            CMClientAssignment.rights == CMRights.EDIT,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if cm is not None:
+        return
+
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "code": "client_user_required",
+            "message": (
+                "Only an active staff member of this client, or the "
+                "assigned Content Manager, may edit packages here."
+            ),
+        },
+    )
 
 
 async def _load_global_active_or_422(
