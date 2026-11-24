@@ -10,9 +10,15 @@ fired yet, this task:
    `bl17_timeline_boundary.compute_window` helper (DAS/DBS supported;
    CALENDAR skipped with a log — same convention used by the alerts
    engine).
-2. Non-retroactive gate: `milestone_ts >= assignment.activated_at`.
-   Farmers already past the milestone when the CA activated the
-   assignment DO NOT receive. Per spec §4.2.
+2. Non-retroactive gate: skip ONLY when the subscription existed
+   at activation time AND its milestone passed before activation
+   (`sub.created_at < activated_at AND milestone_ts < activated_at`).
+   A sub created AFTER the touchpoint was activated couldn't have
+   received the message earlier so it fires regardless of milestone
+   timing — closes the "farmer sowed at 00:00 UTC, subscribed at
+   06:40 UTC, touchpoint was activated at 06:33 UTC" gap caught
+   on KRP staging 2026-11-24. Original spec §4.2 non-retroactive
+   intent preserved for pre-existing subs.
 3. Fire gate: `milestone_ts <= now`.
 4. Dedupe gate: UNIQUE `(assignment_id, subscription_id)` on
    touchpoint_recipients means re-runs on the same (sub, assignment)
@@ -156,9 +162,23 @@ async def _run() -> dict:
                         else window.closes_at
                     )
 
-                    # Non-retroactive gate: milestone must be at or
-                    # after the assignment's activation moment.
-                    if milestone_ts < assignment.activated_at:
+                    # Non-retroactive gate: only skip when the sub
+                    # EXISTED at activation time AND its milestone
+                    # passed before activation. A sub created AFTER
+                    # the touchpoint was activated couldn't have
+                    # received the message earlier, so it deserves
+                    # the fire even if its chosen crop_start_date
+                    # puts the milestone slightly in the past.
+                    # 2026-11-24 — tightened after KR-26-000235 on
+                    # KRP staging missed the "Beginning of T1 / DAS 0"
+                    # trigger because the farmer sowed at 00:00 UTC
+                    # and activated_at was 06:33 UTC same day, even
+                    # though the sub was created 7 minutes after
+                    # activation.
+                    if (
+                        sub.created_at < assignment.activated_at
+                        and milestone_ts < assignment.activated_at
+                    ):
                         continue
 
                     # Fire gate: milestone must have been reached.
