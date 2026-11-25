@@ -38,7 +38,23 @@ from app.modules.subscriptions.snapshot_models import LockedTimelineSnapshot
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-VALID_LOCK_TRIGGERS = {"PURCHASE_ORDER", "VIEWED", "BACKFILL"}
+VALID_LOCK_TRIGGERS = {"PURCHASE_ORDER", "PURCHASE_ACK", "VIEWED", "BACKFILL"}
+# 2026-11-25 — PURCHASE_ACK added for Advisory-Only Mode (AOM).
+# Semantics:
+#   PURCHASE_ORDER  → Regular Mode: farmer placed an in-app order
+#                      (Razorpay-backed) → sacrosanct snapshot
+#   PURCHASE_ACK    → Advisory-Only Mode: farmer tapped "I've purchased
+#                      this" to log an offline purchase → sacrosanct
+#                      snapshot (farmer un-ack is the only way to
+#                      release this lock — force-push does NOT touch
+#                      PURCHASE_ACK snapshots)
+#   VIEWED          → today's-date-in-window (Regular + AOM) →
+#                      overridable via force-push
+#   BACKFILL        → one-time migration label (used by the SMS Grow
+#                      migration 2026-11-25) → treated identically to
+#                      its semantic equivalent (VIEWED or PURCHASE_ACK)
+#                      per the backfill tooling's choice at snapshot
+#                      creation time.
 VALID_SOURCES = {"CCA", "PG", "SP"}
 SCHEMA_VERSION = 1
 

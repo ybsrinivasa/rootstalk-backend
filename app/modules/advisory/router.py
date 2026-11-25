@@ -11670,3 +11670,199 @@ async def qa_list_practices(
         })
 
     return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+# ── AOM content-versioning: edit-preview + force-push ────────────────
+#
+# Policy (locked in 2026-11-25 per user design conversation):
+# - Edit saves default to "respect locks" — VIEWED + PURCHASE_ACK +
+#   PURCHASE_ORDER snapshot content is preserved for affected farmers.
+# - Force-push REWRITES only VIEWED snapshots with the new content;
+#   PURCHASE_ACK + PURCHASE_ORDER are SACROSANCT (farmer's financial
+#   commitment, not overridable).
+# - force_pushed_at = now() is stamped on each rewritten row; the
+#   farmer's PWA renders a "Recently updated" banner for 5 days.
+
+
+_SACROSANCT_LOCK_TRIGGERS = {"PURCHASE_ACK", "PURCHASE_ORDER"}
+_OVERRIDABLE_LOCK_TRIGGERS = {"VIEWED", "BACKFILL"}
+
+
+@router.get("/client/{client_id}/timelines/lineage/{lineage_id}/edit-preview")
+async def timeline_edit_preview(
+    client_id: str, lineage_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Preview counts of farmers affected by an edit to this Timeline.
+
+    Returns:
+      {
+        "unlocked_count": N,             # ACTIVE subs with NO snapshot → receive edit automatically
+        "viewed_locked_count": M,        # VIEWED / BACKFILL snapshot → force-pushable
+        "committed_locked_count": K,     # PURCHASE_ACK / PURCHASE_ORDER → sacrosanct
+        "committed_breakdown": {
+          "purchase_ack": ...,
+          "purchase_order": ...,
+        },
+      }
+
+    Scoped to ACTIVE subs under packages belonging to `client_id`.
+    Called by the CP composer right before the CA/CM saves an edit —
+    renders the 3-way split that drives the [Save] vs [Force-push] UX.
+    """
+    from app.modules.subscriptions.models import Subscription, SubscriptionStatus
+    from app.modules.subscriptions.snapshot_models import LockedTimelineSnapshot
+    from sqlalchemy import func
+
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
+
+    # Count ACTIVE subs whose package carries this lineage (i.e. the
+    # sub "has" this timeline in its PoP).
+    sub_rows = (await db.execute(
+        select(Subscription.id).join(
+            Package, Package.id == Subscription.package_id,
+        ).join(
+            Timeline, Timeline.package_id == Package.id,
+        ).where(
+            Subscription.client_id == client_id,
+            Subscription.status == SubscriptionStatus.ACTIVE,
+            Timeline.lineage_id == lineage_id,
+        ).distinct()
+    )).scalars().all()
+    total_subs = len(sub_rows)
+    if total_subs == 0:
+        return {
+            "unlocked_count": 0,
+            "viewed_locked_count": 0,
+            "committed_locked_count": 0,
+            "committed_breakdown": {"purchase_ack": 0, "purchase_order": 0},
+        }
+
+    # Snapshot distribution across those subs.
+    trigger_rows = (await db.execute(
+        select(
+            LockedTimelineSnapshot.lock_trigger,
+            func.count(LockedTimelineSnapshot.id),
+        ).where(
+            LockedTimelineSnapshot.subscription_id.in_(sub_rows),
+            LockedTimelineSnapshot.lineage_id == lineage_id,
+            LockedTimelineSnapshot.source == "CCA",
+        ).group_by(LockedTimelineSnapshot.lock_trigger)
+    )).all()
+
+    tally = {t: int(n) for t, n in trigger_rows}
+    viewed_locked = sum(tally.get(t, 0) for t in _OVERRIDABLE_LOCK_TRIGGERS)
+    purchase_ack = tally.get("PURCHASE_ACK", 0)
+    purchase_order = tally.get("PURCHASE_ORDER", 0)
+    committed_locked = purchase_ack + purchase_order
+    unlocked = max(0, total_subs - viewed_locked - committed_locked)
+
+    return {
+        "unlocked_count": unlocked,
+        "viewed_locked_count": viewed_locked,
+        "committed_locked_count": committed_locked,
+        "committed_breakdown": {
+            "purchase_ack": purchase_ack,
+            "purchase_order": purchase_order,
+        },
+    }
+
+
+@router.post("/client/{client_id}/timelines/lineage/{lineage_id}/force-push")
+async def timeline_force_push(
+    client_id: str, lineage_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Rewrite VIEWED / BACKFILL snapshots with the current Timeline
+    content for all ACTIVE subs under this client. PURCHASE_ACK +
+    PURCHASE_ORDER snapshots are SKIPPED (sacrosanct — farmer's
+    financial commitment).
+
+    Stamps `force_pushed_at = now()` on each rewritten row so the
+    farmer's PWA renders a "Recently updated" banner for 5 days.
+
+    Intended for safety-critical corrections (recalled brand, dosage
+    error) where the edit MUST reach farmers already inside the
+    window. Gated by the standard view-advisory check — if the actor
+    can edit the timeline, they can force-push it; no separate role.
+    """
+    from app.modules.subscriptions.models import Subscription, SubscriptionStatus
+    from app.modules.subscriptions.snapshot_models import LockedTimelineSnapshot
+    from app.services.snapshot import serialise_timeline
+
+    await _assert_can_view_client_advisory(db, current_user.id, client_id)
+    await _assert_client_user_can_edit(db, current_user.id, client_id)
+
+    # Find all overridable snapshots for this lineage across the
+    # client's ACTIVE subs. Join through Subscription + Package so
+    # we never touch another client's snapshots even on a
+    # hypothetical lineage_id collision.
+    rows = (await db.execute(
+        select(LockedTimelineSnapshot, Subscription, Package).join(
+            Subscription, Subscription.id == LockedTimelineSnapshot.subscription_id,
+        ).join(
+            Package, Package.id == Subscription.package_id,
+        ).where(
+            Subscription.client_id == client_id,
+            Subscription.status == SubscriptionStatus.ACTIVE,
+            LockedTimelineSnapshot.lineage_id == lineage_id,
+            LockedTimelineSnapshot.source == "CCA",
+            LockedTimelineSnapshot.lock_trigger.in_(_OVERRIDABLE_LOCK_TRIGGERS),
+        )
+    )).all()
+
+    if not rows:
+        return {"rewritten_count": 0, "skipped_committed_count": 0}
+
+    # Pre-resolve the ACTIVE Timeline row per package (one package can
+    # have one ACTIVE Timeline per lineage). Cache by package_id to
+    # avoid a per-snapshot lookup.
+    pkg_ids = {p.id for _, _, p in rows}
+    tl_by_pkg: dict[str, str] = {}
+    for pkg_id in pkg_ids:
+        tl = (await db.execute(
+            select(Timeline).where(
+                Timeline.package_id == pkg_id,
+                Timeline.lineage_id == lineage_id,
+            ).limit(1)
+        )).scalars().first()
+        if tl is not None:
+            tl_by_pkg[pkg_id] = tl.id
+
+    from datetime import datetime as _dt, timezone as _tz
+    now = _dt.now(_tz.utc)
+    rewritten = 0
+    for snap, _sub, pkg in rows:
+        tl_id = tl_by_pkg.get(pkg.id)
+        if tl_id is None:
+            continue
+        try:
+            fresh_content = await serialise_timeline(db, tl_id)
+        except Exception:
+            continue
+        snap.content = fresh_content
+        snap.force_pushed_at = now
+        rewritten += 1
+
+    # Count committed snapshots that were skipped (for the response,
+    # so the CA/CM sees how many farmers kept their committed version).
+    from sqlalchemy import func as _func
+    skipped = (await db.execute(
+        select(_func.count(LockedTimelineSnapshot.id)).join(
+            Subscription, Subscription.id == LockedTimelineSnapshot.subscription_id,
+        ).where(
+            Subscription.client_id == client_id,
+            Subscription.status == SubscriptionStatus.ACTIVE,
+            LockedTimelineSnapshot.lineage_id == lineage_id,
+            LockedTimelineSnapshot.source == "CCA",
+            LockedTimelineSnapshot.lock_trigger.in_(_SACROSANCT_LOCK_TRIGGERS),
+        )
+    )).scalar_one()
+
+    await db.commit()
+    return {
+        "rewritten_count": rewritten,
+        "skipped_committed_count": int(skipped),
+    }

@@ -50,6 +50,16 @@ class LockedTimelineSnapshot(Base):
         DateTime(timezone=True), nullable=False, default=utcnow
     )
     lock_trigger: Mapped[str] = mapped_column(String(20), nullable=False)
+    # 2026-11-25 — timestamp of the most-recent force-push that
+    # REWROTE this snapshot's content. NULL = never force-pushed
+    # (default state for every snapshot). The farmer's PWA renders
+    # a "Recently updated" banner on the practice card iff
+    # now() - force_pushed_at < 5 days. PURCHASE_ACK snapshots are
+    # sacrosanct — force-push skips them and this column stays NULL
+    # on PURCHASE_ACK rows.
+    force_pushed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
 
     __table_args__ = (
         UniqueConstraint(

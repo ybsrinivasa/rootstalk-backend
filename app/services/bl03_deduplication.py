@@ -5,7 +5,7 @@ Spec: RootsTalk_Dev_BusinessLogic.pdf §BL-03
 """
 import re
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from typing import Optional
 
 
@@ -94,6 +94,14 @@ class TimelineWindow:
     # cha-{sp|pg|qa}-{Timeline.lineage_id}. Drives the per-occurrence
     # practice-acknowledgement key.
     lineage_id: str = ""
+    # 2026-11-25 — Timestamp of the most-recent CM/CA force-push that
+    # rewrote this Timeline's snapshot content for this farmer. NULL
+    # by default. PWA renders a "Recently updated" banner on practice
+    # cards under this Timeline iff now() - force_pushed_at < 5 days.
+    # AOM content-versioning policy: force-push only touches VIEWED/
+    # BACKFILL snapshots; PURCHASE_ACK + PURCHASE_ORDER are sacrosanct
+    # so this field stays NULL on those rows.
+    force_pushed_at: "datetime | None" = None
 
 
 @dataclass
