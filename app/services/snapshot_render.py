@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -340,14 +340,20 @@ def render_cha_from_content(content: dict) -> list[PStub]:
 async def resolve_cca_content(
     db: AsyncSession, subscription_id: str, timeline_id: str,
     lock_trigger: str = "VIEWED",
-) -> tuple[dict, bool]:
-    """Return (deserialised_content, locked) for a CCA timeline.
+) -> tuple[dict, bool, "datetime | None"]:
+    """Return (deserialised_content, locked, force_pushed_at) for a CCA
+    timeline.
 
     locked=True   → content came from an existing or just-taken snapshot
                     (the farmer's frozen reality).
     locked=False  → snapshot capture failed; we are returning a fresh master
                     serialisation as a degraded fallback. The defensive
                     sweep retries on its next run.
+    force_pushed_at → timestamp of the most-recent CM/CA force-push that
+                    rewrote this snapshot's content, or None if never
+                    force-pushed (or the fallback-to-master branch).
+                    Drives the PWA's "Recently updated" 5-day banner
+                    (added 2026-11-25 per AOM content-versioning policy).
 
     `lock_trigger` labels the snapshot when one is taken inline. Default
     "VIEWED" — caller is rendering an in-window timeline. Pass
@@ -359,26 +365,26 @@ async def resolve_cca_content(
     """
     snap = await get_snapshot(db, subscription_id, timeline_id, "CCA")
     if snap is not None:
-        return deserialise_timeline(snap.content), True
+        return deserialise_timeline(snap.content), True, snap.force_pushed_at
 
     try:
         snap = await take_snapshot(
             db, subscription_id, timeline_id, lock_trigger, source="CCA",
         )
-        return deserialise_timeline(snap.content), True
+        return deserialise_timeline(snap.content), True, snap.force_pushed_at
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "snapshot capture failed (CCA) sub=%s tl=%s: %s — falling back to master",
             subscription_id, timeline_id, exc,
         )
         try:
-            return deserialise_timeline(await serialise_timeline(db, timeline_id)), False
+            return deserialise_timeline(await serialise_timeline(db, timeline_id)), False, None
         except Exception as exc2:  # noqa: BLE001
             logger.error(
                 "master serialisation also failed sub=%s tl=%s: %s",
                 subscription_id, timeline_id, exc2,
             )
-            return _empty_content(timeline_id, "CCA"), False
+            return _empty_content(timeline_id, "CCA"), False, None
 
 
 async def resolve_cha_content(

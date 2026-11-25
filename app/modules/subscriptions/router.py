@@ -6009,6 +6009,56 @@ async def _upsert_practice_ack(
     else:
         raise HTTPException(status_code=400, detail=f"Unknown action: {action}")
 
+    # 2026-11-25 — AOM content-versioning: purchase/unpurchase drive
+    # PURCHASE_ACK snapshot lifecycle. The snapshot freezes the practice
+    # content the farmer committed to; force-push by CM/CA never
+    # overwrites PURCHASE_ACK snapshots (farmer financial commitment is
+    # sacrosanct). Un-purchase deletes the snapshot — farmer falls back
+    # to the live Timeline (or to a VIEWED snapshot if today ∈ window).
+    # Gated on Pure-AOM only (advisory_only_mode=True AND NOT in_app_
+    # orders_enabled); Regular + Hybrid modes have their own
+    # PURCHASE_ORDER path via the order-create flow.
+    if action in ("purchase", "unpurchase") and bool(getattr(sub, "advisory_only_mode", False)) and not bool(getattr(sub, "in_app_orders_enabled", False)):
+        try:
+            from app.modules.subscriptions.snapshot_models import (
+                LockedTimelineSnapshot as _LTS,
+            )
+            from sqlalchemy import delete as _sa_delete
+
+            if action == "purchase":
+                # Resolve the ACTIVE Timeline for this lineage under
+                # the farmer's package so take_snapshot serialises the
+                # content the farmer actually sees. take_snapshot is
+                # a no-op if a snapshot already exists for this
+                # (sub, lineage, CCA) key.
+                tl_row = (await db.execute(
+                    select(Timeline).where(
+                        Timeline.package_id == sub.package_id,
+                        Timeline.lineage_id == body.timeline_lineage_id,
+                    ).limit(1)
+                )).scalars().first()
+                if tl_row is not None:
+                    from app.services.snapshot import take_snapshot as _take
+                    await _take(
+                        db, body.subscription_id, tl_row.id,
+                        "PURCHASE_ACK", source="CCA",
+                    )
+            else:  # unpurchase
+                await db.execute(
+                    _sa_delete(_LTS).where(
+                        _LTS.subscription_id == body.subscription_id,
+                        _LTS.lineage_id == body.timeline_lineage_id,
+                        _LTS.source == "CCA",
+                        _LTS.lock_trigger == "PURCHASE_ACK",
+                    )
+                )
+        except Exception as _e:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                f"PURCHASE_ACK snapshot {action} failed for sub "
+                f"{body.subscription_id} lineage {body.timeline_lineage_id}: {_e}"
+            )
+
     await db.commit()
     return {
         "subscription_id": ack.subscription_id,
@@ -6721,7 +6771,7 @@ async def _today_advisory_for_user(
             # Snapshot is the source of truth for content. If missing,
             # resolve_cca_content takes one synchronously (lock-on-view) so
             # downstream rendering always reads frozen data.
-            content, _locked = await resolve_cca_content(db, sub.id, tl.id)
+            content, _locked, force_pushed_at = await resolve_cca_content(db, sub.id, tl.id)
             rendered = render_cca_from_content(content, today_answers)
 
             if rendered.pending_question:
@@ -6738,6 +6788,7 @@ async def _today_advisory_for_user(
                 created_at=tl.created_at.date() if hasattr(tl.created_at, 'date') else today,
                 practices=rendered.practice_stubs, source="CCA",
                 lineage_id=tl.lineage_id,
+                force_pushed_at=force_pushed_at,
             )
             tl_windows.append(tl_window)
             tl_date_map[tl.id] = (from_d, to_d, day_num)
@@ -7438,7 +7489,7 @@ async def _today_advisory_for_user(
                     # referenced by APPROVED items, so the snapshot capture
                     # is PO-driven, not VIEWED. The label is
                     # observability-only; render behaviour is identical.
-                    ctx_content, _ = await resolve_cca_content(
+                    ctx_content, _, _ = await resolve_cca_content(
                         db, sub.id, ctx_tl.id, lock_trigger="PURCHASE_ORDER",
                     )
                     ctx_rendered = render_cca_from_content(ctx_content, today_answers)
@@ -7921,6 +7972,15 @@ async def _today_advisory_for_user(
                 "day_number": day_num,
                 "suppressed_count": len(dedup_tl.suppressed),
                 "practices": tl_practices_out,
+                # 2026-11-25 — timestamp of the most-recent CM/CA
+                # force-push that rewrote this timeline's snapshot
+                # content for this farmer. PWA uses it to render a
+                # "Recently updated" banner on practice cards for
+                # 5 days (see project_aom_content_versioning memory).
+                "force_pushed_at": (
+                    tl.force_pushed_at.isoformat()
+                    if getattr(tl, "force_pushed_at", None) else None
+                ),
                 # 2026-09-27 — half-open past cutoff. `to_date` is
                 # exclusive, so today >= to_date means the last
                 # inclusive day has elapsed. PWA uses this to render
