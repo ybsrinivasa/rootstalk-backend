@@ -6235,7 +6235,25 @@ async def unpurchase_practice(
                 ),
             },
         )
-    return await _upsert_practice_ack(db, current_user.id, body, "unpurchase")
+    result = await _upsert_practice_ack(db, current_user.id, body, "unpurchase")
+
+    # 2026-11-26 — Mirror of purchase_practice's vanish-on-ack. If
+    # this unpurchase leaves at least one INPUT practice outstanding,
+    # flip today's READ INPUT alerts back to SENT so the promoter
+    # sees the alert again on their incoming-alerts feed. Without
+    # this the promoter would stay blind until the next daily beat.
+    # Best-effort — a revive failure must never roll back the ack.
+    try:
+        from app.tasks.alerts import revive_input_alerts_if_now_due
+        revived = await revive_input_alerts_if_now_due(db, body.subscription_id)
+        if revived:
+            await db.commit()
+    except Exception as _e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            f"Revive-on-unpurchase failed for sub {body.subscription_id}: {_e}"
+        )
+    return result
 
 
 @router.post("/farmer/practice-ack/photo")

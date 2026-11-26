@@ -399,6 +399,99 @@ async def clear_input_alerts_if_no_due_remaining(
     return res.rowcount or 0
 
 
+async def revive_input_alerts_if_now_due(
+    db, subscription_id: str, today_date: date | None = None,
+) -> int:
+    """Flip TODAY's READ INPUT alerts on this sub back to SENT when
+    at least one INPUT practice is now unhandled. Mirror of
+    `clear_input_alerts_if_no_due_remaining`.
+
+    Called from the purchase-ack unpurchase endpoint (2026-11-26) —
+    when the farmer un-marks "I've purchased this" the ack flips
+    from PURCHASED back to DUE_NOW on the RM / CA Farmer Support
+    view, but the promoter's `/promoter/me/incoming-alerts` feed
+    (status=SENT filter) stayed empty because the earlier
+    vanish-on-ack had already flipped SENT→READ. Without this
+    revive, the promoter would only see the alert again on the next
+    daily beat — a 20-hour blind spot after an unpurchase.
+
+    Scope limited to `sent_at >= today_start` (IST) so legitimate
+    READ rows from prior days aren't disturbed — they reflect past
+    cycles the promoter already processed. Within today's window
+    we re-SENT every READ INPUT alert on this sub; the daily beat
+    recomputes anyway, so one extra pass is harmless.
+
+    Edge: if the promoter had NATURALLY read today's alert (not via
+    vanish), this will re-surface it. Acceptable — promoter can
+    re-dismiss; the signal is accurate (the practice IS now due
+    again). The Alert row has no "vanished" flag to distinguish
+    vanish-read from natural-read, so we can't be more precise
+    without a schema change.
+
+    Returns the number of alert rows flipped. Safe to re-run — only
+    acts when still_outstanding is non-empty; otherwise no-ops.
+    """
+    from sqlalchemy import update as sa_update
+    from datetime import timedelta as _td
+    from app.modules.subscriptions.models import Subscription
+
+    if today_date is None:
+        ist_offset = _td(hours=5, minutes=30)
+        today_date = (datetime.now(timezone.utc) + ist_offset).date()
+
+    sub = (await db.execute(
+        select(Subscription).where(Subscription.id == subscription_id)
+    )).scalar_one_or_none()
+    if sub is None or sub.crop_start_date is None:
+        return 0
+
+    is_advisory_only = bool(getattr(sub, "advisory_only_mode", False))
+    in_app_orders_on = bool(getattr(sub, "in_app_orders_enabled", False))
+    is_pure_advisory_only = is_advisory_only and not in_app_orders_on
+    lead_days = _resolve_input_alert_lead_days(sub) if is_pure_advisory_only else 0
+
+    timelines = await _load_timeline_windows(db, sub.package_id)
+    crop_start = sub.crop_start_date.date()
+    day_offset = (today_date - crop_start).days
+    due_pids = find_input_practices_due_today(
+        timelines, day_offset, today_date=today_date, lead_days=lead_days,
+    )
+    if is_pure_advisory_only:
+        handled_pids = await _load_purchased_practice_ids(
+            db, subscription_id, today_date,
+        )
+    elif is_advisory_only:
+        order_handled = await _load_active_order_practice_ids(db, subscription_id)
+        ack_handled = await _load_purchased_practice_ids(
+            db, subscription_id, today_date,
+        )
+        handled_pids = order_handled | ack_handled
+    else:
+        handled_pids = await _load_active_order_practice_ids(db, subscription_id)
+
+    still_outstanding = [p for p in due_pids if p not in handled_pids]
+    if not still_outstanding:
+        return 0
+
+    # Today's lower bound in UTC. Alert.sent_at is TZ-aware UTC;
+    # filter for rows created from IST-today 00:00 onward.
+    ist_offset = _td(hours=5, minutes=30)
+    today_start_utc = (
+        datetime.combine(today_date, datetime.min.time())
+        - ist_offset
+    ).replace(tzinfo=timezone.utc)
+
+    res = await db.execute(
+        sa_update(Alert).where(
+            Alert.subscription_id == subscription_id,
+            Alert.alert_type == AlertType.INPUT,
+            Alert.status == AlertStatus.READ,
+            Alert.sent_at >= today_start_utc,
+        ).values(status=AlertStatus.SENT)
+    )
+    return res.rowcount or 0
+
+
 async def supersede_alerts_for_removed_recipients(
     db, subscription_id: str,
 ) -> int:
