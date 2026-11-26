@@ -2901,6 +2901,10 @@ async def import_timeline(
     for src_p in src_practices:
         new_p = Practice(
             timeline_id=new_tl.id,
+            # 2026-11-26 — PROPAGATE lineage_id so farmer acks written
+            # against the source practice still resolve on the clone.
+            # Dropping this reintroduces incident SM-26-000004.
+            lineage_id=src_p.lineage_id,
             l0_type=src_p.l0_type,
             l1_type=src_p.l1_type,
             l2_type=src_p.l2_type,
@@ -6743,6 +6747,9 @@ async def _deep_copy_advisory_content(
         for src_p in p_result.scalars().all():
             new_p = Practice(
                 timeline_id=new_tl.id,
+                # 2026-11-26 — propagate lineage_id (see incident
+                # SM-26-000004). Clone must share identity with source.
+                lineage_id=src_p.lineage_id,
                 l0_type=src_p.l0_type,
                 l1_type=src_p.l1_type,
                 l2_type=src_p.l2_type,
@@ -8336,6 +8343,8 @@ async def _copy_pg_content_into(
         for src_p in p_result.scalars().all():
             new_p = Practice(
                 timeline_id=new_tl.id,
+                # 2026-11-26 — propagate lineage_id (see SM-26-000004).
+                lineage_id=src_p.lineage_id,
                 l0_type=src_p.l0_type,
                 l1_type=src_p.l1_type,
                 l2_type=src_p.l2_type,
@@ -8386,6 +8395,8 @@ async def _copy_sp_content_into(
         for src_p in p_result.scalars().all():
             new_p = Practice(
                 timeline_id=new_tl.id,
+                # 2026-11-26 — propagate lineage_id (see SM-26-000004).
+                lineage_id=src_p.lineage_id,
                 l0_type=src_p.l0_type,
                 l1_type=src_p.l1_type,
                 l2_type=src_p.l2_type,
@@ -10241,6 +10252,8 @@ async def import_pg_into_sp(
         for src_p in src_practices:
             new_p = Practice(
                 timeline_id=new_tl.id,
+                # 2026-11-26 — propagate lineage_id (see SM-26-000004).
+                lineage_id=src_p.lineage_id,
                 l0_type=src_p.l0_type,
                 l1_type=src_p.l1_type,
                 l2_type=src_p.l2_type,

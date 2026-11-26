@@ -474,6 +474,20 @@ class Practice(Base):
     __tablename__ = "practices"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    # 2026-11-26 — Stable identity across package-clone chains. A fresh
+    # Practice gets a brand-new UUID (model default below). A cloned
+    # Practice MUST pass `lineage_id=src_practice.lineage_id` so the
+    # new row shares identity with the source — this is what lets
+    # PracticeAcknowledgement rows survive a package-version switch.
+    # Without this, acks written against the old practice_id become
+    # unlinkable from the new live Practice and the Farmer Support
+    # "Due now" status silently stays red. See incident SM-26-000004
+    # (2026-11-26). Clone paths: 5 clone_* endpoints in
+    # advisory/router.py — propagate lineage_id at every Practice(...)
+    # inside them.
+    lineage_id: Mapped[str] = mapped_column(
+        String(36), nullable=False, index=True, default=new_uuid,
+    )
     timeline_id: Mapped[str] = mapped_column(String(36), ForeignKey("timelines.id"), nullable=False)
     l0_type: Mapped[PracticeL0] = mapped_column(SAEnum(PracticeL0), nullable=False)
     l1_type: Mapped[str] = mapped_column(String(100), nullable=True)
@@ -710,6 +724,21 @@ class PracticeAcknowledgement(Base):
     timeline_lineage_id: Mapped[str] = mapped_column(String(100), nullable=False)
     practice_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("practices.id"), nullable=False,
+    )
+    # 2026-11-26 — Stable practice identity across package-clone chains.
+    # Set at ack-write from Practice.lineage_id (see _upsert_practice_ack).
+    # The read side (CP Farmer Support, alert-vanish) matches acks by
+    # (subscription_id, timeline_lineage_id, practice_lineage_id)
+    # instead of (subscription_id, timeline_lineage_id, practice_id),
+    # so a sub whose package was republished after the ack still sees
+    # the ack as PURCHASED. Nullable because pre-2026-11-26 ack rows
+    # were written without this column — the backfill in migration
+    # e4b8w6y29d5u fills them from practices.lineage_id. Rows the
+    # backfill couldn't resolve (e.g. ack's practice_id already
+    # deleted) stay NULL and fall back to practice_id matching at read
+    # time. New acks ALWAYS populate this field.
+    practice_lineage_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True, index=True,
     )
     occurrence_date: Mapped[date] = mapped_column(Date, nullable=False)
     marked_at: Mapped[datetime | None] = mapped_column(

@@ -5939,6 +5939,16 @@ async def _upsert_practice_ack(
         )
     )).scalar_one_or_none()
 
+    # 2026-11-26 — Resolve practice_lineage_id so the ack survives a
+    # package-version swap (incident SM-26-000004). Writes on both the
+    # create AND update branches below so acks born before the lineage
+    # column existed get stamped on next touch too. Falls back to NULL
+    # (and the read-side fallback) if the practice row has somehow been
+    # deleted between PWA tap and backend arrival.
+    practice_lineage_id = (await db.execute(
+        select(Practice.lineage_id).where(Practice.id == body.practice_id)
+    )).scalar_one_or_none()
+
     now = datetime.now(timezone.utc)
     if ack is None:
         ack = PracticeAcknowledgement(
@@ -5946,9 +5956,12 @@ async def _upsert_practice_ack(
             subscription_id=body.subscription_id,
             timeline_lineage_id=body.timeline_lineage_id,
             practice_id=body.practice_id,
+            practice_lineage_id=practice_lineage_id,
             occurrence_date=body.occurrence_date,
         )
         db.add(ack)
+    elif practice_lineage_id and not ack.practice_lineage_id:
+        ack.practice_lineage_id = practice_lineage_id
 
     if action == "mark":
         ack.marked_at = now

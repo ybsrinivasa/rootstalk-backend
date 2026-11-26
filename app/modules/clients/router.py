@@ -4779,9 +4779,17 @@ async def get_subscription_practice_timeline(
             PracticeAcknowledgement.subscription_id == subscription_id,
         )
     )).scalars().all()
-    ack_by_key: dict[tuple[str, str], object] = {}
+    # 2026-11-26 — Index acks by BOTH keys so a package-republish
+    # between ack and read doesn't drop the match (incident
+    # SM-26-000004). Lookup order below: lineage first, then practice_id
+    # fallback for pre-2026-11-26 ack rows the migration backfill
+    # couldn't resolve.
+    ack_by_lineage: dict[tuple[str, str], object] = {}
+    ack_by_pid: dict[tuple[str, str], object] = {}
     for a in acks:
-        ack_by_key[(a.practice_id, a.timeline_lineage_id)] = a
+        if a.practice_lineage_id:
+            ack_by_lineage[(a.practice_lineage_id, a.timeline_lineage_id)] = a
+        ack_by_pid[(a.practice_id, a.timeline_lineage_id)] = a
 
     # 2026-11-11 — Practice has no `name` column; the user-facing
     # practice name is derived from l2_type via the Cosh-translated
@@ -4798,7 +4806,10 @@ async def get_subscription_practice_timeline(
         if tl is None or crop_start is None:
             continue
         win_start, win_end = _timeline_window(tl, crop_start)
-        ack = ack_by_key.get((p.id, tl.lineage_id))
+        ack = (
+            ack_by_lineage.get((p.lineage_id, tl.lineage_id))
+            or ack_by_pid.get((p.id, tl.lineage_id))
+        )
         if ack and ack.marked_at:
             status = "COMPLETED"
         elif ack and ack.hidden_at:
@@ -5065,9 +5076,17 @@ async def get_subscription_inputs(
             PracticeAcknowledgement.subscription_id == subscription_id,
         )
     )).scalars().all()
-    ack_by_key: dict[tuple[str, str], object] = {}
+    # 2026-11-26 — Index acks by BOTH keys so a package-republish
+    # between ack and read doesn't drop the match (incident
+    # SM-26-000004). Lookup order below: lineage first, then practice_id
+    # fallback for pre-2026-11-26 ack rows the migration backfill
+    # couldn't resolve.
+    ack_by_lineage: dict[tuple[str, str], object] = {}
+    ack_by_pid: dict[tuple[str, str], object] = {}
     for a in acks:
-        ack_by_key[(a.practice_id, a.timeline_lineage_id)] = a
+        if a.practice_lineage_id:
+            ack_by_lineage[(a.practice_lineage_id, a.timeline_lineage_id)] = a
+        ack_by_pid[(a.practice_id, a.timeline_lineage_id)] = a
 
     # Pull all non-cancelled OrderItems once; derive the three
     # timeline-level booleans we need (active / approved / picked-up)
@@ -5142,7 +5161,10 @@ async def get_subscription_inputs(
             continue
         win_start, win_end = (None, None) if crop_start is None \
             else _timeline_window(tl, crop_start)
-        ack = ack_by_key.get((p.id, tl.lineage_id))
+        ack = (
+            ack_by_lineage.get((p.lineage_id, tl.lineage_id))
+            or ack_by_pid.get((p.id, tl.lineage_id))
+        )
         has_order = tl.id in active_order_tls
         has_approved = tl.id in approved_tls
         picked_up_at = picked_up_by_tl.get(tl.id)
@@ -6382,11 +6404,18 @@ async def get_practice_recommendation(
     else:
         occurrence_date = win_start or today
 
+    # 2026-11-26 — Match by lineage OR practice_id (incident SM-26-000004).
+    # Pre-backfill acks may only have practice_id; post-fix acks always
+    # have both. OR covers both eras + package-republish cases.
+    from sqlalchemy import or_ as _or
     ack = (await db.execute(
         select(PracticeAcknowledgement).where(
             PracticeAcknowledgement.subscription_id == subscription_id,
-            PracticeAcknowledgement.practice_id == practice_id,
             PracticeAcknowledgement.timeline_lineage_id == timeline.lineage_id,
+            _or(
+                PracticeAcknowledgement.practice_lineage_id == practice.lineage_id,
+                PracticeAcknowledgement.practice_id == practice_id,
+            ),
         )
     )).scalars().first()
     ack_payload = {
@@ -6417,17 +6446,27 @@ async def get_practice_recommendation(
             )
         )).scalars().all()
         sibling_pids = [p.id for p in sibling_rows]
+        sibling_lineage_ids = [p.lineage_id for p in sibling_rows]
         sibling_acks: dict[str, PracticeAcknowledgement] = {}
+        # 2026-11-26 — Match by lineage OR practice_id (SM-26-000004).
         if sibling_pids:
             sa_rows = (await db.execute(
                 select(PracticeAcknowledgement).where(
                     PracticeAcknowledgement.subscription_id == subscription_id,
                     PracticeAcknowledgement.timeline_lineage_id == timeline.lineage_id,
-                    PracticeAcknowledgement.practice_id.in_(sibling_pids),
+                    _or(
+                        PracticeAcknowledgement.practice_lineage_id.in_(sibling_lineage_ids),
+                        PracticeAcknowledgement.practice_id.in_(sibling_pids),
+                    ),
                 )
             )).scalars().all()
+            # Key both ways so sp.id lookup below finds the ack
+            # regardless of whether match was via lineage or pid.
+            live_pid_by_lineage = {p.lineage_id: p.id for p in sibling_rows}
             for a in sa_rows:
                 sibling_acks[a.practice_id] = a
+                if a.practice_lineage_id in live_pid_by_lineage:
+                    sibling_acks[live_pid_by_lineage[a.practice_lineage_id]] = a
         siblings_out = []
         for sp in sibling_rows:
             sa = sibling_acks.get(sp.id)
