@@ -3082,6 +3082,13 @@ async def update_practice(
     practice.l2_type = request.l2_type
     practice.display_order = request.display_order
     practice.is_special_input = request.is_special_input
+    # 2026-11-26 — auto-clear brand_image_url when the CA toggles the
+    # brand-lock off. The image only makes sense when the SE-picked
+    # brand is locked; orphaning it would show stale product packaging
+    # for a free-choice practice. CP shows a confirm dialog before
+    # posting this edit when brand_image_url is non-null.
+    if practice.is_brand_locked and not request.is_brand_locked:
+        practice.brand_image_url = None
     practice.is_brand_locked = request.is_brand_locked
     practice.frequency_days = request.frequency_days
 
@@ -3106,6 +3113,96 @@ async def update_practice(
         timeline_id=timeline_id, l2=request.l2_type,
         elements=request.elements,
     )
+    return practice
+
+
+# ── Brand-locked practice image (2026-11-26) ────────────────────────
+#
+# Single image per brand-locked INPUT practice. Farmer PWA renders
+# it inline below the practice card so they recognise the product
+# on the dealer's shelf. Only valid when practice.is_brand_locked
+# is True — upload refuses otherwise. Un-locking the practice
+# auto-clears the image (handled in update_practice above).
+#
+# Content-versioning note: brand_image_url lives on the Practice
+# row, so it's serialised into the LockedTimelineSnapshot content.
+# AOM policy applies: locked farmers keep their committed image;
+# CM force-push rewrites in-window snapshots; PURCHASE_ACK stays
+# sacrosanct. No special handling in this endpoint.
+
+from fastapi import File, UploadFile  # local import — new dep for this block only
+
+
+@router.put("/client/{client_id}/timelines/{timeline_id}/practices/{practice_id}/brand-image", response_model=PracticeOut)
+async def upload_practice_brand_image(
+    client_id: str, timeline_id: str, practice_id: str,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Upload a single image for a brand-locked INPUT practice.
+    Replaces any existing image (one-image-per-practice contract).
+    Max 5 MB; JPEG/PNG/WebP only. Returns the updated practice
+    (including the new brand_image_url) so the CP can refresh
+    inline without a second fetch.
+    """
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    practice = (await db.execute(
+        select(Practice).where(
+            Practice.id == practice_id, Practice.timeline_id == timeline_id,
+        )
+    )).scalar_one_or_none()
+    if practice is None:
+        raise HTTPException(status_code=404, detail="Practice not found")
+    if not practice.is_brand_locked:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "brand_image_requires_lock",
+                "message": (
+                    "Only brand-locked practices can carry a brand image. "
+                    "Lock the brand first, then upload the image."
+                ),
+            },
+        )
+
+    from app.modules.media.router import (
+        upload_to_s3, IMAGE_CONTENT_TYPES,
+    )
+    result = await upload_to_s3(
+        file, folder="brand-images",
+        allowed_types=IMAGE_CONTENT_TYPES,
+        max_size_bytes=5 * 1024 * 1024,
+    )
+    practice.brand_image_url = result["url"]
+    await db.commit()
+    await db.refresh(practice)
+    return practice
+
+
+@router.delete("/client/{client_id}/timelines/{timeline_id}/practices/{practice_id}/brand-image", response_model=PracticeOut)
+async def delete_practice_brand_image(
+    client_id: str, timeline_id: str, practice_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Explicit removal — clears brand_image_url. Idempotent (no-op
+    if already null). The S3 object is NOT deleted — downstream
+    snapshots that locked onto the old URL still reference it, and
+    S3 lifecycle rules can sweep orphans later. Returns the practice
+    for inline CP refresh.
+    """
+    await _assert_can_edit_client_advisory(db, current_user.id, client_id)
+    practice = (await db.execute(
+        select(Practice).where(
+            Practice.id == practice_id, Practice.timeline_id == timeline_id,
+        )
+    )).scalar_one_or_none()
+    if practice is None:
+        raise HTTPException(status_code=404, detail="Practice not found")
+    practice.brand_image_url = None
+    await db.commit()
+    await db.refresh(practice)
     return practice
 
 

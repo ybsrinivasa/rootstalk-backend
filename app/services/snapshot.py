@@ -195,6 +195,12 @@ async def serialise_timeline(db: AsyncSession, timeline_id: str) -> dict:
                 # this line are missing the field; the reader
                 # tolerates that (falls back to live Practice).
                 "is_brand_locked": bool(getattr(p, "is_brand_locked", False)),
+                # 2026-11-26 — single S3 image per brand-locked
+                # practice. Baked into the snapshot so AOM content-
+                # versioning covers image edits: PURCHASE_ACK farmers
+                # keep their committed image; force-push rewrites
+                # VIEWED snapshots with the current image.
+                "brand_image_url": getattr(p, "brand_image_url", None),
                 "elements": [
                     {
                         "id": e.id,
