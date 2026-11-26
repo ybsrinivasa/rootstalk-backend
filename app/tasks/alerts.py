@@ -259,25 +259,52 @@ async def _load_active_order_practice_ids(db, subscription_id: str) -> set[str]:
 async def _load_purchased_practice_ids(
     db, subscription_id: str, today_date: date,
 ) -> set[str]:
-    """Practice IDs the farmer has already "purchased" via the v1.8
-    Advisory-Only Mode two-stage ack (`purchased_at IS NOT NULL` on
-    the PracticeAcknowledgement for an occurrence <= today). These
+    """LIVE Practice IDs the farmer has already "purchased" via the
+    v1.8 Advisory-Only Mode two-stage ack (`purchased_at IS NOT NULL`
+    on the PracticeAcknowledgement for an occurrence <= today). These
     suppress today's INPUT alert in advisory-only mode — the analogue
     of _load_active_order_practice_ids in Regular Mode.
 
     Only rows whose `occurrence_date <= today_date` count. A future
     occurrence isn't yet the alert's target so shouldn't retroactively
     silence today's nudge.
+
+    2026-11-26 — Lineage-aware resolution (incident SM-26-000004).
+    Before: returned ack.practice_id directly, which breaks for subs
+    whose package has been republished between ack and alert-vanish
+    (ack.practice_id points to the OLD, now-not-subscribed, Practice
+    row). After: resolve ack.practice_lineage_id to the SET of all
+    live Practice.ids sharing that lineage (the caller intersects with
+    due_pids from the sub's current package, so other packages'
+    matches are harmless noise). Pre-backfill acks with NULL lineage
+    fall back to practice_id — safe when package wasn't republished.
     """
-    from app.modules.advisory.models import PracticeAcknowledgement
+    from app.modules.advisory.models import (
+        PracticeAcknowledgement, Practice,
+    )
     rows = (await db.execute(
-        select(PracticeAcknowledgement.practice_id).where(
+        select(
+            PracticeAcknowledgement.practice_id,
+            PracticeAcknowledgement.practice_lineage_id,
+        ).where(
             PracticeAcknowledgement.subscription_id == subscription_id,
             PracticeAcknowledgement.purchased_at.is_not(None),
             PracticeAcknowledgement.occurrence_date <= today_date,
         )
-    )).scalars().all()
-    return set(rows)
+    )).all()
+    if not rows:
+        return set()
+    out: set[str] = set()
+    lineage_ids = {r.practice_lineage_id for r in rows if r.practice_lineage_id}
+    direct_pids = {r.practice_id for r in rows if not r.practice_lineage_id}
+    if lineage_ids:
+        live_pids = (await db.execute(
+            select(Practice.id).where(Practice.lineage_id.in_(lineage_ids))
+        )).scalars().all()
+        out.update(live_pids)
+    if direct_pids:
+        out.update(direct_pids)
+    return out
 
 
 async def clear_input_alerts_if_no_due_remaining(
