@@ -274,6 +274,7 @@ def render_cca_from_content(
             ],
             frequency_days=p.get("frequency_days"),
             is_brand_locked=bool(p.get("is_brand_locked", False)),
+            brand_image_url=p.get("brand_image_url"),
         )
         for p in visible_practices
     ]

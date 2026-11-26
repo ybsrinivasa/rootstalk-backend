@@ -252,6 +252,11 @@ class PracticeOut(BaseModel):
     display_order: int
     is_special_input: bool
     is_brand_locked: bool = False
+    # 2026-11-26 — S3 public URL for the single brand-locked product
+    # image (uploaded via PUT .../practices/{pid}/brand-image).
+    # Only populated when is_brand_locked=true; auto-cleared when
+    # the lock flips off.
+    brand_image_url: Optional[str] = None
     relation_id: Optional[str] = None
     created_at: datetime
 

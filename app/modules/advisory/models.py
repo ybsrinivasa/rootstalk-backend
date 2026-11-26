@@ -492,6 +492,13 @@ class Practice(Base):
     # BL-07 "lock by element presence" inference is superseded by this
     # explicit flag.
     is_brand_locked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # 2026-11-26 — Single image per brand-locked INPUT practice. S3
+    # public URL (same storage pattern as logo uploads). ONLY valid
+    # when is_brand_locked=true — PUT practice auto-clears this
+    # field if the CA flips the lock off. Rendered inline below the
+    # practice card on the farmer's PWA so the farmer recognises the
+    # product on the dealer's shelf.
+    brand_image_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     timeline: Mapped["Timeline"] = relationship("Timeline", back_populates="practices")

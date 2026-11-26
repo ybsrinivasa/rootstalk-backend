@@ -7915,6 +7915,13 @@ async def _today_advisory_for_user(
                     # can render Brand + Manufacturer prominently and
                     # disable the Brands button.
                     "is_brand_locked": p.is_brand_locked,
+                    # 2026-11-26 — single S3 image per brand-locked
+                    # practice; PWA renders it inline below the
+                    # practice card so the farmer recognises the
+                    # product on the dealer's shelf. NULL when the
+                    # CM hasn't uploaded one (or the lock was later
+                    # removed → auto-cleared).
+                    "brand_image_url": getattr(p, "brand_image_url", None),
                     "locked_brand_name": (
                         locked_brand_name_by_id.get(_locked_brand_ref)
                         if _locked_brand_ref else None

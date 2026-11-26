@@ -45,6 +45,11 @@ class PracticeStub:
     relation_type: Optional[str] = None  # AND | OR | IF — copied from Relation when known
     frequency_days: Optional[int] = None  # NULL = one-time; >=1 = recurring every N days
     is_brand_locked: bool = False  # SE authoring intent; farmer PWA reveals brand/manufacturer when true
+    # 2026-11-26 — S3 public URL for the single brand-locked product
+    # image. Rendered inline below the practice card on the PWA so
+    # the farmer recognises the product on the dealer's shelf. Only
+    # populated when is_brand_locked=true.
+    brand_image_url: Optional[str] = None
 
     def primary_identity_ref(self) -> Optional[str]:
         """
