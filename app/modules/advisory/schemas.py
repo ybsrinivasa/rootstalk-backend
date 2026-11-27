@@ -298,6 +298,13 @@ class PracticeWithElementsOut(BaseModel):
     display_order: int
     is_special_input: bool
     is_brand_locked: bool = False
+    # 2026-11-27 — Was missing from the LIST shape (only PracticeOut
+    # had it), so the CP package-editor's practice list fetch stripped
+    # brand_image_url on serialisation → the un-lock-brand confirm in
+    # PracticeFormModal always saw it as undefined → never fired. Also
+    # needed so BrandImagePanel's thumbnail actually renders on first
+    # load (not only after upload refetch).
+    brand_image_url: Optional[str] = None
     relation_id: Optional[str] = None
     created_at: datetime
     elements: list[ElementWithLabelOut] = []
