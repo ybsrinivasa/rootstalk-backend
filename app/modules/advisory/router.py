@@ -6400,6 +6400,14 @@ async def _attach_elements_with_labels(
             "display_order": p.display_order,
             "is_special_input": p.is_special_input,
             "is_brand_locked": p.is_brand_locked,
+            # 2026-11-27 — Manually include brand_image_url in the
+            # dict. The response_model (PracticeWithElementsOut) was
+            # updated earlier the same day to carry this field, but
+            # this manual constructor is the source of truth —
+            # response_model only FILTERS keys, it doesn't add them.
+            # Without this line the CP package-editor loses the
+            # thumbnail on every page refresh.
+            "brand_image_url": p.brand_image_url,
             "relation_id": p.relation_id,
             "created_at": p.created_at,
             "elements": by_practice.get(p.id, []),
