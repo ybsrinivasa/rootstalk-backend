@@ -2910,6 +2910,13 @@ async def import_timeline(
             l2_type=src_p.l2_type,
             display_order=src_p.display_order,
             is_special_input=src_p.is_special_input,
+            # 2026-11-27 — Propagate brand lock + image across clone
+            # chains. Without these, an ACTIVE→DRAFT republish
+            # silently un-locks every brand and drops every attached
+            # product image. User-reported: "product image seems to
+            # mage in CP when the package moves from active to draft".
+            is_brand_locked=src_p.is_brand_locked,
+            brand_image_url=src_p.brand_image_url,
             common_name_cosh_id=src_p.common_name_cosh_id,
             frequency_days=src_p.frequency_days,
         )
@@ -6756,6 +6763,8 @@ async def _deep_copy_advisory_content(
                 display_order=src_p.display_order,
                 is_special_input=src_p.is_special_input,
                 is_brand_locked=src_p.is_brand_locked,
+                # 2026-11-27 — Also propagate the product image.
+                brand_image_url=src_p.brand_image_url,
                 common_name_cosh_id=src_p.common_name_cosh_id,
                 frequency_days=src_p.frequency_days,
                 # relation_id + relation_role wired in a second pass
@@ -8350,6 +8359,10 @@ async def _copy_pg_content_into(
                 l2_type=src_p.l2_type,
                 display_order=src_p.display_order,
                 is_special_input=src_p.is_special_input,
+                # 2026-11-27 — Propagate brand lock + image (otherwise
+                # ACTIVE→DRAFT republish silently un-locks + drops img).
+                is_brand_locked=src_p.is_brand_locked,
+                brand_image_url=src_p.brand_image_url,
                 frequency_days=src_p.frequency_days,
             )
             db.add(new_p)
@@ -8402,6 +8415,10 @@ async def _copy_sp_content_into(
                 l2_type=src_p.l2_type,
                 display_order=src_p.display_order,
                 is_special_input=src_p.is_special_input,
+                # 2026-11-27 — Propagate brand lock + image (otherwise
+                # ACTIVE→DRAFT republish silently un-locks + drops img).
+                is_brand_locked=src_p.is_brand_locked,
+                brand_image_url=src_p.brand_image_url,
                 frequency_days=src_p.frequency_days,
             )
             db.add(new_p)
@@ -10259,6 +10276,10 @@ async def import_pg_into_sp(
                 l2_type=src_p.l2_type,
                 display_order=src_p.display_order,
                 is_special_input=src_p.is_special_input,
+                # 2026-11-27 — Propagate brand lock + image (otherwise
+                # ACTIVE→DRAFT republish silently un-locks + drops img).
+                is_brand_locked=src_p.is_brand_locked,
+                brand_image_url=src_p.brand_image_url,
                 frequency_days=src_p.frequency_days,
             )
             db.add(new_p)
