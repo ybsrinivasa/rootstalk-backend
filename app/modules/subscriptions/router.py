@@ -2842,9 +2842,20 @@ async def promoter_assignment_today(
     Returns a single AdvisoryDay dict (the farmer endpoint's list
     element shape), or 404 if the sub has no crop_start_date /
     is not yet renderable."""
+    # 2026-11-27 — Filter by ACTIVE. After the 2026-11-17 Follow-up
+    # Promoter widening, a sub that's been reassigned has TWO rows:
+    # the old assignment flipped to REVOKED_BY_RM + the new ACTIVE
+    # for the follow-up user. Without the status filter,
+    # scalar_one_or_none() raises MultipleResultsFound → 500 → the
+    # follow-up promoter can't see any advisory. Filtering to ACTIVE
+    # returns the one current row. The 409 "assignment_not_active"
+    # branch below is now defensive-only since no non-ACTIVE row can
+    # match this query — kept intact so a future status change
+    # still fails loudly.
     assignment = (await db.execute(
         select(PromoterAssignment).where(
             PromoterAssignment.subscription_id == subscription_id,
+            PromoterAssignment.status == AssignmentStatus.ACTIVE,
         )
     )).scalar_one_or_none()
     if assignment is None or assignment.promoter_user_id != current_user.id:
@@ -3137,8 +3148,18 @@ async def get_assignment_details(
     from app.config import settings
     sub = await _get_subscription(db, subscription_id, current_user.id)
 
+    # 2026-11-27 — Filter by PENDING_FARMER_APPROVAL. This endpoint
+    # powers the farmer-review screen for a pending assignment. After
+    # the 2026-11-17 Follow-up Promoter widening, a sub that's been
+    # reassigned carries both the original REVOKED_BY_RM row and the
+    # new ACTIVE follow-up row — an unfiltered query would hit
+    # MultipleResultsFound. Filter to the farmer-actionable PENDING
+    # row so the review screen loads deterministically.
     assignment = (await db.execute(
-        select(PromoterAssignment).where(PromoterAssignment.subscription_id == subscription_id)
+        select(PromoterAssignment).where(
+            PromoterAssignment.subscription_id == subscription_id,
+            PromoterAssignment.status == AssignmentStatus.PENDING_FARMER_APPROVAL,
+        )
     )).scalar_one_or_none()
     if not assignment:
         raise HTTPException(status_code=404, detail="Not an assignment")
@@ -3314,8 +3335,16 @@ async def respond_to_assignment(
     sub = await _get_subscription(db, subscription_id, current_user.id)
     approved = data.get("approved", False)
 
+    # 2026-11-27 — Filter by PENDING_FARMER_APPROVAL. Same rationale
+    # as get_assignment_details above: without the status filter,
+    # follow-up-reassigned subs trip MultipleResultsFound. The
+    # already_resolved branch below stays as defence-in-depth so a
+    # future status-set mismatch still fails loudly.
     assignment_result = await db.execute(
-        select(PromoterAssignment).where(PromoterAssignment.subscription_id == subscription_id)
+        select(PromoterAssignment).where(
+            PromoterAssignment.subscription_id == subscription_id,
+            PromoterAssignment.status == AssignmentStatus.PENDING_FARMER_APPROVAL,
+        )
     )
     assignment = assignment_result.scalar_one_or_none()
     if assignment is None:
