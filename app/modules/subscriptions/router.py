@@ -2784,6 +2784,27 @@ async def my_incoming_alerts(
         )).all():
             client_display_by_id[cid] = display or full
 
+    # 2026-11-28 — advisory_visible per alert row. True when the
+    # viewing user has an ACTIVE PromoterAssignment on the alert's
+    # subscription — i.e. they're a Promoter (or Follow-up Promoter)
+    # on that sub in addition to being the alert recipient. Lets
+    # the PWA offer a tap-through from the alert to the farmer's
+    # advisory ("I see Suresh has input due — let me open his
+    # advisory to see what"). Pure read-only; auth on
+    # /promoter/assignments/{sid}/today is unchanged (still enforces
+    # ACTIVE assignment at the endpoint).
+    sub_ids = {sub.id for _, sub, _, _ in rows}
+    advisory_visible_sub_ids: set[str] = set()
+    if sub_ids:
+        rows_vis = (await db.execute(
+            select(PromoterAssignment.subscription_id).where(
+                PromoterAssignment.subscription_id.in_(sub_ids),
+                PromoterAssignment.promoter_user_id == current_user.id,
+                PromoterAssignment.status == AssignmentStatus.ACTIVE,
+            )
+        )).scalars().all()
+        advisory_visible_sub_ids = set(rows_vis)
+
     out = []
     for alert, sub, pkg, farmer in rows:
         measure = measure_by_crop.get(pkg.crop_cosh_id, "AREA_WISE") if pkg.crop_cosh_id else "AREA_WISE"
@@ -2816,6 +2837,7 @@ async def my_incoming_alerts(
             "area_unit": sub.area_unit,
             "number_of_plants": sub.number_of_plants,
             "planting_year": sub.planting_year,
+            "advisory_visible": sub.id in advisory_visible_sub_ids,
         })
     return out
 
