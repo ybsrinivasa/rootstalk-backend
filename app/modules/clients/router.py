@@ -4228,6 +4228,103 @@ def _timeline_window(tl, crop_start: "date") -> tuple["date | None", "date | Non
     return (None, None)
 
 
+@router.get("/client/{client_id}/dashboard-summary")
+async def get_dashboard_summary(
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """One-shot counters for the CA Portal Dashboard tiles.
+
+    Returns:
+      packages     — {total, active} across all statuses on this client.
+      active_farmers — distinct farmers with at least one ACTIVE
+                       subscription on this client whose crop_start_date
+                       is set. "Capacity used"-style signal vs the
+                       subscription-pool "capacity available" tile.
+      alerts       — {total, by_type:{...}} summing the five
+                     farmer-support alert sources. by_type lets the
+                     tile hover expose a mini-breakdown.
+
+    2026-11-28 — Replaces the dashboard's earlier pattern of calling
+    /packages with a slice(0,6) in the CP and a non-existent /alerts
+    endpoint. The slice was silently miscounting (6 vs real 100+) and
+    /alerts always 404'd silently to 0.
+
+    Auth: open to any portal member of this client (same gate as the
+    per-type alert endpoints). Read-only — no mutation.
+    """
+    from app.modules.farmpundit.router import _assert_portal_member
+    from app.modules.advisory.models import Package, PackageStatus
+    from app.modules.subscriptions.models import (
+        Subscription, SubscriptionStatus,
+    )
+    from sqlalchemy import func
+    await _assert_portal_member(db, current_user.id, client_id)
+
+    # ── Packages: total + active ─────────────────────────────────────
+    pkg_rows = (await db.execute(
+        select(Package.status, func.count()).where(
+            Package.client_id == client_id,
+        ).group_by(Package.status)
+    )).all()
+    pkg_total = sum(cnt for _s, cnt in pkg_rows)
+    pkg_active = sum(cnt for s, cnt in pkg_rows if s == PackageStatus.ACTIVE)
+
+    # ── Active farmers: distinct farmer_user_id, status=ACTIVE,
+    #    crop_start_date IS NOT NULL. The "has a current crop in
+    #    the ground" count — the number CAs care about most. Farmers
+    #    with ACTIVE subs but no crop_start_date are flagged
+    #    separately in pending_start_dates.
+    active_farmers = (await db.execute(
+        select(func.count(func.distinct(Subscription.farmer_user_id)))
+        .where(
+            Subscription.client_id == client_id,
+            Subscription.status == SubscriptionStatus.ACTIVE,
+            Subscription.crop_start_date.is_not(None),
+        )
+    )).scalar() or 0
+
+    # ── Alerts: delegate each per-type count by reusing the existing
+    #    endpoints' handlers. Each returns a list; we len() it. If a
+    #    sub-call blows up (e.g. a per-type contract change), swallow
+    #    + count 0 for that type so the whole summary still renders.
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+    async def _safe_len(coro):
+        try:
+            rows = await coro
+            return len(rows) if rows is not None else 0
+        except Exception as _e:
+            _log.warning(f"dashboard-summary alert fetch failed: {_e}")
+            return 0
+
+    by_type = {
+        "pending_start_dates": await _safe_len(
+            get_pending_start_dates(client_id, db, current_user),
+        ),
+        "overdue_inputs": await _safe_len(
+            get_overdue_inputs(client_id, db, current_user),
+        ),
+        "missed_inputs": await _safe_len(
+            get_missed_inputs(client_id, db, current_user),
+        ),
+        "overdue_expert_queries": await _safe_len(
+            get_overdue_expert_queries(client_id, db, current_user),
+        ),
+        "no_active_subscription": await _safe_len(
+            get_no_active_subscription(client_id, db, current_user),
+        ),
+    }
+    alert_total = sum(by_type.values())
+
+    return {
+        "packages": {"total": pkg_total, "active": pkg_active},
+        "active_farmers": active_farmers,
+        "alerts": {"total": alert_total, "by_type": by_type},
+    }
+
+
 @router.get("/client/{client_id}/farmer-support/farmers/{farmer_user_id}")
 async def get_farmer_support_profile(
     client_id: str,
