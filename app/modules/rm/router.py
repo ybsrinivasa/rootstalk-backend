@@ -165,6 +165,25 @@ async def user_context(
                   "resolution_status": c.resolution_status, "is_escalated": c.is_escalated,
                   "created_at": c.created_at} for c in cases]
 
+    # 2026-11-28 — Bulk resolve cosh_ids to English names for the UI
+    # (header subtitle + subscription-row crop label). Prior UI was
+    # rendering raw UUIDs into the human subtitle, unreadable.
+    from app.services.i18n_cosh import resolve_names_by_cosh_id
+    cosh_ids = {
+        user.state_cosh_id, user.district_cosh_id, user.sub_district_cosh_id,
+    }
+    cosh_ids.update(
+        s.get("crop_cosh_id") for s in subscription_data if s.get("crop_cosh_id")
+    )
+    cosh_ids = {c for c in cosh_ids if c}
+    name_by_id = (
+        await resolve_names_by_cosh_id(db, cosh_ids, lang="en")
+        if cosh_ids else {}
+    )
+    for s in subscription_data:
+        if s.get("crop_cosh_id"):
+            s["crop_name"] = name_by_id.get(s["crop_cosh_id"])
+
     return {
         "profile": {
             "id": user.id,
@@ -175,6 +194,9 @@ async def user_context(
             "state": user.state_cosh_id,
             "district": user.district_cosh_id,
             "sub_district": user.sub_district_cosh_id,
+            "state_name": name_by_id.get(user.state_cosh_id) if user.state_cosh_id else None,
+            "district_name": name_by_id.get(user.district_cosh_id) if user.district_cosh_id else None,
+            "sub_district_name": name_by_id.get(user.sub_district_cosh_id) if user.sub_district_cosh_id else None,
             "address": user.address_line,
             "gps_lat": float(user.gps_lat) if user.gps_lat else None,
             "gps_lng": float(user.gps_lng) if user.gps_lng else None,
@@ -335,7 +357,32 @@ async def rm_alert_queue(
             })
 
     out.sort(key=lambda x: x["days_pending"], reverse=True)
-    return out[:200]
+    out = out[:200]
+
+    # 2026-11-28 — Resolve district/state cosh_ids to names so the SA
+    # alert table doesn't render raw UUIDs. Bulk resolve once per
+    # request. Rows whose ids aren't in CoshCoreItem (missing/typo)
+    # keep the raw id as fallback — caller can see something is
+    # wrong rather than seeing nothing.
+    from app.services.i18n_cosh import resolve_names_by_cosh_id
+    cosh_ids = set()
+    for row in out:
+        if row.get("farmer_district"): cosh_ids.add(row["farmer_district"])
+        if row.get("farmer_state"): cosh_ids.add(row["farmer_state"])
+    if cosh_ids:
+        name_by_id = await resolve_names_by_cosh_id(
+            db, cosh_ids, lang="en", use_fallback_id=True,
+        )
+        for row in out:
+            if row.get("farmer_district"):
+                row["farmer_district_name"] = name_by_id.get(
+                    row["farmer_district"], row["farmer_district"],
+                )
+            if row.get("farmer_state"):
+                row["farmer_state_name"] = name_by_id.get(
+                    row["farmer_state"], row["farmer_state"],
+                )
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
