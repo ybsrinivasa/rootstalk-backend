@@ -6,7 +6,8 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_, func
+from sqlalchemy import select, or_, func, and_
+from app.config import settings
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.modules.platform.models import User
@@ -17,7 +18,7 @@ from app.modules.subscriptions.models import (
 )
 from app.modules.advisory.models import Package, Timeline, Practice, Element
 from app.modules.orders.models import Order, OrderStatus
-from app.modules.farmpundit.models import Query as FarmPunditQuery
+from app.modules.farmpundit.models import Query as FarmPunditQuery, QueryStatus
 
 router = APIRouter(tags=["RM Support"])
 
@@ -335,6 +336,197 @@ async def rm_alert_queue(
 
     out.sort(key=lambda x: x["days_pending"], reverse=True)
     return out[:200]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5a. Cross-tenant alerts summary — powers the SA RM home dashboard tiles
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/admin/rm/alerts-summary")
+async def rm_alerts_summary(
+    sla_hours: int = 48,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """One-shot cross-client aggregator for the SA RM Support Desk
+    home. Mirrors the five CA Farmer Support alert types + open-cases
+    + a "top clients by alert volume" breakdown so the SA can see
+    which tenant is drowning right now.
+
+    Counts:
+      start_date_pending   — ACTIVE sub with crop_start_date IS NULL
+      input_due            — pre-existing /admin/rm/alerts INPUT_DUE
+                             count (approx; iterates timelines)
+      missed_inputs        — INPUT practice whose window has closed
+                             and no order was placed
+      open_expert_queries  — FarmPunditQuery not RESPONDED/REJECTED/
+                             EXPIRED, older than sla_hours (default 48)
+      lapsed_farmers       — users who ever subscribed with any client
+                             but hold no ACTIVE sub right now
+      open_cases           — RMCase.resolution_status = 'OPEN'
+
+    Top clients: summed across the first FOUR alert types (not
+    open_cases + lapsed_farmers — those are SA-maintained state, not
+    farmer-signal). Returns up to 5 clients sorted by total DESC.
+
+    2026-11-28 — SA-gated. All existing /admin/rm/* endpoints are
+    gate-less; that's a latent tightening target but out of scope here.
+    This new endpoint takes the explicit _require_sa gate.
+    """
+    if not (settings.sa_email and current_user.email == settings.sa_email):
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "sa_only", "message": "SA access required."},
+        )
+
+    now = datetime.now(timezone.utc)
+    today_date = now.date()
+    sla_cutoff = now - timedelta(hours=max(1, sla_hours))
+
+    # ── start_date_pending: cheap SQL ───────────────────────────────
+    sdp_by_client_rows = (await db.execute(
+        select(Subscription.client_id, func.count())
+        .where(
+            Subscription.status == SubscriptionStatus.ACTIVE,
+            Subscription.crop_start_date.is_(None),
+        )
+        .group_by(Subscription.client_id)
+    )).all()
+    sdp_by_client = {cid: cnt for cid, cnt in sdp_by_client_rows}
+    start_date_pending = sum(sdp_by_client.values())
+
+    # ── open_expert_queries: cheap SQL + per-client ────────────────
+    oeq_by_client_rows = (await db.execute(
+        select(FarmPunditQuery.client_id, func.count())
+        .where(
+            FarmPunditQuery.status.notin_([
+                QueryStatus.RESPONDED,
+                QueryStatus.REJECTED,
+                QueryStatus.EXPIRED,
+            ]),
+            FarmPunditQuery.created_at <= sla_cutoff,
+        )
+        .group_by(FarmPunditQuery.client_id)
+    )).all()
+    oeq_by_client = {cid: cnt for cid, cnt in oeq_by_client_rows}
+    open_expert_queries = sum(oeq_by_client.values())
+
+    # ── lapsed_farmers: distinct farmer with NO active sub anywhere ─
+    ever_farmer_ids = (await db.execute(
+        select(Subscription.farmer_user_id).distinct()
+    )).scalars().all()
+    active_farmer_ids = set((await db.execute(
+        select(Subscription.farmer_user_id).distinct()
+        .where(Subscription.status == SubscriptionStatus.ACTIVE)
+    )).scalars().all())
+    lapsed_farmers = len([fid for fid in ever_farmer_ids if fid not in active_farmer_ids])
+
+    # ── open_cases: cheap SQL ───────────────────────────────────────
+    open_cases = (await db.execute(
+        select(func.count(RMCase.id)).where(
+            RMCase.resolution_status == "OPEN",
+        )
+    )).scalar() or 0
+
+    # ── input_due + missed_inputs: iterate subs (bounded) ──────────
+    # Expensive when many active subs; cap at 500 per type to keep
+    # the summary responsive. These counts are "at least N" when
+    # the cap is hit — a conscious tradeoff for a dashboard tile.
+    # UI will show the number verbatim; drill-down on /rm/alerts
+    # uses the exact per-type endpoint.
+    input_due_by_client: dict[str, int] = {}
+    missed_inputs_by_client: dict[str, int] = {}
+    input_due = 0
+    missed_inputs = 0
+    SUB_SCAN_CAP = 500
+
+    live_subs = (await db.execute(
+        select(Subscription).where(
+            Subscription.status == SubscriptionStatus.ACTIVE,
+            Subscription.crop_start_date.isnot(None),
+        ).limit(SUB_SCAN_CAP)
+    )).scalars().all()
+
+    for s in live_subs:
+        crop_start = s.crop_start_date.date() if hasattr(s.crop_start_date, 'date') else s.crop_start_date
+        if not crop_start:
+            continue
+        day_offset = (today_date - crop_start).days
+
+        tls = (await db.execute(
+            select(Timeline).where(Timeline.package_id == s.package_id)
+        )).scalars().all()
+        for tl in tls:
+            if tl.from_type.value != "DAS":
+                continue
+            # Per-timeline order check — short-circuit expensive
+            # practice scans when an order already covers the timeline.
+            has_order = (await db.execute(
+                select(Order.id)
+                .where(
+                    Order.subscription_id == s.id,
+                    Order.status.notin_([OrderStatus.CANCELLED, OrderStatus.EXPIRED]),
+                ).limit(1)
+            )).scalar()
+            if has_order:
+                continue
+            has_input = (await db.execute(
+                select(Practice.id).where(
+                    Practice.timeline_id == tl.id,
+                    Practice.l0_type == "INPUT",
+                ).limit(1)
+            )).scalar()
+            if not has_input:
+                continue
+            if tl.from_value <= day_offset <= tl.to_value:
+                input_due += 1
+                input_due_by_client[s.client_id] = input_due_by_client.get(s.client_id, 0) + 1
+                break
+            if day_offset > tl.to_value:
+                missed_inputs += 1
+                missed_inputs_by_client[s.client_id] = missed_inputs_by_client.get(s.client_id, 0) + 1
+                break
+
+    # ── top clients by farmer-signal alert volume ───────────────────
+    tenant_totals: dict[str, int] = {}
+    for cid, c in sdp_by_client.items():
+        tenant_totals[cid] = tenant_totals.get(cid, 0) + c
+    for cid, c in input_due_by_client.items():
+        tenant_totals[cid] = tenant_totals.get(cid, 0) + c
+    for cid, c in missed_inputs_by_client.items():
+        tenant_totals[cid] = tenant_totals.get(cid, 0) + c
+    for cid, c in oeq_by_client.items():
+        tenant_totals[cid] = tenant_totals.get(cid, 0) + c
+
+    top_client_ids = sorted(tenant_totals.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    top_clients: list[dict] = []
+    if top_client_ids:
+        cid_to_name = {}
+        rows = (await db.execute(
+            select(Client.id, Client.display_name, Client.full_name)
+            .where(Client.id.in_([cid for cid, _ in top_client_ids]))
+        )).all()
+        for cid, dn, fn in rows:
+            cid_to_name[cid] = dn or fn or cid
+        for cid, total in top_client_ids:
+            top_clients.append({
+                "client_id": cid,
+                "client_name": cid_to_name.get(cid, cid),
+                "total_alerts": total,
+            })
+
+    return {
+        "totals": {
+            "start_date_pending": start_date_pending,
+            "input_due": input_due,
+            "missed_inputs": missed_inputs,
+            "open_expert_queries": open_expert_queries,
+            "lapsed_farmers": lapsed_farmers,
+            "open_cases": open_cases,
+        },
+        "top_clients": top_clients,
+        "sub_scan_capped": len(live_subs) >= SUB_SCAN_CAP,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
