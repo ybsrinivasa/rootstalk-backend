@@ -2936,6 +2936,64 @@ async def promoter_assignment_today(
     return day
 
 
+@router.get("/promoter/assignments/{subscription_id}/cluster")
+async def promoter_assignment_cluster(
+    subscription_id: str,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Promoter read-only mirror of /farmer/advisory/cluster.
+
+    2026-11-28 — Added for exact parity with the farmer's cluster
+    navigation. When the sub is Advisory-Only Mode, the farmer walks
+    chapters (overlapping-timeline clusters) via Prev/Today/Next.
+    The promoter should see the same thing — same chapter boundaries,
+    same position chip, same date range — so phone conversations stay
+    aligned. See `_cluster_payload_for_sub` for the shared body.
+
+    Auth: PromoterAssignment.promoter_user_id == current_user.id AND
+    status == ACTIVE on this sub. Same gate as the sibling
+    /promoter/assignments/{sid}/today endpoint; mirrors its
+    2026-11-27 ACTIVE-filter fix for the Multi-Results trap.
+
+    Regular-Mode subs have no cluster concept — the farmer sees only
+    today. This endpoint will still return the cluster payload
+    (useful for debugging / parity check) but the PWA shouldn't call
+    it on non-advisory-only subs.
+    """
+    assignment = (await db.execute(
+        select(PromoterAssignment).where(
+            PromoterAssignment.subscription_id == subscription_id,
+            PromoterAssignment.status == AssignmentStatus.ACTIVE,
+        )
+    )).scalar_one_or_none()
+    if assignment is None or assignment.promoter_user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Assignment not found.")
+
+    sub = await db.get(Subscription, subscription_id)
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found.")
+    if sub.status != SubscriptionStatus.ACTIVE:
+        raise HTTPException(status_code=400, detail={"code": "sub_not_active"})
+    if sub.crop_start_date is None:
+        raise HTTPException(status_code=400, detail={"code": "no_crop_start"})
+    pkg = (await db.execute(
+        select(Package).where(Package.id == sub.package_id, Package.status == "ACTIVE"),
+    )).scalar_one_or_none()
+    if pkg is None:
+        raise HTTPException(status_code=404, detail={"code": "no_package"})
+
+    return await _cluster_payload_for_sub(
+        db, sub=sub, pkg=pkg, offset=offset,
+        lang=current_user.language_code or "en",
+        # Always render from the FARMER'S perspective — the sub's
+        # farmer, not the viewing promoter. The promoter is read-only
+        # here; they see what the farmer sees.
+        farmer_user_id=sub.farmer_user_id,
+    )
+
+
 # F-P B3 (2026-05-29) — F-P self-cancel of a pending assignment.
 WITHDRAW_FCM_TITLE = "Subscription offer withdrawn"
 WITHDRAW_FCM_BODY = (
@@ -5510,11 +5568,12 @@ async def get_advisory_cluster(
         ongoing_timelines: [ TimelineItem, ... ] # frequency + event-triggered
       }
     """
-    from app.services.snapshot_render import (
-        metadata_from_master_cca, cca_calendar_dates,
-    )
-    from app.modules.advisory.models import TimelineStatus
-
+    # 2026-11-28 — Body extracted to `_cluster_payload_for_sub` so the
+    # promoter mirror (/promoter/assignments/{sid}/cluster) can reuse
+    # the exact same cluster math, chapter boundaries and dedup pass
+    # without duplicating 400 lines. The farmer endpoint does its own
+    # auth + sub/pkg resolution here, then calls the helper with its
+    # resolved context.
     sub = await db.get(Subscription, subscription_id)
     if sub is None or sub.farmer_user_id != current_user.id:
         raise HTTPException(status_code=403, detail={"code": "forbidden"})
@@ -5527,12 +5586,40 @@ async def get_advisory_cluster(
     )).scalar_one_or_none()
     if pkg is None:
         raise HTTPException(status_code=404, detail={"code": "no_package"})
+    return await _cluster_payload_for_sub(
+        db, sub=sub, pkg=pkg, offset=offset,
+        lang=current_user.language_code or "en",
+        farmer_user_id=current_user.id,
+    )
+
+
+async def _cluster_payload_for_sub(
+    db: AsyncSession, *,
+    sub: Subscription,
+    pkg: Package,
+    offset: int,
+    lang: str,
+    farmer_user_id: str,
+):
+    """Shared cluster-advisory builder.
+
+    Produces the same cluster payload whether called by the farmer's
+    own advisory endpoint or the promoter's read-only mirror. Takes
+    already-resolved `sub` + `pkg` and the `farmer_user_id` whose data
+    to render (always the sub's farmer — not necessarily the caller).
+
+    Auth is the caller's responsibility; this helper only builds the
+    payload. See both call sites for the gating logic.
+    """
+    from app.services.snapshot_render import (
+        metadata_from_master_cca, cca_calendar_dates,
+    )
+    from app.modules.advisory.models import TimelineStatus
 
     crop_start = (sub.crop_start_date.date()
                   if hasattr(sub.crop_start_date, 'date')
                   else sub.crop_start_date)
     today = date.today()
-    lang = current_user.language_code or "en"
 
     # Load all ACTIVE timelines for the package, separate ongoing from fixed.
     tls = (await db.execute(
@@ -5572,8 +5659,8 @@ async def get_advisory_cluster(
 
     # Load ongoing practices (call today's advisory once, filter to ongoing).
     ongoing_day = await _today_advisory_for_user(
-        db, farmer_user_id=current_user.id,
-        only_subscription_id=subscription_id, lang=lang, for_date=today,
+        db, farmer_user_id=farmer_user_id,
+        only_subscription_id=sub.id, lang=lang, for_date=today,
     )
     ongoing_timelines_out: list[dict] = []
     if ongoing_day and ongoing_day[0].get('timelines'):
@@ -5609,8 +5696,8 @@ async def get_advisory_cluster(
     # include them in every return path below.
     cha_tls_active_today: list[dict] = []
     today_data = await _today_advisory_for_user(
-        db, farmer_user_id=current_user.id,
-        only_subscription_id=subscription_id, lang=lang, for_date=today,
+        db, farmer_user_id=farmer_user_id,
+        only_subscription_id=sub.id, lang=lang, for_date=today,
     )
     if today_data and today_data[0].get('timelines'):
         cha_tls_active_today = [
@@ -5705,8 +5792,8 @@ async def get_advisory_cluster(
     day = target['from']
     while day <= target['to']:
         day_data = await _today_advisory_for_user(
-            db, farmer_user_id=current_user.id,
-            only_subscription_id=subscription_id, lang=lang, for_date=day,
+            db, farmer_user_id=farmer_user_id,
+            only_subscription_id=sub.id, lang=lang, for_date=day,
         )
         if day_data and day_data[0].get('timelines'):
             for tl in day_data[0]['timelines']:
