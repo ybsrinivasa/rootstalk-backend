@@ -2847,6 +2847,7 @@ async def my_incoming_alerts(
 @router.get("/promoter/assignments/{subscription_id}/today")
 async def promoter_assignment_today(
     subscription_id: str,
+    for_date: Optional[date] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -2863,7 +2864,12 @@ async def promoter_assignment_today(
     owned by this user; 409 if the assignment isn't ACTIVE yet.
     Returns a single AdvisoryDay dict (the farmer endpoint's list
     element shape), or 404 if the sub has no crop_start_date /
-    is not yet renderable."""
+    is not yet renderable.
+
+    2026-11-28 — Added `for_date` query param (same shape as
+    /farmer/advisory/today) so the promoter PWA can offer
+    Previous / Today / Next day navigation. Default is today when
+    omitted."""
     # 2026-11-27 — Filter by ACTIVE. After the 2026-11-17 Follow-up
     # Promoter widening, a sub that's been reassigned has TWO rows:
     # the old assignment flipped to REVOKED_BY_RM + the new ACTIVE
@@ -2904,6 +2910,7 @@ async def promoter_assignment_today(
         farmer_user_id=sub.farmer_user_id,
         only_subscription_id=subscription_id,
         lang=current_user.language_code or "en",
+        for_date=for_date,
     )
     if not days:
         # Active assignment but no rendered window yet (e.g. farmer
